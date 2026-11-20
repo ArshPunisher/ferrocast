@@ -2200,6 +2200,10 @@ impl Engine {
                 s.insert("active".into(), Value::Bool(false));
                 s.insert("reconnecting".into(), Value::Bool(false));
                 s.insert("error".into(), Value::String(reason));
+            } else if let Some(reason) = self.golive_main_reconnecting() {
+                // Still running, and honest: nothing is reaching any platform.
+                s.insert("reconnecting".into(), Value::Bool(true));
+                s.insert("reconnecting_reason".into(), Value::String(reason));
             }
         }
         Ok(v)
@@ -2526,6 +2530,11 @@ impl Engine {
             s.insert("active".into(), Value::Bool(false));
             s.insert("reconnecting".into(), Value::Bool(false));
             s.insert("error".into(), Value::String(reason));
+        } else if let Some(s) = v.as_object_mut()
+            && let Some(reason) = self.golive_main_reconnecting()
+        {
+            s.insert("reconnecting".into(), Value::Bool(true));
+            s.insert("reconnecting_reason".into(), Value::String(reason));
         }
         Ok(v)
     }

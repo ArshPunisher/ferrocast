@@ -52,6 +52,17 @@ async fn platform(listener: TcpListener, key: &'static str) -> mpsc::UnboundedRe
 }
 
 async fn serve_platform(sock: &mut TcpStream, key: &str, tx: &mpsc::UnboundedSender<Got>) -> Option<()> {
+    serve_platform_with(sock, key, tx, false).await
+}
+
+/// As [`serve_platform`]; with `hang_up_on_publish` it takes the handshake and the connect, then
+/// closes the socket at the publish without a word (an ingest node draining, or Twitch on a key).
+async fn serve_platform_with(
+    sock: &mut TcpStream,
+    key: &str,
+    tx: &mpsc::UnboundedSender<Got>,
+    hang_up_on_publish: bool,
+) -> Option<()> {
     let rest = conn::handshake(sock, PeerType::Server).await.ok()?;
     let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;
     let mut queue: Vec<ServerSessionResult> = first;
@@ -67,6 +78,9 @@ async fn serve_platform(sock: &mut TcpStream, key: &str, tx: &mpsc::UnboundedSen
                             queue.extend(s.accept_request(request_id).ok()?)
                         }
                         ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+                            if hang_up_on_publish {
+                                return None;
+                            }
                             if stream_key == key {
                                 let _ = tx.send(Got::Publish(stream_key));
                                 queue.extend(s.accept_request(request_id).ok()?);
@@ -428,6 +442,204 @@ async fn an_unreachable_destination_retries_until_it_answers() {
     assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
 }
 
+/// A router reboot or a Wi-Fi drop of a minute: connecting fails at once (no route), over and over.
+/// That is not the platform failing, so the tries aren't counted against it: the destination waits
+/// for the network (still Reconnecting, never Failed) and goes live again by itself, and a later
+/// ordinary failure still has all its own tries.
+/// A platform whose first connection is taken and dropped after `live` (a long stream, then the
+/// network or the node goes), whose next `resets` connections hang up at the publish, and which
+/// then takes the stream for good.
+async fn flaky_platform(
+    listener: TcpListener,
+    key: &'static str,
+    live: Duration,
+    resets: usize,
+) -> mpsc::UnboundedReceiver<Got> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut n = 0usize;
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let (tx, this) = (tx.clone(), n);
+            n += 1;
+            tokio::spawn(async move {
+                if (1..=resets).contains(&this) {
+                    let _ = serve_platform_with(&mut sock, key, &tx, true).await;
+                } else if this == 0 {
+                    let (itx, mut irx) = mpsc::unbounded_channel();
+                    let serve = serve_platform(&mut sock, key, &itx);
+                    let drop_later = async {
+                        while let Some(g) = irx.recv().await {
+                            let published = matches!(g, Got::Publish(_));
+                            let _ = tx.send(g);
+                            if published {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(live).await;
+                    };
+                    tokio::select! { _ = serve => {} _ = drop_later => {} }
+                } else {
+                    let _ = serve_platform(&mut sock, key, &tx).await;
+                }
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    rx
+}
+
+/// An ingest node that drains hangs up at the publish, over and over, while a stream that was live
+/// is reconnecting. That is the server dropping the connection, not the key being refused: the key
+/// worked a moment ago, so it is retried with all the ordinary tries (and the backup ingest),
+/// and it is not reported as a refused key.
+#[tokio::test]
+async fn a_hang_up_at_the_publish_after_the_stream_was_live_is_not_a_refused_key() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = flaky_platform(l, "k", Duration::from_millis(300), 4).await;
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 6 };
+    let health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    // The first connection takes the stream; then it drops, four hang-ups follow at the publish;
+    // the sixth connection is taken. Never Failed on the way.
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    loop {
+        let state = health.borrow().state.clone();
+        if let PushState::Failed { reason, refused, .. } = state {
+            panic!("gave up (refused {refused}): {reason}");
+        }
+        match next(&mut got).await {
+            Got::Publish(k) => {
+                assert_eq!(k, "k");
+                break;
+            }
+            _ => continue,
+        }
+    }
+    let mut health = health;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+}
+
+/// A server that took the stream and then stops accepting connections for a while (an ingest
+/// restarting; one's own server rebooting) is an outage, waited for like a network that is down:
+/// a destination that never took the stream still gives up on a wrong address in a few tries.
+#[tokio::test]
+async fn a_server_that_was_live_and_refuses_connections_for_a_while_is_waited_for() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let (tx, mut got) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let mut conns = tokio::task::JoinSet::new();
+        while let Ok((mut sock, _)) = l.accept().await {
+            let tx = tx.clone();
+            conns.spawn(async move {
+                let _ = serve_platform(&mut sock, "k", &tx).await;
+            });
+        }
+    });
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    // The server goes: its listener and connections close; nothing listens for a while.
+    server.abort();
+    let _ = server.await;
+    let state = state_is(&mut health, |s| {
+        matches!(s, PushState::Failed { .. }) || matches!(s, PushState::Reconnecting { attempt, .. } if *attempt >= 8)
+    })
+    .await;
+    assert!(matches!(state, PushState::Reconnecting { .. }), "gave up on a server that had been live: {state:?}");
+    // It comes back.
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+}
+
+/// A name that never resolved (a typo in a custom server) or an address that never answered is not a
+/// network being down: it fails in the few ordinary tries with the real reason, not after ten minutes
+/// of "your network is down". Only a destination that took the stream earlier gets the long wait.
+/// While the network is waited for, the destination shows Reconnecting (with why) the whole time:
+/// a try in progress doesn't turn it back into a bare Connecting (it did for the length of every
+/// connect timeout, 10 of every 18 seconds).
+#[tokio::test]
+async fn a_destination_waiting_for_the_network_stays_reconnecting_while_a_try_is_made() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set(dport, true);
+    push::fault::set_slow(dport, 150);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(30), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(900);
+    while tokio::time::Instant::now() < deadline {
+        let s = health.borrow().state.clone();
+        assert!(matches!(s, PushState::Reconnecting { .. }), "turned back into {s:?} during a try");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    push::fault::set_slow(dport, 0);
+    push::fault::set(dport, false);
+}
+
+#[tokio::test]
+async fn a_name_that_never_resolved_fails_fast_a_destination_that_was_live_waits() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set_no_name(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { reason, attempts, .. } => {
+            assert_eq!(attempts, 3);
+            assert!(!reason.to_lowercase().contains("network is down"), "{reason}");
+        }
+        s => panic!("{s:?}"),
+    }
+    push::fault::set_no_name(dport, false);
+}
+
+#[tokio::test]
+async fn a_network_that_is_down_is_waited_for_not_counted_against_the_destination() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    // Well past the 3 tries an ordinary refusal would get.
+    let state = state_is(&mut health, |s| {
+        matches!(s, PushState::Failed { .. }) || matches!(s, PushState::Reconnecting { attempt, .. } if *attempt >= 8)
+    })
+    .await;
+    match state {
+        PushState::Reconnecting { reason, .. } => assert!(reason.to_lowercase().contains("network"), "{reason}"),
+        s => panic!("gave up while the network was down: {s:?}"),
+    }
+    // The network comes back with the platform: live by itself.
+    push::fault::set(dport, false);
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+    assert_eq!(next(&mut got).await, Got::Video(0, Bytes::from_static(KEY)));
+}
+
 #[tokio::test]
 async fn obs_stopping_ends_the_stream_everywhere_and_waits_for_the_next() {
     let w = world().await;
@@ -583,6 +795,29 @@ async fn a_platform_that_takes_the_stream_and_drops_it_at_once_waits_longer_each
     let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
     for want in 1..=2u32 {
         state_is(&mut health, |s| *s == PushState::Live).await;
+        match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
+            PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, want, "the count goes on"),
+            s => panic!("{s:?}"),
+        }
+    }
+}
+
+/// How long a session has been live is measured on the monotonic clock: an NTP step or a wake from
+/// sleep moves the wall clock, and a forward one made a session live for a moment count as one live
+/// for hours (the retry count started over and the waits never grew; a backward one made a long
+/// one count as a moment: a false "Kick refused the stream").
+#[tokio::test]
+async fn a_wall_clock_step_does_not_change_how_long_a_session_was_live() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops(l, "k", Duration::from_millis(400)).await;
+    let mut health = start(&w, destination(dport, "k"));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    for want in 1..=2u32 {
+        state_is(&mut health, |s| *s == PushState::Live).await;
+        // The clock jumps an hour ahead while it is live.
+        push::fault::CLOCK_STEP_MS.with(|c| c.set(c.get() + 3_600_000));
         match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
             PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, want, "the count goes on"),
             s => panic!("{s:?}"),

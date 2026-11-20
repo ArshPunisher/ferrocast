@@ -55,6 +55,12 @@ const MIN_BACKLOG_PACKETS: usize = 4;
 pub const DEFAULT_MAX_ATTEMPTS: u32 = 6;
 /// Consecutive auth/key refusals before giving up (no point hammering a bad key).
 pub const REFUSED_MAX_ATTEMPTS: u32 = 3;
+/// How long a destination waits for a network that is down (a Wi-Fi drop, a router reboot) before
+/// giving up for this stream. OBS rides out outages of about this length.
+pub const NETWORK_PATIENCE: Duration = Duration::from_secs(10 * 60);
+/// The longest wait between tries while the network is down: it comes back and the stream follows
+/// within about this long.
+const NETWORK_RETRY_MAX: Duration = Duration::from_secs(8);
 
 /// How long a destination waits before trying again: the first wait, doubling up to the
 /// longest (Advanced mode can change both), and how many failures in a row before giving up
@@ -191,12 +197,30 @@ pub enum PushError {
     Stalled(String),
     #[error("The connection to {0} broke.")]
     Broken(String),
+    /// The server hung up when the stream key was sent (Twitch does this for a wrong key, and an
+    /// ingest node that is draining does it for anything). Which one is only known from whether
+    /// the key worked before in this stream.
+    #[error("{0} closed the connection when the stream started.")]
+    PublishDropped(String),
+    /// No way out to the internet (no route, no DNS, nothing answering): a Wi-Fi drop or a router
+    /// reboot. Not the platform's doing, so it isn't counted against the destination.
+    #[error("Your network is down: waiting for it to reach {0}.")]
+    NetworkDown(String),
 }
 
 impl PushError {
     /// The network failed (not the server saying no): another connection may do better.
     fn is_network(&self) -> bool {
-        matches!(self, Self::Unreachable(_) | Self::Slow(_) | Self::Closed(_) | Self::Stalled(_) | Self::Broken(_))
+        matches!(
+            self,
+            Self::Unreachable(_)
+                | Self::PublishDropped(_)
+                | Self::NetworkDown(_)
+                | Self::Slow(_)
+                | Self::Closed(_)
+                | Self::Stalled(_)
+                | Self::Broken(_)
+        )
     }
 
     /// The server could not be had at all (not a no to this stream or its key): another server
@@ -248,6 +272,11 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         };
         let still_on = |l: &Live| l.on && l.stream == stream;
         let mut attempt = 0u32;
+        // Tries made while the network was down (not counted in `attempt`), and since when it is.
+        let mut net_tries = 0u32;
+        let mut down_since: Option<Instant> = None;
+        // This stream has been live on this destination: its key works.
+        let mut ever_live = false;
         // The connection used: the system's default until that fails, then the next one.
         let mut via: Option<links::Network> = None;
         // The server used: the destination's own, until it can't be reached `BACKUP_AFTER` times in
@@ -259,10 +288,15 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                 (Some(b), true) => b,
                 _ => &dest.target,
             };
-            set_state(&health, PushState::Connecting);
+            // A retry doesn't blank "Reconnecting" (and why) for the length of the try: only a
+            // first connect, or one after a live session, shows Connecting.
+            if !matches!(health.borrow().state, PushState::Reconnecting { .. }) {
+                set_state(&health, PushState::Connecting);
+            }
+            let mut live_at: Option<Instant> = None;
             let outcome = tokio::select! {
                 _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
-                r = session(&dest, target, &hub, &health, stream, via.as_ref()) => r,
+                r = session(&dest, target, &hub, &health, stream, via.as_ref(), &mut live_at) => r,
             };
             match outcome {
                 Ok(Ended::Stopped) => break 'streams,
@@ -276,10 +310,18 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     // the longest wait. One that took the stream and closed it at once doesn't
                     // (19 Nov, live: Kick took it and closed it every 8 s for the whole stream,
                     // always "attempt 1", never waiting longer and never saying why).
-                    let (was_live, live_for_ms) = {
-                        let h = health.borrow();
-                        (h.state == PushState::Live, now_ms().saturating_sub(h.since_ms))
+                    let (was_live, live_for_ms) = match live_at {
+                        Some(t) => (true, u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        None => (false, 0),
                     };
+                    ever_live |= was_live;
+                    // A hang-up at the publish: a wrong key before the key ever worked in this
+                    // stream (what it was always taken for), a server dropping the connection after.
+                    let err = match err {
+                        PushError::PublishDropped(h) if !ever_live => PushError::KeyRefused(h),
+                        e => e,
+                    };
+                    let key_refused = matches!(err, PushError::KeyRefused(_));
                     let rapid_close = was_live && live_for_ms < STAYED_LIVE_MS;
                     let stayed = was_live && live_for_ms >= STAYED_LIVE_MS;
                     if stayed {
@@ -293,7 +335,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                             on_backup = false;
                             connect_failures = 0;
                             switched = true;
-                        } else if !was_live && err.is_connect_failure() {
+                        } else if !was_live && err.is_connect_failure() && !key_refused {
                             connect_failures += 1;
                             if connect_failures >= BACKUP_AFTER {
                                 on_backup = !on_backup;
@@ -304,9 +346,28 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                             connect_failures = 0;
                         }
                     }
-                    attempt = attempt.saturating_add(1);
+                    // A network that is down isn't the destination failing: its tries are counted
+                    // apart and don't use up the ones an ordinary failure gets, and it is waited for
+                    // (up to NETWORK_PATIENCE) rather than given up on after a few seconds.
+                    // Also a server that took this stream earlier and now refuses connections at all
+                    // (an ingest restarting, one's own server rebooting): an outage to wait for. One
+                    // that never took it stays an ordinary failure (a wrong address says so fast).
+                    let net_down = matches!(err, PushError::NetworkDown(_))
+                        || (ever_live && matches!(err, PushError::Unreachable(_) | PushError::Slow(_)));
+                    if net_down {
+                        net_tries = net_tries.saturating_add(1);
+                        down_since.get_or_insert_with(Instant::now);
+                    } else {
+                        attempt = attempt.saturating_add(1);
+                        net_tries = 0;
+                        // The patience clock restarts only once a session really took the stream
+                        // again, not on one odd error between two "network down"s.
+                        if was_live {
+                            down_since = None;
+                        }
+                    }
                     let kick_refused = rapid_close && is_kick(&dest);
-                    let server_refused = matches!(err, PushError::KeyRefused(_) | PushError::Refused(..));
+                    let server_refused = key_refused || matches!(err, PushError::Refused(..));
                     let is_refused = kick_refused || server_refused;
                     let limit = if dest.retry.max_attempts == 0 {
                         0
@@ -321,14 +382,19 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     };
                     // Never hop network interfaces on a server refusal or rapid policy close:
                     // the connection reached the server and the platform itself closed it.
-                    if err.is_network() && !rapid_close && may_move(target) {
+                    if err.is_network() && !key_refused && !rapid_close && may_move(target) {
                         via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
                     }
-                    if limit > 0 && attempt >= limit {
+                    let give_up = if net_down {
+                        limit > 0 && down_since.is_some_and(|t| t.elapsed() >= NETWORK_PATIENCE)
+                    } else {
+                        limit > 0 && attempt >= limit
+                    };
+                    if give_up {
                         let (short_reason, detail) = failure_text(&dest, &err, kick_refused);
                         tracing::warn!(
                             dest = %dest.id,
-                            attempts = attempt,
+                            attempts = attempt.max(net_tries),
                             refused = is_refused,
                             on_backup,
                             error = %err,
@@ -336,15 +402,25 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         );
                         set_state(
                             &health,
-                            PushState::Failed { attempts: attempt, reason: short_reason, detail, refused: is_refused },
+                            PushState::Failed {
+                                attempts: attempt.max(net_tries),
+                                reason: short_reason,
+                                detail,
+                                refused: is_refused,
+                            },
                         );
                         tokio::select! {
                             _ = stop.wait_for(|s| *s) => break 'streams,
                             _ = live.wait_for(|l| !still_on(l)) => break,
                         }
                     }
-                    let wait = backoff(attempt, &dest.retry);
-                    tracing::info!(dest = %dest.id, attempt, error = %err, via = ?via.as_ref().map(|n| &n.name), on_backup, "golive: destination failed, retrying");
+                    let shown = if net_down { net_tries } else { attempt };
+                    let wait = if net_down {
+                        backoff(net_tries, &dest.retry).min(NETWORK_RETRY_MAX)
+                    } else {
+                        backoff(attempt, &dest.retry)
+                    };
+                    tracing::info!(dest = %dest.id, attempt = shown, error = %err, via = ?via.as_ref().map(|n| &n.name), on_backup, "golive: destination failed, retrying");
                     let reason = if switched {
                         format!(
                             "{err} Trying {}.",
@@ -357,7 +433,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     };
                     set_state(
                         &health,
-                        PushState::Reconnecting { attempt, retry_in_ms: wait.as_millis() as u64, reason },
+                        PushState::Reconnecting { attempt: shown, retry_in_ms: wait.as_millis() as u64, reason },
                     );
                     tokio::select! {
                         _ = stop.wait_for(|s| *s) => break 'streams,
@@ -407,6 +483,13 @@ fn failure_text(dest: &Destination, err: &PushError, kick_refused: bool) -> (Str
         return ("Kick refused the stream.".into(), Some(kick_multistream_detail(err)));
     }
     match err {
+        PushError::NetworkDown(host) => (
+            "The network stayed down; stopped trying.".into(),
+            Some(format!(
+                "{host} couldn't be reached for {} minutes. Start the destination again once the internet is back.",
+                NETWORK_PATIENCE.as_secs() / 60
+            )),
+        ),
         PushError::KeyRefused(_) => ("Stream key was refused.".into(), Some(err.to_string())),
         PushError::Refused(_, _) => ("The platform refused the stream.".into(), Some(err.to_string())),
         _ => {
@@ -429,19 +512,99 @@ pub(crate) fn backoff(attempt: u32, retry: &Retry) -> Duration {
 }
 
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    #[cfg(test)]
+    let t = t.saturating_add_signed(fault::CLOCK_STEP_MS.with(std::cell::Cell::get));
+    t
+}
+
+/// What a failed TCP connect says. No route, no network or an interface that's down is the network
+/// being down (waited for, even before the stream was ever live). A name that can't be looked up, a
+/// refusal or a reset is a wrong address or that server not taking it: counted like any failure,
+/// and only waited for by a destination that was live before (it worked a moment ago).
+fn connect_error(e: &std::io::Error, host: &str) -> PushError {
+    use std::io::ErrorKind as K;
+    if matches!(e.kind(), K::NetworkUnreachable | K::HostUnreachable | K::NetworkDown) {
+        return PushError::NetworkDown(host.to_string());
+    }
+    if e.kind() == K::TimedOut {
+        return PushError::Slow(host.to_string());
+    }
+    PushError::Unreachable(host.to_string())
+}
+
+/// Tests take the network away from one destination (by its port) and give it back.
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::sync::Mutex;
+    static DOWN: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    pub(crate) fn set(port: u16, down: bool) {
+        let mut d = DOWN.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if down {
+            d.push(port);
+        }
+    }
+    thread_local! {
+        /// The wall clock stepped by this many ms in this test (an NTP correction, a wake from sleep).
+        pub(crate) static CLOCK_STEP_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+    pub(crate) fn is_down(port: u16) -> bool {
+        DOWN.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
+    static SLOW: Mutex<Vec<(u16, u64)>> = Mutex::new(Vec::new());
+    /// Connecting to this port takes this long (ms) before it fails: a connect that hangs.
+    pub(crate) fn set_slow(port: u16, ms: u64) {
+        let mut d = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|(p, _)| *p != port);
+        if ms > 0 {
+            d.push((port, ms));
+        }
+    }
+    pub(crate) fn slow_ms(port: u16) -> u64 {
+        SLOW.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map_or(0, |(_, m)| *m)
+    }
+    static NO_NAME: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    /// The destination's name can't be looked up (a typo, or no DNS).
+    pub(crate) fn set_no_name(port: u16, on: bool) {
+        let mut d = NO_NAME.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if on {
+            d.push(port);
+        }
+    }
+    pub(crate) fn no_name(port: u16) -> bool {
+        NO_NAME.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
 }
 
 /// Connects to `t`, over `via` when given (else the system's default way).
 pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
+    #[cfg(test)]
+    {
+        let ms = fault::slow_ms(t.port);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
+    #[cfg(test)]
+    if fault::is_down(t.port) {
+        return Err(PushError::NetworkDown(host));
+    }
+    #[cfg(test)]
+    if fault::no_name(t.port) {
+        return Err(connect_error(&std::io::Error::other("failed to lookup address information"), &host));
+    }
     let tcp = match (via, t.pin) {
         (None, Some(addr)) => timeout(CONNECT_DEADLINE, TcpStream::connect(addr)).await,
         (None, None) => timeout(CONNECT_DEADLINE, TcpStream::connect((t.host.as_str(), t.port))).await,
         (Some(n), _) => timeout(CONNECT_DEADLINE, links::tcp_via(n, &t.host, t.port)).await,
     }
+    // Not answering at all looks the same whether the link or the server is down (or the address
+    // is wrong): an ordinary failure, waited for only by a destination that was live before.
     .map_err(|_| PushError::Slow(host.clone()))?
-    .map_err(|_| PushError::Unreachable(host.clone()))?;
+    .map_err(|e| connect_error(&e, &host))?;
     let _ = tcp.set_nodelay(true);
     if !t.tls {
         return Ok(Box::pin(tcp));
@@ -468,6 +631,7 @@ async fn session(
     health: &watch::Sender<Health>,
     stream: u64,
     via: Option<&links::Network>,
+    live_at: &mut Option<Instant>,
 ) -> Result<Ended, PushError> {
     let mut p = Publisher::open(target, &dest.key, via).await?;
     // Its name asks the system (a quick command): off the async threads.
@@ -511,6 +675,8 @@ async fn session(
         }
     }
     set_state(health, PushState::Live);
+    // Measured on the monotonic clock: the wall clock steps (NTP, a wake from sleep).
+    *live_at = Some(Instant::now());
     let mut base: Option<u32> = None;
     let mut started = false;
     let mut video_drop = VideoDrop::default();
@@ -823,9 +989,9 @@ impl Publisher {
             _ => None,
         })
         .await
-        // Twitch over rtmps:// resets the connection instead of closing it cleanly.
+        // Twitch over rtmps:// resets the connection instead of closing it cleanly, for a bad key.
         .map_err(|e| match e {
-            PushError::Closed(h) | PushError::Broken(h) => PushError::KeyRefused(h),
+            PushError::Closed(h) | PushError::Broken(h) => PushError::PublishDropped(h),
             e => e,
         })?;
         Ok(p)
@@ -927,6 +1093,42 @@ impl Publisher {
             }
             *pending = self.client.handle_input(&self.buf[..n]).map_err(|_| self.not_rtmp())?;
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_error_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind as K};
+
+    #[test]
+    fn only_no_route_is_the_network_down_a_name_or_a_refusal_is_the_address() {
+        let class = |e: Error| match connect_error(&e, "h") {
+            PushError::NetworkDown(_) => "down",
+            PushError::Slow(_) => "slow",
+            PushError::Unreachable(_) => "unreachable",
+            _ => "other",
+        };
+        assert_eq!(class(K::NetworkUnreachable.into()), "down", "ENETUNREACH");
+        assert_eq!(class(K::HostUnreachable.into()), "down", "EHOSTUNREACH");
+        assert_eq!(class(K::NetworkDown.into()), "down", "ENETDOWN");
+        assert_eq!(class(K::TimedOut.into()), "slow", "ETIMEDOUT / WSAETIMEDOUT");
+        // A name that can't be looked up (a typo, or no DNS; on Windows WSAHOST_NOT_FOUND 11001,
+        // WSATRY_AGAIN 11002, WSANO_DATA 11004 arrive as raw OS errors) is not proof the network is down.
+        assert_eq!(class(Error::other("failed to lookup address information")), "unreachable");
+        for code in [11001, 11002, 11004] {
+            assert_eq!(class(Error::from_raw_os_error(code)), "unreachable", "{code}");
+        }
+        assert_eq!(class(K::ConnectionRefused.into()), "unreachable");
+        assert_eq!(class(K::ConnectionReset.into()), "unreachable");
+    }
+
+    #[test]
+    fn a_network_that_is_down_never_counts_as_a_refusal_or_blocks_failover() {
+        let e = PushError::NetworkDown("h".into());
+        assert!(e.is_network(), "another connection may do better");
+        assert!(e.is_connect_failure(), "the backup ingest may answer");
+        assert!(!matches!(e, PushError::KeyRefused(_) | PushError::Refused(..)));
     }
 }
 
@@ -1041,5 +1243,28 @@ mod via_tests {
         d.on_lagged();
         assert!(!d.should_drop_audio(200, Some(1_100), Some(900)));
         assert!(!d.should_drop(0, true, Some(1_100), Some(900), Some(400), 950, 2));
+    }
+}
+
+#[cfg(test)]
+mod give_up_text_tests {
+    use super::*;
+
+    #[test]
+    fn after_the_network_patience_runs_out_it_says_so_not_that_it_is_waiting_or_the_server_stopped() {
+        for host in ["live.twitch.tv", "a.rtmps.youtube.com", "fa723fc1b171.global-contribute.live-video.net"] {
+            let d = Destination {
+                id: "x".into(),
+                target: Target::parse(&format!("rtmp://{host}/app")).unwrap(),
+                key: "k".into(),
+                retry: Retry::default(),
+                extra_audio: false,
+                extra_video: false,
+                backup: None,
+            };
+            let (reason, detail) = failure_text(&d, &PushError::NetworkDown(host.into()), false);
+            assert!(!reason.contains("waiting") && !reason.contains("stopped taking"), "{reason}");
+            assert!(detail.is_some_and(|x| x.contains(host)));
+        }
     }
 }
