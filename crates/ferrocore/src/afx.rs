@@ -720,10 +720,11 @@ impl AudioFilter {
                 let open_db = if open_db.is_finite() { open_db } else { -26.0 };
                 let close_db = if close_db.is_finite() { close_db } else { -32.0 };
                 let open = db_to_mul(open_db);
-                // Preserve exact OBS hysteresis whenever `close < open`. Only when set equal or
-                // backwards (`close >= open`, where OBS's gate stalls open because `decay_rate <= 0`)
-                // enforce a 3 dB floor under `open_db` so the gate still closes reliably.
-                let close_eff = if close_db < open_db { close_db } else { open_db - 3.0 };
+                // Preserve exact OBS hysteresis whenever `close < open` (at least 0.01 dB apart so
+                // f32 `open - close` never underflows `decay_rate` to 0). When set equal or
+                // backwards (`close >= open - 0.01`, where OBS's gate stalls open), enforce a 3 dB
+                // floor under `open_db` so the gate still closes reliably.
+                let close_eff = if close_db < open_db - 0.01 { close_db } else { open_db - 3.0 };
                 let close = db_to_mul(close_eff);
                 let attack_rate =
                     if attack_ms.is_finite() && attack_ms > 0.0 { 1.0 / (attack_ms / 1000.0 * rate) } else { 1.0 };
@@ -2204,16 +2205,10 @@ mod tests {
             assert!(l[ms(149)].abs() < 1e-6, "-28.5 dBFS must close -26/-28 gate (got {})", l[ms(149)]);
         }
 
-        // 3. Backwards (`close >= open`): never stalls open forever.
-        {
+        // 3. Backwards (`close >= open`) or sub-0.01 dB near-equal: never stalls open forever.
+        for close_db in [-20.0f32, -26.0, -26.000_002] {
             let mut f = AudioFilter::new(
-                AudioEffect::NoiseGate {
-                    open_db: -26.0,
-                    close_db: -20.0,
-                    attack_ms: 5.0,
-                    hold_ms: 10.0,
-                    release_ms: 10.0,
-                },
+                AudioEffect::NoiseGate { open_db: -26.0, close_db, attack_ms: 5.0, hold_ms: 10.0, release_ms: 10.0 },
                 RATE,
             );
             let (mut l, mut rr) = (vec![db_to_mul(-12.0); ms(30)], vec![db_to_mul(-12.0); ms(30)]);
@@ -2221,7 +2216,7 @@ mod tests {
             // Linear decay from -12 dB (0.251) to -29 dB (0.035) at (open-close)/(1/75 s) takes ~200 ms + hold + release.
             let (mut l, mut rr) = (vec![0.0f32; ms(350)], vec![0.0f32; ms(350)]);
             f.process([&mut l, &mut rr]);
-            assert!(!f.is_open && f.attenuation == 0.0, "backwards gate must still close on silence");
+            assert!(!f.is_open && f.attenuation == 0.0, "gate close_db={close_db} must still close on silence");
         }
     }
 
