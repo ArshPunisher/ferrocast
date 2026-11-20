@@ -2116,8 +2116,8 @@ impl StudioHost for DesktopStudio {
             .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))
     }
 
-    fn levels_now(&self, names: &[String]) -> Option<Value> {
-        serde_json::to_value(ferrocast_studio::stage::levels_now(names)?).ok()
+    fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
+        serde_json::to_value(ferrocast_studio::stage::levels_now(names, fast)?).ok()
     }
 
     async fn act(&self, act: StudioAct) -> Result<Value, String> {

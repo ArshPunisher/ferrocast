@@ -202,10 +202,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Does one thing to the scene collection (checked before it gets here) and answers what
     /// it shows; changes are saved by the host.
     async fn act(&self, act: StudioAct) -> Result<Value, String>;
-    /// The meters' levels over a short window, read without waiting for the Studio's queue
+    /// The meters' levels (the 300 ms window, or `fast`: a few blocks), read without waiting for the Studio's queue
     /// (`act` runs one thing at a time, in order). None: this host can't (or no engine runs),
     /// ask `act` with `StudioAct::Levels` instead.
-    fn levels_now(&self, _names: &[String]) -> Option<Value> {
+    fn levels_now(&self, _names: &[String], _fast: bool) -> Option<Value> {
         None
     }
     /// The Studio's settings (saved by the host; defaults the first time).
@@ -2444,11 +2444,11 @@ impl Engine {
     /// The meters' levels (`POST /studio/engine/levels`): read straight from the engine's
     /// wait-free meters over a short window, so thirty polls a second never queue behind (or in
     /// front of) the user's edits; the Studio's own queue answers when no engine runs.
-    pub async fn studio_levels(&self, names: Vec<String>) -> Result<Value, EngineError> {
+    pub async fn studio_levels(&self, names: Vec<String>, fast: bool) -> Result<Value, EngineError> {
         let mut act = StudioAct::Levels { names };
         act.check()?;
         let StudioAct::Levels { names } = &act else { unreachable!() };
-        if let Some(v) = self.studio_host()?.levels_now(names) {
+        if let Some(v) = self.studio_host()?.levels_now(names, fast) {
             return Ok(v);
         }
         self.studio_act(act).await
@@ -3100,10 +3100,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StudioHost for Fake {
-        fn levels_now(&self, names: &[String]) -> Option<Value> {
+        fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
             self.direct
                 .load(std::sync::atomic::Ordering::SeqCst)
-                .then(|| serde_json::json!({ names[0].clone(): { "peak": [-6.0, -6.0] } }))
+                .then(|| serde_json::json!({ names[0].clone(): { "peak": [if fast { -6.0 } else { -20.0 }, -6.0] } }))
         }
         fn delay_drain(&self) -> Option<(f64, f64)> {
             *self.drain.lock().unwrap()
@@ -3401,16 +3401,20 @@ mod tests {
         // With an engine running, the meters answer at once, not behind it.
         fake.direct.store(true, SeqCst);
         let t0 = std::time::Instant::now();
-        let v = tokio::time::timeout(std::time::Duration::from_millis(50), e.studio_levels(vec!["Mic".into()]))
+        let v = tokio::time::timeout(std::time::Duration::from_millis(50), e.studio_levels(vec!["Mic".into()], true))
             .await
             .expect("levels waited for the busy queue")
             .unwrap();
         assert!(t0.elapsed() < std::time::Duration::from_millis(50));
         assert_eq!(v["Mic"]["peak"][0], -6.0);
+        // The default window is the long one; only `fast` asks for the short one.
+        fake.direct.store(true, SeqCst);
+        let slow = e.studio_levels(vec!["Mic".into()], false).await.unwrap();
+        assert_eq!(slow["Mic"]["peak"][0], -20.0);
         // With none running, the queue answers (as before).
         fake.direct.store(false, SeqCst);
         fake.busy.store(false, SeqCst);
-        let v = e.studio_levels(vec!["Mic".into()]).await.unwrap();
+        let v = e.studio_levels(vec!["Mic".into()], false).await.unwrap();
         assert!(v.get("Mic").is_none(), "the fast path answered with no engine: {v}");
         held.await.unwrap().unwrap();
     }

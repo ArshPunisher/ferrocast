@@ -70,11 +70,11 @@ fn publish_engine(shared: Option<&Arc<own::Shared>>) {
     *LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()) = shared.map_or_else(std::sync::Weak::new, Arc::downgrade);
 }
 
-/// The meters over a short window, read without the Studio's main thread. None when no engine
+/// The meters (the long window, or `fast` over a few blocks), read without the Studio's main thread. None when no engine
 /// is running (the caller then asks the main thread, which says why).
-pub fn levels_now(names: &[String]) -> Option<std::collections::HashMap<String, crate::collection::LevelInfo>> {
+pub fn levels_now(names: &[String], fast: bool) -> Option<std::collections::HashMap<String, crate::collection::LevelInfo>> {
     let e = LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()).upgrade()?;
-    Some(read_levels(&e, names, true))
+    Some(read_levels(&e, names, fast))
 }
 
 /// The scene store.
