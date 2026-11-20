@@ -1414,6 +1414,7 @@ mod full_disk_tests {
             keyframe_secs: 1,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         };
@@ -1550,6 +1551,7 @@ mod rebuild_tests {
             keyframe_secs: 2,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         };
@@ -1606,6 +1608,7 @@ mod rebuild_tests {
             keyframe_secs: 2,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         };
@@ -1691,6 +1694,7 @@ mod rebuild_tests {
             keyframe_secs: 2,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         };
@@ -1728,5 +1732,139 @@ mod rebuild_tests {
     fn a_rebuilt_session_with_the_same_parameter_sets_sends_no_extra_header() {
         let Some((_, tags)) = run(false) else { return };
         assert_eq!(sequence_headers(&tags), 1);
+    }
+}
+
+/// B-frames through the whole output: real Mac encoder, the stream's tags, and a recording (MP4
+/// and MKV) that FFmpeg itself reads back.
+#[cfg(all(test, target_os = "macos"))]
+mod bframe_tests {
+    use super::*;
+    use crate::video::{PixelFormat, RateControl, VideoCodec};
+
+    fn have(tool: &str) -> bool {
+        std::process::Command::new(tool).arg("-version").output().is_ok_and(|o| o.status.success())
+    }
+
+    fn video(bframes: bool) -> VideoConfig {
+        VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1500,
+            rate: RateControl::Cbr,
+            keyframe_secs: 1,
+            software: false,
+            profile: crate::video::H264Profile::High,
+            bframes,
+            preset: None,
+            tune: None,
+        }
+    }
+
+    /// 150 moving frames with sound into `path`; the stream's video tags and the file.
+    fn run(bframes: bool, path: &std::path::Path) -> Option<Vec<(u32, bool, i64)>> {
+        let mut pipe = Pipeline::new(
+            video(bframes),
+            AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 },
+            Some(path),
+        )
+        .ok()?;
+        let pcm = vec![0.05f32; 1600 * 2];
+        let mut tags = Vec::new();
+        for i in 0..150u64 {
+            let ts = i * 33_333_333;
+            let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+            let uv = vec![128u8; 320 * 90];
+            tags.extend(pipe.video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts).ok()?);
+            pipe.audio(&pcm, ts).ok()?;
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        tags.extend(pipe.finish().ok()?);
+        // (tag ms, keyframe, composition time ms) of every picture's tag.
+        Some(
+            tags.iter()
+                .filter_map(|t| match t {
+                    Tag::Video { ms, body } if body.len() > 5 && body[1] == 1 => {
+                        Some((*ms, body[0] >> 4 == 1, i64::from(u32::from_be_bytes([0, body[2], body[3], body[4]]))))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    fn packets(f: &std::path::Path, stream: &str) -> Vec<(f64, f64)> {
+        let o = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                stream,
+                "-show_entries",
+                "packet=pts_time,dts_time",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(f)
+            .output()
+            .unwrap_or_else(|e| panic!("{e}"));
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (p, d) = l.split_once(',')?;
+                Some((p.parse().ok()?, d.parse().ok()?))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stream_and_recordings_with_b_frames_play_and_stay_in_sync() {
+        if !have("ffmpeg") || !have("ffprobe") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ferrocore-bframes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        for ext in ["mp4", "mkv"] {
+            let f = dir.join(format!("b.{ext}"));
+            let Some(tags) = run(true, &f) else { return };
+            // The stream: tag times (decode) never go back; some pictures carry a composition time.
+            assert!(tags.windows(2).all(|w| w[1].0 >= w[0].0), "{ext}: tag times never go back");
+            assert!(tags.iter().any(|t| t.2 > 0), "{ext}: B-frames have composition times");
+            assert!(tags.first().is_some_and(|t| t.1 && t.0 == 0), "{ext}: starts on a keyframe at 0");
+            // The file plays: FFmpeg decodes it without a complaint.
+            let dec = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&f)
+                .args(["-f", "null", "-"])
+                .output()
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(dec.stderr.is_empty(), "{ext}: {}", String::from_utf8_lossy(&dec.stderr));
+            let v = packets(&f, "v:0");
+            let a = packets(&f, "a:0");
+            assert!(v.len() >= 140 && a.len() > 100, "{ext}: {} pictures, {} sound packets", v.len(), a.len());
+            if ext == "mp4" {
+                // MP4 keeps decode times: rising, never after the picture's time.
+                assert!(v.windows(2).all(|w| w[1].1 > w[0].1), "{ext}: decode times rise");
+                assert!(v.iter().all(|p| p.1 <= p.0 + 1e-6), "{ext}: decode never after display");
+            }
+            // Sync: the first picture shown and the first sound start within a frame of each other.
+            let first_v = v.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+            let first_a = a.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+            assert!((first_v - first_a).abs() < 0.034 * 3.0, "{ext}: picture at {first_v}, sound at {first_a}");
+            // The ends line up too (the file's two tracks are as long as each other).
+            let last_v = v.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+            let last_a = a.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+            assert!((last_v - last_a).abs() < 0.2, "{ext}: ends at {last_v} and {last_a}");
+        }
+        // Without B-frames nothing is reordered (the old behaviour is unchanged).
+        let f = dir.join("n.mp4");
+        if let Some(tags) = run(false, &f) {
+            assert!(tags.iter().all(|t| t.2 == 0), "no composition times without B-frames");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

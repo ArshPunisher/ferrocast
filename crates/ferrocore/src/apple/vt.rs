@@ -1,5 +1,6 @@
-//! H.264 and HEVC on the Mac's media engine (VideoToolbox): real-time, no frame reordering (B
-//! frames) so packets leave in order with no delay, keyframes every N seconds, Rec. 709 colours.
+//! H.264 and HEVC on the Mac's media engine (VideoToolbox): real-time, frame reordering (B frames)
+//! only when asked (`VideoConfig::bframes`; then packets carry their own decode times and leave a
+//! frame or two late), keyframes every N seconds, Rec. 709 colours.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -153,9 +154,19 @@ struct Sink {
     /// Times VideoToolbox has called back (a frame, a drop, an error: anything), to tell a
     /// session that went quiet from one that is working.
     callbacks: u64,
+    /// With B-frames: how far decode times are moved back (µs) so none is after its picture's
+    /// presentation time (VideoToolbox counts decode times from the first picture's own), and the
+    /// last decode time given (they must rise).
+    dts_shift: i64,
+    last_dts: Option<i64>,
     /// Tests: the session stops answering (callbacks return at once, as a wedged one's would).
     #[cfg(test)]
     mute: bool,
+}
+
+/// Whether the session reorders frames: asked for, and the profile has B-frames (Baseline hasn't).
+fn reorder_on(cfg: &VideoConfig) -> bool {
+    cfg.bframes && !(cfg.codec == VideoCodec::H264 && cfg.profile == crate::video::H264Profile::Baseline)
 }
 
 /// One VideoToolbox session.
@@ -320,6 +331,14 @@ impl Encoder {
             attrs.set(kCVPixelBufferIOSurfacePropertiesKey, surface.0.0);
         }
         let sink = Arc::new(Mutex::new(Sink::default()));
+        // Three frames: the deepest reordering VideoToolbox's real-time H.264 and HEVC use is two.
+        // Only container times move, nothing waits.
+        let fps_for_shift = f64::from(cfg.fps_num) / f64::from(cfg.fps_den.max(1));
+        if reorder_on(cfg)
+            && let Ok(mut k) = sink.lock()
+        {
+            k.dts_shift = (3_000_000.0 / fps_for_shift.max(1.0)).round() as i64;
+        }
         let mut session: CFTypeRef = ptr::null();
         let codec = if cfg.codec == VideoCodec::H264 { AVC1 } else { HVC1 };
         // SAFETY: every pointer is valid for the call; the refcon is the sink, which outlives the
@@ -349,11 +368,17 @@ impl Encoder {
         };
         let gop = float(f64::from(cfg.gop_secs())).ok_or_else(none)?;
         let rate = float(fps).ok_or_else(none)?;
+        // Baseline has no B-frames: reordering stays off there whatever was asked.
+        let reorder = reorder_on(cfg);
         // SAFETY: reading VideoToolbox's and CoreVideo's constant CFStrings and CF booleans.
         let required = unsafe {
             [
                 (kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "run in real time"),
-                (kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse, "turn off B-frames"),
+                (
+                    kVTCompressionPropertyKey_AllowFrameReordering,
+                    if reorder { kCFBooleanTrue } else { kCFBooleanFalse },
+                    "set B-frames",
+                ),
                 (kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, gop.0, "set the keyframe interval"),
                 (
                     kVTCompressionPropertyKey_ProfileLevel,
@@ -468,6 +493,11 @@ impl Encoder {
                 fresh.prior_header = self.header().or_else(|| self.prior_header.take());
                 fresh.rebuilt_at = std::mem::take(&mut self.rebuilt_at);
                 fresh.rebuilt_at.push_back(now);
+                // Decode times go on rising across the new session.
+                let last = self.sink.lock().ok().and_then(|k| k.last_dts);
+                if let Ok(mut k) = fresh.sink.lock() {
+                    k.last_dts = last;
+                }
                 std::mem::swap(self, &mut fresh);
                 self.lost = false;
                 self.encode_once(frame, pts_us, true)
@@ -735,7 +765,17 @@ extern "C" fn output(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus,
             return;
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sbuf).to_us().unwrap_or(0);
-        let dts = CMSampleBufferGetDecodeTimeStamp(sbuf).to_us().unwrap_or(pts);
+        let mut dts = CMSampleBufferGetDecodeTimeStamp(sbuf).to_us().unwrap_or(pts);
+        if sink.dts_shift > 0 {
+            // Decode times move back so none is after its picture's time, and still rise.
+            dts = (dts - sink.dts_shift).min(pts);
+            if let Some(last) = sink.last_dts
+                && dts <= last
+            {
+                dts = last + 1;
+            }
+            sink.last_dts = Some(dts);
+        }
         let mut key = true;
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sbuf, 0);
         if !attachments.is_null() && CFArrayGetCount(attachments) > 0 {
@@ -782,6 +822,7 @@ mod tests {
             keyframe_secs: 2,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         }
@@ -911,5 +952,40 @@ mod tests {
         assert!(recoverable(-12915), "kVTVideoEncoderNotAvailableNowErr");
         assert!(!recoverable(0));
         assert!(!recoverable(-12902), "a bad property won't mend with a new session");
+    }
+
+    /// B-frames on: packets come back with their own times (decode never after display, decode
+    /// order steady), and pictures really are reordered. Off: nothing is.
+    #[test]
+    fn b_frames_reorder_only_when_asked() {
+        for (codec, on) in
+            [(VideoCodec::H264, false), (VideoCodec::H264, true), (VideoCodec::Hevc, false), (VideoCodec::Hevc, true)]
+        {
+            let Ok(mut e) = Encoder::new(&VideoConfig { bframes: on, codec, ..config() }) else { continue };
+            let mut out = Vec::new();
+            for i in 0..90i64 {
+                // Moving picture: still frames would not need B-frames at all.
+                let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+                let pix = (y, vec![128u8; 320 * 90]);
+                out.extend(e.encode(frame(&pix), i * 33_333, i == 0).unwrap_or_else(|er| panic!("{er}")));
+            }
+            out.extend(e.flush().unwrap_or_else(|er| panic!("{er}")));
+            assert_eq!(out.len(), 90, "every frame comes out (bframes {on})");
+            assert!(out[0].key, "starts on a keyframe");
+            assert!(out.windows(2).all(|w| w[1].dts_us > w[0].dts_us), "decode times rise (bframes {on})");
+            assert!(out.iter().all(|p| p.dts_us <= p.pts_us), "never shown before decoded (bframes {on})");
+            let reordered = out.windows(2).filter(|w| w[1].pts_us < w[0].pts_us).count();
+            if on {
+                assert!(reordered > 0, "B-frames reorder pictures");
+                assert!(out.iter().any(|p| p.pts_us > p.dts_us), "composition offsets exist");
+            } else {
+                assert_eq!(reordered, 0);
+                assert!(out.iter().all(|p| p.pts_us == p.dts_us));
+            }
+            // Every picture exactly once.
+            let mut pts: Vec<i64> = out.iter().map(|p| p.pts_us).collect();
+            pts.sort_unstable();
+            assert_eq!(pts, (0..90).map(|i| i * 33_333).collect::<Vec<i64>>());
+        }
     }
 }
