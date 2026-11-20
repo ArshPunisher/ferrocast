@@ -149,6 +149,13 @@ fn is_scene(s: &Value) -> bool {
     matches!(s.get("id").and_then(Value::as_str), Some("scene" | "group"))
 }
 
+/// A web page whose sound isn't sent to the mixer ("Control audio via Ferrocast" off, OBS's
+/// `reroute_audio`): a picture, with no sound row.
+fn silent_page(kind: &str, src: &Value) -> bool {
+    matches!(kind, "browser_source" | "ferrocast_web")
+        && src.pointer("/settings/reroute_audio").and_then(Value::as_bool) != Some(true)
+}
+
 /// Whether `kind` can produce audio (excludes picture-only sources and video-only cameras).
 fn is_audio_kind(kind: &str) -> bool {
     !matches!(
@@ -1058,7 +1065,8 @@ impl Stage {
                     | "ferrocast_web_text"
                     | "ferrocast_inputs"
             )
-            && !PICTURE_ONLY_DEVICES.contains(&kind.as_str());
+            && !PICTURE_ONLY_DEVICES.contains(&kind.as_str())
+            && !silent_page(&kind, &src);
         // A group's sources, top first, each framed on the canvas through the group.
         let children = if kind == "group" && expand {
             self.scene_items(&name)
@@ -3699,7 +3707,9 @@ impl Stage {
 
     /// The sounds a scene makes (its sources with sound) and the global channels.
     pub fn audio(&self, scene: &str) -> Result<Vec<AudioInfo>, StudioError> {
-        let mut out: Vec<AudioInfo> = Vec::new();
+        // The devices heard in every scene first (Desktop Audio, Mic/Aux), then the scene's own
+        // sources: the same order in "This scene" and "All", so a mic never jumps.
+        let mut out: Vec<AudioInfo> = self.channels();
         // Its sources top first, and those inside its groups with them (OBS's mixer lists a
         // group's sources too; owner, 11 Nov: a video put in a group lost its sound row).
         let mut all = Vec::new();
@@ -3721,7 +3731,6 @@ impl Stage {
                 out.push(self.audio_info(&src, None));
             }
         }
-        out.extend(self.channels());
         Ok(out)
     }
 
@@ -6002,6 +6011,45 @@ mod tests {
         assert!((ok(s.audio_of("Mic/Aux")).volume_db + 3.0).abs() < 0.01);
         ok(s.set_channel(4, None));
         assert!(s.channels().is_empty());
+    }
+
+    /// A web page is a picture with no sound row unless "Control audio" is on (OBS's
+    /// `reroute_audio`): a silent overlay no longer shows as a mixer row (19 Nov, "Just chatting
+    /// (Café corner copy)"). The setting is in its form, off by default.
+    #[test]
+    fn a_web_page_has_a_sound_row_only_when_its_audio_is_controlled() {
+        let s = stage();
+        ok(s.add_source("Main", "browser_source", "Frame", &json!({ "url": "http://x" }), false));
+        ok(s.add_source(
+            "Main",
+            "ferrocast_web",
+            "Alerts",
+            &json!({ "url": "http://y", "reroute_audio": true }),
+            false,
+        ));
+        ok(s.add_source(
+            "Main",
+            "browser_source",
+            "Quiet",
+            &json!({ "url": "http://z", "reroute_audio": false }),
+            false,
+        ));
+        let names: Vec<String> = ok(s.audio("Main")).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["Alerts"], "{names:?}");
+        let opts = ok(s.options("Frame"));
+        assert!(opts.iter().any(|o| o.key == "reroute_audio"), "the form has the switch");
+        assert_eq!(crate::kinds::defaults("browser_source").and_then(|d| d["reroute_audio"].as_bool()), Some(false));
+    }
+
+    /// The devices heard in every scene come first in the mixer, the scene's own sources after,
+    /// in "This scene" as in "All" (a mic jumped from last to first between the two).
+    #[test]
+    fn the_everywhere_devices_come_first_in_the_mixer() {
+        let s = stage();
+        ok(s.set_channel(3, Some(("coreaudio_input_capture", "Mic/Aux", &json!({})))));
+        ok(s.add_source("Main", "ffmpeg_source", "Game", &json!({ "local_file": "/no/such.mp4" }), false));
+        let names: Vec<String> = ok(s.audio("Main")).into_iter().map(|a| a.name).collect();
+        assert_eq!(names, ["Mic/Aux", "Game"], "{names:?}");
     }
 
     /// Push-to-talk and push-to-mute are kept in the sound's own settings (OBS's keys), clamped to

@@ -794,6 +794,7 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("height", "Height", "int").range(1.0, 8192.0, 1.0),
             opt("fps", "Frame rate", "int").range(1.0, 60.0, 1.0),
             opt("css", "Your own CSS", "text").multiline(),
+            opt("reroute_audio", "Control audio in Ferrocast", "bool"),
         ],
         // Transitions.
         "swipe_transition" | "slide_transition" => {
@@ -1105,6 +1106,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
             "is_local_file": false, "local_file": "", "url": "https://obsproject.com/browser-source",
             "width": 800, "height": 600, "fps": 30,
             "css": "body { background-color: rgba(0, 0, 0, 0); margin: 0px auto; overflow: hidden; }",
+            "reroute_audio": false,
         }),
         "chroma_key_filter" | "chroma_key_filter_v2" => {
             json!({ "key_color_type": "green", "similarity": 400, "smoothness": 80, "spill": 100, "opacity": 1.0, "contrast": 0.0, "brightness": 0.0, "gamma": 0.0 })

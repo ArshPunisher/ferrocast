@@ -863,7 +863,10 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
         // its pictures in. OBS's own size keys; 800x600 when it says none.
         "browser_source" | "ferrocast_web" => {
             let n = |k: &str, d: u32| s.get(k).and_then(Value::as_u64).filter(|v| *v > 0).map_or(d, |v| v as u32);
-            (SourceKind::Fed { width: n("width", 800), height: n("height", 600) }, true)
+            // OBS: a page's sound is in the mixer only with "Control audio via OBS" ticked
+            // (`reroute_audio`). A page without it is a picture: no mixer row, no silent meter.
+            let sound = s.get("reroute_audio").and_then(Value::as_bool) == Some(true);
+            (SourceKind::Fed { width: n("width", 800), height: n("height", 600) }, sound)
         }
         other => return Err(other.to_string()),
     })
@@ -2134,6 +2137,16 @@ mod tests {
         assert_eq!(desk.and_then(|d| d.sound.as_ref()).map(|s| s.volume), Some(0.5));
         assert!(got.sources.iter().any(|s| s.name == "Mic/Aux" && s.global));
         assert!(got.skipped.iter().any(|s| s.starts_with("One app")));
+    }
+
+    /// A web page's sound is in the mixer only with "Control audio" on (`reroute_audio`), as in
+    /// OBS: without it the page is a picture.
+    #[test]
+    fn a_web_page_has_sound_only_with_its_audio_controlled() {
+        let page = |settings: Value| json!({ "id": "browser_source", "settings": settings });
+        assert!(!source_has_sound(&page(json!({ "url": "http://x" })), (1920, 1080)));
+        assert!(!source_has_sound(&page(json!({ "reroute_audio": false })), (1920, 1080)));
+        assert!(source_has_sound(&page(json!({ "reroute_audio": true })), (1920, 1080)));
     }
 
     /// OBS's per-source push-to-talk and push-to-mute, with their release delays, come over: on
