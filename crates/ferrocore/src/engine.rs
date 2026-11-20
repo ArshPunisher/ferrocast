@@ -434,6 +434,11 @@ pub struct RecordState {
     pub bytes: u64,
     /// A split waits for its first frame (the next file isn't written to yet).
     pub splitting: bool,
+    /// A rebuilt video encoder needs the recording in a new file: call `split_output` (the
+    /// frames are held until then).
+    pub split_wanted: bool,
+    /// How many times a recording went on in a new file that way (said once each, as a notice).
+    pub auto_splits: u32,
 }
 
 /// One source's load on the engine (see [`Engine::source_load`]).
@@ -520,6 +525,8 @@ fn record_state(pipe: &Pipeline) -> RecordState {
         paused: pipe.paused() || pipe.recording_paused(),
         bytes: pipe.recorded_bytes(),
         splitting: pipe.splitting(),
+        split_wanted: pipe.split_wanted(),
+        auto_splits: pipe.auto_splits(),
     }
 }
 
