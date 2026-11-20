@@ -467,7 +467,23 @@ struct Source {
     /// change under the smoothing (70 ms) was smoothed away and did nothing.
     offset_ns: Option<i64>,
     drift: DriftTrack,
+    /// While a filter that holds sound back is priming (its first output is silence), the dry
+    /// sound it would have replaced (interleaved, from `start_ns`): played in its place, then
+    /// eased into the filter's output. `bypass_pure` frames are dry alone, the rest overlap the
+    /// filter's first sound; `bypass_done` counts frames played.
+    bypass: VecDeque<f32>,
+    bypass_pure: usize,
+    bypass_done: usize,
+    /// What the queue didn't have yet when the filter went on: the next frames pushed go to the
+    /// bypass (`bypass_owed`), then a few more go to both (`ease_owed`, the overlap to ease over).
+    bypass_owed: usize,
+    ease_owed: usize,
 }
+
+/// The longest filter delay a dry bypass covers (frames); the strong noise removal holds 3968.
+const MAX_BYPASS_FRAMES: usize = 8192;
+/// The ease from dry to the filter's own sound, in seconds.
+const BYPASS_EASE_S: f64 = 0.0045;
 
 /// Taps of each phase of the true-peak oversampler.
 const TP_TAPS: usize = 12;
@@ -717,6 +733,8 @@ struct Scratch {
     buf: Vec<f32>,
     fl: Vec<f32>,
     fr: Vec<f32>,
+    /// The dry bypass's block while a source's filter is priming (see `Source::bypass`).
+    bbuf: Vec<f32>,
 }
 
 /// How many given-back blocks are kept (the most a mix ahead of its reader needs, a second's).
@@ -857,6 +875,7 @@ impl Mixer {
                 buf: Vec::with_capacity(BLOCK * 2),
                 fl: Vec::with_capacity(BLOCK),
                 fr: Vec::with_capacity(BLOCK),
+                bbuf: Vec::with_capacity(BLOCK * 2),
             },
             mix_order: Vec::new(),
             key_bufs: Vec::new(),
@@ -1129,6 +1148,11 @@ impl Mixer {
                         adjust_ns: 0,
                         offset_ns: None,
                         drift: DriftTrack::default(),
+                        bypass: VecDeque::new(),
+                        bypass_pure: 0,
+                        bypass_done: 0,
+                        bypass_owed: 0,
+                        ease_owed: 0,
                     },
                 );
                 self.rebuild_mix_plan();
@@ -1167,6 +1191,9 @@ impl Mixer {
             }
             f
         });
+        if !missing.is_empty() {
+            self.reserve_bypass(id);
+        }
         (evicted, missing)
     }
 
@@ -1217,7 +1244,42 @@ impl Mixer {
         if !pure_in_place {
             s.filter_declick = true;
         }
-        let evicted: Vec<AudioFilter> = old.into_iter().filter_map(|(_, o)| o).collect();
+        let mut evicted: Vec<AudioFilter> = old.into_iter().filter_map(|(_, o)| o).collect();
+        // A filter that held sound back and is taken out: what it still held plays first. Its
+        // sound is filed that much later from now on, so without this the source goes quiet for
+        // the filter's delay (82.7 ms of silence, then a step) every time it is switched off.
+        // The held sound goes in front of what is queued, so the sound that comes next
+        // continues from it, nothing lost and nothing doubled.
+        let now_held = held(&s.filters);
+        if now_held == 0 {
+            s.bypass.clear();
+            s.bypass_pure = 0;
+            s.bypass_done = 0;
+            s.bypass_owed = 0;
+            s.ease_owed = 0;
+        }
+        if now_held < before && s.resampler.is_none() {
+            let mut latent = evicted.iter_mut().filter(|f| f.latency_frames() > 0);
+            if let (Some(f), None) = (latent.next(), latent.next()) {
+                let lost = before - now_held;
+                if f.latency_frames() == lost
+                    && let Some([mut l, mut r]) = f.take_tail()
+                {
+                    // Padded or cut to the delay: silence only for what it never had.
+                    for c in [&mut l, &mut r] {
+                        if c.len() < lost {
+                            c.splice(0..0, std::iter::repeat_n(0.0, lost - c.len()));
+                        }
+                        c.drain(..c.len() - lost);
+                    }
+                    for (a, b) in l.iter().zip(&r).rev() {
+                        s.queue.push_front(*b);
+                        s.queue.push_front(*a);
+                    }
+                    s.filter_declick = false;
+                }
+            }
+        }
         // A filter that holds the sound back (the strong noise removal) files the source's sound
         // that much earlier: the mixer waits that much longer at once, rather than finding the
         // sound late and cutting its start.
@@ -1225,8 +1287,47 @@ impl Mixer {
         // needs (its usual wait plus that), not the sum of them all.
         let now = held(&s.filters);
         self.raise_latency_for_filters(before, now);
+        if before == 0 && now > 0 {
+            self.reserve_bypass(id);
+            self.begin_bypass(id, now);
+        }
         self.rebuild_mix_plan();
         evicted
+    }
+
+    /// Makes room for a dry bypass on `id` (done when its filter is asked for, so that putting
+    /// the filter on later allocates nothing).
+    fn reserve_bypass(&mut self, id: u64) {
+        let ease = (BYPASS_EASE_S * f64::from(self.rate)).ceil() as usize;
+        if let Some(s) = self.sources.get_mut(&id) {
+            s.bypass.reserve((MAX_BYPASS_FRAMES + ease) * 2);
+        }
+    }
+
+    /// A filter that holds `lat` frames back went on a source that had none: its first `lat`
+    /// frames of output are silence, and its sound is filed that much earlier. The queue's first
+    /// `lat` frames are set aside as a dry bypass that plays meanwhile (and a little more of
+    /// it, to ease into the filter's sound), and the filter's input is what comes after them:
+    /// nothing cut, nothing skipped, no hole. Allocation-free once `reserve_bypass` has run.
+    fn begin_bypass(&mut self, id: u64, lat: usize) {
+        let ease = (BYPASS_EASE_S * f64::from(self.rate)).ceil() as usize;
+        let Some(s) = self.sources.get_mut(&id) else { return };
+        if lat == 0 || lat > MAX_BYPASS_FRAMES || s.resampler.is_some() || s.bypass.capacity() < (lat + ease) * 2 {
+            return;
+        }
+        let avail = s.queue.len() / 2;
+        let pure = lat.min(avail);
+        let take = (lat + ease).min(avail);
+        s.bypass.clear();
+        s.bypass.extend(s.queue.iter().take(take * 2).copied());
+        s.queue.drain(..pure * 2);
+        s.bypass_pure = lat;
+        s.bypass_done = 0;
+        // The rest comes with the next pushes (the mixer waits longer now, so it arrives
+        // before it is needed).
+        s.bypass_owed = lat - pure;
+        s.ease_owed = if s.bypass_owed > 0 { ease } else { ease - (take - pure) };
+        s.filter_declick = false;
     }
 
     fn raise_latency_for_filters(&mut self, before: usize, now: usize) {
@@ -1287,6 +1388,9 @@ impl Mixer {
         }
         let now = held(&s.filters);
         self.raise_latency_for_filters(before, now);
+        if before == 0 && now > 0 {
+            self.begin_bypass(id, now);
+        }
         out
     }
 
@@ -1399,6 +1503,38 @@ impl Mixer {
         if channels == 0 || rate == 0 || pcm.is_empty() {
             return;
         }
+        // A filter that holds sound back just went on and the queue didn't hold all of the dry
+        // sound it needs: the first frames pushed now are that sound (see `begin_bypass`).
+        let (pcm, ts_ns) = match self.sources.get_mut(&id) {
+            Some(src) if src.bypass_owed + src.ease_owed > 0 => {
+                if rate != out_rate || src.resampler.is_some() || src.drift.follows {
+                    src.bypass.clear();
+                    (src.bypass_owed, src.ease_owed) = (0, 0);
+                    (pcm, ts_ns)
+                } else {
+                    let frames = pcm.len() / channels;
+                    let mut put = |range: std::ops::Range<usize>| {
+                        for f in pcm[range.start * channels..range.end * channels].chunks_exact(channels) {
+                            src.bypass.push_back(f[0]);
+                            src.bypass.push_back(if channels > 1 { f[1] } else { f[0] });
+                        }
+                    };
+                    let k = src.bypass_owed.min(frames);
+                    put(0..k);
+                    src.bypass_owed -= k;
+                    if src.bypass_owed == 0 {
+                        let e = src.ease_owed.min(frames - k);
+                        put(k..k + e);
+                        src.ease_owed -= e;
+                    }
+                    if k == frames {
+                        return;
+                    }
+                    (&pcm[k * channels..], ts_ns + k as u64 * 1_000_000_000 / u64::from(rate))
+                }
+            }
+            _ => (pcm, ts_ns),
+        };
         // Its sync offset, less what its filters hold it back by (the strong noise removal
         // gives a voice back 40 ms late): filed that much earlier, it comes out on time.
         let Some(offset) = self.sources.get(&id).map(|s| {
@@ -1678,6 +1814,7 @@ impl Mixer {
         // The buffers one source's block is made in: kept between blocks.
         let mut buf = std::mem::take(&mut self.scratch.buf);
         let (mut fl, mut fr) = (std::mem::take(&mut self.scratch.fl), std::mem::take(&mut self.scratch.fr));
+        let mut bbuf = std::mem::take(&mut self.scratch.bbuf);
         // Talking, from the voices' last block (a block late: about 20 ms, nothing to hear).
         let duck = self.ducker.as_mut().map(|d| {
             let talking = d.cfg.voices.iter().any(|v| {
@@ -1708,12 +1845,18 @@ impl Mixer {
             let Some(src) = sources.get_mut(&id) else { continue };
             buf.clear();
             buf.resize(BLOCK * 2, 0.0);
+            // Where the dry bypass plays in this block: its first frame and how many.
+            let mut byp = (0usize, 0usize);
             if let Some(s0) = src.start_ns {
                 // Drop what's before this block; place what's in it.
                 if s0 < start {
                     let skip = frames_in(start - s0, rate).min(src.queue.len() / 2);
                     src.queue.drain(..skip * 2);
-                    src.start_ns = Some(s0 + skip as u64 * 1_000_000_000 / u64::from(rate));
+                    // The bypass starts where the queue does: it is late by the same.
+                    let late = frames_in(start - s0, rate).min(src.bypass.len() / 2);
+                    src.bypass.drain(..late * 2);
+                    src.bypass_done += late;
+                    src.start_ns = Some(s0 + skip.max(late) as u64 * 1_000_000_000 / u64::from(rate));
                 }
                 let s0 = src.start_ns.unwrap_or(start);
                 let offset = if s0 > start { frames_in(s0 - start, rate) } else { 0 };
@@ -1722,8 +1865,17 @@ impl Mixer {
                     for (i, v) in src.queue.drain(..n * 2).enumerate() {
                         buf[offset * 2 + i] = v;
                     }
-                    if n > 0 {
-                        src.start_ns = Some(start + ((offset + n) as u64) * 1_000_000_000 / u64::from(rate));
+                    let nb = (BLOCK - offset).min(src.bypass.len() / 2);
+                    if nb > 0 {
+                        bbuf.clear();
+                        bbuf.resize(BLOCK * 2, 0.0);
+                        for (i, v) in src.bypass.drain(..nb * 2).enumerate() {
+                            bbuf[offset * 2 + i] = v;
+                        }
+                        byp = (offset, nb);
+                    }
+                    if n.max(nb) > 0 {
+                        src.start_ns = Some(start + ((offset + n.max(nb)) as u64) * 1_000_000_000 / u64::from(rate));
                     }
                 }
             }
@@ -1765,6 +1917,30 @@ impl Mixer {
             // mix NaN, and Rust's clamp keeps NaN as NaN (OBS clears NaN the same way,
             // `clamp_audio_output`). Before the filters too, so one can't poison a filter's state.
             finite(&mut buf);
+            if byp.1 > 0 {
+                // The dry bypass goes through the same steps, so it joins the filter's sound at
+                // the level it is heard at.
+                for f in bbuf.as_chunks_mut::<2>().0 {
+                    if s.mono {
+                        let m = (f[0] + f[1]) * 0.5;
+                        f[0] = m;
+                        f[1] = m;
+                    }
+                    f[0] *= gl;
+                    f[1] *= gr;
+                }
+                if let Some((from, to)) = &duck
+                    && ducker.as_ref().is_some_and(|d| d.cfg.music.contains(&id))
+                    && (from - 1.0).abs().max((to - 1.0).abs()) > 1e-4
+                {
+                    for (i, f) in bbuf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                        let g = from + (to - from) * i as f32 / BLOCK as f32;
+                        f[0] *= g;
+                        f[1] *= g;
+                    }
+                }
+                finite(&mut bbuf);
+            }
             if !src.filters.is_empty() {
                 fl.clear();
                 fr.clear();
@@ -1793,6 +1969,31 @@ impl Mixer {
                     f[1] = fr[i];
                 }
                 finite(&mut buf);
+            }
+            if byp.1 > 0 {
+                // The filter's first output is silence: the dry sound plays in its place, then
+                // eases into the filter's own (sample-accurate, inside the block). The two are
+                // the same sound at the same moment, so the weights add to one (equal-power
+                // weights would swell a sound that is in both by up to 3 dB).
+                let ease = ((BYPASS_EASE_S * f64::from(rate)).ceil() as usize).max(1);
+                for i in 0..byp.1 {
+                    let k = src.bypass_done + i;
+                    let w = if k < src.bypass_pure {
+                        0.0
+                    } else {
+                        let j = (k - src.bypass_pure) as f32;
+                        (0.5 * (1.0 - (std::f32::consts::PI * (j + 0.5) / ease as f32).cos())).clamp(0.0, 1.0)
+                    };
+                    let at = (byp.0 + i) * 2;
+                    for c in 0..2 {
+                        buf[at + c] = bbuf[at + c] * (1.0 - w) + buf[at + c] * w;
+                    }
+                }
+                src.bypass_done += byp.1;
+                if src.bypass.is_empty() {
+                    src.bypass_pure = 0;
+                    src.bypass_done = 0;
+                }
             }
             // When a filter was added, removed, or reordered mid-stream (e.g. toggling the eye
             // icon in the UI), ease out the step discontinuity over 4 ms so it never pops.
@@ -1914,6 +2115,7 @@ impl Mixer {
             *v = clip(*v);
         }
         self.scratch.buf = buf;
+        self.scratch.bbuf = bbuf;
         self.scratch.fl = fl;
         self.scratch.fr = fr;
         Block { ts_ns: start, tracks, monitor }
@@ -2199,6 +2401,173 @@ mod tests {
         let breaks = tone.windows(2).filter(|w| (w[1] - w[0]).abs() > lim).count();
         assert!(tone.len() > rate as usize * 3, "{} frames out", tone.len());
         assert_eq!(breaks, 0, "breaks in the tone; latency now {} ms", m.latency_ns() / 1_000_000);
+    }
+
+    /// A filter that holds sound back by `n` frames (the strong noise removal: 3968 = 82.7 ms),
+    /// priming with silence as it does.
+    #[derive(Debug)]
+    struct LateBy(usize, [std::collections::VecDeque<f32>; 2]);
+    impl LateBy {
+        fn new(n: usize) -> Self {
+            Self(n, [std::iter::repeat_n(0.0, n).collect(), std::iter::repeat_n(0.0, n).collect()])
+        }
+    }
+    impl crate::afx::SoundPlugin for LateBy {
+        fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
+            for (c, q) in ch.into_iter().zip(self.1.iter_mut()) {
+                for v in c.iter_mut() {
+                    q.push_back(*v);
+                    *v = q.pop_front().unwrap_or(0.0);
+                }
+            }
+            true
+        }
+        fn latency_frames(&self) -> usize {
+            self.0
+        }
+        fn hand_over(&mut self) -> Option<[Vec<f32>; 2]> {
+            Some([self.1[0].drain(..).collect(), self.1[1].drain(..).collect()])
+        }
+    }
+
+    /// A 440 Hz tone mixed as it comes, a 3968-frame filter attached at 2 s and taken off at
+    /// 4 s (as toggling DeepFilterNet does): what came out.
+    fn toggled_tone(attach: bool, detach: bool) -> Vec<f32> {
+        let rate = 48_000u32;
+        let mut m = Mixer::new(rate, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let piece = 960usize;
+        let (mut made, mut out, mut now) = (0usize, Vec::new(), t0);
+        let (mut on, mut off) = (!attach, !detach);
+        if !attach {
+            if let Some(src) = m.sources.get_mut(&1) {
+                src.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::new(3968)), rate)];
+            }
+            m.raise_latency_for_filters(0, 3968);
+        }
+        while now < t0 + 7_000_000_000 {
+            now += 1_000_000_000 / 30;
+            if !on && now >= t0 + 2_000_000_000 {
+                on = true;
+                if let Some(s) = m.sources.get_mut(&1) {
+                    s.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::new(3968)), rate)];
+                    s.filter_declick = true;
+                }
+                m.raise_latency_for_filters(0, 3968);
+                m.reserve_bypass(1);
+                m.begin_bypass(1, 3968);
+            }
+            if !off && now >= t0 + 4_000_000_000 {
+                off = true;
+                m.set_effects(1, &[]);
+            }
+            loop {
+                let start_ns = t0 + made as u64 * 1_000_000_000 / u64::from(rate);
+                if start_ns + 20_000_000 + 10_000_000 > now {
+                    break;
+                }
+                let pcm: Vec<f32> = (made..made + piece)
+                    .flat_map(|i| {
+                        let v = (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                        [v, v]
+                    })
+                    .collect();
+                m.push(1, &pcm, 2, rate, start_ns);
+                made += piece;
+            }
+            for b in m.mix_until(now) {
+                out.extend(b.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+            }
+        }
+        out
+    }
+
+    /// Steps bigger than the tone's own, and holes (a run of silence), in what came out from
+    /// `from` (frames after the tone starts) for `len` frames.
+    fn glitches(out: &[f32], from: usize, len: usize) -> (Vec<usize>, Vec<usize>) {
+        let first = out.iter().position(|v| v.abs() > 0.01).unwrap_or(0);
+        let tone = &out[first + from..first + from + len];
+        let lim = 0.5 * std::f32::consts::TAU * 440.0 / 48_000.0 * 1.5;
+        let steps = tone.windows(2).enumerate().filter(|(_, w)| (w[1] - w[0]).abs() > lim).map(|(i, _)| i).collect();
+        let (mut holes, mut run) = (Vec::new(), 0);
+        for (i, v) in tone.iter().enumerate() {
+            run = if v.abs() < 1e-4 { run + 1 } else { 0 };
+            if run == 12 {
+                holes.push(i);
+            }
+        }
+        (steps, holes)
+    }
+
+    /// Taking a filter that holds sound back (DeepFilterNet, 3968 frames) out used to leave
+    /// 82.7 ms of silence and a step: the source is filed that much later at once. What the
+    /// filter still held plays first now, so the tone goes on whole.
+    #[test]
+    fn taking_a_latency_filter_off_leaves_the_tone_whole() {
+        let out = toggled_tone(false, true);
+        // The filter is on from the start, off at 4 s: look from 1 s to 6 s.
+        let (steps, holes) = glitches(&out, 48_000, 5 * 48_000);
+        assert!(steps.is_empty() && holes.is_empty(), "steps at {steps:?}, holes at {holes:?}");
+    }
+
+    /// Putting such a filter on used to leave a hole and a step: the source is filed 82.7 ms
+    /// earlier at once (the queued sound was cut) and the filter's first 82.7 ms of output is
+    /// silence. The first 3968 frames of the queue now play dry in place of that silence while
+    /// the filter's input starts after them, eased into its sound.
+    #[test]
+    fn putting_a_latency_filter_on_leaves_the_tone_whole() {
+        let out = toggled_tone(true, false);
+        let (steps, holes) = glitches(&out, 48_000, 5 * 48_000);
+        assert!(steps.is_empty() && holes.is_empty(), "steps at {steps:?}, holes at {holes:?}");
+    }
+
+    /// After a filter that holds sound back goes on mid-stream, a click still comes out at its
+    /// own moment (the sync offset ends where it was before), and the sound before and after is
+    /// whole.
+    #[test]
+    fn a_click_after_a_latency_filter_goes_on_is_on_time() {
+        let rate = 48_000u32;
+        let mut m = Mixer::new(rate, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let click_at = t0 + 4_000_000_000;
+        let piece = 960usize;
+        let (mut made, mut now, mut heard) = (0usize, t0, None);
+        let mut on = false;
+        while now < t0 + 6_000_000_000 {
+            now += 1_000_000_000 / 30;
+            if !on && now >= t0 + 2_000_000_000 {
+                on = true;
+                if let Some(s) = m.sources.get_mut(&1) {
+                    s.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::new(3968)), rate)];
+                }
+                m.raise_latency_for_filters(0, 3968);
+                m.reserve_bypass(1);
+                m.begin_bypass(1, 3968);
+            }
+            loop {
+                let start_ns = t0 + made as u64 * 1_000_000_000 / u64::from(rate);
+                if start_ns + 30_000_000 > now {
+                    break;
+                }
+                let mut pcm = vec![0f32; piece * 2];
+                let click = (click_at.saturating_sub(start_ns)) * u64::from(rate) / 1_000_000_000;
+                if click_at >= start_ns && (click as usize) < piece {
+                    pcm[click as usize * 2] = 1.0;
+                    pcm[click as usize * 2 + 1] = 1.0;
+                }
+                m.push(1, &pcm, 2, rate, start_ns);
+                made += piece;
+            }
+            for b in m.mix_until(now) {
+                if let Some(i) = b.tracks[0].as_chunks::<2>().0.iter().position(|f| f[0] > 0.5) {
+                    heard = Some(b.ts_ns + i as u64 * 1_000_000_000 / u64::from(rate));
+                }
+            }
+        }
+        let heard = heard.unwrap_or_else(|| panic!("the click came out"));
+        assert!(heard.abs_diff(click_at) < 100_000, "the click {} µs off", (heard as i64 - click_at as i64) / 1000);
     }
 
     /// A 440 Hz tone in 20 ms pieces, each arriving when `arrives(start, end)` (ns) says, mixed
