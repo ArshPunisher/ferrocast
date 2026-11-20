@@ -497,7 +497,7 @@ async fn a_hang_up_at_the_publish_after_the_stream_was_live_is_not_a_refused_key
     let w = world().await;
     let l = free_listener().await;
     let dport = l.local_addr().unwrap().port();
-    let mut got = flaky_platform(l, "k", Duration::from_millis(1_200), 4).await;
+    let mut got = flaky_platform(l, "k", Duration::from_millis(300), 4).await;
     let mut d = destination(dport, "k");
     d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 6 };
     let health = start(&w, d);
@@ -640,7 +640,7 @@ async fn a_destination_that_gave_up_probes_once_per_wait_and_stays_failed() {
     push::fault::set_no_name(dport, false);
 }
 
-/// A destination that takes the stream and closes it at once (Kick without multistreaming, 40 ms) has
+/// Kick taking the stream and closing it at once (no multistreaming, 40 ms) has
 /// not shown that it works: the next refusal to connect is an ordinary failure, not a ten-minute wait.
 #[tokio::test]
 async fn a_stream_taken_and_closed_at_once_does_not_earn_the_long_wait() {
@@ -649,6 +649,7 @@ async fn a_stream_taken_and_closed_at_once_does_not_earn_the_long_wait() {
     let dport = l.local_addr().unwrap().port();
     let got = platform_that_drops(l, "k", Duration::from_millis(40)).await;
     let mut d = destination(dport, "k");
+    d.id = "kick".into();
     d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
     let mut health = start(&w, d);
     let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();

@@ -314,9 +314,10 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         Some(t) => (true, u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)),
                         None => (false, 0),
                     };
-                    // Live long enough to have really taken the stream: Kick taking it and closing it
-                    // 40 ms later (no multistream) doesn't prove the key or the address works.
-                    ever_live |= was_live && live_for_ms >= EVER_LIVE_AFTER_MS;
+                    // Kick taking the stream and closing it at once (no multistream) doesn't prove the
+                    // key or the address works; any other session that was live does, however short
+                    // (a drop half a second in, then a reconnect, is still a server that took the key).
+                    ever_live |= was_live && !(live_for_ms < STAYED_LIVE_MS && is_kick(&dest));
                     // A hang-up at the publish: a wrong key before the key ever worked in this
                     // stream (what it was always taken for), a server dropping the connection after.
                     let err = match err {
@@ -506,9 +507,6 @@ pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
 const SLOW_RETRY: [Duration; 3] = [Duration::from_secs(60), Duration::from_secs(120), Duration::from_secs(300)];
 #[cfg(test)]
 const SLOW_RETRY: [Duration; 3] = [Duration::from_millis(150), Duration::from_millis(300), Duration::from_millis(600)];
-
-/// A session live this long (ms) counts as the destination having worked in this stream.
-const EVER_LIVE_AFTER_MS: u64 = 1_000;
 
 /// How long a session stays live before its failure starts the retry count over.
 pub(crate) const STAYED_LIVE_MS: u64 = 30_000;
