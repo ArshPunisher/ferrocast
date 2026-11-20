@@ -1217,12 +1217,7 @@ type Sender = (
 
 fn sender(send_to: Option<Send<'_>>, target: Option<Target>, hub: &Arc<Hub>) -> Result<Sender, String> {
     let (Some(d), Some(target)) = (send_to, target) else { return Ok((None, None, None)) };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .thread_name("ferrocast-own-stream")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let rt = push::sender_runtime("ferrocast-own-stream").map_err(|e| e.to_string())?;
     let retry = match d.reconnect {
         Some((retries, every)) => Retry {
             first: Duration::from_secs(u64::from(every.max(1))),

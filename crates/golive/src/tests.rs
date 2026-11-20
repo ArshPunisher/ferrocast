@@ -640,6 +640,55 @@ async fn a_destination_that_gave_up_probes_once_per_wait_and_stays_failed() {
     push::fault::set_no_name(dport, false);
 }
 
+/// How many of the frames sent while one worker of a sender runtime is blocked (a call that never
+/// yields, for 2 s) reach the platform.
+fn frames_through_while_a_worker_is_blocked(workers: usize) -> (u32, u32) {
+    let rt = push::sender_runtime_with("test-sender", workers).unwrap();
+    let (_w, mut got, mut obs) = rt.block_on(async {
+        let w = world().await;
+        let l = free_listener().await;
+        let port = l.local_addr().unwrap().port();
+        let got = platform(l, "k").await;
+        let mut health = start(&w, destination(port, "k"));
+        let obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+        state_is(&mut health, |s| *s == PushState::Live).await;
+        (w, got, obs)
+    });
+    // A worker is parked for two seconds by a call that never yields (spawned from outside, so it
+    // takes a worker as a stuck call inside the sender would).
+    rt.spawn(async { std::thread::sleep(Duration::from_secs(2)) });
+    std::thread::sleep(Duration::from_millis(200));
+    rt.block_on(async {
+        let mut sent = 0u32;
+        let mut videos = 0u32;
+        let until = tokio::time::Instant::now() + Duration::from_millis(1_500);
+        while tokio::time::Instant::now() < until {
+            obs.video(10 + sent, KEY).await;
+            sent += 1;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // What reached the platform meanwhile (a stalled worker delivers it late, which is too late).
+            while let Ok(g) = got.try_recv() {
+                if matches!(g, Got::Video(..)) {
+                    videos += 1;
+                }
+            }
+        }
+        (videos, sent)
+    })
+}
+
+/// Something blocking on the sender's runtime (never found for sure, but with a single worker any
+/// slow system call or lock held for long stops everything the Studio's own sender does, and its
+/// timers, with nothing logged: the S42 stall's signature) must not stop the stream going out.
+#[test]
+fn a_blocking_call_on_the_senders_runtime_does_not_stop_the_stream() {
+    let (one, sent) = frames_through_while_a_worker_is_blocked(1);
+    // The injected call does stop a single worker (the control: the test can see the problem).
+    assert!(one < 3 && sent < 10, "one worker: {one} of {sent} got through, it should have stalled");
+    let (two, sent) = frames_through_while_a_worker_is_blocked(push::sender_runtime_workers());
+    assert!(sent >= 20 && two + 3 >= sent, "{two} of {sent} frames got through while a worker was blocked");
+}
+
 /// Kick taking the stream and closing it at once (no multistreaming, 40 ms) has
 /// not shown that it works: the next refusal to connect is an ordinary failure, not a ten-minute wait.
 #[tokio::test]
