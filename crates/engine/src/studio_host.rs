@@ -826,7 +826,8 @@ pub struct StudioSettings {
     pub record_folder_default: String,
     /// "mp4" or "mov" (both crash-safe).
     pub record_format: String,
-    /// "stream" (same as the stream), "high" (near-lossless, the default), "lossless".
+    /// "stream" (same as the stream), "high" (near-lossless, the default), "balanced" (about half
+    /// its size), "lossless", "custom".
     pub record_quality: String,
     pub reconnect: bool,
     pub reconnect_every_s: u32,
@@ -1064,8 +1065,8 @@ impl StudioSettings {
         if !RECORD_FORMATS.contains(&self.record_format.as_str()) {
             return bad("record_format: mp4, mov, fmp4, fmov, mkv, flv, ts or hls.");
         }
-        if !["stream", "high", "lossless", "custom"].contains(&self.record_quality.as_str()) {
-            return bad("record_quality: stream, high, lossless or custom.");
+        if !["stream", "high", "balanced", "lossless", "custom"].contains(&self.record_quality.as_str()) {
+            return bad("record_quality: stream, high, balanced, lossless or custom.");
         }
         for (field, id) in [("video_encoder", &self.video_encoder), ("record_encoder", &self.record_encoder)] {
             if let Some(id) = id

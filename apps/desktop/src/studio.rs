@@ -562,6 +562,8 @@ fn record_encode(s: &StudioSettings) -> EncodeSettings {
     let mut e = encode_of(s);
     match s.record_quality.as_str() {
         "high" => e.quality = Some(16),
+        // In between: libobs's 22 (x264 CRF 22; the Mac's matching 0-1 quality), about half of High's size.
+        "balanced" => e.quality = Some(22),
         "lossless" => {
             e.video_encoder = "obs_x264".into();
             e.quality = Some(0);
@@ -4072,6 +4074,17 @@ fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+
+    /// Balanced recording sits between High (16) and the stream: libobs's quality 22, which is
+    /// x264's CRF 22 and the Mac's matching 0-1 quality.
+    #[test]
+    fn the_balanced_recording_tier_is_a_constant_quality_of_22() {
+        let s = StudioSettings { record_quality: "balanced".into(), ..StudioSettings::default() };
+        assert_eq!(record_encode(&s).quality, Some(22));
+        let high = StudioSettings { record_quality: "high".into(), ..StudioSettings::default() };
+        assert_eq!(record_encode(&high).quality, Some(16));
+        assert!(StudioSettings { record_quality: "balanced".into(), ..StudioSettings::default() }.check().is_ok());
+    }
 
     #[test]
     fn reads_the_end_of_the_log_without_colour_codes() {
