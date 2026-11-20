@@ -636,6 +636,30 @@ struct Delayed {
     /// Said once: the cap was reached.
     capped: bool,
     gate: Arc<DrainGate>,
+    begin: Arc<Begin>,
+}
+
+/// What starts a delayed stream on its hub (`Hub::start`, then its metadata) when its first packet is
+/// let go, not when the stream begins: until then nothing is live, so the sender to Go live's local
+/// server, and the platforms behind it, don't connect and sit idle for the whole delay (a server
+/// hangs up on a publisher that sends nothing: mediamtx after 10 s, and the local server after 25;
+/// every destination reconnected over and over, and auto quality saw it as a struggling upload).
+#[derive(Default)]
+struct Begin(Mutex<Option<Starter>>);
+
+type Starter = Box<dyn FnOnce(&Hub) + std::marker::Send>;
+
+impl Begin {
+    fn set(&self, f: impl FnOnce(&Hub) + std::marker::Send + 'static) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(f));
+    }
+
+    fn run(&self, hub: &Hub) {
+        let f = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(f) = f {
+            f(hub);
+        }
+    }
 }
 
 /// A stream's delayed tail being sent after it ended: lets the stream's owner wait for it, and
@@ -740,7 +764,7 @@ fn tag_len(t: &Tag) -> usize {
 }
 
 impl Delayed {
-    fn new(hub: Arc<Hub>, counts: Arc<Counts>, delay: Duration, gate: Arc<DrainGate>) -> Self {
+    fn new(hub: Arc<Hub>, counts: Arc<Counts>, delay: Duration, gate: Arc<DrainGate>, begin: Arc<Begin>) -> Self {
         Self {
             hub,
             counts,
@@ -750,19 +774,20 @@ impl Delayed {
             cap: DELAY_CAP_MB.load(Ordering::Relaxed) as usize * 1024 * 1024,
             capped: false,
             gate,
+            begin,
         }
     }
 
     fn send(&mut self, t: Tag) {
         if self.delay.is_zero() {
-            return pass(&self.hub, &self.counts, t);
+            return pass(&self.hub, &self.counts, &self.begin, t);
         }
         self.held_bytes += tag_len(&t);
         self.held.push_back((std::time::Instant::now(), t));
         while self.held.front().is_some_and(|(at, _)| at.elapsed() >= self.delay) {
             if let Some((_, t)) = self.held.pop_front() {
                 self.held_bytes -= tag_len(&t);
-                pass(&self.hub, &self.counts, t);
+                pass(&self.hub, &self.counts, &self.begin, t);
             }
         }
         self.keep_under_cap();
@@ -800,7 +825,8 @@ impl Delayed {
     }
 }
 
-fn pass(hub: &Hub, counts: &Counts, t: Tag) {
+fn pass(hub: &Hub, counts: &Counts, begin: &Begin, t: Tag) {
+    begin.run(hub);
     match t {
         Tag::Video { ms, body } => {
             counts.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
@@ -821,6 +847,7 @@ impl Drop for Delayed {
         // The tail goes on at its own pace (each tag when it is `delay` old), on a thread of its
         // own; the stream's owner waits for it (`gate`) before it ends the hub.
         let (hub, counts, delay, gate) = (self.hub.clone(), self.counts.clone(), self.delay, self.gate.clone());
+        let begin = self.begin.clone();
         let held = std::mem::take(&mut self.held);
         *gate.ends_at.lock().unwrap_or_else(|p| p.into_inner()) = held.back().map(|(at, _)| *at + delay);
         gate.left_bytes.store(self.held_bytes as u64, Ordering::Relaxed);
@@ -839,7 +866,7 @@ impl Drop for Delayed {
                         break;
                     }
                     let n = tag_len(&t) as u64;
-                    pass(&hub, &counts, t);
+                    pass(&hub, &counts, &begin, t);
                     // (This thread is the only writer.)
                     gate.left_bytes.store(gate.left_bytes.load(Ordering::Relaxed).saturating_sub(n), Ordering::Relaxed);
                 }
@@ -963,15 +990,25 @@ impl OwnStream {
         let drain = Arc::new(DrainGate::default());
         let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
-        hub.start();
+        let begin = Arc::new(Begin::default());
+        // A delayed stream is live on its hub only once its first packet is let go.
+        let deferred = streaming && delay_s > 0;
+        if !deferred {
+            hub.start();
+        }
         let kind = match (record, replay) {
             (_, Some((seconds, mb))) => OutputKind::Replay { seconds, mb },
             (Some(p), None) => OutputKind::Record(p.to_path_buf()),
             (None, None) => {
                 // A new stream ends the tail of the last one.
                 discard_delay();
-                let mut out =
-                    Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(u64::from(delay_s)), drain.clone());
+                let mut out = Delayed::new(
+                    hub.clone(),
+                    counts.clone(),
+                    Duration::from_secs(u64::from(delay_s)),
+                    drain.clone(),
+                    begin.clone(),
+                );
                 OutputKind::Stream(Box::new(move |t: Tag| out.send(t)))
             }
         };
@@ -1014,7 +1051,15 @@ impl OwnStream {
             out.video_tracks = video_tracks.to_vec();
         }
         if streaming {
-            hub.metadata(metadata_of(&video, &audio, out.width, out.height, fps_f32(config.fps, config.ntsc)));
+            let meta = metadata_of(&video, &audio, out.width, out.height, fps_f32(config.fps, config.ntsc));
+            if deferred {
+                begin.set(move |hub| {
+                    hub.start();
+                    hub.metadata(meta);
+                });
+            } else {
+                hub.metadata(meta);
+            }
         }
         let output = match engine.start_output_with(kind, out, video, audio) {
             Ok(id) => id,
@@ -1116,10 +1161,21 @@ impl OwnStream {
         let drain = Arc::new(DrainGate::default());
         let (runtime, health, stop_push) = sender(Some(send_to), Some(target), &hub).map_err(fail)?;
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
-        hub.start();
-        hub.metadata(metadata_of(&video, &audio, config.width, config.height, fps_f32(config.fps, config.ntsc)));
+        let meta = metadata_of(&video, &audio, config.width, config.height, fps_f32(config.fps, config.ntsc));
+        let begin = Arc::new(Begin::default());
+        if delay_s > 0 {
+            // Live on its hub once the first packet is let go (see `Begin`).
+            begin.set(move |hub| {
+                hub.start();
+                hub.metadata(meta);
+            });
+        } else {
+            hub.start();
+            hub.metadata(meta);
+        }
         discard_delay();
-        let mut out = Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(u64::from(delay_s)), drain.clone());
+        let mut out =
+            Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(u64::from(delay_s)), drain.clone(), begin);
         if let Err(err) = d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))) {
             // The push started above ends with it (projects-60).
             hub.end();
@@ -1707,8 +1763,13 @@ mod tests {
 
     fn delayed(delay_ms: u64) -> (Delayed, Arc<Counts>) {
         let counts = Arc::new(Counts::default());
-        let out =
-            Delayed::new(Hub::new(), counts.clone(), Duration::from_millis(delay_ms), Arc::new(DrainGate::default()));
+        let out = Delayed::new(
+            Hub::new(),
+            counts.clone(),
+            Duration::from_millis(delay_ms),
+            Arc::new(DrainGate::default()),
+            Arc::new(Begin::default()),
+        );
         (out, counts)
     }
 
@@ -1738,6 +1799,30 @@ mod tests {
         assert_eq!(sent(), 10, "the first when it is 300 ms old");
         gate.wait_done();
         assert_eq!(sent(), 22, "all of it, after the delay");
+    }
+
+    /// A delayed stream is not live on its hub (so nothing connects to a platform, and nothing idles
+    /// there) until its first packet is let go: it began live at once, the platforms' connections sat
+    /// silent for the whole delay and servers hung up on them.
+    #[test]
+    fn a_delayed_stream_goes_live_on_its_hub_when_its_first_packet_is_let_go() {
+        let (mut out, _) = delayed(300);
+        let hub = out.hub.clone();
+        out.begin.set(|hub| hub.start());
+        out.send(video(0, true, 10));
+        assert!(!hub.live().borrow().on, "nothing is live while everything is held");
+        std::thread::sleep(Duration::from_millis(350));
+        out.send(video(350, false, 10));
+        assert!(hub.live().borrow().on, "live when the first is let go");
+        // Stopped while still holding: the tail goes out as a stream of its own, started by its first.
+        let (mut out, _) = delayed(200);
+        let (hub, gate) = (out.hub.clone(), out.gate.clone());
+        out.begin.set(|hub| hub.start());
+        out.send(video(0, true, 10));
+        drop(out);
+        assert!(!hub.live().borrow().on);
+        gate.wait_done();
+        assert!(hub.live().borrow().on, "the tail started it");
     }
 
     #[test]
