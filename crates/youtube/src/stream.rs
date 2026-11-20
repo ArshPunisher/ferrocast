@@ -248,7 +248,12 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                         return End::SignInNeeded;
                     }
                     match api.refresh_after_401(&token).await {
-                        Ok(_) => continue,
+                        // A moment before asking again: Google's edge can take a beat to accept a
+                        // token it just issued, and three tries in a few ms would end the chat.
+                        Ok(_) => {
+                            tokio::time::sleep(Duration::from_millis(600 * u64::from(refused))).await;
+                            continue;
+                        }
                         Err(YoutubeError::SignInNeeded) => return End::SignInNeeded,
                         Err(e) => return End::Lost(e.to_string()),
                     }
