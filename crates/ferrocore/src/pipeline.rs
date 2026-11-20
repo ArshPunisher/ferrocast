@@ -49,6 +49,9 @@ pub struct Pipeline {
     extra: Vec<(AudioEncoder, Option<i64>)>,
     /// Paused since this time (ns): nothing is encoded until it resumes.
     paused_at: Option<u64>,
+    /// Tests: every video frame fails, as a faulting encoder's would.
+    #[cfg(test)]
+    fail_video: bool,
     /// Time spent paused so far, taken off every later frame's time (no gap in the file).
     paused_ns: u64,
     /// The next frame is made a keyframe (after a pause, or to start a split file on).
@@ -56,6 +59,13 @@ pub struct Pipeline {
     /// A new file to go on in at the next keyframe ("Split recording").
     /// Its path too: removed when nothing was written to it (stopped before its keyframe).
     split_to: Option<(File, Kind, std::path::PathBuf)>,
+    /// The video encoder was rebuilt with other parameter sets: the file goes on in a new part
+    /// from the rebuilt session's first keyframe (one avcC per file). Its frames wait in
+    /// `split_held` until the caller names the file (`split`).
+    split_wanted: bool,
+    split_held: VecDeque<VideoPacket>,
+    /// How many times a recording went on in a new file for that reason.
+    auto_splits: u32,
     /// The replay buffer's memory, when this output is one.
     replay: Option<Replay>,
     /// A stream sends the extra tracks too (Enhanced RTMP multitrack audio).
@@ -402,9 +412,14 @@ impl Pipeline {
             recording,
             extra: (0..extra).map(|_| AudioEncoder::new(audio).map(|e| (e, None))).collect::<Result<_, _>>()?,
             paused_at: None,
+            #[cfg(test)]
+            fail_video: false,
             paused_ns: 0,
             key_next: false,
             split_to: None,
+            split_wanted: false,
+            split_held: VecDeque::new(),
+            auto_splits: 0,
             replay: None,
             stream_extra: false,
             sent_extra_headers: Vec::new(),
@@ -612,6 +627,18 @@ impl Pipeline {
         Ok(())
     }
 
+    /// A rebuilt video encoder needs the recording in a new file, and is waiting to be told where
+    /// (`split`). Its frames are held meanwhile.
+    pub fn split_wanted(&self) -> bool {
+        self.split_wanted
+    }
+
+    /// Recordings that went on in a new file because the encoder was rebuilt with other
+    /// parameter sets.
+    pub fn auto_splits(&self) -> u32 {
+        self.auto_splits
+    }
+
     /// Whether a split waits for its keyframe (the next file isn't written to yet).
     pub fn splitting(&self) -> bool {
         self.split_to.is_some()
@@ -655,12 +682,31 @@ impl Pipeline {
         if self.paused_at.is_some() {
             return Ok(Vec::new());
         }
+        #[cfg(test)]
+        if self.fail_video {
+            return Err(AvError::Source("an injected encoder fault".into()));
+        }
         let start = *self.start_ns.get_or_insert(ts_ns);
         let first = !self.sent_video_header && self.video.header().is_none();
         let key = first || std::mem::take(&mut self.key_next);
         let pts = (ts_ns.saturating_sub(start).saturating_sub(self.paused_ns) / 1000) as i64;
         self.last_in_us = pts;
         let packets = self.video.encode(frame, pts, key)?;
+        // A hardware session the system took back and we rebuilt: if its parameter sets differ,
+        // the stream sends a new sequence header before its keyframe, as when a new picture
+        // takes over (`set_video`). A file can't change its codec config: a recording goes on in a new
+        // file from the new session's keyframe (`split_wanted`).
+        if self.video.header_changed() {
+            if matches!(self.recording, Some(Recording::On(_) | Recording::Waiting { .. })) {
+                tracing::warn!(
+                    "the video encoder was rebuilt with other parameter sets; the recording goes on in a new file"
+                );
+                self.split_wanted = true;
+            } else if self.recording.is_some() || self.replay.is_some() {
+                tracing::warn!("the video encoder was rebuilt with other parameter sets; the file keeps the first");
+            }
+            self.sent_video_header = false;
+        }
         self.video_out(packets)
     }
 
@@ -695,6 +741,11 @@ impl Pipeline {
         let (enc, sent) = &mut self.video_tracks[i];
         let first = !*sent && enc.header().is_none();
         let packets = enc.encode(frame, pts, first)?;
+        // A rebuilt hardware session with other parameter sets: this quality's new sequence
+        // header goes out before its keyframe, as the main track's does.
+        if enc.header_changed() {
+            *sent = false;
+        }
         Ok(Self::track_tags(i, enc, sent, packets))
     }
 
@@ -961,6 +1012,27 @@ impl Pipeline {
     }
 
     fn write_video(&mut self, p: &VideoPacket) {
+        if self.split_wanted {
+            if self.split_to.is_none() {
+                // Held for the new file (a few seconds at most): the old one ends at the last
+                // frame the lost session made.
+                if self.split_held.len() < SPLIT_HELD_MAX {
+                    self.split_held.push_back(p.clone());
+                    return;
+                }
+                tracing::warn!("no new file came for the rebuilt encoder; the recording goes on in this one");
+                self.split_wanted = false;
+                for h in std::mem::take(&mut self.split_held) {
+                    self.write_video(&h);
+                }
+            } else {
+                self.split_wanted = false;
+                self.auto_splits += 1;
+                for h in std::mem::take(&mut self.split_held) {
+                    self.write_video(&h);
+                }
+            }
+        }
         // The recording alone paused: frames in a cut aren't written, later ones move back.
         let shifted;
         let p = if self.rec_cuts.is_empty() {
@@ -1078,6 +1150,9 @@ enum CutStep {
     End,
 }
 
+/// The most video packets held while a recording waits to be told its next file.
+const SPLIT_HELD_MAX: usize = 600;
+
 fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64) -> CutStep {
     match resume {
         _ if pts < from => CutStep::Write,
@@ -1087,6 +1162,12 @@ fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64) -> CutStep {
 }
 
 impl Pipeline {
+    /// Tests: this output's encoder faults on every frame from now on.
+    #[cfg(test)]
+    pub(crate) fn fail_video_for_test(&mut self) {
+        self.fail_video = true;
+    }
+
     /// Records into `file` (tests: a file that fails when it is told to).
     #[cfg(test)]
     fn record_into(&mut self, file: File) {
@@ -1366,5 +1447,201 @@ mod cut_tests {
         }
         assert_eq!(held.len(), super::MAX_HELD_AUDIO);
         assert_eq!(held.back().unwrap().1.pts_us, 9_999 * 21_333);
+    }
+}
+
+/// A hardware session lost and rebuilt (agy GAPS #4): viewers' decoders hold the first SPS/PPS,
+/// so a different pair needs a new sequence header before the keyframe; the same needs none.
+#[cfg(all(test, target_os = "macos"))]
+mod rebuild_tests {
+    use super::*;
+    use crate::video::{PixelFormat, RateControl, VideoCodec};
+
+    fn sequence_headers(tags: &[Tag]) -> usize {
+        tags.iter().filter(|t| matches!(t, Tag::Video { body, .. } if body[0] & 0x0f == 7 && body[1] == 0)).count()
+    }
+
+    fn run(differ: bool) -> Option<(usize, Vec<Tag>)> {
+        let video = VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1500,
+            rate: RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+        };
+        let mut pipe =
+            Pipeline::new(video, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None).ok()?;
+        let (y, uv) = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        let frame = || Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 };
+        let mut tags = Vec::new();
+        for i in 0..10u64 {
+            tags.extend(pipe.video(frame(), i * 33_333_333).ok()?);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let before = sequence_headers(&tags);
+        pipe.video.lose_session_for_test(differ);
+        for i in 10..60u64 {
+            tags.extend(pipe.video(frame(), i * 33_333_333).ok()?);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Some((before, tags))
+    }
+
+    #[test]
+    fn a_rebuilt_session_with_other_parameter_sets_sends_a_new_sequence_header_first() {
+        let Some((before, tags)) = run(true) else { return };
+        assert_eq!(before, 1, "the first header went out at the start");
+        assert_eq!(sequence_headers(&tags), 2, "a new one for the rebuilt session");
+        // It comes before the keyframe that follows the rebuild.
+        let at = tags
+            .iter()
+            .rposition(|t| matches!(t, Tag::Video { body, .. } if body[0] & 0x0f == 7 && body[1] == 0))
+            .unwrap_or(0);
+        assert!(
+            matches!(tags.get(at + 1), Some(Tag::Video { body, .. }) if body[0] >> 4 == 1 && body[1] == 1),
+            "a keyframe follows the new header"
+        );
+    }
+
+    fn have(tool: &str) -> bool {
+        std::process::Command::new(tool).arg("-version").output().is_ok_and(|o| o.status.success())
+    }
+
+    /// Records `frames` frames, losing the hardware session half way; the "studio tick" names the
+    /// next file when the pipeline asks. Returns the files made.
+    fn record(differ: bool) -> Option<(Vec<std::path::PathBuf>, u32)> {
+        let video = VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1500,
+            rate: RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+        };
+        let dir = std::env::temp_dir().join(format!("ferrocore-rebuild-{}-{differ}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let (one, two) = (dir.join("part1.mp4"), dir.join("part2.mp4"));
+        let mut pipe =
+            Pipeline::new(video, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, Some(&one))
+                .ok()?;
+        let (y, uv) = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        let pcm = vec![0.0f32; 1600 * 2];
+        for i in 0..90u64 {
+            let ts = i * 33_333_333;
+            pipe.video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts).ok()?;
+            pipe.audio(&pcm, ts).ok()?;
+            if i == 40 {
+                pipe.video.lose_session_for_test(differ);
+            }
+            // The studio's tick: a new file when the pipeline asks for one.
+            if pipe.split_wanted() && !pipe.splitting() {
+                pipe.split(&two).ok()?;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        let splits = pipe.auto_splits();
+        pipe.finish().ok()?;
+        let mut files = vec![one];
+        if two.exists() && std::fs::metadata(&two).map_or(0, |m| m.len()) > 0 {
+            files.push(two);
+        }
+        Some((files, splits))
+    }
+
+    /// Each file plays on its own: it decodes without an error, and its first video packet is a
+    /// keyframe (one avcC per file, so a different parameter set means a different file).
+    fn plays_alone(f: &std::path::Path) -> bool {
+        let dec =
+            std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(f).args(["-f", "null", "-"]).output();
+        let first = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=flags", "-of", "csv=p=0"])
+            .arg(f)
+            .output();
+        let (Ok(dec), Ok(first)) = (dec, first) else { return false };
+        let flags = String::from_utf8_lossy(&first.stdout);
+        dec.stderr.is_empty() && flags.lines().next().is_some_and(|l| l.contains('K'))
+    }
+
+    #[test]
+    fn a_recording_goes_on_in_a_new_file_when_the_parameter_sets_change() {
+        if !have("ffmpeg") || !have("ffprobe") {
+            return;
+        }
+        let Some((files, splits)) = record(true) else { return };
+        assert_eq!((files.len(), splits), (2, 1), "{files:?}");
+        for f in &files {
+            assert!(plays_alone(f), "{f:?} must decode on its own and start on a keyframe");
+        }
+    }
+
+    #[test]
+    fn a_recording_stays_one_file_when_the_parameter_sets_are_the_same() {
+        if !have("ffmpeg") || !have("ffprobe") {
+            return;
+        }
+        let Some((files, splits)) = record(false) else { return };
+        assert_eq!((files.len(), splits), (1, 0), "{files:?}");
+        assert!(plays_alone(&files[0]));
+    }
+
+    /// A quality of Twitch's Enhanced Broadcasting is its own hardware session: when it is
+    /// rebuilt with other parameter sets its new header goes out before its keyframe.
+    #[test]
+    fn an_extra_quality_rebuilt_with_other_parameter_sets_sends_its_own_new_header() {
+        let video = VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1500,
+            rate: RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+        };
+        let Ok(mut pipe) =
+            Pipeline::new(video, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None)
+        else {
+            return;
+        };
+        if pipe.add_video_tracks(&[VideoConfig { width: 160, height: 90, bitrate_kbps: 500, ..video }]) != 1 {
+            return;
+        }
+        let (y, uv) = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        let (y2, uv2) = (vec![90u8; 160 * 90], vec![128u8; 160 * 45]);
+        let mut tags = Vec::new();
+        for i in 0..60u64 {
+            let ts = i * 33_333_333;
+            pipe.video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts).ok();
+            if let Ok(t) = pipe.video_track(0, Frame::Nv12 { y: &y2, y_stride: 160, uv: &uv2, uv_stride: 160 }, ts) {
+                tags.extend(t);
+            }
+            if i == 20 {
+                pipe.video_tracks[0].0.lose_session_for_test(true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        // A multitrack sequence header: packet type 6 (multitrack) in the first byte, 0 after it.
+        let headers = tags
+            .iter()
+            .filter(|t| matches!(t, Tag::Video { body, .. } if body.len() > 1 && body[0] & 0x0f == 6 && body[1] == 0))
+            .count();
+        assert_eq!(headers, 2, "the quality's first header and the new one");
+    }
+
+    #[test]
+    fn a_rebuilt_session_with_the_same_parameter_sets_sends_no_extra_header() {
+        let Some((_, tags)) = run(false) else { return };
+        assert_eq!(sequence_headers(&tags), 1);
     }
 }

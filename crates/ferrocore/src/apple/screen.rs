@@ -194,6 +194,15 @@ pub fn still(target: Target, width: u32) -> Result<Picture, AvError> {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    /// Whether Screen Recording is allowed to this app now. Never shows a prompt.
+    fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
+/// Whether macOS lets this app record the screen now (System Settings → Privacy & Security),
+/// asked without prompting.
+pub fn screen_access_granted() -> bool {
+    // SAFETY: a plain CoreGraphics query with no arguments.
+    unsafe { CGPreflightScreenCaptureAccess() }
 }
 
 #[link(name = "ColorSync", kind = "framework")]
@@ -425,10 +434,13 @@ struct Shared {
     stopped: Mutex<Option<String>>,
 }
 
+/// How a capture's end for a turned-off permission begins (the watchdog tells it from a crash).
+pub(crate) const PERMISSION_REVOKED: &str = "screen recording permission was revoked";
+
 fn format_stream_error(code: isize, desc: &str) -> String {
     match SCStreamErrorCode(code) {
         SCStreamErrorCode::UserDeclined | SCStreamErrorCode::MissingEntitlements => {
-            format!("screen recording permission was revoked ({desc})")
+            format!("{PERMISSION_REVOKED} ({desc})")
         }
         SCStreamErrorCode::NoCaptureSource | SCStreamErrorCode::NoDisplayList | SCStreamErrorCode::NoWindowList => {
             format!("the captured display or window is gone ({desc})")

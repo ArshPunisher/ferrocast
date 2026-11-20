@@ -1007,6 +1007,10 @@ impl OwnStream {
         if state.splitting || state.failed.is_some() {
             return false;
         }
+        // The video encoder was rebuilt with other parameter sets: a new file now (its frames wait).
+        if state.split_wanted {
+            return true;
+        }
         let bytes = state.bytes;
         (plan.split_minutes > 0 && since.elapsed() >= Duration::from_secs(u64::from(plan.split_minutes) * 60))
             || (plan.split_mb > 0 && bytes >= u64::from(plan.split_mb) * 1024 * 1024)
@@ -1041,7 +1045,9 @@ impl OwnStream {
         if let Some(d) = &self.drawn {
             let s = d.shared.engine.stats();
             return StreamStats {
-                active: d.shared.engine.error().is_none() && self.record_problem().is_none() && !stopped_or_failed,
+                active: d.shared.engine.output_error(d.output).is_none()
+                    && self.record_problem().is_none()
+                    && !stopped_or_failed,
                 reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
                 frames: s.frames.saturating_sub(d.from.0).min(u64::from(u32::MAX)) as u32,
@@ -1156,8 +1162,9 @@ impl OwnStream {
         // A recording our engine writes counts its bytes in the file itself (nothing is sent):
         // the Stats panel's recording size and rate were always 0 before.
         let bytes = state.as_ref().map_or(s.bytes, |r| r.bytes.max(s.bytes));
+        let auto_splits = state.as_ref().map_or(0, |r| r.auto_splits);
         let error = state.and_then(|r| r.failed).filter(|_| self.plan().is_some()).map(|p| p.reason);
-        RecordStats { active: s.active, paused, bytes, frames: s.frames, error }
+        RecordStats { active: s.active, paused, bytes, frames: s.frames, error, auto_splits }
     }
 
     /// Which encoder our engine's output uses ("h264_nvenc"…), while it runs.
@@ -1166,7 +1173,7 @@ impl OwnStream {
     }
 
     pub(crate) fn last_error(&self) -> Option<String> {
-        if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.error()) {
+        if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.output_error(d.output)) {
             return Some(e);
         }
         if let Some(e) = self.counts.error.lock().ok().and_then(|e| e.clone()) {

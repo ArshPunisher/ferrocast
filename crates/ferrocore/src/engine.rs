@@ -434,6 +434,11 @@ pub struct RecordState {
     pub bytes: u64,
     /// A split waits for its first frame (the next file isn't written to yet).
     pub splitting: bool,
+    /// A rebuilt video encoder needs the recording in a new file: call `split_output` (the
+    /// frames are held until then).
+    pub split_wanted: bool,
+    /// How many times a recording went on in a new file that way (said once each, as a notice).
+    pub auto_splits: u32,
 }
 
 /// One source's load on the engine (see [`Engine::source_load`]).
@@ -453,7 +458,8 @@ type Seen = Mutex<Shown>;
 #[derive(Debug, Default)]
 struct Shown {
     stats: Stats,
-    error: Option<String>,
+    /// What stopped each output (by id): one output's fault is its own, never another's.
+    errors: Vec<(u64, String)>,
     /// Each output's recording and encoder.
     outputs: Vec<(u64, RecordState, String)>,
     /// Each opened source's load (`Engine::source_load`).
@@ -467,7 +473,7 @@ impl Shown {
     fn of(st: &State) -> Self {
         Self {
             stats: st.stats,
-            error: st.error.clone(),
+            errors: st.errors.iter().map(|(id, e)| (*id, e.clone())).collect(),
             outputs: st.outputs.iter().map(|(id, pipe, ..)| (*id, record_state(pipe), pipe.encoder())).collect(),
             loads: loads_of(st),
             quiet: quiet_of(st),
@@ -519,6 +525,8 @@ fn record_state(pipe: &Pipeline) -> RecordState {
         paused: pipe.paused() || pipe.recording_paused(),
         bytes: pipe.recorded_bytes(),
         splitting: pipe.splitting(),
+        split_wanted: pipe.split_wanted(),
+        auto_splits: pipe.auto_splits(),
     }
 }
 
@@ -822,13 +830,33 @@ struct Watch {
     /// True for camera/capture-card sources that pause auto-retries after [`NO_SIGNAL_MAX_TRIES`]
     /// zero-frame attempts until USB hotplug or a user edit/retry.
     cap_no_signal: bool,
+    /// A camera or microphone: one that has worked is looked for again within seconds when it
+    /// goes (a USB mic bumped out and back in, where Windows has no hotplug wake).
+    quick_retry: bool,
     /// Set once `cap_no_signal && !ever_sent` reaches [`NO_SIGNAL_MAX_TRIES`].
     no_signal: bool,
     /// It panicked in the loop (and was stopped there).
     faulted: bool,
+    /// Ended because the system turned its permission off (Screen Recording): not tried again
+    /// until the permission is back (`regained_access`); each try would only raise the system's
+    /// prompt again (agy GAPS #20).
+    denied: bool,
+    /// The permission is back: the next look restarts it at once.
+    regained: bool,
+    /// Since when frames have been coming without a break (0: not yet). `tries` only goes back
+    /// to 0 after [`STABLE_NS`] of that: one frame from a flapping HDMI link isn't a recovery.
+    flowing_since: u64,
 }
 
 impl Watch {
+    /// The wait before try `n` at starting this source again. A capture card that has sent a
+    /// picture before is looked for again within a few seconds (its HDMI may come back at any
+    /// moment); anything else waits the long backoff.
+    fn backoff(&self, n: u32) -> u64 {
+        let wait = backoff_ns(n);
+        if self.quick_retry && self.ever_sent { wait.min(CARD_RETRY_MAX_NS) } else { wait }
+    }
+
     fn for_kind(kind: Option<&SourceKind>, now: u64) -> Self {
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let cap_no_signal = matches!(kind, Some(SourceKind::Camera(_)));
@@ -837,7 +865,11 @@ impl Watch {
             let _ = kind;
             false
         };
-        Self { since: now, cap_no_signal, ..Self::default() }
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        let quick_retry = matches!(kind, Some(SourceKind::Camera(_) | SourceKind::Microphone(_)));
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        let quick_retry = false;
+        Self { since: now, cap_no_signal, quick_retry, ..Self::default() }
     }
 }
 
@@ -847,6 +879,10 @@ const STALL_NS: u64 = 5_000_000_000;
 const FIRST_FRAME_NS: u64 = 10_000_000_000;
 /// Maximum fruitless zero-frame tries for a capture card/camera before waiting in "no signal".
 const NO_SIGNAL_MAX_TRIES: u32 = 3;
+/// How long a capture must keep sending before its failed tries are forgotten.
+const STABLE_NS: u64 = 10_000_000_000;
+/// The longest wait between tries at a capture card that has worked before.
+const CARD_RETRY_MAX_NS: u64 = 3_000_000_000;
 /// Hard deadline before the watchdog clears a stalled reopen worker slot.
 const REOPEN_TIMEOUT_NS: u64 = 60_000_000_000;
 /// Caps simultaneous reopen worker threads so a USB hub reset doesn't contend on every device at once.
@@ -905,7 +941,8 @@ struct State {
     /// Sorted list of source IDs currently active/heard on `ferrocast-audio` (`SetHeard` dedup).
     last_heard: Vec<u64>,
     stats: Stats,
-    error: Option<String>,
+    /// Why an output failed, by id, until it stops (`deliver`).
+    errors: HashMap<u64, String>,
     /// The previews windows show, by id.
     previews: HashMap<u64, Preview>,
     /// Frames drawn and on their way back from the card, oldest first (`deliver`).
@@ -1156,7 +1193,7 @@ impl Engine {
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio_cfg },
             last_heard: Vec::new(),
             stats: Stats::default(),
-            error: None,
+            errors: HashMap::new(),
             previews: HashMap::new(),
             in_flight: std::collections::VecDeque::new(),
             parked: Vec::new(),
@@ -2843,6 +2880,7 @@ impl Engine {
             deliver(&mut st, &self.gpu, true, &self.recycle_tx);
             tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stops: its last frames handed over");
             let taken = st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at));
+            st.errors.remove(&id);
             sync_heard(&mut st, &self.audio.cmd_sender());
             self.show(&st);
             let ticket = st.sleep_ticket();
@@ -2871,7 +2909,31 @@ impl Engine {
 
     /// What stopped the loop or an output, if anything did (as of its last frame).
     pub fn error(&self) -> Option<String> {
-        let own = self.seen.lock().unwrap_or_else(|p| p.into_inner()).error.clone();
+        let own = {
+            let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.errors.iter().min_by_key(|(id, _)| *id).map(|(_, e)| e.clone())
+        };
+        own.or_else(|| self.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+
+    /// Tests: makes this output's encoder fault on every frame.
+    #[cfg(test)]
+    fn fail_output_for_test(&self, id: u64) {
+        let mut st = self.lock();
+        if let Some((_, pipe, ..)) = st.outputs.iter_mut().find(|(i, ..)| *i == id) {
+            pipe.fail_video_for_test();
+        }
+    }
+
+    /// What stopped this output, if anything did (as of the loop's last frame). Another output's
+    /// fault (a vertical stream's, the replay buffer's) isn't it.
+    pub fn output_error(&self, id: u64) -> Option<String> {
+        let own = {
+            let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.errors.iter().find(|(i, _)| *i == id).map(|(_, e)| e.clone())
+        };
+        // The card's own failure (out of memory, an internal error) stops every picture: it is
+        // each output's, unlike an encoder's.
         own.or_else(|| self.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
@@ -4089,8 +4151,34 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
     if w.faulted {
         return Some("it faulted".into());
     }
+    if w.regained {
+        w.regained = false;
+        w.denied = false;
+        return Some("its permission is back".into());
+    }
+    if w.denied {
+        return None;
+    }
+    if let Some((_, _, Some(why))) = &signs
+        && is_permission_end(why)
+    {
+        w.denied = true;
+        return None;
+    }
     if w.cap_no_signal && !w.ever_sent && w.tries >= NO_SIGNAL_MAX_TRIES {
-        w.no_signal = true;
+        // Waiting for a signal, with the session left open: a picture that comes now (a console
+        // switched on) lets go of the wait, as USB hotplug does. Nothing else is tried.
+        match signs {
+            Some((count, ..)) if running && count > 0 => {
+                w.ever_sent = true;
+                w.no_signal = false;
+                w.count = count;
+                w.since = now;
+                w.tries = 0;
+                w.next_try = 0;
+            }
+            _ => w.no_signal = true,
+        }
         return None;
     }
     if !running {
@@ -4104,10 +4192,17 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
     if count != w.count {
         w.count = count;
         w.since = now;
-        w.tries = 0;
-        w.next_try = 0;
+        if w.flowing_since == 0 {
+            w.flowing_since = now.max(1);
+        }
+        // A link that comes and goes (a loose HDMI cable) is retried on its growing backoff; only
+        // a capture that has kept sending for a while starts afresh.
+        if now.saturating_sub(w.flowing_since) >= STABLE_NS {
+            w.tries = 0;
+            w.next_try = 0;
+        }
     }
-    ended.or_else(|| {
+    let why = ended.or_else(|| {
         if !steady {
             return None;
         }
@@ -4115,7 +4210,33 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
         let limit = if count > 0 { STALL_NS } else { FIRST_FRAME_NS };
         (now.saturating_sub(w.since) > limit)
             .then(|| if count > 0 { "it stopped sending" } else { "it never sent a first frame" }.into())
-    })
+    });
+    if why.is_some() {
+        w.flowing_since = 0;
+    }
+    why
+}
+
+/// Whether a capture ended because its permission was turned off.
+fn is_permission_end(why: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        why.starts_with(crate::apple::screen::PERMISSION_REVOKED)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = why;
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+/// A source that stopped for a turned-off permission is tried again once `granted()` says it's
+/// back (asked without prompting), not before.
+fn retry_if_permission_back(w: &mut Watch, granted: impl FnOnce() -> bool) {
+    if w.denied && granted() {
+        w.regained = true;
+    }
 }
 
 /// Opens a slow source on its own thread: what it plays, and whether it has sound to mix.
@@ -4236,6 +4357,8 @@ fn watchdog_step(
             let running = !matches!(src.live, Live::Still);
             let live_signs = signs(&src.live);
             let w = &mut src.watch;
+            #[cfg(target_os = "macos")]
+            retry_if_permission_back(w, crate::apple::screen::screen_access_granted);
             let was_no_signal = w.no_signal;
             let why = look(w, running, live_signs, now);
             if !was_no_signal && w.no_signal {
@@ -4258,7 +4381,7 @@ fn watchdog_step(
             let Some(kind) = src.kind.clone() else { continue };
             let token = next_open_token();
             let prev_tries = src.watch.tries;
-            src.watch.next_try = now + backoff_ns(prev_tries);
+            src.watch.next_try = now + src.watch.backoff(prev_tries);
             src.watch.tries = prev_tries.saturating_add(1);
             src.watch.faulted = false;
             src.watch.since = now;
@@ -4321,12 +4444,12 @@ fn watchdog_step(
                             src.audio_tx = None;
                             src.watch.count = 0;
                             src.watch.since = now_ns();
-                            src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                            src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
                             st.stats.restarts += 1;
                             let _ = audio_w.send(AudioCmd::SetOutputCapture { id, capture: oc });
                         }
                         Some(Err(e)) => {
-                            src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                            src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
                             tracing::warn!(source = id, error = %e, "the source didn't start again; it's tried later");
                         }
                         None => {}
@@ -4340,7 +4463,7 @@ fn watchdog_step(
                 if let Some(src) = st.sources.get_mut(&id).filter(|s| s.opening == Some(token)) {
                     src.opening = None;
                     src.opening_since = 0;
-                    src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                    src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
                 }
             }
         });
@@ -4350,7 +4473,7 @@ fn watchdog_step(
             if let Some(src) = st.sources.get_mut(&id).filter(|s| s.opening == Some(token)) {
                 src.opening = None;
                 src.opening_since = 0;
-                src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
             }
         }
     }
@@ -4430,12 +4553,13 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             .into_iter()
             .map(|(c, f)| (c, f.and_then(|p| gpu.finish_nv12(p).map_err(|e| e.to_string()))))
             .collect();
-        let mut failed = None;
+        let mut failures: Vec<(u64, String)> = Vec::new();
         let mut encoding = Duration::ZERO;
         for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
             if !outputs.contains(id) {
                 continue;
             }
+            let mut failed: Option<String> = None;
             // A recording on its own that can't be written any more has nothing to encode for:
             // it would only keep the encoder busy until someone presses Stop. (One that shares
             // its encode with a stream goes on, for the stream.)
@@ -4486,9 +4610,14 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                     send(t);
                 }
             }
+            if let Some(why) = failed {
+                failures.push((*id, why));
+            }
         }
-        if failed.is_some() {
-            st.error = failed;
+        // Each fault goes on its own output (the first one stays): the main stream and the
+        // recording aren't marked dead by a vertical stream's or the replay buffer's.
+        for (id, why) in failures {
+            st.errors.entry(id).or_insert(why);
         }
         // Only frames that went through an encoder count (a canvas drawn every other frame, or
         // one that failed to draw, would pull the average down by half).
@@ -5182,7 +5311,9 @@ mod tests {
         );
         assert!(look(&mut w, true, Some((0, true, None)), 60 * s).is_some());
         assert_eq!(look(&mut w, true, Some((5, true, None)), 61 * s), None);
-        assert_eq!(w.tries, 0);
+        assert_eq!(w.tries, 2, "one frame isn't a recovery: the tries stay");
+        assert_eq!(look(&mut w, true, Some((300, true, None)), 72 * s), None);
+        assert_eq!(w.tries, 0, "10 s of frames: afresh");
         // Tries wait 2, 4, 8… seconds, a minute at most.
         assert_eq!((backoff_ns(0), backoff_ns(2), backoff_ns(9)), (2 * s, 8 * s, 60 * s));
     }
@@ -5218,6 +5349,87 @@ mod tests {
         assert!(!src.watch.no_signal);
         assert_eq!(src.watch.tries, 0);
         assert!(look(&mut src.watch, false, None, 20 * sec).is_some());
+    }
+
+    /// A capture that ended because macOS turned its permission off isn't started again every few
+    /// seconds (each try raises the system's prompt); it waits for the permission to come back.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_revoked_permission_stops_the_retries_until_it_is_back() {
+        let s = 1_000_000_000;
+        let gone = || Some((0, false, Some(format!("{} (x)", crate::apple::screen::PERMISSION_REVOKED))));
+        let mut w = Watch::for_kind(None, 0);
+        assert_eq!(look(&mut w, true, gone(), s), None);
+        assert!(w.denied);
+        // Minutes pass: not restarted, however often it's looked at.
+        for t in 2..200 {
+            assert_eq!(look(&mut w, true, gone(), t * s), None);
+        }
+        // Still off: asking says no, nothing changes.
+        retry_if_permission_back(&mut w, || false);
+        assert_eq!(look(&mut w, true, gone(), 300 * s), None);
+        // The person turns it on again: restarted once.
+        retry_if_permission_back(&mut w, || true);
+        assert_eq!(look(&mut w, true, gone(), 301 * s), Some("its permission is back".into()));
+        assert!(!w.denied);
+        // An ordinary crash is still restarted as before.
+        let mut crashed = Watch::for_kind(None, 0);
+        assert!(look(&mut crashed, true, Some((0, false, Some("it crashed".into()))), s).is_some());
+    }
+
+    /// A capture card nobody has plugged anything into yet (a PS5 turned on later): once it
+    /// sends, the "no signal" wait ends by itself, with no unplugging or editing (agy GAPS #6).
+    #[test]
+    fn a_no_signal_card_wakes_when_its_picture_comes() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 40 * s), None);
+        assert!(w.no_signal, "waiting for a signal");
+        // The console is switched on: frames flow on the session that was open all along.
+        assert_eq!(look(&mut w, true, Some((30, true, None)), 90 * s), None);
+        assert!(!w.no_signal && w.ever_sent, "the latch let go");
+        assert_eq!(w.tries, 0);
+        // And it's watched as a working card again: if it stops, it's restarted.
+        assert!(look(&mut w, true, Some((30, true, None)), 97 * s).is_some());
+    }
+
+    /// An HDMI link that flaps (one frame, then nothing, again and again) keeps its tries, so the
+    /// backoff grows instead of a restart every few seconds for ever (agy review R8).
+    #[test]
+    fn a_flapping_link_does_not_reset_its_backoff() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.ever_sent = true;
+        let mut count = 0;
+        let mut now = 100 * s;
+        for _ in 0..5 {
+            count += 1;
+            assert_eq!(look(&mut w, true, Some((count, true, None)), now), None, "one frame");
+            now += 6 * s;
+            assert!(look(&mut w, true, Some((count, true, None)), now).is_some(), "stalled again");
+            w.tries += 1; // the watchdog's reopen
+        }
+        assert_eq!(w.tries, 5, "the failed tries were kept");
+    }
+
+    /// A card that has worked is looked for again within a few seconds when its HDMI comes back
+    /// from a long drop, not up to 30-60 s later; other sources keep the longer wait.
+    #[test]
+    fn a_card_that_worked_is_retried_quickly_not_after_a_minute() {
+        let s = 1_000_000_000;
+        let mut card = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        card.ever_sent = true;
+        assert!(card.backoff(0) <= 3 * s && card.backoff(9) <= 3 * s);
+        let mut mic = Watch::for_kind(Some(&SourceKind::Microphone("usb".into())), 0);
+        assert_eq!(mic.backoff(9), 60 * s, "a mic that never sent keeps the slow wait");
+        mic.ever_sent = true;
+        assert!(mic.backoff(9) <= 3 * s, "a mic that worked is looked for again within seconds");
+        let mut media = Watch::for_kind(Some(&SourceKind::Color { width: 2, height: 2, rgba: [0; 4] }), 0);
+        media.ever_sent = true;
+        assert_eq!(media.backoff(9), 60 * s, "other sources keep it");
+        let unseen = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        assert_eq!(unseen.backoff(9), 60 * s, "a card that never sent keeps the slow wait");
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -5275,6 +5487,36 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(e.lock().stats.restarts, restarts_before);
+    }
+
+    /// Driven through the real watchdog step, not `Watch::backoff` alone: a mic that has worked
+    /// and whose reopen fails is looked for again within seconds (the worker's own writes of
+    /// `next_try` used the long backoff and overwrote the short one; agy review R7).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn a_mic_that_worked_is_retried_within_seconds_after_a_failed_reopen_too() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            let mut src = Src::new(Live::Still, None, Some(SourceKind::Microphone("usb".into())));
+            src.watch.ever_sent = true;
+            src.watch.tries = 9;
+            st.sources.insert(1, src);
+        }
+        let reopen: Reopener = Arc::new(|_| Some(Err(AvError::Source("still unplugged".into()))));
+        let cmd = e.audio.cmd_sender();
+        let now = now_ns();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while e.lock().sources[&1].opening.is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (next, at) = (e.lock().sources[&1].watch.next_try, now_ns());
+        assert!(
+            next.saturating_sub(at) <= CARD_RETRY_MAX_NS + 500_000_000,
+            "next try in {} ms",
+            next.saturating_sub(at) / 1_000_000
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -5960,6 +6202,45 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         assert!(!e.transitioning());
         assert_eq!(e.snapshot().unwrap_or_default()[0], 255);
+    }
+
+    /// The graphics card's failure reaches every output's error (agy review R1).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_gpu_failure_is_every_outputs_error() {
+        let Some(e) = engine() else { return };
+        assert_eq!(e.output_error(7), None);
+        *e.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()) = Some("out of memory".into());
+        assert_eq!(e.output_error(7), Some("out of memory".into()));
+        assert_eq!(e.output_error(8), Some("out of memory".into()));
+    }
+
+    /// One output's encoder fault marks that output, not the others (agy GAPS #3): the main
+    /// stream stays well, and a new output starts with no error.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn one_outputs_fault_is_its_own() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Wide", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Wide").unwrap_or_else(|x| panic!("{x}"));
+        let main = e.start_output(OutputKind::Stream(Box::new(|_| {}))).unwrap_or_else(|x| panic!("{x}"));
+        let second = e.start_output(OutputKind::Replay { seconds: 5, mb: 0 }).unwrap_or_else(|x| panic!("{x}"));
+        e.fail_output_for_test(second);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while e.output_error(second).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(e.output_error(second).is_some(), "the faulting output says so");
+        assert_eq!(e.output_error(main), None, "the main stream isn't marked dead by it");
+        e.stop_output(second).unwrap_or_else(|x| panic!("{x}"));
+        let third = e.start_output(OutputKind::Replay { seconds: 5, mb: 0 }).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(e.output_error(third), None);
+        assert_eq!(e.output_error(second), None, "a stopped output's error goes with it");
+        e.stop_output(third).unwrap_or_else(|x| panic!("{x}"));
+        e.stop_output(main).unwrap_or_else(|x| panic!("{x}"));
     }
 
     #[test]

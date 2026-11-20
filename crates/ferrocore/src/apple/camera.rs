@@ -141,6 +141,8 @@ pub fn microphones() -> Vec<Device> {
 struct Shared {
     device_id: String,
     label: &'static str,
+    /// The "staying off the Bluetooth microphone" line has been logged.
+    bluetooth_noted: std::sync::atomic::AtomicBool,
     frame: Mutex<Option<(Picture, u64)>>,
     /// The newest frame as the camera holds it (no copy), when the card can read it directly.
     surface: Mutex<Option<(super::screen::Surface, u64)>>,
@@ -560,6 +562,9 @@ pub fn own_size(id: &str) -> Option<(u32, u32)> {
 const FOURCC_MJPEG_DMB1: u32 = u32::from_be_bytes(*b"dmb1");
 const FOURCC_JPEG: u32 = u32::from_be_bytes(*b"jpeg");
 const USB_TRANSPORT: i32 = i32::from_be_bytes(*b"usb ");
+/// Bluetooth inputs (AirPods, headsets): macOS drops them to a 16 kHz call profile when used.
+const BLUETOOTH_TRANSPORT: i32 = i32::from_be_bytes(*b"blue");
+const BLUETOOTH_LE_TRANSPORT: i32 = i32::from_be_bytes(*b"blea");
 
 /// A camera format entry with its FourCC subtype.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -994,7 +999,16 @@ impl Capture {
         // Following the system's microphone, and it changed (headphones with a mic plugged
         // in, another input picked in System Settings): this one is done, the new one opens.
         let now = self.follows.as_ref().and_then(|_| default_microphone());
-        moved_on(self.follows.as_deref(), now.as_deref())
+        let moved = moved_on(self.follows.as_deref(), now.as_deref(), is_bluetooth_input);
+        // Said once, not at every look (the watchdog asks every second).
+        if moved.is_none()
+            && let (Some(was), Some(now)) = (self.follows.as_deref(), now.as_deref())
+            && was != now
+            && !self.shared.bluetooth_noted.swap(true, Ordering::Relaxed)
+        {
+            tracing::info!("the system's microphone is now a Bluetooth one; staying on the one in use");
+        }
+        moved
     }
 }
 
@@ -1007,10 +1021,29 @@ impl Drop for Capture {
 
 /// Why a capture following the system's microphone ended: the system's is another one now.
 /// (None when there's no system microphone: the one open stays until one comes.)
-fn moved_on(follows: Option<&str>, now: Option<&str>) -> Option<String> {
+///
+/// Not when it moved to a Bluetooth input from one that isn't: putting on AirPods makes them the
+/// system's microphone, and opening it drops them to the 16 kHz call profile, which ruins the
+/// stream's voice and the streamer's own headphone sound. The mic open stays; picking the
+/// Bluetooth one by name still works (agy GAPS #7).
+fn moved_on(follows: Option<&str>, now: Option<&str>, bluetooth: impl Fn(&str) -> bool) -> Option<String> {
     match (follows, now) {
-        (Some(was), Some(now)) if was != now => Some("the system's microphone changed".into()),
+        (Some(was), Some(now)) if was != now => {
+            if bluetooth(now) && !bluetooth(was) {
+                return None;
+            }
+            Some("the system's microphone changed".into())
+        }
         _ => None,
+    }
+}
+
+/// Whether the input with this unique id is a Bluetooth one.
+fn is_bluetooth_input(id: &str) -> bool {
+    // SAFETY: looking a device up by id and reading its transport type.
+    unsafe {
+        AVCaptureDevice::deviceWithUniqueID(&NSString::from_str(id))
+            .is_some_and(|d| matches!(d.transportType(), BLUETOOTH_TRANSPORT | BLUETOOTH_LE_TRANSPORT))
     }
 }
 
@@ -1021,10 +1054,20 @@ mod tests {
     #[test]
     fn the_systems_microphone_is_followed() {
         assert!(is_default("") && is_default("default") && !is_default("BuiltInMicrophoneDevice"));
-        assert_eq!(moved_on(None, Some("b")), None, "a picked mic stays");
-        assert_eq!(moved_on(Some("a"), Some("a")), None);
-        assert_eq!(moved_on(Some("a"), None), None, "no system mic now: keep what's open");
-        assert!(moved_on(Some("a"), Some("b")).is_some(), "the system's changed: open the new one");
+        let none = |_: &str| false;
+        assert_eq!(moved_on(None, Some("b"), none), None, "a picked mic stays");
+        assert_eq!(moved_on(Some("a"), Some("a"), none), None);
+        assert_eq!(moved_on(Some("a"), None, none), None, "no system mic now: keep what's open");
+        assert!(moved_on(Some("a"), Some("b"), none).is_some(), "the system's changed: open the new one");
+    }
+
+    #[test]
+    fn airpods_becoming_the_systems_mic_dont_take_the_stream_over() {
+        let bt = |id: &str| id == "airpods";
+        assert_eq!(moved_on(Some("usb-mic"), Some("airpods"), bt), None, "stays on the mic in use");
+        assert!(moved_on(Some("airpods"), Some("usb-mic"), bt).is_some(), "leaving Bluetooth follows");
+        assert!(moved_on(Some("airpods"), Some("airpods-2"), |id: &str| id.starts_with("airpods")).is_some());
+        assert!(moved_on(Some("usb-mic"), Some("builtin"), bt).is_some(), "other moves follow as before");
     }
 
     // A webcam's formats: (width, height, highest frame rate).
@@ -1195,6 +1238,23 @@ mod tests {
             kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         );
         assert_eq!(pick_output_pixel_format(&[kCVPixelFormatType_422YpCbCr8]), kCVPixelFormatType_422YpCbCr8);
+    }
+
+    /// agy GAPS #10 said 10-bit (HDR) frames from a card would be dropped by `copy_video_frame`.
+    /// They never reach it: the output is told to deliver an 8-bit format, so AVFoundation
+    /// converts, and the choice never lands on a 10-bit one even when that is all the card lists.
+    #[test]
+    fn the_output_is_never_asked_for_a_ten_bit_format() {
+        use super::pick_output_pixel_format;
+        use objc2_core_video::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange};
+        let x420 = u32::from_be_bytes(*b"x420");
+        let l10r = u32::from_be_bytes(*b"l10r");
+        let p010 = u32::from_be_bytes(*b"p010");
+        assert_eq!(
+            pick_output_pixel_format(&[x420, l10r, p010, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]),
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        );
+        assert_eq!(pick_output_pixel_format(&[x420, l10r, p010]), kCVPixelFormatType_32BGRA);
     }
 
     #[test]

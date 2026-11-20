@@ -452,6 +452,9 @@ pub struct RecordStats {
     pub frames: u32,
     /// Why it stopped, in one line, when it did by itself ("the disk is full").
     pub error: Option<String>,
+    /// Times it went on in a new file because the video encoder was rebuilt (display sleep, the
+    /// system taking the session back).
+    pub auto_splits: u32,
 }
 
 /// How video and sound are encoded.
