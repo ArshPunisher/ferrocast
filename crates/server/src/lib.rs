@@ -98,6 +98,8 @@ pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server
     let app = router(state);
     // The dashboard from anywhere answers phones through this same router (Pro F2).
     engine.set_remote_handler(remote::handler(app.clone(), engine.clone(), addr.port()));
+    // The obs-websocket server, when the owner switched it on.
+    engine.start_obsws();
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!(error = %e, "the local server stopped");
@@ -198,6 +200,8 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
 mod automations_tests;
 #[cfg(test)]
 mod designs_tests;
+#[cfg(test)]
+mod obsws_tests;
 #[cfg(test)]
 mod plugins_tests;
 #[cfg(test)]
