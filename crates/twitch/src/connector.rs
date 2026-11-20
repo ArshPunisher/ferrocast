@@ -86,7 +86,7 @@ impl Connector for TwitchConnector {
     async fn ingest(&self) -> Result<Ingest> {
         self.need_scope("channel:read:stream_key").await?;
         let key = self.helix.stream_key(&self.user_id).await?;
-        Ok(Ingest { url: self.helix.nearest_ingest().await, key, backup: None })
+        Ok(Ingest { url: self.helix.nearest_ingest().await, key, backup: None, note: None })
     }
 }
 

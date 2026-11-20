@@ -311,7 +311,7 @@ impl KickApi {
         let url = field("url")
             .filter(|u| u.starts_with("rtmps://") || u.starts_with("rtmp://"))
             .ok_or_else(|| KickError::Refused("Kick didn't give out the stream address".into()))?;
-        Ok(ferrocast_connector::Ingest { url: with_app(&url), key, backup: None })
+        Ok(ferrocast_connector::Ingest { url: with_app(&url), key, backup: None, note: None })
     }
 }
 

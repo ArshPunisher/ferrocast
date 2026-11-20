@@ -471,8 +471,7 @@ impl Api {
 
     pub async fn current_broadcast(&self) -> Result<Option<String>, YoutubeError> {
         let streams = self.list_streams(true).await?;
-        let vertical = vertical_ids(&streams);
-        let (main, _) = self.broadcasts(&vertical, None, true).await?;
+        let (main, _) = self.broadcasts(&main_excluded(&streams), None, true).await?;
         Ok(main.and_then(|b| b.get("id").and_then(Value::as_str).map(String::from)))
     }
 
@@ -487,7 +486,7 @@ impl Api {
         let mut streams = self.list_streams(false).await?;
         made.merge_fresh_stream(&mut streams, now);
         let vertical = vertical_ids(&streams);
-        let (main, vert) = self.broadcasts(&vertical, None, false).await?;
+        let (main, vert) = self.broadcasts(&main_excluded(&streams), None, false).await?;
         let listed = main
             .as_ref()
             .and_then(|b| b.get("id").and_then(Value::as_str))
@@ -886,8 +885,9 @@ impl Api {
         let mut streams = self.list_streams(true).await?;
         made.merge_fresh_stream(&mut streams, now);
         let vertical = vertical_ids(&streams);
-        // Ferrocast's own vertical streams (and their broadcasts) are never the normal one.
-        let (main, _) = self.broadcasts(&vertical, selected_broadcast, true).await?;
+        // Ferrocast's own vertical streams (and their broadcasts), and keys the streamer made for
+        // vertical video, are never the normal one.
+        let (main, _) = self.broadcasts(&main_excluded(&streams), selected_broadcast, true).await?;
         let fresh_made = if selected_broadcast.is_none() { made.fresh_broadcast(now).cloned() } else { None };
         let live_now = main.as_ref().is_some_and(is_live);
 
@@ -956,7 +956,12 @@ impl Api {
         drop(made);
 
         // Return the exact stream bound to the broadcast — never fall back to a different stream.
-        find_stream(&streams, &stream).and_then(usable).ok_or_else(|| {
+        let chosen = find_stream(&streams, &stream);
+        let note = chosen.map(key_note);
+        if let Some(n) = &note {
+            tracing::info!(stream_id = %stream, key = %n, "YouTube: the stream goes to this key");
+        }
+        chosen.and_then(usable).map(|i| ferrocast_connector::Ingest { note, ..i }).ok_or_else(|| {
             YoutubeError::Refused(
                 "the broadcast's stream key isn't usable for RTMP; check your stream in YouTube Studio".into(),
             )
@@ -991,7 +996,7 @@ impl Api {
         let found = streams.get("items").and_then(Value::as_array).and_then(|i| {
             i.iter().find(|s| {
                 s.pointer("/snippet/title").and_then(Value::as_str) == Some(MAIN_STREAM_TITLE)
-                    && !stream_needs_replacement(s)
+                    && !stream_unfit_for_main(s)
             })
         });
         if let Some(id) = found.and_then(|s| s.get("id").and_then(Value::as_str)) {
@@ -1143,12 +1148,53 @@ pub(crate) fn stream_needs_replacement(s: &Value) -> bool {
     fixed_res || fixed_fps || not_rtmp || usable(s).is_none()
 }
 
+/// Words in a key's title or description that say it was made for upright video (YouTube Shorts
+/// live): such a key never carries the normal, horizontal stream (a streamer's own old "vertical"
+/// key is 1080p, so a 1440p stream sent there came out at 1080p, 20 Nov). A false match only means
+/// Ferrocast's own key is used instead.
+const VERTICAL_WORDS: [&str; 5] = ["vertical", "shorts", "portrait", "9:16", "9x16"];
+
+fn looks_vertical(s: &Value) -> bool {
+    ["/snippet/title", "/snippet/description"].iter().filter_map(|p| s.pointer(p).and_then(Value::as_str)).any(|t| {
+        let t = t.to_lowercase();
+        VERTICAL_WORDS.iter().any(|w| t.contains(w))
+    })
+}
+
+/// A key that mustn't carry the normal stream: [`stream_needs_replacement`], or one made for
+/// vertical video.
+pub(crate) fn stream_unfit_for_main(s: &Value) -> bool {
+    stream_needs_replacement(s) || looks_vertical(s)
+}
+
+/// The streams a normal live never uses: Ferrocast's own vertical one, and any the streamer made
+/// for vertical video.
+fn main_excluded(list: &Value) -> HashSet<String> {
+    let mut ids = vertical_ids(list);
+    ids.extend(
+        list.get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|s| looks_vertical(s))
+            .filter_map(|s| s.get("id").and_then(Value::as_str).filter(|id| !id.is_empty()).map(String::from)),
+    );
+    ids
+}
+
+/// What is said of the key the stream goes to: its title and resolution ("Ferrocast · variable").
+fn key_note(s: &Value) -> String {
+    let title = s.pointer("/snippet/title").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+    let res = s.pointer("/cdn/resolution").and_then(Value::as_str).unwrap_or("variable");
+    format!("{} · {res}", title.unwrap_or("Default key"))
+}
+
 fn find_stream<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
     list.get("items")?.as_array()?.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id))
 }
 
 fn stream_id_needs_replacement(list: &Value, id: &str) -> bool {
-    find_stream(list, id).is_none_or(stream_needs_replacement)
+    find_stream(list, id).is_none_or(stream_unfit_for_main)
 }
 
 /// Whether an upcoming broadcast is eligible to be taken automatically without explicit user
@@ -1366,11 +1412,15 @@ fn main_stream_id(list: &Value, vertical: &HashSet<String>, bound: Option<&str>)
         .collect();
     let id_is = |s: &Value, id: &str| s.get("id").and_then(Value::as_str) == Some(id);
     let default = |s: &Value| s.pointer("/snippet/isDefaultStream").and_then(Value::as_bool) == Some(true);
+    // Beyond the bound one (which is replaced if it's a vertical key), keys made for vertical video
+    // aren't picked; with only those left, the first is named so it's replaced, not "no key".
+    let others: Vec<&Value> = items.iter().copied().filter(|s| !looks_vertical(s)).collect();
     let pick = bound
-        .and_then(|b| items.iter().find(|s| id_is(s, b)))
-        .or_else(|| items.iter().find(|s| default(s)))
-        .or_else(|| items.iter().find(|s| usable(s).is_some()))
-        .or_else(|| items.first())?;
+        .and_then(|b| items.iter().copied().find(|s| id_is(s, b)))
+        .or_else(|| others.iter().copied().find(|s| default(s)))
+        .or_else(|| others.iter().copied().find(|s| usable(s).is_some()))
+        .or_else(|| others.first().copied())
+        .or_else(|| items.first().copied())?;
     pick.get("id").and_then(Value::as_str).map(String::from)
 }
 
@@ -1402,7 +1452,12 @@ fn usable(s: &Value) -> Option<ferrocast_connector::Ingest> {
     .map(str::trim)
     .filter(|b| b.starts_with(if url.starts_with("rtmps://") { "rtmps://" } else { "rtmp://" }))
     .map(|b| b.trim_end_matches('/').to_string());
-    Some(ferrocast_connector::Ingest { url: url.trim_end_matches('/').to_string(), key: key.to_string(), backup })
+    Some(ferrocast_connector::Ingest {
+        url: url.trim_end_matches('/').to_string(),
+        key: key.to_string(),
+        backup,
+        note: None,
+    })
 }
 
 #[cfg(test)]

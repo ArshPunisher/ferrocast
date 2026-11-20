@@ -146,6 +146,8 @@ pub struct Ingest {
     /// Another server for the same key, tried when this one can't be reached (YouTube's backup
     /// ingest). The same scheme as `url`.
     pub backup: Option<String>,
+    /// Which key it is, for the destination's details ("Ferrocast · variable"); never the key.
+    pub note: Option<String>,
 }
 
 impl std::fmt::Debug for Ingest {

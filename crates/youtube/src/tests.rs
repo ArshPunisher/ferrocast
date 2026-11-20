@@ -1909,3 +1909,140 @@ fn the_backup_ingest_comes_with_the_stream_key() {
     let alone = item(json!({ "streamName": "k", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com:443/live2" }));
     assert_eq!(api::pick_stream(&alone, None).unwrap().backup, None);
 }
+
+fn upcoming(id: &str, stream: &str, minutes_ahead: i64) -> serde_json::Value {
+    json!({
+        "id": id,
+        "snippet": { "title": "Today", "scheduledStartTime": crate::api::rfc3339_utc(now_ms() + minutes_ahead * 60_000) },
+        "status": { "lifeCycleStatus": "ready" },
+        "contentDetails": { "boundStreamId": stream, "enableAutoStart": true }
+    })
+}
+
+/// 20 Nov, a real account: the streamer's old key for vertical video is the channel's default, 1080p
+/// fixed. The normal stream must go to Ferrocast's own variable key, not that one.
+#[tokio::test]
+async fn a_channel_whose_default_key_is_an_old_fixed_vertical_one_streams_to_ferrocasts_own() {
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s-old",
+            "Vertical 1080p",
+            true,
+            "1080p",
+            "variable",
+            "rtmp",
+            "old-vertical",
+        )]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let ing = video_api(ep).ingest().await.unwrap();
+    assert!(ing.key.starts_with("var-key-"), "not the old vertical key: {}", ing.key);
+    assert_eq!(ing.note.as_deref(), Some("Ferrocast · variable"));
+    let log = calls.lock().unwrap().clone();
+    assert_eq!(log.iter().filter(|c| c.starts_with("POST /liveStreams ")).count(), 1, "{log:?}");
+    assert!(log.iter().any(|c| c.starts_with("POST /liveBroadcasts ")), "a broadcast on the new key: {log:?}");
+}
+
+/// The same kind of channel with a broadcast already waiting, bound to a fixed 1080p key (named
+/// nothing about vertical): the broadcast is bound to Ferrocast's variable key instead
+/// (liveBroadcasts.bind).
+#[tokio::test]
+async fn an_upcoming_broadcast_bound_to_an_old_fixed_key_is_rebound_to_ferrocasts_own() {
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s-old",
+            "Old key",
+            true,
+            "1080p",
+            "variable",
+            "rtmp",
+            "old-1080p",
+        )]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![upcoming("b1", "s-old", 10)]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let ing = video_api(ep).ingest().await.unwrap();
+    assert!(ing.key.starts_with("var-key-"), "{}", ing.key);
+    let log = calls.lock().unwrap().clone();
+    assert!(log.iter().any(|c| c.starts_with("POST /liveBroadcasts/bind b1->s-new-")), "re-bound: {log:?}");
+}
+
+/// A broadcast waiting on the streamer's own vertical key (fixed 1080p, or variable) is their
+/// vertical one: not taken for the normal live and not re-bound (that would take it from their
+/// Shorts). The normal stream gets its own broadcast on Ferrocast's variable key.
+#[tokio::test]
+async fn a_broadcast_waiting_on_the_streamers_vertical_key_is_left_alone() {
+    for (title, res) in [("Vertical 1080p", "1080p"), ("Shorts live", "variable")] {
+        let st = ScriptedYoutube {
+            stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+                "s-v", title, true, res, "variable", "rtmp", "v-key",
+            )]])),
+            broadcast_pages: Arc::new(Mutex::new(vec![vec![upcoming("b1", "s-v", 5)]])),
+            ..Default::default()
+        };
+        let (ep, calls) = start_scripted(st).await;
+        let ing = video_api(ep).ingest().await.unwrap();
+        assert!(ing.key.starts_with("var-key-"), "{title}: {}", ing.key);
+        assert_eq!(ing.note.as_deref(), Some("Ferrocast · variable"));
+        let log = calls.lock().unwrap().clone();
+        assert!(!log.iter().any(|c| c.contains("bind b1")), "{title}: their broadcast stays: {log:?}");
+        assert!(log.iter().any(|c| c.starts_with("POST /liveBroadcasts ")), "{title}: its own broadcast: {log:?}");
+    }
+}
+
+/// A waiting broadcast on the vertical key is the vertical one, never the normal live: the other
+/// one, on a good key, is used as it is, with nothing created or bound.
+#[tokio::test]
+async fn a_broadcast_on_a_vertical_key_is_not_taken_for_the_normal_live() {
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![
+            stream_item("s-v", "Vertical", false, "variable", "variable", "rtmp", "v-key"),
+            stream_item("s-main", "Stream key", true, "variable", "variable", "rtmp", "main-key"),
+        ]])),
+        // The vertical one is the nearer in time.
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![upcoming("b-v", "s-v", 1), upcoming("b-main", "s-main", 30)]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let ing = video_api(ep).ingest().await.unwrap();
+    assert_eq!(ing.key, "main-key");
+    assert_eq!(ing.note.as_deref(), Some("Stream key · variable"));
+    let log = calls.lock().unwrap().clone();
+    assert!(!log.iter().any(|c| c.contains("bind") || c.starts_with("POST /liveStreams")), "{log:?}");
+}
+
+/// With a vertical default and a good key beside it, the good key is the one (no new key made).
+#[tokio::test]
+async fn a_good_key_beside_a_vertical_default_is_used_for_the_normal_stream() {
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![
+            stream_item("s-v", "Vertical", true, "variable", "variable", "rtmp", "v-key"),
+            stream_item("s-main", "Main", false, "variable", "variable", "rtmp", "main-key"),
+        ]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    let ing = video_api(ep).ingest().await.unwrap();
+    assert_eq!(ing.key, "main-key");
+    let log = calls.lock().unwrap().clone();
+    assert!(!log.iter().any(|c| c.starts_with("POST /liveStreams")), "{log:?}");
+}
+
+#[test]
+fn keys_made_for_vertical_video_are_told_by_their_words() {
+    use crate::api::stream_unfit_for_main;
+    let key = |title: &str, desc: &str| {
+        json!({ "id": "s", "snippet": { "title": title, "description": desc },
+            "cdn": { "resolution": "variable", "frameRate": "variable", "ingestionType": "rtmp",
+                "ingestionInfo": { "streamName": "k", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com/live2" } } })
+    };
+    assert!(!stream_unfit_for_main(&key("Stream key", "")));
+    assert!(!stream_unfit_for_main(&key("Ferrocast", "Ferrocast streams here, at any resolution.")));
+    for (t, d) in [("My Vertical key", ""), ("phone", "for YouTube SHORTS"), ("9:16", ""), ("Portrait", "")] {
+        assert!(stream_unfit_for_main(&key(t, d)), "{t} / {d}");
+    }
+    // Ferrocast's own vertical key is one too: it never carries the normal stream.
+    assert!(stream_unfit_for_main(&key("Ferrocast vertical", "")));
+}
