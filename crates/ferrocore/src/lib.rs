@@ -45,6 +45,7 @@ pub use linux::media;
 pub use linux::screen;
 pub mod afx;
 pub mod audio;
+pub mod audio_thread;
 mod compose;
 pub mod engine;
 pub mod ffenc;

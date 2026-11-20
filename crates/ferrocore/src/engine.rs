@@ -3500,6 +3500,81 @@ pub fn raise_this_thread() {
     on_time();
 }
 
+/// RAII guard for real-time audio thread priority/MMCSS registration on `ferrocast-audio`.
+#[allow(dead_code)]
+pub(crate) struct AudioThreadGuard {
+    #[cfg(target_os = "windows")]
+    mmcss: Option<windows::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for AudioThreadGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        if let Some(h) = self.mmcss.take() {
+            // SAFETY: `h` was returned by `AvSetMmThreadCharacteristicsW` on this thread and
+            // has not been reverted yet.
+            let _ = unsafe { windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(h) };
+        }
+    }
+}
+
+/// Prepares the dedicated real-time audio thread (`ferrocast-audio`): enables x86 FTZ/DAZ, sets
+/// `QOS_CLASS_USER_INTERACTIVE` on macOS, or registers MMCSS `"Audio"` + disables EcoQoS on Windows.
+#[allow(dead_code, unsafe_code)]
+pub(crate) fn raise_audio_thread() -> AudioThreadGuard {
+    crate::afx::enable_ftz_daz();
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: sets the calling thread's own QoS class; takes no pointers.
+        let r = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+        if r != 0 {
+            tracing::debug!(r, "audio thread kept default QoS class");
+        }
+        AudioThreadGuard {}
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Threading::{
+            AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadInformation, SetThreadPriority,
+            THREAD_POWER_THROTTLING_CURRENT_VERSION, THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            THREAD_POWER_THROTTLING_STATE, THREAD_PRIORITY_HIGHEST, ThreadPowerThrottling,
+        };
+        let mut task_idx = 0u32;
+        // SAFETY: `task_idx` is a valid local `u32` and `"Audio"` is a static wide string literal.
+        let mmcss = match unsafe { AvSetMmThreadCharacteristicsW(windows::core::w!("Audio"), &mut task_idx) } {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::debug!(%e, "MMCSS Audio registration failed; falling back to THREAD_PRIORITY_HIGHEST");
+                // SAFETY: pseudo-handle of the current thread (never closed).
+                let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) };
+                None
+            }
+        };
+        let thread = THREAD_POWER_THROTTLING_STATE {
+            Version: THREAD_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: THREAD_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: 0,
+        };
+        // SAFETY: pseudo-handle of this thread and stack-pinned struct alive for the call.
+        if let Err(e) = unsafe {
+            SetThreadInformation(
+                GetCurrentThread(),
+                ThreadPowerThrottling,
+                (&raw const thread).cast(),
+                size_of::<THREAD_POWER_THROTTLING_STATE>() as u32,
+            )
+        } {
+            tracing::debug!(%e, "audio thread kept default power throttling");
+        }
+        AudioThreadGuard { mmcss }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        AudioThreadGuard {}
+    }
+}
+
 /// Remaps imported ducking source IDs to the engine's live IDs, dropping sources that failed to
 /// open and ensuring no source ducks itself.
 fn remap_ducking(

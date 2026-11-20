@@ -652,10 +652,14 @@ impl Feeder {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) struct TestMonitor {
+    pub(crate) feeder: Feeder,
+    ring: Arc<Ring>,
+}
 
-    fn test_feeder(src_rate: u32, dst_rate: u32, channels: usize) -> (Feeder, Arc<Ring>) {
+#[cfg(test)]
+impl TestMonitor {
+    pub(crate) fn new(src_rate: u32, dst_rate: u32, channels: usize) -> Self {
         let stats = Arc::new(Stats::default());
         let ring = Arc::new(Ring::new(dst_rate, channels, stats.clone()));
         let resampler = MonitorResampler::new(src_rate, dst_rate).unwrap_or_else(|e| panic!("{e}"));
@@ -674,7 +678,29 @@ mod tests {
             device: Arc::new(DeviceSlot::new(Some("test".into()))),
             idle_skipped: Arc::new(AtomicBool::new(false)),
         };
-        (feeder, ring)
+        Self { feeder, ring }
+    }
+
+    pub(crate) fn pull(&self, out: &mut [f32]) {
+        self.ring.pull(out);
+    }
+
+    pub(crate) fn stats(&self) -> (u64, u64) {
+        (self.feeder.stats.short.load(Ordering::Relaxed), self.feeder.stats.played.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn queued_frames(&self) -> usize {
+        self.ring.len() / self.ring.channels.max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_feeder(src_rate: u32, dst_rate: u32, channels: usize) -> (Feeder, Arc<Ring>) {
+        let tm = TestMonitor::new(src_rate, dst_rate, channels);
+        (tm.feeder, tm.ring)
     }
 
     /// Speakers that stop (unplugged, the system's default changed) are opened again and play

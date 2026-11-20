@@ -487,6 +487,15 @@ impl std::fmt::Debug for Source {
     }
 }
 
+/// Outcome of [`Mixer::attach_plugins`].
+#[derive(Debug, Default)]
+pub struct AttachOutcome {
+    /// Plugins that became stale or incompatible while building, to drop off-thread.
+    pub rejected: Vec<Box<dyn crate::afx::SoundPlugin>>,
+    /// Filters whose live settings changed incompatibly with retune and need a fresh build.
+    pub rebuild: Vec<(u64, AudioEffect)>,
+}
+
 /// The mixer.
 #[derive(Debug)]
 pub struct Mixer {
@@ -573,6 +582,26 @@ fn db(v: f32) -> f32 {
     if v <= 0.0 { f32::NEG_INFINITY } else { 20.0 * v.log10() }
 }
 
+/// Pushes mono-summed stereo audio `(l, r)` into a tap buffer capped at `TAP_SECONDS`.
+pub(crate) fn push_tap_planar(buf: &std::sync::Mutex<VecDeque<f32>>, l: &[f32], r: &[f32], rate: u32) {
+    let max = TAP_SECONDS * rate as usize;
+    if let Ok(mut b) = buf.lock() {
+        b.extend(l.iter().zip(r).map(|(a, b)| (a + b) * 0.5));
+        let over = b.len().saturating_sub(max);
+        b.drain(..over);
+    }
+}
+
+/// Pushes mono-summed interleaved stereo audio into a tap buffer capped at `TAP_SECONDS`.
+pub(crate) fn push_tap_interleaved(buf: &std::sync::Mutex<VecDeque<f32>>, stereo: &[f32], rate: u32) {
+    let max = TAP_SECONDS * rate as usize;
+    if let Ok(mut b) = buf.lock() {
+        b.extend(stereo.as_chunks::<2>().0.iter().map(|f| (f[0] + f[1]) * 0.5));
+        let over = b.len().saturating_sub(max);
+        b.drain(..over);
+    }
+}
+
 /// Gives source `id`'s sound to its taps (at the mixer's rate only: every capture here gives
 /// it; other rates aren't tapped).
 #[allow(clippy::type_complexity)]
@@ -586,14 +615,9 @@ fn feed_taps(
     if rate != mixer_rate {
         return;
     }
-    let max = TAP_SECONDS * mixer_rate as usize;
     for (_, t) in taps.iter().filter(|(i, _)| *i == id) {
-        if let Some(buf) = t.upgrade()
-            && let Ok(mut b) = buf.lock()
-        {
-            b.extend(l.iter().zip(r).map(|(a, b)| (a + b) * 0.5));
-            let over = b.len().saturating_sub(max);
-            b.drain(..over);
+        if let Some(buf) = t.upgrade() {
+            push_tap_planar(&buf, l, r, mixer_rate);
         }
     }
 }
@@ -720,6 +744,13 @@ impl Mixer {
         }
     }
 
+    /// Updates every source's active flag against a sorted slice `active` without allocating.
+    pub fn sync_active_sorted(&mut self, active: &[u64]) {
+        for (id, s) in &mut self.sources {
+            s.active = active.binary_search(id).is_ok();
+        }
+    }
+
     /// Whether any active, unmuted source is routed to monitoring.
     pub fn has_monitored(&self) -> bool {
         let mon_dev = self.monitor_device.as_deref();
@@ -777,9 +808,14 @@ impl Mixer {
     /// Starts listening to source `id`'s sound (see [`Tap`]).
     pub fn tap(&mut self, id: u64) -> Tap {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-        self.taps.retain(|(_, t)| t.strong_count() > 0);
-        self.taps.push((id, std::sync::Arc::downgrade(&buf)));
+        self.attach_tap(id, std::sync::Arc::downgrade(&buf));
         Tap(buf)
+    }
+
+    /// Registers a pre-created tap handle for source `id`.
+    pub fn attach_tap(&mut self, id: u64, tap: std::sync::Weak<std::sync::Mutex<std::collections::VecDeque<f32>>>) {
+        self.taps.retain(|(_, t)| t.strong_count() > 0);
+        self.taps.push((id, tap));
     }
 
     /// A source's sound settings, if it's in the mix.
@@ -831,12 +867,45 @@ impl Mixer {
     /// compressor made it anew each step: a click each time), and only the rest are made new.
     pub fn set_effects(&mut self, id: u64, effects: &[AudioEffect]) {
         let rate = self.rate;
+        let _ = self.apply_effects_core(id, effects, |e| AudioFilter::new(*e, rate));
+    }
+
+    /// Updates `id`'s filters without constructing or dropping heavy [`SoundPlugin`]s on the
+    /// calling thread. Returns evicted filters (for off-thread drop) and `(build_id, effect)` pairs
+    /// whose plugins should be constructed off-thread and installed via [`Self::attach_plugins`].
+    pub fn set_effects_nonblocking(
+        &mut self,
+        id: u64,
+        effects: &[AudioEffect],
+        next_build_id: &mut impl FnMut() -> u64,
+        needs_plugin: &dyn Fn(AudioEffect, u32) -> bool,
+    ) -> (Vec<AudioFilter>, Vec<(u64, AudioEffect)>) {
+        let rate = self.rate;
+        let mut missing = Vec::new();
+        let evicted = self.apply_effects_core(id, effects, |e| {
+            let mut f = AudioFilter::new_without_plugin(*e, rate);
+            if needs_plugin(*e, rate) {
+                let bid = next_build_id();
+                f.pending_build = Some(bid);
+                missing.push((bid, *e));
+            }
+            f
+        });
+        (evicted, missing)
+    }
+
+    fn apply_effects_core(
+        &mut self,
+        id: u64,
+        effects: &[AudioEffect],
+        mut make_new: impl FnMut(&AudioEffect) -> AudioFilter,
+    ) -> Vec<AudioFilter> {
         // Filters set before the source is in the mix (a slow file still opening) are kept: it's
         // put in with the defaults, its settings come when they're set (they were dropped).
         if !effects.is_empty() {
             self.ensure(id);
         }
-        let Some(s) = self.sources.get_mut(&id) else { return };
+        let Some(s) = self.sources.get_mut(&id) else { return Vec::new() };
         let held = |fs: &[AudioFilter]| fs.iter().map(AudioFilter::latency_frames).sum::<usize>();
         let before = held(&s.filters);
         let mut old: Vec<Option<AudioFilter>> = std::mem::take(&mut s.filters).into_iter().map(Some).collect();
@@ -860,14 +929,20 @@ impl Mixer {
             }
         }
         // …and the rest are made.
-        s.filters =
-            made.into_iter().zip(effects).map(|(f, e)| f.unwrap_or_else(|| AudioFilter::new(*e, rate))).collect();
+        s.filters = made.into_iter().zip(effects).map(|(f, e)| f.unwrap_or_else(|| make_new(e))).collect();
+        let evicted: Vec<AudioFilter> = old.into_iter().flatten().collect();
         // A filter that holds the sound back (the strong noise removal) files the source's sound
         // that much earlier: the mixer waits that much longer at once, rather than finding the
         // sound late and cutting its start.
         // Each source is held back by its own filters only: the wait covers the most any one
         // needs (its usual wait plus that), not the sum of them all.
         let now = held(&s.filters);
+        self.raise_latency_for_filters(before, now);
+        evicted
+    }
+
+    fn raise_latency_for_filters(&mut self, before: usize, now: usize) {
+        let rate = self.rate;
         let need = (self.floor_ns + now as u64 * 1_000_000_000 / u64::from(rate)).min(self.cap_ns());
         if now > before && need > self.latency_ns {
             let was = self.latency_ns;
@@ -881,8 +956,69 @@ impl Mixer {
         }
     }
 
-    pub fn remove(&mut self, id: u64) {
-        self.sources.remove(&id);
+    /// Attaches off-thread built [`SoundPlugin`]s matching their `build_id`s, returning any stale
+    /// or incompatible plugins (to drop off-thread) and any `(build_id, effect)` pairs that need a
+    /// fresh build because the filter changed incompatibly or declined `retune`.
+    pub fn attach_plugins(
+        &mut self,
+        id: u64,
+        plugins: Vec<(u64, AudioEffect, Box<dyn crate::afx::SoundPlugin>)>,
+    ) -> AttachOutcome {
+        let mut out = AttachOutcome::default();
+        let Some(s) = self.sources.get_mut(&id) else {
+            for (.., p) in plugins {
+                out.rejected.push(p);
+            }
+            return out;
+        };
+        let held = |fs: &[AudioFilter]| fs.iter().map(AudioFilter::latency_frames).sum::<usize>();
+        let before = held(&s.filters);
+        for (build_id, effect, mut plugin) in plugins {
+            let Some(slot) = s.filters.iter_mut().find(|f| f.pending_build == Some(build_id)) else {
+                out.rejected.push(plugin);
+                continue;
+            };
+            if slot.effect != effect {
+                let compatible = std::mem::discriminant(&slot.effect) == std::mem::discriminant(&effect)
+                    && !matches!(
+                        (slot.effect, effect),
+                        (AudioEffect::Plugin { slot: a }, AudioEffect::Plugin { slot: b }) if a != b
+                    );
+                if !compatible {
+                    slot.pending_build = None;
+                    out.rejected.push(plugin);
+                    continue;
+                }
+                if !plugin.retune(&slot.effect) {
+                    out.rejected.push(plugin);
+                    out.rebuild.push((build_id, slot.effect));
+                    continue;
+                }
+            }
+            slot.install_plugin(plugin);
+        }
+        let now = held(&s.filters);
+        self.raise_latency_for_filters(before, now);
+        out
+    }
+
+    /// Clears queued audio and timing state for source `id` (e.g. on media pause, stop, or seek),
+    /// while preserving settings, filters, and learned clock-drift slope.
+    pub fn flush_source(&mut self, id: u64) {
+        let Some(s) = self.sources.get_mut(&id) else { return };
+        s.queue.clear();
+        s.start_ns = None;
+        s.adjust_ns = 0;
+        s.drift.reset_segment();
+        s.drift.tail[0].clear();
+        s.drift.tail[1].clear();
+        if let Some(rs) = &mut s.resampler {
+            rs.reset(&mut s.queue);
+        }
+    }
+
+    pub fn remove(&mut self, id: u64) -> Option<Vec<AudioFilter>> {
+        self.sources.remove(&id).map(|s| s.filters)
     }
 
     /// Music quieter while the voices talk (None: off). Kept going when only its settings change.
