@@ -23,10 +23,12 @@ use std::time::Duration;
 #[cfg(any(windows, test))]
 mod crash;
 mod log_limit;
-#[cfg(target_os = "macos")]
-mod mac_update;
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
+mod mac_quit;
+#[cfg(target_os = "macos")]
+mod mac_update;
 mod menu;
 mod quit;
 mod store;
@@ -447,6 +449,9 @@ fn main() {
             #[cfg(target_os = "macos")]
             quit::request(app);
         }
+        // macOS: the app delegate gets the answer to a Quit from the Dock or an AppleEvent.
+        #[cfg(target_os = "macos")]
+        RunEvent::Ready => mac_quit::install(app),
         // macOS: clicking the Dock icon of a running app brings back the hidden window.
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
@@ -958,6 +963,18 @@ async fn follow_settings(app: AppHandle, engine: Engine, shell: Arc<Shell>) {
             hotkey = Some(wanted);
         }
         tokio::time::sleep(SETTINGS_EVERY).await;
+    }
+}
+
+/// The show-window key and the panic key put back, after a shortcut field let every global
+/// shortcut go (see `studio_keys::capture`).
+pub(crate) fn restore_app_shortcuts(app: &AppHandle) {
+    if let Err(e) = app.global_shortcut().register(shortcut_of(SHOW_SHORTCUT)) {
+        tracing::warn!(error = %e, "couldn't register the show-window shortcut again (another app may use it)");
+    }
+    if let (Some(shell), Some(running)) = (app.try_state::<Arc<Shell>>(), app.try_state::<Running>()) {
+        let wanted = running.engine.panic_state().1.hotkey.trim().to_string();
+        set_panic_hotkey(app, &shell, &wanted);
     }
 }
 

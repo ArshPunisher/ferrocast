@@ -2442,6 +2442,24 @@ impl Engine {
         reconnecting_reason(&states)
     }
 
+    /// The state of every enabled main destination (those that run, and those that gave up).
+    pub(crate) fn golive_main_states(&self) -> Vec<PushState> {
+        let cfg = self.golive_config();
+        let g = self.golive();
+        let running = lock(&g.running);
+        let failed = lock(&g.failed);
+        cfg.destinations
+            .iter()
+            .filter(|d| d.canvas == Canvas::Main && d.enabled && !backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
+            .filter_map(|d| {
+                running
+                    .get(&d.id)
+                    .map(|r| r.health.borrow().state.clone())
+                    .or_else(|| failed.get(&d.id).map(|h| h.state.clone()))
+            })
+            .collect()
+    }
+
     /// Records any destination that reached `PushState::Failed`, alerts the dashboard once per
     /// stream, and stops the Studio stream when every enabled main destination has failed so the
     /// Studio stops showing LIVE for a dead broadcast.
@@ -2825,6 +2843,35 @@ fn reconnecting_reason(states: &[PushState]) -> Option<String> {
         PushState::Reconnecting { reason, .. } => Some(reason.clone()),
         _ => None,
     })
+}
+
+/// The most the stream's health may read while some, but not all, of the platforms it goes to
+/// have failed or are reconnecting (the status bar showed 100 with Kick down; the API, a phone
+/// and the logs said so too). All of them down is reported as the stream failing instead.
+pub(crate) const PARTIAL_FAILURE_HEALTH: u64 = 75;
+
+/// `Some(cap)` for the health score when part of the platforms are down.
+pub(crate) fn partial_failure_cap(states: &[PushState]) -> Option<u64> {
+    let down = |s: &PushState| matches!(s, PushState::Failed { .. } | PushState::Reconnecting { .. });
+    let n = states.iter().filter(|s| down(s)).count();
+    (n > 0 && n < states.len()).then_some(PARTIAL_FAILURE_HEALTH)
+}
+
+#[cfg(test)]
+mod partial_failure_tests {
+    use super::*;
+
+    #[test]
+    fn one_of_several_platforms_down_caps_the_health() {
+        let failed = PushState::Failed { reason: "key refused".into(), attempts: 3, detail: None, refused: true };
+        let re = PushState::Reconnecting { attempt: 2, retry_in_ms: 1000, reason: "net".into() };
+        assert_eq!(partial_failure_cap(&[PushState::Live, failed.clone()]), Some(75));
+        assert_eq!(partial_failure_cap(&[PushState::Live, PushState::Live, re.clone()]), Some(75));
+        // All fine, or all down (the stream's own failure path says that), or none: no cap.
+        assert_eq!(partial_failure_cap(&[PushState::Live, PushState::Live]), None);
+        assert_eq!(partial_failure_cap(&[failed.clone(), re]), None);
+        assert_eq!(partial_failure_cap(&[]), None);
+    }
 }
 
 #[cfg(test)]

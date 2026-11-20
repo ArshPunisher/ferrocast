@@ -144,7 +144,7 @@ pub fn convert(doc: &mut Value, web_kind: Option<&str>, known: Option<&BTreeSet<
                     set.get("url").and_then(Value::as_str).unwrap_or_default().to_string()
                 };
                 let mut out = json!({ "url": url });
-                for k in ["width", "height", "css"] {
+                for k in ["width", "height", "css", "reroute_audio"] {
                     if let Some(v) = set.get(k) {
                         out[k] = v.clone();
                     }
@@ -206,7 +206,7 @@ mod tests {
         assert_eq!(alerts["versioned_id"], "ferrocast_web");
         assert_eq!(
             alerts["settings"],
-            json!({ "url": "http://127.0.0.1:47820/o/abc", "width": 1280, "height": 720, "css": "body{}", "fps": 60 })
+            json!({ "url": "http://127.0.0.1:47820/o/abc", "width": 1280, "height": 720, "css": "body{}", "fps": 60, "reroute_audio": true })
         );
         assert_eq!(d["sources"][3]["settings"]["url"], "file:///Users/me/My%20Overlay/index.html");
     }

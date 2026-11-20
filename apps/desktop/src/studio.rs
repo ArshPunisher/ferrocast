@@ -2280,6 +2280,10 @@ impl StudioHost for DesktopStudio {
             .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))
     }
 
+    fn capture_keys(&self, on: bool) {
+        crate::studio_keys::capture(&self.app, on);
+    }
+
     fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
         serde_json::to_value(ferrocast_studio::stage::levels_now(names, fast)?).ok()
     }
