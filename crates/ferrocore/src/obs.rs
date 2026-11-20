@@ -64,6 +64,19 @@ fn color(v: u64) -> [u8; 4] {
     [(v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8, ((v >> 24) & 0xff) as u8]
 }
 
+/// OBS's v1 Color Correction multiplies contrast by `setting + 1` (round mid-grey); v2 and our
+/// own filter use `1 / (1 - setting)` below 0 and `setting + 1` above. So a v1 setting below 0 is
+/// carried as the v2 setting that gives the same multiplier (`-0.5` → 0.5 → `-1.0`), and one at
+/// or below -1 (OBS's multiplier of 0 or less: a flat grey, or the picture inverted) as the
+/// flattest we make, a multiplier of 0.01.
+fn color_filter_v1_contrast(setting: f32) -> f32 {
+    if !setting.is_finite() || setting >= 0.0 {
+        return if setting.is_finite() { setting } else { 0.0 };
+    }
+    let multiplier = (setting + 1.0).max(0.01);
+    1.0 - 1.0 / multiplier
+}
+
 /// A source's picture filter, from OBS's id and settings; None for one the engine lacks.
 pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
     let n = |k: &str, d: f64| f(s, k, d);
@@ -156,7 +169,7 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             };
             Effect::ColorCorrection {
                 gamma: n("gamma", 0.0),
-                contrast: n("contrast", 0.0),
+                contrast: if v2 { n("contrast", 0.0) } else { color_filter_v1_contrast(n("contrast", 0.0)) },
                 brightness: n("brightness", 0.0),
                 saturation: n("saturation", 0.0),
                 hue_shift: n("hue_shift", 0.0),
@@ -2373,6 +2386,28 @@ mod tests {
     /// OBS v1 video filter IDs (`chroma_key_filter`, `color_key_filter`, `color_filter`,
     /// `luma_key_filter`, `sharpness_filter`) import with exact OBS v1 opacity/brightness/color
     /// conversions, and v2 keyer smoothness/spill clamp >= 1.0 to avoid shader 0/0 NaNs.
+    #[test]
+    fn color_correction_contrast_keeps_each_obs_versions_multiplier() {
+        // OBS v1: multiplier = setting + 1. v2: setting < 0 → 1 / (1 - setting), else setting + 1.
+        // Ours is the v2 curve, so v1's negative settings are converted at import.
+        let ours = |c: f32| if c < 0.0 { 1.0 / (1.0 - c) } else { c + 1.0 };
+        let imported = |kind: &str, c: f64| match effect_from(kind, &json!({ "contrast": c })) {
+            Some(Effect::ColorCorrection { contrast, .. }) => contrast,
+            other => panic!("{other:?}"),
+        };
+        for c in [-0.9_f64, -0.5, -0.25, 0.0, 0.5, 2.0] {
+            let v1 = ours(imported("color_filter", c));
+            assert!((v1 - (c as f32 + 1.0)).abs() < 1e-5, "v1 {c}: multiplier {v1}");
+            let v2_setting = imported("color_filter_v2", c);
+            assert_eq!(v2_setting, c as f32, "v2 settings are ours as they are");
+        }
+        // v1 at or below -1 (multiplier 0 or less in OBS) is the flattest, never inverted.
+        for c in [-1.0_f64, -1.5, -2.0] {
+            let m = ours(imported("color_filter", c));
+            assert!((0.0..=0.02).contains(&m), "v1 {c}: multiplier {m}");
+        }
+    }
+
     #[test]
     fn obs_v1_and_v2_video_filters_import_with_correct_scaling() {
         // v1 Chroma Key: opacity 0..100 -> 0..1, brightness * 0.5, zero smoothness clamped to 1.0.
