@@ -578,7 +578,7 @@ pub(crate) mod projector_window {
 
     use dispatch2::DispatchQueue;
     use objc2::rc::Retained;
-    use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+    use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
     use objc2_app_kit::{
         NSBackingStoreType, NSEvent, NSResponder, NSScreen, NSView, NSWindow, NSWindowCollectionBehavior,
@@ -594,6 +594,36 @@ pub(crate) mod projector_window {
         pub close: Box<dyn Fn()>,
         /// The view's new size in pixels.
         pub resize: Box<dyn Fn(u32, u32)>,
+        /// The pointer is hidden over the window (a blank cursor over the whole view).
+        pub hide_cursor: std::cell::Cell<bool>,
+    }
+
+    thread_local! {
+        /// The blank cursor (an NSCursor with a clear 1×1 picture), made once, on the main thread.
+        static BLANK: std::cell::RefCell<Option<Retained<AnyObject>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// An NSCursor that draws nothing.
+    fn blank_cursor() -> Option<Retained<AnyObject>> {
+        BLANK.with(|b| {
+            if b.borrow().is_none() {
+                let image_class = AnyClass::get(c"NSImage")?;
+                let cursor_class = AnyClass::get(c"NSCursor")?;
+                // SAFETY: NSImage's alloc/initWithSize: with a valid size, on the main thread.
+                let image: Option<Retained<AnyObject>> = unsafe {
+                    let a: *mut AnyObject = msg_send![image_class, alloc];
+                    Retained::from_raw(msg_send![a, initWithSize: NSSize::new(1.0, 1.0)])
+                };
+                let image = image?;
+                // SAFETY: NSCursor's alloc/initWithImage:hotSpot: with that image.
+                let cursor: Option<Retained<AnyObject>> = unsafe {
+                    let a: *mut AnyObject = msg_send![cursor_class, alloc];
+                    Retained::from_raw(msg_send![a, initWithImage: &*image, hotSpot: NSPoint::new(0.0, 0.0)])
+                };
+                *b.borrow_mut() = cursor;
+            }
+            b.borrow().clone()
+        })
     }
 
     /// Carries main-thread values to the main queue, where alone they're used.
@@ -644,6 +674,20 @@ pub(crate) mod projector_window {
                 // Esc leaves a full-screen projector (OBS's key for it).
                 if e.keyCode() == 53 {
                     later(self.ivars(), |h| (h.close)());
+                }
+            }
+
+            /// Over the window the pointer is blank when asked: a cursor area on the whole view,
+            /// so it comes back by itself the moment the pointer leaves.
+            #[unsafe(method(resetCursorRects))]
+            fn reset_cursor_rects(&self) {
+                if self.ivars().hide_cursor.get()
+                    && let Some(c) = blank_cursor()
+                {
+                    let b = self.bounds();
+                    // SAFETY: NSView's addCursorRect:cursor: from inside its own resetCursorRects,
+                    // with an NSCursor we hold.
+                    let _: () = unsafe { msg_send![self, addCursorRect: b, cursor: &*c] };
                 }
             }
 
@@ -833,6 +877,15 @@ pub(crate) mod projector_window {
             if MainThreadMarker::new().is_some() && self.window.level() != 25 {
                 // NSFloatingWindowLevel is 3; NSNormalWindowLevel 0.
                 self.window.setLevel(if on { 3 } else { 0 });
+            }
+        }
+
+        /// Hides the pointer over the window, or shows it again.
+        pub fn set_hide_cursor(&self, on: bool) {
+            if MainThreadMarker::new().is_some() {
+                self.view.ivars().hide_cursor.set(on);
+                // SAFETY: NSWindow's own invalidateCursorRectsForView: with our live view.
+                let _: () = unsafe { msg_send![&*self.window, invalidateCursorRectsForView: &*self.view] };
             }
         }
 

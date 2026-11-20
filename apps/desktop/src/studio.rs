@@ -2011,6 +2011,7 @@ fn open_projector(h: &mut Held, p: &ProjectorReq, data: &std::path::Path) -> Res
     if p.on_top || settings.projector_on_top {
         made.set_on_top(true);
     }
+    made.set_hide_cursor(settings.projector_hide_cursor);
     // One full-screen projector per display: the one already on it goes (after the new one is
     // up, so the picture never leaves the screen).
     if settings.projector_one_per_screen && p.screen.is_some() {
@@ -4660,6 +4661,11 @@ mod projector_tests {
         assert_eq!(back, list);
         // The settings file of an older version has none of the new fields: today's behaviour.
         let old: StudioSettings = serde_json::from_str(r#"{ "video_kbps": 4500 }"#).unwrap();
-        assert!(!old.projector_on_top && !old.projector_one_per_screen && !old.projector_restore);
+        assert!(
+            !old.projector_on_top
+                && !old.projector_one_per_screen
+                && !old.projector_restore
+                && !old.projector_hide_cursor
+        );
     }
 }

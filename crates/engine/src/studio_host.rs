@@ -962,6 +962,9 @@ pub struct StudioSettings {
     pub projector_one_per_screen: bool,
     /// The projectors open when Ferrocast quits come back at the next Start.
     pub projector_restore: bool,
+    /// OBS's "Hide cursor over projectors": the pointer is hidden while it is over a projector
+    /// window and comes back when it leaves.
+    pub projector_hide_cursor: bool,
 }
 
 /// The replay buffer's memory cap when none is set: it kept encoded video in RAM without a limit.
@@ -1049,6 +1052,7 @@ impl Default for StudioSettings {
             projector_on_top: false,
             projector_one_per_screen: false,
             projector_restore: false,
+            projector_hide_cursor: false,
         }
     }
 }
@@ -4059,7 +4063,12 @@ mod tests {
         let old: StudioSettings = serde_json::from_str(r#"{ "video_kbps": 4500 }"#).unwrap();
         assert_eq!((old.video_kbps, old.fps), (4500, 30));
         // The projector options are off until asked for: today's behaviour.
-        assert!(!old.projector_on_top && !old.projector_one_per_screen && !old.projector_restore);
+        assert!(
+            !old.projector_on_top
+                && !old.projector_one_per_screen
+                && !old.projector_restore
+                && !old.projector_hide_cursor
+        );
         assert!(
             !StudioAct::Audio { scene: "x".into() }.changes() && StudioAct::RemoveScene { scene: "x".into() }.changes()
         );

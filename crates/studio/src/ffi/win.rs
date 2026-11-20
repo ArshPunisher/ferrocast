@@ -439,6 +439,7 @@ mod tests {
 /// Projector windows on Windows (the macOS ones are `ffi::projector_window`): titled and
 /// resizable, or borderless over a whole display, with the same hooks.
 pub mod projector {
+    use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Once;
 
@@ -450,11 +451,12 @@ pub mod projector {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AdjustWindowRectEx, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_USERDATA,
-        GetClientRect, GetWindowLongPtrW, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, LoadCursorW, MONITORINFOF_PRIMARY,
-        PostMessageW, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetForegroundWindow,
-        SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-        WM_NCDESTROY, WM_SIZE, WM_SIZING, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT,
-        WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+        GetClientRect, GetWindowLongPtrW, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, LoadCursorW,
+        MONITORINFOF_PRIMARY, PostMessageW, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetCursor,
+        SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN,
+        WM_LBUTTONDOWN, WM_NCDESTROY, WM_SETCURSOR, WM_SIZE, WM_SIZING, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT,
+        WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+        WS_POPUP, WS_VISIBLE,
     };
 
     use super::point_of;
@@ -467,6 +469,8 @@ pub mod projector {
         pub close: Box<dyn Fn()>,
         /// The view's new size in pixels.
         pub resize: Box<dyn Fn(u32, u32)>,
+        /// The pointer is hidden over the window.
+        pub hide_cursor: Cell<bool>,
     }
 
     /// Posted to itself so `close` runs after the message that asked for it, never inside it
@@ -536,6 +540,12 @@ pub mod projector {
                 let hooks = state.hooks.clone();
                 (hooks.close)();
                 0
+            }
+            // Over the picture the pointer is hidden when asked (OBS's "Hide cursor over projectors").
+            WM_SETCURSOR if state.hooks.hide_cursor.get() && (lparam & 0xffff) as u32 == HTCLIENT => {
+                // SAFETY: a null cursor hides the pointer for this message; Windows asks again as it moves.
+                unsafe { SetCursor(std::ptr::null_mut()) };
+                1
             }
             WM_SIZE => {
                 let (w, h) = (lparam as u32 & 0xffff, (lparam as u32 >> 16) & 0xffff);
@@ -729,6 +739,14 @@ pub mod projector {
                 let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
                 // SAFETY: changes only this live window's z-order.
                 unsafe { SetWindowPos(self.hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+            }
+        }
+
+        /// Hides the pointer over the window, or shows it again.
+        pub fn set_hide_cursor(&self, on: bool) {
+            // SAFETY: GWLP_USERDATA holds this window's State (boxed in `open`, alive while `Win` is).
+            if let Some(state) = unsafe { (GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const State).as_ref() } {
+                state.hooks.hide_cursor.set(on);
             }
         }
 
