@@ -4,7 +4,7 @@
 //! the person by it). Until the first mask the picture shows as it is.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -66,21 +66,31 @@ pub(crate) struct Cutout {
     /// The engine it works for (a new one needs a new worker).
     engine: Weak<Shared>,
     stop: Arc<AtomicBool>,
+    /// The mask pictures it feeds: one worker serves every filter on its source.
+    masks: Arc<Mutex<Vec<String>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Cutout {
-    /// Finds the person in `source` and hands masks to the picture called `mask`.
-    pub(crate) fn start(engine: Weak<Shared>, source: String, mask: String) -> Self {
+    /// Finds the person in `source` and hands masks to the pictures called `masks`.
+    pub(crate) fn start(engine: Weak<Shared>, source: String, masks: Vec<String>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let masks = Arc::new(Mutex::new(masks));
         let thread = {
-            let (stop, engine) = (stop.clone(), engine.clone());
+            let (stop, engine, masks) = (stop.clone(), engine.clone(), masks.clone());
             std::thread::Builder::new()
                 .name("ferrocast-cutout".into())
-                .spawn(move || run(&engine, &source, &mask, &stop))
+                .spawn(move || run(&engine, &source, &masks, &stop))
                 .ok()
         };
-        Self { engine, stop, thread }
+        Self { engine, stop, masks, thread }
+    }
+
+    /// Changes which pictures it feeds (the same source, other filters or items).
+    pub(crate) fn set_masks(&self, masks: Vec<String>) {
+        if let Ok(mut m) = self.masks.lock() {
+            *m = masks;
+        }
     }
 
     /// Whether it works for this engine.
@@ -91,35 +101,49 @@ impl Cutout {
 
 impl Drop for Cutout {
     fn drop(&mut self) {
+        // Not joined: a pass of Vision can take 200 ms, and this runs on the UI thread (a delete,
+        // an undo). The thread sees `stop` after its pass and ends; it holds only a Weak engine.
         self.stop.store(true, Ordering::Release);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        drop(self.thread.take());
     }
 }
 
-fn run(engine: &Weak<Shared>, source: &str, mask: &str, stop: &AtomicBool) {
-    // The mask picture the last mask went to: a new one (the collection opened again) starts
+fn run(engine: &Weak<Shared>, source: &str, masks: &Mutex<Vec<String>>, stop: &AtomicBool) {
+    // The mask picture each name last went to: a new one (the collection opened again) starts
     // clear, so it's given "all person" at once.
-    let mut fed_id = None;
+    let mut fed_ids = std::collections::HashMap::new();
     let mut finder = Finder::default();
     while !stop.load(Ordering::Acquire) {
         let started = Instant::now();
         let Some(shared) = engine.upgrade() else { return };
         let e = &shared.engine;
-        if let (Some((src, Some((w, h)))), Some((mid, _))) = (e.source_named(source), e.source_named(mask))
-            && let Some(feed) = e.fed(mid)
-        {
-            if fed_id != Some(mid) {
-                fed_id = Some(mid);
-                feed.picture(Picture { width: 1, height: 1, rgba: vec![255; 4], premultiplied: false });
+        let names = masks.lock().map(|m| m.clone()).unwrap_or_default();
+        fed_ids.retain(|n, _| names.contains(n));
+        if let Some((src, Some((w, h)))) = e.source_named(source) {
+            let targets: Vec<_> = names
+                .iter()
+                .filter_map(|n| {
+                    let (mid, _) = e.source_named(n)?;
+                    Some((n, mid, e.fed(mid)?))
+                })
+                .collect();
+            for (n, mid, feed) in &targets {
+                if fed_ids.get(*n) != Some(mid) {
+                    fed_ids.insert((*n).clone(), *mid);
+                    feed.picture(Picture { width: 1, height: 1, rgba: vec![255; 4], premultiplied: false });
+                }
             }
-            let (sw, sh) = finder.size(w, h);
-            if let Some(rgba) = e.snapshot_source_at(src, (sw, sh))
-                && let Some((px, mw, mh)) = finder.person(&rgba, sw, sh)
-            {
-                let rgba = px.iter().flat_map(|v| [*v, *v, *v, 255]).collect();
-                feed.picture(Picture { width: mw, height: mh, rgba, premultiplied: false });
+            if !targets.is_empty() {
+                let (sw, sh) = finder.size(w, h);
+                if let Some(rgba) = e.snapshot_source_at(src, (sw, sh))
+                    && let Some((px, mw, mh)) = finder.person(&rgba, sw, sh)
+                {
+                    // One look at the source, handed to each filter's picture.
+                    let rgba: Vec<u8> = px.iter().flat_map(|v| [*v, *v, *v, 255]).collect();
+                    for (_, _, feed) in &targets {
+                        feed.picture(Picture { width: mw, height: mh, rgba: rgba.clone(), premultiplied: false });
+                    }
+                }
             }
         }
         drop(shared);
