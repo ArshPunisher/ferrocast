@@ -135,7 +135,10 @@ impl AutoQuality {
             None => false,
             Some(l) => Self::trouble(l, &s),
         };
+        // Down at the look before: the first look with platforms live again proves nothing either.
+        let was_down = s_dests_all_down(&self.last);
         self.last = Some(s);
+        let now_down = s_dests_all_down(&self.last);
         if at - started < GRACE_MS {
             return None;
         }
@@ -149,11 +152,7 @@ impl AutoQuality {
             return None;
         }
         // Every platform down: nothing is being sent, so a quiet look proves nothing.
-        if !s_dests_all_down(&self.last)
-            && self.pct < 100
-            && at - self.last_trouble >= CALM_MS
-            && at - self.last_change >= CALM_MS
-        {
+        if !was_down && self.pct < 100 && at - self.last_trouble >= CALM_MS && at - self.last_change >= CALM_MS {
             self.pct = (self.pct + UP).min(100);
             self.last_change = at;
             return Some(self.pct);
@@ -237,7 +236,8 @@ mod tests {
             at += 2_000;
         }
         assert_eq!(q.pct(), 85, "held");
-        // Live again and calm: it climbs after the usual calm.
+        // Live again and calm: it climbs after the usual calm, not at the first look.
+        let mut up_at_first_live_look = None;
         let mut up = None;
         for i in 0..40 {
             let s = Signals {
@@ -247,11 +247,18 @@ mod tests {
                 ..Default::default()
             };
             if let Some(p) = q.tick(200_000 + i * 2_000, s) {
+                if i == 0 {
+                    up_at_first_live_look = Some(p);
+                }
                 up = Some(p);
                 break;
             }
         }
         assert_eq!(up, Some(95));
+        assert!(
+            up_at_first_live_look.is_none(),
+            "the first look with platforms back stepped the quality up: {up_at_first_live_look:?}"
+        );
     }
 
     #[test]
