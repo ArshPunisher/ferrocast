@@ -2742,6 +2742,108 @@ mod steady_state_tests {
         assert!(again.tracks.iter().all(|t| t.iter().all(|v| *v == 0.0)) && again.monitor.iter().all(|v| *v == 0.0));
     }
 
+    /// A filter toggled after the source went quiet (a pause, a muted mic, a stopped clip) must not
+    /// fade in a stale sample from before the pause: the resumed sound is exactly what it would
+    /// have been had the filter been there all along.
+    #[test]
+    fn toggling_a_filter_after_a_pause_adds_no_thump() {
+        for eff in [AudioEffect::Gain { db: 10.0 }, AudioEffect::InvertPolarity] {
+            let run = |toggle_during_pause: bool| -> Vec<f32> {
+                let mut m = Mixer::new(48_000, 0);
+                m.set(1, SourceSettings::default());
+                if !toggle_during_pause {
+                    m.set_effects(1, &[eff]);
+                }
+                let step = block_ns(48_000);
+                let t0 = 1_000_000_000u64;
+                let _ = m.mix_until(t0);
+                let mut sample_idx = 0usize;
+                let mut tone = |n: usize| {
+                    let mut pcm = Vec::with_capacity(n * 2);
+                    for _ in 0..n {
+                        let s = 0.25 * (std::f32::consts::TAU * 220.0 * sample_idx as f32 / 48_000.0).sin();
+                        pcm.push(s);
+                        pcm.push(s);
+                        sample_idx += 1;
+                    }
+                    pcm
+                };
+                let mut out = Vec::new();
+                // Two blocks of tone, then six blocks with nothing pushed (the pause).
+                for b in 0..8u64 {
+                    if b < 2 {
+                        let pcm = tone(BLOCK);
+                        m.push(1, &pcm, 2, 48_000, t0 + b * step);
+                    }
+                    for blk in m.mix_until(t0 + (b + 1) * step) {
+                        out.extend(blk.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+                    }
+                }
+                // The toggle comes during the silence, then the tone returns.
+                if toggle_during_pause {
+                    m.set_effects(1, &[eff]);
+                }
+                let pcm = tone(BLOCK);
+                m.push(1, &pcm, 2, 48_000, t0 + 8 * step);
+                for blk in m.mix_until(t0 + 9 * step) {
+                    out.extend(blk.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+                }
+                out[8 * BLOCK..].to_vec()
+            };
+            let toggled = run(true);
+            let always = run(false);
+            let worst = toggled.iter().zip(&always).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "{eff:?}: a toggle after a pause changed the resumed sound by {worst:.4}");
+        }
+    }
+
+    /// The audio thread's own way in (`set_effects_nonblocking`, the D1 path) retunes a running
+    /// filter in place like `set_effects` does: a gain dragged from 0 to +12 dB mid-tone is ramped
+    /// (no zipper click) and needs no de-click or rebuild.
+    #[test]
+    fn a_gain_dragged_through_the_audio_threads_path_is_ramped_in_place() {
+        let mut m = Mixer::new(48_000, 0);
+        m.set(1, SourceSettings::default());
+        let mut id = 0u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        let step = block_ns(48_000);
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let (_, missing) = m.set_effects_nonblocking(1, &[AudioEffect::Gain { db: 0.0 }], &mut next, &|_, _| false);
+        assert!(missing.is_empty());
+        let mut sample_idx = 0usize;
+        let mut out = Vec::new();
+        for b in 0..6u64 {
+            if b == 3 {
+                let (evicted, missing) =
+                    m.set_effects_nonblocking(1, &[AudioEffect::Gain { db: 12.0 }], &mut next, &|_, _| false);
+                assert!(evicted.is_empty() && missing.is_empty(), "retuned in place, nothing rebuilt");
+                assert!(!m.sources.get(&1).is_some_and(|s| s.filter_declick), "no step de-click for a retune");
+            }
+            let mut pcm = Vec::with_capacity(BLOCK * 2);
+            for _ in 0..BLOCK {
+                let s = 0.2 * (std::f32::consts::TAU * 220.0 * sample_idx as f32 / 48_000.0).sin();
+                pcm.push(s);
+                pcm.push(s);
+                sample_idx += 1;
+            }
+            m.push(1, &pcm, 2, 48_000, t0 + b * step);
+            for blk in m.mix_until(t0 + (b + 1) * step) {
+                out.extend(blk.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+            }
+        }
+        let at = 3 * BLOCK;
+        let worst = out[at - 2..at + 600].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        // 220 Hz at 0.2 moves 0.006 a sample; at +12 dB (x4) at most 0.026. A jump of the gain would
+        // step by up to 0.6.
+        assert!(worst < 0.04, "a gain drag clicked: max step {worst:.4}");
+        let end = out[out.len() - 480..].iter().fold(0.0f32, |a, x| a.max(x.abs()));
+        assert!(end > 0.7, "and reached +12 dB: peak {end:.3}");
+    }
+
     /// Toggling a filter on/off via `set_effects` (eye icon in UI) eases out the step jump so
     /// adding or removing `Gain +10 dB` or `InvertPolarity` mid-tone produces no click.
     #[test]

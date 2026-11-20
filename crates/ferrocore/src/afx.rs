@@ -2463,6 +2463,61 @@ mod tests {
         }
     }
 
+    /// A mono mic on one channel (the other silent) comes out of the stereo-linked Expander and
+    /// Upward compressor exactly as the same mic on both channels did: with nothing on the other
+    /// side the linked level is the mic's own, so saved scenes sound as they did.
+    #[test]
+    fn a_mono_mic_on_one_channel_sounds_as_it_did_before_linking() {
+        let mic: Vec<f32> = sine(300.0, db_to_mul(-12.0), 1.0)
+            .iter()
+            .zip(sine(3.0, 1.0, 1.0))
+            .map(|(a, e)| a * (0.3 + 0.7 * e.abs()))
+            .collect();
+        let effects = [
+            AudioEffect::Expander {
+                ratio: 4.0,
+                threshold_db: -30.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                rms: true,
+            },
+            AudioEffect::Expander {
+                ratio: 10.0,
+                threshold_db: -30.0,
+                attack_ms: 10.0,
+                release_ms: 125.0,
+                output_db: 0.0,
+                rms: false,
+            },
+            AudioEffect::UpwardCompressor {
+                ratio: 0.5,
+                threshold_db: -20.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                knee_db: 10.0,
+            },
+        ];
+        for eff in effects {
+            // On both channels (how a mono mic reaches the filters).
+            let mut both = AudioFilter::new_without_plugin(eff, RATE);
+            let (mut bl, mut br) = (mic.clone(), mic.clone());
+            for (a, b) in bl.chunks_mut(480).zip(br.chunks_mut(480)) {
+                both.process([a, b]);
+            }
+            // On the left only.
+            let mut left = AudioFilter::new_without_plugin(eff, RATE);
+            let (mut ll, mut lr) = (mic.clone(), vec![0.0f32; mic.len()]);
+            for (a, b) in ll.chunks_mut(480).zip(lr.chunks_mut(480)) {
+                left.process([a, b]);
+            }
+            let worst = bl.iter().zip(&ll).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-6, "{eff:?}: the left-only mic differs from the dual mono one by {worst}");
+            assert!(lr.iter().all(|v| v.abs() < 1e-6), "{eff:?}: the empty side stays empty");
+        }
+    }
+
     /// Sample-rate scaling across 44.1 kHz, 48 kHz, and 96 kHz preserves timings and EQ crossovers.
     #[test]
     fn sample_rates_44100_48000_96000_preserve_timings_and_eq() {
