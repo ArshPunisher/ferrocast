@@ -101,7 +101,14 @@ impl Notice {
 
     #[must_use]
     pub fn action(mut self, label: impl Into<String>, href: impl Into<String>) -> Self {
-        self.action = Some(NoticeAction { label: label.into(), href: href.into() });
+        self.action = Some(NoticeAction { label: label.into(), href: href.into(), post: None });
+        self
+    }
+
+    /// An action that is a POST of `body` to `href` (the dashboard makes the request).
+    #[must_use]
+    pub fn post_action(mut self, label: impl Into<String>, href: impl Into<String>, body: serde_json::Value) -> Self {
+        self.action = Some(NoticeAction { label: label.into(), href: href.into(), post: Some(body) });
         self
     }
 }
@@ -118,11 +125,28 @@ pub enum NoticeLevel {
 pub struct NoticeAction {
     pub label: String,
     pub href: String,
+    /// When set, the action is a request the dashboard makes (a POST to `href` with this body)
+    /// rather than a link it opens (Reload a stalled browser source).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_post_action_carries_its_request_and_a_link_action_does_not() {
+        let post = Notice::new(NoticeLevel::Warn, "x stopped drawing").post_action(
+            "Reload",
+            "/api/v1/studio/engine/sources/x/web",
+            json!({ "do": "reload" }),
+        );
+        let v = serde_json::to_value(&post).unwrap();
+        assert_eq!(v["action"]["post"], json!({ "do": "reload" }));
+        let link = serde_json::to_value(Notice::new(NoticeLevel::Info, "y").action("Open", "#/x")).unwrap();
+        assert!(link["action"].get("post").is_none(), "a link has no post");
+    }
 
     #[test]
     fn a_notice_is_one_line_and_its_detail_is_only_sent_when_there_is_one() {

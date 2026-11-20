@@ -3791,6 +3791,11 @@ impl Stage {
         }
     }
 
+    /// Which web page sources stopped drawing (their browser's watchdog gave up): (name, stalled).
+    pub fn stalled_pages(&self) -> Vec<(String, bool)> {
+        self.pages.borrow().iter().map(|(name, (_, page))| (name.clone(), page.stalled())).collect()
+    }
+
     /// What the captures this collection's engine opened want said on the dashboard, since the
     /// last call (each engine keeps its own).
     pub fn take_notices(&self) -> Vec<ferrocore::notices::Notice> {

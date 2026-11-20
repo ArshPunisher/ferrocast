@@ -537,6 +537,19 @@ impl Engine {
         self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key)));
     }
 
+    /// A notice with an action the dashboard makes as a request (a POST of `body` to `href`).
+    pub(crate) fn notice_post(
+        &self,
+        key: &str,
+        level: NoticeLevel,
+        message: &str,
+        detail: &str,
+        action: (&str, &str, serde_json::Value),
+    ) {
+        let n = Notice::new(level, message).key(key).detail(detail).post_action(action.0, action.1, action.2);
+        self.send_live(LiveFrame::new("notice", &n));
+    }
+
     /// The same with what the line leaves out (the engine's own words), behind an (i) on the page.
     pub(crate) fn notice_detail(&self, key: &str, level: NoticeLevel, message: &str, detail: &str) {
         self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key).detail(detail)));

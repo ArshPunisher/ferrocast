@@ -216,6 +216,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn record_stats(&self) -> Result<Value, String> {
         Ok(Value::Null)
     }
+    /// Web page sources and whether each stopped drawing (its browser gave up being brought back).
+    async fn stalled_sources(&self) -> Vec<(String, bool)> {
+        Vec::new()
+    }
     /// One-line things the Studio's captures want said (key, line, detail), since the last call.
     async fn take_notices(&self) -> Vec<(String, String, String)> {
         Vec::new()

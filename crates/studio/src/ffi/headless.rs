@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -42,6 +42,12 @@ struct Look {
 enum Cmd {
     Look(Look),
     Reload,
+    /// Tests: the screencast is stopped, as when a browser stops sending frames; with the
+    /// watchdog on or off.
+    #[cfg(test)]
+    Stall {
+        watchdog: bool,
+    },
 }
 
 /// A web page shown in a fed source. Dropping it closes the browser.
@@ -49,6 +55,8 @@ pub(crate) struct FedPage {
     tx: Option<Sender<Cmd>>,
     feed: Arc<Mutex<Feed>>,
     thread: Option<JoinHandle<()>>,
+    /// Set when the watchdog gave up: the page stopped drawing and reloads didn't bring it back.
+    stalled: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FedPage {
@@ -68,14 +76,30 @@ impl FedPage {
         let look = Look { url: file_url(url), w: w.max(1), h: h.max(1), css: css.to_string(), fps: fps.clamp(1, 60) };
         let (tx, rx) = channel();
         let feed = Arc::new(Mutex::new(feed));
+        let stalled = Arc::new(AtomicBool::new(false));
         let thread = {
             let feed = feed.clone();
+            let stalled = stalled.clone();
             std::thread::Builder::new()
                 .name("ferrocast-web-page".into())
-                .spawn(move || run(&browser, look, &rx, &feed))
+                .spawn(move || run(&browser, look, &rx, &feed, &stalled))
                 .ok()?
         };
-        Some(Self { tx: Some(tx), feed, thread: Some(thread) })
+        Some(Self { tx: Some(tx), feed, thread: Some(thread), stalled })
+    }
+
+    /// Tests: makes the browser stop sending frames.
+    #[cfg(test)]
+    pub(crate) fn stall_for_test(&self, watchdog: bool) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Cmd::Stall { watchdog });
+        }
+    }
+
+    /// Whether the page stopped drawing and the watchdog gave up ("This browser source stopped
+    /// drawing": the source shows a notice with a Reload action, which starts it over).
+    pub(crate) fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::Relaxed)
     }
 
     /// Our engine's source changed (the collection was opened again): its new feed.
@@ -151,13 +175,13 @@ fn browser() -> Option<PathBuf> {
 
 /// Shows the page until the channel closes, starting the browser again when it ends or can't be
 /// reached: after 3 s, twice as long each time it fails in a row (a minute at most).
-fn run(browser: &Path, mut look: Look, rx: &Receiver<Cmd>, feed: &Mutex<Feed>) {
+fn run(browser: &Path, mut look: Look, rx: &Receiver<Cmd>, feed: &Mutex<Feed>, stalled: &AtomicBool) {
     let mut pause = Duration::from_secs(3);
     loop {
         let ended = match Session::start(browser, &look) {
             Ok(mut s) => {
                 pause = Duration::from_secs(3);
-                s.serve(&mut look, rx, feed)
+                s.serve(&mut look, rx, feed, stalled)
             }
             Err(e) => {
                 tracing::warn!("a web page source's browser didn't start: {e}");
@@ -177,6 +201,8 @@ fn run(browser: &Path, mut look: Look, rx: &Receiver<Cmd>, feed: &Mutex<Feed>) {
                 match rx.recv_timeout(left) {
                     Ok(Cmd::Look(l)) => look = l,
                     Ok(Cmd::Reload) => {}
+                    #[cfg(test)]
+                    Ok(Cmd::Stall { .. }) => {}
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
@@ -279,6 +305,15 @@ impl Session {
         Ok(s)
     }
 
+    /// Stops and starts the screencast again (it sends a picture as it starts).
+    fn restart_screencast(&mut self, look: &Look) -> Result<(), String> {
+        self.call("Page.stopScreencast", json!({}))?;
+        self.call(
+            "Page.startScreencast",
+            json!({ "format": "png", "maxWidth": look.w, "maxHeight": look.h, "everyNthFrame": 1 }),
+        )
+    }
+
     /// Sends a command (its answer isn't waited for).
     fn call(&mut self, method: &str, params: Value) -> Result<(), String> {
         self.next += 1;
@@ -287,9 +322,62 @@ impl Session {
     }
 
     /// Hands the page's pictures on, and follows commands, until it's closed or lost.
-    fn serve(&mut self, look: &mut Look, rx: &Receiver<Cmd>, feed: &Mutex<Feed>) -> Ended {
+    fn serve(&mut self, look: &mut Look, rx: &Receiver<Cmd>, feed: &Mutex<Feed>, stalled: &AtomicBool) -> Ended {
         let mut last = None::<Instant>;
+        let mut dog = Watchdog::new(Instant::now());
+        // The screenshot asked for, and the last picture's fingerprint (a page that is just
+        // still answers with the same one).
+        let mut shot_id = None::<u64>;
+        let mut last_print = None::<u64>;
+        let mut where_id = None::<u64>;
+        #[cfg(test)]
+        let mut watching = true;
         loop {
+            #[cfg(test)]
+            let step = if watching { dog.step(Instant::now()) } else { Step::Wait };
+            #[cfg(not(test))]
+            let step = dog.step(Instant::now());
+            match step {
+                Step::Wait => {}
+                Step::AskPicture => {
+                    // No screencast frame for a while: a still page sends none, a stalled
+                    // screencast sends none either. A screenshot tells them apart (it answers
+                    // either way) and shows what the page looks like now; the screencast is
+                    // started again, which sends a frame at once.
+                    tracing::debug!("a web page source sent no frame for a while: asking for a picture");
+                    let id = self.next + 1;
+                    if self.call("Page.captureScreenshot", json!({ "format": "png" })).is_err() {
+                        return Ended::Lost;
+                    }
+                    shot_id = Some(id);
+                    // And where the page is: a browser that never left its blank starting page
+                    // (the navigation lost) answers the screenshot with that page, alive and
+                    // still, and would never be reloaded.
+                    where_id = Some(self.next + 1);
+                    if self
+                        .call("Runtime.evaluate", json!({ "expression": "location.href", "returnByValue": true }))
+                        .is_err()
+                    {
+                        return Ended::Lost;
+                    }
+                    if self.restart_screencast(look).is_err() {
+                        return Ended::Lost;
+                    }
+                }
+                Step::Reload(n) => {
+                    tracing::warn!(attempt = n, "a web page source's browser doesn't answer: reloading the page");
+                    if self.call("Page.reload", json!({})).is_err() {
+                        return Ended::Lost;
+                    }
+                    if self.restart_screencast(look).is_err() {
+                        return Ended::Lost;
+                    }
+                }
+                Step::GiveUp => {
+                    tracing::error!("This browser source stopped drawing; Reload starts it over");
+                    stalled.store(true, Ordering::Relaxed);
+                }
+            }
             match rx.try_recv() {
                 Ok(Cmd::Look(l)) => {
                     let again = (l.w, l.h, &l.css) != (look.w, look.h, &look.css);
@@ -303,7 +391,17 @@ impl Session {
                     }
                 }
                 Ok(Cmd::Reload) => {
+                    // Asked for (a person's Reload): the watchdog starts over, the notice goes.
+                    dog.reset(Instant::now());
+                    stalled.store(false, Ordering::Relaxed);
                     if self.call("Page.reload", json!({})).is_err() {
+                        return Ended::Lost;
+                    }
+                }
+                #[cfg(test)]
+                Ok(Cmd::Stall { watchdog }) => {
+                    watching = watchdog;
+                    if self.call("Page.stopScreencast", json!({})).is_err() {
                         return Ended::Lost;
                     }
                 }
@@ -329,9 +427,47 @@ impl Session {
                 }
             };
             let Ok(v) = serde_json::from_str::<Value>(text.as_str()) else { continue };
+            // The answer to the screenshot asked for: the page is alive; its picture goes on
+            // (a still page's is the same as before: no new frame is made of it then).
+            if where_id.is_some() && v.get("id").and_then(Value::as_u64) == where_id {
+                where_id = None;
+                let href = v["result"]["result"]["value"].as_str().unwrap_or_default();
+                if needs_navigation(href, &look.url) {
+                    tracing::warn!(
+                        at = href,
+                        "a web page source is still on its blank starting page: opening it again"
+                    );
+                    if self.call("Page.navigate", json!({ "url": look.url })).is_err() {
+                        return Ended::Lost;
+                    }
+                }
+                continue;
+            }
+            if shot_id.is_some() && v.get("id").and_then(Value::as_u64) == shot_id {
+                shot_id = None;
+                dog.alive(Instant::now());
+                stalled.store(false, Ordering::Relaxed);
+                if let Some(data) = v["result"].get("data").and_then(Value::as_str) {
+                    let print = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        data.hash(&mut h);
+                        h.finish()
+                    };
+                    let new = last_print != Some(print);
+                    last_print = Some(print);
+                    dog.picture_was_new(new);
+                    if new && let Some(pic) = decode(data) {
+                        feed.lock().unwrap_or_else(|e| e.into_inner()).clone().picture(pic);
+                    }
+                }
+                continue;
+            }
             if v.get("method").and_then(Value::as_str) != Some("Page.screencastFrame") {
                 continue;
             }
+            dog.alive(Instant::now());
+            stalled.store(false, Ordering::Relaxed);
             let p = &v["params"];
             // Each picture is acknowledged, or the browser sends no more.
             let session = p.get("sessionId").cloned().unwrap_or(Value::Null);
@@ -347,6 +483,100 @@ impl Session {
             last = Some(Instant::now());
             feed.lock().unwrap_or_else(|e| e.into_inner()).clone().picture(pic);
         }
+    }
+}
+
+/// Whether the page is still on the browser's blank starting page when it should be showing
+/// `wanted` (its navigation was lost).
+fn needs_navigation(href: &str, wanted: &str) -> bool {
+    href.starts_with("about:blank") && !wanted.starts_with("about:blank") && !wanted.is_empty()
+}
+
+/// What the watchdog asks of the session next.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Wait,
+    /// Ask for a screenshot and start the screencast again.
+    AskPicture,
+    /// Reload the page (the nth try).
+    Reload(u32),
+    /// Stopped drawing for good: say so, and wait for a person's Reload.
+    GiveUp,
+}
+
+/// Tells a page that stopped drawing from one that is just still. A still page sends no screencast
+/// frames, so silence alone proves nothing: after `QUIET` without one the page is asked for a
+/// picture (a screenshot answers either way). Only a page that doesn't even answer that is
+/// reloaded, after 0, 5, 15 and 60 s (`RELOADS`), and given up on after the last.
+struct Watchdog {
+    /// The last sign of life (a frame, or the answer to a screenshot).
+    alive: Instant,
+    /// When the picture was last asked for, and whether it is still unanswered.
+    asked: Option<Instant>,
+    /// Reloads done since the last sign of life, and when the next may be.
+    reloads: u32,
+    next_reload: Instant,
+    gave_up: bool,
+    /// How long a still page is left alone before the next question (grows while its
+    /// pictures stay the same: a clock page isn't asked every 2 s forever).
+    quiet: Duration,
+}
+
+impl Watchdog {
+    const QUIET: Duration = Duration::from_secs(2);
+    const QUIET_MAX: Duration = Duration::from_secs(30);
+    /// How long a screenshot may take to answer before the page counts as hung.
+    const ANSWER_WITHIN: Duration = Duration::from_secs(5);
+    const RELOADS: [Duration; 3] = [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(60)];
+
+    fn new(now: Instant) -> Self {
+        Self { alive: now, asked: None, reloads: 0, next_reload: now, gave_up: false, quiet: Self::QUIET }
+    }
+
+    /// A person asked for a reload: from the start again.
+    fn reset(&mut self, now: Instant) {
+        *self = Self::new(now);
+    }
+
+    /// A frame or a screenshot's answer came.
+    fn alive(&mut self, now: Instant) {
+        self.alive = now;
+        self.asked = None;
+        self.reloads = 0;
+        self.gave_up = false;
+    }
+
+    /// The picture that came was (not) different from the last: a page that stays the same is
+    /// asked less often, a changing one is asked at the base rate.
+    fn picture_was_new(&mut self, new: bool) {
+        self.quiet = if new { Self::QUIET } else { (self.quiet * 2).min(Self::QUIET_MAX) };
+    }
+
+    fn step(&mut self, now: Instant) -> Step {
+        if self.gave_up {
+            return Step::Wait;
+        }
+        if let Some(at) = self.asked {
+            // Asked and not answered: hung (not still).
+            if now.duration_since(at) < Self::ANSWER_WITHIN || now < self.next_reload {
+                return Step::Wait;
+            }
+            if self.reloads as usize > Self::RELOADS.len() {
+                self.gave_up = true;
+                return Step::GiveUp;
+            }
+            self.reloads += 1;
+            self.next_reload =
+                now + Self::RELOADS.get(self.reloads as usize - 1).copied().unwrap_or(Duration::from_secs(60));
+            // Asked again after the reload.
+            self.asked = Some(now);
+            return Step::Reload(self.reloads);
+        }
+        if now.duration_since(self.alive) >= self.quiet {
+            self.asked = Some(now);
+            return Step::AskPicture;
+        }
+        Step::Wait
     }
 }
 
@@ -525,16 +755,153 @@ mod tests {
         let ready = |px: &[u8]| at(px, 40, 90) == Some(vec![255, 0, 0]) && at(px, 280, 90) == Some(vec![0, 0, 0]);
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut px = Vec::new();
+        // On a busy machine the browser's first screencast frames are sometimes of its blank
+        // starting page (dark grey, 18) and no more come (seen on both branches, 1 run in 5 at a
+        // load of 20): a reload every 10 s asks it for fresh ones, as a person would.
+        let mut nudged = Instant::now();
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
             px = e.snapshot().unwrap_or_default();
             if ready(&px) {
                 break;
             }
+            if nudged.elapsed() > Duration::from_secs(10) {
+                nudged = Instant::now();
+                page.act(Do::Reload).unwrap_or_else(|x| panic!("{x}"));
+            }
         }
         page.act(Do::Reload).unwrap_or_else(|x| panic!("{x}"));
         drop(page);
         assert_eq!(at(&px, 40, 90), Some(vec![255, 0, 0]), "the page's red box");
         assert_eq!(at(&px, 280, 90), Some(vec![0, 0, 0]), "nothing drawn where the page is clear");
+    }
+
+    /// A page that sends no frames because it is still isn't reloaded: it is asked for a picture,
+    /// answers, and is asked less and less often, for ten minutes, with no reload.
+    #[test]
+    fn a_still_page_is_never_reloaded() {
+        let t0 = Instant::now();
+        let mut dog = Watchdog::new(t0);
+        let (mut asks, mut reloads) = (0, 0);
+        for s in 0..600u64 {
+            let now = t0 + Duration::from_secs(s);
+            match dog.step(now) {
+                Step::AskPicture => {
+                    asks += 1;
+                    dog.picture_was_new(false);
+                    dog.alive(now);
+                }
+                Step::Reload(_) | Step::GiveUp => reloads += 1,
+                Step::Wait => {}
+            }
+        }
+        assert_eq!(reloads, 0, "a still page must not be reloaded");
+        assert!((5..60).contains(&asks), "asked now and then, less and less often: {asks}");
+    }
+
+    /// A page whose browser stops answering is reloaded after 0, 5, 15 and 60 s, then given up on
+    /// (once, with a notice), and a person's Reload starts it over.
+    #[test]
+    fn a_hung_page_is_reloaded_with_a_backoff_then_given_up() {
+        let t0 = Instant::now();
+        let mut dog = Watchdog::new(t0);
+        let mut seen = Vec::new();
+        for s in 0..300u64 {
+            let step = dog.step(t0 + Duration::from_secs(s));
+            if step != Step::Wait {
+                seen.push((s, step));
+            }
+        }
+        let steps: Vec<_> = seen.iter().map(|(_, st)| format!("{st:?}")).collect();
+        assert_eq!(steps, ["AskPicture", "Reload(1)", "Reload(2)", "Reload(3)", "Reload(4)", "GiveUp"], "{seen:?}");
+        let at: Vec<u64> = seen.iter().map(|(s, _)| *s).collect();
+        assert!(at.windows(2).all(|w| w[1] > w[0]));
+        assert_eq!(dog.step(t0 + Duration::from_secs(400)), Step::Wait, "given up: quiet");
+        dog.reset(t0 + Duration::from_secs(400));
+        assert_eq!(dog.step(t0 + Duration::from_secs(403)), Step::AskPicture, "watching again");
+        // A sign of life at any point clears the count.
+        dog.alive(t0 + Duration::from_secs(404));
+        assert_eq!(dog.reloads, 0);
+    }
+
+    #[test]
+    fn a_page_left_on_the_blank_start_page_is_opened_again() {
+        assert!(needs_navigation("about:blank", "https://example.com/alert"));
+        assert!(!needs_navigation("https://example.com/alert", "https://example.com/alert"));
+        assert!(!needs_navigation("about:blank", "about:blank"));
+        // A page that moved on by itself (a redirect) is not sent back.
+        assert!(!needs_navigation("https://example.com/other", "https://example.com/alert"));
+    }
+
+    /// Starts a page that flips between red and green every 300 ms, and the engine showing it.
+    fn flipping_page() -> Option<(ferrocore::engine::Engine, FedPage)> {
+        use ferrocore::engine::{Engine, EngineConfig, SceneItem, SourceKind};
+        browser()?;
+        let video = ferrocore::video::VideoConfig {
+            codec: ferrocore::video::VideoCodec::H264,
+            input: ferrocore::video::PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1000,
+            rate: ferrocore::video::RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+            profile: ferrocore::video::H264Profile::High,
+            preset: None,
+            tune: None,
+        };
+        let audio = ferrocore::audio::AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
+        let e =
+            Engine::new(EngineConfig { width: 320, height: 180, fps: 30, ..Default::default() }, video, audio).ok()?;
+        e.set_source(1, SourceKind::Fed { width: 320, height: 180 }).ok()?;
+        e.set_scene("Main", vec![SceneItem::new(1, ferrocore::Placement::default())]);
+        e.go("Main").ok()?;
+        let feed = e.fed(1)?;
+        let html = "data:text/html,<body style='margin:0'><script>let c=0;setInterval(()=>{document.body.style.background=(c++%2)?'rgb(255,0,0)':'rgb(0,255,0)'},300)</script></body>";
+        let page = FedPage::open(html, 320, 180, "", 30, feed)?;
+        Some((e, page))
+    }
+
+    /// The colour at the middle of the engine's picture (red, green or neither).
+    fn colour(e: &ferrocore::engine::Engine) -> Option<[u8; 3]> {
+        let px = e.snapshot().ok()?;
+        let at = (90 * 320 + 160) * 4;
+        Some([*px.get(at)?, *px.get(at + 1)?, *px.get(at + 2)?])
+    }
+
+    /// Waits until the picture has shown both colours (the page is flipping and arriving).
+    fn flips_for(e: &ferrocore::engine::Engine, within: Duration) -> bool {
+        let end = Instant::now() + within;
+        let mut seen = std::collections::HashSet::new();
+        while Instant::now() < end {
+            if let Some(c) = colour(e)
+                && (c == [255, 0, 0] || c == [0, 255, 0])
+            {
+                seen.insert(c);
+                if seen.len() == 2 {
+                    return true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// A browser that stops sending frames while the page goes on changing: the watchdog gets
+    /// the picture moving again; with it off the picture stays frozen.
+    #[test]
+    fn the_watchdog_brings_a_stalled_page_back_and_without_it_it_stays_frozen() {
+        for watchdog in [true, false] {
+            let Some((e, page)) = flipping_page() else { return };
+            assert!(flips_for(&e, Duration::from_secs(60)), "the page flips before the stall");
+            page.stall_for_test(watchdog);
+            // Frames already in flight; then see whether it moves again.
+            std::thread::sleep(Duration::from_millis(1500));
+            let moves = flips_for(&e, Duration::from_secs(12));
+            drop(page);
+            assert_eq!(moves, watchdog, "watchdog {watchdog}: the picture moves again = {moves}");
+        }
     }
 }

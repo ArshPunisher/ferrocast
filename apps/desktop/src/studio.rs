@@ -2777,6 +2777,10 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn stalled_sources(&self) -> Vec<(String, bool)> {
+        self.on_main(|h| h.collection.as_ref().map(|c| c.stalled_pages()).unwrap_or_default()).await.unwrap_or_default()
+    }
+
     async fn take_notices(&self) -> Vec<(String, String, String)> {
         self.on_main(|h| {
             h.collection
