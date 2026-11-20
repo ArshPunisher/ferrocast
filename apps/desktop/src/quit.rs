@@ -63,7 +63,12 @@ fn request_inner(app: &AppHandle, mode: Mode) {
     tauri::async_runtime::spawn(async move {
         let active = match app.try_state::<crate::Running>() {
             Some(r) => {
-                let stats = r.engine.studio_stats().await.ok();
+                // Not waited for long: a system quit (logout, the Dock) is held up while this
+                // runs, and a Studio busy with a long edit must not hold it up for good.
+                let stats = tokio::time::timeout(std::time::Duration::from_secs(3), r.engine.studio_stats())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
                 Active::from(r.engine.is_live(), stats.as_ref())
             }
             None => Active::default(),
