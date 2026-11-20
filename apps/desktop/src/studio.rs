@@ -1487,8 +1487,9 @@ impl DesktopStudio {
         rx.await.map_err(|_| "The window closed.".to_string())
     }
 
-    /// Puts collection or profile `id` in use. A running Studio swaps its scenes at once; a
-    /// profile's settings are applied as Settings applies them (refused while live).
+    /// Puts collection or profile `id` in use. Refused while any output is active (stream,
+    /// recording, source record, replay, virtual camera, NDI) so switching never orphans or
+    /// blacks out live outputs (M9-01).
     async fn switch(&self, kind: Kind, id: &str) -> Result<(), String> {
         let data = self.data.clone();
         let mut lib = library::load(&data);
@@ -1497,6 +1498,25 @@ impl DesktopStudio {
         }
         if lib.shelf(kind).current == id {
             return Ok(());
+        }
+        let busy = self
+            .on_main(|h| {
+                h.stream.is_some()
+                    || h.vstream.is_some()
+                    || h.lstream.is_some()
+                    || h.record.is_some()
+                    || !h.source_records.is_empty()
+                    || h.replay.is_some()
+                    || h.virtualcam.is_some()
+                    || h.ndi.is_some()
+            })
+            .await?;
+        if busy {
+            let noun = match kind {
+                Kind::Collections => "scene collections",
+                Kind::Profiles => "profiles",
+            };
+            return Err(format!("Stop streaming and recording before changing {noun}."));
         }
         let from = lib.current_file(&data, kind);
         let before = lib.shelf(kind).current.clone();
@@ -1514,14 +1534,6 @@ impl DesktopStudio {
                 Ok(())
             }
             Kind::Profiles => {
-                let busy = self
-                    .on_main(|h| {
-                        h.stream.is_some() || h.record.is_some() || h.replay.is_some() || h.virtualcam.is_some()
-                    })
-                    .await?;
-                if busy {
-                    return Err("Stop streaming and recording before changing profiles.".into());
-                }
                 let next = std::fs::read(&to)
                     .ok()
                     .and_then(|b| serde_json::from_slice::<StudioSettings>(&b).ok())

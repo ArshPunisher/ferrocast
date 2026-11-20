@@ -2233,6 +2233,7 @@ impl Engine {
         if !collection_id_ok(id) {
             return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
         }
+        self.ensure_idle_for_switch("scene collections").await?;
         let host = self.studio_host()?;
         let list = host.streamlabs_collections().await.map_err(failed)?;
         if !list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id)) {
@@ -2252,6 +2253,7 @@ impl Engine {
         if !collection_id_ok(id) {
             return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
         }
+        self.ensure_idle_for_switch("scene collections").await?;
         let host = self.studio_host()?;
         let list = host.obs_collections().await.map_err(failed)?;
         let known = list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id));
@@ -2523,9 +2525,59 @@ impl Engine {
         self.studio_host()?.close_projectors().await.map_err(failed)
     }
 
+    /// Refuses scene-collection or profile switches (and imports/new) while a Show or any
+    /// live Studio output (stream, recording, source record, replay, virtual camera, NDI) is
+    /// active, so outputs can never be orphaned or blacked out mid-broadcast (M9-01).
+    async fn ensure_idle_for_switch(&self, noun: &str) -> Result<(), EngineError> {
+        if self.is_show_active() {
+            return Err(EngineError::Refused {
+                status: 409,
+                code: "studio_busy",
+                message: format!("Stop the show before changing {noun}."),
+                hint: "End the show or cancel the countdown first.".into(),
+                retry_after: None,
+            });
+        }
+        let Ok(host) = self.studio_host() else { return Ok(()) };
+        if !host.status().await.running {
+            return Ok(());
+        }
+        let streaming = host
+            .stream_stats()
+            .await
+            .ok()
+            .is_some_and(|v| v["active"].as_bool() == Some(true) || v["reconnecting"].as_bool() == Some(true));
+        let stats_busy = host.stats().await.ok().is_some_and(|v| {
+            let active = |k: &str| v[k]["active"].as_bool() == Some(true);
+            active("stream")
+                || v["stream"]["reconnecting"].as_bool() == Some(true)
+                || active("vertical_stream")
+                || active("light_stream")
+                || active("record")
+                || active("replay")
+                || active("virtualcam")
+                || active("ndi")
+                || v["source_records"].as_array().is_some_and(|a| !a.is_empty())
+        });
+        if streaming || stats_busy {
+            return Err(EngineError::Refused {
+                status: 409,
+                code: "studio_busy",
+                message: format!("Stop streaming and recording before changing {noun}."),
+                hint: "Stop every active output first.".into(),
+                retry_after: None,
+            });
+        }
+        Ok(())
+    }
+
     /// Scene collections or profiles: one act on that list.
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
+        if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
+            let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
+            self.ensure_idle_for_switch(noun).await?;
+        }
         let out = self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)?;
         // Another collection may have its own vertical picture (or none): the stream follows.
         self.studio_sync_vertical().await;
