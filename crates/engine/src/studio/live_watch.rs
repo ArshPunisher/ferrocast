@@ -15,6 +15,9 @@ use crate::studio_host::StudioAct;
 
 /// How often the watch looks.
 const EVERY: Duration = Duration::from_secs(2);
+/// A gap longer than this between 2-second ticks means the system slept or froze: reset
+/// pending silence/black/frozen durations so wake never fires false live alerts.
+const WAKE_JUMP_MS: i64 = 10_000;
 
 impl Engine {
     /// Starts the live watch's loop (once per engine). It looks only while the Studio streams.
@@ -32,6 +35,7 @@ impl Engine {
                 if live != was_live {
                     // A new stream: everything starts fresh.
                     engine.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).reset();
+                    *engine.studio().last_watch_mono.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     engine.studio().auto_brb.lock().unwrap_or_else(|p| p.into_inner()).clear();
                     *engine.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     *engine.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
@@ -159,7 +163,17 @@ impl Engine {
             return Vec::new();
         }
         let show = self.show_config();
-        let mut sample = WatchSample { at: now().0, ..Default::default() };
+        let mono = self.mono_ms();
+        let wake_jumped = {
+            let mut last = self.studio().last_watch_mono.lock().unwrap_or_else(|p| p.into_inner());
+            let jumped = last.is_some_and(|prev| mono - prev > WAKE_JUMP_MS);
+            *last = Some(mono);
+            jumped
+        };
+        if wake_jumped {
+            self.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).reset();
+        }
+        let mut sample = WatchSample { at: mono, ..Default::default() };
         if !show.mic_sources.is_empty()
             && let Ok(v) = self.studio_act(StudioAct::Levels { names: show.mic_sources.clone() }).await
         {

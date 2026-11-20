@@ -1596,10 +1596,15 @@ async fn preflight_fix(State(app): State<AppState>, Body(b): Body<FixBody>) -> A
 struct StartBody {
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    stream: Option<bool>,
 }
 
 async fn start_show(State(app): State<AppState>, Body(b): Body<StartBody>) -> ApiResult<Response> {
-    let run = app.engine.start_show(b.force).await?;
+    let run = app
+        .engine
+        .start_show_with(ferrocast_engine::studio::show::ShowStartOpts { force: b.force, stream: b.stream })
+        .await?;
     Ok((StatusCode::CREATED, Json(json!({ "show": run }))).into_response())
 }
 

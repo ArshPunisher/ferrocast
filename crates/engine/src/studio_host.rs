@@ -2036,7 +2036,19 @@ impl Engine {
     }
 
     pub async fn studio_stop(&self) -> Result<StudioStatus, EngineError> {
-        self.studio_host()?.stop().await.map_err(failed)
+        let host = self.studio_host()?;
+        let was_running = host.status().await.running;
+        // Cancel any active Show, countdown, or pending delayed stop immediately (even before
+        // acquiring output_lock) so an in-flight start_show / go_live_now sees the generation
+        // bump at once and never posts Discord/chat or resurrects Live after Studio stops.
+        if was_running {
+            self.cancel_show_on_studio_stop("Studio stopped.");
+        }
+        let _out = self.studio().output_lock.lock().await;
+        if was_running {
+            *crate::golive::lock_enhanced(self) = None;
+        }
+        host.stop().await.map_err(failed)
     }
 
     pub async fn studio_kinds(&self) -> Result<Value, EngineError> {
@@ -2274,6 +2286,12 @@ impl Engine {
     /// Starts or stops streaming the Studio into this PC's Go live ingest, which sends it on
     /// to every destination switched on, as a stream from OBS would.
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
+        let _out = self.studio().output_lock.lock().await;
+        self.studio_stream_locked(on).await
+    }
+
+    /// Runs `studio_stream` while the caller already holds `studio().output_lock`.
+    pub(crate) async fn studio_stream_locked(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let s = host.settings().await;
         if on {
@@ -2307,7 +2325,10 @@ impl Engine {
                 return Err(failed(e));
             }
         };
-        let mut also = follow_stream(host.as_ref(), true, &s).await;
+        // Mark a new stream session (even when `running` was still true during a prior Show's
+        // stop delay) so no earlier Show's delayed stop can kill this stream.
+        self.on_stream_started();
+        let mut also = if running { None } else { follow_stream(host.as_ref(), true, &s).await };
         if let Some(note) = eb_note {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         }

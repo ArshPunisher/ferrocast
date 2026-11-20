@@ -127,6 +127,18 @@ impl Default for ShowConfig {
 }
 
 impl ShowConfig {
+    /// Whether this Show config does more than a plain stream (starting or ending scene,
+    /// countdown, Discord go-live post, preset, or replay buffer). Matches the dashboard's
+    /// Show vs "Just go live" choice so hotkeys and backend actions agree.
+    pub fn is_show_style(&self) -> bool {
+        self.discord
+            || self.starting_scene.is_some()
+            || self.ending_scene.is_some()
+            || self.countdown_s > 0
+            || self.preset_id.is_some()
+            || self.replay_buffer
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for (field, s) in [
             ("starting_scene", &self.starting_scene),

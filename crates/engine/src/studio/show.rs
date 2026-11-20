@@ -1,7 +1,9 @@
 //! "Start show" and "End show" (API.md §4 "Studio: show"): the go-live checklist the
-//! streamer sets up once, pre-flight checks with one-click fixes, and the countdown that
-//! switches to the live scene at zero, in the Studio (or OBS, see `rig`). Every step reports
-//! what it did; one step failing never stops the others (the Studio stopped shouldn't stop the stream info going out).
+//! streamer sets up once, pre-flight checks with one-click fixes, and the locked broadcast
+//! state machine (`Idle → Preparing → Starting/Countdown → Live → Ending`) that serializes
+//! countdowns, delayed stops, hotkeys, and Studio stop in the Studio (or OBS, see `rig`).
+//! Every step reports what it did; one step failing never stops the others (the Studio
+//! stopped shouldn't stop the stream info going out).
 
 use std::time::Duration;
 
@@ -14,6 +16,7 @@ use super::rig::Rig;
 use super::{SHOW_KEY, save_setting};
 use crate::{Engine, EngineError, now, platform_key};
 
+/// Public wire phases of a Show run (kept to the 4 strings the dashboard renders).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -51,10 +54,146 @@ pub struct ShowRun {
     pub steps: Vec<Step>,
 }
 
+/// Per-run options for `start_show_with` (without mutating saved `ShowConfig`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShowStartOpts {
+    pub force: bool,
+    /// Override `ShowConfig.start_stream` for this run only (None = use saved config).
+    pub stream: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Preflight {
     pub checks: Vec<Check>,
     pub ready: bool,
+}
+
+/// Internal phases of the locked broadcast state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BroadcastPhase {
+    #[default]
+    Idle,
+    /// `start_show` checklist is running.
+    Preparing,
+    /// On Starting Soon without an active countdown (or after cancelling countdown).
+    Starting,
+    /// Counting down on a monotonic timer before switching to the live scene.
+    Countdown,
+    /// On air on the live scene.
+    Live,
+    /// `end_show` steps are running or a delayed stop is waiting.
+    Ending,
+}
+
+/// A gap longer than this between 1-second countdown ticks means the system slept or froze:
+/// clamp the deducted time so waking from sleep never fires `go_live_now` prematurely.
+const COUNTDOWN_WAKE_JUMP: Duration = Duration::from_secs(5);
+const COUNTDOWN_WAKE_CLAMP: Duration = Duration::from_secs(1);
+
+/// Monotonic countdown timer driven by `tokio::time::Instant` (immune to wall-clock jumps).
+#[derive(Debug, Clone)]
+pub(crate) struct CountdownTimer {
+    remaining: Duration,
+    last_tick: tokio::time::Instant,
+}
+
+impl CountdownTimer {
+    fn start(remaining: Duration, now: tokio::time::Instant) -> Self {
+        Self { remaining, last_tick: now }
+    }
+
+    /// Advances the timer to `now`. Returns `(remaining, wake_jumped)`.
+    fn advance(&mut self, now: tokio::time::Instant) -> (Duration, bool) {
+        let raw = now.saturating_duration_since(self.last_tick);
+        self.last_tick = now;
+        let jumped = raw > COUNTDOWN_WAKE_JUMP;
+        let step = if jumped { COUNTDOWN_WAKE_CLAMP } else { raw };
+        self.remaining = self.remaining.saturating_sub(step);
+        (self.remaining, jumped)
+    }
+}
+
+/// Single locked state machine for the Show, countdown, and delayed stream stop.
+/// Protected by a fast `std::sync::Mutex` and NEVER held across `.await`.
+#[derive(Debug, Default)]
+pub(crate) struct BroadcastMachine {
+    pub phase: BroadcastPhase,
+    /// Incremented on every Show transition; in-flight async work checks its epoch
+    /// before side-effects and before committing state.
+    pub epoch: u64,
+    /// Incremented whenever any stream starts (Show or plain Go live) or Studio stops.
+    /// A delayed stop only fires if BOTH `epoch` and `stream_epoch` still match.
+    pub stream_epoch: u64,
+    pub run: Option<ShowRun>,
+    pub countdown: Option<CountdownTimer>,
+    pub stop_task: Option<tokio::task::AbortHandle>,
+    /// Epoch of an in-flight `go_live_now` transition (blocks duplicate switches/chat
+    /// and lets `cancel_countdown` / `studio_stop` invalidate it cleanly).
+    pub transitioning_live: Option<u64>,
+    pub ending_in_flight: bool,
+    pub stop_waiting: bool,
+    pub started_stream: bool,
+}
+
+/// Rolls back `Preparing → Idle` if `start_show_with` exits early or is dropped mid-await.
+struct PreparingGuard<'a> {
+    engine: &'a Engine,
+    epoch: u64,
+    committed: bool,
+}
+
+impl Drop for PreparingGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut m = self.engine.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        if m.epoch == self.epoch && m.phase == BroadcastPhase::Preparing {
+            m.phase = BroadcastPhase::Idle;
+            m.started_stream = false;
+        }
+    }
+}
+
+/// Clears `ending_in_flight` if `end_show_opts` exits early or is dropped mid-await.
+struct EndingGuard<'a> {
+    engine: &'a Engine,
+    epoch: u64,
+    committed: bool,
+}
+
+impl Drop for EndingGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut m = self.engine.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        if m.epoch == self.epoch && m.ending_in_flight {
+            m.ending_in_flight = false;
+            if !m.stop_waiting && m.phase == BroadcastPhase::Ending {
+                m.phase = BroadcastPhase::Idle;
+            }
+        }
+    }
+}
+
+/// Clears `transitioning_live` if `go_live_now` exits early or is dropped mid-await.
+struct LiveTransitionGuard<'a> {
+    engine: &'a Engine,
+    epoch: u64,
+    committed: bool,
+}
+
+impl Drop for LiveTransitionGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut m = self.engine.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        if m.transitioning_live == Some(self.epoch) {
+            m.transitioning_live = None;
+        }
+    }
 }
 
 impl Engine {
@@ -85,11 +224,29 @@ impl Engine {
     }
 
     pub fn show_run(&self) -> Option<ShowRun> {
-        self.studio().show.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        self.studio().machine.lock().unwrap_or_else(|p| p.into_inner()).run.clone()
     }
 
-    fn set_show(&self, run: Option<ShowRun>) {
-        *self.studio().show.lock().unwrap_or_else(|p| p.into_inner()) = run.clone();
+    /// True while a Show is actively starting, counting down, live, or running its ending
+    /// steps (used to refuse scene-collection swaps mid-show).
+    pub fn is_show_active(&self) -> bool {
+        let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        matches!(
+            m.phase,
+            BroadcastPhase::Preparing | BroadcastPhase::Starting | BroadcastPhase::Countdown | BroadcastPhase::Live
+        ) || m.ending_in_flight
+    }
+
+    fn is_show_epoch(&self, epoch: u64) -> bool {
+        self.studio().machine.lock().unwrap_or_else(|p| p.into_inner()).epoch == epoch
+    }
+
+    fn is_live_transition(&self, epoch: u64) -> bool {
+        let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        m.epoch == epoch && m.transitioning_live == Some(epoch)
+    }
+
+    fn emit_show(&self, run: Option<ShowRun>) {
         self.studio_frame("show", &serde_json::json!({ "show": run }));
         // Timers on screen follow Start show's countdown (they reach zero with the switch).
         self.send_overlay(crate::frames::OverlayFrame::new(
@@ -105,6 +262,105 @@ impl Engine {
     pub(crate) fn show_overlay_state(&self) -> serde_json::Value {
         let ends = self.show_run().and_then(|r| r.countdown_ends_at);
         serde_json::json!({ "countdown_ends_at": ends })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_countdown_remaining_for_test(&self, remaining: Duration) {
+        let run = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.phase == BroadcastPhase::Countdown {
+                m.countdown = Some(CountdownTimer::start(remaining, tokio::time::Instant::now()));
+                if let Some(r) = m.run.as_mut() {
+                    r.countdown_ends_at = Some(now().0 + i64::try_from(remaining.as_millis()).unwrap_or(0));
+                }
+            }
+            m.run.clone()
+        };
+        self.emit_show(run);
+    }
+
+    /// Called whenever a stream starts (Show or plain Go live): advances `stream_gen` and
+    /// aborts any pending delayed stop from an earlier Show so it can never kill this stream.
+    pub(crate) fn on_stream_started(&self) {
+        let emit = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            m.stream_epoch += 1;
+            if let Some(h) = m.stop_task.take() {
+                h.abort();
+            }
+            if m.stop_waiting {
+                m.stop_waiting = false;
+                if m.phase == BroadcastPhase::Ending && !m.ending_in_flight {
+                    m.phase = BroadcastPhase::Idle;
+                }
+                if let Some(r) = m.run.as_mut() {
+                    if let Some(s) = r.steps.iter_mut().find(|s| s.id == "stop_stream" && s.status == "waiting") {
+                        s.status = "skipped".into();
+                        s.detail = "A new stream started.".into();
+                    }
+                    Some(r.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(run) = emit {
+            self.emit_show(Some(run));
+        }
+    }
+
+    /// Cancels any active Show, countdown, or pending delayed stop when the Studio stops.
+    pub(crate) fn cancel_show_on_studio_stop(&self, reason: &str) {
+        let emit = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(h) = m.stop_task.take() {
+                h.abort();
+            }
+            let was_waiting = m.stop_waiting;
+            m.stop_waiting = false;
+            m.countdown = None;
+            m.transitioning_live = None;
+            m.started_stream = false;
+            m.ending_in_flight = false;
+            m.epoch += 1;
+            m.stream_epoch += 1;
+            m.phase = BroadcastPhase::Idle;
+            if let Some(r) = m.run.as_mut() {
+                if r.phase != Phase::Ended {
+                    r.phase = Phase::Ended;
+                    r.ended_at = Some(now().0);
+                    r.countdown_ends_at = None;
+                    if let Some(s) = r.steps.iter_mut().find(|s| s.id == "countdown" && s.status == "waiting") {
+                        s.status = "skipped".into();
+                        s.detail = reason.into();
+                    }
+                    if let Some(s) = r.steps.iter_mut().find(|s| s.id == "stop_stream" && s.status == "waiting") {
+                        s.status = "done".into();
+                        s.detail = reason.into();
+                    }
+                    Some(r.clone())
+                } else if was_waiting {
+                    if let Some(s) = r.steps.iter_mut().find(|s| s.id == "stop_stream" && s.status == "waiting") {
+                        s.status = "done".into();
+                        s.detail = reason.into();
+                    }
+                    Some(r.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        *self.studio().brb_from.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.studio().auto_brb.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        if let Some(run) = emit {
+            self.emit_show(Some(run));
+        } else {
+            self.studio().show_wake.notify_one();
+        }
     }
 
     /// Everything that could go wrong at go-live, each with how to fix it.
@@ -313,32 +569,94 @@ impl Engine {
         Ok(self.preflight().await)
     }
 
-    /// Starts the show. 409 while one is running; 422 `preflight_failed` when a check
-    /// failed, unless `force`.
+    /// Starts the show. 409 while one is running or starting; 422 `preflight_failed` when a
+    /// check failed, unless `force`.
     pub async fn start_show(&self, force: bool) -> Result<ShowRun, EngineError> {
-        // A show whose stream stopped some other way (Stop Studio, the stream dropping) is over:
-        // it no longer blocks a new one (19 Nov, live: Go live said "a show is already running"
-        // after the Studio was stopped and started). A countdown still blocks until cancelled.
-        // (Only a show that streams: one that doesn't may run with the stream off.)
-        if self.show_config().start_stream
-            && let Some(old) = self.show_run().filter(|r| matches!(r.phase, Phase::Live | Phase::Starting))
+        self.start_show_with(ShowStartOpts { force, stream: None }).await
+    }
+
+    /// Starts the show with per-run options (e.g. `stream: Some(true)` without rewriting saved
+    /// `ShowConfig`). Serialized through the locked `BroadcastMachine`.
+    pub async fn start_show_with(&self, opts: ShowStartOpts) -> Result<ShowRun, EngineError> {
+        let cfg = self.show_config();
+        let start_stream = opts.stream.unwrap_or(cfg.start_stream);
+
+        // A show whose stream stopped some other way (the stream dropping, external stop) is
+        // over: it no longer blocks a new one (19 Nov, live). A countdown still blocks until
+        // cancelled. (Only a show that streamed: one that didn't may run with the stream off.)
+        let stale_candidate = {
+            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if (m.started_stream || cfg.start_stream)
+                && matches!(m.phase, BroadcastPhase::Live | BroadcastPhase::Starting)
+            {
+                Some(m.epoch)
+            } else {
+                None
+            }
+        };
+        if let Some(old_gen) = stale_candidate
             && let Ok(rig) = self.rig().await
             && matches!(self.rig_streaming(&rig).await, Ok(false))
-            // Still that same show after the wait: one started meanwhile is kept (CodeRabbit).
-            && let Some(mut same) =
-                self.show_run().filter(|r| r.id == old.id && matches!(r.phase, Phase::Live | Phase::Starting))
         {
-            same.phase = Phase::Ended;
-            same.ended_at = Some(now().0);
-            self.set_show(Some(same));
+            let ended = {
+                let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+                if m.epoch == old_gen && matches!(m.phase, BroadcastPhase::Live | BroadcastPhase::Starting) {
+                    m.phase = BroadcastPhase::Idle;
+                    m.epoch += 1;
+                    m.countdown = None;
+                    m.transitioning_live = None;
+                    m.started_stream = false;
+                    if let Some(r) = m.run.as_mut() {
+                        r.phase = Phase::Ended;
+                        r.ended_at = Some(now().0);
+                        r.countdown_ends_at = None;
+                        Some(r.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(r) = ended {
+                self.emit_show(Some(r));
+            }
         }
-        if self.show_run().is_some_and(|r| r.phase != Phase::Ended) {
-            return Err(EngineError::Conflict(
-                "A show is already running. End it first, or cancel the countdown.".into(),
-            ));
-        }
-        if !force {
+
+        // Atomically claim `Preparing` before any `.await` so double-clicks or racing starts
+        // never overlap, and abort any pending delayed stop from an earlier ended Show.
+        let my_gen = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(
+                m.phase,
+                BroadcastPhase::Preparing | BroadcastPhase::Starting | BroadcastPhase::Countdown | BroadcastPhase::Live
+            ) {
+                return Err(EngineError::Conflict(
+                    "A show is already running. End it first, or cancel the countdown.".into(),
+                ));
+            }
+            if m.ending_in_flight {
+                return Err(EngineError::Conflict("The show is ending. Wait a moment and try again.".into()));
+            }
+            if let Some(h) = m.stop_task.take() {
+                h.abort();
+            }
+            m.stop_waiting = false;
+            m.epoch += 1;
+            let g = m.epoch;
+            m.phase = BroadcastPhase::Preparing;
+            m.countdown = None;
+            m.transitioning_live = None;
+            m.started_stream = start_stream;
+            g
+        };
+        let mut guard = PreparingGuard { engine: self, epoch: my_gen, committed: false };
+
+        if !opts.force {
             let pf = self.preflight().await;
+            if !self.is_show_epoch(my_gen) {
+                return Err(EngineError::Conflict("Show start was cancelled.".into()));
+            }
             if !pf.ready {
                 let failed: Vec<String> = pf
                     .checks
@@ -355,9 +673,12 @@ impl Engine {
                 });
             }
         }
+
         let cfg = self.show_config();
+        let start_stream = opts.stream.unwrap_or(cfg.start_stream);
         let at = now().0;
         let mut steps = Vec::new();
+        let mut stream_started_by_us = false;
 
         // Stream info first: it's what viewers see in the directory.
         let mut title = None;
@@ -398,11 +719,15 @@ impl Engine {
                 }
             });
         }
+        if !self.is_show_epoch(my_gen) {
+            return Err(EngineError::Conflict("Show start was cancelled.".into()));
+        }
+
         let client = if cfg.starting_scene.is_some()
             || cfg.live_scene.is_some()
             || cfg.countdown_s > 0
             || cfg.replay_buffer
-            || cfg.start_stream
+            || start_stream
         {
             Some(self.rig().await)
         } else {
@@ -422,6 +747,10 @@ impl Engine {
                 cfg.starting_scene.as_deref() != Some(s.as_str()) && cfg.ending_scene.as_deref() != Some(s.as_str())
             })
         });
+
+        if !self.is_show_epoch(my_gen) {
+            return Err(EngineError::Conflict("Show start was cancelled.".into()));
+        }
         if cfg.replay_buffer {
             steps.push(match &client {
                 Some(Ok(r)) => match self.rig_start_replay(r).await {
@@ -432,18 +761,36 @@ impl Engine {
                 None => Step::new("replay", "Replay buffer", "skipped", ""),
             });
         }
+        if !self.is_show_epoch(my_gen) {
+            return Err(EngineError::Conflict("Show start was cancelled.".into()));
+        }
         if let Some(scene) = &cfg.starting_scene {
             steps.push(self.switch_step(&client, "starting_scene", "Starting scene", scene).await);
         }
-        if cfg.start_stream {
+        if !self.is_show_epoch(my_gen) {
+            return Err(EngineError::Conflict("Show start was cancelled.".into()));
+        }
+        if start_stream {
             steps.push(match &client {
                 Some(Ok(r)) => match self.rig_set_streaming(r, true).await {
-                    Ok(()) => Step::new("stream", "Go live", "done", format!("{} is streaming.", r.title())),
+                    Ok(()) => {
+                        stream_started_by_us = true;
+                        Step::new("stream", "Go live", "done", format!("{} is streaming.", r.title()))
+                    }
                     Err(e) => Step::new("stream", "Go live", "failed", e.to_string()),
                 },
                 Some(Err(e)) => Step::new("stream", "Go live", "failed", e.to_string()),
                 None => Step::new("stream", "Go live", "skipped", ""),
             });
+        }
+        if !self.is_show_epoch(my_gen) {
+            if stream_started_by_us
+                && let Some(Ok(r)) = &client
+                && matches!(self.rig_streaming(r).await, Ok(true))
+            {
+                let _ = self.rig_set_streaming(r, false).await;
+            }
+            return Err(EngineError::Conflict("Show start was cancelled.".into()));
         }
         if cfg.alerts_on {
             let q = self.queue().await;
@@ -462,6 +809,15 @@ impl Engine {
                 Err(e) => Step::new("bot", "Bot and timers", "failed", e.to_string()),
             });
         }
+        if !self.is_show_epoch(my_gen) {
+            if stream_started_by_us
+                && let Some(Ok(r)) = &client
+                && matches!(self.rig_streaming(r).await, Ok(true))
+            {
+                let _ = self.rig_set_streaming(r, false).await;
+            }
+            return Err(EngineError::Conflict("Show start was cancelled.".into()));
+        }
         if cfg.discord {
             let d = self.discord().await.ok();
             steps.push(match d {
@@ -477,7 +833,7 @@ impl Engine {
                 _ => Step::new("discord", "Discord post", "skipped", "No Discord webhook (Settings, Discord)."),
             });
         }
-        let (phase, ends) = if cfg.countdown_s > 0 {
+        let (phase, next_bphase, countdown_timer, ends) = if cfg.countdown_s > 0 {
             let n = cfg.countdown_s;
             steps.push(Step::new(
                 "countdown",
@@ -485,12 +841,27 @@ impl Engine {
                 "waiting",
                 if cfg.at_zero.switch { format!("{n} seconds, then the live scene.") } else { format!("{n} seconds.") },
             ));
-            (Phase::Countdown, Some(at + i64::from(n) * 1000))
+            let dur = Duration::from_secs(u64::from(n));
+            (
+                Phase::Countdown,
+                BroadcastPhase::Countdown,
+                Some(CountdownTimer::start(dur, tokio::time::Instant::now())),
+                Some(now().0 + i64::from(n) * 1000),
+            )
         } else if let Some(scene) = &cfg.live_scene {
+            if !self.is_show_epoch(my_gen) {
+                if stream_started_by_us
+                    && let Some(Ok(r)) = &client
+                    && matches!(self.rig_streaming(r).await, Ok(true))
+                {
+                    let _ = self.rig_set_streaming(r, false).await;
+                }
+                return Err(EngineError::Conflict("Show start was cancelled.".into()));
+            }
             steps.push(self.switch_step(&client, "live_scene", "Live scene", scene).await);
-            (Phase::Live, None)
+            (Phase::Live, BroadcastPhase::Live, None, None)
         } else {
-            (Phase::Starting, None)
+            (Phase::Starting, BroadcastPhase::Starting, None, None)
         };
         let run = ShowRun {
             id: ferrocast_store::new_id(),
@@ -501,7 +872,28 @@ impl Engine {
             ended_at: None,
             steps,
         };
-        self.set_show(Some(run.clone()));
+        let committed = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.epoch == my_gen && m.phase == BroadcastPhase::Preparing {
+                m.phase = next_bphase;
+                m.countdown = countdown_timer;
+                m.run = Some(run.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !committed {
+            if stream_started_by_us
+                && let Some(Ok(r)) = &client
+                && matches!(self.rig_streaming(r).await, Ok(true))
+            {
+                let _ = self.rig_set_streaming(r, false).await;
+            }
+            return Err(EngineError::Conflict("Show start was cancelled.".into()));
+        }
+        guard.committed = true;
+        self.emit_show(Some(run.clone()));
         Ok(run)
     }
 
@@ -536,42 +928,87 @@ impl Engine {
 
     /// Ends the countdown now: switch to the live scene.
     pub async fn skip_countdown(&self) -> Result<ShowRun, EngineError> {
-        let run = self.show_run().filter(|r| r.phase == Phase::Countdown).ok_or(NO_COUNTDOWN)?;
-        Ok(self.go_live_now(run).await)
+        self.go_live_now(false).await
     }
 
-    /// Stops the countdown; OBS stays where it is.
+    /// Stops the countdown; OBS stays where it is. Synchronous and serialized through the
+    /// locked `BroadcastMachine`, so an in-flight `go_live_now` cannot resurrect `Live`.
     pub fn cancel_countdown(&self) -> Result<ShowRun, EngineError> {
-        let mut run = self.show_run().filter(|r| r.phase == Phase::Countdown).ok_or(NO_COUNTDOWN)?;
-        run.phase = Phase::Starting;
-        run.countdown_ends_at = None;
-        if let Some(s) = run.steps.iter_mut().find(|s| s.id == "countdown") {
-            s.status = "skipped".into();
-            s.detail = "Cancelled.".into();
-        }
-        self.set_show(Some(run.clone()));
+        let run = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.phase != BroadcastPhase::Countdown {
+                return Err(NO_COUNTDOWN);
+            }
+            let Some(mut run) = m.run.clone() else {
+                return Err(NO_COUNTDOWN);
+            };
+            m.epoch += 1;
+            m.phase = BroadcastPhase::Starting;
+            m.countdown = None;
+            m.transitioning_live = None;
+            run.phase = Phase::Starting;
+            run.countdown_ends_at = None;
+            if let Some(s) = run.steps.iter_mut().find(|s| s.id == "countdown") {
+                s.status = "skipped".into();
+                s.detail = "Cancelled.".into();
+            }
+            m.run = Some(run.clone());
+            run
+        };
+        self.emit_show(Some(run.clone()));
         Ok(run)
     }
 
     /// Switch to the live scene now (from Starting or at the end of the countdown).
     pub async fn go_live_scene(&self) -> Result<ShowRun, EngineError> {
-        let run =
-            self.show_run().filter(|r| matches!(r.phase, Phase::Countdown | Phase::Starting)).ok_or(NO_COUNTDOWN)?;
-        Ok(self.go_live_now(run).await)
+        self.go_live_now(true).await
     }
 
-    async fn go_live_now(&self, mut run: ShowRun) -> ShowRun {
+    /// Serialized Countdown/Starting → Live transition. Claims `transitioning_live` under
+    /// `BroadcastMachine` so racing callers (countdown expiry + Skip click) never post chat
+    /// twice, and checks generation before every step and before committing so a cancelled
+    /// countdown or stopped Show can never be resurrected.
+    async fn go_live_now(&self, allow_starting: bool) -> Result<ShowRun, EngineError> {
+        let (my_gen, mut run) = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            let phase_ok =
+                m.phase == BroadcastPhase::Countdown || (allow_starting && m.phase == BroadcastPhase::Starting);
+            if !phase_ok || m.transitioning_live.is_some() {
+                return Err(NO_COUNTDOWN);
+            }
+            let Some(run) = m.run.clone() else {
+                return Err(NO_COUNTDOWN);
+            };
+            m.epoch += 1;
+            let g = m.epoch;
+            m.transitioning_live = Some(g);
+            m.countdown = None;
+            (g, run)
+        };
+        let mut guard = LiveTransitionGuard { engine: self, epoch: my_gen, committed: false };
+
         let cfg = self.show_config();
         let z = &cfg.at_zero;
         run.steps.retain(|s| s.id != "countdown" && !s.id.starts_with("zero_") && s.id != "live_scene");
+
         if z.switch {
+            if !self.is_live_transition(my_gen) {
+                return Ok(self.show_run().unwrap_or(run));
+            }
             run.steps.push(match &run.live_scene {
                 Some(scene) => self.switch_step(&None, "live_scene", "Live scene", scene).await,
                 None => Step::new("live_scene", "Live scene", "skipped", "No live scene picked."),
             });
         }
+        if !self.is_live_transition(my_gen) {
+            return Ok(self.show_run().unwrap_or(run));
+        }
+
         let client = if z.unmute || z.start_stream || z.record { Some(self.rig().await) } else { None };
         if z.unmute {
+            if !self.is_live_transition(my_gen) {
+                return Ok(self.show_run().unwrap_or(run));
+            }
             run.steps.push(match &client {
                 Some(Ok(r)) => {
                     let mut bad = Vec::new();
@@ -593,6 +1030,9 @@ impl Engine {
             });
         }
         if z.start_stream {
+            if !self.is_live_transition(my_gen) {
+                return Ok(self.show_run().unwrap_or(run));
+            }
             run.steps.push(match &client {
                 Some(Ok(r)) => match self.rig_streaming(r).await {
                     Ok(true) => {
@@ -608,6 +1048,9 @@ impl Engine {
             });
         }
         if z.record {
+            if !self.is_live_transition(my_gen) {
+                return Ok(self.show_run().unwrap_or(run));
+            }
             run.steps.push(match &client {
                 Some(Ok(r)) => match self.rig_start_record(r).await {
                     Ok(()) => Step::new("zero_record", "Recording", "done", format!("{} is recording.", r.title())),
@@ -618,6 +1061,9 @@ impl Engine {
             });
         }
         if let Some(text) = &z.chat {
+            if !self.is_live_transition(my_gen) {
+                return Ok(self.show_run().unwrap_or(run));
+            }
             let connected: Vec<Platform> =
                 Platform::CHAT.iter().copied().filter(|p| self.connector(*p).is_some()).collect();
             run.steps.push(if connected.is_empty() {
@@ -652,77 +1098,227 @@ impl Engine {
                 }
             });
         }
-        if z.marker {
+        if z.marker && self.is_live_transition(my_gen) {
             let _ = self.add_marker_now(ferrocast_core::moments::MomentKind::Manual, "Live", None, false).await;
         }
-        run.phase = Phase::Live;
-        run.countdown_ends_at = None;
-        self.set_show(Some(run.clone()));
-        run
+
+        // Only commit `Live` if the transition wasn't cancelled, ended, or stopped meanwhile.
+        let committed = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.epoch == my_gen && m.transitioning_live == Some(my_gen) {
+                m.transitioning_live = None;
+                m.phase = BroadcastPhase::Live;
+                run.phase = Phase::Live;
+                run.countdown_ends_at = None;
+                m.run = Some(run.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !committed {
+            return Ok(self.show_run().unwrap_or(run));
+        }
+        guard.committed = true;
+        self.emit_show(Some(run.clone()));
+        Ok(run)
     }
 
     /// End show: the ending scene, then a thank-you in chat with this stream's supporters.
     pub async fn end_show(&self) -> Result<ShowRun, EngineError> {
-        let cfg = self.show_config();
-        let mut run = self.show_run().filter(|r| r.phase != Phase::Ended).unwrap_or(ShowRun {
-            id: ferrocast_store::new_id(),
-            phase: Phase::Live,
-            started_at: self.stream_started_at().unwrap_or(now().0),
-            countdown_ends_at: None,
-            live_scene: None,
-            ended_at: None,
-            steps: Vec::new(),
-        });
-        run.steps.clear();
-        if let Some(scene) = &cfg.ending_scene {
-            run.steps.push(self.switch_step(&None, "ending_scene", "Ending scene", scene).await);
-        }
-        if let Some(tpl) = &cfg.recap_message {
-            let recap = self.recap(None).await.ok();
-            let (thanks, follows, subs) =
-                recap.map(|r| (r.thanks, r.totals.follows, r.totals.subs)).unwrap_or_default();
-            let duration = now().0 - self.stream_started_at().unwrap_or(run.started_at);
-            let vars = show::recap_vars(&thanks, follows, subs, duration);
-            let text = Template::parse(tpl).map(|t| t.render(&vars)).unwrap_or_default();
-            let connected: Vec<Platform> =
-                Platform::CHAT.iter().copied().filter(|p| self.connector(*p).is_some()).collect();
-            run.steps.push(if connected.is_empty() {
-                Step::new("recap", "Thank-you message", "skipped", "No chat is connected.")
-            } else {
-                match self.send_chat(&text, &connected, None).await {
-                    Ok(o) if o.failed.is_empty() => Step::new("recap", "Thank-you message", "done", text),
-                    Ok(o) => Step::new(
-                        "recap",
-                        "Thank-you message",
-                        if o.ok.is_empty() { "failed" } else { "done" },
-                        o.failed
-                            .iter()
-                            .map(|f| format!("{}: {}", f.platform.label(), f.reason))
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    ),
-                    Err(e) => Step::new("recap", "Thank-you message", "failed", e.to_string()),
+        self.end_show_with(false).await
+    }
+
+    /// End show, optionally stopping the stream immediately (`at_once = true`, skipping any
+    /// `stop_delay_s` wait or bringing an already-waiting stop forward without re-running the
+    /// ending scene/recap).
+    pub async fn end_show_with(&self, at_once: bool) -> Result<ShowRun, EngineError> {
+        self.end_show_opts(at_once, None).await
+    }
+
+    pub(crate) async fn end_show_opts(
+        &self,
+        at_once: bool,
+        stop_stream_override: Option<bool>,
+    ) -> Result<ShowRun, EngineError> {
+        // Fast path: if a delayed stop is already waiting and the caller asks for `at_once`,
+        // stop immediately without repeating the ending scene or thank-you chat.
+        let bring_forward = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.phase == BroadcastPhase::Ending && !m.ending_in_flight && m.stop_waiting && at_once {
+                if let Some(h) = m.stop_task.take() {
+                    h.abort();
                 }
-            });
-        }
-        let _ = self.add_marker_now(ferrocast_core::moments::MomentKind::Manual, "Show ended", None, false).await;
-        if cfg.stop_stream {
-            run.steps.push(if cfg.stop_delay_s == 0 {
-                self.stop_stream_step().await
+                m.stop_waiting = false;
+                m.ending_in_flight = true;
+                m.epoch += 1;
+                Some(m.epoch)
             } else {
-                let engine = self.clone();
-                let (id, delay) = (run.id.clone(), cfg.stop_delay_s);
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(u64::from(delay))).await;
-                    engine.stop_stream_later(&id).await;
-                });
-                Step::new("stop_stream", "Stop streaming", "waiting", format!("Streaming stops in {delay} seconds."))
+                None
+            }
+        };
+        if let Some(my_gen) = bring_forward {
+            let mut guard = EndingGuard { engine: self, epoch: my_gen, committed: false };
+            let step = self.stop_stream_step().await;
+            let out = {
+                let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+                m.ending_in_flight = false;
+                if m.epoch == my_gen {
+                    m.phase = BroadcastPhase::Idle;
+                    if let Some(r) = m.run.as_mut() {
+                        match r.steps.iter_mut().find(|s| s.id == "stop_stream") {
+                            Some(s) => *s = step,
+                            None => r.steps.push(step),
+                        }
+                        Some(r.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    m.run.clone()
+                }
+            };
+            guard.committed = true;
+            if let Some(run) = out {
+                self.emit_show(Some(run.clone()));
+                return Ok(run);
+            }
+            return Ok(ShowRun {
+                id: ferrocast_store::new_id(),
+                phase: Phase::Ended,
+                started_at: now().0,
+                countdown_ends_at: None,
+                live_scene: None,
+                ended_at: Some(now().0),
+                steps: Vec::new(),
             });
         }
+
+        let (my_gen, was_preparing, mut run) = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.ending_in_flight {
+                return Err(EngineError::Conflict("The show is already ending.".into()));
+            }
+            if let Some(h) = m.stop_task.take() {
+                h.abort();
+            }
+            let was_preparing = m.phase == BroadcastPhase::Preparing;
+            m.stop_waiting = false;
+            m.countdown = None;
+            m.transitioning_live = None;
+            m.epoch += 1;
+            let g = m.epoch;
+            m.phase = BroadcastPhase::Ending;
+            m.ending_in_flight = true;
+            let run = m.run.clone().filter(|r| r.phase != Phase::Ended).unwrap_or(ShowRun {
+                id: ferrocast_store::new_id(),
+                phase: Phase::Live,
+                started_at: self.stream_started_at().unwrap_or(now().0),
+                countdown_ends_at: None,
+                live_scene: None,
+                ended_at: None,
+                steps: Vec::new(),
+            });
+            (g, was_preparing, run)
+        };
+        let mut guard = EndingGuard { engine: self, epoch: my_gen, committed: false };
+
+        let cfg = self.show_config();
+        run.steps.clear();
+        if !was_preparing {
+            if let Some(scene) = &cfg.ending_scene
+                && self.is_show_epoch(my_gen)
+            {
+                run.steps.push(self.switch_step(&None, "ending_scene", "Ending scene", scene).await);
+            }
+            if let Some(tpl) = &cfg.recap_message
+                && self.is_show_epoch(my_gen)
+            {
+                let recap = self.recap(None).await.ok();
+                let (thanks, follows, subs) =
+                    recap.map(|r| (r.thanks, r.totals.follows, r.totals.subs)).unwrap_or_default();
+                let duration = now().0 - self.stream_started_at().unwrap_or(run.started_at);
+                let vars = show::recap_vars(&thanks, follows, subs, duration);
+                let text = Template::parse(tpl).map(|t| t.render(&vars)).unwrap_or_default();
+                let connected: Vec<Platform> =
+                    Platform::CHAT.iter().copied().filter(|p| self.connector(*p).is_some()).collect();
+                run.steps.push(if connected.is_empty() {
+                    Step::new("recap", "Thank-you message", "skipped", "No chat is connected.")
+                } else {
+                    match self.send_chat(&text, &connected, None).await {
+                        Ok(o) if o.failed.is_empty() => Step::new("recap", "Thank-you message", "done", text),
+                        Ok(o) => Step::new(
+                            "recap",
+                            "Thank-you message",
+                            if o.ok.is_empty() { "failed" } else { "done" },
+                            o.failed
+                                .iter()
+                                .map(|f| format!("{}: {}", f.platform.label(), f.reason))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        ),
+                        Err(e) => Step::new("recap", "Thank-you message", "failed", e.to_string()),
+                    }
+                });
+            }
+            if self.is_show_epoch(my_gen) {
+                let _ =
+                    self.add_marker_now(ferrocast_core::moments::MomentKind::Manual, "Show ended", None, false).await;
+            }
+        }
+
+        let want_stop = at_once || stop_stream_override.unwrap_or(cfg.stop_stream);
+        let mut scheduled_delay: Option<u32> = None;
+        if want_stop && self.is_show_epoch(my_gen) {
+            if at_once || cfg.stop_delay_s == 0 || was_preparing {
+                run.steps.push(self.stop_stream_step().await);
+            } else {
+                let delay = cfg.stop_delay_s;
+                run.steps.push(Step::new(
+                    "stop_stream",
+                    "Stop streaming",
+                    "waiting",
+                    format!("Streaming stops in {delay} seconds."),
+                ));
+                scheduled_delay = Some(delay);
+            }
+        }
+
         run.phase = Phase::Ended;
         run.ended_at = Some(now().0);
         run.countdown_ends_at = None;
-        self.set_show(Some(run.clone()));
+
+        let committed = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            m.ending_in_flight = false;
+            if m.epoch == my_gen {
+                m.started_stream = false;
+                m.run = Some(run.clone());
+                if let Some(delay) = scheduled_delay {
+                    let stream_gen = m.stream_epoch;
+                    let engine = self.clone();
+                    let id = run.id.clone();
+                    let handle = tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(u64::from(delay))).await;
+                        engine.stop_stream_later(my_gen, stream_gen, &id).await;
+                    });
+                    m.stop_task = Some(handle.abort_handle());
+                    m.stop_waiting = true;
+                    m.phase = BroadcastPhase::Ending;
+                } else {
+                    m.stop_waiting = false;
+                    m.phase = BroadcastPhase::Idle;
+                }
+                true
+            } else {
+                false
+            }
+        };
+        guard.committed = true;
+        if !committed {
+            return Ok(self.show_run().unwrap_or(run));
+        }
+        self.emit_show(Some(run.clone()));
         Ok(run)
     }
 }
@@ -739,20 +1335,55 @@ impl Engine {
         }
     }
 
-    /// The delayed Stop Streaming of an ended show. Does nothing if another show started
-    /// meanwhile (the streamer went live again).
-    async fn stop_stream_later(&self, show_id: &str) {
-        let current = self.show_run();
-        if current.as_ref().is_none_or(|r| r.id != show_id || r.phase != Phase::Ended) {
+    async fn stop_stream_step_locked(&self) -> Step {
+        let rig = match self.rig().await {
+            Ok(r) => r,
+            Err(e) => return Step::new("stop_stream", "Stop streaming", "failed", e.to_string()),
+        };
+        match self.rig_set_streaming_locked(&rig, false).await {
+            Ok(()) => Step::new("stop_stream", "Stop streaming", "done", format!("{} stopped streaming.", rig.title())),
+            Err(e) => Step::new("stop_stream", "Stop streaming", "failed", e.to_string()),
+        }
+    }
+
+    /// The delayed Stop Streaming of an ended show. Serialized with `output_lock` and guarded
+    /// by BOTH `show_gen` and `stream_gen`, so it never kills a new Show OR a plain stream
+    /// started without a Show.
+    async fn stop_stream_later(&self, show_gen: u64, stream_gen: u64, show_id: &str) {
+        let _out = self.studio().output_lock.lock().await;
+        let still_ours = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            let ok = m.epoch == show_gen
+                && m.stream_epoch == stream_gen
+                && m.stop_waiting
+                && m.run.as_ref().is_some_and(|r| r.id == show_id && r.phase == Phase::Ended);
+            if ok {
+                m.stop_task = None;
+                m.stop_waiting = false;
+            }
+            ok
+        };
+        if !still_ours {
             return;
         }
-        let step = self.stop_stream_step().await;
-        if let Some(mut run) = self.show_run().filter(|r| r.id == show_id) {
-            match run.steps.iter_mut().find(|s| s.id == "stop_stream") {
-                Some(s) => *s = step,
-                None => run.steps.push(step),
+        let step = self.stop_stream_step_locked().await;
+        let emit = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.epoch == show_gen && m.phase == BroadcastPhase::Ending {
+                m.phase = BroadcastPhase::Idle;
             }
-            self.set_show(Some(run));
+            if let Some(r) = m.run.as_mut().filter(|r| r.id == show_id) {
+                match r.steps.iter_mut().find(|s| s.id == "stop_stream") {
+                    Some(s) => *s = step,
+                    None => r.steps.push(step),
+                }
+                Some(r.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(run) = emit {
+            self.emit_show(Some(run));
         }
     }
 
@@ -762,12 +1393,32 @@ impl Engine {
         if let Err(e) = self.studio_stream(false).await {
             tracing::warn!(error = %e, "couldn't stop Studio stream after destination failure");
         }
-        if let Some(mut run) = self.show_run().filter(|r| r.phase != Phase::Ended) {
-            run.phase = Phase::Ended;
-            run.ended_at = Some(now().0);
-            run.countdown_ends_at = None;
-            run.steps.push(Step::new("stream", "Go live", "failed", reason));
-            self.set_show(Some(run));
+        let emit = {
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(h) = m.stop_task.take() {
+                h.abort();
+            }
+            m.stop_waiting = false;
+            m.countdown = None;
+            m.transitioning_live = None;
+            m.started_stream = false;
+            m.ending_in_flight = false;
+            if m.phase != BroadcastPhase::Idle {
+                m.epoch += 1;
+                m.phase = BroadcastPhase::Idle;
+            }
+            if let Some(r) = m.run.as_mut().filter(|r| r.phase != Phase::Ended) {
+                r.phase = Phase::Ended;
+                r.ended_at = Some(now().0);
+                r.countdown_ends_at = None;
+                r.steps.push(Step::new("stream", "Go live", "failed", reason));
+                Some(r.clone())
+            } else {
+                None
+            }
+        };
+        if let Some(run) = emit {
+            self.emit_show(Some(run));
         }
     }
 
@@ -779,6 +1430,7 @@ impl Engine {
 
     /// Presses OBS's Start or Stop Streaming (`POST /api/v1/obs/stream`).
     pub async fn obs_set_streaming(&self, on: bool) -> Result<bool, EngineError> {
+        let _out = self.studio().output_lock.lock().await;
         let c = self.obs_client().await?;
         if on {
             ferrocast_obs::control::start_stream(&c).await.map_err(super::obs_error)?;
@@ -789,9 +1441,12 @@ impl Engine {
         // is the new state (a stale one read "stopped" right after Start).
         let deadline = tokio::time::Instant::now() + STREAM_SWITCH_WAIT;
         loop {
-            let now = ferrocast_obs::control::streaming(&c).await.map_err(super::obs_error)?;
-            if now == on {
-                return Ok(now);
+            let live = ferrocast_obs::control::streaming(&c).await.map_err(super::obs_error)?;
+            if live == on {
+                if on {
+                    self.on_stream_started();
+                }
+                return Ok(live);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(EngineError::Refused {
@@ -816,27 +1471,73 @@ const NO_COUNTDOWN: EngineError = EngineError::Missing {
     hint: "Start the show first.",
 };
 
-/// Switches to the live scene when a countdown reaches zero.
+/// Switches to the live scene when a monotonic countdown reaches zero.
+/// Ticks at most once per second so sleep/wake clock jumps are detected and clamped rather
+/// than blasting straight through the countdown into the live scene.
 pub(crate) async fn countdown_loop(engine: Engine) {
     loop {
-        let wait = engine
-            .show_run()
-            .filter(|r| r.phase == Phase::Countdown)
-            .and_then(|r| r.countdown_ends_at)
-            .map(|end| Duration::from_millis(u64::try_from((end - now().0).max(0)).unwrap_or(0)));
-        match wait {
-            Some(w) if w.is_zero() => {
-                if let Some(run) = engine.show_run().filter(|r| r.phase == Phase::Countdown) {
-                    engine.go_live_now(run).await;
+        let (wait, resync_run) = {
+            let mut m = engine.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.phase == BroadcastPhase::Countdown && m.transitioning_live.is_none() {
+                if let Some(timer) = m.countdown.as_mut() {
+                    let (rem, jumped) = timer.advance(tokio::time::Instant::now());
+                    let resync = if jumped && let Some(run) = m.run.as_mut() {
+                        run.countdown_ends_at = Some(now().0 + i64::try_from(rem.as_millis()).unwrap_or(0));
+                        Some(run.clone())
+                    } else {
+                        None
+                    };
+                    (Some(rem), resync)
+                } else {
+                    (None, None)
                 }
+            } else {
+                (None, None)
             }
-            Some(w) => {
+        };
+        if let Some(run) = resync_run {
+            engine.emit_show(Some(run));
+        }
+        match wait {
+            Some(rem) if rem.is_zero() => {
+                let _ = engine.go_live_now(false).await;
+            }
+            Some(rem) => {
+                let step = rem.min(Duration::from_secs(1));
                 tokio::select! {
-                    () = tokio::time::sleep(w) => {}
+                    () = tokio::time::sleep(step) => {}
                     () = engine.studio().show_wake.notified() => {}
                 }
             }
             None => engine.studio().show_wake.notified().await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn countdown_timer_clamps_wake_jumps_and_expires_normally() {
+        let t0 = tokio::time::Instant::now();
+        let mut timer = CountdownTimer::start(Duration::from_secs(10), t0);
+        // Normal 1 s tick reduces remaining by 1 s.
+        let (rem, jumped) = timer.advance(t0 + Duration::from_secs(1));
+        assert!(!jumped);
+        assert_eq!(rem, Duration::from_secs(9));
+        // A 5-minute sleep/wake jump is clamped to 1 s instead of firing go_live_now early.
+        let (rem, jumped) = timer.advance(t0 + Duration::from_secs(301));
+        assert!(jumped);
+        assert_eq!(rem, Duration::from_secs(8));
+        // Normal ticks finish cleanly to zero.
+        let mut t = t0 + Duration::from_secs(301);
+        for _ in 0..8 {
+            t += Duration::from_secs(1);
+            let (_, jumped) = timer.advance(t);
+            assert!(!jumped);
+        }
+        let (rem, _) = timer.advance(t);
+        assert!(rem.is_zero());
     }
 }

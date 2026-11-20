@@ -737,13 +737,7 @@ async fn the_countdown_reaches_zero_by_itself() {
     let run = e.start_show(true).await.unwrap();
     assert_eq!(run.phase, super::show::Phase::Countdown);
     // Pull the end in so the test doesn't wait 10 s: the loop wakes on the change.
-    {
-        let mut s = e.studio().show.lock().unwrap();
-        if let Some(r) = s.as_mut() {
-            r.countdown_ends_at = Some(crate::now().0 + 50);
-        }
-    }
-    e.studio().show_wake.notify_one();
+    e.set_countdown_remaining_for_test(Duration::from_millis(50));
     eventually(|| obs.lock().unwrap().current == "Gameplay").await;
     eventually(|| e.show_run().is_some_and(|r| r.phase == super::show::Phase::Live)).await;
     let c = e.start_show(true).await;

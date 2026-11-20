@@ -297,10 +297,20 @@ impl Engine {
     }
 
     pub(crate) async fn rig_set_streaming(&self, rig: &Rig, on: bool) -> Result<(), EngineError> {
+        let _out = self.studio().output_lock.lock().await;
+        self.rig_set_streaming_locked(rig, on).await
+    }
+
+    /// Runs Start/Stop Streaming on `rig` while the caller already holds `studio().output_lock`.
+    pub(crate) async fn rig_set_streaming_locked(&self, rig: &Rig, on: bool) -> Result<(), EngineError> {
         match rig {
-            Rig::Obs(c) if on => ferrocast_obs::control::start_stream(c).await.map_err(obs_error),
+            Rig::Obs(c) if on => {
+                ferrocast_obs::control::start_stream(c).await.map_err(obs_error)?;
+                self.on_stream_started();
+                Ok(())
+            }
             Rig::Obs(c) => ferrocast_obs::control::stop_stream(c).await.map_err(obs_error),
-            Rig::Studio => self.studio_stream(on).await.map(drop),
+            Rig::Studio => self.studio_stream_locked(on).await.map(drop),
         }
     }
 
