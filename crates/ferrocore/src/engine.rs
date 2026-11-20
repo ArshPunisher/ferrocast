@@ -2914,8 +2914,13 @@ impl Engine {
     /// What stopped this output, if anything did (as of the loop's last frame). Another output's
     /// fault (a vertical stream's, the replay buffer's) isn't it.
     pub fn output_error(&self, id: u64) -> Option<String> {
-        let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        seen.errors.iter().find(|(i, _)| *i == id).map(|(_, e)| e.clone())
+        let own = {
+            let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.errors.iter().find(|(i, _)| *i == id).map(|(_, e)| e.clone())
+        };
+        // The card's own failure (out of memory, an internal error) stops every picture: it is
+        // each output's, unlike an encoder's.
+        own.or_else(|| self.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
     }
 
     /// Any scene drawn now at the engine's size, RGBA: Studio Mode's preview, the Scenes grid.
@@ -6183,6 +6188,17 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         assert!(!e.transitioning());
         assert_eq!(e.snapshot().unwrap_or_default()[0], 255);
+    }
+
+    /// The graphics card's failure reaches every output's error (agy review R1).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_gpu_failure_is_every_outputs_error() {
+        let Some(e) = engine() else { return };
+        assert_eq!(e.output_error(7), None);
+        *e.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()) = Some("out of memory".into());
+        assert_eq!(e.output_error(7), Some("out of memory".into()));
+        assert_eq!(e.output_error(8), Some("out of memory".into()));
     }
 
     /// One output's encoder fault marks that output, not the others (agy GAPS #3): the main

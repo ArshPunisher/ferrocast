@@ -141,6 +141,8 @@ pub fn microphones() -> Vec<Device> {
 struct Shared {
     device_id: String,
     label: &'static str,
+    /// The "staying off the Bluetooth microphone" line has been logged.
+    bluetooth_noted: std::sync::atomic::AtomicBool,
     frame: Mutex<Option<(Picture, u64)>>,
     /// The newest frame as the camera holds it (no copy), when the card can read it directly.
     surface: Mutex<Option<(super::screen::Surface, u64)>>,
@@ -997,7 +999,16 @@ impl Capture {
         // Following the system's microphone, and it changed (headphones with a mic plugged
         // in, another input picked in System Settings): this one is done, the new one opens.
         let now = self.follows.as_ref().and_then(|_| default_microphone());
-        moved_on(self.follows.as_deref(), now.as_deref(), is_bluetooth_input)
+        let moved = moved_on(self.follows.as_deref(), now.as_deref(), is_bluetooth_input);
+        // Said once, not at every look (the watchdog asks every second).
+        if moved.is_none()
+            && let (Some(was), Some(now)) = (self.follows.as_deref(), now.as_deref())
+            && was != now
+            && !self.shared.bluetooth_noted.swap(true, Ordering::Relaxed)
+        {
+            tracing::info!("the system's microphone is now a Bluetooth one; staying on the one in use");
+        }
+        moved
     }
 }
 
@@ -1019,7 +1030,6 @@ fn moved_on(follows: Option<&str>, now: Option<&str>, bluetooth: impl Fn(&str) -
     match (follows, now) {
         (Some(was), Some(now)) if was != now => {
             if bluetooth(now) && !bluetooth(was) {
-                tracing::info!("the system's microphone is now a Bluetooth one; staying on the one in use");
                 return None;
             }
             Some("the system's microphone changed".into())
