@@ -3647,7 +3647,9 @@ pub fn raise_this_thread() {
 
 /// RAII guard for real-time audio thread priority/MMCSS registration on `ferrocast-audio`.
 #[allow(dead_code)]
-pub(crate) struct AudioThreadGuard {
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AudioThreadGuard {
     #[cfg(target_os = "windows")]
     mmcss: Option<windows::Win32::Foundation::HANDLE>,
 }
@@ -3667,7 +3669,8 @@ impl Drop for AudioThreadGuard {
 /// Prepares the dedicated real-time audio thread (`ferrocast-audio`): enables x86 FTZ/DAZ, sets
 /// `QOS_CLASS_USER_INTERACTIVE` on macOS, or registers MMCSS `"Audio"` + disables EcoQoS on Windows.
 #[allow(dead_code, unsafe_code)]
-pub(crate) fn raise_audio_thread() -> AudioThreadGuard {
+#[doc(hidden)]
+pub fn raise_audio_thread() -> AudioThreadGuard {
     crate::afx::enable_ftz_daz();
     #[cfg(target_os = "macos")]
     {
@@ -3675,6 +3678,11 @@ pub(crate) fn raise_audio_thread() -> AudioThreadGuard {
         let r = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
         if r != 0 {
             tracing::debug!(r, "audio thread kept default QoS class");
+        }
+        // The real-time class, as CoreAudio's own threads: precise wakes for a 21.3 ms block's
+        // clock (about 4 ms of work, due within 10 ms of waking).
+        if !crate::apple::make_realtime(21_333_333, 4_000_000, 10_000_000) {
+            tracing::debug!("audio thread kept the timeshare class");
         }
         AudioThreadGuard {}
     }

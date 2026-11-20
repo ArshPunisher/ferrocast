@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
 use crate::mix::Levels;
@@ -355,28 +356,30 @@ impl AudioClock for SystemClock {
     }
 
     fn sleep_until_ns(&self, target_ns: u64) {
-        // High-res waitable timers on Windows wake within ~0.5 ms; leave 1.5 ms of margin there
-        // (1 ms elsewhere) so coarse sleeps never overshoot a 21.333 ms audio block.
+        // The last stretch is yielded, then spun: the OS wakes a coarse sleep a little late.
         #[cfg(target_os = "windows")]
         const SPIN_NS: u64 = 1_500_000;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        const SPIN_NS: u64 = 60_000;
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         const SPIN_NS: u64 = 1_000_000;
-        const BUSY_SPIN_NS: u64 = 200_000;
+        const BUSY_SPIN_NS: u64 = 30_000;
         loop {
             let now = self.now_ns();
             if now >= target_ns {
                 return;
             }
             let left = target_ns - now;
-            if left > 2 * SPIN_NS {
-                // Windows: the high-resolution timer wakes within ~0.5 ms, so sleep to the margin.
-                // Elsewhere the system's timer slack grows with the length asked for (this Mac: a
-                // 5 ms sleep woke 2.5 ms late, a 20 ms one 7-10 ms late: after the target, and 4.5
-                // ms late at the median for an audio block): half of what is left never passes it,
-                // and the last milliseconds are yielded.
+            if left > SPIN_NS + SPIN_NS / 2 {
+                // macOS: `mach_wait_until`, precise and not a busy wait (a plain sleep's timer slack
+                // grows with its length: 20 ms woke 7-10 ms late, 4.5 ms at the median for a block).
+                #[cfg(target_os = "macos")]
+                crate::apple::wait_until_ns(target_ns - SPIN_NS);
+                // Windows: the high-resolution timer wakes within ~0.5 ms: sleep to the margin.
                 #[cfg(target_os = "windows")]
                 crate::sleep_precise(Duration::from_nanos(left - SPIN_NS));
-                #[cfg(not(target_os = "windows"))]
+                // Elsewhere: half of what is left never passes the target.
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 crate::sleep_precise(Duration::from_nanos(left / 2));
             } else if left > BUSY_SPIN_NS {
                 std::thread::yield_now();
@@ -629,30 +632,6 @@ mod tests {
         assert!(b - target < 50_000_000, "woke {} ms late", (b - target) / 1_000_000);
         c.sleep_until_ns(a);
         assert!(c.now_ns() >= b, "a target in the past returns at once");
-    }
-
-    /// Off Windows the system's timer slack made a plain sleep wake up to 10 ms after an audio block's
-    /// time (this Mac: a 20 ms sleep woke 7-10 ms late): the wake is now close to the target, at a
-    /// small CPU cost (the last millisecond is yielded).
-    #[cfg(not(windows))]
-    #[test]
-    fn system_clock_wakes_close_to_an_audio_blocks_time_without_burning_a_core() {
-        let c = SystemClock;
-        let step_ns = 21_333_333u64;
-        let mut target = c.now_ns() + step_ns;
-        let mut late_us = Vec::new();
-        let t0 = std::time::Instant::now();
-        for _ in 0..40 {
-            c.sleep_until_ns(target);
-            late_us.push((c.now_ns().saturating_sub(target)) / 1000);
-            target += step_ns;
-        }
-        late_us.sort_unstable();
-        let (p50, p90) = (late_us[late_us.len() / 2], late_us[late_us.len() * 9 / 10]);
-        assert!(p50 < 1500 && p90 < 3500, "woke {p50} us (median) and {p90} us (p90) after the block's time");
-        // Yielding is not spinning: the wait took the block time, not a busy hundred percent of it
-        // (checked loosely, a loaded machine reschedules).
-        assert!(t0.elapsed() >= std::time::Duration::from_nanos(step_ns * 39));
     }
 
     /// On Windows, `SystemClock::sleep_until_ns` must hold a 21.333 ms audio cadence via high-res

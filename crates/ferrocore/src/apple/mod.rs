@@ -70,6 +70,14 @@ struct TimebaseInfo {
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
     fn mach_timebase_info(info: *mut TimebaseInfo) -> i32;
+    /// Sleeps until `mach_absolute_time` reaches the deadline; 0 when it did.
+    fn mach_wait_until(deadline: u64) -> i32;
+    /// This task's port.
+    static mach_task_self_: u32;
+    /// The calling thread's port (a send right to give back).
+    fn mach_thread_self() -> u32;
+    /// Gives back a send right (here the one `mach_thread_self` added).
+    fn mach_port_deallocate(task: u32, name: u32) -> i32;
 }
 
 /// The Mac's tick-to-nanosecond ratio, asked once (it never changes while the machine runs): every
@@ -97,6 +105,57 @@ pub(crate) fn host_ns() -> u64 {
     // SAFETY: a plain system call.
     let t = unsafe { mach_absolute_time() };
     ticks_to_ns(t, timebase())
+}
+
+/// Sleeps until the host clock ([`host_ns`]) reaches `target_ns`, at once if it has. Precise to tens
+/// of microseconds and not a busy wait: a plain `thread::sleep` on this clock's threads wakes late by
+/// a share of the time asked for (the timer slack: 7-10 ms for 20 ms on a Mac mini), which put a
+/// 21.3 ms audio block's wake 4.5 ms late at the median.
+pub(crate) fn wait_until_ns(target_ns: u64) {
+    let ticks = match timebase() {
+        Some((numer, denom)) if numer != denom => {
+            (u128::from(target_ns) * u128::from(denom) / u128::from(numer)).min(u128::from(u64::MAX)) as u64
+        }
+        _ => target_ns,
+    };
+    // SAFETY: a plain system call taking a time, no pointers.
+    unsafe { mach_wait_until(ticks) };
+}
+
+/// Puts the calling thread on the real-time scheduling class (`THREAD_TIME_CONSTRAINT_POLICY`, what
+/// CoreAudio's own I/O threads use): it runs `computation_ns` of work every `period_ns`, within
+/// `constraint_ns` of waking. The system also stops coalescing its timers: at the user-interactive
+/// QoS alone a `mach_wait_until` woke 4.6 ms late at the median for a 21.3 ms block, on this class
+/// 0 µs. Whether it took.
+pub(crate) fn make_realtime(period_ns: u64, computation_ns: u64, constraint_ns: u64) -> bool {
+    let ticks = |ns: u64| -> u32 {
+        let t = match timebase() {
+            Some((numer, denom)) if numer != denom => u128::from(ns) * u128::from(denom) / u128::from(numer),
+            _ => u128::from(ns),
+        };
+        t.min(u128::from(u32::MAX)) as u32
+    };
+    let mut policy = libc::thread_time_constraint_policy {
+        period: ticks(period_ns),
+        computation: ticks(computation_ns),
+        constraint: ticks(constraint_ns),
+        preemptible: 1,
+    };
+    // SAFETY: sets the calling thread's own scheduling policy from a struct alive for the call; the
+    // thread's port is the one `mach_thread_self` returned (a send right, released right after).
+    let (thread, r) = unsafe {
+        let thread = mach_thread_self();
+        let r = libc::thread_policy_set(
+            thread,
+            libc::THREAD_TIME_CONSTRAINT_POLICY as u32,
+            (&raw mut policy).cast(),
+            libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+        );
+        (thread, r)
+    };
+    // SAFETY: gives back the send right `mach_thread_self` added.
+    unsafe { mach_port_deallocate(mach_task_self_, thread) };
+    r == 0
 }
 
 /// A Core Foundation object this code owns (one retain), released when dropped.
