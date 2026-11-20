@@ -194,6 +194,13 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             Effect::Sharpen { sharpness: n("sharpness", 0.08).clamp(0.0, 1.0) }
         }
         "ferrocast_freeze" | "freeze_filter" => Effect::Freeze,
+        // OBS's Render Delay holds pictures only; its Video Delay (Async) holds the sound too.
+        "ferrocast_video_delay" => Effect::Delay {
+            ms: (n("delay_ms", 0.0).clamp(0.0, 20_000.0)) as u32,
+            audio: s.get("audio").and_then(Value::as_bool).unwrap_or(false),
+        },
+        "gpu_delay" => Effect::Delay { ms: (n("delay_ms", 0.0).clamp(0.0, 500.0)) as u32, audio: false },
+        "async_delay_filter" => Effect::Delay { ms: (n("delay_ms", 0.0).clamp(0.0, 20_000.0)) as u32, audio: true },
         "scroll_filter" => {
             let size = |on: &str, k: &str| {
                 s.get(on)
@@ -2038,7 +2045,7 @@ mod tests {
                   "settings": { "color": 0xFF00_80FFu32 },
                   "filters": [{ "id": "sharpness_filter", "versioned_id": "sharpness_filter_v2", "settings": {} },
                               { "id": "gain_filter", "settings": { "db": 3.0 } },
-                              { "id": "gpu_delay", "settings": {} }] },
+                              { "id": "gpu_delay", "settings": { "delay_ms": 100 } }] },
                 { "id": "browser_source", "name": "Web", "settings": {} },
                 { "id": "scene", "name": "Two", "settings": { "items": [
                     { "name": "One", "pos": { "x": 10.0, "y": 20.0 }, "scale": { "x": 0.5, "y": 0.5 }, "visible": true } ] } },
@@ -2053,20 +2060,46 @@ mod tests {
         assert_eq!(got.sources.len(), 2, "the web page comes over, for the app to render");
         assert_eq!(got.sources[0].kind, SourceKind::Color { width: 640, height: 360, rgba: [0xFF, 0x80, 0, 0xFF] });
         assert_eq!(got.sources[1].kind, SourceKind::Fed { width: 800, height: 600 });
-        assert!(got.skipped.iter().any(|s| s.contains("gpu_delay")));
+        assert!(!got.skipped.iter().any(|s| s.contains("gpu_delay")), "Render Delay comes over now");
         let names: Vec<&str> = got.scenes.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["One", "Two"]);
         let back = &got.scenes[0].1[0];
         assert!(!back.visible);
         assert_eq!(back.blend, Blend::Screen);
         assert_eq!(back.filter, Filter::Lanczos);
-        assert_eq!(back.effects.len(), 1);
+        assert_eq!(back.effects.len(), 2, "sharpen, and the render delay");
         assert_eq!((back.placement.rotation, back.placement.bounds, back.placement.crop[0]), (30.0, Bounds::Fit, 4));
         assert_eq!(got.scenes[0].1.len(), 2, "the web page's item stays (its pictures come from the app)");
         let nested = &got.scenes[1].1[0];
         assert_eq!(nested.scene.as_deref(), Some("One"));
         assert_eq!((nested.placement.x, nested.placement.scale_x), (10.0, 0.5));
         assert_eq!(nested.group, None);
+    }
+
+    #[test]
+    fn the_delay_filters_come_over_with_their_times() {
+        let doc = json!({ "sources": [
+            { "id": "color_source", "name": "Cam", "settings": {},
+              "filters": [{ "id": "gpu_delay", "settings": { "delay_ms": 200 } },
+                          { "id": "async_delay_filter", "settings": { "delay_ms": 1500 } },
+                          { "id": "gpu_delay", "settings": { "delay_ms": 9999 } }] },
+            { "id": "scene", "name": "S", "settings": { "items": [{ "name": "Cam" }] } }] });
+        let got = import(&doc, (64, 64));
+        assert!(got.skipped.is_empty(), "nothing left out: {:?}", got.skipped);
+        let e = &got.scenes[0].1[0].effects;
+        assert_eq!(
+            e[..],
+            [
+                Effect::Delay { ms: 200, audio: false },
+                Effect::Delay { ms: 1500, audio: true },
+                Effect::Delay { ms: 500, audio: false },
+            ],
+            "Render Delay holds pictures only and stops at 500 ms; the async one takes the sound too"
+        );
+        assert_eq!(
+            effect_from("ferrocast_video_delay", &json!({ "delay_ms": 30000, "audio": true })),
+            Some(Effect::Delay { ms: 20_000, audio: true })
+        );
     }
 
     #[test]

@@ -198,6 +198,7 @@ pub fn kinds() -> Kinds {
             kind("ferrocast_look", "Look"),
             kind("ferrocast_shader", "Shader Effect"),
             kind("ferrocast_freeze", "Freeze"),
+            kind("ferrocast_video_delay", "Video Delay"),
             kind("gain_filter", "Gain"),
             kind("noise_gate_filter", "Noise Gate"),
             kind("compressor_filter", "Compressor"),
@@ -540,6 +541,11 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
         "ferrocast_replay" => vec![opt("switch", "Show its scene while it plays", "bool")],
         // Nothing to set: its switch freezes and unfreezes.
         "ferrocast_freeze" => vec![],
+        // Pictures held in memory: the longer and bigger, the more it takes (capped).
+        "ferrocast_video_delay" => vec![
+            opt("delay_ms", "Delay", "int").range(0.0, 20_000.0, 10.0).unit(" ms"),
+            opt("audio", "Delay its sound too", "bool"),
+        ],
         // Its choices are the collection's sources and scenes (Stage::options fills them in).
         "ferrocast_clone" => {
             vec![opt("clone", "Source", "list").choices(&[]), opt("filters", "Include its filters", "bool")]
@@ -1029,6 +1035,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ndi_source" => json!({ "ndi_source_name": "" }),
         "ferrocast_clone" => json!({ "clone": "", "filters": true }),
         "ferrocast_freeze" => json!({}),
+        "ferrocast_video_delay" => json!({ "delay_ms": 200, "audio": false }),
         "ferrocast_replay" => json!({ "local_file": "", "switch": true }),
         "ferrocast_visualizer" => json!({
             "source": "", "bars": 32, "width": 800, "height": 200, "color": 0xFFFF_FFFFu32, "mirror": false,
