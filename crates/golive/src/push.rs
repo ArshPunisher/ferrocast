@@ -344,7 +344,11 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     // A network that is down isn't the destination failing: its tries are counted
                     // apart and don't use up the ones an ordinary failure gets, and it is waited for
                     // (up to NETWORK_PATIENCE) rather than given up on after a few seconds.
-                    let net_down = matches!(err, PushError::NetworkDown(_));
+                    // Also a server that took this stream earlier and now refuses connections at all
+                    // (an ingest restarting, one's own server rebooting): an outage to wait for. One
+                    // that never took it stays an ordinary failure (a wrong address says so fast).
+                    let net_down = matches!(err, PushError::NetworkDown(_))
+                        || (ever_live && matches!(err, PushError::Unreachable(_)));
                     if net_down {
                         net_tries = net_tries.saturating_add(1);
                         down_since.get_or_insert_with(Instant::now);

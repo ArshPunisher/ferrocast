@@ -522,6 +522,45 @@ async fn a_hang_up_at_the_publish_after_the_stream_was_live_is_not_a_refused_key
     state_is(&mut health, |s| *s == PushState::Live).await;
 }
 
+/// A server that took the stream and then stops accepting connections for a while (an ingest
+/// restarting; one's own server rebooting) is an outage, waited for like a network that is down:
+/// a destination that never took the stream still gives up on a wrong address in a few tries.
+#[tokio::test]
+async fn a_server_that_was_live_and_refuses_connections_for_a_while_is_waited_for() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let (tx, mut got) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let mut conns = tokio::task::JoinSet::new();
+        while let Ok((mut sock, _)) = l.accept().await {
+            let tx = tx.clone();
+            conns.spawn(async move {
+                let _ = serve_platform(&mut sock, "k", &tx).await;
+            });
+        }
+    });
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    // The server goes: its listener and connections close; nothing listens for a while.
+    server.abort();
+    let _ = server.await;
+    let state = state_is(&mut health, |s| {
+        matches!(s, PushState::Failed { .. }) || matches!(s, PushState::Reconnecting { attempt, .. } if *attempt >= 8)
+    })
+    .await;
+    assert!(matches!(state, PushState::Reconnecting { .. }), "gave up on a server that had been live: {state:?}");
+    // It comes back.
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+}
+
 #[tokio::test]
 async fn a_network_that_is_down_is_waited_for_not_counted_against_the_destination() {
     let w = world().await;
