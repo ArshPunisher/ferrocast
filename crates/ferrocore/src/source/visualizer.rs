@@ -28,14 +28,21 @@ const WINDOW: usize = 2048;
 /// How fast a bar falls back each frame (rising is at once).
 const FALL: f32 = 0.86;
 
+/// Which audio tap feeds a [`VisualizerLive`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TapKey {
+    Master,
+    Source(u64),
+}
+
 /// A visualizer as it runs: what it heard last and where its bars stand.
 #[derive(Debug)]
 pub(crate) struct VisualizerLive {
     pub spec: VisualizerSpec,
     ring: VecDeque<f32>,
     levels: Vec<f32>,
-    /// The source it taps now (its id) and the tap.
-    pub tap: Option<(u64, crate::mix::Tap)>,
+    /// What it taps now and the tap handle.
+    pub tap: Option<(TapKey, crate::mix::Tap)>,
 }
 
 impl VisualizerLive {

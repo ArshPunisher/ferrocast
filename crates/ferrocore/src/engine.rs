@@ -7,13 +7,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioConfig;
-use crate::mix::{Mixer, SourceSettings};
+use crate::audio_thread::{AudioCmd, AudioHandle, ToneSpec};
+use crate::mix::{Block, SourceSettings};
 use crate::pipeline::{Pipeline, Tag};
+use crate::rt::{AtomicLevels, AudioProducer, SpscAudioRing};
 use crate::source::image::ImageSource;
 use crate::source::text::{TextRenderer, TextStyle};
 use crate::video::{Frame, VideoConfig};
@@ -605,9 +607,11 @@ fn next_reopen_token() -> u64 {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 fn spawn_media_reopen(
     state: Arc<Mutex<State>>,
-    mixer: Arc<Mutex<Mixer>>,
+    audio_cmd: mpsc::Sender<AudioCmd>,
+    levels: Arc<RwLock<HashMap<u64, Arc<AtomicLevels>>>>,
     id: u64,
     token: u64,
     path: PathBuf,
@@ -620,26 +624,37 @@ fn spawn_media_reopen(
         {
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
             let still_wanted = !require_active || active(&st).contains(&id);
-            match (opened, st.sources.get_mut(&id).map(|s| &mut s.live)) {
-                (Ok(m), Some(Live::Media(slot))) if slot.reopening == Some(token) && still_wanted => {
+            match (opened, st.sources.get_mut(&id)) {
+                (Ok(m), Some(src))
+                    if matches!(&src.live, Live::Media(slot) if slot.reopening == Some(token)) && still_wanted =>
+                {
                     let has_audio = m.has_audio;
-                    slot.reopening = None;
-                    slot.duration_ns = m.duration_ns;
-                    slot.cleared = false;
-                    slot.player = Some(Arc::new(m));
+                    if let Live::Media(slot) = &mut src.live {
+                        slot.reopening = None;
+                        slot.duration_ns = m.duration_ns;
+                        slot.cleared = false;
+                        slot.player = Some(Arc::new(m));
+                    }
+                    src.audio_tx = None;
                     if has_audio {
-                        mixer.lock().unwrap_or_else(|e| e.into_inner()).ensure(id);
+                        let atom = ensure_levels_in(&levels, id);
+                        let _ = audio_cmd.send(AudioCmd::EnsureSource { id, levels: atom });
+                        let _ = audio_cmd.send(AudioCmd::SetOutputCapture { id, capture: None });
                     }
                 }
-                (Ok(m), Some(Live::Media(slot))) if slot.reopening == Some(token) => {
-                    slot.reopening = None;
+                (Ok(m), Some(src)) if matches!(&src.live, Live::Media(slot) if slot.reopening == Some(token)) => {
+                    if let Live::Media(slot) = &mut src.live {
+                        slot.reopening = None;
+                    }
                     leftover = Some(m);
                 }
                 (Ok(m), _) => {
                     leftover = Some(m);
                 }
-                (Err(e), Some(Live::Media(slot))) if slot.reopening == Some(token) => {
-                    slot.reopening = None;
+                (Err(e), Some(src)) if matches!(&src.live, Live::Media(slot) if slot.reopening == Some(token)) => {
+                    if let Live::Media(slot) = &mut src.live {
+                        slot.reopening = None;
+                    }
                     tracing::warn!(source = id, file = %path.display(), error = %e, "media source couldn't reopen");
                 }
                 (Err(_), _) => {}
@@ -655,12 +670,6 @@ enum Live {
         src: ImageSource,
         since: Instant,
         last: Option<usize>,
-    },
-    Tone {
-        hz: f32,
-        every_ns: u64,
-        beep_ns: u64,
-        pushed_to: Option<u64>,
     },
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     Screen(crate::screen::ScreenCapture),
@@ -709,6 +718,8 @@ struct Src {
     opening_since: u64,
     /// Pictures sent to the card so far (how busy it keeps the engine; Stats shows the rate).
     sent: u64,
+    /// Per-source SPSC audio ring producer attached lazily on the first forwarded audio chunk.
+    audio_tx: Option<AudioProducer>,
 }
 
 /// How long a hidden capture may hold a pinned zero-copy surface without a newer frame before
@@ -784,7 +795,18 @@ impl Fresh {
 impl Src {
     fn new(live: Live, size: Option<(u32, u32, bool)>, kind: Option<SourceKind>) -> Self {
         let watch = Watch::for_kind(kind.as_ref(), now_ns());
-        Src { live, size, kind, watch, pending: None, pending_since: 0, opening: None, opening_since: 0, sent: 0 }
+        Src {
+            live,
+            size,
+            kind,
+            watch,
+            pending: None,
+            pending_since: 0,
+            opening: None,
+            opening_since: 0,
+            sent: 0,
+            audio_tx: None,
+        }
     }
 }
 
@@ -880,11 +902,8 @@ struct State {
     taps: Vec<(u64, Canvas, FrameSink)>,
     video: VideoConfig,
     audio: AudioConfig,
-    /// Where monitored sound is played, when monitoring is on.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    monitor: Option<crate::monitor::Feeder>,
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    monitor_epoch: u64,
+    /// Sorted list of source IDs currently active/heard on `ferrocast-audio` (`SetHeard` dedup).
+    last_heard: Vec<u64>,
     stats: Stats,
     error: Option<String>,
     /// The previews windows show, by id.
@@ -1008,12 +1027,15 @@ fn join_bounded(handle: JoinHandle<()>, done: &(Mutex<bool>, Condvar), timeout: 
 /// The engine. Dropping it stops its thread and closes its outputs.
 pub struct Engine {
     config: EngineConfig,
-    /// The device monitored sound plays on (it stays on this side: its feeder goes to the loop).
+    /// The device monitored sound plays on (it stays on this side: its feeder goes to `ferrocast-audio`).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     monitor: Mutex<Option<crate::monitor::Monitor>>,
     state: Arc<Mutex<State>>,
     gpu: Arc<Compositor>,
-    mixer: Arc<Mutex<Mixer>>,
+    audio: AudioHandle,
+    /// Lock-free level mirrors shared with `ferrocast-audio`, keyed by source ID.
+    levels: Arc<RwLock<HashMap<u64, Arc<AtomicLevels>>>>,
+    recycle_tx: mpsc::SyncSender<Block>,
     /// Shared with countdowns, so fonts are loaded once.
     text: Arc<Mutex<TextRenderer>>,
     stop: Arc<AtomicBool>,
@@ -1049,15 +1071,68 @@ pub fn now_ns() -> u64 {
     }
 }
 
+const FRAME_RING_SECONDS: usize = 4;
+const FRAME_RING_PIECE_FRAMES: usize = 480;
+const MAX_RING_CHUNK_FRAMES: usize = 4096;
+
+fn ensure_levels_in(levels: &RwLock<HashMap<u64, Arc<AtomicLevels>>>, id: u64) -> Arc<AtomicLevels> {
+    if let Some(atom) = levels.read().unwrap_or_else(|e| e.into_inner()).get(&id) {
+        return Arc::clone(atom);
+    }
+    let mut map = levels.write().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(id).or_insert_with(AtomicLevels::shared))
+}
+
+fn sync_heard(st: &mut State, audio_cmd: &mpsc::Sender<AudioCmd>) {
+    let mut list: Vec<u64> = heard(st).into_iter().collect();
+    list.sort_unstable();
+    if list != st.last_heard {
+        let msg: Arc<[u64]> = Arc::from(list.as_slice());
+        st.last_heard = list;
+        let _ = audio_cmd.send(AudioCmd::SetHeard(msg));
+    }
+}
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", target_os = "linux")), allow(dead_code))]
+fn forward_audio(
+    id: u64,
+    slot: &mut Option<AudioProducer>,
+    audio_cmd: &mpsc::Sender<AudioCmd>,
+    pcm: &[f32],
+    channels: usize,
+    rate: u32,
+    ts_ns: u64,
+) {
+    let Ok(ch) = u8::try_from(channels) else { return };
+    if channels == 0 || rate == 0 || pcm.is_empty() || !pcm.len().is_multiple_of(channels) {
+        return;
+    }
+    let prod = slot.get_or_insert_with(|| {
+        let (p, c) = SpscAudioRing::for_seconds(FRAME_RING_SECONDS, 48_000, 2, FRAME_RING_PIECE_FRAMES);
+        let _ = audio_cmd.send(AudioCmd::AttachRing { id, consumer: c });
+        p
+    });
+    let max_samples = MAX_RING_CHUNK_FRAMES * channels;
+    let mut offset_frames = 0usize;
+    for chunk in pcm.chunks(max_samples) {
+        let chunk_ts = ts_ns.saturating_add(((offset_frames as u128 * 1_000_000_000) / u128::from(rate)) as u64);
+        let _ = prod.push(chunk, ch, rate, chunk_ts);
+        offset_frames += chunk.len() / channels;
+    }
+}
+
 impl Engine {
     /// Starts the engine and its frame loop.
-    pub fn new(config: EngineConfig, video: VideoConfig, audio: AudioConfig) -> Result<Self, AvError> {
+    pub fn new(config: EngineConfig, video: VideoConfig, audio_cfg: AudioConfig) -> Result<Self, AvError> {
         if config.fps == 0 || config.fps > 240 || !config.width.is_multiple_of(2) || !config.height.is_multiple_of(2) {
             return Err(AvError::BadSize(config.width, config.height));
         }
         let gpu = Arc::new(Compositor::new()?);
-        let mixer =
-            Arc::new(Mutex::new(Mixer::new(config.sample_rate, u64::from(config.audio_latency_ms) * 1_000_000)));
+        let (audio, bridge_rx) =
+            AudioHandle::spawn(config.sample_rate, u64::from(config.audio_latency_ms) * 1_000_000)?;
+        let levels: Arc<RwLock<HashMap<u64, Arc<AtomicLevels>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let recycle_tx = audio.recycle_sender();
+        let audio_cmd = audio.cmd_sender();
         let state = Arc::new(Mutex::new(State {
             sources: BTreeMap::new(),
             scenes: BTreeMap::new(),
@@ -1078,11 +1153,8 @@ impl Engine {
             next_output: 1,
             taps: Vec::new(),
             video: VideoConfig { width: config.width, height: config.height, fps_num: config.fps, fps_den: 1, ..video },
-            audio: AudioConfig { sample_rate: config.sample_rate, ..audio },
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            monitor: None,
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            monitor_epoch: 0,
+            audio: AudioConfig { sample_rate: config.sample_rate, ..audio_cfg },
+            last_heard: Vec::new(),
             stats: Stats::default(),
             error: None,
             previews: HashMap::new(),
@@ -1095,19 +1167,30 @@ impl Engine {
         let seen: Arc<Seen> = Arc::default();
         let sleep = Arc::new(crate::sleep::SleepMonitor::default());
         let thread = {
-            let (state, gpu, mixer, stop, seen, sleep) =
-                (state.clone(), gpu.clone(), mixer.clone(), stop.clone(), seen.clone(), sleep.clone());
+            let (state, gpu, audio_cmd, levels, recycle_tx, stop, seen, sleep) = (
+                state.clone(),
+                gpu.clone(),
+                audio_cmd.clone(),
+                levels.clone(),
+                recycle_tx.clone(),
+                stop.clone(),
+                seen.clone(),
+                sleep.clone(),
+            );
             std::thread::Builder::new()
                 .name("ferrocast-engine".into())
-                .spawn(move || run(config, &state, &gpu, &mixer, &stop, &seen, &sleep))
+                .spawn(move || {
+                    run(config, &state, &gpu, &audio_cmd, &levels, &bridge_rx, &recycle_tx, &stop, &seen, &sleep)
+                })
                 .map_err(|e| AvError::Source(format!("the engine's thread didn't start ({e})")))?
         };
         let watchdog_done = Arc::new((Mutex::new(false), Condvar::new()));
         let watchdog = {
-            let (state, mixer, stop, done) = (state.clone(), mixer.clone(), stop.clone(), watchdog_done.clone());
+            let (state, audio_cmd, stop, done) =
+                (state.clone(), audio_cmd.clone(), stop.clone(), watchdog_done.clone());
             std::thread::Builder::new()
                 .name("ferrocast-watchdog".into())
-                .spawn(move || watchdog(config, state, mixer, stop, done))
+                .spawn(move || watchdog(config, state, audio_cmd, stop, done))
                 .ok()
         };
         Ok(Self {
@@ -1116,7 +1199,9 @@ impl Engine {
             monitor: Mutex::new(None),
             state,
             gpu,
-            mixer,
+            audio,
+            levels,
+            recycle_tx,
             text: Arc::new(Mutex::new(TextRenderer::new())),
             stop,
             seen,
@@ -1148,9 +1233,10 @@ impl Engine {
     /// source, not to the device it opens; resetting them made a muted source loud, 20 Nov), and
     /// no longer marked as capturing an output until it says so again.
     fn reset_sound(&self, id: u64) {
-        let mut mx = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
-        mx.ensure(id);
-        mx.set_output_capture(id, None);
+        let levels = ensure_levels_in(&self.levels, id);
+        let cmd = self.audio.cmd_sender();
+        let _ = cmd.send(AudioCmd::EnsureSource { id, levels });
+        let _ = cmd.send(AudioCmd::SetOutputCapture { id, capture: None });
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1159,6 +1245,7 @@ impl Engine {
 
     /// Adds (or replaces) a source. Errors say what's wrong (a missing file, a camera in use).
     pub fn set_source(&self, id: u64, kind: SourceKind) -> Result<(), AvError> {
+        let is_tone = matches!(kind, SourceKind::Tone { .. });
         let restart = is_capture(&kind).then(|| kind.clone());
         let (live, picture) = match kind {
             SourceKind::Color { width, height, rgba } => {
@@ -1174,16 +1261,15 @@ impl Engine {
                 (Live::Still, Some(p))
             }
             SourceKind::Tone { hz, every_ms, beep_ms } => {
-                self.reset_sound(id);
-                (
-                    Live::Tone {
-                        hz,
-                        every_ns: every_ms.max(1) * 1_000_000,
-                        beep_ns: beep_ms * 1_000_000,
-                        pushed_to: None,
-                    },
-                    None,
-                )
+                let levels = ensure_levels_in(&self.levels, id);
+                let cmd = self.audio.cmd_sender();
+                let _ = cmd.send(AudioCmd::SetTone {
+                    id,
+                    tone: Some(ToneSpec { hz, every_ns: every_ms.max(1) * 1_000_000, beep_ns: beep_ms * 1_000_000 }),
+                    levels: Some(levels),
+                });
+                let _ = cmd.send(AudioCmd::SetOutputCapture { id, capture: None });
+                (Live::Still, None)
             }
             #[cfg(target_os = "macos")]
             SourceKind::App { .. } | SourceKind::AppSound(_) => {
@@ -1217,7 +1303,14 @@ impl Engine {
                 }
                 if let Some(live) = self.unpark(&kind) {
                     tracing::info!(source = id, "a camera taken out a moment ago came back without opening again");
-                    self.lock().sources.insert(id, Src::new(live, None, Some(kind)));
+                    let gone = {
+                        let mut st = self.lock();
+                        self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
+                        let prev = st.sources.insert(id, Src::new(live, None, Some(kind)));
+                        sync_heard(&mut st, &self.audio.cmd_sender());
+                        prev
+                    };
+                    drop(gone);
                     return Ok(());
                 }
                 // The same camera parked with other settings (a new size or frame rate): let it go
@@ -1242,10 +1335,14 @@ impl Engine {
                     if !path.is_file() {
                         return Err(AvError::Source(format!("{} isn't there", path.display())));
                     }
-                    let gone = self
-                        .lock()
-                        .sources
-                        .insert(id, Src::new(Live::Media(MediaSlot::closed(path, options)), None, None));
+                    let gone = {
+                        let mut st = self.lock();
+                        self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
+                        let prev =
+                            st.sources.insert(id, Src::new(Live::Media(MediaSlot::closed(path, options)), None, None));
+                        sync_heard(&mut st, &self.audio.cmd_sender());
+                        prev
+                    };
                     drop(gone);
                     self.gpu.forget(id);
                     return Ok(());
@@ -1314,10 +1411,15 @@ impl Engine {
         };
         let gone = {
             let mut st = self.lock();
+            if !is_tone {
+                self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
+            }
             // A capture opened in place (an App capture handed over) keeps the old picture on
             // the card until its first one comes.
             let size = size.or_else(|| restart.as_ref().and(st.sources.get(&id).and_then(|s| s.size)));
-            st.sources.insert(id, Src::new(live, size, restart))
+            let prev = st.sources.insert(id, Src::new(live, size, restart));
+            sync_heard(&mut st, &self.audio.cmd_sender());
+            prev
         };
         drop(gone);
         Ok(())
@@ -1369,6 +1471,7 @@ impl Engine {
         let now = now_ns();
         {
             let mut st = self.lock();
+            self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
             match st.sources.get_mut(&id) {
                 // Already here with a picture (a screen capture handed over): it keeps running
                 // and showing until the new one is open.
@@ -1390,7 +1493,8 @@ impl Engine {
         }
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), AvError>>();
         let state = self.state.clone();
-        let mixer = self.mixer.clone();
+        let audio_cmd = self.audio.cmd_sender();
+        let levels = self.levels.clone();
         let stop = self.stop.clone();
         let spawned = std::thread::Builder::new().name("ferrocore-open".into()).spawn(move || {
             // A panic opening it is an error like any other: the token is cleared below and the
@@ -1414,16 +1518,18 @@ impl Engine {
                     leftover = Some(std::mem::replace(&mut src.live, live));
                     src.opening = None;
                     src.opening_since = 0;
+                    src.audio_tx = None;
                     src.watch = Watch::for_kind(src.kind.as_ref(), now_ns());
                     // Its sound into the mix (a file with sound), under the same lock so a
-                    // removal can't slip in between (state, then mixer: the frame loop's order).
+                    // removal can't slip in between.
                     if heard || oc.is_some() || matches!(src.live, Live::Screen(_)) {
-                        let mut mx = mixer.lock().unwrap_or_else(|e| e.into_inner());
                         if heard {
-                            mx.ensure(id);
+                            let atom = ensure_levels_in(&levels, id);
+                            let _ = audio_cmd.send(AudioCmd::EnsureSource { id, levels: atom });
                         }
-                        mx.set_output_capture(id, oc);
+                        let _ = audio_cmd.send(AudioCmd::SetOutputCapture { id, capture: oc });
                     }
+                    sync_heard(&mut st, &audio_cmd);
                     Ok(())
                 }
                 (Err(e), Some(src)) => {
@@ -1453,9 +1559,9 @@ impl Engine {
             };
             if discard {
                 st.sources.remove(&id);
-                // Its slot in the mix too (state, then mixer: the frame loop's order), else
-                // settings or filters set while it opened stayed there with nothing to play.
-                mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                levels.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                let _ = audio_cmd.send(AudioCmd::RemoveSource(id));
+                sync_heard(&mut st, &audio_cmd);
             }
             drop(st);
             drop(leftover);
@@ -1478,7 +1584,9 @@ impl Engine {
                 let mut st = self.lock();
                 if st.sources.get(&id).is_some_and(|s| matches!(s.live, Live::Still) && s.opening.is_none()) {
                     st.sources.remove(&id);
-                    self.mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+                    self.levels.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    self.audio.send(AudioCmd::RemoveSource(id));
+                    sync_heard(&mut st, &self.audio.cmd_sender());
                     drop(st);
                     // A picture left from a capture it took over from.
                     self.gpu.forget(id);
@@ -1499,7 +1607,7 @@ impl Engine {
         let gone = {
             let mut st = self.lock();
             st.globals.remove(&id);
-            match st.sources.remove(&id) {
+            let removed = match st.sources.remove(&id) {
                 // A running, healthy camera is parked a moment (see `State::parked`).
                 Some(src)
                     if src.opening.is_none()
@@ -1512,37 +1620,41 @@ impl Engine {
                     None
                 }
                 other => other,
-            }
+            };
+            self.levels.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.audio.send(AudioCmd::RemoveSource(id));
+            sync_heard(&mut st, &self.audio.cmd_sender());
+            removed
         };
         // Let go outside the lock (stopping a capture can wait).
         drop(gone);
         self.gpu.forget(id);
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
     /// A source's sound settings (volume, mute, balance, tracks…), for sources with sound.
     pub fn set_sound(&self, id: u64, settings: SourceSettings) {
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(id, settings);
+        let levels = ensure_levels_in(&self.levels, id);
+        self.audio.send(AudioCmd::SetSettings { id, settings, levels });
     }
 
     /// Low latency sound (Settings): the mixer waits at most 60 ms past its filters' delay.
     pub fn set_low_latency(&self, on: bool) {
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_low_latency(on);
+        self.audio.send(AudioCmd::SetLowLatency(on));
     }
 
     /// Meters read true peak (4x oversampled) or sample peak.
     pub fn set_true_peak(&self, on: bool) {
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_true_peak(on);
+        self.audio.send(AudioCmd::SetTruePeak(on));
     }
 
     /// Music quieter while the voices talk (None: off).
     pub fn set_ducking(&self, ducking: Option<crate::level::Ducking>) {
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_ducking(ducking);
+        self.audio.send(AudioCmd::SetDucking(ducking));
     }
 
     /// Every track steered to `target_lufs` and kept under -1 dBFS (None: off).
     pub fn set_loudness(&self, target_lufs: Option<f32>) {
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_loudness(target_lufs);
+        self.audio.send(AudioCmd::SetLoudness(target_lufs));
     }
 
     /// Plays monitored sound (sources set to `Monitoring::Only` or `AndOutput`) on `device` (a
@@ -1553,13 +1665,8 @@ impl Engine {
         let feeder = m.as_ref().map(crate::monitor::Monitor::feeder);
         let dev_id = feeder.as_ref().and_then(crate::monitor::Feeder::device_id);
         let epoch = feeder.as_ref().map_or(0, crate::monitor::Feeder::device_epoch);
-        {
-            let mut st = self.lock();
-            st.monitor = feeder;
-            st.monitor_epoch = epoch;
-            self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_monitor_device(dev_id);
-        }
-        // Drop old monitor outside both `state` and `monitor` locks (its drop joins its thread).
+        self.audio.send(AudioCmd::SetMonitor { feeder, dev_id, epoch });
+        // Drop old monitor outside both `monitor` lock and `ferrocast-audio` (its drop joins its thread).
         let old = std::mem::replace(&mut *self.monitor.lock().unwrap_or_else(|e| e.into_inner()), m);
         drop(old);
         Ok(())
@@ -1573,7 +1680,8 @@ impl Engine {
 
     /// A source's sound filters, in order (gate, compressor, EQ…), replacing any before.
     pub fn set_sound_effects(&self, id: u64, effects: &[crate::afx::AudioEffect]) {
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set_effects(id, effects);
+        let levels = ensure_levels_in(&self.levels, id);
+        self.audio.send(AudioCmd::SetEffects { id, effects: effects.to_vec(), levels: Some(levels) });
     }
 
     /// Plays, pauses, restarts, stops or seeks a media source (OBS's media controls).
@@ -1602,8 +1710,23 @@ impl Engine {
         };
         if let Some(m) = player {
             m.control(c);
+            if matches!(
+                c,
+                crate::media::Control::Restart | crate::media::Control::Seek(_) | crate::media::Control::Stop
+            ) {
+                self.audio.send(AudioCmd::FlushSource(id));
+            }
         } else if let Some((tok, path, options)) = reopen {
-            spawn_media_reopen(self.state.clone(), self.mixer.clone(), id, tok, path, options, false);
+            spawn_media_reopen(
+                self.state.clone(),
+                self.audio.cmd_sender(),
+                self.levels.clone(),
+                id,
+                tok,
+                path,
+                options,
+                false,
+            );
         }
         Ok(())
     }
@@ -1637,12 +1760,21 @@ impl Engine {
 
     /// Listens to one source's sound (mono, 48 kHz, as it comes in): live captions.
     pub fn tap_sound(&self, id: u64) -> crate::mix::Tap {
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).tap(id)
+        let buf = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        self.audio.send(AudioCmd::AttachTap { id, tap: Arc::downgrade(&buf) });
+        crate::mix::Tap(buf)
     }
 
-    /// A source's sound levels over the last block (for meters).
+    /// A source's sound levels over the last block (for meters), wait-free via [`AtomicLevels`].
     pub fn levels(&self, id: u64) -> Option<crate::mix::Levels> {
-        self.mixer.lock().unwrap_or_else(|e| e.into_inner()).levels(id)
+        self.levels.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|atom| atom.load())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sound_settings(&self, id: u64) -> Option<SourceSettings> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.audio.send(AudioCmd::QuerySettings { id, reply: tx });
+        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
     }
 
     /// A scene's items, bottom first (replacing what it had).
@@ -1652,7 +1784,9 @@ impl Engine {
     }
 
     pub fn set_scene(&self, name: &str, items: Vec<SceneItem>) {
-        self.lock().scenes.insert(name.to_string(), items);
+        let mut st = self.lock();
+        st.scenes.insert(name.to_string(), items);
+        sync_heard(&mut st, &self.audio.cmd_sender());
     }
 
     /// Opens an OBS scene collection (the JSON OBS and Ferrocast's Studio save): its sources,
@@ -1824,6 +1958,7 @@ impl Engine {
             st.missing = missing;
             st.loaded = Some(loaded);
             st.loaded_at = Some(Instant::now());
+            sync_heard(&mut st, &self.audio.cmd_sender());
         }
         for id in old_rest {
             self.remove_source(id);
@@ -1915,6 +2050,7 @@ impl Engine {
         // Why each that couldn't open didn't, as the full load said.
         let mut skipped = imported.skipped;
         skipped.extend(st.missing.values().map(|(.., why)| why.clone()));
+        sync_heard(&mut st, &self.audio.cmd_sender());
         drop(st);
         for s in imported.sources {
             if let Some(sound) = s.sound.filter(|_| running.contains(&s.name)) {
@@ -1978,6 +2114,7 @@ impl Engine {
         } else {
             st.globals.remove(&id);
         }
+        sync_heard(&mut st, &self.audio.cmd_sender());
     }
 
     /// Every source a collection brought, by name: pictures sent to the card so far and their
@@ -2090,6 +2227,7 @@ impl Engine {
             Some(f) if kind != TransitionKind::Cut && ms > 0 && f != name => Some((f, kind, now, ms * 1_000_000)),
             _ => None,
         };
+        sync_heard(&mut st, &self.audio.cmd_sender());
         Ok(())
     }
 
@@ -2106,7 +2244,10 @@ impl Engine {
         }
         let dur = m.duration_ns.max(1);
         if m.has_audio {
-            self.mixer.lock().unwrap_or_else(|e| e.into_inner()).set(STINGER, SourceSettings::default());
+            let levels = ensure_levels_in(&self.levels, STINGER);
+            let cmd = self.audio.cmd_sender();
+            let _ = cmd.send(AudioCmd::SetSettings { id: STINGER, settings: SourceSettings::default(), levels });
+            let _ = cmd.send(AudioCmd::SetOutputCapture { id: STINGER, capture: None });
         }
         let now = now_ns();
         let mut st = self.lock();
@@ -2129,6 +2270,7 @@ impl Engine {
         // The media's first frame shows about 100 ms after it opens.
         let start = now + 100_000_000;
         st.stinger = Some((from, start, start + cut_ms * 1_000_000, start + dur));
+        sync_heard(&mut st, &self.audio.cmd_sender());
         Ok(())
     }
 
@@ -2247,6 +2389,7 @@ impl Engine {
         let id = st.next_output;
         st.next_output += 1;
         st.outputs.push((id, pipe, kind, canvas));
+        sync_heard(&mut st, &self.audio.cmd_sender());
         self.show(&st);
         let ticket = st.sleep_ticket();
         drop(st);
@@ -2314,13 +2457,14 @@ impl Engine {
         }
         // Frames drawn for the old scene go out first: matched by canvas, they'd be dropped
         // once it names the new one, while their sound still went (review).
-        deliver(&mut st, &self.gpu, true);
+        deliver(&mut st, &self.gpu, true, &self.recycle_tx);
         let (.., canvas) = st
             .outputs
             .iter_mut()
             .find(|(i, ..)| *i == id)
             .ok_or_else(|| AvError::Source(format!("there's no output {id}")))?;
         canvas.scene = scene;
+        sync_heard(&mut st, &self.audio.cmd_sender());
         Ok(())
     }
 
@@ -2454,7 +2598,7 @@ impl Engine {
     /// only records, the file alone when a stream shares its encode (the stream goes on).
     pub fn pause_recording(&self, id: u64, on: bool) -> Result<(), AvError> {
         let mut st = self.lock();
-        deliver(&mut st, &self.gpu, true);
+        deliver(&mut st, &self.gpu, true, &self.recycle_tx);
         let (_, pipe, kind, _) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
         if pipe.recording_paused() || (on && matches!(kind, OutputKind::Stream(_))) {
@@ -2496,7 +2640,7 @@ impl Engine {
     pub fn stream_on(&self, id: u64, send: Box<dyn FnMut(Tag) + Send>) -> Result<(), AvError> {
         let mut st = self.lock();
         // Frames drawn before the join go to the recording alone: the stream starts after them.
-        deliver(&mut st, &self.gpu, true);
+        deliver(&mut st, &self.gpu, true, &self.recycle_tx);
         let (_, pipe, kind, _) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
         if !matches!(kind, OutputKind::Record(_)) {
@@ -2572,7 +2716,7 @@ impl Engine {
         f: impl FnOnce(&mut Pipeline) -> Result<T, AvError>,
     ) -> Result<T, AvError> {
         let mut st = self.lock();
-        deliver(&mut st, &self.gpu, true);
+        deliver(&mut st, &self.gpu, true, &self.recycle_tx);
         let r = Self::on_output(&mut st, id, f);
         self.show(&st);
         let ticket = st.sleep_ticket();
@@ -2633,7 +2777,7 @@ impl Engine {
         let mut st = self.lock();
         refuse(&st)?;
         // Frames drawn at the old size go out first.
-        deliver(&mut st, &self.gpu, true);
+        deliver(&mut st, &self.gpu, true, &self.recycle_tx);
         let config = self.config;
         let (_, pipe, kind, canvas) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
@@ -2663,9 +2807,10 @@ impl Engine {
             let mut st = self.lock();
             tracing::info!(id, waited_ms = t.elapsed().as_millis() as u64, "an output stops: the engine's lock taken");
             // Its last frames still on the card go into it first.
-            deliver(&mut st, &self.gpu, true);
+            deliver(&mut st, &self.gpu, true, &self.recycle_tx);
             tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stops: its last frames handed over");
             let taken = st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at));
+            sync_heard(&mut st, &self.audio.cmd_sender());
             self.show(&st);
             let ticket = st.sleep_ticket();
             (taken, ticket)
@@ -2819,6 +2964,7 @@ impl Drop for Engine {
         if let Some(t) = self.watchdog.take() {
             join_bounded(t, &self.watchdog_done, WATCHDOG_STOP_TIMEOUT);
         }
+        self.audio.shutdown();
         let (sources, parked) = {
             let mut st = self.lock();
             (std::mem::take(&mut st.sources), std::mem::take(&mut st.parked))
@@ -3149,34 +3295,33 @@ fn active(st: &State) -> std::collections::HashSet<u64> {
 /// source's through a tap opened by name, again if that source is opened anew), drawn now.
 fn visualize(
     st: &mut State,
-    blocks: &[crate::mix::Block],
     seen: &std::collections::HashSet<u64>,
     gpu: &Compositor,
-    mixer: &Mutex<Mixer>,
+    audio_cmd: &mpsc::Sender<AudioCmd>,
     rate: u32,
 ) {
-    let mut on_air: Option<Vec<f32>> = None;
+    use crate::source::visualizer::TapKey;
     let names: HashMap<String, u64> = st.opened.iter().map(|(n, (id, _))| (n.clone(), *id)).collect();
     for (id, src) in st.sources.iter_mut() {
         let Live::Visualizer(v) = &mut src.live else { continue };
         if !seen.contains(id) {
             continue;
         }
-        let heard = match v.spec.of.clone() {
-            None => on_air
-                .get_or_insert_with(|| {
-                    blocks
-                        .iter()
-                        .filter_map(|b| b.tracks.first())
-                        .flat_map(|t| t.chunks(2).map(|c| (c[0] + c.get(1).copied().unwrap_or(c[0])) * 0.5))
-                        .collect()
-                })
-                .clone(),
-            Some(name) => match names.get(&name) {
+        let heard = match v.spec.of.as_deref() {
+            None => {
+                if v.tap.as_ref().is_none_or(|(k, _)| *k != TapKey::Master) {
+                    let buf = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+                    let _ = audio_cmd.send(AudioCmd::AttachMasterTap(Arc::downgrade(&buf)));
+                    v.tap = Some((TapKey::Master, crate::mix::Tap(buf)));
+                }
+                v.tap.as_ref().map(|(_, t)| t.take()).unwrap_or_default()
+            }
+            Some(name) => match names.get(name) {
                 Some(&target) => {
-                    if v.tap.as_ref().is_none_or(|(t, _)| *t != target) {
-                        let tap = mixer.lock().unwrap_or_else(|e| e.into_inner()).tap(target);
-                        v.tap = Some((target, tap));
+                    if v.tap.as_ref().is_none_or(|(k, _)| *k != TapKey::Source(target)) {
+                        let buf = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+                        let _ = audio_cmd.send(AudioCmd::AttachTap { id: target, tap: Arc::downgrade(&buf) });
+                        v.tap = Some((TapKey::Source(target), crate::mix::Tap(buf)));
                     }
                     v.tap.as_ref().map(|(_, t)| t.take()).unwrap_or_default()
                 }
@@ -3589,11 +3734,15 @@ fn remap_ducking(
 }
 
 /// The frame loop.
+#[allow(clippy::too_many_arguments)]
 fn run(
     config: EngineConfig,
     state: &Arc<Mutex<State>>,
     gpu: &Compositor,
-    mixer: &Arc<Mutex<Mixer>>,
+    audio_cmd: &mpsc::Sender<AudioCmd>,
+    levels: &Arc<RwLock<HashMap<u64, Arc<AtomicLevels>>>>,
+    bridge_rx: &mpsc::Receiver<Block>,
+    recycle_tx: &mpsc::SyncSender<Block>,
     stop: &AtomicBool,
     seen: &Seen,
     sleep: &crate::sleep::SleepMonitor,
@@ -3615,7 +3764,8 @@ fn run(
         let started = Instant::now();
 
         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let ticket = frame(&config, state, gpu, mixer, ts, behind, started, seen);
+            let ticket =
+                frame(&config, state, gpu, audio_cmd, levels, bridge_rx, recycle_tx, ts, behind, started, seen);
             // Pictures uploaded this frame are sent even when nothing drew (no preview, no
             // output), and what the card finished with is let go: without this, Direct3D and
             // Vulkan keep it all and run out of memory in minutes.
@@ -3997,7 +4147,7 @@ type Reopener = Arc<dyn Fn(&SourceKind) -> Option<Result<Live, AvError>> + Send 
 /// [`MAX_PARALLEL_REOPENS`] concurrent opens) with a hard [`REOPEN_TIMEOUT_NS`] slot deadline.
 fn watchdog_step(
     state: &Arc<Mutex<State>>,
-    mixer: &Arc<Mutex<Mixer>>,
+    audio_cmd: &mpsc::Sender<AudioCmd>,
     stop: &Arc<AtomicBool>,
     reopen: &Reopener,
     connected: Option<&[String]>,
@@ -4076,8 +4226,8 @@ fn watchdog_step(
             drop(old);
             return;
         }
-        let (state_w, state_panic, mixer_w, stop_w, reopen_w) =
-            (state.clone(), state.clone(), mixer.clone(), stop.clone(), reopen.clone());
+        let (state_w, state_panic, audio_w, stop_w, reopen_w) =
+            (state.clone(), state.clone(), audio_cmd.clone(), stop.clone(), reopen.clone());
         let spawned = std::thread::Builder::new().name("ferrocore-reopen".into()).spawn(move || {
             let worker_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 drop(old);
@@ -4119,11 +4269,12 @@ fn watchdog_step(
                             #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
                             let oc: Option<crate::mix::OutputCapture> = None;
                             leftover = Some(std::mem::replace(&mut src.live, live));
+                            src.audio_tx = None;
                             src.watch.count = 0;
                             src.watch.since = now_ns();
                             src.watch.next_try = now_ns() + backoff_ns(prev_tries);
                             st.stats.restarts += 1;
-                            mixer_w.lock().unwrap_or_else(|e| e.into_inner()).set_output_capture(id, oc);
+                            let _ = audio_w.send(AudioCmd::SetOutputCapture { id, capture: oc });
                         }
                         Some(Err(e)) => {
                             src.watch.next_try = now_ns() + backoff_ns(prev_tries);
@@ -4172,7 +4323,7 @@ impl Drop for SignalDone<'_> {
 fn watchdog(
     config: EngineConfig,
     state: Arc<Mutex<State>>,
-    mixer: Arc<Mutex<Mixer>>,
+    audio_cmd: mpsc::Sender<AudioCmd>,
     stop: Arc<AtomicBool>,
     done: Arc<(Mutex<bool>, Condvar)>,
 ) {
@@ -4192,13 +4343,9 @@ fn watchdog(
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        watchdog_step(&state, &mixer, &stop, &reopen, connected.as_deref(), now_ns());
+        watchdog_step(&state, &audio_cmd, &stop, &reopen, connected.as_deref(), now_ns());
     }
 }
-
-/// The most of the past a source catches up on after the clock jumped (sleep, a debugger):
-/// beyond it, it starts again from now.
-const MAX_CATCH_UP_NS: u64 = 2_000_000_000;
 
 /// Frames a canvas waits for at most before the loop waits for the card: two (33 ms at 60
 /// fps), as OBS keeps its staging surfaces.
@@ -4217,7 +4364,7 @@ struct InFlight {
 
 /// Hands the frames that came back to their outputs and taps, oldest first: those ready, and
 /// any past [`IN_FLIGHT`] (waiting for the card); every one with `flush`.
-fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
+fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::SyncSender<Block>) {
     let _ = gpu.device.poll(wgpu::PollType::Poll);
     if st.outputs.is_empty() {
         // Nothing encodes: the next output's time starts afresh.
@@ -4311,6 +4458,9 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool) {
                 sink(f, ts);
             }
         }
+        for b in blocks {
+            let _ = recycle_tx.try_send(b);
+        }
     }
 }
 
@@ -4319,13 +4469,17 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
     p.downcast_ref::<&str>().copied().or_else(|| p.downcast_ref::<String>().map(String::as_str)).unwrap_or("a fault")
 }
 
-/// One frame: sources taken in, sound mixed, each canvas drawn and its outputs fed.
+/// One frame: sources taken in, forwarded audio synced to the audio thread, each canvas drawn
+/// and its outputs fed.
 #[allow(clippy::too_many_arguments)]
 fn frame(
     config: &EngineConfig,
     state: &Arc<Mutex<State>>,
     gpu: &Compositor,
-    mixer: &Arc<Mutex<Mixer>>,
+    audio_cmd: &mpsc::Sender<AudioCmd>,
+    levels: &Arc<RwLock<HashMap<u64, Arc<AtomicLevels>>>>,
+    bridge_rx: &mpsc::Receiver<Block>,
+    recycle_tx: &mpsc::SyncSender<Block>,
     ts: u64,
     behind: u64,
     started: Instant,
@@ -4334,25 +4488,16 @@ fn frame(
     let rate = config.sample_rate;
     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
     st.stats.skipped += behind;
-    let mut mx = mixer.lock().unwrap_or_else(|e| e.into_inner());
     // Only what's on air is heard (and monitored), as libobs mixes its program's tree; the
     // rest still has its sound taken, so it doesn't pile up.
     let heard = heard(&st);
-    mx.sync_active(&heard);
+    sync_heard(&mut st, audio_cmd);
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     let active_set = active(&st);
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if let Some((epoch, dev_id)) = st.monitor.as_ref().and_then(|f| {
-        let epoch = f.device_epoch();
-        (epoch != st.monitor_epoch).then(|| (epoch, f.device_id()))
-    }) {
-        st.monitor_epoch = epoch;
-        mx.set_monitor_device(dev_id);
-    }
     // Pictures go to the GPU only for sources something drawn shows (and a source's first,
     // for its size); the rest keep their newest until they're shown.
     let seen = seen(&st);
-    // Sources: new pictures to the GPU, new sound to the mixer.
+    // Sources: new pictures to the GPU, captured/media sound forwarded to per-source rings.
     let mut uploads = Vec::new();
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     let mut media_clear: Vec<u64> = Vec::new();
@@ -4370,8 +4515,9 @@ fn frame(
     }
     let mut st_recovered = 0;
     for (id, src) in st.sources.iter_mut() {
-        let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut src.live {
-            // Drawn after the sound is mixed (`visualize`).
+        let Src { live, audio_tx, .. } = src;
+        let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match live {
+            // Drawn after the frame (`visualize`).
             Live::Still | Live::Visualizer(_) => {}
             #[cfg(test)]
             Live::PanicOnDrop(_) => {}
@@ -4381,27 +4527,6 @@ fn frame(
                     uploads.push((*id, Fresh::Pic(p.clone())));
                     *last = None;
                 }
-            }
-            Live::Tone { hz, every_ns, beep_ns, pushed_to } => {
-                // Beeps scheduled up to half a second ahead, on the frame clock. After the clock
-                // jumped (the computer slept), it starts again from now: catching up on an hour
-                // of beeps in one frame would allocate gigabytes (agy's M11 scan).
-                let fresh = ts - ts % *every_ns;
-                let mut at = pushed_to.filter(|p| *p + MAX_CATCH_UP_NS >= ts).unwrap_or(fresh);
-                while at < ts + 500_000_000 {
-                    let n = (u128::from(*beep_ns) * u128::from(rate) / 1_000_000_000) as usize;
-                    let pcm: Vec<f32> = (0..n)
-                        .flat_map(|i| {
-                            let v = (i as f32 * *hz * std::f32::consts::TAU / rate as f32).sin() * 0.5;
-                            [v, v]
-                        })
-                        .collect();
-                    if heard.contains(id) {
-                        mx.push(*id, &pcm, 2, rate, at);
-                    }
-                    at += *every_ns;
-                }
-                *pushed_to = Some(at);
             }
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             Live::Screen(cap) => {
@@ -4422,7 +4547,7 @@ fn frame(
                 }
                 for (pcm, t) in cap.take_sound() {
                     if heard.contains(id) {
-                        mx.push(*id, &pcm, 2, 48_000, t);
+                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t);
                     }
                 }
             }
@@ -4445,7 +4570,7 @@ fn frame(
             Live::Microphone(cap) => {
                 for (pcm, t) in cap.take_sound() {
                     if heard.contains(id) {
-                        mx.push(*id, &pcm, 2, 48_000, t);
+                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t);
                     }
                 }
             }
@@ -4461,6 +4586,7 @@ fn frame(
                     if let Some(m) = &slot.player {
                         if slot.options.restart_on_activate {
                             m.control(crate::media::Control::Restart);
+                            let _ = audio_cmd.send(AudioCmd::FlushSource(*id));
                         }
                     } else if slot.options.close_when_inactive && slot.reopening.is_none() {
                         let tok = next_reopen_token();
@@ -4472,6 +4598,7 @@ fn frame(
                         slot.reopening = None;
                         if let Some(m) = slot.player.take() {
                             media_drop.push(m);
+                            let _ = audio_cmd.send(AudioCmd::FlushSource(*id));
                         }
                         if slot.options.clear_on_media_end {
                             media_clear.push(*id);
@@ -4481,6 +4608,7 @@ fn frame(
                         && let Some(m) = &slot.player
                     {
                         m.control(crate::media::Control::Stop);
+                        let _ = audio_cmd.send(AudioCmd::FlushSource(*id));
                         if slot.options.clear_on_media_end {
                             media_clear.push(*id);
                             slot.cleared = true;
@@ -4499,7 +4627,7 @@ fn frame(
                     }
                     for (pcm, t) in m.take_sound() {
                         if heard.contains(id) {
-                            mx.push(*id, &pcm, 2, 48_000, t);
+                            forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, 48_000, t);
                         }
                     }
                     // Clear texture / close decoder only after the final queued frame has been shown.
@@ -4538,8 +4666,8 @@ fn frame(
                 }
                 let sound: Vec<_> = feed.0.sound.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
                 if heard.contains(id) {
-                    for (pcm, rate, t) in sound {
-                        mx.push(*id, &pcm, 2, rate, t);
+                    for (pcm, ch_rate, t) in sound {
+                        forward_audio(*id, audio_tx, audio_cmd, &pcm, 2, ch_rate, t);
                     }
                 }
             }
@@ -4548,6 +4676,7 @@ fn frame(
             // This source alone stops (its last picture stays); the watchdog starts a capture again.
             tracing::error!(source = id, why = panic_text(&*p), "a source faulted: stopped");
             src.live = Live::Still;
+            src.audio_tx = None;
             src.watch.faulted = true;
             st_recovered += 1;
         }
@@ -4600,31 +4729,20 @@ fn frame(
             unpin_stale_pending(s, now);
         }
     }
-    let blocks = mx.mix_until(now_ns());
-    let mon_active = mx.has_monitored();
-    drop(mx);
-    visualize(&mut st, &blocks, &seen, gpu, mixer, rate);
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if let Some(f) = &st.monitor {
-        if mon_active {
-            for b in &blocks {
-                f.push(&b.monitor);
-            }
-        } else {
-            f.idle();
-        }
-    }
+    visualize(&mut st, &seen, gpu, audio_cmd, rate);
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if st.stinger.as_ref().is_some_and(|(.., end)| ts >= *end) {
         st.stinger = None;
         st.sources.remove(&STINGER);
         gpu.forget(STINGER);
-        mixer.lock().unwrap_or_else(|e| e.into_inner()).remove(STINGER);
+        levels.write().unwrap_or_else(|e| e.into_inner()).remove(&STINGER);
+        let _ = audio_cmd.send(AudioCmd::ScheduleRemove { id: STINGER, after_ns: ts });
     }
     if st.moving.as_ref().is_some_and(|(_, _, start, dur)| ts >= start + dur) {
         st.moving = None;
     }
+    sync_heard(&mut st, audio_cmd);
     if !st.lingering.is_empty() {
         let mut playing: Vec<String> = st.moving.iter().map(|(from, ..)| from.clone()).collect();
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -4636,6 +4754,10 @@ fn frame(
             st.started.remove(&n);
             st.lingering.retain(|l| *l != n);
         }
+    }
+    let mut blocks = Vec::new();
+    while let Ok(b) = bridge_rx.try_recv() {
+        blocks.push(b);
     }
     if !st.outputs.is_empty() || !st.taps.is_empty() {
         // Each distinct canvas drawn once this frame (if it takes this one). The card reads them
@@ -4687,6 +4809,14 @@ fn frame(
             }
         }
         drawn.extend(extra);
+        let blocks = if st.outputs.is_empty() {
+            for b in blocks {
+                let _ = recycle_tx.try_send(b);
+            }
+            Vec::new()
+        } else {
+            blocks
+        };
         let entry = InFlight {
             ts,
             blocks,
@@ -4695,8 +4825,12 @@ fn frame(
             drawn,
         };
         st.in_flight.push_back(entry);
+    } else {
+        for b in blocks {
+            let _ = recycle_tx.try_send(b);
+        }
     }
-    deliver(&mut st, gpu, false);
+    deliver(&mut st, gpu, false, recycle_tx);
     let ms = started.elapsed().as_secs_f32() * 1000.0;
     st.stats.frames += 1;
     st.stats.frame_ms = ms;
@@ -4710,7 +4844,7 @@ fn frame(
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
         for (id, tok, path, options) in media_reopen {
-            spawn_media_reopen(state.clone(), mixer.clone(), id, tok, path, options, true);
+            spawn_media_reopen(state.clone(), audio_cmd.clone(), levels.clone(), id, tok, path, options, true);
         }
         if !media_drop.is_empty()
             && std::thread::Builder::new().name("ferrocore-media-close".into()).spawn(move || drop(media_drop)).is_err()
@@ -5064,16 +5198,17 @@ mod tests {
         });
 
         let now = now_ns();
-        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now);
+        let cmd = e.audio.cmd_sender();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
         first_entered_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|x| panic!("{x}"));
         assert!(e.lock().sources[&1].opening.is_some());
 
         // Before the 60 s deadline, no second worker launches.
-        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now + REOPEN_TIMEOUT_NS - 1_000_000_000);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now + REOPEN_TIMEOUT_NS - 1_000_000_000);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
         // At >= 60 s, the stalled slot is released and a fresh worker runs cleanly.
-        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now + REOPEN_TIMEOUT_NS);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now + REOPEN_TIMEOUT_NS);
         std::thread::sleep(Duration::from_millis(80));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         let stale_token = e.lock().sources[&1].opening;
@@ -5110,7 +5245,8 @@ mod tests {
         });
 
         let now = now_ns();
-        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now);
+        let cmd = e.audio.cmd_sender();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
         std::thread::sleep(Duration::from_millis(30));
 
         // Source 1 panicked inside `drop(old)` so its slot recovered at once (even though it never
@@ -5125,7 +5261,7 @@ mod tests {
 
         // Wait for remaining workers and confirm source 1 & pending sources remain recoverable on later tick.
         std::thread::sleep(Duration::from_millis(200));
-        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now + 10_000_000_000);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now + 10_000_000_000);
         std::thread::sleep(Duration::from_millis(180));
         assert!(entered.load(Ordering::SeqCst) >= 3);
     }
@@ -5165,14 +5301,15 @@ mod tests {
         });
 
         let now = now_ns() + 1_000_000_000;
-        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now);
+        let cmd = e.audio.cmd_sender();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
 
         // Source 1 is blocked inside reopen, yet Source 2 completes immediately without waiting.
         dead_entered_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|x| panic!("{x}"));
         fast_done_rx.recv_timeout(Duration::from_millis(500)).unwrap_or_else(|x| panic!("fast source blocked: {x}"));
 
         // A second watchdog tick while Source 1 is still reopening doesn't launch a duplicate reopen.
-        watchdog_step(&e.state, &e.mixer, &e.stop, &reopen, None, now + 5_000_000_000);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now + 5_000_000_000);
         assert_eq!(dead_attempts.load(Ordering::SeqCst), 1);
 
         // Removing Source 1 while its reopen is in flight never resurrects it when reopen finishes.
@@ -5598,7 +5735,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(e.opening(), 0);
-        let kept = e.mixer.lock().unwrap_or_else(|p| p.into_inner()).settings(9);
+        let kept = e.sound_settings(9);
         assert_eq!(kept, Some(muted), "still muted after it opened");
     }
 
@@ -7601,5 +7738,70 @@ mod tests {
         drop(e);
         let _ = std::fs::remove_file(&webm);
         assert!(verified, "transparent WebM stinger must cover right half in red while revealing scene on left half");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_audio_thread_gets_mmcss_or_high_priority() {
+        use windows::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_HIGHEST};
+        let (has_mmcss, prio) = std::thread::spawn(|| {
+            let guard = raise_audio_thread();
+            let has_mmcss = guard.mmcss.is_some();
+            // SAFETY: this thread's pseudo-handle.
+            let prio = unsafe { GetThreadPriority(GetCurrentThread()) };
+            drop(guard);
+            (has_mmcss, prio)
+        })
+        .join()
+        .unwrap_or_default();
+        if !has_mmcss {
+            assert_eq!(prio, THREAD_PRIORITY_HIGHEST.0);
+        }
+    }
+
+    /// Gate (D1 Commit 3): holding the engine's `State` mutex for 250 ms (simulating a GPU
+    /// readback stall) never stalls `Engine::levels()` or `ferrocast-audio` tone generation.
+    #[test]
+    fn engine_levels_stays_nonblocking_during_250ms_state_stall() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Tone { hz: 440.0, every_ms: 40, beep_ms: 40 }).unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+
+        // Wait until the tone has been mixed and published through `AtomicLevels`.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if e.levels(1).is_some_and(|l| l.peak[0] > -20.0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(e.levels(1).is_some_and(|l| l.peak[0] > -20.0), "expected live levels before stall");
+
+        // Hold `e.state` for 250 ms on a side thread.
+        let state = Arc::clone(&e.state);
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = state.lock().unwrap_or_else(|x| x.into_inner());
+            let _ = locked_tx.send(());
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|x| panic!("{x}"));
+        assert!(e.state.try_lock().is_err(), "state mutex must be held by stall thread");
+
+        // Every `levels()` call returns in microseconds with live meter values while State is stalled.
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            let lv = e.levels(1);
+            let elapsed = t0.elapsed();
+            assert!(elapsed < Duration::from_millis(5), "levels() stalled for {elapsed:?}");
+            assert!(lv.is_some_and(|l| l.peak[0] > -20.0), "stale or missing levels during stall: {lv:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = blocker.join();
+
+        e.remove_source(1);
+        assert!(e.levels(1).is_none());
     }
 }

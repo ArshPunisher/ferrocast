@@ -542,7 +542,7 @@ impl<C: AudioClock> AudioRunner<C> {
 
     fn drain_rings(&mut self) {
         for (&id, consumer) in &mut self.rings {
-            let heard = self.heard.binary_search(&id).is_ok();
+            let heard = self.heard.binary_search(&id).is_ok() || self.pending_removals.contains_key(&id);
             while let Some(piece) = consumer.peek() {
                 let needed = piece.samples();
                 if self.ring_scratch.len() < needed {
