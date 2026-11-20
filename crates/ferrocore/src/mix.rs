@@ -1212,7 +1212,35 @@ impl Mixer {
         if !pure_in_place {
             s.filter_declick = true;
         }
-        let evicted: Vec<AudioFilter> = old.into_iter().filter_map(|(_, o)| o).collect();
+        let mut evicted: Vec<AudioFilter> = old.into_iter().filter_map(|(_, o)| o).collect();
+        // A filter that held sound back and is taken out: what it still held plays first. Its
+        // sound is filed that much later from now on, so without this the source goes quiet for
+        // the filter's delay (82.7 ms of silence, then a step) every time it is switched off.
+        // The held sound goes in front of what is queued, so the sound that comes next
+        // continues from it, nothing lost and nothing doubled.
+        let now_held = held(&s.filters);
+        if now_held < before && s.resampler.is_none() {
+            let mut latent = evicted.iter_mut().filter(|f| f.latency_frames() > 0);
+            if let (Some(f), None) = (latent.next(), latent.next()) {
+                let lost = before - now_held;
+                if f.latency_frames() == lost
+                    && let Some([mut l, mut r]) = f.take_tail()
+                {
+                    // Padded or cut to the delay: silence only for what it never had.
+                    for c in [&mut l, &mut r] {
+                        if c.len() < lost {
+                            c.splice(0..0, std::iter::repeat_n(0.0, lost - c.len()));
+                        }
+                        c.drain(..c.len() - lost);
+                    }
+                    for (a, b) in l.iter().zip(&r).rev() {
+                        s.queue.push_front(*b);
+                        s.queue.push_front(*a);
+                    }
+                    s.filter_declick = false;
+                }
+            }
+        }
         // A filter that holds the sound back (the strong noise removal) files the source's sound
         // that much earlier: the mixer waits that much longer at once, rather than finding the
         // sound late and cutting its start.
@@ -2188,6 +2216,124 @@ mod tests {
         let breaks = tone.windows(2).filter(|w| (w[1] - w[0]).abs() > lim).count();
         assert!(tone.len() > rate as usize * 3, "{} frames out", tone.len());
         assert_eq!(breaks, 0, "breaks in the tone; latency now {} ms", m.latency_ns() / 1_000_000);
+    }
+
+    /// A filter that holds sound back by `n` frames (the strong noise removal: 3968 = 82.7 ms),
+    /// priming with silence as it does.
+    #[derive(Debug)]
+    struct LateBy(usize, [std::collections::VecDeque<f32>; 2]);
+    impl LateBy {
+        fn new(n: usize) -> Self {
+            Self(n, [std::iter::repeat_n(0.0, n).collect(), std::iter::repeat_n(0.0, n).collect()])
+        }
+    }
+    impl crate::afx::SoundPlugin for LateBy {
+        fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
+            for (c, q) in ch.into_iter().zip(self.1.iter_mut()) {
+                for v in c.iter_mut() {
+                    q.push_back(*v);
+                    *v = q.pop_front().unwrap_or(0.0);
+                }
+            }
+            true
+        }
+        fn latency_frames(&self) -> usize {
+            self.0
+        }
+        fn hand_over(&mut self) -> Option<[Vec<f32>; 2]> {
+            Some([self.1[0].drain(..).collect(), self.1[1].drain(..).collect()])
+        }
+    }
+
+    /// A 440 Hz tone mixed as it comes, a 3968-frame filter attached at 2 s and taken off at
+    /// 4 s (as toggling DeepFilterNet does): what came out.
+    fn toggled_tone(attach: bool, detach: bool) -> Vec<f32> {
+        let rate = 48_000u32;
+        let mut m = Mixer::new(rate, 40_000_000);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let piece = 960usize;
+        let (mut made, mut out, mut now) = (0usize, Vec::new(), t0);
+        let (mut on, mut off) = (!attach, !detach);
+        if !attach {
+            if let Some(src) = m.sources.get_mut(&1) {
+                src.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::new(3968)), rate)];
+            }
+            m.raise_latency_for_filters(0, 3968);
+        }
+        while now < t0 + 7_000_000_000 {
+            now += 1_000_000_000 / 30;
+            if !on && now >= t0 + 2_000_000_000 {
+                on = true;
+                if let Some(s) = m.sources.get_mut(&1) {
+                    s.filters = vec![AudioFilter::with_plugin(Box::new(LateBy::new(3968)), rate)];
+                    s.filter_declick = true;
+                }
+                m.raise_latency_for_filters(0, 3968);
+            }
+            if !off && now >= t0 + 4_000_000_000 {
+                off = true;
+                m.set_effects(1, &[]);
+            }
+            loop {
+                let start_ns = t0 + made as u64 * 1_000_000_000 / u64::from(rate);
+                if start_ns + 20_000_000 + 10_000_000 > now {
+                    break;
+                }
+                let pcm: Vec<f32> = (made..made + piece)
+                    .flat_map(|i| {
+                        let v = (i as f32 * 440.0 * std::f32::consts::TAU / rate as f32).sin() * 0.5;
+                        [v, v]
+                    })
+                    .collect();
+                m.push(1, &pcm, 2, rate, start_ns);
+                made += piece;
+            }
+            for b in m.mix_until(now) {
+                out.extend(b.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+            }
+        }
+        out
+    }
+
+    /// Steps bigger than the tone's own, and holes (a run of silence), in what came out from
+    /// `from` (frames after the tone starts) for `len` frames.
+    fn glitches(out: &[f32], from: usize, len: usize) -> (Vec<usize>, Vec<usize>) {
+        let first = out.iter().position(|v| v.abs() > 0.01).unwrap_or(0);
+        let tone = &out[first + from..first + from + len];
+        let lim = 0.5 * std::f32::consts::TAU * 440.0 / 48_000.0 * 1.5;
+        let steps = tone.windows(2).enumerate().filter(|(_, w)| (w[1] - w[0]).abs() > lim).map(|(i, _)| i).collect();
+        let (mut holes, mut run) = (Vec::new(), 0);
+        for (i, v) in tone.iter().enumerate() {
+            run = if v.abs() < 1e-4 { run + 1 } else { 0 };
+            if run == 12 {
+                holes.push(i);
+            }
+        }
+        (steps, holes)
+    }
+
+    /// Taking a filter that holds sound back (DeepFilterNet, 3968 frames) out used to leave
+    /// 82.7 ms of silence and a step: the source is filed that much later at once. What the
+    /// filter still held plays first now, so the tone goes on whole.
+    #[test]
+    fn taking_a_latency_filter_off_leaves_the_tone_whole() {
+        let out = toggled_tone(false, true);
+        // The filter is on from the start, off at 4 s: look from 1 s to 6 s.
+        let (steps, holes) = glitches(&out, 48_000, 5 * 48_000);
+        assert!(steps.is_empty() && holes.is_empty(), "steps at {steps:?}, holes at {holes:?}");
+    }
+
+    /// Putting such a filter on still leaves a hole and a step: it files the source 82.7 ms
+    /// earlier at once (the queued sound is cut) and the filter's first 82.7 ms of output is
+    /// silence. Not fixed yet: the way is to take the first 3968 frames of the queue as a dry
+    /// bypass that plays in place of that silence while the filter's input starts after them.
+    #[test]
+    #[ignore = "attaching a latency filter still glitches; see the note above"]
+    fn putting_a_latency_filter_on_leaves_the_tone_whole() {
+        let out = toggled_tone(true, false);
+        let (steps, holes) = glitches(&out, 48_000, 5 * 48_000);
+        assert!(steps.is_empty() && holes.is_empty(), "steps at {steps:?}, holes at {holes:?}");
     }
 
     /// A 440 Hz tone in 20 ms pieces, each arriving when `arrives(start, end)` (ns) says, mixed

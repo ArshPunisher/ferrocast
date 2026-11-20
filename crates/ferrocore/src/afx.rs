@@ -589,6 +589,16 @@ impl AudioFilter {
         }
     }
 
+    /// When it is taken out of the chain: the sound it took in and hasn't given back yet (as long
+    /// as its delay, left and right), so what plays after it goes on from there. None when it
+    /// never ran or holds nothing back.
+    pub fn take_tail(&mut self) -> Option<[Vec<f32>; 2]> {
+        if let Some(p) = self.plugin.as_mut() {
+            return if self.plugin_ran { p.hand_over() } else { None };
+        }
+        self.delay.as_mut().map(|h| [h[0].drain(..).collect(), h[1].drain(..).collect()])
+    }
+
     /// Filters a block in place (both sides the same length).
     pub fn process(&mut self, ch: [&mut [f32]; 2]) {
         self.process_inner(ch, None);
