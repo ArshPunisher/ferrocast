@@ -109,42 +109,71 @@ pub fn effect_from(kind: &str, s: &Value) -> Option<Effect> {
             temperature: n("temperature", 0.0),
             tint: n("tint", 0.0),
         },
-        "chroma_key_filter_v2" => Effect::ChromaKey {
-            key: key_of(&[("green", 0x00FF00), ("blue", 0xFF9900), ("magenta", 0xFF00FF)], 0x00FF00),
-            similarity: n("similarity", 400.0),
-            smoothness: n("smoothness", 80.0),
-            spill: n("spill", 100.0),
-            opacity: n("opacity", 1.0),
-            contrast: n("contrast", 0.0),
-            brightness: n("brightness", 0.0),
-            gamma: n("gamma", 0.0),
-        },
-        "color_key_filter_v2" => Effect::ColorKey {
-            key: key_of(&[("green", 0x00FF00), ("blue", 0xFF0000), ("red", 0x0000FF), ("magenta", 0xFF00FF)], 0x00FF00),
-            similarity: n("similarity", 80.0),
-            smoothness: n("smoothness", 50.0),
-            opacity: n("opacity", 1.0),
-            contrast: n("contrast", 0.0),
-            brightness: n("brightness", 0.0),
-            gamma: n("gamma", 0.0),
-        },
-        "color_filter_v2" => Effect::ColorCorrection {
-            gamma: n("gamma", 0.0),
-            contrast: n("contrast", 0.0),
-            brightness: n("brightness", 0.0),
-            saturation: n("saturation", 0.0),
-            hue_shift: n("hue_shift", 0.0),
-            opacity: n("opacity", 1.0),
-            multiply: s.get("color_multiply").and_then(Value::as_u64).unwrap_or(0x00FF_FFFF) as u32,
-            add: s.get("color_add").and_then(Value::as_u64).unwrap_or(0) as u32,
-        },
-        "luma_key_filter_v2" => Effect::LumaKey {
+        "chroma_key_filter" | "chroma_key_filter_v2" => {
+            let v2 = kind == "chroma_key_filter_v2";
+            Effect::ChromaKey {
+                key: key_of(&[("green", 0x00FF00), ("blue", 0xFF9900), ("magenta", 0xFF00FF)], 0x00FF00),
+                similarity: n("similarity", 400.0).clamp(1.0, 1000.0),
+                smoothness: n("smoothness", 80.0).clamp(1.0, 1000.0),
+                spill: n("spill", 100.0).clamp(1.0, 1000.0),
+                opacity: if v2 { n("opacity", 1.0) } else { n("opacity", 100.0) / 100.0 }.clamp(0.0, 1.0),
+                contrast: n("contrast", 0.0),
+                brightness: if v2 { n("brightness", 0.0) } else { n("brightness", 0.0) * 0.5 },
+                gamma: n("gamma", 0.0),
+            }
+        }
+        "color_key_filter" | "color_key_filter_v2" => {
+            let v2 = kind == "color_key_filter_v2";
+            Effect::ColorKey {
+                key: key_of(
+                    &[("green", 0x00FF00), ("blue", 0xFF0000), ("red", 0x0000FF), ("magenta", 0xFF00FF)],
+                    0x00FF00,
+                ),
+                similarity: n("similarity", 80.0).clamp(1.0, 1000.0),
+                smoothness: n("smoothness", 50.0).clamp(1.0, 1000.0),
+                opacity: if v2 { n("opacity", 1.0) } else { n("opacity", 100.0) / 100.0 }.clamp(0.0, 1.0),
+                contrast: n("contrast", 0.0),
+                brightness: if v2 { n("brightness", 0.0) } else { n("brightness", 0.0) * 0.5 },
+                gamma: n("gamma", 0.0),
+            }
+        }
+        "color_filter" | "color_filter_v2" => {
+            let v2 = kind == "color_filter_v2";
+            let (multiply, add) = if !v2 && s.get("color_multiply").is_none() && s.get("color_add").is_none() {
+                // OBS v1 `color_correction_filter_update_v1`: single ABGR `color` where RGB
+                // multiplies and `RGB * A` adds.
+                let c = s.get("color").and_then(Value::as_u64).unwrap_or(0x00FF_FFFF) as u32;
+                let a = ((c >> 24) & 0xff) as f32 / 255.0;
+                let r = (((c & 0xff) as f32) * a).round().clamp(0.0, 255.0) as u32;
+                let g = ((((c >> 8) & 0xff) as f32) * a).round().clamp(0.0, 255.0) as u32;
+                let b = ((((c >> 16) & 0xff) as f32) * a).round().clamp(0.0, 255.0) as u32;
+                (c & 0x00FF_FFFF, r | (g << 8) | (b << 16))
+            } else {
+                (
+                    s.get("color_multiply").and_then(Value::as_u64).unwrap_or(0x00FF_FFFF) as u32,
+                    s.get("color_add").and_then(Value::as_u64).unwrap_or(0) as u32,
+                )
+            };
+            Effect::ColorCorrection {
+                gamma: n("gamma", 0.0),
+                contrast: n("contrast", 0.0),
+                brightness: n("brightness", 0.0),
+                saturation: n("saturation", 0.0),
+                hue_shift: n("hue_shift", 0.0),
+                opacity: if v2 { n("opacity", 1.0) } else { n("opacity", 100.0) / 100.0 }.clamp(0.0, 1.0),
+                multiply,
+                add,
+            }
+        }
+        "luma_key_filter" | "luma_key_filter_v2" => Effect::LumaKey {
             max: n("luma_max", 1.0),
             min: n("luma_min", 0.0),
             max_smooth: n("luma_max_smooth", 0.0),
             min_smooth: n("luma_min_smooth", 0.0),
         },
-        "sharpness_filter_v2" => Effect::Sharpen { sharpness: n("sharpness", 0.08) },
+        "sharpness_filter" | "sharpness_filter_v2" => {
+            Effect::Sharpen { sharpness: n("sharpness", 0.08).clamp(0.0, 1.0) }
+        }
         "ferrocast_freeze" | "freeze_filter" => Effect::Freeze,
         "scroll_filter" => {
             let size = |on: &str, k: &str| {
@@ -2339,5 +2368,62 @@ mod tests {
         let a = run_chain(&mic.sound_effects);
         let b = run_chain(&expected);
         assert_eq!(a, b);
+    }
+
+    /// OBS v1 video filter IDs (`chroma_key_filter`, `color_key_filter`, `color_filter`,
+    /// `luma_key_filter`, `sharpness_filter`) import with exact OBS v1 opacity/brightness/color
+    /// conversions, and v2 keyer smoothness/spill clamp >= 1.0 to avoid shader 0/0 NaNs.
+    #[test]
+    fn obs_v1_and_v2_video_filters_import_with_correct_scaling() {
+        // v1 Chroma Key: opacity 0..100 -> 0..1, brightness * 0.5, zero smoothness clamped to 1.0.
+        assert_eq!(
+            effect_from("chroma_key_filter", &json!({ "opacity": 50, "brightness": 0.4, "smoothness": 0, "spill": 0 })),
+            Some(Effect::ChromaKey {
+                key: [0, 255, 0],
+                similarity: 400.0,
+                smoothness: 1.0,
+                spill: 1.0,
+                opacity: 0.5,
+                contrast: 0.0,
+                brightness: 0.2,
+                gamma: 0.0,
+            })
+        );
+        // v1 Color Key.
+        assert_eq!(
+            effect_from("color_key_filter", &json!({ "opacity": 80, "brightness": -0.6 })),
+            Some(Effect::ColorKey {
+                key: [0, 255, 0],
+                similarity: 80.0,
+                smoothness: 50.0,
+                opacity: 0.8,
+                contrast: 0.0,
+                brightness: -0.3,
+                gamma: 0.0,
+            })
+        );
+        // v1 Color Correction: opacity 0..100 -> 0..1, single ABGR `color` splits into multiply + premul add.
+        assert_eq!(
+            effect_from("color_filter", &json!({ "opacity": 75, "color": 0x8000_64C8u64 })),
+            Some(Effect::ColorCorrection {
+                gamma: 0.0,
+                contrast: 0.0,
+                brightness: 0.0,
+                saturation: 0.0,
+                hue_shift: 0.0,
+                opacity: 0.75,
+                multiply: 0x0000_64C8,
+                add: 0x0000_3264,
+            })
+        );
+        // v1 Luma Key & Sharpen.
+        assert_eq!(
+            effect_from("luma_key_filter", &json!({ "luma_min": 0.2, "luma_max": 0.9 })),
+            Some(Effect::LumaKey { max: 0.9, min: 0.2, max_smooth: 0.0, min_smooth: 0.0 })
+        );
+        assert_eq!(
+            effect_from("sharpness_filter", &json!({ "sharpness": 0.25 })),
+            Some(Effect::Sharpen { sharpness: 0.25 })
+        );
     }
 }

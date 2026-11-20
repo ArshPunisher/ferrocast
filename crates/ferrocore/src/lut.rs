@@ -50,7 +50,8 @@ impl Lut {
         }
     }
 
-    /// OBS's PNG layout: square z sits at column z % (width / 64), row z / (height / 64).
+    /// OBS's PNG layout: square z sits at column `z % (width / 64)`, row `z / (width / 64)`
+    /// (works for both 512×512 grids and 4096×64 / 64×4096 strips without out-of-bounds panics).
     pub fn from_png(width: u32, height: u32, rgba: &[u8]) -> Result<Self, AvError> {
         let n = PNG_WIDTH;
         if !width.is_multiple_of(n) || !height.is_multiple_of(n) || width * height != n * n * n {
@@ -59,11 +60,10 @@ impl Lut {
         if rgba.len() != (width * height * 4) as usize {
             return Err(AvError::BadPixels(width, height));
         }
-        let (macro_w, macro_h) = (width / n, height / n);
+        let macro_w = width / n;
         let mut out = Vec::with_capacity(rgba.len());
         for z in 0..n {
-            // As color-grade-filter.c (it divides by the height in squares for the row).
-            let (zx, zy) = ((z % macro_w) * n, (z / macro_h) * n);
+            let (zx, zy) = ((z % macro_w) * n, (z / macro_w) * n);
             for y in 0..n {
                 let row = width * (zy + y);
                 for x in 0..n {
@@ -177,5 +177,18 @@ mod tests {
         let LutData::Srgb8(d) = &l.data else { panic!("not sRGB") };
         assert_eq!(d[(9 * 64 * 64) * 4], 200);
         assert!(Lut::from_png(256, 256, &px[..256 * 256 * 4]).is_err());
+
+        // Non-square strip layouts (4096×64 horizontal and 64×4096 vertical) load without panicking.
+        let mut hstrip = vec![0u8; 4096 * 64 * 4];
+        hstrip[(5 * 64) * 4] = 177;
+        let lh = Lut::from_png(4096, 64, &hstrip).unwrap_or_else(|e| panic!("{e}"));
+        let LutData::Srgb8(dh) = &lh.data else { panic!("not sRGB") };
+        assert_eq!(dh[(5 * 64 * 64) * 4], 177);
+
+        let mut vstrip = vec![0u8; 64 * 4096 * 4];
+        vstrip[(7 * 64 * 64) * 4] = 133;
+        let lv = Lut::from_png(64, 4096, &vstrip).unwrap_or_else(|e| panic!("{e}"));
+        let LutData::Srgb8(dv) = &lv.data else { panic!("not sRGB") };
+        assert_eq!(dv[(7 * 64 * 64) * 4], 133);
     }
 }

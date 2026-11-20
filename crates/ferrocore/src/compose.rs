@@ -2269,10 +2269,10 @@ fn color_correction_matrix(
     multiply: u32,
     add: u32,
 ) -> [f32; 16] {
-    // color-correction-filter.c (v2): the setting plus one, round mid-grey (the `(1 - c) / 2`
-    // row). Ours took the keys' contrast curve and no middle: "contrast" only brightened or
-    // darkened everything (owner, 15 Nov).
-    let c = contrast + 1.0;
+    // Contrast turns round mid-grey (`(1 - c) / 2`), using OBS's monotonic `obs_contrast` curve
+    // so positive values boost contrast as expected while negative values down to -4 smoothly
+    // flatten toward mid-grey instead of inverting negative below -1.0.
+    let c = obs_contrast(contrast);
     let mid = (1.0 - c) / 2.0;
     let con: M4 = [[c, 0.0, 0.0, 0.0], [0.0, c, 0.0, 0.0], [0.0, 0.0, c, 0.0], [mid, mid, mid, 1.0]];
     let bright: M4 =
@@ -2348,8 +2348,8 @@ fn scroll_offset(per_sec_x: f32, per_sec_y: f32, ms: u64, looping: bool) -> (f32
     let one = |v: f32| {
         let o = f64::from(v) * secs;
         if looping {
-            // Past 1 wraps; below 0 it keeps going (the sampler wraps it), as OBS's.
-            if o > 1.0 { o.fract() as f32 } else { o as f32 }
+            // Wrap both directions past ±1 so hours-long negative scroll never loses f32 precision.
+            if o.abs() > 1.0 { o.fract() as f32 } else { o as f32 }
         } else {
             o.min(1.0) as f32
         }
@@ -2460,6 +2460,11 @@ mod mask_tests {
         assert!((x - 0.5).abs() < 1e-6 && y == 0.0, "{x} {y}");
         assert_eq!(scroll_offset(0.25, 0.0, 6_000, false).0, 1.0, "not looping: it's gone");
         assert!((scroll_offset(-0.25, 0.0, 2_000, true).0 + 0.5).abs() < 1e-6, "backwards keeps going");
+        let (neg_long, _) = scroll_offset(-0.25, 0.0, 10 * 3_600_000 + 2_000, true);
+        assert!(
+            neg_long.abs() < 1.0 && (neg_long + 0.5).abs() < 1e-5,
+            "long negative scroll wraps cleanly: {neg_long}"
+        );
     }
 
     /// A half see-through picture through each of Ferrocast's own filters, set to change
