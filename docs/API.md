@@ -618,6 +618,9 @@ Auto-detect reads OBS's own WebSocket settings (`plugin_config/obs-websocket/con
 ### Studio engine (2.1 preview, Track B: stream without OBS)
 OBS's own libobs and plugins, run by the **desktop app** on its main thread (STUDIO-PARITY.md, `crates/studio`). For the preview it uses the OBS installed on the computer (32 or newer). The headless server and browsers have no engine: every route but GET answers 422 `studio_unavailable`. Phones (Dashboard anywhere) are refused all of them.
 
+
+**Safe Mode** (after Ferrocast didn't close normally, or when started with `--safe-mode`). While it is on, plugins, VST3 plugins and the automatic return of the recording and replay buffer are off, and the saved scene collection is **not loaded**: the Studio starts with an empty temporary collection and never overwrites the saved one. `GET /api/v1/status` and the engine status carry `safe_mode: { unclean_exit, active, offer, collection_pending, plugins_disabled, vsts_disabled, auto_start_disabled, reason? }` (`collection_pending`: the saved scenes are waiting for a yes; `offer`: the choice is still open). `POST /api/v1/studio/engine/start` takes an optional body `{ safe_mode?: boolean, confirm_collection?: boolean }`: `confirm_collection: true` loads the saved scenes; `safe_mode: false` goes back to Normal Mode (409 `safe_mode_locked` when `--safe-mode` was given). A clean quit removes the note that starts it, so the launch after one is normal whatever was chosen.
+
 | Method | Path | |
 |---|---|---|
 | GET | `/api/v1/studio/engine` | `{ available, running, version: string \| null, renderer: "opengl" \| "metal" \| null, detail: string \| null }` |
