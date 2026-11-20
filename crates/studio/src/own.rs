@@ -45,6 +45,8 @@ fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32, ntsc: boo
         keyframe_secs: e.keyframe_s,
         software: is_x264(&e.video_encoder),
         profile: ferrocore::video::H264Profile::from_name(&e.profile),
+        // Only the Mac's own encoder reorders frames; x264 and FFmpeg's give times back by order.
+        bframes: e.bframes && !is_x264(&e.video_encoder),
         preset: x264_option(e, "preset", &ferrocore::video::X264_PRESETS),
         tune: x264_option(e, "tune", &ferrocore::video::X264_TUNES),
     }

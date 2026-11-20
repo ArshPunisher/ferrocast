@@ -474,6 +474,7 @@ pub struct EncodeSettings {
     pub keyframe_s: u32,
     /// "high", "main" or "baseline".
     pub profile: String,
+    /// B-frames in the Mac's encoder (off by default).
     pub bframes: bool,
     /// Sent at this size instead of the canvas's.
     pub scale: Option<(u32, u32)>,
@@ -502,7 +503,7 @@ impl EncodeSettings {
             quality: None,
             keyframe_s: 2,
             profile: "high".into(),
-            bframes: true,
+            bframes: false,
             scale: None,
             scale_filter: default_scale_filter(),
             audio_kbps: 160,

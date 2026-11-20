@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keyframe_secs: 2,
         software,
         profile: ferrocore::video::H264Profile::High,
+        bframes: false,
         preset: None,
         tune: None,
     };

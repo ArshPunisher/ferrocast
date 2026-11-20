@@ -1114,6 +1114,7 @@ mod tests {
             keyframe_secs: 2,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         }

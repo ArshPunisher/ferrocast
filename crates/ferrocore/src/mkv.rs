@@ -484,4 +484,103 @@ mod tests {
         assert_eq!(bytes.windows(name.len()).filter(|w| **w == name).count(), 1, "one named track");
         assert_eq!(bytes.windows(2).filter(|w| **w == [0x53, 0x6E]).count(), 1, "the other has no Name");
     }
+
+    /// Every (track, time in ms) block of a file's clusters, in file order.
+    fn blocks(b: &[u8]) -> Vec<(u8, i64, bool)> {
+        fn id(b: &[u8], at: &mut usize) -> u32 {
+            let n = b[*at].leading_zeros() as usize + 1;
+            let v = b[*at..*at + n].iter().fold(0u32, |a, x| a << 8 | u32::from(*x));
+            *at += n;
+            v
+        }
+        fn len(b: &[u8], at: &mut usize) -> Option<usize> {
+            let n = b[*at].leading_zeros() as usize + 1;
+            let mut v = u64::from(b[*at]) & ((1u64 << (8 - n)) - 1);
+            let all = v == (1u64 << (8 - n)) - 1;
+            for x in &b[*at + 1..*at + n] {
+                v = v << 8 | u64::from(*x);
+            }
+            *at += n;
+            let unknown = all && b[*at - n + 1..*at].iter().all(|x| *x == 0xFF);
+            (!unknown).then_some(v as usize)
+        }
+        let (mut out, mut at, mut base) = (Vec::new(), 0usize, 0i64);
+        while at < b.len() {
+            let tag = id(b, &mut at);
+            let size = len(b, &mut at);
+            match tag {
+                // Segment and Cluster: look inside.
+                0x1853_8067 | 0x1F43_B675 => {}
+                0xE7 => {
+                    base = b[at..at + size.unwrap_or(0)].iter().fold(0i64, |a, x| a << 8 | i64::from(*x));
+                    at += size.unwrap_or(0);
+                }
+                0xA3 => {
+                    let n = size.unwrap_or(0);
+                    let rel = i64::from(i16::from_be_bytes([b[at + 1], b[at + 2]]));
+                    out.push((b[at] & 0x7F, base + rel, b[at + 3] & 0x80 != 0));
+                    at += n;
+                }
+                _ => at += size.unwrap_or(b.len() - at),
+            }
+        }
+        out
+    }
+
+    /// B-frames: each block is at its picture's own display time (not its decode time), in decode
+    /// order inside a cluster, and the sound is on the same clock.
+    #[test]
+    fn b_frame_blocks_are_timed_by_display_with_the_sound_on_the_same_clock() {
+        use crate::audio::AudioPacket;
+        use crate::mp4::{AudioTrack, VideoTrack};
+        use crate::video::{VideoCodec, VideoPacket};
+        let v = VideoTrack {
+            codec: VideoCodec::H264,
+            width: 64,
+            height: 64,
+            config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
+        };
+        let a = AudioTrack {
+            sample_rate: 48_000,
+            channels: 2,
+            config: vec![0x11, 0x90],
+            bitrate_kbps: 160,
+            name: String::new(),
+        };
+        let mut w =
+            MkvWriter::new(std::io::Cursor::new(Vec::new()), Some(v), Some(a)).unwrap_or_else(|e| panic!("{e}"));
+        let f = 33_333i64;
+        // Decode order 0, then groups of (P, B, B) with decode times three frames early.
+        let mut order = vec![0i64];
+        let mut g = 1;
+        while order.len() < 90 {
+            order.extend([g + 2, g, g + 1]);
+            g += 3;
+        }
+        order.truncate(90);
+        let mut next_audio = 0i64;
+        let mut want = Vec::new();
+        for (k, shown) in order.iter().enumerate() {
+            let dts = (k as i64 - 1) * f;
+            while next_audio <= dts {
+                w.audio(&AudioPacket { pts_us: next_audio, data: vec![9; 20] }).unwrap_or_else(|e| panic!("{e}"));
+                next_audio += 21_333;
+            }
+            let p = VideoPacket { pts_us: shown * f, dts_us: dts, key: k % 30 == 0, data: vec![1; 100] };
+            want.push(shown * f - (-f)); // relative to the first decode time (-f)
+            w.video(&p).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let bytes = w.finish().unwrap_or_else(|e| panic!("{e}")).into_inner();
+        let got = blocks(&bytes);
+        let video: Vec<&(u8, i64, bool)> = got.iter().filter(|b| b.0 == VIDEO).collect();
+        assert_eq!(video.len(), 90);
+        for (b, w) in video.iter().zip(&want) {
+            assert!((b.1 - w / 1000).abs() <= 1, "block at {} ms, picture at {} ms", b.1, w / 1000);
+        }
+        assert!(video.windows(2).any(|w| w[1].1 < w[0].1), "decode order: some later block is earlier in time");
+        assert_eq!(video.iter().filter(|b| b.2).count(), 3, "keyframes");
+        // Sound from pts 0 sits where the first picture (pts 0) is: one frame after the file's start.
+        let first_audio = got.iter().find(|b| b.0 == AUDIO).map_or(-1, |b| b.1);
+        assert!((first_audio - f / 1000).abs() <= 1, "sound starts at {first_audio} ms");
+    }
 }

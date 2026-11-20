@@ -836,6 +836,9 @@ pub struct StudioSettings {
     pub keyframe_s: u32,
     /// "high", "main" or "baseline".
     pub profile: String,
+    /// B-frames in the Mac's encoder. Its own key: the old `bframes` (always saved as true, and
+    /// ignored) must not switch them on.
+    #[serde(rename = "b_frames")]
     pub bframes: bool,
     /// Send at this size instead of the canvas's.
     pub scale: Option<[u32; 2]>,
@@ -975,7 +978,7 @@ impl Default for StudioSettings {
             vbr: false,
             keyframe_s: 2,
             profile: "high".into(),
-            bframes: true,
+            bframes: false,
             scale: None,
             scale_filter: "bicubic".into(),
             audio_kbps: 160,

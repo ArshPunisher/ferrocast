@@ -56,9 +56,12 @@ pub struct VideoConfig {
     /// x264 (through FFmpeg) instead of the system's own encoder: sharper at low bitrates, and
     /// lossless with `RateControl::Crf(0)`. H.264 only.
     pub software: bool,
-    /// The H.264 profile (HEVC is always Main). B-frames stay off in every profile: the encoders
-    /// give times back by order, which B-frames would break.
+    /// The H.264 profile (HEVC is always Main).
     pub profile: H264Profile,
+    /// B-frames (frame reordering) in the Mac's encoder, as OBS has them by default: packets carry
+    /// their own decode and presentation times. Off for Baseline (it has none), and always off for
+    /// x264 and the FFmpeg hardware encoders, whose times are matched back by order.
+    pub bframes: bool,
     /// x264's speed preset and tune, when the settings pick them (`X264_PRESETS`, `X264_TUNES`);
     /// other encoders ignore them.
     /// (indices into the lists, to keep this small).

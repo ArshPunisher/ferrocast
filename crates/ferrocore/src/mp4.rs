@@ -1293,4 +1293,166 @@ mod finished_tests {
         let sum_us = 60 * 33_333i64;
         assert!(i64::from(dur) * 1_000_000 / 90_000 < sum_us, "{dur} ticks is under the running sum");
     }
+
+    /// A reordered stream as VideoToolbox gives it with B-frames: decode order I P B B P B B (a
+    /// pyramid two frames deep), decode times shifted back three frames so none passes its
+    /// picture's time. Pictures are `n` frames of 33 333 us; returns packets and each one's
+    /// display index.
+    fn reordered(n: i64) -> Vec<(VideoPacket, i64)> {
+        let f = 33_333;
+        // Display order 0 1 2 3 ...; decode order inside each group of three: 2 0 1 (P first).
+        let mut order = vec![0];
+        let mut g = 1;
+        while order.len() < n as usize {
+            for k in [g + 2, g, g + 1] {
+                if k < n {
+                    order.push(k);
+                }
+            }
+            g += 3;
+        }
+        order
+            .iter()
+            .enumerate()
+            .map(|(k, &shown)| {
+                let p = VideoPacket {
+                    pts_us: shown * f,
+                    dts_us: (k as i64 - 3) * f + 2 * f,
+                    key: k % 30 == 0,
+                    data: vec![k as u8; 300],
+                };
+                assert!(p.dts_us <= p.pts_us);
+                (p, shown)
+            })
+            .collect()
+    }
+
+    /// The finished file's picture tables: per sample (decode ticks, composition ticks, sync).
+    fn video_samples(bytes: &[u8]) -> Vec<(i64, i64, bool)> {
+        let top = boxes_in(bytes, 0, bytes.len());
+        let moov = find(&top, b"moov").unwrap_or_else(|| panic!("moov")).clone();
+        let trak = find(&boxes_in(bytes, moov.at, moov.end), b"trak").unwrap_or_else(|| panic!("trak")).clone();
+        let mdia = find(&boxes_in(bytes, trak.at, trak.end), b"mdia").unwrap_or_else(|| panic!("mdia")).clone();
+        let minf = find(&boxes_in(bytes, mdia.at, mdia.end), b"minf").unwrap_or_else(|| panic!("minf")).clone();
+        let stbl = find(&boxes_in(bytes, minf.at, minf.end), b"stbl").unwrap_or_else(|| panic!("stbl")).clone();
+        let st = boxes_in(bytes, stbl.at, stbl.end);
+        let stts = find(&st, b"stts").unwrap_or_else(|| panic!("stts"));
+        let mut dts = Vec::new();
+        let (mut t, runs) = (0i64, u32_at(bytes, stts.at + 4) as usize);
+        for r in 0..runs {
+            let (n, d) = (u32_at(bytes, stts.at + 8 + 8 * r), u32_at(bytes, stts.at + 12 + 8 * r));
+            for _ in 0..n {
+                dts.push(t);
+                t += i64::from(d);
+            }
+        }
+        let mut cts = vec![0i64; dts.len()];
+        if let Some(c) = find(&st, b"ctts") {
+            assert_eq!(bytes[c.at], 1, "version 1: signed offsets");
+            let (mut i, runs) = (0, u32_at(bytes, c.at + 4) as usize);
+            for r in 0..runs {
+                let n = u32_at(bytes, c.at + 8 + 8 * r) as usize;
+                let off = u32_at(bytes, c.at + 12 + 8 * r) as i32;
+                for _ in 0..n {
+                    cts[i] = i64::from(off);
+                    i += 1;
+                }
+            }
+            assert_eq!(i, dts.len(), "an offset for every sample");
+        }
+        let keys: Vec<u32> = find(&st, b"stss")
+            .map(|k| (0..u32_at(bytes, k.at + 4) as usize).map(|i| u32_at(bytes, k.at + 8 + 4 * i)).collect())
+            .unwrap_or_default();
+        dts.iter().zip(&cts).enumerate().map(|(i, (d, c))| (*d, *c, keys.contains(&(i as u32 + 1)))).collect()
+    }
+
+    fn written_reordered(frames: &[(VideoPacket, i64)]) -> Mp4Writer<Cursor<Vec<u8>>> {
+        let (v, a) = tracks();
+        let mut w = Mp4Writer::new(Cursor::new(Vec::new()), Some(v), Some(a)).unwrap_or_else(|e| panic!("{e}"));
+        let mut next_audio = 0i64;
+        for (p, _) in frames {
+            // Sound in time order, by decode time as the pipeline interleaves it.
+            while next_audio <= p.dts_us {
+                w.audio(&AudioPacket { pts_us: next_audio, data: vec![9; 30] }).unwrap_or_else(|e| panic!("{e}"));
+                next_audio += 21_333;
+            }
+            w.video(p).unwrap_or_else(|e| panic!("{e}"));
+        }
+        w
+    }
+
+    /// B-frames in a finished file: decode times rise from 0, composition offsets give back each
+    /// picture's own time, and the pictures show at the same clock the sound is on.
+    #[test]
+    fn a_finished_file_keeps_each_pictures_decode_and_display_times_with_b_frames() {
+        let frames = reordered(90);
+        let bytes = written_reordered(&frames).finalize().unwrap_or_else(|e| panic!("{}", e.error)).into_inner();
+        let got = video_samples(&bytes);
+        assert_eq!(got.len(), 90);
+        assert_eq!(got[0].0, 0, "the file starts at the first decode time");
+        assert!(got.windows(2).all(|w| w[1].0 > w[0].0), "decode times rise");
+        let start = frames[0].0.dts_us;
+        for (g, (p, _)) in got.iter().zip(&frames) {
+            let want_pts = (p.pts_us - start) * 90_000 / 1_000_000;
+            assert!((g.0 + g.1 - want_pts).abs() <= 1, "display time {} vs {want_pts}", g.0 + g.1);
+            assert!(g.1 >= 0, "never displayed before decoded");
+        }
+        assert!(got.iter().any(|g| g.1 > 0), "some pictures are reordered");
+        assert_eq!(got.iter().filter(|g| g.2).count(), 3, "keyframes are the sync samples");
+        // A/V: the first picture shows at the clock's `first pts - start` ticks, as the sound's
+        // timeline counts (sound from pts 0 starts that far in, by an empty edit).
+        let first_shown = got.iter().map(|g| g.0 + g.1).min().unwrap_or(0);
+        let want_ms = (frames.iter().map(|f| f.0.pts_us).min().unwrap_or(0) - start) / 1000;
+        assert!((first_shown * 1000 / 90_000 - want_ms).abs() <= 33, "{first_shown} ticks vs {want_ms} ms");
+        // The sound's empty edit (where it starts on the movie's clock) is the first picture's time.
+        let top = boxes_in(&bytes, 0, bytes.len());
+        let moov = find(&top, b"moov").unwrap_or_else(|| panic!("moov")).clone();
+        let inside = boxes_in(&bytes, moov.at, moov.end);
+        let traks: Vec<&B> = inside.iter().filter(|b| &b.kind == b"trak").collect();
+        let parts = boxes_in(&bytes, traks[1].at, traks[1].end);
+        let edts = find(&parts, b"edts").unwrap_or_else(|| panic!("the sound starts late"));
+        let elst = find(&boxes_in(&bytes, edts.at, edts.end), b"elst").unwrap_or_else(|| panic!("elst")).clone();
+        let delay_ms = i64::from(u32_at(&bytes, elst.at + 8));
+        assert!(
+            (delay_ms - first_shown * 1000 / 90_000).abs() <= 33,
+            "sound starts at {delay_ms} ms, picture at {first_shown} ticks"
+        );
+    }
+
+    /// The same in the fragmented file a crash leaves: each fragment's trun carries the offsets.
+    #[test]
+    fn a_fragmented_file_carries_composition_offsets_in_each_run() {
+        let frames = reordered(90);
+        let (out, whole) = written_reordered(&frames).abandon();
+        let bytes = out.into_inner();
+        let top = boxes_in(&bytes, 0, whole as usize);
+        let mut offsets = Vec::new();
+        for moof in top.iter().filter(|b| &b.kind == b"moof") {
+            let traf = boxes_in(&bytes, moof.at, moof.end);
+            for t in traf.iter().filter(|b| &b.kind == b"traf") {
+                let parts = boxes_in(&bytes, t.at, t.end);
+                let tfhd = find(&parts, b"tfhd").unwrap_or_else(|| panic!("tfhd"));
+                if u32_at(&bytes, tfhd.at + 4) != VIDEO {
+                    continue;
+                }
+                let trun = find(&parts, b"trun").unwrap_or_else(|| panic!("trun"));
+                assert_eq!(bytes[trun.at], 1, "version 1: signed offsets");
+                let n = u32_at(&bytes, trun.at + 4) as usize;
+                for i in 0..n {
+                    offsets.push(u32_at(&bytes, trun.at + 12 + 16 * i + 12) as i32);
+                }
+            }
+        }
+        // The last group isn't written until the next keyframe: what is, is in order.
+        assert!(offsets.len() >= 60, "{} samples", offsets.len());
+        let want: Vec<i32> = frames
+            .iter()
+            .take(offsets.len())
+            .map(|(p, _)| ((p.pts_us - p.dts_us) * 90_000 / 1_000_000) as i32)
+            .collect();
+        for (o, w) in offsets.iter().zip(&want) {
+            assert!((o - w).abs() <= 1, "{o} vs {w}");
+        }
+        assert!(offsets.iter().any(|o| *o > 0));
+    }
 }

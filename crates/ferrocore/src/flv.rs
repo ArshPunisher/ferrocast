@@ -161,6 +161,42 @@ mod tests {
         assert_eq!(t[0], 0x27);
     }
 
+    /// B-frames on the wire: a tag's time is the decode time and its composition time brings the
+    /// display time back, for H.264 and HEVC; the stream's own time starts at the first keyframe's
+    /// decode time, and tag times never go back.
+    #[test]
+    fn reordered_pictures_keep_their_display_time_through_the_composition_time() {
+        let f = 33_333i64;
+        let mut order = vec![0i64];
+        let mut g = 1;
+        while order.len() < 91 {
+            order.extend([g + 2, g, g + 1]);
+            g += 3;
+        }
+        order.truncate(90);
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            let base = 5_000_000i64;
+            let start = base + (-2) * f;
+            let mut last = 0u32;
+            let mut seen_offset = false;
+            for (k, shown) in order.iter().enumerate() {
+                let p = packet(base + shown * f, base + (k as i64 - 2) * f, k == 0);
+                let (ms, t) = video_tag(codec, &p, start);
+                assert!(ms >= last, "tag times never go back");
+                last = ms;
+                let cts = match codec {
+                    VideoCodec::H264 => i64::from(u32::from_be_bytes([0, t[2], t[3], t[4]])),
+                    // CodedFrames (1) carries it after the fourcc; CodedFramesX (3) has none.
+                    VideoCodec::Hevc if t[0] & 0x0F == 1 => i64::from(u32::from_be_bytes([0, t[5], t[6], t[7]])),
+                    VideoCodec::Hevc => 0,
+                };
+                seen_offset |= cts > 0;
+                assert_eq!(i64::from(ms) + cts, (p.pts_us - start) / 1000, "{codec:?} picture {shown}");
+            }
+            assert!(seen_offset, "{codec:?}: some pictures have a composition time");
+        }
+    }
+
     #[test]
     fn hevc_tags_are_enhanced_rtmp() {
         assert_eq!(video_header(VideoCodec::Hevc, &[1])[..5], [0x90, b'h', b'v', b'c', b'1']);

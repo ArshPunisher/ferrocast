@@ -5401,6 +5401,7 @@ mod tests {
             keyframe_secs: 1,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         };
@@ -5444,6 +5445,7 @@ mod tests {
             keyframe_secs: 2,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         };
@@ -5542,6 +5544,7 @@ mod tests {
             keyframe_secs: 1,
             software: false,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         };
@@ -7273,6 +7276,7 @@ mod tests {
             keyframe_secs: 4,
             software: true,
             profile: crate::video::H264Profile::High,
+            bframes: false,
             preset: None,
             tune: None,
         };
