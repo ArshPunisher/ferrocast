@@ -281,6 +281,9 @@ mod tests {
     use crate::studio_host::{Recovered, StudioHost, StudioSettings, StudioStatus};
     use crate::{Engine, PlatformApps};
 
+    /// Safe Mode switches the process-wide "VST plugins off" flag: the tests that do run one at a time.
+    static PLUGINS_FLAG: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[derive(Debug, Default)]
     struct MockHost {
         running: AtomicBool,
@@ -289,6 +292,8 @@ mod tests {
         record_calls: AtomicUsize,
         replay_calls: AtomicUsize,
         recovered: Mutex<Option<Recovered>>,
+        /// A stream is on (what stats and stream_stats then say).
+        streaming: AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -340,7 +345,7 @@ mod tests {
             Ok(None)
         }
         async fn stats(&self) -> Result<serde_json::Value, String> {
-            Ok(serde_json::json!({}))
+            Ok(serde_json::json!({ "stream": { "active": self.streaming.load(Ordering::Relaxed) } }))
         }
         async fn record(&self, _on: bool) -> Result<serde_json::Value, String> {
             self.record_calls.fetch_add(1, Ordering::Relaxed);
@@ -368,7 +373,11 @@ mod tests {
             Ok(())
         }
         async fn stream_stats(&self) -> Result<serde_json::Value, String> {
-            Ok(serde_json::json!(null))
+            if self.streaming.load(Ordering::Relaxed) {
+                Ok(serde_json::json!({ "active": true, "reconnecting": false }))
+            } else {
+                Ok(serde_json::json!(null))
+            }
         }
         async fn obs_collections(&self) -> Result<serde_json::Value, String> {
             Ok(serde_json::json!([]))
@@ -415,6 +424,7 @@ mod tests {
             }
         }
         let _reset_vsts = ResetVsts;
+        let _serial = PLUGINS_FLAG.lock().await;
 
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let engine = Engine::start_with(dir.path(), Arc::new(MemorySecrets::default()), PlatformApps::default())
@@ -475,6 +485,63 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("--safe-mode"));
         ferrocore::afx::set_plugins_disabled(false);
+    }
+
+    /// "Load my scenes" and "Start normally" on a Studio that is already running reload its
+    /// scene collection (the undo history goes, NDI, the virtual camera and the vertical picture
+    /// stop, the temporary scenes are replaced). While live that is refused like any other
+    /// collection switch; with nothing held back there is nothing to load, so it isn't touched.
+    #[tokio::test]
+    async fn confirming_scenes_on_a_running_studio_waits_for_the_outputs_and_only_when_needed() {
+        struct ResetVsts;
+        impl Drop for ResetVsts {
+            fn drop(&mut self) {
+                ferrocore::afx::set_plugins_disabled(false);
+            }
+        }
+        let _serial = PLUGINS_FLAG.lock().await;
+        let _reset = ResetVsts;
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = Engine::start_with(dir.path(), Arc::new(MemorySecrets::default()), PlatformApps::default())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        engine.set_safe_mode_for_test(true, false);
+        let host = Arc::new(MockHost::default());
+        engine.set_studio_host(host.clone());
+
+        // Safe Mode, the Studio started with a blank canvas, then a stream goes live on it.
+        engine.studio_start().await.unwrap_or_else(|e| panic!("{e}"));
+        host.streaming.store(true, Ordering::Relaxed);
+        for opts in [
+            StartOptions { safe_mode: Some(true), confirm_collection: true },
+            StartOptions { safe_mode: Some(false), confirm_collection: true },
+        ] {
+            let err = engine.studio_start_with(opts).await.unwrap_err();
+            assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "{err:?}");
+        }
+        assert_eq!(host.confirm_calls.load(Ordering::Relaxed), 0, "nothing was reloaded under the stream");
+        let held = engine.safe_mode_status();
+        assert!(held.active && held.offer && held.collection_pending, "a refused choice changes nothing: {held:?}");
+
+        // Off air, the same choice goes through once.
+        host.streaming.store(false, Ordering::Relaxed);
+        engine
+            .studio_start_with(StartOptions { safe_mode: Some(true), confirm_collection: true })
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.confirm_calls.load(Ordering::Relaxed), 1);
+
+        // Nothing held back now: Start normally flips the mode, even live, and reloads nothing.
+        host.streaming.store(true, Ordering::Relaxed);
+        let st = engine
+            .studio_start_with(StartOptions { safe_mode: Some(false), confirm_collection: true })
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(st.safe_mode.is_none());
+        assert_eq!(host.confirm_calls.load(Ordering::Relaxed), 1, "no second reload with nothing pending");
+        // And a plain Start on the running Studio in Normal Mode is no reload either.
+        engine.studio_start().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.confirm_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

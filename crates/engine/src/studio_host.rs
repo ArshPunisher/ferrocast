@@ -2074,10 +2074,25 @@ impl Engine {
             let _ = self.get_ffmpeg().await;
         }
         let host = self.studio_host()?;
-        let (load_collection, allow_auto_start, _enabled_normal) = self.apply_start_options(&opts)?;
         let was_running = host.status().await.running;
+        // A running Studio reloads its scene collection only to put the held-back saved scenes in
+        // place of the temporary ones. That is a collection switch, refused while a show or any
+        // output is on (it used to run on every Start, wiping the undo history and stopping NDI,
+        // the virtual camera and the vertical picture), and it is asked before any choice is made,
+        // so a refused one leaves Safe Mode as it was.
+        let confirming = was_running
+            && self.safe_mode_status().collection_pending
+            && (opts.confirm_collection || opts.safe_mode == Some(false));
+        if confirming {
+            self.ensure_idle_for_switch("scene collections").await?;
+        }
+        let (load_collection, allow_auto_start, _enabled_normal) = self.apply_start_options(&opts)?;
         let mut status = if was_running {
-            if load_collection { host.confirm_collection().await.map_err(failed)? } else { host.status().await }
+            if confirming && load_collection {
+                host.confirm_collection().await.map_err(failed)?
+            } else {
+                host.status().await
+            }
         } else {
             host.start_with_mode(load_collection).await.map_err(failed)?
         };
