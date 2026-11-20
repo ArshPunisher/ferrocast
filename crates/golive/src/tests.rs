@@ -215,6 +215,7 @@ fn destination(port: u16, key: &str) -> Destination {
         retry: Default::default(),
         extra_audio: false,
         extra_video: false,
+        backup: None,
     }
 }
 
@@ -1219,6 +1220,176 @@ async fn a_refused_stream_key_gives_up_after_bounded_attempts() {
             assert!(detail.as_deref().is_some_and(|d| d.contains("refused the stream key")), "{detail:?}");
         }
         s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_destination_far_behind_skips_older_keyframes_and_stale_audio() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let lf = free_listener().await;
+    let ls = small_buf_listener().await;
+    let (pf, ps) = (lf.local_addr().unwrap().port(), ls.local_addr().unwrap().port());
+    let (open_tx, open_rx) = watch::channel(true);
+    let mut fast = platform(lf, "fast").await;
+    let mut slow = controlled_platform(ls, "slow", open_rx, None).await;
+    let mut hf = start(&w, Destination { id: "fast".into(), ..destination(pf, "fast") });
+    let mut hs = start(&w, Destination { id: "slow".into(), ..destination(ps, "slow") });
+    state_is(&mut hf, |s| *s == PushState::Live).await;
+    state_is(&mut hs, |s| *s == PushState::Live).await;
+
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+
+    w.hub.video(0, big_video(true, 0));
+    w.hub.audio(10, Bytes::from_static(AAC));
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Video(0, _)));
+        assert_eq!(next(rx).await, Got::Audio(10, Bytes::from_static(AAC)));
+    }
+
+    // Stall slow, then send 4.25 s across 10 GOPs (keyframes every 400 ms at 400..=4000).
+    open_tx.send_replace(false);
+    let mut total_video = 1u64;
+    let mut total_audio = 1u64;
+    for step in 1..=85u32 {
+        let ts = step * 50;
+        let is_key = ts.is_multiple_of(400);
+        w.hub.video(ts, big_video(is_key, step as u8));
+        w.hub.audio(ts + 10, Bytes::from_static(AAC));
+        total_video += 1;
+        total_audio += 1;
+        assert!(matches!(next(&mut fast).await, Got::Video(t, _) if t == ts));
+        assert_eq!(next(&mut fast).await, Got::Audio(ts + 10, Bytes::from_static(AAC)));
+    }
+    assert_eq!(hf.borrow().dropped, 0);
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    open_tx.send_replace(true);
+    w.hub.end();
+
+    let mut slow_videos = vec![(0u32, true)];
+    let mut slow_audios = vec![10u32];
+    loop {
+        match next(&mut slow).await {
+            Got::Video(ts, data) => slow_videos.push((ts, crate::flv::video_is_keyframe(&data))),
+            Got::Audio(ts, _) => slow_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+    state_is(&mut hs, |s| *s == PushState::Waiting).await;
+
+    // Slow destination jumped directly to the newest keyframe (4000), skipping intermediate GOPs
+    // and dropping the stale audio belonging to those skipped GOPs.
+    let dropped = hs.borrow().dropped;
+    assert_eq!(
+        slow_videos.len() as u64 + slow_audios.len() as u64 + dropped,
+        total_video + total_audio,
+        "every dropped video + skipped audio is accounted for in Health.dropped"
+    );
+    assert!(slow_videos.iter().any(|&(ts, key)| ts == 4000 && key), "resumed at newest keyframe 4000");
+    assert!(
+        !slow_videos.iter().any(|&(ts, key)| (1200..4000).contains(&ts) && key),
+        "intermediate keyframes before 4000 were skipped: {slow_videos:?}"
+    );
+    assert!(
+        slow_audios.contains(&4010) && !slow_audios.iter().any(|&ts| (1200..4000).contains(&ts)),
+        "stale audio in skipped GOPs dropped and resumed with newest keyframe: {slow_audios:?}"
+    );
+    for pair in slow_videos.windows(2) {
+        if pair[1].0 > pair[0].0 + 50 {
+            assert!(pair[1].1, "no orphan P-frame after gap: {:?} -> {:?}", pair[0], pair[1]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_link_slower_than_keyframes_alone_skips_to_newest_keyframe() {
+    let w = world().await;
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+
+    let lf = free_listener().await;
+    let ls = small_buf_listener().await;
+    let (pf, ps) = (lf.local_addr().unwrap().port(), ls.local_addr().unwrap().port());
+    let (_open_tx, open_rx) = watch::channel(true);
+    let mut fast = platform(lf, "fast").await;
+    // Slow platform drains only 16 KB per 100 ms (160 KB/s), while keyframes alone are 128 KB every
+    // 400 ms stream time (320 KB/s stream -> 640 KB/s wall rate at 2x pacing): keyframes alone
+    // exceed the slow link speed, so without keyframe skipping it drifts farther behind forever.
+    let mut slow = controlled_platform(ls, "slow", open_rx, Some((16 * 1024, Duration::from_millis(100)))).await;
+    let mut hf = start(&w, Destination { id: "fast".into(), ..destination(pf, "fast") });
+    let mut hs = start(&w, Destination { id: "slow".into(), ..destination(ps, "slow") });
+    state_is(&mut hf, |s| *s == PushState::Live).await;
+    state_is(&mut hs, |s| *s == PushState::Live).await;
+
+    for rx in [&mut fast, &mut slow] {
+        assert!(matches!(next(rx).await, Got::Publish(_)));
+        assert_eq!(next(rx).await, Got::Video(0, Bytes::from_static(AVC_HEADER)));
+        assert_eq!(next(rx).await, Got::Audio(0, Bytes::from_static(AAC_HEADER)));
+    }
+
+    let hub = w.hub.clone();
+    let pub_task = tokio::spawn(async move {
+        // 120 frames = 6.0 s stream time (keyframes every 400 ms: 0, 400, ..., 5600), 25 ms wall step.
+        for step in 0..120u32 {
+            let ts = step * 50;
+            let is_key = ts.is_multiple_of(400);
+            let bytes = if is_key { 128 * 1024 } else { 32 * 1024 };
+            hub.video(ts, sized_video(is_key, step as u8, bytes));
+            hub.audio(ts + 10, Bytes::from_static(AAC));
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        hub.end();
+    });
+
+    let mut slow_videos = Vec::new();
+    let mut slow_audios = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(12), slow.recv()).await.expect("slow pkt").expect("slow open") {
+            Got::Video(ts, data) => slow_videos.push((ts, crate::flv::video_is_keyframe(&data))),
+            Got::Audio(ts, _) => slow_audios.push(ts),
+            Got::Closed => break,
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+    pub_task.await.unwrap();
+
+    let mut fast_count = 0usize;
+    loop {
+        match next(&mut fast).await {
+            Got::Video(_, _) => fast_count += 1,
+            Got::Audio(_, _) => {}
+            Got::Closed => break,
+            other => panic!("unexpected packet: {other:?}"),
+        }
+    }
+    state_is(&mut hs, |s| *s == PushState::Waiting).await;
+    assert_eq!(fast_count, 120);
+    assert_eq!(hf.borrow().dropped, 0);
+
+    // Slow platform jumped across intermediate keyframes cleanly, reached the tail of the stream
+    // quickly instead of falling behind forever, never emitted orphan inter frames, and dropped
+    // skipped audio in lockstep with skipped GOPs.
+    let key_ts: Vec<u32> = slow_videos.iter().filter(|&&(_, k)| k).map(|&(t, _)| t).collect();
+    assert!(key_ts.len() < 15, "must have skipped intermediate keyframes when slower than keyframes: {key_ts:?}");
+    assert!(
+        key_ts.last().copied().unwrap_or(0) >= 4800,
+        "jumped near the live tail instead of stalling far behind: {key_ts:?}"
+    );
+    assert!(slow_audios.len() < 120, "skipped-GOP audio dropped with video: sent {}", slow_audios.len());
+    for pair in slow_videos.windows(2) {
+        if pair[1].0 > pair[0].0 + 50 {
+            assert!(pair[1].1, "no orphan inter frame after gap: {:?} -> {:?}", pair[0], pair[1]);
+        }
     }
 }
 mod platforms;

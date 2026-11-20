@@ -580,11 +580,24 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
         ],
         "ffmpeg_source" => vec![
             opt("is_local_file", "From a file on this computer", "bool"),
-            opt("local_file", "File", "path").file(MEDIA),
-            opt("looping", "Loop", "bool"),
+            opt("local_file", "File", "path").file(MEDIA).when("is_local_file", &[json!(true)]),
+            opt("input", "Address", "text").when("is_local_file", &[json!(false)]),
+            opt("input_format", "Format", "text").when("is_local_file", &[json!(false)]),
+            opt("reconnect_delay_sec", "Reconnect after", "int")
+                .range(1.0, 60.0, 1.0)
+                .unit(" s")
+                .when("is_local_file", &[json!(false)]),
+            opt("ffmpeg_options", "FFmpeg options", "text").when("is_local_file", &[json!(false)]),
+            opt("looping", "Loop", "bool").when("is_local_file", &[json!(true)]),
             opt("restart_on_activate", "Start over when shown", "bool"),
             opt("close_when_inactive", "Let go of the file when hidden", "bool"),
-            opt("speed_percent", "Speed", "int").range(1.0, 200.0, 1.0).slider().unit("%"),
+            opt("clear_on_media_end", "Clear when it ends", "bool").when("is_local_file", &[json!(true)]),
+            opt("hw_decode", "Hardware decoding", "bool"),
+            opt("speed_percent", "Speed", "int")
+                .range(1.0, 200.0, 1.0)
+                .slider()
+                .unit("%")
+                .when("is_local_file", &[json!(true)]),
         ],
         "screen_capture" => {
             let mut v = vec![opt("type", "What to capture", "list").choices(&[
@@ -1011,9 +1024,20 @@ pub fn defaults(kind: &str) -> Option<Value> {
             "drop_shadow": false, "word_wrap": false, "custom_width": 0, "antialiasing": true,
             "align": "left", "bk_color": 0xFF00_0000u32, "bk_opacity": 0,
         }),
-        "ffmpeg_source" => {
-            json!({ "is_local_file": true, "local_file": "", "looping": false, "restart_on_activate": true, "close_when_inactive": false, "speed_percent": 100 })
-        }
+        "ffmpeg_source" => json!({
+            "is_local_file": true,
+            "local_file": "",
+            "input": "",
+            "input_format": "",
+            "reconnect_delay_sec": 2,
+            "ffmpeg_options": "",
+            "looping": false,
+            "restart_on_activate": true,
+            "close_when_inactive": false,
+            "clear_on_media_end": true,
+            "hw_decode": true,
+            "speed_percent": 100,
+        }),
         "screen_capture" => json!({ "type": 0, "show_cursor": true, "application": "", "exclude_apps": [] }),
         "av_capture_input" | "av_capture_input_v2" => json!({ "device": "", "resolution": "", "fps": 0 }),
         "coreaudio_input_capture" => json!({ "device_id": "default" }),
@@ -1062,7 +1086,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "speed_x": 0.0, "speed_y": 0.0, "limit_cx": false, "cx": 100, "limit_cy": false, "cy": 100, "loop": true })
         }
         "gain_filter" => json!({ "db": 0.0 }),
-        "ferrocast_deepfilter" => json!({ "strength": 100 }),
+        "ferrocast_deepfilter" => json!({ "strength": 40 }),
         "ferrocast_vst" => json!({ "path": "", "cid": "", "name": "", "state": "" }),
         "noise_suppress_filter" | "noise_suppress_filter_v2" => json!({ "method": "rnnoise", "suppress_level": -30 }),
         "ferrocast_remove_background" => json!({ "mode": 0, "soft": 10, "blur": 24 }),

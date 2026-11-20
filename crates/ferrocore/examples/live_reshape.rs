@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         retry: Retry::default(),
         extra_audio: false,
         extra_video: false,
+        backup: None,
     };
     let pusher = rt.spawn(push::run(dest, hub.clone(), health_tx, stop));
 

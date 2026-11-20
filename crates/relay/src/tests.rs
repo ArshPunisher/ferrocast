@@ -78,6 +78,9 @@ async fn fake_kick() -> String {
             if body.contains("refresh_token=revoked") {
                 return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": "invalid" })));
             }
+            if body.contains("refresh_token=kick-down") {
+                return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({ "error": "busy" })));
+            }
             (StatusCode::OK, axum::Json(json!({ "access_token": "kick-access", "refresh_token": "kick-refresh", "expires_in": "7200", "token_type": "Bearer", "scope": "" })))
         }))
         .route("/public/v1/users", get(|| async { axum::Json(json!({ "data": [{ "user_id": 4242, "name": "kicker", "profile_picture": "" }] })) }));
@@ -221,6 +224,19 @@ async fn refresh_goes_through_the_relay_and_strangers_are_refused() {
         .await
         .unwrap();
     assert_eq!(revoked.status(), 401);
+    let rev: Value = revoked.json().await.unwrap();
+    assert_eq!(rev["error"]["code"], "sign_in_needed", "Kick refusing the token is a sign-out");
+    // Kick being down is not a sign-out.
+    let down = http
+        .post(format!("{}/v1/kick/refresh", r.base))
+        .bearer_auth(&auth)
+        .json(&json!({ "refresh_token": "kick-down" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(down.status(), 502);
+    let down: Value = down.json().await.unwrap();
+    assert_eq!(down["error"]["code"], "kick_unreachable");
     let (id, _) = auth.split_once('.').unwrap();
     for bad in ["".to_string(), "nodot".into(), format!("{id}.wrong-secret"), "ghost.secret".into()] {
         let res = http

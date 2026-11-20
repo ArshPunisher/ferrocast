@@ -5,6 +5,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use reqwest::Method;
@@ -37,6 +38,9 @@ pub struct KickApi {
     tokens: Mutex<KickTokens>,
     refresher: Refresher,
     on_tokens: OnTokens,
+    /// The newest tokens couldn't be saved: tried again at every use (the saved refresh token
+    /// is the one already spent).
+    unsaved: AtomicBool,
 }
 
 impl fmt::Debug for KickApi {
@@ -60,13 +64,22 @@ impl KickApi {
             .user_agent(concat!("Ferrocast/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
-        KickApi { http, base: base.trim_end_matches('/').to_string(), tokens: Mutex::new(tokens), refresher, on_tokens }
+        KickApi {
+            http,
+            base: base.trim_end_matches('/').to_string(),
+            tokens: Mutex::new(tokens),
+            refresher,
+            on_tokens,
+            unsaved: AtomicBool::new(false),
+        }
     }
 
     async fn access(&self) -> Result<String, KickError> {
         let mut t = self.tokens.lock().await;
         if t.needs_refresh(now_ms()) {
             *t = self.refresh_locked(&t).await?;
+        } else {
+            self.save_again(&t);
         }
         Ok(t.access_token.clone())
     }
@@ -74,6 +87,7 @@ impl KickApi {
     async fn refresh_after_401(&self, seen: &str) -> Result<String, KickError> {
         let mut t = self.tokens.lock().await;
         if t.access_token != seen {
+            self.save_again(&t);
             return Ok(t.access_token.clone());
         }
         *t = self.refresh_locked(&t).await?;
@@ -82,8 +96,28 @@ impl KickApi {
 
     async fn refresh_locked(&self, current: &KickTokens) -> Result<KickTokens, KickError> {
         let fresh = (self.refresher)(current.refresh_token.clone()).await?;
-        (self.on_tokens)(&fresh).map_err(|e| KickError::Refused(format!("couldn't save the new Kick sign-in: {e}")))?;
+        // The relay already spent the old refresh token with Kick: the new tokens are used even
+        // when saving them failed (a keychain hiccup), else the next refresh would sign out for
+        // good; saving is tried again at every use.
+        self.save(&fresh);
         Ok(fresh)
+    }
+
+    fn save(&self, t: &KickTokens) {
+        match (self.on_tokens)(t) {
+            Ok(()) => self.unsaved.store(false, Ordering::Release),
+            Err(e) => {
+                if !self.unsaved.swap(true, Ordering::AcqRel) {
+                    tracing::error!(error = %e, "couldn't save the new Kick sign-in; it's kept for this session, saving is retried");
+                }
+            }
+        }
+    }
+
+    fn save_again(&self, t: &KickTokens) {
+        if self.unsaved.load(Ordering::Acquire) {
+            self.save(t);
+        }
     }
 
     async fn call(
@@ -269,7 +303,7 @@ impl KickApi {
         let url = field("url")
             .filter(|u| u.starts_with("rtmps://") || u.starts_with("rtmp://"))
             .ok_or_else(|| KickError::Refused("Kick didn't give out the stream address".into()))?;
-        Ok(ferrocast_connector::Ingest { url: with_app(&url), key })
+        Ok(ferrocast_connector::Ingest { url: with_app(&url), key, backup: None })
     }
 }
 

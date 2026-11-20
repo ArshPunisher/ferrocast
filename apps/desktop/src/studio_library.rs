@@ -136,12 +136,10 @@ impl Library {
 
 /// The library, made the first time from the files earlier versions kept (moved, not copied).
 pub fn load(data: &Path) -> Library {
-    if let Some(lib) =
-        std::fs::read(index(data)).ok().and_then(|b| serde_json::from_slice::<Library>(&b).ok()).filter(|l| {
-            l.collections.get(&l.collections.current).is_some() && l.profiles.get(&l.profiles.current).is_some()
-        })
-    {
-        return lib;
+    if let Some(loaded) = ferrocast_store::durable::load_json_with_backup::<Library>(&index(data), |l| {
+        l.collections.get(&l.collections.current).is_some() && l.profiles.get(&l.profiles.current).is_some()
+    }) {
+        return loaded.value;
     }
     let lib = Library { collections: Shelf::first(), profiles: Shelf::first() };
     for (old, kind) in [("scenes.json", Kind::Collections), ("settings.json", Kind::Profiles)] {
@@ -151,7 +149,7 @@ pub fn load(data: &Path) -> Library {
             if let Some(dir) = to.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if let Err(e) = std::fs::rename(&from, &to) {
+            if let Err(e) = ferrocast_store::durable::rename_patiently(&from, &to) {
                 tracing::warn!(error = %e, file = %from.display(), "an earlier Studio file couldn't move into the library");
             }
         }
@@ -162,16 +160,7 @@ pub fn load(data: &Path) -> Library {
 
 /// Writes the library, whole or not at all.
 pub fn save(data: &Path, lib: &Library) {
-    let file = index(data);
-    let tmp = file.with_extension("json.tmp");
-    let written = serde_json::to_vec_pretty(lib)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| {
-            std::fs::create_dir_all(root(data))?;
-            std::fs::write(&tmp, bytes)
-        })
-        .and_then(|()| std::fs::rename(&tmp, &file));
-    if let Err(e) = written {
+    if let Err(e) = ferrocast_store::durable::save_json_pretty(&index(data), lib) {
         tracing::warn!(error = %e, "the Studio's library couldn't be saved");
     }
 }
@@ -230,5 +219,35 @@ mod tests {
         let lib = load(dir.path());
         assert_eq!(lib.collections.list.len(), 1);
         assert_eq!(lib.profiles.current, "untitled");
+    }
+
+    #[test]
+    fn truncated_library_falls_back_to_bak() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut lib = load(dir.path());
+        lib.collections.list.push(Entry { id: "gaming".into(), name: "Gaming".into() });
+        lib.collections.current = "gaming".into();
+        save(dir.path(), &lib);
+
+        let bytes = std::fs::read(index(dir.path())).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(index(dir.path()), &bytes[..bytes.len() / 3]).unwrap_or_else(|e| panic!("{e}"));
+
+        let recovered = load(dir.path());
+        assert_eq!(recovered.collections.list.len(), 1, "last good library before truncation was .bak");
+        assert!(ferrocast_store::durable::backup_path(&index(dir.path())).exists());
+
+        // Second save -> third save preserves second save in .bak and survives truncation.
+        let mut lib2 = recovered;
+        lib2.collections.list.push(Entry { id: "gaming".into(), name: "Gaming".into() });
+        lib2.collections.current = "gaming".into();
+        save(dir.path(), &lib2);
+        let mut lib3 = lib2.clone();
+        lib3.profiles.list.push(Entry { id: "podcast".into(), name: "Podcast".into() });
+        save(dir.path(), &lib3);
+
+        let full = std::fs::read(index(dir.path())).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(index(dir.path()), &full[..full.len() / 2]).unwrap_or_else(|e| panic!("{e}"));
+        let loaded = load(dir.path());
+        assert_eq!(loaded.collections.current, "gaming");
     }
 }

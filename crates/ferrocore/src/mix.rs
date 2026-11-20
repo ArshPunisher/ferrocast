@@ -29,12 +29,20 @@ const LATENCY_ROOM_NS: u64 = 20_000_000;
 /// its sound comes (19 Nov: a USB capture card's sound came over a second late, the mixer
 /// waited a second for it, and every source, the mic too, came out late and broken).
 const RETIME_NS: u64 = 300_000_000;
-/// The drift average's length, the offset it must reach before a source's clock is followed
-/// (bursts and jitter average out well under it; 300 ppm reaches it in ~17 s), how fast it's
-/// brought back, and the most a source is sped up or slowed down (0.2%: no pitch anyone hears).
-const DRIFT_AVERAGE_S: f64 = 2.0;
-const FOLLOW_AFTER_NS: f64 = 5_000_000.0;
-const DRIFT_CORRECT_S: f64 = 10.0;
+/// Drift tracking parameters:
+/// - `PHASE_AVERAGE_S`: 2 s EMA length for residual placement phase (`ts - expected`) so burst
+///   jitter averages out.
+/// - `REG_TAU_S` / `MIN_REG_S`: EWMA OLS window (20 s, exact unweighted OLS while `< 20 s`) and
+///   minimum continuous span (10 s) before trusting a slope estimate.
+/// - `MIN_DRIFT_PPM` / `FOLLOW_SKEW_S`: minimum estimated rate offset (40 ppm) and accumulated
+///   skew (4 ms) before engaging the resampler, so 0-ppm bursty devices never pay resampler CPU.
+/// - `PHASE_TRIM_S` / `MAX_DRIFT`: pulls residual phase error to 0 over ~10 s, clamped to ±0.2%.
+const PHASE_AVERAGE_S: f64 = 2.0;
+const REG_TAU_S: f64 = 20.0;
+const MIN_REG_S: f64 = 10.0;
+const MIN_DRIFT_PPM: f64 = 40e-6;
+const FOLLOW_SKEW_S: f64 = 0.004;
+const PHASE_TRIM_S: f64 = 10.0;
 const MAX_DRIFT: f64 = 0.002;
 /// Frames faded out and in where a source's sample rate changes (2 ms at 48 kHz).
 const SWITCH_FADE: usize = 96;
@@ -93,13 +101,19 @@ impl Default for SourceSettings {
 
 /// A source's levels per channel (left, right), in dBFS (-inf is silence): over the last block
 /// (what the ducker hears), or over [`METER_BLOCKS`] for a meter ([`Mixer::levels`]).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Levels {
     pub peak: [f32; 2],
     pub rms: [f32; 2],
     /// The highest the sound came in at, before its filters and its fader (a noise gate's
     /// threshold is set against this: the meter after the gate shows nothing while it's shut).
     pub input_peak: [f32; 2],
+}
+
+impl Default for Levels {
+    fn default() -> Self {
+        Self { peak: [f32::NEG_INFINITY; 2], rms: [f32::NEG_INFINITY; 2], input_peak: [f32::NEG_INFINITY; 2] }
+    }
 }
 
 /// Blocks a meter reads over (about 300 ms): a meter read ten times a second saw one block in
@@ -133,6 +147,283 @@ pub struct OutputCapture {
     pub excludes_self: bool,
 }
 
+/// Resampler for one source: `SincFixedIn` with reusable planar scratch buffers and exact
+/// delay/warmup accounting so engaging drift following or resetting never injects a zero-pad click.
+struct SourceResampler {
+    in_rate: u32,
+    out_rate: u32,
+    sinc_len: usize,
+    rs: SincFixedIn<f32>,
+    pending: [Vec<f32>; 2],
+    in_scratch: [Vec<f32>; 2],
+    out_scratch: [Vec<f32>; 2],
+    primed: bool,
+    skip_out: usize,
+}
+
+impl SourceResampler {
+    fn make_sinc(in_rate: u32, out_rate: u32) -> Option<(usize, SincFixedIn<f32>)> {
+        // Same-rate drift tracking only shifts rate by <= 0.2%, so a cache-resident 32-tap
+        // linear-interpolated sinc filter achieves >92 dB SNR at 15 kHz at ~1/8 the CPU cost
+        // of the 128-tap cubic filter used for arbitrary rate conversions (e.g. 44.1 -> 48 kHz).
+        let (sinc_len, oversampling, interpolation) = if in_rate == out_rate {
+            (32, 256, SincInterpolationType::Linear)
+        } else {
+            (128, 128, SincInterpolationType::Cubic)
+        };
+        let params = SincInterpolationParameters {
+            sinc_len,
+            f_cutoff: 0.95,
+            oversampling_factor: oversampling,
+            interpolation,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let rs =
+            SincFixedIn::<f32>::new(f64::from(out_rate) / f64::from(in_rate), 1.1, params, RESAMPLE_CHUNK, 2).ok()?;
+        Some((sinc_len, rs))
+    }
+
+    fn new_cold(in_rate: u32, out_rate: u32) -> Option<Self> {
+        let (sinc_len, rs) = Self::make_sinc(in_rate, out_rate)?;
+        let out_max = rs.output_frames_max();
+        Some(Self {
+            in_rate,
+            out_rate,
+            sinc_len,
+            rs,
+            pending: [Vec::new(), Vec::new()],
+            in_scratch: [vec![0.0; RESAMPLE_CHUNK], vec![0.0; RESAMPLE_CHUNK]],
+            out_scratch: [vec![0.0; out_max], vec![0.0; out_max]],
+            primed: false,
+            skip_out: 0,
+        })
+    }
+
+    /// Runs the already-filled `in_scratch` through a fresh `1:1` resampler so its internal
+    /// lookahead matches `queue`'s end, then trims the overlapping tail from `queue`.
+    fn prime_from_scratch(&mut self, queue: &mut VecDeque<f32>) -> bool {
+        if let Ok((_, w_out)) = self.rs.process_into_buffer(&self.in_scratch, &mut self.out_scratch, None) {
+            // SincFixedIn starts last_index at -(sinc_len / 2), so w_out covers input 0..w_out
+            // and the remaining (RESAMPLE_CHUNK - w_out) frames are buffered inside `rs`.
+            let overlap = RESAMPLE_CHUNK.saturating_sub(w_out);
+            let queued = queue.len() / 2;
+            if queued >= overlap {
+                queue.truncate((queued - overlap) * 2);
+                self.skip_out = 0;
+            } else {
+                queue.clear();
+                self.skip_out = overlap - queued;
+            }
+            self.primed = true;
+            return true;
+        }
+        false
+    }
+
+    /// Primes a newly created same-rate resampler with the last `RESAMPLE_CHUNK` frames already
+    /// pushed to `queue`, trimming the overlapping tail from `queue` so output is continuous.
+    fn new_warm(in_rate: u32, out_rate: u32, tail: &[Vec<f32>; 2], queue: &mut VecDeque<f32>) -> Option<Self> {
+        let mut s = Self::new_cold(in_rate, out_rate)?;
+        if in_rate == out_rate && tail[0].len() >= RESAMPLE_CHUNK {
+            let start = tail[0].len() - RESAMPLE_CHUNK;
+            s.in_scratch[0].copy_from_slice(&tail[0][start..]);
+            s.in_scratch[1].copy_from_slice(&tail[1][start..]);
+            s.prime_from_scratch(queue);
+        }
+        Some(s)
+    }
+
+    fn reset(&mut self, queue: &mut VecDeque<f32>) {
+        self.rs.reset();
+        self.pending[0].clear();
+        self.pending[1].clear();
+        let queued = queue.len() / 2;
+        if self.in_rate == self.out_rate && queued >= RESAMPLE_CHUNK {
+            let base = (queued - RESAMPLE_CHUNK) * 2;
+            for i in 0..RESAMPLE_CHUNK {
+                self.in_scratch[0][i] = queue[base + i * 2];
+                self.in_scratch[1][i] = queue[base + i * 2 + 1];
+            }
+            if self.prime_from_scratch(queue) {
+                return;
+            }
+        }
+        self.primed = false;
+        self.skip_out = 0;
+    }
+
+    fn effective_ratio(&self, drift_ratio: f64) -> f64 {
+        (f64::from(self.out_rate) / f64::from(self.in_rate)) * drift_ratio
+    }
+
+    fn held_in_frames(&self, ratio: f64) -> f64 {
+        let rs_in = if self.primed {
+            // SincFixedIn stops when idx >= chunk - (sinc_len + 1) - ceil(1/r); center is idx + sinc_len/2.
+            (self.sinc_len / 2 + 1) as f64 + (1.0 / ratio).ceil() - 0.5 / ratio
+        } else {
+            0.0
+        };
+        self.pending[0].len() as f64 + rs_in
+    }
+
+    /// Output-equivalent frames currently held in `pending` plus inside `rs`'s delay window.
+    fn held_out_frames(&self, drift_ratio: f64) -> f64 {
+        let r = self.effective_ratio(drift_ratio);
+        (self.held_in_frames(r) * r - self.skip_out as f64).max(0.0)
+    }
+
+    fn process_ready(&mut self, queue: &mut VecDeque<f32>, follows: bool, drift_ratio: f64) {
+        while self.pending[0].len() >= RESAMPLE_CHUNK {
+            if follows {
+                let _ = self.rs.set_resample_ratio_relative(drift_ratio, true);
+            }
+            self.in_scratch[0].copy_from_slice(&self.pending[0][..RESAMPLE_CHUNK]);
+            self.in_scratch[1].copy_from_slice(&self.pending[1][..RESAMPLE_CHUNK]);
+            self.pending[0].drain(..RESAMPLE_CHUNK);
+            self.pending[1].drain(..RESAMPLE_CHUNK);
+            if let Ok((_, n_out)) = self.rs.process_into_buffer(&self.in_scratch, &mut self.out_scratch, None) {
+                self.primed = true;
+                let skip = self.skip_out.min(n_out);
+                self.skip_out -= skip;
+                for i in skip..n_out {
+                    queue.push_back(self.out_scratch[0][i]);
+                    queue.push_back(self.out_scratch[1][i]);
+                }
+            }
+        }
+    }
+
+    fn flush_into(mut self, queue: &mut VecDeque<f32>, drift_ratio: f64) {
+        let r = self.effective_ratio(drift_ratio);
+        let owed = (self.held_in_frames(r) * r).round() as usize;
+        let mut out: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+        if !self.pending[0].is_empty()
+            && let Ok(o) = self.rs.process_partial(Some(&self.pending), None)
+        {
+            out[0].extend_from_slice(&o[0]);
+            out[1].extend_from_slice(&o[1]);
+        }
+        while out[0].len() < owed + self.skip_out {
+            let Ok(o) = self.rs.process_partial(None::<&[Vec<f32>]>, None) else { break };
+            if o[0].is_empty() {
+                break;
+            }
+            out[0].extend_from_slice(&o[0]);
+            out[1].extend_from_slice(&o[1]);
+        }
+        let skip = self.skip_out.min(out[0].len());
+        for (a, b) in out[0][skip..].iter().zip(&out[1][skip..]).take(owed) {
+            queue.push_back(*a);
+            queue.push_back(*b);
+        }
+    }
+}
+
+/// Adaptive clock-drift state: online rate regression from stamps vs device frames plus a
+/// phase trim loop that pulls steady-state placement error to zero without pitch wobble.
+struct DriftTrack {
+    seg_ts0: Option<u64>,
+    seg_dev_s: f64,
+    mx: f64,
+    my: f64,
+    vxx: f64,
+    vxy: f64,
+    slope: f64,
+    phase_err_ns: f64,
+    ratio: f64,
+    follows: bool,
+    tail: [Vec<f32>; 2],
+}
+
+impl Default for DriftTrack {
+    fn default() -> Self {
+        Self {
+            seg_ts0: None,
+            seg_dev_s: 0.0,
+            mx: 0.0,
+            my: 0.0,
+            vxx: 0.0,
+            vxy: 0.0,
+            slope: 0.0,
+            phase_err_ns: 0.0,
+            ratio: 1.0,
+            follows: false,
+            tail: [Vec::new(), Vec::new()],
+        }
+    }
+}
+
+impl DriftTrack {
+    fn reset_segment(&mut self) {
+        self.seg_ts0 = None;
+        self.seg_dev_s = 0.0;
+        self.mx = 0.0;
+        self.my = 0.0;
+        self.vxx = 0.0;
+        self.vxy = 0.0;
+        self.phase_err_ns = 0.0;
+        if self.follows {
+            self.ratio = (1.0 + self.slope).clamp(1.0 - MAX_DRIFT, 1.0 + MAX_DRIFT);
+        }
+    }
+
+    fn observe(&mut self, id: u64, ts: u64, expected: u64, piece_s: f64, can_warm: bool) {
+        // 1. Update placement phase EMA (`ts - expected`).
+        let err = ts as f64 - expected as f64;
+        let a_phase = (piece_s / PHASE_AVERAGE_S).min(1.0);
+        self.phase_err_ns += (err - self.phase_err_ns) * a_phase;
+
+        // 2. Update Welford-EWMA OLS of clock skew `y = (ts - seg_ts0)/1e9 - dev_s` vs `x = dev_s`.
+        let ts0 = *self.seg_ts0.get_or_insert(ts);
+        let x = self.seg_dev_s;
+        let y = (ts as f64 - ts0 as f64) / 1e9 - x;
+        let next_dev_s = x + piece_s;
+        let w = (piece_s / next_dev_s.min(REG_TAU_S)).min(1.0);
+        let dx = x - self.mx;
+        let dy = y - self.my;
+        self.mx += w * dx;
+        self.my += w * dy;
+        self.vxx = (1.0 - w) * (self.vxx + w * dx * dx);
+        self.vxy = (1.0 - w) * (self.vxy + w * dx * dy);
+        self.seg_dev_s = next_dev_s;
+
+        if self.seg_dev_s >= MIN_REG_S && self.vxx >= 4.0 {
+            let est = (self.vxy / self.vxx).clamp(-MAX_DRIFT, MAX_DRIFT);
+            self.slope = est;
+            if !self.follows
+                && can_warm
+                && est.abs() >= MIN_DRIFT_PPM
+                && ((est * self.seg_dev_s).abs() > FOLLOW_SKEW_S || self.phase_err_ns.abs() > 5_000_000.0)
+            {
+                self.follows = true;
+                tracing::info!(
+                    source = id,
+                    drift_ppm = -(est * 1e6).round(),
+                    off_ms = self.phase_err_ns / 1e6,
+                    "a source's clock drifts: the mixer follows it"
+                );
+            }
+        }
+        if self.follows {
+            self.ratio =
+                (1.0 + self.slope + self.phase_err_ns / 1e9 / PHASE_TRIM_S).clamp(1.0 - MAX_DRIFT, 1.0 + MAX_DRIFT);
+        }
+    }
+
+    fn push_tail(&mut self, l: &[f32], r: &[f32]) {
+        if self.follows {
+            return;
+        }
+        self.tail[0].extend_from_slice(l);
+        self.tail[1].extend_from_slice(r);
+        if self.tail[0].len() > RESAMPLE_CHUNK {
+            let drop_n = self.tail[0].len() - RESAMPLE_CHUNK;
+            self.tail[0].drain(..drop_n);
+            self.tail[1].drain(..drop_n);
+        }
+    }
+}
+
 struct Source {
     settings: SourceSettings,
     output_capture: Option<OutputCapture>,
@@ -140,8 +431,8 @@ struct Source {
     /// Sound waiting, interleaved stereo at the mixer's rate, starting at `start_ns`.
     queue: VecDeque<f32>,
     start_ns: Option<u64>,
-    /// Turning its rate into the mixer's, when they differ: the resampler and what it hasn't taken.
-    resampler: Option<(u32, SincFixedIn<f32>, [Vec<f32>; 2])>,
+    /// Turning its rate into the mixer's, when they differ or when following clock drift.
+    resampler: Option<SourceResampler>,
     /// Its filters, in order (after mono and balance, before volume, as OBS runs them).
     filters: Vec<AudioFilter>,
     levels: Levels,
@@ -156,14 +447,7 @@ struct Source {
     /// back): a change starts its timing again, as libobs does on a sync-offset change, else a
     /// change under the smoothing (70 ms) was smoothed away and did nothing.
     offset_ns: Option<i64>,
-    /// How far (ns, averaged over ~2 s) its stamps run ahead of (+) or behind (-) where its
-    /// sound lands in the queue: a device clock that isn't the host's shows here as a slow
-    /// creep, which libobs lets grow to 70 ms and then cuts (a click every few minutes).
-    drift_err_ns: f64,
-    /// Played this much faster (>1: more sound made from what came) to follow its clock, once
-    /// it was seen to drift (`follows`); 1 until then.
-    ratio: f64,
-    follows: bool,
+    drift: DriftTrack,
 }
 
 /// Taps of each phase of the true-peak oversampler.
@@ -234,7 +518,28 @@ pub struct Mixer {
     usual_floor_ns: u64,
     /// The active monitoring output device id (`None` when monitoring is off or disconnected).
     monitor_device: Option<String>,
+    /// Working space kept between blocks, so a steady mix allocates nothing (D1).
+    scratch: Scratch,
+    /// Blocks given back by [`Mixer::recycle`], made again instead of allocated.
+    pool: Vec<Block>,
+    /// Blocks allocated new (not found in the pool) so far.
+    allocated: usize,
 }
+
+/// Working buffers of the mixer, made once and grown only when a bigger piece comes.
+#[derive(Debug, Default)]
+struct Scratch {
+    /// The planar copy of a pushed piece.
+    l: Vec<f32>,
+    r: Vec<f32>,
+    /// One source's block while it is mixed, and the planar halves its filters work on.
+    buf: Vec<f32>,
+    fl: Vec<f32>,
+    fr: Vec<f32>,
+}
+
+/// How many given-back blocks are kept (the most a mix ahead of its reader needs, a second's).
+const MAX_POOL: usize = 64;
 
 /// Low latency sound: where the wait starts, and the most it waits beyond a filter's delay.
 const LOW_FLOOR_NS: u64 = 20_000_000;
@@ -340,6 +645,50 @@ impl Mixer {
             low_latency: false,
             usual_floor_ns: latency_ns,
             monitor_device: None,
+            scratch: Scratch {
+                l: Vec::with_capacity(RESAMPLE_CHUNK * 4),
+                r: Vec::with_capacity(RESAMPLE_CHUNK * 4),
+                buf: Vec::with_capacity(BLOCK * 2),
+                fl: Vec::with_capacity(BLOCK),
+                fr: Vec::with_capacity(BLOCK),
+            },
+            pool: Vec::new(),
+            allocated: 0,
+        }
+    }
+
+    /// Gives a block back once it has been used, to be made again by a later mix. Blocks of
+    /// another shape, and those beyond [`MAX_POOL`], are simply dropped.
+    pub fn recycle(&mut self, b: Block) {
+        let whole =
+            b.tracks.len() == TRACKS && b.tracks.iter().all(|t| t.len() == BLOCK * 2) && b.monitor.len() == BLOCK * 2;
+        if whole && self.pool.len() < MAX_POOL {
+            self.pool.push(b);
+        }
+    }
+
+    /// How many blocks were allocated new, not taken from the pool (a steady mix that gives them
+    /// back stops adding to it).
+    #[must_use]
+    pub fn blocks_allocated(&self) -> usize {
+        self.allocated
+    }
+
+    /// A silent block: from the pool when there is one.
+    fn take_block(&mut self, ts_ns: u64) -> Block {
+        match self.pool.pop() {
+            Some(mut b) => {
+                b.ts_ns = ts_ns;
+                for t in &mut b.tracks {
+                    t.fill(0.0);
+                }
+                b.monitor.fill(0.0);
+                b
+            }
+            None => {
+                self.allocated += 1;
+                Block { ts_ns, tracks: vec![vec![0f32; BLOCK * 2]; TRACKS], monitor: vec![0f32; BLOCK * 2] }
+            }
         }
     }
 
@@ -468,9 +817,7 @@ impl Mixer {
                         tp: [[0.0; TP_TAPS]; 2],
                         adjust_ns: 0,
                         offset_ns: None,
-                        drift_err_ns: 0.0,
-                        ratio: 1.0,
-                        follows: false,
+                        drift: DriftTrack::default(),
                     },
                 );
             }
@@ -584,6 +931,25 @@ impl Mixer {
     /// A source's sound: `channels` interleaved (1 or 2; more are folded to their first two) at
     /// `rate`, its first frame at `ts_ns`. Unknown sources are ignored.
     pub fn push(&mut self, id: u64, pcm: &[f32], channels: usize, rate: u32, ts_ns: u64) {
+        // The planar copy lives in buffers kept between pushes (taken out, so the rest of
+        // `self` can be borrowed meanwhile): a steady source allocates nothing.
+        let (mut l, mut r) = (std::mem::take(&mut self.scratch.l), std::mem::take(&mut self.scratch.r));
+        self.push_with(id, pcm, channels, rate, ts_ns, &mut l, &mut r);
+        self.scratch.l = l;
+        self.scratch.r = r;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_with(
+        &mut self,
+        id: u64,
+        pcm: &[f32],
+        channels: usize,
+        rate: u32,
+        ts_ns: u64,
+        l: &mut Vec<f32>,
+        r: &mut Vec<f32>,
+    ) {
         let out_rate = self.rate;
         if channels == 0 || rate == 0 || pcm.is_empty() {
             return;
@@ -654,9 +1020,11 @@ impl Mixer {
         // Where this sound would continue what's queued: jitter is smoothed over; a gap ahead
         // (a source that went quiet, beeps scheduled apart) is filled with silence, as libobs
         // does, so nothing queued is lost; a jump back or a long jump (a seek) restarts the queue.
-        // What its resampler still holds counts at the rate it came in (not this piece's).
-        let queued = src.queue.len() / 2
-            + src.resampler.as_ref().map_or(0, |(r0, _, p)| p[0].len() * out_rate as usize / *r0 as usize);
+        // What its resampler still holds counts at its actual input rate and active drift ratio.
+        let q_frames = src.queue.len() / 2;
+        let held_frames = src.resampler.as_ref().map_or(0.0, |rs| rs.held_out_frames(src.drift.ratio));
+        let queued_ns = ((q_frames as f64 + held_frames) * 1_000_000_000.0 / f64::from(out_rate)).round() as u64;
+        let held_ns = (held_frames * 1_000_000_000.0 / f64::from(out_rate)).round() as u64;
         let piece_s = (pcm.len() / channels) as f64 / f64::from(rate);
         let mut gap = 0usize;
         let mut on_course = false;
@@ -667,24 +1035,19 @@ impl Mixer {
             // sound for good when the stall was longer than the mixer's wait (20 Nov, Neon).
             // (Its resampler keeps running: only where the sound goes moves, so a bursty device
             // that runs dry between bursts never has its sound broken by a reset.)
-            Some(start)
-                if mixed_to.is_some_and(|m| start + queued as u64 * 1_000_000_000 / u64::from(out_rate) < m) =>
-            {
-                let held = queued - src.queue.len() / 2;
+            Some(start) if mixed_to.is_some_and(|m| start + queued_ns < m) => {
                 src.queue.clear();
-                src.start_ns = Some(ts.saturating_sub(held as u64 * 1_000_000_000 / u64::from(out_rate)));
+                src.start_ns = Some(ts.saturating_sub(held_ns));
                 None
             }
             Some(start) => {
-                let expected = start + queued as u64 * 1_000_000_000 / u64::from(out_rate);
+                let expected = start + queued_ns;
                 // Its offset changed (a sync offset dialled in, a filter that holds sound back
                 // switched on): placed exactly at its new time (a gap filled or what overlaps
                 // replaced), not smoothed back to where it was, and not by clearing the queue.
                 if ts == expected || (!moved && ts.abs_diff(expected) < SMOOTHING_NS) {
-                    // On course: how far off it is feeds the drift average.
-                    let err = ts as f64 - expected as f64;
-                    let a = (piece_s / DRIFT_AVERAGE_S).min(1.0);
-                    src.drift_err_ns += (err - src.drift_err_ns) * a;
+                    let can_warm = rate != out_rate || src.drift.tail[0].len() >= RESAMPLE_CHUNK;
+                    src.drift.observe(id, ts, expected, piece_s, can_warm);
                     on_course = true;
                     None
                 } else if ts > expected && ts - expected <= MAX_GAP_NS {
@@ -696,10 +1059,8 @@ impl Mixer {
                     // rest of the queue stays (clearing it all was the tearing, 19 Nov).
                     let keep = frames_in(ts - start, out_rate).min(src.queue.len() / 2);
                     src.queue.truncate(keep * 2);
-                    if let Some((_, rs, pending)) = &mut src.resampler {
-                        rs.reset();
-                        pending[0].clear();
-                        pending[1].clear();
+                    if let Some(rs) = &mut src.resampler {
+                        rs.reset(&mut src.queue);
                     }
                     None
                 } else {
@@ -709,25 +1070,20 @@ impl Mixer {
             None => Some(ts),
         };
         if !on_course {
-            // A jump (a gap filled, a burst placed, a new start): the average starts again; the
-            // clock it follows stays (a device's drift doesn't change with a stall).
-            src.drift_err_ns = 0.0;
-        }
-        if !src.follows && src.drift_err_ns.abs() > FOLLOW_AFTER_NS {
-            src.follows = true;
-            tracing::info!(
-                source = id,
-                off_ms = src.drift_err_ns / 1e6,
-                "a source's clock drifts: the mixer follows it"
-            );
-        }
-        if src.follows {
-            // Brought back over about `DRIFT_CORRECT_S`, never faster than a hair of pitch.
-            src.ratio = (1.0 + src.drift_err_ns / 1e9 / DRIFT_CORRECT_S).clamp(1.0 - MAX_DRIFT, 1.0 + MAX_DRIFT);
+            // A jump (a gap filled, a burst placed, a new start): restart the regression segment
+            // and phase EMA, while keeping the learned clock drift (`follows` and `slope`).
+            src.drift.reset_segment();
+            if !src.drift.follows {
+                src.drift.tail[0].clear();
+                src.drift.tail[1].clear();
+            }
         }
         // Stereo, planar, after the silence that fills a gap.
         let frames = pcm.len() / channels;
-        let (mut l, mut r) = (vec![0.0; gap], vec![0.0; gap]);
+        l.clear();
+        r.clear();
+        l.resize(gap, 0.0);
+        r.resize(gap, 0.0);
         l.reserve(frames);
         r.reserve(frames);
         for f in pcm.chunks_exact(channels) {
@@ -740,40 +1096,20 @@ impl Mixer {
         if let Some(t) = at {
             src.queue.clear();
             src.start_ns = Some(t);
-            if let Some((_, rs, pending)) = &mut src.resampler {
-                rs.reset();
-                pending[0].clear();
-                pending[1].clear();
+            src.drift.tail[0].clear();
+            src.drift.tail[1].clear();
+            if let Some(rs) = &mut src.resampler {
+                rs.reset(&mut src.queue);
             }
         }
         // Its rate changed (a device or file at another rate now): what the old resampler still
         // holds is played out first, not dropped (a click of ~11 ms; Sonnet's soak test, 20 Nov).
-        if src.resampler.as_ref().is_some_and(|(r0, ..)| *r0 != rate)
-            && let Some((r0, mut rs, pending)) = src.resampler.take()
+        let mut switched_rate = false;
+        if src.resampler.as_ref().is_some_and(|rs| rs.in_rate != rate)
+            && let Some(rs) = src.resampler.take()
         {
-            // Its last input, then its delay line (input it took that hasn't come out yet):
-            // as many frames as went in, at the new rate.
-            let owed = rs.output_delay()
-                + ((pending[0].len() as u64 * u64::from(out_rate) + u64::from(r0) / 2) / u64::from(r0)) as usize;
-            let mut out: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
-            if !pending[0].is_empty()
-                && let Ok(o) = rs.process_partial(Some(&pending), None)
-            {
-                out[0].extend_from_slice(&o[0]);
-                out[1].extend_from_slice(&o[1]);
-            }
-            while out[0].len() < owed {
-                let Ok(o) = rs.process_partial(None::<&[Vec<f32>]>, None) else { break };
-                if o[0].is_empty() {
-                    break;
-                }
-                out[0].extend_from_slice(&o[0]);
-                out[1].extend_from_slice(&o[1]);
-            }
-            for (a, b) in out[0].iter().zip(&out[1]).take(owed) {
-                src.queue.push_back(*a);
-                src.queue.push_back(*b);
-            }
+            switched_rate = true;
+            rs.flush_into(&mut src.queue, src.drift.ratio);
             // The tail's last frames were filtered with silence for the input that never came at
             // the old rate: no exact join exists, so the old sound fades out and the new fades in
             // over 2 ms (a dip, not a click).
@@ -790,43 +1126,31 @@ impl Mixer {
                 *b *= g;
             }
         }
-        if rate == out_rate && !src.follows {
+        if rate == out_rate && !src.drift.follows {
             src.resampler = None;
-            for (a, b) in l.iter().zip(&r) {
+            src.drift.push_tail(l, r);
+            for (a, b) in l.iter().zip(r.iter()) {
                 src.queue.push_back(*a);
                 src.queue.push_back(*b);
             }
         } else {
-            if src.resampler.as_ref().is_none_or(|(r0, ..)| *r0 != rate) {
-                let params = SincInterpolationParameters {
-                    sinc_len: 128,
-                    f_cutoff: 0.95,
-                    oversampling_factor: 128,
-                    interpolation: SincInterpolationType::Cubic,
-                    window: WindowFunction::BlackmanHarris2,
+            if src.resampler.as_ref().is_none_or(|rs| rs.in_rate != rate) {
+                let made = if rate == out_rate && !switched_rate && src.drift.tail[0].len() >= RESAMPLE_CHUNK {
+                    let rs = SourceResampler::new_warm(rate, out_rate, &src.drift.tail, &mut src.queue);
+                    src.drift.tail = [Vec::new(), Vec::new()];
+                    rs
+                } else {
+                    SourceResampler::new_cold(rate, out_rate)
                 };
-                match SincFixedIn::<f32>::new(f64::from(out_rate) / f64::from(rate), 1.1, params, RESAMPLE_CHUNK, 2) {
-                    Ok(rs) => src.resampler = Some((rate, rs, [Vec::new(), Vec::new()])),
-                    Err(_) => return,
+                match made {
+                    Some(rs) => src.resampler = Some(rs),
+                    None => return,
                 }
             }
-            let Some((_, rs, pending)) = &mut src.resampler else { return };
-            if src.follows {
-                let _ = rs.set_resample_ratio_relative(src.ratio, true);
-            }
-            pending[0].extend_from_slice(&l);
-            pending[1].extend_from_slice(&r);
-            while pending[0].len() >= RESAMPLE_CHUNK {
-                let chunk = [pending[0][..RESAMPLE_CHUNK].to_vec(), pending[1][..RESAMPLE_CHUNK].to_vec()];
-                pending[0].drain(..RESAMPLE_CHUNK);
-                pending[1].drain(..RESAMPLE_CHUNK);
-                if let Ok(out) = rs.process(&chunk, None) {
-                    for (a, b) in out[0].iter().zip(&out[1]) {
-                        src.queue.push_back(*a);
-                        src.queue.push_back(*b);
-                    }
-                }
-            }
+            let Some(rs) = &mut src.resampler else { return };
+            rs.pending[0].extend_from_slice(l);
+            rs.pending[1].extend_from_slice(r);
+            rs.process_ready(&mut src.queue, src.drift.follows, src.drift.ratio);
         }
         let max = MAX_QUEUE_SECS * out_rate as usize * 2;
         if src.queue.len() > max {
@@ -840,6 +1164,14 @@ impl Mixer {
 
     /// Every block that ends `latency` before `now_ns`. The first call starts the clock there.
     pub fn mix_until(&mut self, now_ns: u64) -> Vec<Block> {
+        let mut out = Vec::new();
+        self.mix_until_into(now_ns, &mut out);
+        out
+    }
+
+    /// [`Mixer::mix_until`], the blocks added to `out` (kept by the caller between calls, and
+    /// the blocks given back with [`Mixer::recycle`]: a steady mix then allocates nothing).
+    pub fn mix_until_into(&mut self, now_ns: u64, out: &mut Vec<Block>) {
         self.maybe_wait_less(now_ns);
         let until = now_ns.saturating_sub(self.latency_ns);
         let step = block_ns(self.rate);
@@ -853,23 +1185,24 @@ impl Mixer {
             for src in self.sources.values_mut() {
                 src.queue.clear();
                 src.start_ns = None;
-                src.drift_err_ns = 0.0;
+                src.drift.reset_segment();
             }
             next = until.saturating_sub(step);
         }
-        let mut out = Vec::new();
+        let mut made = 0usize;
         while next + step <= until {
-            out.push(self.mix_block(next));
+            let block = self.mix_block(next);
+            out.push(block);
+            made += 1;
             // Exact frame counts, so blocks never drift from the sample clock.
             next += step;
         }
         // The wait `next` was reached with: only a mix that moved it (or started it) changes
         // that, else a raised wait would count the next late piece as later still (review).
-        if !started || !out.is_empty() {
+        if !started || made > 0 {
             self.mixed_with_ns = self.latency_ns;
         }
         self.next_ns = Some(next);
-        out
     }
 
     /// After a calm stretch, the wait comes down to what the sound in it needed: nothing is lost
@@ -880,7 +1213,8 @@ impl Mixer {
         if now_ns.saturating_sub(since) < SHRINK_AFTER_NS {
             return;
         }
-        let target = (self.worst_late_ns + 2 * LATENCY_ROOM_NS + block_ns(self.rate)).max(self.floor_ns);
+        let min_wait = (self.floor_ns + self.held_most_ns()).min(self.cap_ns());
+        let target = (self.worst_late_ns + 2 * LATENCY_ROOM_NS + block_ns(self.rate)).max(min_wait).min(self.cap_ns());
         if self.latency_ns > target + LATENCY_ROOM_NS / 2 {
             tracing::info!(
                 from_ms = self.latency_ns / 1_000_000,
@@ -895,15 +1229,16 @@ impl Mixer {
 
     fn mix_block(&mut self, start: u64) -> Block {
         let rate = self.rate;
-        let mut tracks = vec![vec![0f32; BLOCK * 2]; TRACKS];
-        let mut monitor = vec![0f32; BLOCK * 2];
+        let Block { mut tracks, mut monitor, .. } = self.take_block(start);
+        // The buffers one source's block is made in: kept between blocks.
+        let mut buf = std::mem::take(&mut self.scratch.buf);
+        let (mut fl, mut fr) = (std::mem::take(&mut self.scratch.fl), std::mem::take(&mut self.scratch.fr));
         // Talking, from the voices' last block (a block late: about 20 ms, nothing to hear).
         let duck = self.ducker.as_mut().map(|d| {
             let talking = d.cfg.voices.iter().any(|v| {
                 self.sources.get(v).is_some_and(|s| s.levels.peak[0].max(s.levels.peak[1]) > d.cfg.threshold_db)
             });
-            let (from, to) = d.step(talking, BLOCK as f32 / rate as f32);
-            (d.cfg.music.clone(), from, to)
+            d.step(talking, BLOCK as f32 / rate as f32)
         });
         let mon_dev = self.monitor_device.as_deref();
         // OBS `should_silence_monitored_source`: when an active, unmuted non-self-excluding output
@@ -923,7 +1258,8 @@ impl Mixer {
             }
         }
         for (id, src) in self.sources.iter_mut() {
-            let mut buf = vec![0f32; BLOCK * 2];
+            buf.clear();
+            buf.resize(BLOCK * 2, 0.0);
             if let Some(s0) = src.start_ns {
                 // Drop what's before this block; place what's in it.
                 if s0 < start {
@@ -965,8 +1301,8 @@ impl Mixer {
                 f[0] *= gl;
                 f[1] *= gr;
             }
-            if let Some((music, from, to)) = &duck
-                && music.contains(id)
+            if let Some((from, to)) = &duck
+                && self.ducker.as_ref().is_some_and(|d| d.cfg.music.contains(id))
                 && (from - 1.0).abs().max((to - 1.0).abs()) > 1e-4
             {
                 // Smoothly across the block, no click.
@@ -982,16 +1318,21 @@ impl Mixer {
             // `clamp_audio_output`). Before the filters too, so one can't poison a filter's state.
             finite(&mut buf);
             if !src.filters.is_empty() {
-                let (mut l, mut r): (Vec<f32>, Vec<f32>) = buf.as_chunks::<2>().0.iter().map(|f| (f[0], f[1])).unzip();
+                fl.clear();
+                fr.clear();
+                for f in buf.as_chunks::<2>().0 {
+                    fl.push(f[0]);
+                    fr.push(f[1]);
+                }
                 for f in &mut src.filters {
-                    f.process([&mut l, &mut r]);
+                    f.process([&mut fl, &mut fr]);
                     // Between filters too: one that makes NaN mustn't poison the next one's state.
-                    finite(&mut l);
-                    finite(&mut r);
+                    finite(&mut fl);
+                    finite(&mut fr);
                 }
                 for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-                    f[0] = l[i];
-                    f[1] = r[i];
+                    f[0] = fl[i];
+                    f[1] = fr[i];
                 }
                 finite(&mut buf);
             }
@@ -1066,6 +1407,9 @@ impl Mixer {
         for v in &mut monitor {
             *v = clip(*v);
         }
+        self.scratch.buf = buf;
+        self.scratch.fl = fl;
+        self.scratch.fr = fr;
         Block { ts_ns: start, tracks, monitor }
     }
 }
@@ -1898,5 +2242,329 @@ mod tests {
         // And it goes on normally from there.
         let later = m.mix_until(t0 + 3_600_000_000_000 + 100_000_000);
         assert!((4..=6).contains(&later.len()), "{}", later.len());
+    }
+
+    struct DriftSummary {
+        follows: bool,
+        has_resampler: bool,
+        slope_ppm: f64,
+        phase_err_ns: f64,
+        worst_step: f32,
+        longest_quiet: u32,
+        end_phase_err_ms: f64,
+    }
+
+    fn run_drift_scenario(arrival: bool, ppm: f64, secs: u64, stall_at_sec: Option<u64>) -> DriftSummary {
+        const HZ: f64 = 440.0;
+        const AMP: f32 = 0.5;
+        let mut m = Mixer::new(RATE, 40_000_000);
+        m.set(1, SourceSettings { tracks: 0b01, ..SourceSettings::default() });
+        m.set(2, SourceSettings { tracks: 0b10, ..SourceSettings::default() });
+        let t0 = 10_000_000_000u64;
+        let mut now = t0;
+        let mut card_deliv = 0u64;
+        let mut mic_deliv = 0u64;
+        let mut next_burst = t0;
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_rng = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let per_sec = f64::from(RATE) * (1.0 + ppm / 1e6);
+        let mut last: Option<f32> = None;
+        let mut worst_step = 0.0f32;
+        let mut quiet = 0u32;
+        let mut longest_quiet = 0u32;
+        let mut end_phase_err_ms = 0.0f64;
+        let mut did_stall = false;
+        for _tick in 0..(secs * 60) {
+            now += 16_666_667;
+            while t0 + (mic_deliv + 1) * 10_000_000 <= now {
+                m.push(1, &[0.1f32; 480], 1, RATE, t0 + mic_deliv * 10_000_000);
+                mic_deliv += 1;
+            }
+            if now >= next_burst {
+                let total = ((now - t0) as f64 * per_sec / 1e9) as u64 / 480;
+                let n = total - card_deliv;
+                for k in 0..n {
+                    let p = card_deliv + k;
+                    let pcm: Vec<f32> = (0..480)
+                        .map(|i| {
+                            let t_dev = (p * 480 + i) as f64 / per_sec;
+                            AMP * (2.0 * std::f64::consts::PI * HZ * t_dev).sin() as f32
+                        })
+                        .collect();
+                    let ts = if arrival {
+                        now.saturating_sub((n - k) * 10_000_000)
+                    } else {
+                        t0 + (p as f64 * 480.0 * 1e9 / per_sec) as u64
+                    };
+                    m.push(2, &pcm, 1, RATE, ts);
+                }
+                card_deliv = total;
+                let trigger_stall = !did_stall && stall_at_sec.is_some_and(|s| now >= t0 + s * 1_000_000_000);
+                let burst_ms = if trigger_stall {
+                    did_stall = true;
+                    450
+                } else {
+                    40 + next_rng() % 81
+                };
+                next_burst = now + burst_ms * 1_000_000;
+            }
+            for b in m.mix_until(now) {
+                if b.ts_ns > t0 + 3_000_000_000 {
+                    for (i, f) in b.tracks[1].as_chunks::<2>().0.iter().enumerate() {
+                        if let Some(p) = last {
+                            let d = (f[0] - p).abs();
+                            if quiet < 48 && d > worst_step {
+                                worst_step = d;
+                            }
+                        }
+                        last = Some(f[0]);
+                        quiet = if f[0].abs() < 0.01 { quiet + 1 } else { 0 };
+                        longest_quiet = longest_quiet.max(quiet);
+                        if b.ts_ns > t0 + secs.saturating_sub(2) * 1_000_000_000 && i == 0 {
+                            let t_out = (b.ts_ns - t0) as f64 / 1e9;
+                            let angle = 2.0 * std::f64::consts::PI * HZ * t_out;
+                            let expected_v = AMP * angle.sin() as f32;
+                            if angle.cos() > 0.5 && expected_v.abs() < 0.05 && f[0].abs() < 0.4 {
+                                let slope = AMP * (2.0 * std::f64::consts::PI * HZ * angle.cos()) as f32;
+                                end_phase_err_ms = f64::from((f[0] - expected_v) / slope) * 1000.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let s = &m.sources[&2];
+        DriftSummary {
+            follows: s.drift.follows,
+            has_resampler: s.resampler.is_some(),
+            slope_ppm: s.drift.slope * 1e6,
+            phase_err_ns: s.drift.phase_err_ns,
+            worst_step,
+            longest_quiet,
+            end_phase_err_ms,
+        }
+    }
+
+    #[test]
+    fn drift_is_not_engaged_by_arrival_jitter_alone() {
+        let steepest = 0.5 * (2.0 * std::f64::consts::PI * 440.0 / f64::from(RATE)) as f32;
+        let r = run_drift_scenario(true, 0.0, 90, None);
+        assert!(!r.follows, "0 ppm jitter engaged drift tracking: slope={:.1}ppm", r.slope_ppm);
+        assert!(!r.has_resampler, "0 ppm jitter should keep the resampler off");
+        assert!(r.worst_step <= steepest * 1.25, "step={}", r.worst_step);
+        assert!(r.longest_quiet < 120, "quiet={}", r.longest_quiet);
+        assert!(r.end_phase_err_ms.abs() < 1.0, "end phase={}ms", r.end_phase_err_ms);
+    }
+
+    #[test]
+    fn drift_locks_without_click_and_tracks_phase() {
+        let steepest = 0.5 * (2.0 * std::f64::consts::PI * 440.0 / f64::from(RATE)) as f32;
+        for (arrival, ppm) in [(true, 300.0), (false, 300.0), (false, -300.0)] {
+            let r = run_drift_scenario(arrival, ppm, 45, None);
+            assert!(r.follows, "drift not followed for arrival={arrival} ppm={ppm}");
+            assert!(r.has_resampler, "resampler should be active once following");
+            // Arrival stamps carry a 0..10 ms burst-end remainder (sigma = 10/sqrt(12) = 2.89 ms)
+            // across ~80 ms bursts; with tau = 20 s EWMA and vxx ~ 161 s^2 at 45 s, slope SE is
+            // ~10.2 ppm (~3.9 sigma = 40 ppm; 1.5 sigma observed), vs ~0.1 ppm for 1 ns Device stamps.
+            let slope_tol = if arrival { 40.0 } else { 5.0 };
+            assert!((r.slope_ppm + ppm).abs() < slope_tol, "expected ~-{ppm}ppm, got {:.1}", r.slope_ppm);
+            assert!(r.worst_step <= steepest * 1.25, "click on arrival={arrival} ppm={ppm}: step={}", r.worst_step);
+            assert!(r.longest_quiet < 120, "dropout on arrival={arrival} ppm={ppm}: quiet={}", r.longest_quiet);
+            assert!(
+                r.end_phase_err_ms.abs() < 2.0,
+                "phase error {}ms on arrival={arrival} ppm={ppm}",
+                r.end_phase_err_ms
+            );
+        }
+    }
+
+    #[test]
+    fn drift_preserves_slope_across_stall() {
+        let r = run_drift_scenario(false, 300.0, 50, Some(30));
+        assert!(r.follows, "following should persist across a 450 ms stall");
+        assert!((r.slope_ppm + 300.0).abs() < 15.0, "slope reset across stall: {:.1}ppm", r.slope_ppm);
+        assert!(r.phase_err_ns.abs() < 5_000_000.0, "phase error after recovery: {}ms", r.phase_err_ns / 1e6);
+    }
+
+    #[test]
+    fn sinc_warm_handoff_preserves_sample_alignment() {
+        const HZ: f64 = 440.0;
+        const AMP: f32 = 0.5;
+        let steepest = AMP * (2.0 * std::f64::consts::PI * HZ / f64::from(RATE)) as f32;
+        let sample = |k: usize| AMP * (2.0 * std::f64::consts::PI * HZ * k as f64 / f64::from(RATE)).sin() as f32;
+        let mut queue = VecDeque::new();
+        let mut drift = DriftTrack::default();
+        for chunk in 0..3 {
+            let l: Vec<f32> = (0..RESAMPLE_CHUNK).map(|i| sample(chunk * RESAMPLE_CHUNK + i)).collect();
+            drift.push_tail(&l, &l);
+            for v in l {
+                queue.push_back(v);
+                queue.push_back(v);
+            }
+        }
+        let Some(mut rs) = SourceResampler::new_warm(RATE, RATE, &drift.tail, &mut queue) else {
+            panic!("failed to allocate warm resampler");
+        };
+        for chunk in 3..6 {
+            let l: Vec<f32> = (0..RESAMPLE_CHUNK).map(|i| sample(chunk * RESAMPLE_CHUNK + i)).collect();
+            rs.pending[0].extend_from_slice(&l);
+            rs.pending[1].extend_from_slice(&l);
+            rs.process_ready(&mut queue, true, 0.9997);
+        }
+        let mut last: Option<f32> = None;
+        let mut worst = 0.0f32;
+        for f in queue.make_contiguous().as_chunks::<2>().0 {
+            if let Some(p) = last {
+                worst = worst.max((f[0] - p).abs());
+            }
+            last = Some(f[0]);
+        }
+        assert!(worst <= steepest * 1.15, "warm handoff jumped: step={worst:.4} (sine={steepest:.4})");
+    }
+
+    /// After a calm 20 s stretch (`SHRINK_AFTER_NS`), `maybe_wait_less` must never shrink the
+    /// mixer's wait below `floor_ns + held_most_ns()` while a delayed filter (e.g. DeepFilterNet,
+    /// 3968 frames = 82.7 ms) is active; once removed, the wait shrinks back down (M2-05).
+    #[test]
+    fn maybe_wait_less_never_drops_below_active_filter_latency() {
+        #[derive(Debug)]
+        struct Delayed(usize);
+        impl crate::afx::SoundPlugin for Delayed {
+            fn process(&mut self, _: [&mut [f32]; 2]) -> bool {
+                true
+            }
+            fn latency_frames(&self) -> usize {
+                self.0
+            }
+        }
+        let floor = 40_000_000u64;
+        let mut m = Mixer::new(RATE, floor);
+        m.set(1, SourceSettings::default());
+        let Some(src) = m.sources.get_mut(&1) else { panic!("source 1 missing") };
+        src.filters.push(AudioFilter::with_plugin(Box::new(Delayed(3968)), RATE));
+        let held = m.held_most_ns();
+        assert!(held > 80_000_000, "expected ~82.7 ms filter delay, got {held}");
+        // Case 1: already at floor + held; 25 s of silence must not drop wait below floor + held.
+        m.latency_ns = floor + held;
+        let mut t = 1_000_000_000u64;
+        m.mix_until(t);
+        for _ in 0..25 {
+            t += 1_000_000_000;
+            m.mix_until(t);
+        }
+        assert!(
+            m.latency_ns() >= floor + held,
+            "latency shrank below floor + filter delay: {} < {}",
+            m.latency_ns(),
+            floor + held
+        );
+        // Case 2: recover from a transient 400 ms spike down to floor + held, no lower.
+        m.latency_ns = 400_000_000;
+        for _ in 0..25 {
+            t += 1_000_000_000;
+            m.mix_until(t);
+        }
+        assert_eq!(m.latency_ns(), floor + held, "shrunk from spike back to floor + filter delay");
+        // Case 3: once the delayed filter is removed, wait shrinks back down.
+        m.set_effects(1, &[]);
+        for _ in 0..25 {
+            t += 1_000_000_000;
+            m.mix_until(t);
+        }
+        assert!(m.latency_ns() < floor + held, "latency shrinks once filter is removed: {}", m.latency_ns());
+    }
+}
+
+#[cfg(test)]
+mod steady_state_tests {
+    use super::*;
+
+    /// Every buffer that grows with the sound, as sizes: when a steady mix stops changing these, it
+    /// is not allocating (the allocator itself is counted in `tests/mix_alloc.rs`).
+    fn footprint(m: &Mixer) -> Vec<usize> {
+        let mut v = vec![
+            m.blocks_allocated(),
+            m.pool.len(),
+            m.scratch.l.capacity(),
+            m.scratch.r.capacity(),
+            m.scratch.buf.capacity(),
+            m.scratch.fl.capacity(),
+            m.scratch.fr.capacity(),
+        ];
+        for s in m.sources.values() {
+            v.push(s.queue.capacity());
+            v.push(s.recent.capacity());
+            if let Some(rs) = &s.resampler {
+                v.extend([rs.pending[0].capacity(), rs.pending[1].capacity()]);
+            }
+            v.extend([s.drift.tail[0].capacity(), s.drift.tail[1].capacity()]);
+        }
+        v
+    }
+
+    /// A same-rate mic, a 44.1 kHz card (resampled) and a source with a filter, 20 ms at a time,
+    /// meters reading true peak: after a short warm-up, 1,000 blocks change no buffer's size and
+    /// take every block from the pool.
+    #[test]
+    fn mix_block_steady_state_reuses_buffers() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        for id in 1..=3 {
+            m.set(id, SourceSettings::default());
+        }
+        m.set_effects(3, &[AudioEffect::Gain { db: -2.0 }]);
+        m.set_true_peak(true);
+        let mic = vec![0.2f32; 960 * 2];
+        let card = vec![0.1f32; 882 * 2];
+        let mut out: Vec<Block> = Vec::new();
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let mut step = |m: &mut Mixer, k: u64| {
+            let at = t0 + k * 20_000_000;
+            m.push(1, &mic, 2, 48_000, at);
+            m.push(2, &card, 2, 44_100, at);
+            m.push(3, &mic, 2, 48_000, at);
+            m.mix_until_into(at + 20_000_000, &mut out);
+            for b in out.drain(..) {
+                assert!(b.tracks[0].iter().any(|v| *v != 0.0) || k < 5, "sound on track 1 at {k}");
+                m.recycle(b);
+            }
+        };
+        for k in 0..100 {
+            step(&mut m, k);
+        }
+        let warm = footprint(&m);
+        for k in 100..1100 {
+            step(&mut m, k);
+        }
+        assert_eq!(footprint(&m), warm, "a buffer grew or a block was made in 1,000 steady blocks");
+        assert!(m.blocks_allocated() <= 3, "blocks made new: {}", m.blocks_allocated());
+    }
+
+    /// Without giving blocks back, nothing changes for the caller: they are made as before.
+    #[test]
+    fn blocks_not_given_back_are_simply_made_new() {
+        let mut m = Mixer::new(48_000, 0);
+        m.set(1, SourceSettings::default());
+        let _ = m.mix_until(1_000_000_000);
+        m.push(1, &[0.5; 2 * 4800], 2, 48_000, 1_000_000_000);
+        let before = m.blocks_allocated();
+        let blocks = m.mix_until(1_100_000_000);
+        assert!(blocks.len() >= 4);
+        assert_eq!(m.blocks_allocated() - before, blocks.len());
+        assert!(blocks[1].tracks[0].iter().any(|v| *v > 0.4));
+        // A block of another shape isn't kept.
+        m.recycle(Block { ts_ns: 0, tracks: vec![vec![0.0; 4]], monitor: vec![] });
+        assert_eq!(m.pool.len(), 0);
+        // A recycled one comes back silent, not with the old sound in it.
+        let b = blocks.into_iter().nth(1).unwrap();
+        m.recycle(b);
+        let again = m.take_block(5);
+        assert_eq!(again.ts_ns, 5);
+        assert!(again.tracks.iter().all(|t| t.iter().all(|v| *v == 0.0)) && again.monitor.iter().all(|v| *v == 0.0));
     }
 }

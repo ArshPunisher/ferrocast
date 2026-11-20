@@ -10,6 +10,14 @@ use serde_json::Value;
 
 use crate::{Engine, EngineError};
 
+/// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch or Kick is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCap {
+    pub max_kbps: u32,
+    pub h264_only: bool,
+    pub keyframe_secs: u32,
+}
+
 /// What `GET /studio/engine` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StudioStatus {
@@ -26,6 +34,9 @@ pub struct StudioStatus {
     /// what came back on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovered: Option<Recovered>,
+    /// Present when an unclean exit was detected or Safe Mode is active / awaiting confirmation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_mode: Option<crate::safe_mode::SafeModeStatus>,
 }
 
 /// What the Studio was doing when Ferrocast last closed without quitting.
@@ -158,6 +169,14 @@ impl PreviewRect {
 pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn status(&self) -> StudioStatus;
     async fn start(&self) -> Result<StudioStatus, String>;
+    /// Starts the Studio, deferring saved collection load when `load_collection` is `false` (Safe Mode).
+    async fn start_with_mode(&self, _load_collection: bool) -> Result<StudioStatus, String> {
+        self.start().await
+    }
+    /// Confirms loading the saved scene collection while running in Safe Mode or switching to Normal Mode.
+    async fn confirm_collection(&self) -> Result<StudioStatus, String> {
+        Ok(self.status().await)
+    }
     async fn stop(&self) -> Result<StudioStatus, String>;
     /// Every kind of source, filter, transition, encoder and output (`ferrocast_studio::Kinds`).
     async fn kinds(&self) -> Result<Value, String>;
@@ -192,6 +211,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn stats(&self) -> Result<Value, String>;
     /// Starts or stops recording → the recording's stats (null when stopped) and its file.
     async fn record(&self, on: bool) -> Result<Value, String>;
+    /// The recording's stats now (`active`, `bytes`, `seconds`, `file`, `error`, `error_detail`,
+    /// `disk_free_mb`), or null without one. Looked at every couple of seconds.
+    async fn record_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
     async fn record_pause(&self, on: bool) -> Result<(), String>;
     /// Starts or stops the replay buffer → `{ active }`.
     async fn replay(&self, _on: bool) -> Result<Value, String> {
@@ -246,6 +270,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// fills enough of it, else what stands out; None where nothing is found.
     async fn focus(&self, _pictures: Vec<Vec<u8>>, _w: u32, _h: u32) -> Result<Vec<Option<f32>>, String> {
         Err(NOT_HERE.into())
+    }
+    /// Tells the Studio the active shared-stream ceiling imposed by enabled main destinations
+    /// (e.g. Twitch 6,000 kbps H.264 / 2 s keyframes) without altering saved user settings.
+    async fn set_stream_cap(&self, _cap: Option<StreamCap>) -> Result<(), String> {
+        Ok(())
     }
     /// Auto quality: the stream on air (and the vertical one) at `pct` percent of the bitrate
     /// set, from now on; what's saved doesn't change.
@@ -1524,6 +1553,14 @@ pub enum StudioAct {
         window: bool,
         width: u32,
     },
+    /// A still of a display, window, camera, or capture card for Add-source picker cards, at most
+    /// `width` wide -> `{ image: data URL | null }`.
+    SourceStill {
+        kind: String,
+        key: String,
+        value: Value,
+        width: u32,
+    },
     /// The VST plugins on this computer → `{ available, why, plugins: [{ path, cid, name,
     /// vendor, kinds }] }` (looked for once; `rescan` looks again).
     VstPlugins {
@@ -1795,6 +1832,21 @@ impl StudioAct {
                 Err(EngineError::Invalid("width: 64 to 1280.".into()))
             }
             A::ScreenStill { .. } => Ok(()),
+            A::SourceStill { kind, key, value, width } => {
+                if kind.trim().is_empty() || kind.len() > 64 {
+                    return Err(EngineError::Invalid("kind: a source kind id.".into()));
+                }
+                if key.trim().is_empty() || key.len() > 64 {
+                    return Err(EngineError::Invalid("key: a source setting key.".into()));
+                }
+                if value.is_null() || matches!(value, Value::String(s) if s.trim().is_empty()) {
+                    return Err(EngineError::Invalid("value: a device, screen, or window id.".into()));
+                }
+                if !(64..=640).contains(width) {
+                    return Err(EngineError::Invalid("width: 64 to 640.".into()));
+                }
+                Ok(())
+            }
             A::VstPlugins { .. } => Ok(()),
             A::Vst { name, filter, what } => {
                 check_source_name(name)?;
@@ -1913,6 +1965,7 @@ impl StudioAct {
                 | A::SourcePicture { .. }
                 | A::SourceStatus { .. }
                 | A::ScreenStill { .. }
+                | A::SourceStill { .. }
                 | A::VstPlugins { .. }
                 | A::Vst { .. }
                 | A::Items { .. }
@@ -2002,36 +2055,54 @@ impl Engine {
     }
 
     pub async fn studio_status(&self) -> StudioStatus {
-        match self.studio_host() {
+        let mut status = match self.studio_host() {
             Ok(h) => h.status().await,
             Err(_) => StudioStatus { detail: Some(NONE.into()), ..Default::default() },
-        }
+        };
+        status.safe_mode = self.safe_mode_option();
+        status
     }
 
     pub async fn studio_start(&self) -> Result<StudioStatus, EngineError> {
+        self.studio_start_with(crate::safe_mode::StartOptions::default()).await
+    }
+
+    pub async fn studio_start_with(&self, opts: crate::safe_mode::StartOptions) -> Result<StudioStatus, EngineError> {
         // Off a Mac, cameras, video files and some screen capture go through FFmpeg: fetched
         // now, in the background, so a new streamer never installs anything or waits later.
         if !cfg!(target_os = "macos") && self.ffmpeg_path().is_none() {
             let _ = self.get_ffmpeg().await;
         }
-        let mut status = self.studio_host()?.start().await.map_err(failed)?;
+        let host = self.studio_host()?;
+        let (load_collection, allow_auto_start, _enabled_normal) = self.apply_start_options(&opts)?;
+        let was_running = host.status().await.running;
+        let mut status = if was_running {
+            if load_collection { host.confirm_collection().await.map_err(failed)? } else { host.status().await }
+        } else {
+            host.start_with_mode(load_collection).await.map_err(failed)?
+        };
         // After a crash: the replay buffer and the recording come back on as they were (a new
-        // file); the stream waits for the streamer.
+        // file) unless Safe Mode has auto-start disabled; the stream always waits for the streamer.
         if let Some(r) = status.recovered.as_mut() {
-            if r.replay {
-                match self.studio_replay(true).await {
-                    Ok(_) => r.again.push("replay buffer".into()),
-                    Err(e) => r.failed.push(format!("The replay buffer didn't start: {e}")),
+            if allow_auto_start {
+                if r.replay {
+                    match self.studio_replay(true).await {
+                        Ok(_) => r.again.push("replay buffer".into()),
+                        Err(e) => r.failed.push(format!("The replay buffer didn't start: {e}")),
+                    }
                 }
-            }
-            if r.record {
-                match self.studio_record(true).await {
-                    Ok(_) => r.again.push("recording".into()),
-                    Err(e) => r.failed.push(format!("Recording didn't start: {e}")),
+                if r.record {
+                    match self.studio_record(true).await {
+                        Ok(_) => r.again.push("recording".into()),
+                        Err(e) => r.failed.push(format!("Recording didn't start: {e}")),
+                    }
                 }
+                tracing::info!(?r, "the Studio came back after Ferrocast closed unexpectedly");
+            } else {
+                tracing::info!(?r, "Safe Mode kept recording and replay buffer off after crash");
             }
-            tracing::info!(?r, "the Studio came back after Ferrocast closed unexpectedly");
         }
+        status.safe_mode = self.safe_mode_option();
         Ok(status)
     }
 
@@ -2047,6 +2118,7 @@ impl Engine {
         let _out = self.studio().output_lock.lock().await;
         if was_running {
             *crate::golive::lock_enhanced(self) = None;
+            self.set_studio_live(false);
         }
         host.stop().await.map_err(failed)
     }
@@ -2079,9 +2151,12 @@ impl Engine {
         }
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
+        let saved = host.settings().await;
+        self.note_studio_settings(&saved);
+        self.send_golive_pub();
         // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).
         let (restart, detail) = one_line(restart, "Some changes apply after a restart");
-        let mut out = serde_json::json!({ "settings": host.settings().await, "restart": restart });
+        let mut out = serde_json::json!({ "settings": saved, "restart": restart });
         if let (Some(d), Some(o)) = (detail, out.as_object_mut()) {
             o.insert("restart_detail".into(), Value::String(d));
         }
@@ -2296,18 +2371,22 @@ impl Engine {
     pub(crate) async fn studio_stream_locked(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let s = host.settings().await;
+        self.note_studio_settings(&s);
         if on {
             self.ffmpeg_first(s.stream_needs_ffmpeg()).await?;
         }
         if !on {
+            self.set_studio_live(false);
             // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
             *crate::golive::lock_enhanced(self) = None;
             host.stream_stop().await.map_err(failed)?;
+            self.send_golive_pub();
             // The stream has ended either way; what didn't stop with it comes back in words.
             return Ok(follow_stream(host.as_ref(), false, &s)
                 .await
                 .map_or(Value::Null, |also| serde_json::json!({ "also": also })));
         }
+        self.sync_stream_cap().await;
         let (server, key) = self.golive_ingest().await?;
         // Twitch Enhanced Broadcasting: its other qualities, when Twitch's destination wants it.
         // Not while one already runs: its plan stays with it (Start then only says how it is).
@@ -2323,6 +2402,7 @@ impl Engine {
             Err(e) => {
                 if !running {
                     *crate::golive::lock_enhanced(self) = None;
+                    self.set_studio_live(false);
                 }
                 return Err(failed(e));
             }
@@ -2330,6 +2410,8 @@ impl Engine {
         // Mark a new stream session (even when `running` was still true during a prior Show's
         // stop delay) so no earlier Show's delayed stop can kill this stream.
         self.on_stream_started();
+        self.set_studio_live(true);
+        self.send_golive_pub();
         let mut also = if running { None } else { follow_stream(host.as_ref(), true, &s).await };
         if let Some(note) = eb_note {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));

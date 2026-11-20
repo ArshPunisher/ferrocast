@@ -247,11 +247,11 @@ impl Engine {
         let mut a = self.inner.automations.lock().unwrap_or_else(|e| e.into_inner());
         if !a.loaded {
             a.loaded = true;
-            a.rules = std::fs::read(self.automations_file())
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Vec<Rule>>(&b).ok())
-                .filter(|r| check(r).is_ok())
-                .unwrap_or_default();
+            a.rules = ferrocast_store::durable::load_json_with_backup::<Vec<Rule>>(&self.automations_file(), |r| {
+                check(r).is_ok()
+            })
+            .map(|loaded| loaded.value)
+            .unwrap_or_default();
         }
         f(&mut a)
     }
@@ -265,11 +265,9 @@ impl Engine {
         check(&rules)?;
         let body = serde_json::to_vec_pretty(&rules).map_err(|e| EngineError::Internal(e.to_string()))?;
         let file = self.automations_file();
-        let tmp = file.with_extension("json.new");
         // Under the lock, so two saves can't write the same file at once or end up apart.
         self.with_automations(|a| {
-            std::fs::write(&tmp, body)
-                .and_then(|()| std::fs::rename(&tmp, &file))
+            ferrocast_store::durable::write_json_bytes(&file, &body)
                 .map_err(|e| EngineError::Internal(format!("The rules couldn't be saved: {e}")))?;
             a.last.retain(|id, _| rules.iter().any(|r| &r.id == id));
             a.rules = rules.clone();

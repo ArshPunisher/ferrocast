@@ -1181,9 +1181,10 @@ impl Engine {
         self.end_show_with(false).await
     }
 
-    /// End show, optionally stopping the stream immediately (`at_once = true`, skipping any
-    /// `stop_delay_s` wait or bringing an already-waiting stop forward without re-running the
-    /// ending scene/recap).
+    /// End show; with `at_once` (`{ now: true }` in the API) the stream stops at once, as
+    /// OBS's Stop Streaming does (also when the show doesn't stop it by itself): no
+    /// `stop_delay_s` wait. On a show that is already ending (its stop waiting) `at_once`
+    /// only brings the stop forward without repeating the ending scene or recap.
     pub async fn end_show_with(&self, at_once: bool) -> Result<ShowRun, EngineError> {
         self.end_show_opts(at_once, None).await
     }
@@ -1399,16 +1400,21 @@ impl Engine {
     }
 
     /// The delayed Stop Streaming of an ended show. Serialized with `output_lock` and guarded
-    /// by BOTH `show_gen` and `stream_gen`, so it never kills a new Show OR a plain stream
-    /// started without a Show.
+    /// by BOTH `show_gen`, `stream_gen`, and a still-waiting `stop_stream` step, so it never
+    /// fires after "stop now", a new Show, or a plain stream started without a Show.
     async fn stop_stream_later(&self, show_gen: u64, stream_gen: u64, show_id: &str) {
         let _out = self.studio().output_lock.lock().await;
         let still_ours = {
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            let waiting = |r: &ShowRun| {
+                r.id == show_id
+                    && r.phase == Phase::Ended
+                    && r.steps.iter().any(|s| s.id == "stop_stream" && s.status == "waiting")
+            };
             let ok = m.epoch == show_gen
                 && m.stream_epoch == stream_gen
                 && m.stop_waiting
-                && m.run.as_ref().is_some_and(|r| r.id == show_id && r.phase == Phase::Ended);
+                && m.run.as_ref().is_some_and(waiting);
             if ok {
                 m.stop_task = None;
                 m.stop_waiting = false;

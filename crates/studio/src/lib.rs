@@ -40,13 +40,13 @@ use serde::{Deserialize, Serialize};
 /// The kind id of Ferrocast's Web page source (macOS; OBS's Browser source keys).
 pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
-pub use collection::png_data_url;
 pub use collection::{
     AudioInfo, BOUNDS, CHANNEL_KEYS, Captions, DEINTERLACE, Face, FaceFollow, FilterInfo, FollowLook, ItemEdit,
     ItemInfo, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, SceneInfo, SoundTap, SourceUse, StudioOptions,
     TBarState, TapReader, Transform, TransitionInfo, VERTICAL_SIZE, VerticalInfo, WebAct, ask_captions_access,
     captions_access, find_busy, find_faces, focus_x,
 };
+pub use collection::{jpeg_data_url, png_data_url};
 pub use projector::{MultiviewLayout, MultiviewLook, ProjectorOf, Screen};
 
 /// What went wrong in the Studio.
@@ -425,12 +425,15 @@ impl RecordPlan {
 }
 
 /// How a recording is going.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordStats {
+    /// False once the recording stopped, by itself too (a full disk, a drive taken away).
     pub active: bool,
     pub paused: bool,
     pub bytes: u64,
     pub frames: u32,
+    /// Why it stopped, in one line, when it did by itself ("the disk is full").
+    pub error: Option<String>,
 }
 
 /// How video and sound are encoded.
@@ -441,6 +444,9 @@ pub struct EncodeSettings {
     pub video_kbps: u32,
     /// Varying bitrate (VBR) instead of steady (CBR).
     pub vbr: bool,
+    /// Strict 1× VBV / 1 s DataRateLimits CBR used when capped for a platform limit.
+    #[serde(default)]
+    pub strict_cbr: bool,
     /// Constant quality instead of a bitrate (recordings): 0 is lossless, 18 very high.
     pub quality: Option<u32>,
     /// Seconds between keyframes (platforms ask for 2; 0 lets the encoder pick).
@@ -463,6 +469,7 @@ impl EncodeSettings {
             video_encoder: id.into(),
             video_kbps: 6000,
             vbr: false,
+            strict_cbr: false,
             quality: None,
             keyframe_s: 2,
             profile: "high".into(),

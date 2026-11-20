@@ -17,6 +17,10 @@ const AUDIO: u8 = 2;
 const CLUSTER_MS: i64 = 30_000;
 /// Sound alone starts a new cluster this often (ms).
 const AUDIO_ONLY_CLUSTER_MS: i64 = 5_000;
+/// Room inside Info for the duration: its element (11 bytes) and a Void for what is left (3).
+const DURATION_ROOM: usize = 14;
+/// What a finish that failed hands back (shared with MP4's).
+pub use crate::mp4::FinishFailed;
 
 /// An element's size in Matroska's variable-length form (8 bytes when it's big, else fewest).
 fn size(n: u64) -> Vec<u8> {
@@ -74,6 +78,14 @@ pub struct MkvWriter<W: Write> {
     chapters: Vec<(i64, String)>,
     /// The latest time written (µs from the file's start): where a mark goes.
     last_us: i64,
+    /// Where the segment's data starts (what positions in the index count from), and its size field.
+    segment_at: u64,
+    /// Where Info and Tracks start, and the room inside Info kept for the duration.
+    info_at: u64,
+    tracks_at: u64,
+    duration_room: u64,
+    /// Each cluster written: its time (ms) and where it starts in the file (for the index).
+    cues: Vec<(i64, u64)>,
 }
 
 /// A Void element exactly `len` bytes long (at least 2), or None.
@@ -137,8 +149,17 @@ impl<W: Write> MkvWriter<W> {
             .concat(),
         );
         let app = format!("Ferrocast {}", env!("CARGO_PKG_VERSION"));
-        let info =
-            element(0x1549_A966, &[uint(0x2AD7B1, 1_000_000), string(0x4D80, &app), string(0x5741, &app)].concat());
+        // A Void inside Info, where the duration goes when the file is finished.
+        let info = element(
+            0x1549_A966,
+            &[
+                uint(0x2AD7B1, 1_000_000),
+                string(0x4D80, &app),
+                string(0x5741, &app),
+                void(DURATION_ROOM).unwrap_or_default(),
+            ]
+            .concat(),
+        );
         let mut tracks = Vec::new();
         if let Some(v) = &video {
             let codec = if v.codec == VideoCodec::Hevc { "V_MPEGH/ISO/HEVC" } else { "V_MPEG4/ISO/AVC" };
@@ -176,7 +197,11 @@ impl<W: Write> MkvWriter<W> {
         let mut head = ebml;
         // The segment's size stays unknown: the file can end anywhere and still play.
         head.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let segment_at = head.len() as u64;
+        let info_at = segment_at;
+        let duration_room = info_at + info.len() as u64 - DURATION_ROOM as u64;
         head.extend(info);
+        let tracks_at = head.len() as u64;
         head.extend(element(0x1654_AE6B, &tracks));
         let room_at = head.len() as u64;
         head.extend(void(crate::mp4::ROOM).unwrap_or_default());
@@ -192,6 +217,11 @@ impl<W: Write> MkvWriter<W> {
             room_at,
             chapters: Vec::new(),
             last_us: 0,
+            segment_at,
+            info_at,
+            tracks_at,
+            duration_room,
+            cues: Vec::new(),
         })
     }
 
@@ -266,6 +296,8 @@ impl<W: Write> MkvWriter<W> {
             let c = element(0x1F43_B675, &[uint(0xE7, at.max(0) as u64), blocks].concat());
             self.out.write_all(&c)?;
             self.out.flush()?;
+            // Where it starts, for the index a finished file has.
+            self.cues.push((at.max(0), self.written));
             self.written += c.len() as u64;
         }
         Ok(())
@@ -274,6 +306,12 @@ impl<W: Write> MkvWriter<W> {
     /// Bytes written to the output so far (the cluster being gathered isn't).
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// Gives the output up without writing the cluster being gathered (a disk that can't take
+    /// it): the output, and where the last whole cluster ends (see `Mp4Writer::abandon`).
+    pub fn abandon(self) -> (W, u64) {
+        (self.out, self.written)
     }
 
     /// Writes out the last cluster and hands the output back.
@@ -285,25 +323,119 @@ impl<W: Write> MkvWriter<W> {
 }
 
 impl<W: Write + Seek> MkvWriter<W> {
-    /// As `finish`, with the chapter marks written into the room after the tracks; marks that
-    /// don't fit are left out.
+    /// As `finalize`, with the error flattened (the writer is dropped: nothing is cut back).
     pub fn finish_with_chapters(self) -> io::Result<W> {
-        let (at, chapters) = (self.room_at, self.chapters.clone());
-        let mut out = self.finish()?;
-        for n in (1..=chapters.len()).rev() {
-            let c = chapters_element(&chapters[..n]);
-            let Some(rest) = crate::mp4::ROOM.checked_sub(c.len()) else { continue };
+        self.finalize().map_err(|f| f.error)
+    }
+
+    /// Writes out the last cluster and makes the file a finished Matroska: the duration in Info,
+    /// an index of the clusters (Cues) at the end, a SeekHead that says where Info, Tracks, the
+    /// chapters and the index are, the chapters, and the segment's size. A player then shows the
+    /// length and seeks without reading the file through. If any step fails the header is put back
+    /// as it was (the file plays as the open-ended one it was), and the failure hands back the
+    /// output and where the last whole cluster ends, to cut back to.
+    pub fn finalize(mut self) -> Result<W, FinishFailed<W>> {
+        macro_rules! fail {
+            ($self:ident, $e:expr) => {{
+                let whole = $self.written;
+                return Err(FinishFailed { error: $e, out: $self.out, whole });
+            }};
+        }
+        if let Err(e) = self.flush_cluster().and_then(|()| self.out.flush()) {
+            fail!(self, e);
+        }
+        if self.cues.is_empty() {
+            return Ok(self.out);
+        }
+        let track = if self.has_video { VIDEO } else { AUDIO };
+        let points: Vec<u8> = self
+            .cues
+            .iter()
+            .flat_map(|(ms, at)| {
+                element(
+                    0xBB,
+                    &[
+                        uint(0xB3, *ms as u64),
+                        element(0xB7, &[uint(0xF7, u64::from(track)), uint(0xF1, at - self.segment_at)].concat()),
+                    ]
+                    .concat(),
+                )
+            })
+            .collect();
+        let cues = element(0x1C53_BB6B, &points);
+        let end = self.written;
+        let chapters = self.chapters.clone();
+        // The room after Tracks: the SeekHead (a fixed size for the same entries), then the
+        // chapters that fit, then a Void for what is left.
+        let seek = |positions: [u64; 4], chapters: bool| -> Vec<u8> {
+            let entry = |id: &[u8], at: u64| {
+                element(0x4DBB, &[element(0x53AB, id), element(0x53AC, &at.to_be_bytes())].concat())
+            };
+            let mut list =
+                [entry(&[0x15, 0x49, 0xA9, 0x66], positions[0]), entry(&[0x16, 0x54, 0xAE, 0x6B], positions[1])]
+                    .concat();
+            if chapters {
+                list.extend(entry(&[0x10, 0x43, 0xA7, 0x70], positions[2]));
+            }
+            list.extend(entry(&[0x1C, 0x53, 0xBB, 0x6B], positions[3]));
+            element(0x114D_9B74, &list)
+        };
+        let mut room = None;
+        for n in (0..=chapters.len()).rev() {
+            let c = if n == 0 { Vec::new() } else { chapters_element(&chapters[..n]) };
+            let seek_len = seek([0; 4], n > 0).len();
+            let Some(rest) = crate::mp4::ROOM.checked_sub(seek_len + c.len()) else { continue };
             let rest = if rest == 0 { Some(Vec::new()) } else { void(rest) };
             if let Some(rest) = rest {
-                out.seek(SeekFrom::Start(at))?;
-                out.write_all(&c)?;
-                out.write_all(&rest)?;
-                out.seek(SeekFrom::End(0))?;
-                out.flush()?;
+                let chapters_at = self.room_at + seek_len as u64;
+                let rel = |at: u64| at - self.segment_at;
+                let head = seek([rel(self.info_at), rel(self.tracks_at), rel(chapters_at), rel(end)], n > 0);
+                room = Some([head, c, rest].concat());
                 break;
             }
         }
-        Ok(out)
+        let Some(room) = room else {
+            fail!(self, io::Error::other("no room for the index"));
+        };
+        let original_room = void(crate::mp4::ROOM).unwrap_or_default();
+        let duration_ms = (self.last_us.max(0) as f64) / 1000.0;
+        let duration = [float(0x4489, duration_ms), void(DURATION_ROOM - 11).unwrap_or_default()].concat();
+        let void_duration = void(DURATION_ROOM).unwrap_or_default();
+        // 1. The index at the end. Failing here leaves the open-ended file with a piece of index
+        //    past its last cluster, which the caller cuts off.
+        let wrote =
+            self.out.seek(SeekFrom::Start(end)).and_then(|_| self.out.write_all(&cues)).and_then(|()| self.out.flush());
+        if let Err(e) = wrote {
+            fail!(self, e);
+        }
+        // 2. The header: duration, SeekHead and chapters, then the segment's size. Put back if one fails.
+        let size = end + cues.len() as u64 - self.segment_at;
+        let patch = (|| -> io::Result<()> {
+            self.out.seek(SeekFrom::Start(self.duration_room))?;
+            self.out.write_all(&duration)?;
+            self.out.seek(SeekFrom::Start(self.room_at))?;
+            self.out.write_all(&room)?;
+            // The segment's size, in 8 bytes (the length marker, then 7).
+            self.out.seek(SeekFrom::Start(self.segment_at - 8))?;
+            let mut field = vec![0x01];
+            field.extend_from_slice(&size.to_be_bytes()[1..]);
+            self.out.write_all(&field)?;
+            self.out.seek(SeekFrom::End(0))?;
+            self.out.flush()
+        })();
+        if let Err(e) = patch {
+            let _ = (|| -> io::Result<()> {
+                self.out.seek(SeekFrom::Start(self.duration_room))?;
+                self.out.write_all(&void_duration)?;
+                self.out.seek(SeekFrom::Start(self.room_at))?;
+                self.out.write_all(&original_room)?;
+                self.out.seek(SeekFrom::Start(self.segment_at - 8))?;
+                self.out.write_all(&[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])?;
+                self.out.flush()
+            })();
+            fail!(self, e);
+        }
+        Ok(self.out)
     }
 }
 

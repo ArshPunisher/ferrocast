@@ -22,7 +22,7 @@ use ferrocast_engine::studio_host::{
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
-use crate::extract::Body;
+use crate::extract::{Body, OptionalBody};
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
@@ -116,6 +116,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/sources/{name}/picture", get(engine_source_picture))
         .route("/studio/engine/sources/{name}/status", get(engine_source_status))
         .route("/studio/engine/screens/{id}/still", get(engine_screen_still))
+        .route("/studio/engine/still", get(engine_source_still))
         .route("/studio/engine/vst/plugins", get(engine_vst_plugins))
         .route("/studio/engine/sources/{name}/filters/{filter}/vst", get(engine_vst_status).post(engine_vst_act))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
@@ -385,8 +386,11 @@ async fn engine_status(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.studio_status().await))
 }
 
-async fn engine_start(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(app.engine.studio_start().await?)))
+async fn engine_start(
+    State(app): State<AppState>,
+    OptionalBody(opts): OptionalBody<ferrocast_engine::StartOptions>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.studio_start_with(opts).await?)))
 }
 
 async fn engine_stop(State(app): State<AppState>) -> ApiResult<Json<Value>> {
@@ -1219,7 +1223,7 @@ struct StillQuery {
 }
 
 fn still_width() -> u32 {
-    320
+    240
 }
 
 /// `GET …/screens/{id}/still?w=320&window=false` → `{ image }`: a still of a screen or window
@@ -1229,7 +1233,23 @@ async fn engine_screen_still(
     Path(id): Path<u32>,
     Query(q): Query<StillQuery>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::ScreenStill { id, window: q.window, width: q.w }).await
+    act(&app, StudioAct::ScreenStill { id, window: q.window, width: q.w.min(320) }).await
+}
+
+#[derive(Deserialize)]
+struct SourceStillQuery {
+    kind: String,
+    key: String,
+    value: String,
+    #[serde(default = "still_width")]
+    w: u32,
+}
+
+/// `GET …/still?kind=&key=&value=&w=240` → `{ image }`: a single low-res JPEG still of a window,
+/// display, camera, or capture card, aborted automatically when the HTTP client disconnects.
+async fn engine_source_still(State(app): State<AppState>, Query(q): Query<SourceStillQuery>) -> ApiResult<Json<Value>> {
+    let value = q.value.parse::<i64>().map_or_else(|_| Value::String(q.value.clone()), |n| json!(n));
+    act(&app, StudioAct::SourceStill { kind: q.kind, key: q.key, value, width: q.w.min(320) }).await
 }
 
 /// `GET …/sources/{name}/status` → how the source is doing (a Web text's last read, whether a
@@ -1620,8 +1640,21 @@ async fn live_scene(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "show": app.engine.go_live_scene().await? })))
 }
 
-async fn end_show(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!({ "show": app.engine.end_show().await? })))
+#[derive(Deserialize, Default)]
+struct EndBody {
+    /// Stop the stream at once, without the show's `stop_delay_s` wait.
+    #[serde(default)]
+    now: bool,
+}
+
+/// The body is optional (older callers send none): without `now` the show ends as before.
+async fn end_show(State(app): State<AppState>, body: axum::body::Bytes) -> ApiResult<Json<Value>> {
+    let b: EndBody = if body.iter().all(u8::is_ascii_whitespace) {
+        EndBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("A field is wrong: {e}")))?
+    };
+    Ok(Json(json!({ "show": app.engine.end_show_with(b.now).await? })))
 }
 
 // ------------------------------------------------------------------ OBS

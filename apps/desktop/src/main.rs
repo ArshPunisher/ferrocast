@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod crash;
 #[cfg(target_os = "macos")]
 mod mac_update;
@@ -45,6 +45,8 @@ use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 const SHOW_SHORTCUT: &str = "CmdOrCtrl+Alt+Shift+F";
 /// Passed by the login item: start in the tray without opening the window.
 const MINIMIZED_ARG: &str = "--minimized";
+/// Launch directly in Safe Mode (no third-party plugins, VSTs, auto-start, or auto-loaded collection).
+const SAFE_MODE_ARG: &str = "--safe-mode";
 /// How often the shell picks up settings changed in the dashboard.
 const SETTINGS_EVERY: Duration = Duration::from_secs(2);
 
@@ -107,10 +109,16 @@ fn init_tracing(dir: &std::path::Path) {
 fn main() {
     let dir = data_dir();
     init_tracing(&dir);
+    let safe_mode = std::env::args().any(|a| a == SAFE_MODE_ARG);
+    let guarded = safe_mode || ferrocast_engine::safe_mode::has_unclean_exit(&dir);
     // VST plugins run in their own locked-down helper, which may never read this folder (stream
-    // keys, sign-ins); the Studio's sound filters then reach them.
+    // keys, sign-ins); the Studio's sound filters then reach them. Deferred in Safe Mode.
     ferrocast_vsthost::client::keep_private(vec![dir.clone()]);
-    ferrocast_vsthost::install();
+    if !guarded {
+        ferrocast_vsthost::install();
+    } else {
+        tracing::warn!(safe_mode, "Safe Mode active at launch: VST plugins and third-party plugins held off");
+    }
     #[cfg(windows)]
     crash::install(&dir);
     #[cfg(all(windows, debug_assertions))]
@@ -150,7 +158,7 @@ fn main() {
                 .build(),
         )
         .setup(move |app| {
-            let started = tauri::async_runtime::block_on(start(&dir));
+            let started = tauri::async_runtime::block_on(start(&dir, safe_mode));
             let running = match started {
                 Ok(r) => r,
                 Err(message) => {
@@ -160,6 +168,8 @@ fn main() {
                 }
             };
             let engine = running.engine.clone();
+            engine.on_exit_safe_mode(Arc::new(ferrocast_vsthost::install));
+            let show_for_safe_mode = engine.safe_mode_status().active || engine.safe_mode_status().offer;
             app.manage(running);
             app.manage(studio_keys::StudioKeys::new(engine.clone()));
             engine.set_studio_host(Arc::new(studio::DesktopStudio::new(app.handle().clone(), dir.clone())));
@@ -198,8 +208,9 @@ fn main() {
             tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone(), pending.clone()));
             tauri::async_runtime::spawn(restart_when_asked(app.handle().clone(), engine.clone(), pending));
             tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
-            // Started minimized (at login) with no tray: shown, or nothing could bring it up.
-            if !minimized || !has_tray {
+            // Started minimized (at login) with no tray, or offering/running Safe Mode: shown so
+            // the prompt is never hidden in the tray.
+            if !minimized || !has_tray || show_for_safe_mode {
                 show_window(app.handle());
             }
             Ok(())
@@ -246,14 +257,45 @@ fn main() {
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
         RunEvent::Exit => {
-            studio::end_session();
             tracing::info!("Ferrocast quitting");
-            // Before the main thread's own end, which can't run the engine's GPU cleanup.
-            studio::close();
+            let running = app.try_state::<Running>();
+            clean_exit_sequence(
+                studio::mark_quitting,
+                studio::close,
+                || {
+                    if let Some(r) = running.as_ref() {
+                        r.engine.shutdown();
+                    }
+                },
+                || {
+                    studio::end_session();
+                    if let Some(r) = running.as_ref() {
+                        r.engine.clear_running_marker();
+                    }
+                },
+            );
             tracing::info!("the Studio closed");
         }
         _ => {}
     });
+}
+
+fn clean_exit_sequence(
+    mark_quitting: impl FnOnce(),
+    close_studio: impl FnOnce() -> bool,
+    shutdown_engine: impl FnOnce(),
+    clear_markers: impl FnOnce(),
+) -> bool {
+    mark_quitting();
+    // Before the main thread's own end, which can't run the engine's GPU cleanup.
+    let closed = close_studio();
+    shutdown_engine();
+    if closed {
+        clear_markers();
+    } else {
+        tracing::warn!("clean quit markers preserved: Studio did not finish closing cleanly");
+    }
+    closed
 }
 
 fn shortcut_of(s: &str) -> Shortcut {
@@ -657,8 +699,8 @@ async fn notify_when_hidden(app: AppHandle, engine: Engine) {
     }
 }
 
-async fn start(dir: &std::path::Path) -> Result<Running, String> {
-    let engine = Engine::start(dir).await.map_err(|e| e.to_string())?;
+async fn start(dir: &std::path::Path, safe_mode: bool) -> Result<Running, String> {
+    let engine = Engine::start_with_mode(dir, safe_mode).await.map_err(|e| e.to_string())?;
     // LAN access is read once here: changing it takes effect the next time Ferrocast starts.
     let opts = ferrocast_server::ServeOptions { lan: engine.settings().lan_access, ..Default::default() };
     let server = ferrocast_server::serve(engine.clone(), opts)
@@ -1199,5 +1241,34 @@ mod update_tests {
         let cut = release_notes(Some(&long)).unwrap();
         assert_eq!(cut.chars().count(), NOTES_MAX + 1);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn clean_exit_sequence_deletes_markers_only_after_clean_close() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let ok = clean_exit_sequence(
+            || log.borrow_mut().push("mark_quitting"),
+            || {
+                log.borrow_mut().push("close_studio");
+                true
+            },
+            || log.borrow_mut().push("shutdown_engine"),
+            || log.borrow_mut().push("clear_markers"),
+        );
+        assert!(ok);
+        assert_eq!(*log.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine", "clear_markers"]);
+
+        let partial = std::cell::RefCell::new(Vec::new());
+        let failed = clean_exit_sequence(
+            || partial.borrow_mut().push("mark_quitting"),
+            || {
+                partial.borrow_mut().push("close_studio");
+                false
+            },
+            || partial.borrow_mut().push("shutdown_engine"),
+            || partial.borrow_mut().push("clear_markers"),
+        );
+        assert!(!failed);
+        assert_eq!(*partial.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine"]);
     }
 }

@@ -251,7 +251,7 @@ impl Connector for ChatRecorder {
     }
     async fn ingest(&self) -> ferrocast_connector::Result<Ingest> {
         match &self.ingest_url {
-            Some(url) => Ok(Ingest { url: url.clone(), key: "kick-k".into() }),
+            Some(url) => Ok(Ingest { url: url.clone(), key: "kick-k".into(), backup: None }),
             None => Err(ferrocast_connector::ConnectorError::NotSupported { platform: self.platform, what: "ingest" }),
         }
     }

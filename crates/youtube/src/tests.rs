@@ -485,6 +485,100 @@ async fn with_no_broadcast_one_is_made_for_the_stream_info() {
     assert_eq!((p[2]["id"].as_str(), p[2]["snippet"]["title"].as_str()), (Some("made-1"), Some("Ranked")));
 }
 
+#[test]
+fn privacy_is_ordered_from_private_to_public_and_names_what_youtube_says() {
+    use crate::Privacy;
+    assert!(Privacy::Private < Privacy::Unlisted && Privacy::Unlisted < Privacy::Public);
+    assert_eq!(Privacy::default(), Privacy::Public, "as before: public unless the streamer chose");
+    for p in [Privacy::Public, Privacy::Unlisted, Privacy::Private] {
+        assert_eq!(Privacy::parse(p.as_str()), Some(p));
+    }
+    for bad in ["", "Public", "members", "unlisted ", "PRIVATE"] {
+        assert_eq!(Privacy::parse(bad), None, "{bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_broadcast_is_made_with_the_privacy_the_streamer_chose() {
+    use crate::Privacy;
+    use ferrocast_core::stream_info::StreamInfo;
+    for (chosen, said) in [(Privacy::Public, "public"), (Privacy::Unlisted, "unlisted"), (Privacy::Private, "private")]
+    {
+        let (ep, puts) = fake_videos(false).await;
+        let api = video_api(ep).with_privacy(Arc::new(move || chosen));
+        api.update_broadcast_info(&StreamInfo { title: Some("Ranked".into()), ..Default::default() }).await.unwrap();
+        let p = puts.lock().unwrap().clone();
+        assert_eq!(p[0]["made"]["status"]["privacyStatus"], said);
+        assert_eq!(p[0]["made"]["status"]["selfDeclaredMadeForKids"], false, "that part is not the choice");
+    }
+}
+
+#[tokio::test]
+async fn the_choice_is_read_when_a_broadcast_is_made_not_when_the_api_is_built() {
+    use crate::Privacy;
+    use ferrocast_core::stream_info::StreamInfo;
+    let cell = Arc::new(std::sync::atomic::AtomicU8::new(2));
+    let read = cell.clone();
+    let source = Arc::new(move || match read.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => Privacy::Private,
+        1 => Privacy::Unlisted,
+        _ => Privacy::Public,
+    });
+    let (ep, puts) = fake_videos(false).await;
+    let api = video_api(ep).with_privacy(source);
+    // The streamer changes the setting after the Api exists, before the broadcast is made.
+    cell.store(0, std::sync::atomic::Ordering::SeqCst);
+    api.update_broadcast_info(&StreamInfo { title: Some("Ranked".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(puts.lock().unwrap()[0]["made"]["status"]["privacyStatus"], "private");
+}
+
+#[tokio::test]
+async fn the_vertical_broadcast_never_shows_more_than_the_choice_or_the_normal_live() {
+    use crate::Privacy;
+    // The normal live is unlisted (fake_live). Public chosen: it copies unlisted, as before.
+    // Private chosen: private, though the normal live is more public than that.
+    for (chosen, said) in
+        [(Privacy::Public, "unlisted"), (Privacy::Unlisted, "unlisted"), (Privacy::Private, "private")]
+    {
+        let (ep, calls) = fake_live().await;
+        video_api(ep).with_privacy(Arc::new(move || chosen)).vertical_ingest().await.unwrap();
+        let log = calls.lock().unwrap().clone();
+        assert!(
+            log.iter().any(|c| c.starts_with(&format!("broadcasts.insert \"{said}\""))),
+            "{chosen:?} should make it {said}: {log:?}"
+        );
+    }
+    // No normal live to copy: the choice itself.
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k-main",
+        )]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    video_api(ep).with_privacy(Arc::new(|| Privacy::Unlisted)).vertical_ingest().await.unwrap();
+    let log = calls.lock().unwrap().clone();
+    assert!(log.iter().any(|c| c.contains("POST /liveBroadcasts ") && c.contains("privacy=unlisted")), "{log:?}");
+}
+
+#[tokio::test]
+async fn going_live_with_no_broadcast_makes_one_with_the_choice_too() {
+    use crate::Privacy;
+    let st = ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k-main",
+        )]])),
+        ..Default::default()
+    };
+    let (ep, calls) = start_scripted(st).await;
+    video_api(ep).with_privacy(Arc::new(|| Privacy::Private)).ingest().await.unwrap();
+    let log = calls.lock().unwrap().clone();
+    assert!(
+        log.iter().any(|c| c.starts_with("POST /liveBroadcasts b-new-") && c.contains("privacy=private")),
+        "{log:?}"
+    );
+}
+
 #[tokio::test]
 async fn one_broadcast_is_made_even_when_youtube_is_slow_to_list_it() {
     use ferrocast_core::stream_info::StreamInfo;
@@ -1046,14 +1140,22 @@ async fn start_scripted(st: ScriptedYoutube) -> (Endpoints, Arc<Mutex<Vec<String
         )
         .route(
             "/api/videos",
-            axum::routing::get(|Query(q): Query<HashMap<String, String>>| async move {
+            axum::routing::get(|State(st): State<ScriptedYoutube>, Query(q): Query<HashMap<String, String>>| async move {
                 let id = q.get("id").cloned().unwrap_or_else(|| "v1".into());
+                st.calls.lock().unwrap().push(format!("GET /videos {id}"));
                 axum::Json(json!({ "items": [{ "id": id, "snippet": { "title": "Old", "description": "", "categoryId": "20" } }] }))
             })
             .put(|State(st): State<ScriptedYoutube>, axum::Json(b): axum::Json<serde_json::Value>| async move {
                 let id = b["id"].as_str().unwrap_or("").to_string();
                 st.calls.lock().unwrap().push(format!("PUT /videos {id}"));
                 axum::Json(b)
+            }),
+        )
+        .route(
+            "/api/upload/thumbnails/set",
+            axum::routing::post(|State(st): State<ScriptedYoutube>, Query(q): Query<HashMap<String, String>>| async move {
+                st.calls.lock().unwrap().push(format!("POST thumbnails.set {}", q.get("videoId").cloned().unwrap_or_default()));
+                axum::Json(json!({ "items": [] }))
             }),
         )
         .with_state(st);
@@ -1402,4 +1504,301 @@ async fn pagination_finds_streams_and_broadcasts_on_later_pages_and_guards_verti
     let alog = calls_auto.lock().unwrap().clone();
     assert!(alog.contains(&"POST /liveBroadcasts/bind b-unbound->s1".to_string()), "{alog:?}");
     assert!(alog.contains(&"PUT /liveBroadcasts bv-manual".to_string()), "{alog:?}");
+}
+
+// --- limits: a burst is not the day's quota (M10-06) ------------------------------------
+
+/// A REST API that answers each request from a script, in order, then with an empty list.
+async fn rest_that_answers(script: Vec<(u16, serde_json::Value)>) -> (Endpoints, Arc<Mutex<usize>>) {
+    use std::collections::VecDeque;
+    let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+    let count = Arc::new(Mutex::new(0usize));
+    let (q, n) = (queue.clone(), count.clone());
+    let app = axum::Router::new().fallback(move || {
+        let (q, n) = (q.clone(), n.clone());
+        async move {
+            *n.lock().unwrap() += 1;
+            let next = q.lock().unwrap().pop_front();
+            let (code, body) = next.unwrap_or((200, json!({ "items": [] })));
+            let mut res = axum::response::Response::new(axum::body::Body::from(body.to_string()));
+            *res.status_mut() = axum::http::StatusCode::from_u16(code).unwrap();
+            res.headers_mut().insert("content-type", "application/json".parse().unwrap());
+            if code == 429 {
+                res.headers_mut().insert("retry-after", "120".parse().unwrap());
+            }
+            res
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let ep = Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    };
+    (ep, count)
+}
+
+fn google_error(reason: &str) -> serde_json::Value {
+    json!({ "error": { "code": 403, "message": "No.", "errors": [{ "reason": reason }] } })
+}
+
+#[tokio::test]
+async fn a_burst_limit_and_the_days_quota_are_told_apart() {
+    for (script, want) in [
+        ((403, google_error("rateLimitExceeded")), YoutubeError::RateLimited(Duration::from_secs(5))),
+        ((403, google_error("userRateLimitExceeded")), YoutubeError::RateLimited(Duration::from_secs(5))),
+        ((403, google_error("quotaExceeded")), YoutubeError::QuotaExceeded),
+        ((403, google_error("dailyLimitExceeded")), YoutubeError::QuotaExceeded),
+        // A 429 says how long (120 s): never more than a minute.
+        ((429, json!({})), YoutubeError::RateLimited(Duration::from_secs(60))),
+    ] {
+        let (ep, _) = rest_that_answers(vec![script.clone()]).await;
+        let got = video_api(ep).active_live_chat().await.unwrap_err();
+        assert_eq!(got, want, "{script:?}");
+    }
+    // What the rest of the app hears: seconds for a burst, until Pacific midnight for the day.
+    let burst: ferrocast_connector::ConnectorError = YoutubeError::RateLimited(Duration::from_secs(7)).into();
+    assert!(
+        matches!(burst, ferrocast_connector::ConnectorError::RateLimited { retry_after, .. } if retry_after == Duration::from_secs(7))
+    );
+    let day: ferrocast_connector::ConnectorError = YoutubeError::QuotaExceeded.into();
+    let ferrocast_connector::ConnectorError::RateLimited { retry_after, .. } = day else { panic!("{day:?}") };
+    assert!(retry_after != Duration::from_secs(3600), "not a blind hour");
+    assert!(retry_after <= Duration::from_secs(86_400 + 300), "{retry_after:?}");
+}
+
+#[test]
+fn the_quota_is_back_at_midnight_pacific_time() {
+    let at = |s: &str| api::parse_rfc3339_ms(s).unwrap();
+    let hours = |now: &str| quota_resets_in(at(now), 0).as_secs_f64() / 3600.0;
+    // Winter (PST, UTC-8): noon in Los Angeles is 20:00 UTC, midnight 12 hours on.
+    assert_eq!(hours("2026-11-20T20:00:00Z"), 12.0);
+    // Summer (PDT, UTC-7).
+    assert_eq!(hours("2026-07-01T12:00:00Z"), 19.0);
+    // The night the clocks go forward (second Sunday of March, 2:00): 23:00 PST, an hour to midnight.
+    assert_eq!(hours("2026-03-08T07:00:00Z"), 1.0);
+    // The morning after it, in PDT.
+    assert_eq!(hours("2026-03-08T12:00:00Z"), 19.0);
+    // And back (first Sunday of November): still PDT on the Saturday, PST by Sunday noon.
+    assert_eq!(hours("2026-10-31T20:00:00Z"), 11.0);
+    assert_eq!(hours("2026-11-01T12:00:00Z"), 20.0);
+    // The spread is added.
+    assert_eq!(quota_resets_in(at("2026-11-20T20:00:00Z"), 90).as_secs(), 12 * 3600 + 90);
+}
+
+/// The statuses a run said, until `n` of them or the time is up.
+async fn statuses(
+    api: Arc<crate::api::Api>,
+    waits: stream::Waits,
+    n: usize,
+) -> (Vec<ferrocast_core::event::ConnectorStatus>, Duration) {
+    let (sink, mut rx) = mpsc::channel(64);
+    let task = tokio::spawn(stream::run_with(api, sink, Arc::new(Notify::new()), Arc::default(), waits));
+    let t0 = std::time::Instant::now();
+    let mut got = Vec::new();
+    while got.len() < n {
+        let Ok(Some(e)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await else { break };
+        if let EventKind::Connector(s) = e.kind {
+            got.push(s);
+        }
+    }
+    task.abort();
+    (got, t0.elapsed())
+}
+
+#[tokio::test]
+async fn a_burst_limit_retries_in_seconds_and_never_says_connected_between_failures() {
+    use ferrocast_core::event::ConnectorStatus as S;
+    let limited = || (403, google_error("rateLimitExceeded"));
+    let (ep, _) = rest_that_answers(vec![limited(), limited(), limited()]).await;
+    let waits = stream::Waits { rate: Some(Duration::from_millis(40)), quota: None };
+    let (got, took) = statuses(Arc::new(video_api(ep)), waits, 5).await;
+    assert_eq!(
+        got,
+        vec![
+            S::Connected,
+            S::Reconnecting { attempt: 1 },
+            S::Reconnecting { attempt: 2 },
+            S::Reconnecting { attempt: 3 },
+            S::Connected,
+        ],
+        "one Connected to start, none between the failures, one when it worked"
+    );
+    assert!(took < Duration::from_secs(3), "a burst limit isn't an hour: {took:?}");
+}
+
+#[tokio::test]
+async fn the_days_quota_pauses_and_says_so_without_connected_between_attempts() {
+    use ferrocast_core::event::ConnectorStatus as S;
+    let gone = || (403, google_error("quotaExceeded"));
+    let (ep, calls) = rest_that_answers(vec![gone(), gone()]).await;
+    let waits = stream::Waits { rate: None, quota: Some(Duration::from_millis(40)) };
+    let (got, _) = statuses(Arc::new(video_api(ep)), waits, 4).await;
+    assert!(
+        matches!(&got[..], [S::Connected, S::Disconnected { .. }, S::Disconnected { .. }, S::Connected]),
+        "{got:?}"
+    );
+    assert_eq!(*calls.lock().unwrap(), 3, "asked three times: it didn't poll while it waited");
+}
+
+#[test]
+fn a_burst_backs_off_from_five_seconds_to_a_minute() {
+    let s = Duration::from_secs;
+    assert_eq!(stream::rate_backoff(1, s(0)), s(5));
+    assert_eq!(stream::rate_backoff(2, s(0)), s(10));
+    assert_eq!(stream::rate_backoff(5, s(0)), s(60));
+    assert_eq!(stream::rate_backoff(9, s(0)), s(60));
+    assert_eq!(stream::rate_backoff(1, s(30)), s(30), "never less than YouTube asked");
+    assert_eq!(stream::rate_backoff(1, s(300)), s(60));
+}
+
+// --- quota units (M10-06) -----------------------------------------------------------
+
+/// YouTube's units for each call in a fake's log: a read is 1, every write 50.
+fn units(calls: &[String]) -> u32 {
+    calls.iter().map(|c| if c.starts_with("GET ") { 1 } else { 50 }).sum()
+}
+
+fn reads(calls: &[String], what: &str) -> usize {
+    calls.iter().filter(|c| c.starts_with(&format!("GET {what}"))).count()
+}
+
+/// A channel with its default key and a Ferrocast broadcast waiting on it, as after a first stream.
+fn a_channel_with_a_broadcast() -> ScriptedYoutube {
+    ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k-main",
+        )]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![json!({
+            "id": "b1",
+            "snippet": { "title": "Live now" },
+            "status": { "lifeCycleStatus": "ready" },
+            "contentDetails": { "boundStreamId": "s1", "enableAutoStart": true }
+        })]])),
+        ..Default::default()
+    }
+}
+
+/// A title and then a thumbnail, set one after the other as Go live does, listed the channel's
+/// streams and broadcasts twice (3 units a time, each time); the lookup is kept for a minute and
+/// forgotten at any write, and going live reads the channel as it is.
+#[tokio::test]
+async fn a_title_and_a_thumbnail_are_one_lookup_not_two() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let info = StreamInfo { title: Some("Ranked all night".into()), ..Default::default() };
+
+    // As before (nothing kept): two lookups.
+    let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+    let old = video_api(ep).with_read_cache(Duration::ZERO);
+    old.update_broadcast_info(&info).await.unwrap();
+    old.set_thumbnail(b"x", "image/png").await.unwrap();
+    let before = calls.lock().unwrap().clone();
+    assert_eq!((reads(&before, "/liveStreams"), reads(&before, "/liveBroadcasts")), (2, 4), "{before:?}");
+
+    // Now: one.
+    let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+    let api = video_api(ep);
+    api.update_broadcast_info(&info).await.unwrap();
+    api.set_thumbnail(b"x", "image/png").await.unwrap();
+    let after = calls.lock().unwrap().clone();
+    assert_eq!((reads(&after, "/liveStreams"), reads(&after, "/liveBroadcasts")), (1, 2), "{after:?}");
+    eprintln!("units for a title and a thumbnail: {} before, {} after", units(&before), units(&after));
+    assert!(units(&after) < units(&before));
+
+    // Going live reads the channel as it is now, never what was kept; and writes it makes empty it.
+    let n = reads(&after, "/liveStreams");
+    api.ingest().await.unwrap();
+    let live = calls.lock().unwrap().clone();
+    assert_eq!(reads(&live, "/liveStreams"), n + 1, "going live listed the streams again: {live:?}");
+}
+
+/// A write forgets what was kept: the lookup after it reads again.
+#[tokio::test]
+async fn a_write_forgets_the_kept_lookup() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let info = StreamInfo { title: Some("A".into()), ..Default::default() };
+    let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+    let api = video_api(ep);
+    api.update_broadcast_info(&info).await.unwrap();
+    // A broadcast is made on the vertical stream: lists change.
+    api.vertical_ingest().await.unwrap();
+    let before = reads(&calls.lock().unwrap(), "/liveStreams");
+    api.set_thumbnail(b"x", "image/png").await.unwrap();
+    let after = reads(&calls.lock().unwrap(), "/liveStreams");
+    assert_eq!(after, before + 1, "the thumbnail's lookup read again after the writes: {:?}", calls.lock().unwrap());
+}
+
+/// The bot's polling for a live chat is never answered from what was kept.
+#[tokio::test]
+async fn looking_for_the_live_chat_is_never_answered_from_the_kept_lists() {
+    let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+    let api = video_api(ep);
+    api.active_live_chat().await.unwrap();
+    api.active_live_chat().await.unwrap();
+    assert_eq!(reads(&calls.lock().unwrap(), "/liveBroadcasts"), 2);
+}
+
+/// A whole Go live with a title, a thumbnail and the vertical stream, as the engine does it:
+/// what it costs in YouTube's units with nothing kept, and now.
+#[tokio::test]
+async fn units_for_a_whole_go_live() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let info = StreamInfo { title: Some("Ranked all night".into()), ..Default::default() };
+    let go_live = |keep: Duration| {
+        let info = info.clone();
+        async move {
+            let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+            let api = video_api(ep).with_read_cache(keep);
+            api.update_broadcast_info(&info).await.unwrap();
+            api.set_thumbnail(b"x", "image/png").await.unwrap();
+            api.ingest().await.unwrap();
+            api.vertical_ingest().await.unwrap();
+            let log = calls.lock().unwrap().clone();
+            (units(&log), log)
+        }
+    };
+    let (before, _) = go_live(Duration::ZERO).await;
+    let (after, log) = go_live(Duration::from_secs(60)).await;
+    eprintln!("units for a whole Go live (title, thumbnail, normal and vertical): {before} before, {after} after");
+    assert!(after < before, "{log:?}");
+}
+
+/// YouTube's second ingest for the same key rides along, of the same kind as the first (secure when
+/// that is); one of another kind, or none, leaves the stream with just the first.
+#[test]
+fn the_backup_ingest_comes_with_the_stream_key() {
+    let item = |info: serde_json::Value| {
+        json!({ "items": [{ "id": "s1", "snippet": { "title": "Default", "isDefaultStream": true },
+            "cdn": { "ingestionType": "rtmp", "resolution": "variable", "frameRate": "variable", "ingestionInfo": info } }] })
+    };
+    let secure = item(json!({
+        "streamName": "k",
+        "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com:443/live2",
+        "rtmpsBackupIngestionAddress": "rtmps://b.rtmps.youtube.com:443/live2?backup=1",
+        "ingestionAddress": "rtmp://a.rtmp.youtube.com/live2",
+        "backupIngestionAddress": "rtmp://b.rtmp.youtube.com/live2?backup=1"
+    }));
+    let i = api::pick_stream(&secure, None).unwrap();
+    assert_eq!(i.url, "rtmps://a.rtmps.youtube.com:443/live2");
+    assert_eq!(i.backup.as_deref(), Some("rtmps://b.rtmps.youtube.com:443/live2?backup=1"));
+    // Plain RTMP only: the plain backup.
+    let plain = item(json!({
+        "streamName": "k",
+        "ingestionAddress": "rtmp://a.rtmp.youtube.com/live2",
+        "backupIngestionAddress": "rtmp://b.rtmp.youtube.com/live2?backup=1"
+    }));
+    let i = api::pick_stream(&plain, None).unwrap();
+    assert_eq!(i.backup.as_deref(), Some("rtmp://b.rtmp.youtube.com/live2?backup=1"));
+    // A secure first server never gets a plain backup, and none given is none.
+    let mixed = item(json!({
+        "streamName": "k",
+        "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com:443/live2",
+        "backupIngestionAddress": "rtmp://b.rtmp.youtube.com/live2?backup=1"
+    }));
+    assert_eq!(api::pick_stream(&mixed, None).unwrap().backup, None);
+    let alone = item(json!({ "streamName": "k", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com:443/live2" }));
+    assert_eq!(api::pick_stream(&alone, None).unwrap().backup, None);
 }

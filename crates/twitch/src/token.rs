@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Mutex;
 
@@ -17,6 +18,10 @@ pub struct Auth {
     pub(crate) client_id: String,
     tokens: Mutex<Tokens>,
     on_tokens: OnTokens,
+    /// The newest tokens couldn't be saved: saving is tried again at every use, so a keychain
+    /// that was only briefly locked has them before the app quits (the saved refresh token is
+    /// one Twitch already retired).
+    unsaved: AtomicBool,
 }
 
 impl fmt::Debug for Auth {
@@ -30,7 +35,7 @@ impl Auth {
     /// `on_tokens` must persist new tokens (the secret store) and return an error if it couldn't;
     /// a refresh whose result can't be saved would lose the account at the next restart.
     pub fn new(http: reqwest::Client, ep: Endpoints, client_id: String, tokens: Tokens, on_tokens: OnTokens) -> Self {
-        Auth { http, ep, client_id, tokens: Mutex::new(tokens), on_tokens }
+        Auth { http, ep, client_id, tokens: Mutex::new(tokens), on_tokens, unsaved: AtomicBool::new(false) }
     }
 
     /// A valid access token, refreshing first when it's about to expire.
@@ -38,6 +43,8 @@ impl Auth {
         let mut t = self.tokens.lock().await;
         if t.needs_refresh(now_ms()) {
             *t = self.refresh_locked(&t).await?;
+        } else {
+            self.save_again(&t);
         }
         Ok(t.access_token.clone())
     }
@@ -46,6 +53,7 @@ impl Auth {
     pub async fn refresh_after_401(&self, seen: &str) -> Result<String, TwitchError> {
         let mut t = self.tokens.lock().await;
         if t.access_token != seen {
+            self.save_again(&t);
             return Ok(t.access_token.clone());
         }
         *t = self.refresh_locked(&t).await?;
@@ -58,9 +66,29 @@ impl Auth {
 
     async fn refresh_locked(&self, current: &Tokens) -> Result<Tokens, TwitchError> {
         let fresh = auth::refresh(&self.http, &self.ep, &self.client_id, &current.refresh_token).await?;
-        (self.on_tokens)(&fresh)
-            .map_err(|e| TwitchError::Refused(format!("couldn't save the new Twitch sign-in: {e}")))?;
+        // Twitch has already retired the old refresh token: the new tokens are kept even when
+        // saving them failed (a keychain hiccup), else the very next refresh would sign out for
+        // good, and saved again at the next use (`save_again`).
+        self.save(&fresh);
         tracing::info!("Twitch sign-in refreshed");
         Ok(fresh)
+    }
+
+    fn save(&self, t: &Tokens) {
+        match (self.on_tokens)(t) {
+            Ok(()) => self.unsaved.store(false, Ordering::Release),
+            Err(e) => {
+                // Logged once, not at every retry.
+                if !self.unsaved.swap(true, Ordering::AcqRel) {
+                    tracing::error!(error = %e, "couldn't save the new Twitch sign-in; it's kept for this session, saving is retried");
+                }
+            }
+        }
+    }
+
+    fn save_again(&self, t: &Tokens) {
+        if self.unsaved.load(Ordering::Acquire) {
+            self.save(t);
+        }
     }
 }

@@ -17,6 +17,10 @@ pub use apple::media;
 pub use apple::screen;
 #[cfg(target_os = "windows")]
 mod win;
+// Built for its tests elsewhere too (format picking, pacing, monitor matching).
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod win_logic;
 /// Cameras and microphones (Windows: DirectShow through FFmpeg, WASAPI).
 #[cfg(target_os = "windows")]
 pub use win::camera;
@@ -56,7 +60,9 @@ pub mod mp4;
 pub mod obs;
 pub mod pipeline;
 pub mod preview;
+pub mod rt;
 pub mod shaderfx;
+mod sleep;
 /// Sound in through cpal: microphones, and the computer's own sound (Windows).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod sound_in;
@@ -185,6 +191,90 @@ impl Picture {
         }
         Self { width, height, rgba, premultiplied: true }
     }
+
+    /// Resizes proportionally so width is at most `max_width` (bilinear/triangle filter).
+    pub fn scaled_to_width(&self, max_width: u32) -> Self {
+        let max_w = max_width.clamp(16, 1280);
+        if self.width <= max_w || self.width == 0 || self.height == 0 {
+            return self.clone();
+        }
+        let target_h = ((u64::from(self.height) * u64::from(max_w)) / u64::from(self.width)).max(1) as u32;
+        let Some(img) = image::RgbaImage::from_raw(self.width, self.height, self.rgba.clone()) else {
+            return self.clone();
+        };
+        let resized = image::imageops::resize(&img, max_w, target_h, image::imageops::FilterType::Triangle);
+        Self { width: max_w, height: target_h, rgba: resized.into_raw(), premultiplied: self.premultiplied }
+    }
+
+    /// Encodes RGBA pixels over opaque black as JPEG bytes (`quality` clamped to 40..=95).
+    pub fn encode_jpeg_rgba(
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        premultiplied: bool,
+        quality: u8,
+    ) -> Result<Vec<u8>, AvError> {
+        if width == 0 || height == 0 || rgba.len() < width as usize * height as usize * 4 {
+            return Err(AvError::BadPixels(width, height));
+        }
+        let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+        for px in rgba.as_chunks::<4>().0.iter().take(width as usize * height as usize) {
+            if premultiplied {
+                rgb.extend_from_slice(&px[..3]);
+            } else {
+                let a = u16::from(px[3]);
+                rgb.push(((u16::from(px[0]) * a + 127) / 255) as u8);
+                rgb.push(((u16::from(px[1]) * a + 127) / 255) as u8);
+                rgb.push(((u16::from(px[2]) * a + 127) / 255) as u8);
+            }
+        }
+        let mut out = Vec::with_capacity((width as usize * height as usize) / 4);
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(40, 95));
+        enc.encode(&rgb, width, height, image::ExtendedColorType::Rgb8)
+            .map_err(|e| AvError::Encoder(format!("jpeg thumbnail encode failed ({e})")))?;
+        Ok(out)
+    }
+}
+
+/// One-shot still of a display or window across platforms, stopping immediately after the first
+/// frame or early if `cancel` flips to `true`.
+pub fn screen_still_cancel(
+    target: screen::Target,
+    width: u32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Picture, AvError> {
+    let w = width.clamp(64, 320);
+    let cap = screen::ScreenCapture::start(target, w, w, 4, false)?;
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+    while std::time::Instant::now() < until {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AvError::Source("thumbnail request cancelled".into()));
+        }
+        if let Some(p) = cap.take() {
+            return Ok(p.scaled_to_width(w));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    Err(AvError::Source("the screen gave no picture in time".into()))
+}
+
+/// One-shot still of a camera or capture card across platforms, stopping immediately after the
+/// first frame or early if `cancel` flips to `true`.
+pub fn camera_still_cancel(id: &str, width: u32, cancel: &std::sync::atomic::AtomicBool) -> Result<Picture, AvError> {
+    let w = width.clamp(64, 320);
+    let spec = engine::CameraSpec { id: id.to_string(), size: None, fps: None };
+    let cap = camera::Capture::camera(&spec)?;
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while std::time::Instant::now() < until {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AvError::Source("thumbnail request cancelled".into()));
+        }
+        if let Some((p, _)) = cap.take_frame() {
+            return Ok(p.scaled_to_width(w));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    Err(AvError::Source("the camera gave no picture in time".into()))
 }
 
 /// Ferrocast's own picture filters, applied to an item's picture in order before it's placed

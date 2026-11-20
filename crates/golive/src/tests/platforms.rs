@@ -280,68 +280,312 @@ async fn a_platform_that_stops_reading_is_called_stalled_backs_off_and_spares_th
     feeder.abort();
 }
 
-/// OBS drops frames when a platform falls 700 ms behind (its "drop threshold"); here a platform
-/// on a slow link may be a couple of seconds behind the live picture, no more: further behind it
-/// is showing the past, and the stream's delay grows by the minute. What is measured is what a
-/// viewer feels: the newest frame the platform was given against the newest sent. Frames never
-/// given are not delay: leaving them out is how a slow platform catches up.
-#[tokio::test]
-#[ignore = "finding M3.4: on a 20 KB/s link the newest picture it has is ~7 s old (frame 16 of 230, nothing dropped); agy's skip to the newest keyframe when far behind is what makes it pass"]
-async fn a_slow_platform_falls_behind_alone_and_never_far() {
-    const FRAME: usize = 20 * 1024;
+/// A link far too slow for the stream (160 kbit/s against 2 to 5 Mbit/s) can't stay live at any
+/// buffer size: the bytes already handed to the kernel sit in the OS buffers (OBS doesn't cap
+/// SO_SNDBUF either, and a cap would hurt normal links). What must happen is what upload
+/// protection does (M3.5): the destination is judged slow, paused within a bounded time as the
+/// bottom one of the order (the engine puts "Paused to keep Twitch smooth; it comes back by
+/// itself." on it), nothing more is sent to it, and the good destination never notices.
+async fn a_hopeless_link_is_paused_and_the_good_one_never_notices(frame: usize) {
     let w = world().await;
     let (ls, lg) = (free_listener().await, free_listener().await);
     let (sport, gport) = (ls.local_addr().unwrap().port(), lg.local_addr().unwrap().port());
-    // 8 KB every 400 ms (20 KB/s) against a stream of about 600 KB/s.
-    let mut slow_got = platform_that_is_slow(ls, "k", 8 * 1024, Duration::from_millis(400)).await;
+    // 8 KB every 400 ms (20 KB/s = 160 kbit/s).
+    let _slow_got = platform_that_is_slow(ls, "k", 8 * 1024, Duration::from_millis(400)).await;
     let mut good_got = platform(lg, "k").await;
-    let mut slow = start(&w, destination_with(sport, "kick", 200, 4000));
+    // The slow one has its own stop, as the engine's pause stops just that destination.
+    let (slow_stop, slow_stop_rx) = watch::channel(false);
+    let (tx, mut slow) = watch::channel(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        link: None,
+        via: None,
+        since_ms: 0,
+    });
+    tokio::spawn(push::run(destination_with(sport, "kick", 200, 4000), w.hub.clone(), tx, slow_stop_rx));
     let mut good = start(&w, destination_with(gport, "twitch", 200, 4000));
     let obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
     let sent = Arc::new(AtomicU64::new(0));
-    let feeder = feed(obs, FRAME, Duration::from_millis(33), sent.clone());
+    let feeder = feed(obs, frame, Duration::from_millis(33), sent.clone());
 
     state_is(&mut good, |s| *s == PushState::Live).await;
     let good_since = good.borrow().since_ms;
     state_is(&mut slow, |s| *s == PushState::Live).await;
-    tokio::time::sleep(Duration::from_secs(8)).await;
 
-    // Of what was sent (30 a second), the good one has nearly all.
+    // The engine's loop, once a second, with the destinations that are live: the top of the
+    // order keeps going, the bottom is the one that pauses.
+    let mut protector = crate::protect::Protector::default();
+    let order = ["twitch", "kick"];
+    let started = std::time::Instant::now();
+    let mut paused_after = None;
+    let mut slow_sent_at_pause = 0u64;
+    for second in 0..25u64 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (g, sl) = (good.borrow().clone(), slow.borrow().clone());
+        let want = w.hub.stats().kbps;
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let mut live = Vec::new();
+        if g.state == PushState::Live {
+            live.push(sample("twitch", &g, want, now_ms));
+        }
+        if sl.state == PushState::Live && paused_after.is_none() {
+            live.push(sample("kick", &sl, want, now_ms));
+        }
+        match protector.tick(started + Duration::from_secs(second), &live, &order) {
+            Some(crate::protect::Action::Pause(id)) => {
+                assert_eq!(id, "kick", "only the slow one is ever paused");
+                slow_sent_at_pause = sl.sent;
+                paused_after = Some(second + 1);
+                slow_stop.send_replace(true);
+            }
+            Some(other) => panic!("{other:?}"),
+            None => {}
+        }
+        if paused_after.is_some_and(|p| second >= p + 3) {
+            break;
+        }
+    }
+    let paused_after = paused_after.expect("upload protection paused the destination that can't keep up");
+    // Within a bounded time: warm-up, 3 s of rate to judge, 4 s of trouble (about 7 to 9 s). It
+    // used to take the 10 s write deadline more at 2 Mbit/s, when the rate looked fine until then.
+    assert!(paused_after <= 12, "it took {paused_after} s to be paused");
+
+    // Nothing more is sent to it once paused; what it was handed overall is bounded (the OS
+    // buffers and one retry's burst), not growing with the stream.
+    let sent_after = slow.borrow().sent;
+    assert!(sent_after <= slow_sent_at_pause + 1_000_000, "{sent_after} bytes now, {slow_sent_at_pause} at the pause");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(slow.borrow().sent, sent_after, "nothing more goes to a paused destination");
+    assert!(sent_after < 4_000_000, "{sent_after} bytes handed to the slow link in all");
+
+    // The good one never noticed: live all along, never reconnected, nothing skipped, nearly
+    // every frame there.
     let (_, videos, _) = tally(&mut good_got);
     let sent_n = sent.load(Ordering::Relaxed);
     assert!(videos as u64 * 10 >= sent_n * 8, "the good one got {videos} of {sent_n} frames");
     assert_eq!(good.borrow().state, PushState::Live);
     assert_eq!(good.borrow().since_ms, good_since, "the good one was never reconnected");
     assert_eq!(good.borrow().dropped, 0);
-
-    // The slow one: never silent about why it isn't live, if it isn't.
-    let h = slow.borrow().clone();
-    match &h.state {
-        PushState::Live => {}
-        PushState::Reconnecting { reason, .. } => assert!(reason.contains("stalled"), "{reason}"),
-        s => panic!("the slow destination is {s:?}"),
-    }
-    // How old is the newest picture it was given? (frame numbers ride in the frames' bytes)
-    let mut newest: Option<u32> = None;
-    while let Ok(g) = slow_got.try_recv() {
-        if let Got::Video(_, data) = g
-            && data.len() >= 9
-            && data[1] == 1
-        {
-            let n = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
-            newest = Some(newest.map_or(n, |m| m.max(n)));
-        }
-    }
-    let newest = newest.expect("the slow platform was given pictures");
-    let behind_s = (sent_n.saturating_sub(1).saturating_sub(u64::from(newest))) as f64 * 0.033;
-    eprintln!(
-        "slow destination: newest picture it got is frame {newest} of {sent_n} sent: {behind_s:.1} s old, dropped {}",
-        h.dropped
-    );
-    assert!(
-        behind_s <= 2.0,
-        "the newest picture the slow platform has is {behind_s:.1} s old (frame {newest} of {sent_n})"
-    );
-    let _ = FRAME;
     feeder.abort();
+}
+
+/// About 5 Mbit/s: the slow one's first second looks like a burst, then its rate collapses.
+#[tokio::test]
+async fn a_slow_platform_on_a_5_mbit_stream_is_paused_and_the_good_one_never_notices() {
+    a_hopeless_link_is_paused_and_the_good_one_never_notices(20 * 1024).await;
+}
+
+/// About 2 Mbit/s: the slow one's measured rate stays high until the 10 s write deadline, so
+/// the pause comes later (and still comes).
+#[tokio::test]
+async fn a_slow_platform_on_a_2_mbit_stream_is_paused_and_the_good_one_never_notices() {
+    a_hopeless_link_is_paused_and_the_good_one_never_notices(8 * 1024).await;
+}
+
+/// What the engine's one-second upload-protection loop does with this destination's numbers
+/// (`Engine::protect_tick`): its health becomes a sample, judged against the stream's own rate.
+fn sample<'a>(id: &'a str, h: &Health, want_kbps: u32, now_ms: u64) -> crate::protect::Sample<'a> {
+    crate::protect::Sample {
+        id,
+        kbps: h.kbps,
+        want_kbps,
+        dropped: h.dropped,
+        live_ms: now_ms.saturating_sub(h.since_ms),
+    }
+}
+
+/// A destination that stopped reading blocks its writes for up to the 10 s write deadline. Its
+/// rate is reported as it happens, so within about two seconds it reads 0 while it is still
+/// "Live" (the state changes only at the deadline), and upload protection can see it.
+#[tokio::test]
+async fn a_stalled_writer_reports_no_rate_within_a_couple_of_seconds() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_stalls(l, "k").await;
+    let mut dest = start(&w, destination_with(dport, "kick", 200, 4000));
+    let obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let sent = Arc::new(AtomicU64::new(0));
+    let feeder = feed(obs, 20 * 1024, Duration::from_millis(33), sent.clone());
+    state_is(&mut dest, |s| *s == PushState::Live).await;
+    // The kernel's buffers take a few hundred kilobytes first: it shows a rate.
+    let filling = timeout(Duration::from_secs(5), dest.wait_for(|h| h.kbps > 500)).await.is_ok();
+    assert!(filling, "the buffers filled at some rate");
+    // Then nothing is taken: 0, and still Live, within a few seconds (the deadline is 10).
+    let got = timeout(Duration::from_secs(4), dest.wait_for(|h| h.kbps == 0 && h.sent > 100_000)).await.is_ok();
+    let h = dest.borrow().clone();
+    assert!(got, "no rate reported while its writes are blocked: {h:?}");
+    assert_eq!(h.state, PushState::Live, "still within the write deadline");
+    feeder.abort();
+}
+
+// --- a backup server for the same key (YouTube's backup ingest, M10-05) ---------------------
+
+/// A destination with a backup server beside its own.
+fn with_backup(primary: u16, backup: u16) -> Destination {
+    Destination {
+        backup: Some(Target::parse(&format!("rtmp://127.0.0.1:{backup}/app")).unwrap()),
+        ..destination_with(primary, "youtube", 20, 100)
+    }
+}
+
+/// A port nothing listens on.
+async fn dead_port() -> u16 {
+    let l = free_listener().await;
+    let p = l.local_addr().unwrap().port();
+    drop(l);
+    p
+}
+
+/// A main server that can't be reached: after `BACKUP_AFTER` tries the stream goes to the backup,
+/// said in words, and it is live there.
+#[tokio::test]
+async fn a_dead_main_server_goes_to_the_backup_after_a_few_tries() {
+    let w = world().await;
+    let primary = dead_port().await;
+    let l = free_listener().await;
+    let bport = l.local_addr().unwrap().port();
+    let mut got = platform(l, "k").await;
+    let mut health = start(&w, with_backup(primary, bport));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    // The third failure says it is switching.
+    let said = state_within(
+        &mut health,
+        LONG,
+        |s| matches!(s, PushState::Reconnecting { reason, .. } if reason.contains("backup server")),
+    )
+    .await;
+    match said.state {
+        PushState::Reconnecting { attempt, .. } => {
+            assert_eq!(attempt, push::BACKUP_AFTER, "after {} tries", push::BACKUP_AFTER)
+        }
+        s => panic!("{s:?}"),
+    }
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()), "the same key, at the backup");
+}
+
+/// A destination without a backup (every one but YouTube) is as it was: it keeps trying its one
+/// server and never says anything about another.
+#[tokio::test]
+async fn a_destination_without_a_backup_keeps_trying_its_own_server() {
+    let w = world().await;
+    let primary = dead_port().await;
+    let mut health = start(&w, destination_with(primary, "twitch", 20, 100));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    for _ in 0..2 * push::BACKUP_AFTER {
+        match state_within(&mut health, LONG, |s| {
+            matches!(s, PushState::Reconnecting { .. } | PushState::Failed { .. })
+        })
+        .await
+        .state
+        {
+            PushState::Reconnecting { reason, .. } => assert!(!reason.contains("backup"), "{reason}"),
+            PushState::Failed { reason, detail, .. } => {
+                assert!(!reason.contains("backup"), "{reason}");
+                assert!(!detail.as_deref().unwrap_or("").contains("backup"), "{detail:?}");
+                break;
+            }
+            s => panic!("{s:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    let attempt = match &health.borrow().state {
+        PushState::Reconnecting { attempt, .. } | PushState::Failed { attempts: attempt, .. } => *attempt,
+        s => panic!("{s:?}"),
+    };
+    assert!(attempt > push::BACKUP_AFTER, "{attempt}");
+}
+
+/// A key the server refuses isn't a server that can't be reached: no backup is tried for it.
+#[tokio::test]
+async fn a_refused_key_does_not_move_to_the_backup() {
+    let w = world().await;
+    let (lp, lb) = (free_listener().await, free_listener().await);
+    let (pport, bport) = (lp.local_addr().unwrap().port(), lb.local_addr().unwrap().port());
+    let _p = platform(lp, "right-key").await;
+    let mut b = platform(lb, "right-key").await;
+    let dest = Destination { key: "wrong-key".into(), ..with_backup(pport, bport) };
+    let mut health = start(&w, dest);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    for _ in 0..push::BACKUP_AFTER + 2 {
+        match state_within(&mut health, LONG, |s| {
+            matches!(s, PushState::Reconnecting { .. } | PushState::Failed { .. })
+        })
+        .await
+        .state
+        {
+            PushState::Reconnecting { reason, .. } => assert!(!reason.contains("backup"), "{reason}"),
+            PushState::Failed { reason, detail, refused, .. } => {
+                assert!(refused);
+                assert!(!reason.contains("backup"), "{reason}");
+                assert!(!detail.as_deref().unwrap_or("").contains("backup"), "{detail:?}");
+                break;
+            }
+            s => panic!("{s:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    assert!(timeout(Duration::from_millis(200), b.recv()).await.is_err(), "the backup was never asked");
+}
+
+/// The main server comes back: the next stream starts on it, not on the backup that held before.
+#[tokio::test]
+async fn the_next_stream_starts_on_the_main_server_again() {
+    let w = world().await;
+    let primary = dead_port().await;
+    let l = free_listener().await;
+    let bport = l.local_addr().unwrap().port();
+    let mut backup_got = platform(l, "k").await;
+    let mut health = start(&w, with_backup(primary, bport));
+    let obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut backup_got).await, Got::Publish("k".into()));
+    // The stream ends; the main server is back before the next one.
+    drop(obs);
+    state_within(&mut health, LONG, |s| *s == PushState::Waiting).await;
+    let mut main_got = platform(TcpListener::bind(("127.0.0.1", primary)).await.unwrap(), "k").await;
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut main_got).await, Got::Publish("k".into()), "the main server, the backup not needed");
+}
+
+/// A backup that held for a while and then dropped: the main server first again (it may have
+/// come back meanwhile), not the backup that just failed.
+#[tokio::test]
+async fn a_backup_that_held_then_dropped_gives_way_to_the_main_server() {
+    let w = world().await;
+    let primary = dead_port().await;
+    let l = free_listener().await;
+    let bport = l.local_addr().unwrap().port();
+    // It takes the stream and hangs up after 31 s (STAYED_LIVE_MS is 30).
+    let mut backup_got = platform_that_drops(l, "k", Duration::from_secs(31)).await;
+    let mut health = start(&w, with_backup(primary, bport));
+    // OBS keeps sending (the ingest hangs up on a silent one after 30 s).
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    obs.meta().await;
+    obs.video(0, AVC_HEADER).await;
+    tokio::spawn(async move {
+        let mut ts = 10;
+        loop {
+            obs.video(ts, if ts % 2000 == 0 { KEY } else { INTER }).await;
+            ts += 1000;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut backup_got).await, Got::Publish("k".into()));
+    // The main server is up now.
+    let mut main_got = platform(TcpListener::bind(("127.0.0.1", primary)).await.unwrap(), "k").await;
+    let said = state_within(
+        &mut health,
+        Duration::from_secs(40),
+        |s| matches!(s, PushState::Reconnecting { reason, .. } if reason.contains("main server again")),
+    )
+    .await;
+    assert!(matches!(said.state, PushState::Reconnecting { .. }));
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut main_got).await, Got::Publish("k".into()));
 }

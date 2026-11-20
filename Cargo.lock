@@ -2241,6 +2241,7 @@ dependencies = [
  "ferrocast-engine",
  "ferrocast-guest",
  "ferrocast-server",
+ "ferrocast-store",
  "ferrocast-studio",
  "ferrocast-vsthost",
  "ferrocore",

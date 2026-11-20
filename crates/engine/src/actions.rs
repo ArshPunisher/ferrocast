@@ -627,6 +627,7 @@ impl Engine {
             "connectors": st.connectors,
             "panic": st.panic_on,
             "session": st.session,
+            "safe_mode": self.safe_mode_status(),
         })
     }
 

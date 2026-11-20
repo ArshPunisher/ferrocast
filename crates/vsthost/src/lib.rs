@@ -25,6 +25,9 @@ pub use client::{Helper, scan};
 /// Whether VST plugins run here: Err says why not (no sandbox for them on this system yet,
 /// or no helper in this build).
 pub fn available() -> Result<(), String> {
+    if ferrocore::afx::plugins_disabled() {
+        return Err("VST plugins are disabled in Safe Mode.".into());
+    }
     if !cfg!(target_os = "macos") {
         return Err("VST plugins come to this system with their sandbox (Mac only for now).".into());
     }
@@ -64,3 +67,24 @@ pub fn plugins(rescan: bool) -> Vec<Found> {
     l
 }
 pub use effect::{install, live};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_mode_blocks_vst_availability_and_plugin_list() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ferrocore::afx::set_plugins_disabled(false);
+            }
+        }
+        let _guard = Reset;
+
+        ferrocore::afx::set_plugins_disabled(true);
+        let err = available().err().unwrap_or_else(|| panic!("expected Safe Mode error"));
+        assert!(err.contains("Safe Mode"), "unexpected error: {err}");
+        assert!(plugins(false).is_empty(), "plugins() must return empty when disabled");
+    }
+}

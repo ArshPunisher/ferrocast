@@ -7,10 +7,11 @@
 
 pub mod app_sound;
 pub mod camera;
+pub(crate) mod power;
 pub mod screen;
 pub mod wgc;
 
 /// Video and sound files.
 pub mod media {
-    pub use crate::ffsrc::{Control, Media, MediaState};
+    pub use crate::ffsrc::{Control, Media, MediaOptions, MediaState};
 }

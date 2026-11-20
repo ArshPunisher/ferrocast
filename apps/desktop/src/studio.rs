@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{
     CaptionsSet, FilePick, FilterEdit, FollowSet, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq,
-    STOPPED, ShelfAct, StudioAct, StudioHost, StudioSettings, StudioStatus,
+    STOPPED, ShelfAct, StreamCap, StudioAct, StudioHost, StudioSettings, StudioStatus,
 };
 // The Studio's scenes kept by Ferrocast's own engine (ENGINE.md step 3): no libobs.
 use ferrocast_studio::stage::Stage as Collection;
@@ -38,7 +38,6 @@ use crate::studio_library::{self as library, Kind};
 /// it either). Stop takes the scenes and preview away; Start loads them back on the same engine.
 #[derive(Default)]
 struct Held {
-    collection: Option<Collection>,
     preview: Option<Preview>,
     /// Where the preview is, to make it again when the canvas changes.
     preview_at: Option<(Rect, f64)>,
@@ -115,6 +114,13 @@ struct Held {
     follow_run: u64,
     /// Auto quality's share of the set bitrate on the stream now (None: all of it).
     live_pct: Option<u8>,
+    /// Shared-stream ceiling pushed by Go live (Twitch 6,000 / Kick 8,000 kbps H.264 2 s).
+    stream_cap: Option<StreamCap>,
+    /// Kept LAST so Rust's implicit drop order always drops outputs before the collection.
+    collection: Option<Collection>,
+    /// True in Safe Mode when a temporary empty collection is running until the user confirms
+    /// loading the saved collection; guards against overwriting the saved file on disk.
+    collection_deferred: bool,
 }
 
 /// `kbps` at auto quality's share `pct` (the floor a stream never goes under: 300).
@@ -332,6 +338,7 @@ fn encode_of(s: &StudioSettings) -> EncodeSettings {
         video_encoder: chosen.cloned().unwrap_or_else(|| hardware.unwrap_or("obs_x264").into()),
         video_kbps: s.video_kbps,
         vbr: s.vbr,
+        strict_cbr: false,
         quality: None,
         keyframe_s: s.keyframe_s,
         profile: s.profile.clone(),
@@ -428,12 +435,12 @@ fn light_size(width: u32, height: u32) -> Option<(u32, u32)> {
     })
 }
 
-fn encode_budget(s: &StudioSettings, engines: Option<u32>, also: Also) -> Value {
+fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32>, also: Also) -> Value {
     let mpx = |w: u32, h: u32| f64::from(w) * f64::from(h) * f64::from(s.fps) / 1e6;
     let canvas = mpx(s.width, s.height);
     // Only the video encoder's own encodes count: x264 (software, Lossless) runs on the CPU.
     let hardware = |id: &str| !id.to_ascii_lowercase().contains("x264");
-    let mut stream = stream_settings(s);
+    let mut stream = stream_settings(s, cap);
     // Twitch Enhanced Broadcasting's qualities: Twitch's plan sets them when the stream starts;
     // about 720p and 480p beside the main one (projects-60).
     if also.enhanced {
@@ -450,7 +457,7 @@ fn encode_budget(s: &StudioSettings, engines: Option<u32>, also: Also) -> Value 
     }
     let plan = ferrocast_studio::RecordPlan {
         tracks: s.record_tracks.clone(),
-        encode: record_encode(s),
+        encode: record_encode_capped(s, cap),
         ..Default::default()
     };
     let shares = ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps)
@@ -485,11 +492,50 @@ fn encode_budget(s: &StudioSettings, engines: Option<u32>, also: Also) -> Value 
     })
 }
 
+/// Replaces any HEVC/H.265 encoder id with its H.264 counterpart when a destination requires H.264.
+fn h264_encoder_for(id: &str) -> String {
+    let low = id.to_ascii_lowercase();
+    if !low.contains("hevc") && !low.contains("h265") {
+        return id.to_string();
+    }
+    if let Some(prefix) = id.strip_suffix(".hevc") {
+        format!("{prefix}.avc")
+    } else if cfg!(target_os = "macos") {
+        "com.apple.videotoolbox.videoencoder.ave.avc".into()
+    } else {
+        "ffmpeg_hardware".into()
+    }
+}
+
+/// Effective encode settings for the main stream after clamping to `cap` (if any) and `live_pct`.
+fn effective_stream_encode(s: &StudioSettings, cap: Option<StreamCap>, live_pct: Option<u8>) -> EncodeSettings {
+    let mut e = encode_of(s);
+    if let Some(cap) = cap {
+        e.video_kbps = e.video_kbps.min(cap.max_kbps);
+        if cap.h264_only {
+            e.video_encoder = h264_encoder_for(&e.video_encoder);
+        }
+        if cap.keyframe_secs > 0 {
+            e.keyframe_s = cap.keyframe_secs;
+        }
+        // Strict CBR with 1x VBV (FFmpeg) / DataRateLimits (VideoToolbox) prevents platform peaks.
+        e.vbr = false;
+        e.strict_cbr = true;
+    }
+    e.video_kbps = at_pct(e.video_kbps, live_pct);
+    e
+}
+
+fn shape_differs(a: &EncodeSettings, b: &EncodeSettings) -> bool {
+    let normalize = |e: &EncodeSettings| EncodeSettings { video_kbps: 0, audio_kbps: 0, ..e.clone() };
+    normalize(a) != normalize(b)
+}
+
 /// What the Studio streams into Go live with. Go live sends it on as it comes, so this is what
-/// viewers get (Twitch takes up to 6000 kbps; Kick refuses over 8000, 25 Oct).
-fn stream_settings(s: &StudioSettings) -> StreamSettings {
+/// viewers get (capped when Twitch or Kick is active).
+fn stream_settings(s: &StudioSettings, cap: Option<StreamCap>) -> StreamSettings {
     StreamSettings {
-        encode: encode_of(s),
+        encode: effective_stream_encode(s, cap, None),
         reconnect: s.reconnect.then_some((s.reconnect_tries, s.reconnect_every_s)),
         delay_s: s.delay_s,
         vod_track: (s.twitch_vod_track >= 2).then_some(s.twitch_vod_track),
@@ -500,6 +546,18 @@ fn stream_settings(s: &StudioSettings) -> StreamSettings {
 
 /// What a recording uses: the stream's settings, or constant quality (high: near-lossless
 /// with the same encoder; lossless: x264, much bigger files).
+/// What a recording is encoded with: "Same as stream" is the stream's own encode, held to the
+/// platform's limit when one is (so it can share the stream's encoder, in either order, and a
+/// stream joining the recording's encoder is as strict as it asks); the others are as chosen.
+fn record_encode_capped(s: &StudioSettings, cap: Option<StreamCap>) -> EncodeSettings {
+    if s.record_quality == "stream"
+        && let Some(cap) = cap
+    {
+        return EncodeSettings { scale: None, ..effective_stream_encode(s, Some(cap), None) };
+    }
+    record_encode(s)
+}
+
 fn record_encode(s: &StudioSettings) -> EncodeSettings {
     let mut e = encode_of(s);
     match s.record_quality.as_str() {
@@ -567,7 +625,57 @@ fn forget(data: &std::path::Path, kind: Kind, id: &str) {
     let mut lib = library::load(data);
     lib.shelf_mut(kind).list.retain(|e| e.id != id);
     library::save(data, &lib);
-    let _ = std::fs::remove_file(library::file(data, kind, id));
+    ferrocast_store::durable::remove_with_backup(&library::file(data, kind, id));
+}
+
+fn load_collection_doc(canvas: Canvas, file: &std::path::Path) -> Result<Collection, ferrocast_studio::StudioError> {
+    let load_one = |path: &std::path::Path| -> Option<Result<Collection, Option<ferrocast_studio::StudioError>>> {
+        let bytes = match ferrocast_store::durable::read_patiently(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, file = %path.display(), "couldn't read scene collection");
+                return Some(Err(None));
+            }
+        };
+        if bytes.is_empty() {
+            tracing::warn!(file = %path.display(), "scene collection file is empty");
+            return Some(Err(None));
+        }
+        let doc = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, file = %path.display(), "a scene collection didn't read");
+                return Some(Err(None));
+            }
+        };
+        Some(Collection::load(canvas, &doc, FIRST_SCENE).map_err(Some))
+    };
+
+    if let Some(res) = load_one(file) {
+        match res {
+            Ok(c) => return Ok(c),
+            Err(schema_err) => {
+                let _ = ferrocast_store::durable::rename_patiently(file, &file.with_extension("json.unreadable"));
+                let bak = ferrocast_store::durable::backup_path(file);
+                if let Some(Ok(c)) = load_one(&bak) {
+                    tracing::warn!(file = %file.display(), "recovered scene collection from .bak");
+                    return Ok(c);
+                }
+                if let Some(e) = schema_err {
+                    return Err(e);
+                }
+                return Collection::new(canvas, FIRST_SCENE);
+            }
+        }
+    }
+
+    let bak = ferrocast_store::durable::backup_path(file);
+    if let Some(Ok(c)) = load_one(&bak) {
+        tracing::warn!(file = %file.display(), "recovered scene collection from .bak");
+        return Ok(c);
+    }
+    Collection::new(canvas, FIRST_SCENE)
 }
 
 /// Saves the scenes in use to `from` and puts `to`'s in their place (a missing file is a new
@@ -591,9 +699,10 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
         c.stop_follow(&f);
     }
     let old = h.collection.take().map(|c| {
-        save(&c, from);
+        save_confirmed(h.collection_deferred, &c, from);
         c.save(COLLECTION)
     });
+    let was_deferred = h.collection_deferred;
     h.history.clear();
     h.selected = None;
     h.frames = None;
@@ -602,19 +711,13 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     if let Some(p) = &h.preview {
         p.show_scene(None);
     }
-    // Only a missing file is a new set; one that doesn't read is kept aside, never overwritten.
-    let made = match std::fs::read(to).ok().map(|b| serde_json::from_slice::<Value>(&b)) {
-        Some(Ok(d)) => Collection::load(canvas, &d, FIRST_SCENE),
-        Some(Err(e)) => {
-            tracing::warn!(error = %e, file = %to.display(), "a scene collection didn't read; kept aside");
-            let _ = std::fs::rename(to, to.with_extension("json.unreadable"));
-            Collection::new(canvas, FIRST_SCENE)
-        }
-        None => Collection::new(canvas, FIRST_SCENE),
-    };
+    // Only a missing file (or corrupt JSON without a working `.bak`) starts fresh; valid JSON that
+    // fails collection loading restores the old collection.
+    let made = load_collection_doc(canvas, to);
     match made {
         Ok(c) => {
-            save(&c, to);
+            h.collection_deferred = false;
+            save_confirmed(false, &c, to);
             c.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             c.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(c);
@@ -623,6 +726,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
             Ok(())
         }
         Err(e) => {
+            h.collection_deferred = was_deferred;
             if let Some(old) = old {
                 h.collection = Collection::load(canvas, &old, FIRST_SCENE).ok();
             }
@@ -632,27 +736,15 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     }
 }
 
-/// The saved settings, or the defaults (an unreadable file is left as it is).
+/// The saved settings, falling back to `.bak` when unreadable, or the defaults.
 fn load_settings(data: &std::path::Path) -> StudioSettings {
-    std::fs::read(settings_file(data))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<StudioSettings>(&b).ok())
-        .filter(|s| s.check().is_ok())
+    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
+        .map(|l| l.value)
         .unwrap_or_default()
 }
 
 fn save_json(file: &std::path::Path, v: &Value) {
-    let tmp = file.with_extension("json.tmp");
-    let written = serde_json::to_vec_pretty(v)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| {
-            if let Some(dir) = file.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&tmp, bytes)
-        })
-        .and_then(|()| std::fs::rename(&tmp, file));
-    if let Err(e) = written {
+    if let Err(e) = ferrocast_store::durable::save_json_pretty(file, v) {
         tracing::warn!(error = %e, file = %file.display(), "the Studio couldn't save");
     }
 }
@@ -738,28 +830,160 @@ fn write_session(now: Option<&ferrocast_engine::studio_host::Recovered>) {
     }
     match now {
         Some(s) => save_json(file, &serde_json::to_value(s).unwrap_or(Value::Null)),
-        None => {
-            let _ = std::fs::remove_file(file);
+        None => ferrocast_store::durable::remove_with_backup(file),
+    }
+}
+
+/// Maximum time `close()` / `stop()` waits for parallel off-main-thread output drains (exceeds
+/// `OwnStream`'s internal 5 s tokio runtime shutdown timeout so normal drains finish cleanly).
+const QUIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+fn push_opt_drain<T: Send + 'static>(jobs: &mut Vec<Box<dyn FnOnce() + Send>>, slot: &mut Option<T>) {
+    if let Some(item) = slot.take() {
+        jobs.push(Box::new(move || {
+            let _dropped = item;
+        }));
+    }
+}
+
+fn push_vec_drain<T: Send + 'static>(jobs: &mut Vec<Box<dyn FnOnce() + Send>>, items: &mut Vec<T>) {
+    for item in items.drain(..) {
+        jobs.push(Box::new(move || {
+            let _dropped = item;
+        }));
+    }
+}
+
+fn take_outputs_from_held(h: &mut Held) -> Vec<Box<dyn FnOnce() + Send>> {
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+    h.stream_with = None;
+    h.record_with = None;
+    h.replay_shown = None;
+    h.replay_back = None;
+    h.replay_wait = None;
+    h.live_pct = None;
+    push_opt_drain(&mut jobs, &mut h.vstream);
+    push_opt_drain(&mut jobs, &mut h.lstream);
+    push_opt_drain(&mut jobs, &mut h.stream);
+    push_opt_drain(&mut jobs, &mut h.record);
+    push_vec_drain(&mut jobs, &mut h.source_records);
+    push_opt_drain(&mut jobs, &mut h.replay);
+    push_opt_drain(&mut jobs, &mut h.virtualcam);
+    push_opt_drain(&mut jobs, &mut h.ndi);
+    push_vec_drain(&mut jobs, &mut h.guests);
+    jobs
+}
+
+struct DrainGuard {
+    tx: std::sync::mpsc::Sender<bool>,
+    ok: bool,
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(self.ok);
+    }
+}
+
+/// Drops each extracted output on its own worker thread in parallel off the main thread, returning
+/// `true` iff every output finished within `timeout` without panicking.
+fn drain_outputs_bounded(jobs: Vec<Box<dyn FnOnce() + Send>>, timeout: std::time::Duration) -> bool {
+    if jobs.is_empty() {
+        return true;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let mut started = 0usize;
+    let mut all_ok = true;
+    for job in jobs {
+        let tx = tx.clone();
+        match std::thread::Builder::new().name("ferrocast-drain".into()).spawn(move || {
+            let mut guard = DrainGuard { tx, ok: false };
+            job();
+            guard.ok = true;
+        }) {
+            Ok(_) => started += 1,
+            Err(err) => {
+                tracing::warn!(%err, "failed to spawn Studio output drain thread");
+                all_ok = false;
+            }
         }
     }
+    drop(tx);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut finished = 0usize;
+    while finished < started {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            tracing::warn!(
+                finished,
+                total = started,
+                timeout_ms = timeout.as_millis() as u64,
+                "Studio outputs exceeded shutdown drain deadline"
+            );
+            return false;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(ok) => {
+                finished += 1;
+                all_ok &= ok;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    finished,
+                    total = started,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Studio outputs exceeded shutdown drain deadline"
+                );
+                return false;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    all_ok && finished == started
+}
+
+fn clear_non_output_held(h: &mut Held) {
+    h.preview = None;
+    h.preview_at = None;
+    h.program_view = None;
+    h.program_at = None;
+    h.vertical = VerticalView::default();
+    h.projectors.clear();
+    h.history.clear();
+    h.captions = None;
+    if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
+        c.stop_follow(&f);
+    }
+}
+
+/// Prevents session persistence updates from clearing `session.json` prematurely while outputs are
+/// stopping during an application quit. Call `end_session()` strictly after clean close completes.
+pub fn mark_quitting() {
+    QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Ferrocast is quitting normally: the note goes, so the next launch isn't taken for a crash.
 pub fn end_session() {
-    QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    mark_quitting();
     if let Some(file) = SESSION.get() {
-        let _ = std::fs::remove_file(file);
+        ferrocast_store::durable::remove_with_backup(file);
     }
 }
 
-/// Closes the Studio (its engine, outputs and preview) now, on the main thread while it's still
-/// whole. Left to the thread's own end, the engine's graphics queue waited for the GPU inside an
-/// Objective-C autorelease pool whose thread-local list was already gone: a panic in a
-/// thread-local destructor, and Ferrocast aborted on every quit with the Studio running (9 Nov).
-pub fn close() {
-    // Taken out first, then dropped: nothing borrows HELD while the engine closes.
-    let held = HELD.with(|h| h.try_borrow_mut().ok().map(|mut h| std::mem::take(&mut *h)));
+/// Closes the Studio cleanly before exit on the main thread while AppKit/GPU state is still whole:
+/// stops and drains active outputs in parallel off the main thread (bounded) BEFORE dropping the
+/// scene collection. Returns `true` when outputs drained cleanly within the bound.
+pub fn close() -> bool {
+    // Taken out first, then drained/dropped: nothing borrows HELD while the engine closes.
+    let Some(mut held) = HELD.with(|h| h.try_borrow_mut().ok().map(|mut h| std::mem::take(&mut *h))) else {
+        tracing::warn!("Studio state is still borrowed on close");
+        return false;
+    };
+    let jobs = take_outputs_from_held(&mut held);
+    let clean = drain_outputs_bounded(jobs, QUIT_DRAIN_TIMEOUT);
+    clear_non_output_held(&mut held);
     drop(held);
+    clean
 }
 
 /// What live captions last heard, as the "Captions" text source shows it.
@@ -983,7 +1207,9 @@ fn record_stats(r: &(Recording, PathBuf, std::time::Instant)) -> Value {
     if let Some(o) = v.as_object_mut() {
         o.insert("file".into(), Value::String(r.1.display().to_string()));
         o.insert("seconds".into(), json!(r.2.elapsed().as_secs()));
-        o.insert("error".into(), r.0.last_error().map_or(Value::Null, Value::String));
+        // Why it stopped by itself (a full disk), else what the output says (its own error).
+        let stopped = o.get("error").and_then(Value::as_str).map(|why| format!("The recording stopped: {why}."));
+        o.insert("error".into(), stopped.or_else(|| r.0.last_error()).map_or(Value::Null, Value::String));
         o.insert("encoder".into(), r.0.encoder().map_or(Value::Null, Value::String));
     }
     v
@@ -1097,9 +1323,11 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
         A::Thumbnail { scene, width } => Ok(json!({ "image": c.thumbnail(&scene, width)? })),
-        A::SourceStatus { .. } | A::ScreenStill { .. } | A::VstPlugins { .. } | A::Vst { .. } => {
-            Err(ferrocast_studio::StudioError::Failed("read off the main thread".into()))
-        }
+        A::SourceStatus { .. }
+        | A::ScreenStill { .. }
+        | A::SourceStill { .. }
+        | A::VstPlugins { .. }
+        | A::Vst { .. } => Err(ferrocast_studio::StudioError::Failed("read off the main thread".into())),
         A::SourcePicture { name, width, filters } => Ok(match c.source_picture_pixels(&name, width, filters)? {
             Some((px, w, h, (sw, sh))) => {
                 json!({ "image": ferrocast_studio::png_data_url(&px, w, h, &name)?, "width": sw, "height": sh })
@@ -1275,19 +1503,15 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
     }
 }
 
-/// Writes the collection next to the plugins' config, whole or not at all (a new file, then
-/// renamed over the old one).
-fn save(c: &Collection, file: &std::path::Path) {
+/// Writes the collection atomically with `.bak` backup unless collection loading is deferred in
+/// Safe Mode (so the temporary blank collection never overwrites saved scenes on disk).
+fn save_confirmed(deferred: bool, c: &Collection, file: &std::path::Path) {
+    if deferred {
+        return;
+    }
     let doc = c.save(COLLECTION);
-    let tmp = file.with_extension("json.tmp");
-    // On a new install the collections folder isn't there yet (2.1 found every save failing).
-    let folder = file.parent().map_or(Ok(()), std::fs::create_dir_all);
-    let written = folder
-        .and_then(|()| serde_json::to_vec_pretty(&doc).map_err(std::io::Error::other))
-        .and_then(|bytes| std::fs::write(&tmp, bytes))
-        .and_then(|()| std::fs::rename(&tmp, file));
-    if let Err(e) = written {
-        tracing::warn!(error = %e, "the Studio's scenes couldn't be saved");
+    if let Err(e) = ferrocast_store::durable::save_json_pretty(file, &doc) {
+        tracing::warn!(error = %e, file = %file.display(), "the Studio's scenes couldn't be saved");
     }
 }
 
@@ -1359,16 +1583,16 @@ impl DesktopStudio {
         let _ = APP.set(app.clone());
         let file = data.join("studio").join("session.json");
         // A note left from last time: Ferrocast didn't close normally while the Studio ran.
-        if let Some(r) = std::fs::read(&file)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<ferrocast_engine::studio_host::Recovered>(&b).ok())
+        if let Some(loaded) =
+            ferrocast_store::durable::load_json_with_backup::<ferrocast_engine::studio_host::Recovered>(&file, |_| true)
         {
+            let r = loaded.value;
             tracing::warn!(?r, "Ferrocast didn't close normally last time; the next Start puts the Studio back");
             if let Ok(mut c) = CRASHED.lock() {
                 *c = Some(r);
             }
         }
-        let _ = std::fs::remove_file(&file);
+        ferrocast_store::durable::remove_with_backup(&file);
         let _ = SESSION.set(file);
         let me = DesktopStudio { app, data };
         let watcher = DesktopStudio { app: me.app.clone(), data: me.data.clone() };
@@ -1559,6 +1783,7 @@ impl DesktopStudio {
             renderer: h.collection.as_ref().map(|_| h.renderer.to_string()),
             detail: None,
             recovered: None,
+            safe_mode: None,
         }
     }
 }
@@ -1641,6 +1866,10 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn start(&self) -> Result<StudioStatus, String> {
+        self.start_with_mode(true).await
+    }
+
+    async fn start_with_mode(&self, load_collection: bool) -> Result<StudioStatus, String> {
         #[cfg(windows)]
         fetch_matte(self.data.clone());
         let config = self.data.join("studio");
@@ -1656,25 +1885,20 @@ impl StudioHost for DesktopStudio {
             let _ = &config;
             h.renderer = "ferrocast";
             let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-            // The saved scenes, or one empty scene the first time. A file that doesn't read is
-            // kept aside (never overwritten) and the Studio starts fresh.
-            let saved = std::fs::read(&file).ok().map(|b| serde_json::from_slice::<Value>(&b));
-            let collection = match saved {
-                Some(Ok(doc)) => Collection::load(canvas, &doc, FIRST_SCENE),
-                Some(Err(e)) => {
-                    tracing::warn!(error = %e, "the Studio's scenes didn't read; starting with a new set");
-                    let _ = std::fs::rename(&file, file.with_extension("json.unreadable"));
-                    Collection::new(canvas, FIRST_SCENE)
-                }
-                None => Collection::new(canvas, FIRST_SCENE),
-            }
-            .map_err(|e| e.to_string())?;
+            let collection = if load_collection {
+                h.collection_deferred = false;
+                load_collection_doc(canvas, &file).map_err(|e| e.to_string())?
+            } else {
+                // Safe Mode: start cleanly without loading the saved collection until confirmed.
+                h.collection_deferred = true;
+                Collection::new(canvas, FIRST_SCENE).map_err(|e| e.to_string())?
+            };
             if let Some((name, id)) = &s.monitoring
                 && let Err(e) = collection.set_monitoring_device(name, id)
             {
                 tracing::warn!(error = %e, "the listening device is gone; using the system's");
             }
-            save(&collection, &file);
+            save_confirmed(h.collection_deferred, &collection, &file);
             collection.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
             collection.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(collection);
@@ -1686,34 +1910,35 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
-    async fn stop(&self) -> Result<StudioStatus, String> {
+    async fn confirm_collection(&self) -> Result<StudioStatus, String> {
         let data = self.data.clone();
         self.on_main(move |h| {
             let file = scenes_file(&data);
-            // The stream, the recording, the preview and the scenes go (saved first); the engine
-            // stays loaded for the next Start.
-            h.vstream = None;
-            h.lstream = None;
-            h.stream = None;
-            h.record = None;
-            h.source_records.clear();
-            h.replay = None;
-            h.virtualcam = None;
-            h.ndi = None;
-            h.preview = None;
-            h.preview_at = None;
-            h.program_view = None;
-            h.program_at = None;
-            h.vertical = VerticalView::default();
-            h.projectors.clear();
-            h.history.clear();
-            h.captions = None;
-            if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
-                c.stop_follow(&f);
+            if h.collection.is_some() {
+                swap_collection(h, &file, &file)?;
+                write_session(session_now(h).as_ref());
             }
+            Ok(Self::status_of(h))
+        })
+        .await?
+    }
+
+    async fn stop(&self) -> Result<StudioStatus, String> {
+        // Extract active outputs on main thread without blocking UI, then drain them in parallel
+        // off the main thread BEFORE saving and dropping the scene collection.
+        let jobs = self.on_main(take_outputs_from_held).await?;
+        if !jobs.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || drain_outputs_bounded(jobs, QUIT_DRAIN_TIMEOUT)).await;
+        }
+        let data = self.data.clone();
+        self.on_main(move |h| {
+            let file = scenes_file(&data);
+            let deferred = h.collection_deferred;
+            clear_non_output_held(h);
             if let Some(c) = h.collection.take() {
-                save(&c, &file);
+                save_confirmed(deferred, &c, &file);
             }
+            h.collection_deferred = false;
             write_session(None);
             Self::status_of(h)
         })
@@ -1877,57 +2102,196 @@ impl StudioHost for DesktopStudio {
                 .await??;
             return serde_json::to_value(opts).map_err(|e| e.to_string());
         }
-        // A screen's or window's still for the picker's cards: a short capture off the main
-        // thread (Mac; elsewhere none yet, and the card keeps its icon).
-        if let StudioAct::ScreenStill { id, window, width } = &act {
-            let (id, window, width) = (*id, *window, *width);
-            #[cfg(target_os = "macos")]
-            {
-                use ferrocore::screen::{Target, still};
-                type Kept = std::collections::HashMap<(bool, u32, u32), (std::time::Instant, Option<String>)>;
-                // Each still starts a ScreenCaptureKit stream: two at a time (a window list of
-                // 30 asked at once ran over their time and kept their icons), and one taken
-                // in the last seconds is given again (the dialog opened again).
-                static TURNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-                static KEPT: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
-                const KEEP: std::time::Duration = std::time::Duration::from_secs(5);
-                let key = (window, id, width);
-                let kept = |k| {
-                    KEPT.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get_or_insert_default()
-                        .get(&k)
-                        .filter(|(at, _)| at.elapsed() < KEEP)
-                        .map(|(_, i)| i.clone())
-                };
-                if let Some(image) = kept(key) {
-                    return Ok(json!({ "image": image }));
+        // Unified picker still (screen, window, camera, capture card) on every platform:
+        // 1) reuses an already-open stage source (zero hardware contention / camera LED flash);
+        // 2) serves 15s cached JPEG stills and deduplicates concurrent asks;
+        // 3) cancels queued/in-flight captures via Drop guard when the dialog closes.
+        if matches!(&act, StudioAct::ScreenStill { .. } | StudioAct::SourceStill { .. }) {
+            use std::collections::HashMap;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Mutex, OnceLock};
+            use std::time::{Duration, Instant};
+            use tokio::sync::{Notify, Semaphore};
+
+            struct CancelOnDrop(Arc<AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
                 }
-                let _turn =
-                    TURNS.get_or_init(|| tokio::sync::Semaphore::new(2)).acquire().await.map_err(|e| e.to_string())?;
-                // Taken by another ask while this one waited its turn.
-                if let Some(image) = kept(key) {
-                    return Ok(json!({ "image": image }));
+            }
+
+            #[derive(Clone, Hash, PartialEq, Eq)]
+            enum StillTarget {
+                Display(u32, u32),
+                Window(u32, u32),
+                Camera(String, u32),
+            }
+
+            type Kept = HashMap<StillTarget, (Instant, String)>;
+            type FlightMap = HashMap<StillTarget, Arc<(Notify, Mutex<Option<Option<String>>>)>>;
+            static TURNS: OnceLock<Semaphore> = OnceLock::new();
+            static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
+            static IN_FLIGHT: Mutex<Option<FlightMap>> = Mutex::new(None);
+            const KEEP: Duration = Duration::from_secs(15);
+            const MAX_KEPT: usize = 128;
+
+            let (target_kind, key_name, val_json, target, width) = match &act {
+                StudioAct::ScreenStill { id, window, width } => {
+                    let w = (*width).clamp(64, 320);
+                    let tk = if *window { "window_capture" } else { "screen_capture" }.to_string();
+                    let kn = if *window { "window" } else { "display" }.to_string();
+                    let tgt = if *window { StillTarget::Window(*id, w) } else { StillTarget::Display(*id, w) };
+                    (tk, kn, json!(*id), tgt, w)
                 }
-                let target = if window { Target::Window(id) } else { Target::Display(id) };
+                StudioAct::SourceStill { kind, key, value, width } => {
+                    let w = (*width).clamp(64, 320);
+                    let tgt = if matches!(key.as_str(), "window") || kind.contains("window") {
+                        let Some(id) = value.as_u64().and_then(|n| u32::try_from(n).ok()) else {
+                            return Ok(json!({ "image": null }));
+                        };
+                        StillTarget::Window(id, w)
+                    } else if matches!(key.as_str(), "display" | "monitor_id")
+                        || kind.contains("screen")
+                        || kind.contains("monitor")
+                        || kind == "xshm_input"
+                    {
+                        let Some(id) = value.as_u64().and_then(|n| u32::try_from(n).ok()) else {
+                            return Ok(json!({ "image": null }));
+                        };
+                        StillTarget::Display(id, w)
+                    } else {
+                        let Some(id) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                            return Ok(json!({ "image": null }));
+                        };
+                        StillTarget::Camera(id.to_string(), w)
+                    };
+                    (kind.clone(), key.clone(), value.clone(), tgt, w)
+                }
+                _ => unreachable!(),
+            };
+
+            let read_kept = |k: &StillTarget| {
+                KEPT.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_default()
+                    .get(k)
+                    .filter(|(at, _)| at.elapsed() < KEEP)
+                    .map(|(_, img)| img.clone())
+            };
+            if let Some(image) = read_kept(&target) {
+                return Ok(json!({ "image": image }));
+            }
+
+            // Fast path: reuse an already-open stage source on the GPU (zero hardware contend).
+            let reuse_job = self
+                .on_main(move |h| {
+                    h.collection
+                        .as_ref()
+                        .and_then(|c| c.matching_device_picture_job(&target_kind, &key_name, &val_json, width))
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(job) = reuse_job {
                 let image = tokio::task::spawn_blocking(move || {
-                    still(target, width)
-                        .ok()
-                        .and_then(|p| ferrocast_studio::png_data_url(&p.rgba, p.width, p.height, "screen").ok())
+                    job().and_then(|(px, pw, ph)| ferrocast_studio::jpeg_data_url(&px, pw, ph, true, "picker").ok())
                 })
                 .await
                 .map_err(|e| e.to_string())?;
-                let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let all = all.get_or_insert_default();
-                all.retain(|_, (at, _)| at.elapsed() < KEEP);
-                all.insert(key, (std::time::Instant::now(), image.clone()));
+                if let Some(img) = &image {
+                    let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let map = all.get_or_insert_default();
+                    map.retain(|_, (at, _)| at.elapsed() < KEEP);
+                    if map.len() >= MAX_KEPT {
+                        map.clear();
+                    }
+                    map.insert(target, (Instant::now(), img.clone()));
+                    return Ok(json!({ "image": image }));
+                }
+            }
+
+            // Single-flight deduplication + early cancellation if caller disconnects.
+            let (flight, is_leader) = {
+                let mut map_guard = IN_FLIGHT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let map = map_guard.get_or_insert_default();
+                if let Some(existing) = map.get(&target) {
+                    (existing.clone(), false)
+                } else {
+                    let created = Arc::new((Notify::new(), Mutex::new(None)));
+                    map.insert(target.clone(), created.clone());
+                    (created, true)
+                }
+            };
+            if !is_leader {
+                let notified = flight.0.notified();
+                let cached_before = flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                if let Some(res) = cached_before {
+                    return Ok(json!({ "image": res }));
+                }
+                notified.await;
+                let res = flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().flatten();
+                return Ok(json!({ "image": res }));
+            }
+
+            struct FlightCleanup {
+                target: StillTarget,
+                flight: Arc<(Notify, Mutex<Option<Option<String>>>)>,
+            }
+            impl Drop for FlightCleanup {
+                fn drop(&mut self) {
+                    let mut done = self.flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if done.is_none() {
+                        *done = Some(None);
+                    }
+                    drop(done);
+                    if let Ok(mut map) = IN_FLIGHT.lock()
+                        && let Some(m) = map.as_mut()
+                    {
+                        m.remove(&self.target);
+                    }
+                    self.flight.0.notify_waiters();
+                }
+            }
+            let _flight_cleanup = FlightCleanup { target: target.clone(), flight: flight.clone() };
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let _cancel_guard = CancelOnDrop(cancel_flag.clone());
+
+            let _turn = TURNS.get_or_init(|| Semaphore::new(2)).acquire().await.map_err(|e| e.to_string())?;
+            if let Some(image) = read_kept(&target) {
+                *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Some(image.clone()));
                 return Ok(json!({ "image": image }));
             }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (id, window, width);
-                return Ok(json!({ "image": null }));
+
+            let capture_target = target.clone();
+            let flag = cancel_flag.clone();
+            let image = tokio::task::spawn_blocking(move || {
+                let pic = match capture_target {
+                    StillTarget::Display(id, w) => {
+                        ferrocore::screen_still_cancel(ferrocore::screen::Target::Display(id), w, &flag).ok()
+                    }
+                    StillTarget::Window(id, w) => {
+                        ferrocore::screen_still_cancel(ferrocore::screen::Target::Window(id), w, &flag).ok()
+                    }
+                    StillTarget::Camera(id, w) => ferrocore::camera_still_cancel(&id, w, &flag).ok(),
+                };
+                pic.and_then(|p| {
+                    ferrocast_studio::jpeg_data_url(&p.rgba, p.width, p.height, p.premultiplied, "picker").ok()
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+            if let Some(img) = &image {
+                let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let map = all.get_or_insert_default();
+                map.retain(|_, (at, _)| at.elapsed() < KEEP);
+                if map.len() >= MAX_KEPT {
+                    map.clear();
+                }
+                map.insert(target, (Instant::now(), img.clone()));
             }
+            *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(image.clone());
+            return Ok(json!({ "image": image }));
         }
         // How a source is doing: its settings read on the main thread, a Browser source's
         // address tried off it (the app's web client, its time limit).
@@ -2021,7 +2385,7 @@ impl StudioHost for DesktopStudio {
                         let c = h.collection.as_ref().ok_or(STOPPED)?;
                         c.update_filter(&n, &f, &json!({ "state": state })).map_err(|e| e.to_string())?;
                         // Written now: a crash right after keeps what was saved (CodeRabbit).
-                        save(c, &scenes_file(&data));
+                        save_confirmed(h.collection_deferred, c, &scenes_file(&data));
                         Ok(())
                     })
                     .await??;
@@ -2120,7 +2484,7 @@ impl StudioHost for DesktopStudio {
             // The Studio off: its scenes from the saved file, so the show, BRB and the scene
             // switcher can still be set up (owner, 30 Oct: "it's not showing my screens").
             if act == StudioAct::Scenes && h.collection.is_none() {
-                let saved = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                let saved = ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
                 return Ok(saved_scenes(saved.as_ref()));
             }
             if let StudioAct::Select { scene, id, frames, also, guides } = &act {
@@ -2154,7 +2518,7 @@ impl StudioHost for DesktopStudio {
                 // A scene that came back or went changes what the pictures show.
                 sync_views(h);
                 let done = done?;
-                save(c, &file);
+                save_confirmed(h.collection_deferred, c, &file);
                 refresh_projectors(h);
                 let (undo, redo) = h.history.labels();
                 return Ok(json!({ "done": done, "undo": undo, "redo": redo }));
@@ -2185,7 +2549,7 @@ impl StudioHost for DesktopStudio {
             }
             sync_views(h);
             if changes && out.is_ok() {
-                save(c, &file);
+                save_confirmed(h.collection_deferred, c, &file);
                 refresh_projectors(h);
             }
             out
@@ -2252,23 +2616,15 @@ impl StudioHost for DesktopStudio {
                 // The stream on air takes a new encoder, size or frame rate at once, without
                 // stopping; a new bitrate alone just changes the bitrate.
                 let was = h.settings.clone();
+                let was_encode = was.as_ref().map(|o| effective_stream_encode(o, h.stream_cap, h.live_pct));
+                let encode = effective_stream_encode(&s, h.stream_cap, h.live_pct);
                 // What changed besides the bitrate: the encoder, its options, the size, the rate.
                 let shape_changed = was.as_ref().is_some_and(|o| {
-                    let (mut a, mut b) = (encode_of(o), encode_of(&s));
-                    a.video_kbps = 0;
-                    b.video_kbps = 0;
-                    // The sound's bitrate isn't changed live (a new video encoder for it was a
-                    // hiccup for nothing): it's for the next stream.
-                    a.audio_kbps = 0;
-                    b.audio_kbps = 0;
-                    a != b || o.fps != s.fps
+                    was_encode.as_ref().is_some_and(|a| shape_differs(a, &encode)) || o.fps != s.fps
                 });
-                // At auto quality's share, as the stream was (a full bitrate here, then the
-                // next step up from 70% would have lowered it).
-                let kbps = at_pct(s.video_kbps, h.live_pct);
+                let kbps = encode.video_kbps;
                 let reshaped = match h.stream.as_ref() {
                     Some(st) if live && shape_changed => {
-                        let encode = EncodeSettings { video_kbps: kbps, ..encode_of(&s) };
                         match st.reshape(&encode, s.fps) {
                             Ok(()) => {
                                 // What it runs with now: a recording "Same as stream" started
@@ -2292,11 +2648,11 @@ impl StudioHost for DesktopStudio {
                 }
                 let was_kbps = was.as_ref().map(|o| o.video_kbps);
                 if was_kbps.is_some_and(|k| k != s.video_kbps) {
-                    // The vertical picture's stream uses the same bitrate (CodeRabbit); the main
-                    // one has it already when it was reshaped.
-                    let main = if reshaped { None } else { h.stream.as_mut() };
-                    for st in [main, h.vstream.as_mut()].into_iter().flatten() {
+                    if !reshaped && let Some(st) = h.stream.as_mut() {
                         st.set_video_kbps(kbps);
+                    }
+                    if let Some(st) = h.vstream.as_mut() {
+                        st.set_video_kbps(at_pct(s.video_kbps, h.live_pct));
                     }
                 }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
@@ -2327,7 +2683,7 @@ impl StudioHost for DesktopStudio {
                 // A captured window resized keeps its shape on the canvas (and stays so after
                 // a restart).
                 if c.follow_sizes() {
-                    save(c, &scenes_file(&data));
+                    save_confirmed(h.collection_deferred, c, &scenes_file(&data));
                 }
             }
             let disk_free = {
@@ -2377,6 +2733,25 @@ impl StudioHost for DesktopStudio {
         .await?
     }
 
+    async fn record_stats(&self) -> Result<Value, String> {
+        self.on_main(|h| {
+            h.record.as_ref().map_or(Value::Null, |r| {
+                let mut v = record_stats(r);
+                if let Some(o) = v.as_object_mut() {
+                    // What to do about it, for behind the (i); and the room left where it writes.
+                    if let Some((_, detail)) = r.0.record_problem() {
+                        o.insert("error_detail".into(), Value::String(detail));
+                    }
+                    let folder = r.1.parent().map(PathBuf::from).unwrap_or_default();
+                    let at = folder.ancestors().find(|p| p.exists()).map(PathBuf::from).unwrap_or(folder);
+                    o.insert("disk_free_mb".into(), json!(ferrocast_studio::system::free_disk_mb(&at)));
+                }
+                v
+            })
+        })
+        .await
+    }
+
     async fn record(&self, on: bool) -> Result<Value, String> {
         let app = self.app.clone();
         tracing::info!(on, "the recording is asked to {}", if on { "start" } else { "stop" });
@@ -2423,7 +2798,7 @@ impl StudioHost for DesktopStudio {
                 split_minutes: s.record_split_minutes,
                 split_mb: s.record_split_mb,
                 tracks: s.record_tracks.clone(),
-                encode: record_encode(&s),
+                encode: record_encode_capped(&s, h.stream_cap),
                 muxer: s.record_muxer.clone(),
                 own_encoder: s.own_encoder,
             };
@@ -2501,7 +2876,7 @@ impl StudioHost for DesktopStudio {
                     c.add_source(&scene, "ffmpeg_source", &source, &settings, false).map_err(|e| e.to_string())?;
                 c.edit_item(&scene, item.id, ItemEdit::Hide).map_err(|e| e.to_string())?;
             }
-            save(c, &scenes_file(&data));
+            save_confirmed(h.collection_deferred, c, &scenes_file(&data));
             // The connection whose source this was, if any, is over.
             h.guests.retain(|(_, s, _)| *s != source);
             h.guests.push((name, source, guest));
@@ -2892,13 +3267,59 @@ impl StudioHost for DesktopStudio {
         .map_err(|e| e.to_string())
     }
 
+    async fn set_stream_cap(&self, cap: Option<StreamCap>) -> Result<(), String> {
+        self.on_main(move |h| -> Result<(), String> {
+            if h.stream_cap == cap {
+                return Ok(());
+            }
+            h.stream_cap = cap;
+            if !h.stream.as_ref().is_some_and(|s| s.stats().active) {
+                return Ok(());
+            }
+            let s = h.settings.clone().unwrap_or_default();
+            let target = effective_stream_encode(&s, cap, h.live_pct);
+            let cur_encode = h.stream_with.as_ref().map(|w| &w.encode);
+            if cur_encode.is_some_and(|prev| shape_differs(prev, &target)) {
+                if let Some(st) = h.stream.as_ref() {
+                    // Its encoder is swapped on the run (a new header and keyframe, no stop). It
+                    // can refuse (the encoder is shared with a recording): that is told, never
+                    // swallowed, as the stream then isn't held to the limit.
+                    match st.reshape(&target, s.fps) {
+                        Ok(()) => {
+                            if let Some(w) = h.stream_with.as_mut() {
+                                w.encode = target;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "couldn't reshape stream for updated platform cap");
+                            return Err(e.to_string());
+                        }
+                    }
+                }
+            } else if cur_encode.is_none_or(|prev| prev.video_kbps != target.video_kbps)
+                && let Some(st) = h.stream.as_mut()
+            {
+                st.set_video_kbps(target.video_kbps);
+                if let Some(w) = h.stream_with.as_mut() {
+                    w.encode.video_kbps = target.video_kbps;
+                }
+            }
+            Ok(())
+        })
+        .await?
+    }
+
     async fn set_live_quality(&self, pct: u8) -> Result<(), String> {
         self.on_main(move |h| {
             let set = h.settings.as_ref().map_or(6000, |s| s.video_kbps);
+            let capped = h.stream_cap.map_or(set, |c| set.min(c.max_kbps));
             h.live_pct = (pct < 100).then_some(pct);
-            let kbps = at_pct(set, h.live_pct);
-            for st in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten() {
+            let kbps = at_pct(capped, h.live_pct);
+            if let Some(st) = h.stream.as_mut() {
                 st.set_video_kbps(kbps);
+            }
+            if let Some(st) = h.vstream.as_mut() {
+                st.set_video_kbps(at_pct(set, h.live_pct));
             }
             // The lighter stream (3,000 kbps at most) comes down with it.
             if let Some(l) = h.lstream.as_mut() {
@@ -3047,8 +3468,12 @@ impl StudioHost for DesktopStudio {
                 let file = library::file(&data, kind, &id);
                 if file.exists() {
                     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                    let _ = std::fs::rename(&file, file.with_extension(format!("json.removed-{stamp}")));
+                    let _ = ferrocast_store::durable::rename_patiently(
+                        &file,
+                        &file.with_extension(format!("json.removed-{stamp}")),
+                    );
                 }
+                let _ = ferrocast_store::durable::remove_patiently(&ferrocast_store::durable::backup_path(&file));
                 library::save(&data, &lib);
                 Ok(Value::Null)
             }
@@ -3061,12 +3486,12 @@ impl StudioHost for DesktopStudio {
                     let f = file.clone();
                     self.on_main(move |h| {
                         if let Some(c) = &h.collection {
-                            save(c, &f);
+                            save_confirmed(h.collection_deferred, c, &f);
                         }
                     })
                     .await?;
                 }
-                let doc = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+                let doc = ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
                 Ok(match (kind, doc) {
                     (_, Some(mut d)) => {
                         if kind == Kind::Collections
@@ -3095,17 +3520,16 @@ impl StudioHost for DesktopStudio {
                         let f = from.clone();
                         self.on_main(move |h| {
                             if let Some(c) = &h.collection {
-                                save(c, &f);
+                                save_confirmed(h.collection_deferred, c, &f);
                             }
                         })
                         .await?;
                     }
                     let to = library::file(&data, kind, &id);
-                    if from.exists() {
-                        if let Some(dir) = to.parent() {
-                            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-                        }
-                        std::fs::copy(&from, &to).map_err(|e| format!("The copy couldn't be made: {e}"))?;
+                    if let Some(loaded) = ferrocast_store::durable::load_json_with_backup::<Value>(&from, |_| true) {
+                        let bytes = serde_json::to_vec_pretty(&loaded.value).map_err(|e| e.to_string())?;
+                        ferrocast_store::durable::write_json_bytes(&to, &bytes)
+                            .map_err(|e| format!("The copy couldn't be made: {e}"))?;
                     }
                 }
                 lib.shelf_mut(kind).list.push(library::Entry { id: id.clone(), name });
@@ -3243,10 +3667,10 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         // The saved profile (loaded if nothing asked for it yet), and a replay buffer that runs
         // (one that failed isn't an encode; CodeRabbit).
-        let (saved, replay) = self
+        let (saved, replay, cap) = self
             .on_main(move |h| {
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
-                (s, h.replay.as_ref().is_some_and(|r| r.active()))
+                (s, h.replay.as_ref().is_some_and(|r| r.active()), h.stream_cap)
             })
             .await?;
         let s = match draft {
@@ -3254,7 +3678,7 @@ impl StudioHost for DesktopStudio {
             None => saved,
         };
         let also = Also { enhanced, light, replay: replay || s.replay_when_streaming };
-        Ok(encode_budget(&s, ferrocast_studio::system::video_engines(), also))
+        Ok(encode_budget(&s, cap, ferrocast_studio::system::video_engines(), also))
     }
 
     async fn screen_access(&self) -> Result<Value, String> {
@@ -3375,7 +3799,7 @@ impl StudioHost for DesktopStudio {
             // A frame rate chosen during the last stream, still waiting.
             apply_waiting_canvas(&app, h);
             let s = h.settings.clone().unwrap_or_default();
-            let mut settings = stream_settings(&s);
+            let mut settings = stream_settings(&s, h.stream_cap);
             settings.video_tracks = tracks;
             tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, qualities = settings.video_tracks.len() + 1, "the Studio starts streaming into Go live");
             // Ferrocast's own engine draws what goes out; what it can't do yet is refused with
@@ -3439,7 +3863,7 @@ impl StudioHost for DesktopStudio {
             }
             h.lstream = None;
             let s = h.settings.clone().unwrap_or_default();
-            let mut settings = stream_settings(&s);
+            let mut settings = stream_settings(&s, None);
             // 720 high at the canvas's shape (even sizes), 3,000 kbps at most; one sound.
             let canvas = studio.canvas();
             settings.encode.scale = light_size(canvas.width, canvas.height);
@@ -3478,7 +3902,7 @@ impl StudioHost for DesktopStudio {
             }
             h.vstream = None;
             let s = h.settings.clone().unwrap_or_default();
-            let settings = stream_settings(&s);
+            let settings = stream_settings(&s, None);
             tracing::info!(
                 kbps = settings.encode.video_kbps,
                 "the Studio's vertical picture starts streaming into Go live"
@@ -3686,35 +4110,196 @@ mod budget_tests {
             record_quality: quality.into(),
             ..StudioSettings::default()
         };
-        let level =
-            |s: &StudioSettings| encode_budget(s, Some(1), Also::default())["level"].as_str().unwrap_or("").to_string();
+        let level = |s: &StudioSettings| {
+            encode_budget(s, None, Some(1), Also::default())["level"].as_str().unwrap_or("").to_string()
+        };
         assert_eq!(level(&at(3840, 2160, 60, "high")), "over");
         // One 4K60 encode is all one engine does (1.0x): at the limit, but holding its 60.
-        let shared = encode_budget(&at(3840, 2160, 60, "stream"), Some(1), Also::default());
+        let shared = encode_budget(&at(3840, 2160, 60, "stream"), None, Some(1), Also::default());
         assert_eq!((shared["shared"].as_bool(), shared["level"].as_str()), (Some(true), Some("limit")), "{shared}");
         assert_eq!(level(&at(3840, 2160, 30, "high")), "limit");
         assert_eq!(level(&at(2560, 1440, 60, "high")), "ok");
         // A Max's two engines: two 4K60 encodes fill them, two 4K30 fit.
-        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), Some(2), Also::default())["level"], "limit");
-        assert_eq!(encode_budget(&at(3840, 2160, 30, "high"), Some(2), Also::default())["level"], "ok");
-        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), None, Also::default())["level"], "unknown");
+        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), None, Some(2), Also::default())["level"], "limit");
+        assert_eq!(encode_budget(&at(3840, 2160, 30, "high"), None, Some(2), Also::default())["level"], "ok");
+        assert_eq!(encode_budget(&at(3840, 2160, 60, "high"), None, None, Also::default())["level"], "unknown");
         let mut two = at(3840, 2160, 60, "stream");
         two.record_tracks = vec![1, 2];
-        let b = encode_budget(&two, Some(1), Also::default());
+        let b = encode_budget(&two, None, Some(1), Also::default());
         assert_eq!(b["level"], "over");
         assert!(b["why_not_shared"].as_str().is_some_and(|w| w.contains("2 sound tracks")), "{b}");
         // projects-60's gaps: Twitch's qualities can't share and add encodes; the replay buffer
         // is its own encode; x264 (Lossless) isn't the video encoder's.
         let same = at(3840, 2160, 60, "stream");
-        let eb = encode_budget(&same, Some(1), Also { enhanced: true, ..Also::default() });
+        let eb = encode_budget(&same, None, Some(1), Also { enhanced: true, ..Also::default() });
         assert_eq!((eb["shared"].as_bool(), eb["level"].as_str()), (Some(false), Some("over")), "{eb}");
-        let replay = encode_budget(&same, Some(1), Also { replay: true, ..Also::default() });
+        let replay = encode_budget(&same, None, Some(1), Also { replay: true, ..Also::default() });
         assert_eq!(replay["level"], "over", "{replay}");
-        let lossless = encode_budget(&at(3840, 2160, 60, "lossless"), Some(1), Also::default());
+        let lossless = encode_budget(&at(3840, 2160, 60, "lossless"), None, Some(1), Also::default());
         assert_eq!(
             (lossless["record_mpx"].as_f64(), lossless["level"].as_str()),
             (Some(0.0), Some("limit")),
             "{lossless}"
         );
+    }
+
+    #[test]
+    fn truncated_settings_and_session_load_their_bak() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let settings_path = settings_file(dir.path());
+        let first = StudioSettings { width: 1280, height: 720, fps: 30, ..StudioSettings::default() };
+        let second = StudioSettings { width: 2560, height: 1440, fps: 60, ..StudioSettings::default() };
+
+        save_json(&settings_path, &serde_json::to_value(&first).unwrap_or_else(|e| panic!("{e}")));
+        save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));
+        assert!(ferrocast_store::durable::backup_path(&settings_path).exists());
+
+        let bytes = std::fs::read(&settings_path).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&settings_path, &bytes[..bytes.len() / 2]).unwrap_or_else(|e| panic!("{e}"));
+
+        let loaded = load_settings(dir.path());
+        assert_eq!((loaded.width, loaded.height, loaded.fps), (1280, 720, 30));
+
+        // Corrupt existing settings must not clobber `.bak` on a save_json overwrite.
+        save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!((load_settings(dir.path()).width, load_settings(dir.path()).fps), (2560, 60));
+    }
+
+    #[test]
+    fn deferred_safe_mode_collection_never_overwrites_saved_scenes() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let scenes_path = scenes_file(dir.path());
+        let saved_doc = json!({
+            "current_scene": "Main Show",
+            "scene_order": [{ "name": "Main Show" }]
+        });
+        save_json(&scenes_path, &saved_doc);
+
+        if let Ok(temp_blank) = Collection::new(Canvas { width: 640, height: 360, fps: 30 }, FIRST_SCENE) {
+            // While `collection_deferred` is true (Safe Mode before user confirm), save_confirmed is a no-op.
+            save_confirmed(true, &temp_blank, &scenes_path);
+            let still_on_disk: Value =
+                serde_json::from_slice(&std::fs::read(&scenes_path).unwrap_or_else(|e| panic!("{e}")))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(still_on_disk["current_scene"], "Main Show");
+        }
+    }
+
+    #[test]
+    fn drain_outputs_bounded_runs_off_main_in_parallel_and_bounds_stalls() {
+        use std::sync::{Arc, Barrier, Condvar, Mutex};
+
+        let caller_tid = std::thread::current().id();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_tids = Arc::new(Mutex::new(Vec::new()));
+
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..2)
+            .map(|_| {
+                let b = barrier.clone();
+                let tids = worker_tids.clone();
+                Box::new(move || {
+                    tids.lock().unwrap_or_else(|e| e.into_inner()).push(std::thread::current().id());
+                    // Barrier proves both drains execute concurrently off the caller thread.
+                    b.wait();
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+
+        assert!(drain_outputs_bounded(jobs, std::time::Duration::from_secs(2)));
+        let tids = worker_tids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(tids.len(), 2);
+        assert!(tids.iter().all(|&tid| tid != caller_tid));
+        assert_ne!(tids[0], tids[1]);
+
+        // Stalled drain returns false at the bound instead of wedging the main thread.
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_worker = gate.clone();
+        let stalled: Vec<Box<dyn FnOnce() + Send>> = vec![Box::new(move || {
+            let g = gate_worker.0.lock().unwrap_or_else(|e| e.into_inner());
+            drop(gate_worker.1.wait_while(g, |done| !*done));
+        })];
+        let started = std::time::Instant::now();
+        assert!(!drain_outputs_bounded(stalled, std::time::Duration::from_millis(40)));
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+        *gate.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        gate.1.notify_all();
+    }
+
+    #[test]
+    fn take_outputs_keeps_collection_alive_until_drain_and_close_clears_held() {
+        if let Ok(collection) = Collection::new(Canvas { width: 640, height: 360, fps: 30 }, FIRST_SCENE) {
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                h.collection = Some(collection);
+            });
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                let jobs = take_outputs_from_held(&mut h);
+                assert!(jobs.is_empty());
+                assert!(h.collection.is_some(), "collection stays intact until outputs finish");
+            });
+            assert!(close());
+            assert!(HELD.with(|h| h.borrow().collection.is_none()));
+        }
+    }
+
+    /// "Same as stream" is the stream's own encode, held to the platform's limit: so the stream and
+    /// the recording can share one encoder in either order, and a stream joining a recording's
+    /// encoder is as strict as it asks (it used to join a plain CBR one, past Twitch's limit, with
+    /// nothing saying so).
+    #[test]
+    fn a_same_as_stream_recording_follows_the_platform_cap_so_the_two_share_strictly() {
+        let s = StudioSettings {
+            video_kbps: 14_000,
+            vbr: false,
+            keyframe_s: 2,
+            record_quality: "stream".into(),
+            ..StudioSettings::default()
+        };
+        let twitch = StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 };
+        let stream = stream_settings(&s, Some(twitch));
+        let capped = record_encode_capped(&s, Some(twitch));
+        assert!(capped.strict_cbr && capped.scale.is_none());
+        let plan = ferrocast_studio::RecordPlan { tracks: vec![1], encode: capped, ..Default::default() };
+        assert_eq!(ferrocast_studio::stage::can_share(&stream, &plan, true, 60, 60), Ok(()));
+        // Without a cap, nothing changes: the plain stream and the plain recording share.
+        let plain = ferrocast_studio::RecordPlan {
+            tracks: vec![1],
+            encode: record_encode_capped(&s, None),
+            ..Default::default()
+        };
+        assert_eq!(ferrocast_studio::stage::can_share(&stream_settings(&s, None), &plain, true, 60, 60), Ok(()));
+        // A recording that began plain can't be joined by a strict stream: it gets its own encoder.
+        assert!(ferrocast_studio::stage::can_share(&stream, &plain, true, 60, 60).is_err());
+        // The other qualities are as chosen, cap or not.
+        let high = StudioSettings { record_quality: "high".into(), ..s.clone() };
+        assert_eq!(record_encode_capped(&high, Some(twitch)), record_encode(&high));
+    }
+
+    #[test]
+    fn twitch_cap_clamps_encode_forces_h264_2s_strict_cbr_and_clamps_auto_quality() {
+        let mut s = StudioSettings {
+            video_kbps: 14_000,
+            vbr: true,
+            keyframe_s: 4,
+            video_encoder: Some("com.apple.videotoolbox.videoencoder.ave.hevc".into()),
+            ..StudioSettings::default()
+        };
+        let twitch = StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 };
+        let capped = effective_stream_encode(&s, Some(twitch), None);
+        assert_eq!(capped.video_kbps, 6_000);
+        assert!(!capped.vbr, "CBR forced when capped");
+        assert!(capped.strict_cbr, "strict 1x VBV / DataRateLimits enabled");
+        assert_eq!(capped.keyframe_s, 2);
+        assert!(!capped.video_encoder.to_ascii_lowercase().contains("hevc"), "{}", capped.video_encoder);
+
+        // Auto quality scales the capped ceiling (6,000), never 14,000, and recovery returns to 6,000.
+        assert_eq!(effective_stream_encode(&s, Some(twitch), Some(75)).video_kbps, 4_500);
+        assert_eq!(effective_stream_encode(&s, Some(twitch), Some(100)).video_kbps, 6_000);
+
+        // A user setting already below the cap scales from its own bitrate.
+        s.video_kbps = 4_500;
+        assert_eq!(effective_stream_encode(&s, Some(twitch), Some(50)).video_kbps, 2_250);
+        assert_eq!(effective_stream_encode(&s, None, None).video_kbps, 4_500);
     }
 }

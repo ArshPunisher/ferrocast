@@ -1176,6 +1176,44 @@ async fn the_show_can_start_and_stop_streaming_in_obs() {
 }
 
 #[tokio::test]
+async fn ending_the_show_now_skips_the_stop_delay() {
+    let (e, _d) = engine().await;
+    let obs = with_obs(&e).await;
+    let tw = Fake::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    let cfg = json!({ "start_stream": true, "stop_stream": true, "stop_delay_s": 1, "discord": false });
+    e.patch_show_config(cfg.as_object().unwrap()).await.unwrap();
+    let step =
+        |r: &crate::studio::show::ShowRun| r.steps.iter().find(|s| s.id == "stop_stream").map(|s| s.status.clone());
+    // On a show running: the ending is done and the stream stops with it.
+    e.start_show(true).await.unwrap();
+    let ended = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&ended).as_deref(), Some("done"));
+    assert!(!obs.lock().unwrap().streaming);
+    // On a show already ending: only the stop comes forward; the thank-you isn't said twice.
+    e.start_show(true).await.unwrap();
+    let ending = e.end_show().await.unwrap();
+    assert_eq!(step(&ending).as_deref(), Some("waiting"));
+    let said = tw.said().len();
+    let stopped = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&stopped).as_deref(), Some("done"));
+    assert_eq!(stopped.id, ending.id, "the same show");
+    assert!(!obs.lock().unwrap().streaming);
+    assert_eq!(tw.said().len(), said, "one thank-you");
+    // The delayed stop of the stopped show doesn't touch a stream started since.
+    e.start_show(true).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(obs.lock().unwrap().streaming, "the old show's waiting stop did nothing");
+    // The show not stopping streams by itself: now still stops it (the streamer pressed Stop).
+    e.patch_show_config(json!({ "stop_stream": false }).as_object().unwrap()).await.unwrap();
+    let ended = e.end_show().await.unwrap();
+    assert!(step(&ended).is_none() && obs.lock().unwrap().streaming, "by default it stays on");
+    let ended = e.end_show_with(true).await.unwrap();
+    assert_eq!(step(&ended).as_deref(), Some("done"));
+    assert!(!obs.lock().unwrap().streaming);
+}
+
+#[tokio::test]
 async fn at_zero_runs_only_the_actions_that_are_on() {
     let (e, _d) = engine().await;
     let obs = with_obs(&e).await;
@@ -1239,10 +1277,15 @@ struct FakeStudio {
     empty_scene: Mutex<Option<String>>,
     /// Per-scene item list overrides for deep emptiness tests.
     scene_items: Mutex<std::collections::HashMap<String, Value>>,
+    /// What the recording's stats say now (null: no recording).
+    record_now: Mutex<serde_json::Value>,
 }
 
 #[async_trait]
 impl crate::studio_host::StudioHost for FakeStudio {
+    async fn record_stats(&self) -> Result<serde_json::Value, String> {
+        Ok(self.record_now.lock().unwrap().clone())
+    }
     async fn status(&self) -> crate::studio_host::StudioStatus {
         crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
     }
@@ -1726,4 +1769,47 @@ async fn brb_holds_isolate_manual_from_auto_and_hotkeys_run_the_show() {
     assert_eq!(e.show_run().unwrap().id, prev_id, "plain go_live did not start a Show");
     e.end_live().await.unwrap();
     assert!(!*studio.streaming.lock().unwrap());
+}
+
+/// M7-01: a recording that stops by itself (a full disk, a drive taken away) is said once on the
+/// dashboard in one line with its detail, however many times the watch looks; low room is said
+/// once before it runs out.
+#[tokio::test]
+async fn a_recording_that_stops_is_said_once_and_low_room_before_it() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    let mut live = e.subscribe_live();
+    let notices = |live: &mut tokio::sync::broadcast::Receiver<crate::frames::LiveFrame>| {
+        let mut out = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    };
+    // Room running low while it runs: one warning, not one per look.
+    *studio.record_now.lock().unwrap() = json!({ "file": "/r/a.mp4", "active": true, "error": null,
+        "bytes": 600_000_000u64, "seconds": 60, "disk_free_mb": 1500 });
+    for _ in 0..10 {
+        e.record_watch_tick().await;
+    }
+    let n = notices(&mut live);
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("record-space"), Some("warn")));
+    assert!(n[0]["detail"].as_str().unwrap().contains("recording stops and keeps what it has"), "{n:?}");
+    // The disk fills: it stopped, with the reason. One notice over many looks.
+    *studio.record_now.lock().unwrap() = json!({ "file": "/r/a.mp4", "active": false,
+        "error": "The recording stopped: the disk is full.", "bytes": 1_500_000_000u64, "seconds": 90,
+        "disk_free_mb": 0, "error_detail": "Free some space or choose another drive, then record again." });
+    for _ in 0..30 {
+        e.record_watch_tick().await;
+    }
+    let n = notices(&mut live);
+    assert_eq!(n.len(), 1, "{n:?}");
+    assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("record-stopped"), Some("error")));
+    assert_eq!(n[0]["message"], "Recording stopped: the disk is full");
+    assert!(n[0]["detail"].as_str().unwrap().contains("Free some space"), "{n:?}");
 }

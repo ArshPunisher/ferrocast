@@ -9,6 +9,34 @@ use crate::error::ApiError;
 #[derive(Debug)]
 pub struct Body<T>(pub T);
 
+/// Like [`Body`], but accepts an empty body and falls back to `T::default()`.
+#[derive(Debug)]
+pub struct OptionalBody<T>(pub T);
+
+impl<S, T> FromRequest<S> for OptionalBody<T>
+where
+    T: DeserializeOwned + Default,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::Bytes::from_request(req, state).await.map_err(|_| {
+            ApiError::new(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                format!("The request is too big; the limit is {} KB.", crate::JSON_LIMIT / 1024),
+            )
+        })?;
+        if bytes.is_empty() {
+            return Ok(OptionalBody(T::default()));
+        }
+        serde_json::from_slice::<T>(&bytes)
+            .map(OptionalBody)
+            .map_err(|e| ApiError::invalid(format!("The request isn't valid JSON ({e}).")))
+    }
+}
+
 impl<S, T> FromRequest<S> for Body<T>
 where
     T: DeserializeOwned,

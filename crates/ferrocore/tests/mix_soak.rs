@@ -114,7 +114,9 @@ impl Card {
     }
 
     /// What the card hands over at `now` (pieces and their times), if it's time.
-    fn poll(&mut self, now: u64) -> Vec<(Vec<f32>, u64)> {
+    /// When `sine_hz` is `Some(hz)`, generates a band-limited `0.5`-amplitude sine on device time
+    /// so any sub-sample jump, click or dropout shows cleanly after resampling (S1-F2 does the same).
+    fn poll(&mut self, now: u64, sine_hz: Option<(f64, f32)>) -> Vec<(Vec<f32>, u64)> {
         if now < self.next_burst {
             return Vec::new();
         }
@@ -124,7 +126,15 @@ impl Card {
         let mut out = Vec::new();
         for k in 0..n {
             let p = self.delivered + k;
-            let pcm = (0..PIECE as u64).map(|i| ramp(p * PIECE as u64 + i, 0.1, 0.8)).collect();
+            let pcm = match sine_hz {
+                Some((hz, amp)) => (0..PIECE as u64)
+                    .map(|i| {
+                        let t_dev = (p * PIECE as u64 + i) as f64 / per_sec;
+                        amp * (2.0 * std::f64::consts::PI * hz * t_dev).sin() as f32
+                    })
+                    .collect(),
+                None => (0..PIECE as u64).map(|i| ramp(p * PIECE as u64 + i, 0.1, 0.8)).collect(),
+            };
             let ts = match self.stamp {
                 Stamp::Device => T0 + (p as f64 * PIECE as f64 * 1e9 / per_sec) as u64,
                 Stamp::Arrival => now.saturating_sub((n - k) * ms(10)),
@@ -289,25 +299,43 @@ struct SoakResult {
 }
 
 fn soak(cfg: &Soak) -> SoakResult {
+    run_soak(cfg, None).0
+}
+
+fn run_soak(cfg: &Soak, card_sine: Option<(f64, f32)>) -> (SoakResult, SineJudge) {
     let mut m = mixer();
     let mut mic = Mic { delivered: 0, off: cfg.mic_off.map(|(a, b)| (T0 + secs(a), T0 + secs(b))) };
     let mut card = Card::new(0x9E37_79B9_7F4A_7C15, cfg.drift_ppm, cfg.stamp, cfg.stalls);
-    let (mut mj, mut cj) = (MicJudge::default(), CardJudge::default());
+    let (mut mj, mut cj, mut sj) = (MicJudge::default(), CardJudge::default(), SineJudge::default());
     let end = T0 + secs(cfg.secs);
     let (mut now, mut tick) = (T0, 0u64);
     let (mut max_latency, mut at_cap, mut max_queue) = (0u64, 0u64, [0u64; 2]);
+    let mut end_phase_err_ms = 0.0f64;
     while now < end {
         now += TICK_NS;
         tick += 1;
         mic.poll(now, RATE, |pcm, ts, rate| m.push(MIC, &pcm, 1, rate, ts));
-        for (pcm, ts) in card.poll(now) {
+        for (pcm, ts) in card.poll(now, card_sine) {
             m.push(CARD, &pcm, 1, RATE, ts);
         }
         for b in m.mix_until(now) {
             // The first seconds are the mixer finding its feet.
             if b.ts_ns > T0 + secs(3) {
                 mj.block(&b, RATE);
-                cj.block(&b, RATE);
+                if let Some((hz, amp)) = card_sine {
+                    sj.block(&b, RATE, 1);
+                    if b.ts_ns > T0 + secs(cfg.secs.saturating_sub(2)) {
+                        let t_out = (b.ts_ns - T0) as f64 / 1e9;
+                        let angle = 2.0 * std::f64::consts::PI * hz * t_out;
+                        let expected = amp * angle.sin() as f32;
+                        if angle.cos() > 0.5 && expected.abs() < 0.05 && b.tracks[1][0].abs() < 0.4 {
+                            let slope = amp * (2.0 * std::f64::consts::PI * hz * angle.cos()) as f32;
+                            end_phase_err_ms = f64::from((b.tracks[1][0] - expected) / slope) * 1000.0;
+                        }
+                    }
+                } else {
+                    cj.block(&b, RATE);
+                }
             }
         }
         max_latency = max_latency.max(m.latency_ns());
@@ -319,15 +347,19 @@ fn soak(cfg: &Soak) -> SoakResult {
             max_queue[1] = max_queue[1].max(queued_frames(&m, CARD));
         }
     }
-    SoakResult {
-        mic: mj,
-        card: cj,
-        deliveries: card.deliveries,
-        max_latency_ns: max_latency,
-        latency_at_end_ns: m.latency_ns(),
-        ticks_at_cap: at_cap,
-        max_queue,
-    }
+    sj.phase_err_ms = end_phase_err_ms;
+    (
+        SoakResult {
+            mic: mj,
+            card: cj,
+            deliveries: card.deliveries,
+            max_latency_ns: max_latency,
+            latency_at_end_ns: m.latency_ns(),
+            ticks_at_cap: at_cap,
+            max_queue,
+        },
+        sj,
+    )
 }
 
 /// The stretches the card was silent for no reason: a hole is excused only inside a stall (the
@@ -388,29 +420,55 @@ fn two_hours_with_a_bursty_card_stamped_by_the_device() {
 /// The mic never notices the card's drift or stalls; and the card's own sound: a clock that runs
 /// fast makes the mixer drop 70 ms of it each time the stamps fall that far behind the sound
 /// (a jump in what's heard, a click), one that runs slow leaves a gap of what it fell short by.
-/// Both come from a device clock that isn't followed (the mixer places sound by stamps only).
+/// Uses a band-limited 440 Hz sine (like `S1-F2`) because any valid resampler rings on the
+/// 1 Hz `-0.8` sawtooth cliff of `ramp()`.
 #[test]
-#[ignore = "finding S1-F1: a card's clock drift isn't followed: a click every ~4 min fast, a dropout every ~70 s slow"]
 fn a_drifting_card_gives_no_clicks_and_no_dropouts() {
+    const HZ: f64 = 440.0;
+    const AMP: f32 = 0.5;
+    let steepest = AMP * (2.0 * std::f64::consts::PI * HZ / f64::from(RATE)) as f32;
     let mut bad = Vec::new();
-    for (name, stamp, ppm) in [
-        ("arrival +300", Stamp::Arrival, 300.0),
-        ("device +300", Stamp::Device, 300.0),
-        ("device -300", Stamp::Device, -300.0),
+    for (name, stamp, ppm, run_secs) in [
+        ("arrival 0ppm", Stamp::Arrival, 0.0, 120u64),
+        ("arrival +300", Stamp::Arrival, 300.0, 600),
+        ("device +300", Stamp::Device, 300.0, 600),
+        ("device -300", Stamp::Device, -300.0, 600),
     ] {
-        let r = soak(&Soak { stamp, drift_ppm: ppm, stalls: false, secs: 600, mic_off: None });
-        if !r.card.tears.is_empty() {
+        let (r, sj) =
+            run_soak(&Soak { stamp, drift_ppm: ppm, stalls: false, secs: run_secs, mic_off: None }, Some((HZ, AMP)));
+        eprintln!(
+            "{name}: worst step {:.4} (lim {:.4}) at {:.3}s, quiet {} frames, end phase {:.3}ms",
+            sj.worst_step,
+            steepest * 1.25,
+            (sj.worst_at.saturating_sub(T0)) as f64 / 1e9,
+            sj.longest_quiet,
+            sj.phase_err_ms
+        );
+        if sj.worst_step > steepest * 1.25 {
             bad.push(format!(
-                "{name}: the card's sound jumped {} times: {:?}",
-                r.card.tears.len(),
-                &r.card.tears[..r.card.tears.len().min(3)]
+                "{name}: click at {:.3}s: step {:.4} > {:.4}",
+                (sj.worst_at.saturating_sub(T0)) as f64 / 1e9,
+                sj.worst_step,
+                steepest * 1.25
             ));
         }
-        if !r.card.holes.is_empty() {
+        if sj.longest_quiet >= 120 {
+            bad.push(format!("{name}: dropout of {} frames", sj.longest_quiet));
+        }
+        if sj.phase_err_ms.abs() > 2.0 {
+            bad.push(format!("{name}: clock phase drifted to {:.3} ms", sj.phase_err_ms));
+        }
+        if !r.mic.glitches.is_empty() || r.mic.silent_blocks > 0 || r.mic.worst_shift_frames.abs() > 48 {
             bad.push(format!(
-                "{name}: the card dropped out {} times: {:?}",
-                r.card.holes.len(),
-                &r.card.holes[..r.card.holes.len().min(3)]
+                "{name}: mic affected: silent={} shift={} glitches={:?}",
+                r.mic.silent_blocks, r.mic.worst_shift_frames, r.mic.glitches
+            ));
+        }
+        if r.max_latency_ns > ms(340) || r.max_queue.iter().any(|q| *q > u64::from(RATE)) {
+            bad.push(format!(
+                "{name}: wait/queue exceeded: latency={}ms queues={:?}",
+                r.max_latency_ns / 1_000_000,
+                r.max_queue
             ));
         }
     }
@@ -453,11 +511,12 @@ struct SineJudge {
     worst_at: u64,
     quiet_run: u32,
     longest_quiet: u32,
+    phase_err_ms: f64,
 }
 
 impl SineJudge {
-    fn block(&mut self, b: &Block, rate: u32) {
-        for (i, f) in b.tracks[0].as_chunks::<2>().0.iter().enumerate() {
+    fn block(&mut self, b: &Block, rate: u32, track: usize) {
+        for (i, f) in b.tracks[track].as_chunks::<2>().0.iter().enumerate() {
             if let Some(p) = self.last {
                 let d = (f[0] - p).abs();
                 if d > self.worst_step {
@@ -502,7 +561,7 @@ fn a_mic_that_changes_rate_mid_stream_has_no_click_and_no_gap() {
         }
         for b in m.mix_until(now) {
             if b.ts_ns > T0 + secs(3) {
-                j.block(&b, RATE);
+                j.block(&b, RATE, 0);
             }
         }
     }
