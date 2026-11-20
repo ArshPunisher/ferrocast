@@ -18,6 +18,29 @@ use crate::{Engine, EngineError, now};
 /// The key of the notice [`Engine::browser_didnt_open`] sends.
 pub const BROWSER_NOTICE: &str = "browser";
 
+/// What the keychain holds for a saved sign-in: nothing, something unreadable, or the tokens.
+/// A keychain that can't be read (locked, a hiccup at boot) is not the streamer being signed out:
+/// the sign-in is kept and the connector isn't told "sign in again".
+pub(crate) enum Saved<T> {
+    Missing,
+    Unreadable,
+    Found(T),
+}
+
+pub(crate) fn saved_tokens<T: serde::de::DeserializeOwned>(
+    secrets: &dyn ferrocast_secrets::Secrets,
+    key: &str,
+) -> Saved<T> {
+    match secrets.get(key) {
+        Err(e) => {
+            tracing::warn!(error = %e, key, "the saved sign-in couldn't be read from the keychain; it is kept");
+            Saved::Unreadable
+        }
+        Ok(None) => Saved::Missing,
+        Ok(Some(j)) => serde_json::from_str(&j).map_or(Saved::Missing, Saved::Found),
+    }
+}
+
 const TWITCH_TOKENS: &str = "twitch-tokens";
 const YOUTUBE_TOKENS: &str = "youtube-tokens";
 /// How long the browser sign-in for YouTube may take.
@@ -239,13 +262,13 @@ impl Engine {
                 continue;
             }
             if a.platform == "youtube" {
-                let saved = self.inner.secrets.get(YOUTUBE_TOKENS).ok().flatten();
-                match saved.and_then(|j| serde_json::from_str::<ferrocast_youtube::Tokens>(&j).ok()) {
-                    Some(t) => match self.youtube_api(t) {
+                match saved_tokens::<ferrocast_youtube::Tokens>(&*self.inner.secrets, YOUTUBE_TOKENS) {
+                    Saved::Unreadable => {}
+                    Saved::Found(t) => match self.youtube_api(t) {
                         Ok(api) => self.start_youtube(api, a.clone()),
                         Err(e) => tracing::warn!(%e, "YouTube is saved but can't start"),
                     },
-                    None => {
+                    Saved::Missing => {
                         let _ = self
                             .submit(Event::live(
                                 Platform::Youtube,
@@ -259,13 +282,13 @@ impl Engine {
                 continue;
             }
             if a.platform == "twitch" {
-                let saved = self.inner.secrets.get(TWITCH_TOKENS).ok().flatten();
-                match saved.and_then(|j| serde_json::from_str::<Tokens>(&j).ok()) {
-                    Some(t) => match self.twitch_auth(t) {
+                match saved_tokens::<Tokens>(&*self.inner.secrets, TWITCH_TOKENS) {
+                    Saved::Unreadable => {}
+                    Saved::Found(t) => match self.twitch_auth(t) {
                         Ok(auth) => self.start_twitch(auth, a),
                         Err(e) => tracing::warn!(%e, "Twitch is saved but can't start"),
                     },
-                    None => {
+                    Saved::Missing => {
                         let _ = self
                             .submit(Event::live(
                                 Platform::Twitch,
@@ -457,5 +480,31 @@ impl Engine {
     /// The same with what the line leaves out (the engine's own words), behind an (i) on the page.
     pub(crate) fn notice_detail(&self, key: &str, level: NoticeLevel, message: &str, detail: &str) {
         self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key).detail(detail)));
+    }
+}
+
+#[cfg(test)]
+mod saved_tokens_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Locked;
+    impl ferrocast_secrets::Secrets for Locked {
+        fn get(&self, _: &str) -> Result<Option<String>, ferrocast_secrets::SecretError> {
+            Err(ferrocast_secrets::SecretError::Unavailable("the keychain is locked".into()))
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_keychain_that_cant_be_read_is_not_a_missing_sign_in() {
+        assert!(matches!(saved_tokens::<Tokens>(&Locked, "twitch-tokens"), Saved::Unreadable));
+        let mem = ferrocast_secrets::MemorySecrets::default();
+        assert!(matches!(saved_tokens::<Tokens>(&mem, "twitch-tokens"), Saved::Missing));
     }
 }
