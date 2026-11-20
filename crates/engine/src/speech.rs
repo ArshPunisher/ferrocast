@@ -156,18 +156,22 @@ pub async fn synthesize(text: &str, voice: Option<&str>, work: &Path, out: &Path
         return Err(SpeechError::Failed("too many lines are waiting to be read".into()));
     };
     let _turn = GATE.acquire().await.map_err(|_| SpeechError::Failed("the voice is closed".into()))?;
+    synthesize_one(text, voice, work, out).await
+}
+
+async fn synthesize_one(text: &str, voice: Option<&str>, work: &Path, out: &Path) -> Result<(), SpeechError> {
     #[cfg(test)]
     {
         let now = ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         PEAK.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
     }
-    let result = synthesize_one(text, voice, work, out).await;
+    let result = synthesize_inner(text, voice, work, out).await;
     #[cfg(test)]
     ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     result
 }
 
-async fn synthesize_one(text: &str, voice: Option<&str>, work: &Path, out: &Path) -> Result<(), SpeechError> {
+async fn synthesize_inner(text: &str, voice: Option<&str>, work: &Path, out: &Path) -> Result<(), SpeechError> {
     tokio::fs::create_dir_all(work).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
     let input: PathBuf = work.join(input_name());
     tokio::fs::write(&input, text.as_bytes()).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
@@ -257,6 +261,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn speaks_hostile_text_into_a_real_wav() {
+        let _turn = PEAK_TEST.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("a.wav");
         // Looks like options and shell, must just be read aloud.
@@ -266,6 +271,9 @@ mod tests {
         assert!(!std::path::Path::new("/tmp/pwned").exists());
         assert!(!voices().await.is_empty());
     }
+
+    /// The tests that read the voice's concurrency peak take turns.
+    static PEAK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn input_names_never_repeat_even_across_threads() {
@@ -284,7 +292,21 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn an_alert_flood_speaks_one_at_a_time_and_lets_a_long_line_go() {
+        let _turn = PEAK_TEST.lock().unwrap_or_else(|p| p.into_inner());
         let dir = tempfile::tempdir().unwrap();
+        // The old behaviour (no gate, every line at once): several voices at the same time.
+        PEAK.store(0, std::sync::atomic::Ordering::SeqCst);
+        let ungated: Vec<_> = (0..6)
+            .map(|i| {
+                let (work, out) = (dir.path().to_path_buf(), dir.path().join(format!("old{i}.wav")));
+                tokio::spawn(async move { synthesize_one("hi", None, &work, &out).await })
+            })
+            .collect();
+        for t in ungated {
+            t.await.unwrap().unwrap();
+        }
+        assert!(PEAK.load(std::sync::atomic::Ordering::SeqCst) > 1, "without the gate, voices overlap");
+        PEAK.store(0, std::sync::atomic::Ordering::SeqCst);
         let work = dir.path().to_path_buf();
         let tasks: Vec<_> = (0..40)
             .map(|i| {
