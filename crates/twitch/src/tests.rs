@@ -405,8 +405,12 @@ async fn tokens_that_couldnt_be_saved_are_saved_at_the_next_use() {
     assert!(saved.lock().unwrap().is_empty(), "the refresh's save failed");
     auth.access().await.unwrap();
     assert!(saved.lock().unwrap().is_empty(), "the second try failed too");
+    // Not asked again at every call (a 30 s wait); after it, the next use saves.
     auth.access().await.unwrap();
-    assert_eq!(saved.lock().unwrap().len(), 1, "the third use saved the new tokens");
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2, "the Keychain was left alone for a while");
+    auth.forget_save_cooldown();
+    auth.access().await.unwrap();
+    assert_eq!(saved.lock().unwrap().len(), 1, "the third try saved the new tokens");
     let before = attempts.load(std::sync::atomic::Ordering::SeqCst);
     auth.access().await.unwrap();
     assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), before, "saved: no more tries");

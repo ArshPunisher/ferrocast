@@ -41,6 +41,9 @@ pub struct KickApi {
     /// The newest tokens couldn't be saved: tried again at every use (the saved refresh token
     /// is the one already spent).
     unsaved: AtomicBool,
+    /// When saving was last retried while `unsaved`: not again for a while, so a locked Keychain isn't
+    /// asked, under the token lock, at every call.
+    last_save_try: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl fmt::Debug for KickApi {
@@ -71,6 +74,7 @@ impl KickApi {
             refresher,
             on_tokens,
             unsaved: AtomicBool::new(false),
+            last_save_try: std::sync::Mutex::new(None),
         }
     }
 
@@ -116,7 +120,11 @@ impl KickApi {
 
     fn save_again(&self, t: &KickTokens) {
         if self.unsaved.load(Ordering::Acquire) {
-            self.save(t);
+            let mut last = self.last_save_try.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(30)) {
+                *last = Some(std::time::Instant::now());
+                self.save(t);
+            }
         }
     }
 
