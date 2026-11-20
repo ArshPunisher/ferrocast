@@ -151,6 +151,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/ndi", post(engine_ndi_output))
         .route("/studio/engine/record/chapter", post(engine_record_chapter))
         .route("/studio/engine/remux", post(engine_remux))
+        .route("/studio/remote-control", get(remote_control).post(set_remote_control))
+        .route("/studio/remote-control/password", post(new_remote_control_password))
         .route("/studio/engine/encoders/{id}/options", post(engine_encoder_options))
         .route("/studio/engine/monitoring", get(engine_monitoring))
         // chatbot
@@ -1534,6 +1536,30 @@ struct RemuxBody {
 /// `POST /studio/engine/remux` `{ file }` → `{ to }`: an MP4 made beside it, in the background.
 async fn engine_remux(State(app): State<AppState>, Body(b): Body<RemuxBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_remux(b.file).await?))
+}
+
+/// `GET /studio/remote-control` → the obs-websocket server's settings and state.
+async fn remote_control(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.obsws_view().await)))
+}
+
+/// `POST /studio/remote-control` `{ enabled?, port?, lan? }` → the same, with `password` (once)
+/// when switching it on made one.
+async fn set_remote_control(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::obsws::ObsWsPatch>,
+) -> ApiResult<Json<Value>> {
+    let (view, password) = app.engine.obsws_set(b).await?;
+    let mut out = json!(view);
+    if let Some(p) = password {
+        out["password"] = json!(p);
+    }
+    Ok(Json(out))
+}
+
+/// `POST /studio/remote-control/password` → `{ password }`: a new one; the old one stops working.
+async fn new_remote_control_password(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({ "password": app.engine.obsws_regenerate().await? })))
 }
 
 #[derive(Deserialize)]

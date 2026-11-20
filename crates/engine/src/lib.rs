@@ -43,6 +43,7 @@ mod polls;
 mod pro;
 pub mod speech_model;
 pub use pro::{ProStatus, ProView};
+pub mod obsws;
 mod recap;
 mod relay;
 mod remote;
@@ -189,6 +190,7 @@ struct Inner {
     cloud_tts: speech::CloudTts,
     /// Pro dashboard from anywhere: the tunnel to the relay and the server's handler.
     remote: remote::Remote,
+    obsws: obsws::Runtime,
     /// Pro 24/7 cloud bot: the pushed config's version and hashes, counters seen.
     cloud_bot: cloud_bot::CloudBot,
     /// Cloud sync and "Use cloud overlays" (docs/CLOUD.md §1.1): the switches and URLs.
@@ -341,6 +343,7 @@ impl Engine {
                 cloud_backup: Default::default(),
                 cloud_tts: Default::default(),
                 remote: Default::default(),
+                obsws: Default::default(),
                 cloud_bot: Default::default(),
                 cloud_sync: Mutex::new(Default::default()),
                 smart: Mutex::new(Default::default()),
