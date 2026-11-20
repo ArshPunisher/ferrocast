@@ -1578,7 +1578,7 @@ async fn set_privacy(State(app): State<AppState>, Body(privacy): Body<Value>) ->
 
 /// `POST /studio/engine/levels` `{ names }` → `{ name: { peak: [l, r], magnitude: [l, r] } }`.
 async fn engine_levels(State(app): State<AppState>, Body(b): Body<LevelsBody>) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::Levels { names: b.names }).await
+    Ok(Json(app.engine.studio_levels(b.names).await?))
 }
 
 async fn show_config(State(app): State<AppState>) -> Json<Value> {

@@ -123,6 +123,11 @@ impl Default for Levels {
 /// five, so peaks between reads never showed and the bars jumped (18 Nov).
 pub const METER_BLOCKS: usize = 14;
 
+/// Blocks the fast meter reads over (about 43 ms): the dashboard's bars, polled at 30 Hz, see
+/// every block (a window shorter than the poll gap would miss peaks) and draw the release
+/// themselves, so the engine's 300 ms window no longer smears them.
+pub const METER_FAST_BLOCKS: usize = 2;
+
 /// One block's linear measures, kept for meters.
 #[derive(Debug, Clone, Copy, Default)]
 struct Measured {
@@ -1342,13 +1347,19 @@ impl Mixer {
     /// A source's levels for a meter: the highest peak and the RMS over the last
     /// [`METER_BLOCKS`] blocks (every reader sees the same; nothing is reset by reading).
     pub fn levels(&self, id: u64) -> Option<Levels> {
+        self.levels_over(id, METER_BLOCKS)
+    }
+
+    /// Like [`Mixer::levels`] over only the newest `blocks` blocks (allocation-free).
+    pub fn levels_over(&self, id: u64, blocks: usize) -> Option<Levels> {
         let s = self.sources.get(&id)?;
         if s.recent.is_empty() {
             return Some(s.levels);
         }
-        let n = s.recent.len() as f32 * BLOCK as f32;
+        let take = blocks.min(s.recent.len());
+        let n = take as f32 * BLOCK as f32;
         let mut m = Measured::default();
-        for r in &s.recent {
+        for r in s.recent.iter().rev().take(take) {
             for c in 0..2 {
                 m.peak[c] = m.peak[c].max(r.peak[c]);
                 m.input[c] = m.input[c].max(r.input[c]);
@@ -2358,6 +2369,27 @@ mod tests {
         drop(tap);
         m.push(1, &[0.2, 0.4], 2, RATE, 20_000);
         assert!(m.taps.iter().all(|(_, t)| t.strong_count() == 0), "a dropped tap gets nothing");
+    }
+
+    /// The meter's window: the slow one still holds a loud block for about 300 ms, the fast one
+    /// (the dashboard's) only for a few blocks, so a bar that falls is not smeared by the engine.
+    #[test]
+    fn the_fast_meter_window_is_a_few_blocks_and_the_slow_one_is_unchanged() {
+        const { assert!(METER_FAST_BLOCKS * BLOCK * 1000 / 48_000 <= 50) } // about 40 ms
+        const { assert!(METER_BLOCKS * BLOCK * 1000 / 48_000 >= 290) } // about 300 ms
+        let mut m = Mixer::new(RATE, 0);
+        m.set(1, SourceSettings::default());
+        let t0 = 1_000_000_000;
+        m.mix_until(t0);
+        // One loud block, then silence for the fast window and a block more.
+        let mut pcm = vec![0.5f32; BLOCK * 2];
+        pcm.extend(vec![0.0f32; BLOCK * 2 * (METER_FAST_BLOCKS + 1)]);
+        m.push(1, &pcm, 2, RATE, t0);
+        m.mix_until(t0 + ns(BLOCK * (METER_FAST_BLOCKS + 2), RATE));
+        let slow = m.levels(1).unwrap_or_default();
+        let fast = m.levels_over(1, METER_FAST_BLOCKS).unwrap_or_default();
+        assert!(slow.peak[0] > -10.0, "the slow window still holds the loud block: {}", slow.peak[0]);
+        assert!(fast.peak[0] == f32::NEG_INFINITY || fast.peak[0] < -60.0, "the fast one let it go: {}", fast.peak[0]);
     }
 
     #[test]

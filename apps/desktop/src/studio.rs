@@ -2116,6 +2116,10 @@ impl StudioHost for DesktopStudio {
             .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))
     }
 
+    fn levels_now(&self, names: &[String]) -> Option<Value> {
+        serde_json::to_value(ferrocast_studio::stage::levels_now(names)?).ok()
+    }
+
     async fn act(&self, act: StudioAct) -> Result<Value, String> {
         // A source's form: its kind found on the main thread, the form read off it (devices).
         if let StudioAct::Options { name } = &act {

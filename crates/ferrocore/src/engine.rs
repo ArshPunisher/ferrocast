@@ -1847,6 +1847,12 @@ impl Engine {
         self.levels.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|atom| atom.load())
     }
 
+    /// A source's levels over the last few blocks only (about 43 ms), wait-free: the dashboard's
+    /// meters, which smooth the fall themselves. [`Engine::levels`] keeps its 300 ms window.
+    pub fn levels_fast(&self, id: u64) -> Option<crate::mix::Levels> {
+        self.levels.read().unwrap_or_else(|e| e.into_inner()).get(&id).map(|atom| atom.load_fast())
+    }
+
     #[cfg(test)]
     pub(crate) fn sound_settings(&self, id: u64) -> Option<SourceSettings> {
         let (tx, rx) = mpsc::sync_channel(1);

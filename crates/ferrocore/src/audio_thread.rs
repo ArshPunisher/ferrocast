@@ -359,6 +359,9 @@ impl<C: AudioClock> AudioRunner<C> {
                 if let Some(lvl) = self.mixer.levels(*id) {
                     atom.store(&lvl);
                 }
+                if let Some(fast) = self.mixer.levels_over(*id, crate::mix::METER_FAST_BLOCKS) {
+                    atom.store_fast(&fast);
+                }
             }
             if !self.master_taps.is_empty() {
                 self.master_taps.retain(|w| w.strong_count() > 0);

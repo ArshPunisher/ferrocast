@@ -35,6 +35,48 @@ const CHANNEL_KEYS: [&str; 6] = [
 /// still there while the transition to the new one plays). Not a name anyone can type.
 pub(crate) const PROGRAM_COPY: [&str; 2] = ["\u{1}On air 1", "\u{1}On air 2"];
 
+/// Reads each named source's levels (dBFS, floored at -100), from the engine's wait-free
+/// meters: over the long (300 ms) window, or `fast` over a few blocks.
+fn read_levels(
+    e: &own::Shared,
+    names: &[String],
+    fast: bool,
+) -> std::collections::HashMap<String, crate::collection::LevelInfo> {
+    names
+        .iter()
+        .filter_map(|n| {
+            let (id, _) = e.engine.source_named(n)?;
+            let l = if fast { e.engine.levels_fast(id)? } else { e.engine.levels(id)? };
+            // Silence is -100, not -inf: JSON has no infinity, so it went out as null, which
+            // the page read as 0 dB, a full red meter the moment the sound stopped.
+            let floor = |v: [f32; 2]| v.map(|x| if x.is_finite() { x.max(-100.0) } else { -100.0 });
+            Some((
+                n.clone(),
+                crate::collection::LevelInfo {
+                    peak: floor(l.peak),
+                    magnitude: floor(l.rms),
+                    input_peak: floor(l.input_peak),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The running engine, for readers that must not wait for the Studio's main thread (the meters
+/// poll thirty times a second). Weak: the picture-size check counts strong holders.
+static LIVE_ENGINE: std::sync::Mutex<std::sync::Weak<own::Shared>> = std::sync::Mutex::new(std::sync::Weak::new());
+
+fn publish_engine(shared: Option<&Arc<own::Shared>>) {
+    *LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()) = shared.map_or_else(std::sync::Weak::new, Arc::downgrade);
+}
+
+/// The meters over a short window, read without the Studio's main thread. None when no engine
+/// is running (the caller then asks the main thread, which says why).
+pub fn levels_now(names: &[String]) -> Option<std::collections::HashMap<String, crate::collection::LevelInfo>> {
+    let e = LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()).upgrade()?;
+    Some(read_levels(&e, names, true))
+}
+
 /// The scene store.
 #[derive(Debug)]
 pub struct Stage {
@@ -347,6 +389,7 @@ impl Stage {
         shared.engine.set_true_peak(self.true_peak.get());
         shared.engine.set_low_latency(self.low_latency.get());
         *self.engine.borrow_mut() = Some(shared.clone());
+        publish_engine(Some(&shared));
         self.sync_pages();
         Ok(shared)
     }
@@ -2695,6 +2738,7 @@ impl Stage {
             return Err(fail("The picture size can't change while streaming or recording. Stop first."));
         }
         *self.engine.borrow_mut() = None;
+        publish_engine(None);
         self.canvas = canvas;
         Ok(())
     }
@@ -2774,24 +2818,7 @@ impl Stage {
     /// Each named source's sound now (dBFS; -100 is silence): the mixer's meters.
     pub fn levels(&self, names: &[String]) -> std::collections::HashMap<String, crate::collection::LevelInfo> {
         let Some(e) = self.engine.borrow().clone() else { return Default::default() };
-        names
-            .iter()
-            .filter_map(|n| {
-                let (id, _) = e.engine.source_named(n)?;
-                let l = e.engine.levels(id)?;
-                // Silence is -100, not -inf: JSON has no infinity, so it went out as null, which
-                // the page read as 0 dB, a full red meter the moment the sound stopped.
-                let floor = |v: [f32; 2]| v.map(|x| if x.is_finite() { x.max(-100.0) } else { -100.0 });
-                Some((
-                    n.clone(),
-                    crate::collection::LevelInfo {
-                        peak: floor(l.peak),
-                        magnitude: floor(l.rms),
-                        input_peak: floor(l.input_peak),
-                    },
-                ))
-            })
-            .collect()
+        read_levels(&e, names, false)
     }
 
     /// Ferrocast's sound care: `{ ducking: { voices, music, depth_db } | null, loudness_lufs:
