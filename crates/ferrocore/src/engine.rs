@@ -830,6 +830,14 @@ struct Watch {
 }
 
 impl Watch {
+    /// The wait before try `n` at starting this source again. A capture card that has sent a
+    /// picture before is looked for again within a few seconds (its HDMI may come back at any
+    /// moment); anything else waits the long backoff.
+    fn backoff(&self, n: u32) -> u64 {
+        let wait = backoff_ns(n);
+        if self.cap_no_signal && self.ever_sent { wait.min(CARD_RETRY_MAX_NS) } else { wait }
+    }
+
     fn for_kind(kind: Option<&SourceKind>, now: u64) -> Self {
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let cap_no_signal = matches!(kind, Some(SourceKind::Camera(_)));
@@ -848,6 +856,8 @@ const STALL_NS: u64 = 5_000_000_000;
 const FIRST_FRAME_NS: u64 = 10_000_000_000;
 /// Maximum fruitless zero-frame tries for a capture card/camera before waiting in "no signal".
 const NO_SIGNAL_MAX_TRIES: u32 = 3;
+/// The longest wait between tries at a capture card that has worked before.
+const CARD_RETRY_MAX_NS: u64 = 3_000_000_000;
 /// Hard deadline before the watchdog clears a stalled reopen worker slot.
 const REOPEN_TIMEOUT_NS: u64 = 60_000_000_000;
 /// Caps simultaneous reopen worker threads so a USB hub reset doesn't contend on every device at once.
@@ -4098,7 +4108,19 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
         return Some("it faulted".into());
     }
     if w.cap_no_signal && !w.ever_sent && w.tries >= NO_SIGNAL_MAX_TRIES {
-        w.no_signal = true;
+        // Waiting for a signal, with the session left open: a picture that comes now (a console
+        // switched on) lets go of the wait, as USB hotplug does. Nothing else is tried.
+        match signs {
+            Some((count, ..)) if running && count > 0 => {
+                w.ever_sent = true;
+                w.no_signal = false;
+                w.count = count;
+                w.since = now;
+                w.tries = 0;
+                w.next_try = 0;
+            }
+            _ => w.no_signal = true,
+        }
         return None;
     }
     if !running {
@@ -4266,7 +4288,7 @@ fn watchdog_step(
             let Some(kind) = src.kind.clone() else { continue };
             let token = next_open_token();
             let prev_tries = src.watch.tries;
-            src.watch.next_try = now + backoff_ns(prev_tries);
+            src.watch.next_try = now + src.watch.backoff(prev_tries);
             src.watch.tries = prev_tries.saturating_add(1);
             src.watch.faulted = false;
             src.watch.since = now;
@@ -5232,6 +5254,37 @@ mod tests {
         assert!(!src.watch.no_signal);
         assert_eq!(src.watch.tries, 0);
         assert!(look(&mut src.watch, false, None, 20 * sec).is_some());
+    }
+
+    /// A capture card nobody has plugged anything into yet (a PS5 turned on later): once it
+    /// sends, the "no signal" wait ends by itself, with no unplugging or editing (agy GAPS #6).
+    #[test]
+    fn a_no_signal_card_wakes_when_its_picture_comes() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 40 * s), None);
+        assert!(w.no_signal, "waiting for a signal");
+        // The console is switched on: frames flow on the session that was open all along.
+        assert_eq!(look(&mut w, true, Some((30, true, None)), 90 * s), None);
+        assert!(!w.no_signal && w.ever_sent, "the latch let go");
+        assert_eq!(w.tries, 0);
+        // And it's watched as a working card again: if it stops, it's restarted.
+        assert!(look(&mut w, true, Some((30, true, None)), 97 * s).is_some());
+    }
+
+    /// A card that has worked is looked for again within a few seconds when its HDMI comes back
+    /// from a long drop, not up to 30-60 s later; other sources keep the longer wait.
+    #[test]
+    fn a_card_that_worked_is_retried_quickly_not_after_a_minute() {
+        let s = 1_000_000_000;
+        let mut card = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        card.ever_sent = true;
+        assert!(card.backoff(0) <= 3 * s && card.backoff(9) <= 3 * s);
+        let mic = Watch::for_kind(Some(&SourceKind::Microphone("usb".into())), 0);
+        assert_eq!(mic.backoff(9), 60 * s);
+        let unseen = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        assert_eq!(unseen.backoff(9), 60 * s, "a card that never sent keeps the slow wait");
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
