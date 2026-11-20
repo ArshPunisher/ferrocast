@@ -560,6 +560,9 @@ pub fn own_size(id: &str) -> Option<(u32, u32)> {
 const FOURCC_MJPEG_DMB1: u32 = u32::from_be_bytes(*b"dmb1");
 const FOURCC_JPEG: u32 = u32::from_be_bytes(*b"jpeg");
 const USB_TRANSPORT: i32 = i32::from_be_bytes(*b"usb ");
+/// Bluetooth inputs (AirPods, headsets): macOS drops them to a 16 kHz call profile when used.
+const BLUETOOTH_TRANSPORT: i32 = i32::from_be_bytes(*b"blue");
+const BLUETOOTH_LE_TRANSPORT: i32 = i32::from_be_bytes(*b"blea");
 
 /// A camera format entry with its FourCC subtype.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -994,7 +997,7 @@ impl Capture {
         // Following the system's microphone, and it changed (headphones with a mic plugged
         // in, another input picked in System Settings): this one is done, the new one opens.
         let now = self.follows.as_ref().and_then(|_| default_microphone());
-        moved_on(self.follows.as_deref(), now.as_deref())
+        moved_on(self.follows.as_deref(), now.as_deref(), is_bluetooth_input)
     }
 }
 
@@ -1007,10 +1010,30 @@ impl Drop for Capture {
 
 /// Why a capture following the system's microphone ended: the system's is another one now.
 /// (None when there's no system microphone: the one open stays until one comes.)
-fn moved_on(follows: Option<&str>, now: Option<&str>) -> Option<String> {
+///
+/// Not when it moved to a Bluetooth input from one that isn't: putting on AirPods makes them the
+/// system's microphone, and opening it drops them to the 16 kHz call profile, which ruins the
+/// stream's voice and the streamer's own headphone sound. The mic open stays; picking the
+/// Bluetooth one by name still works (agy GAPS #7).
+fn moved_on(follows: Option<&str>, now: Option<&str>, bluetooth: impl Fn(&str) -> bool) -> Option<String> {
     match (follows, now) {
-        (Some(was), Some(now)) if was != now => Some("the system's microphone changed".into()),
+        (Some(was), Some(now)) if was != now => {
+            if bluetooth(now) && !bluetooth(was) {
+                tracing::info!("the system's microphone is now a Bluetooth one; staying on the one in use");
+                return None;
+            }
+            Some("the system's microphone changed".into())
+        }
         _ => None,
+    }
+}
+
+/// Whether the input with this unique id is a Bluetooth one.
+fn is_bluetooth_input(id: &str) -> bool {
+    // SAFETY: looking a device up by id and reading its transport type.
+    unsafe {
+        AVCaptureDevice::deviceWithUniqueID(&NSString::from_str(id))
+            .is_some_and(|d| matches!(d.transportType(), BLUETOOTH_TRANSPORT | BLUETOOTH_LE_TRANSPORT))
     }
 }
 
@@ -1021,10 +1044,20 @@ mod tests {
     #[test]
     fn the_systems_microphone_is_followed() {
         assert!(is_default("") && is_default("default") && !is_default("BuiltInMicrophoneDevice"));
-        assert_eq!(moved_on(None, Some("b")), None, "a picked mic stays");
-        assert_eq!(moved_on(Some("a"), Some("a")), None);
-        assert_eq!(moved_on(Some("a"), None), None, "no system mic now: keep what's open");
-        assert!(moved_on(Some("a"), Some("b")).is_some(), "the system's changed: open the new one");
+        let none = |_: &str| false;
+        assert_eq!(moved_on(None, Some("b"), none), None, "a picked mic stays");
+        assert_eq!(moved_on(Some("a"), Some("a"), none), None);
+        assert_eq!(moved_on(Some("a"), None, none), None, "no system mic now: keep what's open");
+        assert!(moved_on(Some("a"), Some("b"), none).is_some(), "the system's changed: open the new one");
+    }
+
+    #[test]
+    fn airpods_becoming_the_systems_mic_dont_take_the_stream_over() {
+        let bt = |id: &str| id == "airpods";
+        assert_eq!(moved_on(Some("usb-mic"), Some("airpods"), bt), None, "stays on the mic in use");
+        assert!(moved_on(Some("airpods"), Some("usb-mic"), bt).is_some(), "leaving Bluetooth follows");
+        assert!(moved_on(Some("airpods"), Some("airpods-2"), |id: &str| id.starts_with("airpods")).is_some());
+        assert!(moved_on(Some("usb-mic"), Some("builtin"), bt).is_some(), "other moves follow as before");
     }
 
     // A webcam's formats: (width, height, highest frame rate).
