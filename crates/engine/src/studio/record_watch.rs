@@ -163,6 +163,26 @@ impl Engine {
         for (key, line, detail) in host.take_notices().await {
             self.notice_detail(&key, NoticeLevel::Info, &line, &detail);
         }
+        // A browser source whose page stopped drawing: one notice each, with a Reload, and a calm
+        // line when it draws again (the same key replaces the first).
+        let now = host.stalled_sources().await;
+        let says = {
+            let mut noted = self.studio().stalled_noted.lock().unwrap_or_else(|p| p.into_inner());
+            stall_says(&mut noted, &now)
+        };
+        for s in says {
+            if let Some(path) = s.reload {
+                self.notice_post(
+                    &s.key,
+                    s.level,
+                    &s.line,
+                    &s.detail,
+                    ("Reload", &path, serde_json::json!({ "do": "reload" })),
+                );
+            } else {
+                self.notice_detail(&s.key, s.level, &s.line, &s.detail);
+            }
+        }
         let Ok(v) = host.record_stats().await else { return };
         let says = {
             let mut w = self.studio().record_watch.lock().unwrap_or_else(|p| p.into_inner());
@@ -185,8 +205,77 @@ impl Engine {
     }
 }
 
+/// One line about a browser source: said when it stops drawing, and when it draws again.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StallSay {
+    pub key: String,
+    pub level: NoticeLevel,
+    pub line: String,
+    pub detail: String,
+    /// The route that reloads the source, while it is stalled.
+    pub reload: Option<String>,
+}
+
+/// A name as a URL path piece (JavaScript's encodeURIComponent: the dashboard decodes it).
+fn percent(name: &str) -> String {
+    name.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// What to say about the sources now (`(name, stalled)`), given the ones already said to be
+/// stalled: each stalled source once, each recovered one once, nothing while nothing changes.
+pub(crate) fn stall_says(noted: &mut std::collections::HashSet<String>, now: &[(String, bool)]) -> Vec<StallSay> {
+    let mut out = Vec::new();
+    for (name, stalled) in now {
+        let key = format!("web-stalled:{name}");
+        if *stalled && noted.insert(name.clone()) {
+            out.push(StallSay {
+                key,
+                level: NoticeLevel::Warn,
+                line: format!("{name} stopped drawing"),
+                detail: "Its browser stopped sending pictures and starting it again didn't help. Reload starts the page over."
+                    .into(),
+                reload: Some(format!("/api/v1/studio/engine/sources/{}/web", percent(name))),
+            });
+        } else if !*stalled && noted.remove(name) {
+            out.push(StallSay {
+                key,
+                level: NoticeLevel::Info,
+                line: format!("{name} is drawing again"),
+                detail: String::new(),
+                reload: None,
+            });
+        }
+    }
+    // A source that went away while stalled: its notice is not left behind.
+    noted.retain(|n| now.iter().any(|(name, _)| name == n));
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stalled_source_is_said_once_with_a_reload_and_again_when_it_recovers() {
+        let mut noted = std::collections::HashSet::new();
+        let stalled = vec![("Alerts".to_string(), true), ("Chat".to_string(), false)];
+        let first = super::stall_says(&mut noted, &stalled);
+        assert_eq!(first.len(), 1, "one notice, for the stalled one only");
+        assert_eq!(first[0].key, "web-stalled:Alerts");
+        assert!(first[0].line.contains("Alerts stopped drawing"));
+        assert!(first[0].reload.as_deref().is_some_and(|p| p.ends_with("/sources/Alerts/web")));
+        assert_eq!(super::percent("Chat & Alerts/1"), "Chat%20%26%20Alerts%2F1");
+        assert!(super::stall_says(&mut noted, &stalled).is_empty(), "said once, not every tick");
+        let back = super::stall_says(&mut noted, &[("Alerts".to_string(), false), ("Chat".to_string(), false)]);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].key, "web-stalled:Alerts", "the same key replaces the first line");
+        assert!(back[0].reload.is_none());
+        assert!(super::stall_says(&mut noted, &[("Alerts".to_string(), false)]).is_empty());
+    }
+
     use serde_json::json;
 
     use super::*;

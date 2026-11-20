@@ -98,7 +98,6 @@ impl FedPage {
 
     /// Whether the page stopped drawing and the watchdog gave up ("This browser source stopped
     /// drawing": the source shows a notice with a Reload action, which starts it over).
-    #[allow(dead_code)]
     pub(crate) fn stalled(&self) -> bool {
         self.stalled.load(Ordering::Relaxed)
     }
