@@ -2026,18 +2026,12 @@ impl Stage {
         Ok(opts)
     }
 
-    /// Whether `src` makes sound a compressor could duck under: it has a sound track, and when the
-    /// engine is running and has opened it, the engine has sound for it (a screen capture without
-    /// "capture audio" has none; the import would drop a compressor keyed to it).
+    /// Whether `src` makes sound a compressor could duck under: it has a sound track, and the import
+    /// gives its kind sound on this platform (a Windows display capture has none: the import drops a
+    /// compressor keyed to it).
     fn has_sound_to_key(&self, src: &Value) -> bool {
-        if !src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0) {
-            return false;
-        }
-        let Some(e) = self.engine.borrow().clone() else { return true };
-        match e.engine.source_named(name_of(src)) {
-            Some((id, _)) => e.engine.levels(id).is_some(),
-            None => true,
-        }
+        src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0)
+            && ferrocore::obs::source_has_sound(src, (self.canvas.width, self.canvas.height))
     }
 
     /// Other audio sources in this collection (global channels first, then scene sources),

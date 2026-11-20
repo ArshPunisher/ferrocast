@@ -1393,6 +1393,17 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
     out
 }
 
+/// Whether this OBS source (as the collection document has it) makes sound the mixer hears: what
+/// the import decides per kind and platform (a Windows display capture or a camera has none, a
+/// Mac display capture plays what the Mac plays). A source the import can't build yet (no file or
+/// app picked) counts as having sound, so it can still be picked.
+#[must_use]
+pub fn source_has_sound(source: &Value, canvas: (u32, u32)) -> bool {
+    let id = source.get("versioned_id").or_else(|| source.get("id")).and_then(Value::as_str).unwrap_or_default();
+    let settings = source.get("settings").cloned().unwrap_or(Value::Null);
+    kind_from(id, &settings, canvas, &[]).map_or(true, |(_, sound)| sound)
+}
+
 /// Detects sidechain compressor cycles directly from an OBS scene collection document, using the
 /// same deterministic cycle-breaking order as [`crate::mix::Mixer`]. Returns `(source, key)` pairs
 /// whose sidechain edge is severed to silence.
@@ -2118,6 +2129,22 @@ mod tests {
     /// `AuxAudioDevice1`) instead of the global `level::Ducker`, while `"none"` / `""` stay a
     /// self-compressor, missing targets and self-loops are skipped (never self-compressing), and
     /// A↔B cycles are detected and broken deterministically.
+    #[test]
+    fn source_has_sound_follows_the_import() {
+        let has = |v: serde_json::Value| source_has_sound(&v, (1920, 1080));
+        assert!(has(json!({ "id": "ffmpeg_source", "settings": { "local_file": "/a.mp4" } })));
+        // A source the import can't build yet can still be picked.
+        assert!(has(json!({ "id": "ffmpeg_source", "settings": {} })));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                !has(json!({ "id": "av_capture_input", "settings": { "device": "cam" } })),
+                "a camera has no sound"
+            );
+            assert!(has(json!({ "id": "screen_capture", "settings": { "type": 0 } })), "a Mac display plays sound");
+        }
+    }
+
     #[test]
     fn sidechain_compressor_imports_as_sidechain_effect_not_global_ducker() {
         // Direct unit check on audio_effect_from.
