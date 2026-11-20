@@ -5903,6 +5903,34 @@ mod tests {
         assert!(ok(s.scene_transition_of("First")).is_some(), "its override came along");
     }
 
+    /// A second holder makes the solo scene (`show_alone`) and, an instant before it counts itself
+    /// (`keep_alone`), the first holder lets go and removes it: the second must not be left
+    /// holding a scene that is gone.
+    #[test]
+    fn a_holder_that_joins_as_the_last_one_leaves_still_has_its_scene() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        let _ = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Card",
+            &json!({ "color": 4278190335u32, "width": 160, "height": 90 }),
+            false,
+        ));
+        let (scene, _, _) = ok(own::show_alone(&e.engine, "Card", (320, 180)));
+        e.keep_alone("Card"); // the first holder
+        // The second holder's `show_alone` found the scene there; now the first one closes.
+        let (again, _, _) = ok(own::show_alone(&e.engine, "Card", (320, 180)));
+        assert_eq!(again, scene);
+        e.release_alone("Card");
+        assert!(e.engine.scene(&scene).is_none(), "the last holder took it away");
+        // The second holder counts itself: its scene must be there.
+        e.keep_alone("Card");
+        assert!(e.engine.scene(&scene).is_some(), "a holder always has its solo scene");
+        e.release_alone("Card");
+        assert!(e.engine.scene(&scene).is_none());
+    }
+
     #[test]
     fn solo_scenes_are_refcounted_and_removed_on_last_release() {
         let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));

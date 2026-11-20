@@ -232,30 +232,27 @@ impl Shared {
     }
 
     /// Keeps a source shown alone (a projector, screenshot, or Source Record) through reopens.
-    /// Pair every call with [`Self::release_alone`].
+    /// Pair every call with [`Self::release_alone`]. The scene is made again if the last holder
+    /// took it away between the caller's `show_alone` and now (the count and the scene change
+    /// together, under the lock).
     pub(crate) fn keep_alone(&self, name: &str) {
         let mut seen = self.seen();
         *seen.alone.entry(name.to_string()).or_insert(0) += 1;
+        if let Err(e) = keep_alone_scene(&self.engine, name) {
+            tracing::warn!("Ferrocast's own engine lost the source it shows alone: {e}");
+        }
     }
 
     /// Releases one holder of `name`'s solo scene; removes the hidden scene once no holders remain.
     pub(crate) fn release_alone(&self, name: &str) {
-        let remove = {
-            let mut seen = self.seen();
-            match seen.alone.get_mut(name) {
-                Some(n) if *n > 1 => {
-                    *n -= 1;
-                    false
-                }
-                Some(_) => {
-                    seen.alone.remove(name);
-                    true
-                }
-                None => false,
+        let mut seen = self.seen();
+        match seen.alone.get_mut(name) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                seen.alone.remove(name);
+                self.engine.remove_scene(&alone_scene(name));
             }
-        };
-        if remove {
-            self.engine.remove_scene(&alone_scene(name));
+            None => {}
         }
     }
 
