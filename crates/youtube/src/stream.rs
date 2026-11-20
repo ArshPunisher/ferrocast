@@ -209,6 +209,8 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
     let mut page_token: Option<String> = None;
     let mut first_batch = true;
     let mut drops = 0u32;
+    // The stream refused a token this many times in a row (reset when it delivers).
+    let mut refused = 0u32;
     loop {
         let ch = match channel(&api.ep.grpc).await {
             Ok(c) => c,
@@ -236,10 +238,20 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
             Ok(r) => r.into_inner(),
             Err(status) => match status.code() {
                 Code::Unauthenticated => {
-                    if api.refresh_after_401(&token).await.is_err() {
+                    // Only Google refusing the sign-in for good ends the chat. A refresh that
+                    // failed for any other reason (the token endpoint or the network having a bad
+                    // moment, the Keychain refusing the save) is tried again with the usual wait;
+                    // and a fresh token that is refused again is a sign-in that no longer works,
+                    // not a reason to ask over and over.
+                    refused += 1;
+                    if refused > 2 {
                         return End::SignInNeeded;
                     }
-                    continue;
+                    match api.refresh_after_401(&token).await {
+                        Ok(_) => continue,
+                        Err(YoutubeError::SignInNeeded) => return End::SignInNeeded,
+                        Err(e) => return End::Lost(e.to_string()),
+                    }
                 }
                 Code::ResourceExhausted => return exhausted(&status),
                 Code::NotFound | Code::FailedPrecondition => return End::ChatEnded,
@@ -250,6 +262,7 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
             match stream.message().await {
                 Ok(Some(resp)) => {
                     drops = 0;
+                    refused = 0;
                     if let Some(next) = resp.next_page_token.clone().filter(|t| !t.is_empty()) {
                         page_token = Some(next);
                     }

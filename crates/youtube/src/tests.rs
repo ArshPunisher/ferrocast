@@ -188,6 +188,21 @@ impl V3DataLiveChatMessageService for FakeChat {
 }
 
 async fn fakes() -> (Endpoints, Arc<Mutex<Script>>, Arc<Mutex<Vec<String>>>) {
+    fakes_with_token_failures(0).await
+}
+
+/// As [`fakes`]; the token endpoint answers 503 the first `failures` times (Google having a bad
+/// moment, or the Wi-Fi blipping just as the token was refreshed).
+async fn fakes_with_token_failures(failures: usize) -> (Endpoints, Arc<Mutex<Script>>, Arc<Mutex<Vec<String>>>) {
+    fakes_issuing(failures, "access-0").await
+}
+
+/// As [`fakes_with_token_failures`]; the token endpoint hands out `issued` (the chat only takes
+/// "access-0").
+async fn fakes_issuing(
+    failures: usize,
+    issued: &'static str,
+) -> (Endpoints, Arc<Mutex<Script>>, Arc<Mutex<Vec<String>>>) {
     let script = Arc::new(Mutex::new(Script::default()));
     let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let grpc_addr = grpc.local_addr().unwrap();
@@ -206,8 +221,23 @@ async fn fakes() -> (Endpoints, Arc<Mutex<Script>>, Arc<Mutex<Vec<String>>>) {
             axum::routing::post(move |body: String| {
                 let f = f2.clone();
                 async move {
-                    f.lock().unwrap().push(body);
-                    axum::Json(json!({ "access_token": "access-0", "refresh_token": "refresh-0", "expires_in": 3600 }))
+                    let n = {
+                        let mut f = f.lock().unwrap();
+                        f.push(body);
+                        f.len()
+                    };
+                    if n <= failures {
+                        return (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(json!({ "error": "backend" })),
+                        );
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(
+                            json!({ "access_token": "access-0", "refresh_token": "refresh-0", "expires_in": 3600 }),
+                        ),
+                    )
                 }
             }),
         )
@@ -300,6 +330,57 @@ async fn the_stream_marks_history_resumes_after_a_drop_and_ends_with_the_chat() 
     let requests = script.lock().unwrap().requests.clone();
     assert_eq!(requests, vec![None, Some("p2".into())], "resumed from the last page token");
     assert!(live.read().unwrap().is_none(), "no live chat after it ended");
+}
+
+/// One failed refresh of the sign-in (the token endpoint having a bad moment, or the Wi-Fi blipping
+/// right then, or the Keychain refusing the save) is not the streamer signing out: the chat tries
+/// again and comes back by itself. Only a refresh that Google refuses for good ends it.
+#[tokio::test]
+async fn one_failed_token_refresh_does_not_end_the_chat_for_good() {
+    use ferrocast_core::event::ConnectorStatus as S;
+    let (ep, script, forms) = fakes_with_token_failures(1).await;
+    // The token the chat has is stale (the server wants access-0): it is refused, then refreshed.
+    let tokens = Tokens { access_token: "stale".into(), refresh_token: "r".into(), expires_at: now_ms() + 3_600_000 };
+    let api = Arc::new(Api::new(http_client(), ep, app(), tokens, Arc::new(|_| Ok(()))));
+    let (sink, mut rx) = mpsc::channel(64);
+    tokio::spawn(stream::run(api, sink, Arc::new(Notify::new()), Arc::default()));
+    let mut saw_chat = false;
+    loop {
+        let Ok(Some(e)) = tokio::time::timeout(Duration::from_secs(12), rx.recv()).await else {
+            panic!("the chat never came back (the connector statuses stopped)");
+        };
+        match e.kind {
+            EventKind::Connector(S::SignInNeeded) => panic!("one failed refresh was taken for a sign-out"),
+            EventKind::ChatMessage { .. } => saw_chat = true,
+            EventKind::StreamOffline => break,
+            _ => {}
+        }
+    }
+    assert!(saw_chat, "the chat flowed after the refresh worked");
+    assert_eq!(forms.lock().unwrap().len(), 2, "one refresh failed, the next worked");
+    assert!(script.lock().unwrap().requests.len() >= 2);
+}
+
+/// A fresh token the chat still refuses means the sign-in no longer works (access taken away): it
+/// says so and stops, after a couple of tries, instead of refreshing in a tight loop.
+#[tokio::test]
+async fn a_fresh_token_that_is_refused_again_ends_the_chat_asking_for_a_sign_in() {
+    use ferrocast_core::event::ConnectorStatus as S;
+    let (ep, _script, forms) = fakes_issuing(0, "access-never-accepted").await;
+    let tokens = Tokens { access_token: "stale".into(), refresh_token: "r".into(), expires_at: now_ms() + 3_600_000 };
+    let api = Arc::new(Api::new(http_client(), ep, app(), tokens, Arc::new(|_| Ok(()))));
+    let (sink, mut rx) = mpsc::channel(64);
+    let task = tokio::spawn(stream::run(api, sink, Arc::new(Notify::new()), Arc::default()));
+    loop {
+        let Ok(Some(e)) = tokio::time::timeout(Duration::from_secs(8), rx.recv()).await else {
+            panic!("it never said the sign-in is needed");
+        };
+        if matches!(e.kind, EventKind::Connector(S::SignInNeeded)) {
+            break;
+        }
+    }
+    assert!(forms.lock().unwrap().len() <= 3, "not a loop of refreshes: {}", forms.lock().unwrap().len());
+    let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
 }
 
 // ---------------------------------------------------------------- stream info (Studio)
