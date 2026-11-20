@@ -1041,7 +1041,9 @@ impl OwnStream {
         if let Some(d) = &self.drawn {
             let s = d.shared.engine.stats();
             return StreamStats {
-                active: d.shared.engine.error().is_none() && self.record_problem().is_none() && !stopped_or_failed,
+                active: d.shared.engine.output_error(d.output).is_none()
+                    && self.record_problem().is_none()
+                    && !stopped_or_failed,
                 reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
                 frames: s.frames.saturating_sub(d.from.0).min(u64::from(u32::MAX)) as u32,
@@ -1166,7 +1168,7 @@ impl OwnStream {
     }
 
     pub(crate) fn last_error(&self) -> Option<String> {
-        if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.error()) {
+        if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.output_error(d.output)) {
             return Some(e);
         }
         if let Some(e) = self.counts.error.lock().ok().and_then(|e| e.clone()) {

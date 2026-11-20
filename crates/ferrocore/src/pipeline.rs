@@ -49,6 +49,9 @@ pub struct Pipeline {
     extra: Vec<(AudioEncoder, Option<i64>)>,
     /// Paused since this time (ns): nothing is encoded until it resumes.
     paused_at: Option<u64>,
+    /// Tests: every video frame fails, as a faulting encoder's would.
+    #[cfg(test)]
+    fail_video: bool,
     /// Time spent paused so far, taken off every later frame's time (no gap in the file).
     paused_ns: u64,
     /// The next frame is made a keyframe (after a pause, or to start a split file on).
@@ -402,6 +405,8 @@ impl Pipeline {
             recording,
             extra: (0..extra).map(|_| AudioEncoder::new(audio).map(|e| (e, None))).collect::<Result<_, _>>()?,
             paused_at: None,
+            #[cfg(test)]
+            fail_video: false,
             paused_ns: 0,
             key_next: false,
             split_to: None,
@@ -654,6 +659,10 @@ impl Pipeline {
     pub fn video(&mut self, frame: Frame<'_>, ts_ns: u64) -> Result<Vec<Tag>, AvError> {
         if self.paused_at.is_some() {
             return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        if self.fail_video {
+            return Err(AvError::Source("an injected encoder fault".into()));
         }
         let start = *self.start_ns.get_or_insert(ts_ns);
         let first = !self.sent_video_header && self.video.header().is_none();
@@ -1087,6 +1096,12 @@ fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64) -> CutStep {
 }
 
 impl Pipeline {
+    /// Tests: this output's encoder faults on every frame from now on.
+    #[cfg(test)]
+    pub(crate) fn fail_video_for_test(&mut self) {
+        self.fail_video = true;
+    }
+
     /// Records into `file` (tests: a file that fails when it is told to).
     #[cfg(test)]
     fn record_into(&mut self, file: File) {

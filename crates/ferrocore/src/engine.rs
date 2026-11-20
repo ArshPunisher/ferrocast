@@ -453,7 +453,8 @@ type Seen = Mutex<Shown>;
 #[derive(Debug, Default)]
 struct Shown {
     stats: Stats,
-    error: Option<String>,
+    /// What stopped each output (by id): one output's fault is its own, never another's.
+    errors: Vec<(u64, String)>,
     /// Each output's recording and encoder.
     outputs: Vec<(u64, RecordState, String)>,
     /// Each opened source's load (`Engine::source_load`).
@@ -467,7 +468,7 @@ impl Shown {
     fn of(st: &State) -> Self {
         Self {
             stats: st.stats,
-            error: st.error.clone(),
+            errors: st.errors.iter().map(|(id, e)| (*id, e.clone())).collect(),
             outputs: st.outputs.iter().map(|(id, pipe, ..)| (*id, record_state(pipe), pipe.encoder())).collect(),
             loads: loads_of(st),
             quiet: quiet_of(st),
@@ -905,7 +906,8 @@ struct State {
     /// Sorted list of source IDs currently active/heard on `ferrocast-audio` (`SetHeard` dedup).
     last_heard: Vec<u64>,
     stats: Stats,
-    error: Option<String>,
+    /// Why an output failed, by id, until it stops (`deliver`).
+    errors: HashMap<u64, String>,
     /// The previews windows show, by id.
     previews: HashMap<u64, Preview>,
     /// Frames drawn and on their way back from the card, oldest first (`deliver`).
@@ -1156,7 +1158,7 @@ impl Engine {
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio_cfg },
             last_heard: Vec::new(),
             stats: Stats::default(),
-            error: None,
+            errors: HashMap::new(),
             previews: HashMap::new(),
             in_flight: std::collections::VecDeque::new(),
             parked: Vec::new(),
@@ -2829,6 +2831,7 @@ impl Engine {
             deliver(&mut st, &self.gpu, true, &self.recycle_tx);
             tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stops: its last frames handed over");
             let taken = st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at));
+            st.errors.remove(&id);
             sync_heard(&mut st, &self.audio.cmd_sender());
             self.show(&st);
             let ticket = st.sleep_ticket();
@@ -2857,8 +2860,27 @@ impl Engine {
 
     /// What stopped the loop or an output, if anything did (as of its last frame).
     pub fn error(&self) -> Option<String> {
-        let own = self.seen.lock().unwrap_or_else(|p| p.into_inner()).error.clone();
+        let own = {
+            let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+            seen.errors.iter().min_by_key(|(id, _)| *id).map(|(_, e)| e.clone())
+        };
         own.or_else(|| self.gpu.gpu_error.lock().unwrap_or_else(|p| p.into_inner()).clone())
+    }
+
+    /// Tests: makes this output's encoder fault on every frame.
+    #[cfg(test)]
+    fn fail_output_for_test(&self, id: u64) {
+        let mut st = self.lock();
+        if let Some((_, pipe, ..)) = st.outputs.iter_mut().find(|(i, ..)| *i == id) {
+            pipe.fail_video_for_test();
+        }
+    }
+
+    /// What stopped this output, if anything did (as of the loop's last frame). Another output's
+    /// fault (a vertical stream's, the replay buffer's) isn't it.
+    pub fn output_error(&self, id: u64) -> Option<String> {
+        let seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        seen.errors.iter().find(|(i, _)| *i == id).map(|(_, e)| e.clone())
     }
 
     /// Any scene drawn now at the engine's size, RGBA: Studio Mode's preview, the Scenes grid.
@@ -4416,12 +4438,13 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             .into_iter()
             .map(|(c, f)| (c, f.and_then(|p| gpu.finish_nv12(p).map_err(|e| e.to_string()))))
             .collect();
-        let mut failed = None;
+        let mut failures: Vec<(u64, String)> = Vec::new();
         let mut encoding = Duration::ZERO;
         for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
             if !outputs.contains(id) {
                 continue;
             }
+            let mut failed: Option<String> = None;
             // A recording on its own that can't be written any more has nothing to encode for:
             // it would only keep the encoder busy until someone presses Stop. (One that shares
             // its encode with a stream goes on, for the stream.)
@@ -4472,9 +4495,14 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                     send(t);
                 }
             }
+            if let Some(why) = failed {
+                failures.push((*id, why));
+            }
         }
-        if failed.is_some() {
-            st.error = failed;
+        // Each fault goes on its own output (the first one stays): the main stream and the
+        // recording aren't marked dead by a vertical stream's or the replay buffer's.
+        for (id, why) in failures {
+            st.errors.entry(id).or_insert(why);
         }
         // Only frames that went through an encoder count (a canvas drawn every other frame, or
         // one that failed to draw, would pull the average down by half).
@@ -5946,6 +5974,34 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         assert!(!e.transitioning());
         assert_eq!(e.snapshot().unwrap_or_default()[0], 255);
+    }
+
+    /// One output's encoder fault marks that output, not the others (agy GAPS #3): the main
+    /// stream stays well, and a new output starts with no error.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn one_outputs_fault_is_its_own() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Wide", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Wide").unwrap_or_else(|x| panic!("{x}"));
+        let main = e.start_output(OutputKind::Stream(Box::new(|_| {}))).unwrap_or_else(|x| panic!("{x}"));
+        let second = e.start_output(OutputKind::Replay { seconds: 5, mb: 0 }).unwrap_or_else(|x| panic!("{x}"));
+        e.fail_output_for_test(second);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while e.output_error(second).is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(e.output_error(second).is_some(), "the faulting output says so");
+        assert_eq!(e.output_error(main), None, "the main stream isn't marked dead by it");
+        e.stop_output(second).unwrap_or_else(|x| panic!("{x}"));
+        let third = e.start_output(OutputKind::Replay { seconds: 5, mb: 0 }).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(e.output_error(third), None);
+        assert_eq!(e.output_error(second), None, "a stopped output's error goes with it");
+        e.stop_output(third).unwrap_or_else(|x| panic!("{x}"));
+        e.stop_output(main).unwrap_or_else(|x| panic!("{x}"));
     }
 
     #[test]
