@@ -187,13 +187,15 @@ pub enum AudioEffect {
         hold_ms: f32,
         release_ms: f32,
     },
-    /// "ratio" 10, "threshold" -18, "attack_time" 6, "release_time" 60, "output_gain" 0.
+    /// "ratio" 10, "threshold" -18, "attack_time" 6, "release_time" 60, "output_gain" 0,
+    /// "sidechain_source" (resolved mixer source ID, or `None` for self-keyed).
     Compressor {
         ratio: f32,
         threshold_db: f32,
         attack_ms: f32,
         release_ms: f32,
         output_db: f32,
+        sidechain: Option<u64>,
     },
     /// "threshold" -6, "release_time" 60.
     Limiter {
@@ -989,10 +991,11 @@ impl AudioFilter {
         let rg = coefficient(self.rate, release_ms / 1000.0);
         let mut env = self.envelope;
         for i in 0..n {
-            let x = match key {
+            let raw_x = match key {
                 Some([kl, kr]) => kl.get(i).copied().unwrap_or(0.0).abs().max(kr.get(i).copied().unwrap_or(0.0).abs()),
                 None => l[i].abs().max(r[i].abs()),
             };
+            let x = if raw_x.is_finite() { raw_x } else { 0.0 };
             env = flush_denormal(if env < x { x + ag * (env - x) } else { x + rg * (env - x) });
             let threshold = self.smooth_thresh.next();
             let slope = self.smooth_slope.next();
@@ -1624,6 +1627,7 @@ mod tests {
             attack_ms: 6.0,
             release_ms: 60.0,
             output_db: 0.0,
+            sidechain: None,
         };
         let out = run(c, &input);
         let reduction = mul_to_db(peak(&out[RATE as usize / 2..])) - mul_to_db(peak(&input));
@@ -1706,6 +1710,7 @@ mod tests {
                 attack_ms: 1.0,
                 release_ms: 5.0,
                 output_db: 0.0,
+                sidechain: None,
             },
             AudioEffect::Limiter { threshold_db: -6.0, release_ms: 5.0 },
             AudioEffect::Expander {
@@ -1766,6 +1771,7 @@ mod tests {
                 attack_ms: -5.0,
                 release_ms: 0.0,
                 output_db: 0.0,
+                sidechain: None,
             },
             AudioEffect::Limiter { threshold_db: -6.0, release_ms: -10.0 },
             AudioEffect::Expander {
@@ -1879,6 +1885,7 @@ mod tests {
                 attack_ms: 6.0,
                 release_ms: 60.0,
                 output_db: out_db,
+                sidechain: None,
             };
             for in_db in [-30.0f32, -18.0, -12.0, -6.0, 0.0] {
                 let inp = vec![db_to_mul(in_db); n];
@@ -1985,6 +1992,7 @@ mod tests {
                     attack_ms: 20.0,
                     release_ms: 100.0,
                     output_db: 0.0,
+                    sidechain: None,
                 },
                 RATE,
             );
@@ -2236,6 +2244,7 @@ mod tests {
                     attack_ms: 6.0,
                     release_ms: 60.0,
                     output_db: 0.0,
+                    sidechain: None,
                 },
                 AudioEffect::Compressor {
                     ratio: 12.0,
@@ -2243,6 +2252,7 @@ mod tests {
                     attack_ms: 6.0,
                     release_ms: 60.0,
                     output_db: 6.0,
+                    sidechain: None,
                 },
             ),
             (
@@ -2353,6 +2363,7 @@ mod tests {
                 attack_ms: 2.0,
                 release_ms: 50.0,
                 output_db: 0.0,
+                sidechain: None,
             },
             AudioEffect::Limiter { threshold_db: -18.0, release_ms: 50.0 },
             AudioEffect::Expander {
@@ -2416,6 +2427,7 @@ mod tests {
                 attack_ms: 5.0,
                 release_ms: 50.0,
                 output_db: 2.0,
+                sidechain: None,
             },
             AudioEffect::Limiter { threshold_db: -18.0, release_ms: 50.0 },
             AudioEffect::Expander {
@@ -2531,6 +2543,7 @@ mod tests {
                 attack_ms: 20.0,
                 release_ms: 80.0,
                 output_db: 0.0,
+                sidechain: None,
             };
             let out = run_at_rate(comp, rate, &vec![1.0f32; n]);
             let thresh_lin = db_to_mul(-20.0);
@@ -2582,6 +2595,7 @@ mod tests {
             attack_ms: 10.0,
             release_ms: 150.0,
             output_db: 0.0,
+            sidechain: None,
         };
         let mut f = AudioFilter::new(eff, RATE);
         let (mut l, mut rr) = (music.clone(), music.clone());
@@ -2650,6 +2664,7 @@ mod tests {
                     attack_ms: 6.0,
                     release_ms: 60.0,
                     output_db: 0.0,
+                    sidechain: None,
                 },
                 RATE,
             ),

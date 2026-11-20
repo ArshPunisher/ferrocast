@@ -65,6 +65,15 @@ fn a_steady_mix_allocates_nothing() {
                 attack_ms: 6.0,
                 release_ms: 60.0,
                 output_db: 0.0,
+                sidechain: None,
+            },
+            AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -24.0,
+                attack_ms: 10.0,
+                release_ms: 150.0,
+                output_db: 0.0,
+                sidechain: Some(1),
             },
             AudioEffect::Limiter { threshold_db: -1.0, release_ms: 60.0 },
             AudioEffect::Expander {
