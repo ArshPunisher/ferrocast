@@ -639,14 +639,6 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
             gop.to_string(),
             "-bf".into(),
             "0".into(),
-            "-profile:v".into(),
-            match (cfg.codec, cfg.profile) {
-                (VideoCodec::Hevc, _) => "main",
-                (_, crate::video::H264Profile::Baseline) => "baseline",
-                (_, crate::video::H264Profile::Main) => "main",
-                (_, crate::video::H264Profile::High) => "high",
-            }
-            .into(),
             // One frame out for each in, in order: our own times are matched back by order.
             "-fps_mode".into(),
             "passthrough".into(),
@@ -657,6 +649,19 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
             "-color_trc".into(),
             "bt709".into(),
         ]);
+        // x264's lossless is its own profile (High 4:4:4 Predictive): naming one would refuse it.
+        if !matches!(cfg.rate, RateControl::Crf(0)) {
+            a.extend([
+                "-profile:v".into(),
+                match (cfg.codec, cfg.profile) {
+                    (VideoCodec::Hevc, _) => "main",
+                    (_, crate::video::H264Profile::Baseline) => "baseline",
+                    (_, crate::video::H264Profile::Main) => "main",
+                    (_, crate::video::H264Profile::High) => "high",
+                }
+                .into(),
+            ]);
+        }
         let cbr = matches!(cfg.rate, RateControl::Cbr | RateControl::CappedCbr);
         // Constant quality on libobs's scale, 0 (best) … 51, from the 0-1 the engine carries.
         let cq = match cfg.rate {
