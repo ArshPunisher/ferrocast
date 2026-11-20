@@ -22,6 +22,12 @@ const LOOK_W: u32 = 32;
 const LOOK_H: u32 = 18;
 
 /// OBS's global sound channels, in its saved collection: Desktop Audio 1-2, Mic/Aux 1-4.
+#[derive(Clone, Copy)]
+enum FilterTarget<'a> {
+    Source(&'a str),
+    Item { scene: &'a str, id: i64 },
+}
+
 const CHANNEL_KEYS: [&str; 6] = [
     "DesktopAudioDevice1",
     "DesktopAudioDevice2",
@@ -289,6 +295,37 @@ fn new_item(source: &Value, id: i64) -> Value {
     })
 }
 
+fn has_item_filter_override(it: &Value) -> bool {
+    it.get("ferrocast_filters").and_then(Value::as_array).is_some()
+}
+
+fn clone_filters_with_fresh_uuids(filters: &[Value], keep: impl Fn(&Value) -> bool) -> Vec<Value> {
+    filters
+        .iter()
+        .filter(|f| keep(f))
+        .map(|f| {
+            let mut copy = f.clone();
+            copy["uuid"] = json!(uuid());
+            copy
+        })
+        .collect()
+}
+
+fn video_filters_from(source: &Value) -> Vec<Value> {
+    let list = source.get("filters").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    clone_filters_with_fresh_uuids(list, |f| !ferrocore::obs::is_audio_filter_kind(kind_of(f)))
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn is_active_cutout(f: &Value) -> bool {
+    kind_of(f) == "ferrocast_remove_background" && f.get("enabled").and_then(Value::as_bool) != Some(false)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn cutout_filter_name(f: &Value) -> &str {
+    f.get("name").and_then(Value::as_str).unwrap_or("ferrocast_remove_background")
+}
+
 /// Cameras and capture cards: a picture only. Their sound is a device of its own (a capture
 /// card's "USB2 Digital Audio"), with a row of its own in the mixer: theirs showed a second,
 /// silent row (owner, 17 Nov; OBS shows one), and Sound bars mustn't listen to them.
@@ -414,28 +451,59 @@ impl Stage {
     /// Starts or stops finding the person for each Remove background filter that's on.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sync_cutouts(&self, e: &Arc<own::Shared>) {
-        let want: Vec<(String, String)> = self
-            .sources_list()
-            .iter()
-            .flat_map(|s| {
-                let source = name_of(s).to_string();
-                s.get("filters")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter(|f| {
-                        f.get("versioned_id").or_else(|| f.get("id")).and_then(Value::as_str)
-                            == Some("ferrocast_remove_background")
-                            && f.get("enabled").and_then(Value::as_bool) != Some(false)
-                    })
-                    .map(move |f| {
-                        let fname = f.get("name").and_then(Value::as_str).unwrap_or("ferrocast_remove_background");
-                        // The engine names the mask picture so (ferrocore::obs).
-                        (format!("{source}: {fname}"), source.clone())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let mut want: Vec<(String, String)> = Vec::new();
+        let mut shared_users: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut clone_users: Vec<(String, String)> = Vec::new();
+        for s in self.sources_list() {
+            let kind = kind_of(&s);
+            if matches!(kind, "scene" | "group") {
+                let container = name_of(&s).to_string();
+                for it in s.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten() {
+                    let src_name = name_of(it).to_string();
+                    if let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                        let item_id = it.get("id").and_then(Value::as_i64).unwrap_or(0);
+                        for f in ov.iter().filter(|f| is_active_cutout(f)) {
+                            let fname = cutout_filter_name(f);
+                            want.push((format!("{container}#{item_id}: {fname}"), src_name.clone()));
+                        }
+                    } else {
+                        shared_users.insert(src_name);
+                    }
+                }
+            } else if matches!(kind, "ferrocast_clone" | "source-clone")
+                && s.pointer("/settings/filters").and_then(Value::as_bool) != Some(false)
+                && let Some(target) = s.pointer("/settings/clone").and_then(Value::as_str)
+            {
+                clone_users.push((name_of(&s).to_string(), target.to_string()));
+            }
+        }
+        // Any clone that brings its target's filters keeps source-level cutouts on that target live
+        // when at least one placement uses the clone without an item override.
+        loop {
+            let mut changed = false;
+            for (clone_name, target) in &clone_users {
+                if shared_users.contains(clone_name) && shared_users.insert(target.clone()) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for s in self.sources_list() {
+            if matches!(kind_of(&s), "scene" | "group") {
+                continue;
+            }
+            let source = name_of(&s).to_string();
+            if !shared_users.contains(&source) {
+                continue;
+            }
+            for f in s.get("filters").and_then(Value::as_array).into_iter().flatten().filter(|f| is_active_cutout(f)) {
+                let fname = cutout_filter_name(f);
+                // The engine names the mask picture so (ferrocore::obs).
+                want.push((format!("{source}: {fname}"), source.clone()));
+            }
+        }
         let mut cutouts = self.cutouts.borrow_mut();
         // Gone, or working for an engine that's gone (a new canvas): stopped.
         cutouts.retain(|mask, c| c.serves(e) && want.iter().any(|(m, _)| m == mask));
@@ -854,6 +922,11 @@ impl Stage {
         // A group belongs to one scene (as in OBS): the copy gets groups of its own, holding the
         // same sources, so changing one scene's group leaves the other's alone.
         for it in items.iter_mut() {
+            if let Some(ov) = it.get_mut("ferrocast_filters").and_then(Value::as_array_mut) {
+                for f in ov {
+                    f["uuid"] = json!(uuid());
+                }
+            }
             let gname = name_of(it).to_string();
             let Ok(src) = self.source(&gname) else { continue };
             if kind_of(&src) != "group" {
@@ -965,12 +1038,20 @@ impl Stage {
     /// the canvas and every move or resize use this (9 Nov: a cropped source kept the outline
     /// of its whole picture).
     fn size_of(&self, source: &str) -> (u32, u32) {
+        self.item_size_of(source, None)
+    }
+
+    fn item_size_of(&self, source: &str, item: Option<&Value>) -> (u32, u32) {
         let (w, h) = self.own_size_of(source);
         if w == 0 || h == 0 {
             return (w, h);
         }
         let s = self.source(source).unwrap_or(Value::Null);
-        let filters = s.get("filters").and_then(Value::as_array).cloned().unwrap_or_default();
+        let filters = item
+            .and_then(|it| it.get("ferrocast_filters").and_then(Value::as_array))
+            .or_else(|| s.get("filters").and_then(Value::as_array))
+            .cloned()
+            .unwrap_or_default();
         let effects: Vec<ferrocore::Effect> = filters
             .iter()
             .filter(|f| f.get("enabled").and_then(Value::as_bool) != Some(false))
@@ -1034,7 +1115,7 @@ impl Stage {
     fn info_with(&self, it: &Value, expand: bool) -> ItemInfo {
         let name = name_of(it).to_string();
         let src = self.source(&name).unwrap_or(Value::Null);
-        let (w, h) = self.size_of(&name);
+        let (w, h) = self.item_size_of(&name, Some(it));
         let p = ferrocore::obs::placement_of(it);
         let a = ferrocore::draw_transform(&p, w, h);
         let (cw, ch) = ferrocore::cropped(w, h, p.crop);
@@ -1098,6 +1179,7 @@ impl Stage {
             top_field_first: false,
             media,
             kind,
+            own_filters: has_item_filter_override(it),
         }
     }
 
@@ -1175,7 +1257,7 @@ impl Stage {
 
     /// How a group's own pixels map onto the canvas.
     fn group_map(&self, group_item: &Value) -> ferrocore::Affine {
-        let (w, h) = self.size_of(name_of(group_item));
+        let (w, h) = self.item_size_of(name_of(group_item), Some(group_item));
         ferrocore::draw_transform(&ferrocore::obs::placement_of(group_item), w, h)
     }
 
@@ -1187,7 +1269,7 @@ impl Stage {
         let kids = self.scene_items(&gname)?;
         // Nothing to fit yet, or a source that doesn't know its size yet (a camera or a video
         // still opening reads 0×0): fitting now would shrink the group round nothing.
-        if kids.is_empty() || kids.iter().any(|c| matches!(self.size_of(name_of(c)), (0, _) | (_, 0))) {
+        if kids.is_empty() || kids.iter().any(|c| matches!(self.item_size_of(name_of(c), Some(c)), (0, _) | (_, 0))) {
             return Ok(());
         }
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -1269,6 +1351,15 @@ impl Stage {
 
     /// Puts `source` (an existing one) at the top of `scene` → its item.
     fn place(&self, scene: &str, source: &Value) -> Result<ItemInfo, StudioError> {
+        self.place_with(scene, source, None)
+    }
+
+    fn place_with(
+        &self,
+        scene: &str,
+        source: &Value,
+        override_filters: Option<Vec<Value>>,
+    ) -> Result<ItemInfo, StudioError> {
         let floor = self.top_id(scene);
         let item = self.with_items(scene, |items, set| {
             let id = set
@@ -1279,7 +1370,10 @@ impl Stage {
                 .max(items.iter().filter_map(|i| i.get("id")?.as_i64()).max().unwrap_or(0))
                 + 1;
             set.insert("id_counter".into(), json!(id));
-            let it = new_item(source, id);
+            let mut it = new_item(source, id);
+            if let Some(ov) = override_filters {
+                it["ferrocast_filters"] = Value::Array(ov);
+            }
             items.push(it.clone());
             it
         })?;
@@ -1350,19 +1444,22 @@ impl Stage {
         Ok((info, false))
     }
 
-    /// Shows a source already made (in another scene) in `scene` too.
+    /// Shows a source already made (in another scene) in `scene` too. When the source already
+    /// carries video filters, the new item gets its own copy (`own_filters: true`) so edits on one
+    /// canvas do not change the other.
     pub fn add_existing(&self, scene: &str, name: &str) -> Result<ItemInfo, StudioError> {
         let source = self.source(name)?;
         if name == scene {
             return Err(fail("A scene can't show itself."));
         }
-        self.place(scene, &source)
+        let video = video_filters_from(&source);
+        self.place_with(scene, &source, (!video.is_empty()).then_some(video))
     }
 
     pub fn transform(&self, scene: &str, id: i64) -> Result<Transform, StudioError> {
         let it = self.item(scene, id)?;
         let p = ferrocore::obs::placement_of(&it);
-        let (w, h) = self.size_of(name_of(&it));
+        let (w, h) = self.item_size_of(name_of(&it), Some(&it));
         Ok(Transform {
             x: p.x,
             y: p.y,
@@ -1643,6 +1740,16 @@ impl Stage {
                 let mut s = src.clone();
                 s["name"] = json!(copy);
                 s["uuid"] = json!(uuid());
+                let src_flts = src.get("filters").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+                if let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                    let mut combined = clone_filters_with_fresh_uuids(ov, |_| true);
+                    combined.extend(clone_filters_with_fresh_uuids(src_flts, |f| {
+                        ferrocore::obs::is_audio_filter_kind(kind_of(f))
+                    }));
+                    s["filters"] = Value::Array(combined);
+                } else {
+                    s["filters"] = Value::Array(clone_filters_with_fresh_uuids(src_flts, |_| true));
+                }
                 self.fresh_ids(scene, &mut s);
                 self.edit(|d| d["sources"].as_array_mut().map(|l| l.push(s.clone())));
                 // Inside a group: the copy goes in the same group, just above the original (OBS).
@@ -1650,6 +1757,9 @@ impl Stage {
                 if home != scene {
                     let next = self.top_id(scene) + 1;
                     let mut c = it.clone();
+                    if let Some(obj) = c.as_object_mut() {
+                        obj.remove("ferrocast_filters");
+                    }
                     c["id"] = json!(next);
                     c["name"] = json!(copy);
                     c["source_uuid"] = s["uuid"].clone();
@@ -1994,15 +2104,38 @@ impl Stage {
     }
 
     pub fn filters(&self, name: &str) -> Result<Vec<FilterInfo>, StudioError> {
-        Ok(self
-            .filter_list(name)?
-            .iter()
-            .map(|f| FilterInfo {
-                name: name_of(f).to_string(),
-                kind: kind_of(f).to_string(),
-                enabled: f.get("enabled").and_then(Value::as_bool).unwrap_or(true),
-            })
-            .collect())
+        self.target_filters(FilterTarget::Source(name))
+    }
+
+    pub fn item_filters(&self, scene: &str, id: i64) -> Result<Vec<FilterInfo>, StudioError> {
+        self.target_filters(FilterTarget::Item { scene, id })
+    }
+
+    fn target_filters(&self, target: FilterTarget<'_>) -> Result<Vec<FilterInfo>, StudioError> {
+        let to_info = |f: &Value, scope: Option<&str>| FilterInfo {
+            name: name_of(f).to_string(),
+            kind: kind_of(f).to_string(),
+            enabled: f.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            scope: scope.map(str::to_string),
+        };
+        match target {
+            FilterTarget::Source(name) => Ok(self.filter_list(name)?.iter().map(|f| to_info(f, None)).collect()),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src = self.filter_list(name_of(&it))?;
+                if let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                    let mut out: Vec<FilterInfo> = ov.iter().map(|f| to_info(f, Some("item"))).collect();
+                    out.extend(
+                        src.iter()
+                            .filter(|f| ferrocore::obs::is_audio_filter_kind(kind_of(f)))
+                            .map(|f| to_info(f, Some("source"))),
+                    );
+                    Ok(out)
+                } else {
+                    Ok(src.iter().map(|f| to_info(f, Some("source"))).collect())
+                }
+            }
+        }
     }
 
     fn with_filters<T>(&self, name: &str, f: impl FnOnce(&mut Vec<Value>) -> T) -> Result<T, StudioError> {
@@ -2014,10 +2147,141 @@ impl Stage {
         })
     }
 
+    /// Switches a scene item between `"This picture only"` (`own = true`: copies the source's
+    /// video filters into an item override) and `"Everywhere this source is used"` (`own = false`:
+    /// clears the item override so it shares the source's filters again). Audio filters always stay
+    /// per source.
+    pub fn set_item_filter_scope(&self, scene: &str, id: i64, own: bool) -> Result<ItemInfo, StudioError> {
+        let it = self.item(scene, id)?;
+        let src = self.source(name_of(&it))?;
+        if own {
+            if !has_item_filter_override(&it) {
+                let video = video_filters_from(&src);
+                self.with_item(scene, id, |i| {
+                    i["ferrocast_filters"] = Value::Array(video);
+                })?;
+            }
+        } else if has_item_filter_override(&it) {
+            self.with_item(scene, id, |i| {
+                if let Some(obj) = i.as_object_mut() {
+                    obj.remove("ferrocast_filters");
+                }
+            })?;
+        }
+        self.item(scene, id).map(|i| self.info_of(&i))
+    }
+
+    fn target_owner_label(&self, target: FilterTarget<'_>) -> Result<String, StudioError> {
+        match target {
+            FilterTarget::Source(name) => Ok(name.to_string()),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                Ok(name_of(&it).to_string())
+            }
+        }
+    }
+
+    /// Resolves `(source_name, write_to_item_override)` for mutating a filter on `target`.
+    fn resolve_filter_store(
+        &self,
+        target: FilterTarget<'_>,
+        kind: Option<&str>,
+        filter_name: Option<&str>,
+    ) -> Result<(String, bool), StudioError> {
+        match target {
+            FilterTarget::Source(name) => Ok((name.to_string(), false)),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src_name = name_of(&it).to_string();
+                let src = self.source(&src_name)?;
+                let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) else {
+                    return Ok((src_name, false));
+                };
+                if let Some(k) = kind {
+                    return Ok((src_name, !ferrocore::obs::is_audio_filter_kind(k)));
+                }
+                if let Some(fname) = filter_name {
+                    if ov.iter().any(|f| name_of(f) == fname) {
+                        return Ok((src_name, true));
+                    }
+                    let is_src_audio = src.get("filters").and_then(Value::as_array).is_some_and(|l| {
+                        l.iter().any(|f| name_of(f) == fname && ferrocore::obs::is_audio_filter_kind(kind_of(f)))
+                    });
+                    return Ok((src_name, !is_src_audio));
+                }
+                Ok((src_name, true))
+            }
+        }
+    }
+
+    fn with_target_filters<T>(
+        &self,
+        target: FilterTarget<'_>,
+        kind: Option<&str>,
+        filter_name: Option<&str>,
+        f: impl FnOnce(&mut Vec<Value>) -> T,
+    ) -> Result<T, StudioError> {
+        let (src_name, on_item) = self.resolve_filter_store(target, kind, filter_name)?;
+        match (target, on_item) {
+            (FilterTarget::Item { scene, id }, true) => self.with_item(scene, id, |it| {
+                let mut list = it.get("ferrocast_filters").and_then(Value::as_array).cloned().unwrap_or_default();
+                let out = f(&mut list);
+                it["ferrocast_filters"] = Value::Array(list);
+                out
+            }),
+            _ => self.with_filters(&src_name, f),
+        }
+    }
+
+    fn target_filter_value(&self, target: FilterTarget<'_>, filter: &str) -> Result<Value, StudioError> {
+        let owner = self.target_owner_label(target)?;
+        match target {
+            FilterTarget::Source(name) => self
+                .filter_list(name)?
+                .into_iter()
+                .find(|f| name_of(f) == filter)
+                .ok_or_else(|| fail(format!("\"{owner}\" has no filter called \"{filter}\"."))),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src = self.filter_list(name_of(&it))?;
+                let found = match it.get("ferrocast_filters").and_then(Value::as_array) {
+                    Some(ov) => ov.iter().find(|f| name_of(f) == filter).cloned().or_else(|| {
+                        src.into_iter()
+                            .find(|f| name_of(f) == filter && ferrocore::obs::is_audio_filter_kind(kind_of(f)))
+                    }),
+                    None => src.into_iter().find(|f| name_of(f) == filter),
+                };
+                found.ok_or_else(|| fail(format!("\"{owner}\" has no filter called \"{filter}\".")))
+            }
+        }
+    }
+
     pub fn add_filter(&self, name: &str, kind: &str, filter: &str, settings: &Value) -> Result<(), StudioError> {
+        self.add_target_filter(FilterTarget::Source(name), kind, filter, settings)
+    }
+
+    pub fn add_item_filter(
+        &self,
+        scene: &str,
+        id: i64,
+        kind: &str,
+        filter: &str,
+        settings: &Value,
+    ) -> Result<(), StudioError> {
+        self.add_target_filter(FilterTarget::Item { scene, id }, kind, filter, settings)
+    }
+
+    fn add_target_filter(
+        &self,
+        target: FilterTarget<'_>,
+        kind: &str,
+        filter: &str,
+        settings: &Value,
+    ) -> Result<(), StudioError> {
         check_name(filter)?;
-        if self.filter_list(name)?.iter().any(|f| name_of(f) == filter) {
-            return Err(fail(format!("\"{name}\" already has a filter called \"{filter}\".")));
+        let owner = self.target_owner_label(target)?;
+        if self.target_filters(target)?.iter().any(|f| f.name == filter) {
+            return Err(fail(format!("\"{owner}\" already has a filter called \"{filter}\".")));
         }
         let mut set = crate::kinds::defaults(kind).unwrap_or_else(|| json!({}));
         // A new shadow spills past the box and the picture keeps its size. Not a default: an
@@ -2034,37 +2298,72 @@ impl Stage {
             "id": kind, "versioned_id": kind, "name": filter, "uuid": uuid(), "enabled": true,
             "settings": set,
         });
-        self.with_filters(name, |l| l.push(f))
+        self.with_target_filters(target, Some(kind), None, |l| l.push(f))
     }
 
     pub fn remove_filter(&self, name: &str, filter: &str) -> Result<(), StudioError> {
-        let gone = self.with_filters(name, |l| {
+        self.remove_target_filter(FilterTarget::Source(name), filter)
+    }
+
+    pub fn remove_item_filter(&self, scene: &str, id: i64, filter: &str) -> Result<(), StudioError> {
+        self.remove_target_filter(FilterTarget::Item { scene, id }, filter)
+    }
+
+    fn remove_target_filter(&self, target: FilterTarget<'_>, filter: &str) -> Result<(), StudioError> {
+        let owner = self.target_owner_label(target)?;
+        let gone = self.with_target_filters(target, None, Some(filter), |l| {
             let n = l.len();
             l.retain(|f| name_of(f) != filter);
             n != l.len()
         })?;
-        if gone { Ok(()) } else { Err(fail(format!("\"{name}\" has no filter called \"{filter}\"."))) }
+        if gone { Ok(()) } else { Err(fail(format!("\"{owner}\" has no filter called \"{filter}\"."))) }
     }
 
     pub fn set_filter_enabled(&self, name: &str, filter: &str, on: bool) -> Result<(), StudioError> {
-        self.with_filter(name, filter, |f| f["enabled"] = json!(on))
+        self.set_target_filter_enabled(FilterTarget::Source(name), filter, on)
+    }
+
+    pub fn set_item_filter_enabled(&self, scene: &str, id: i64, filter: &str, on: bool) -> Result<(), StudioError> {
+        self.set_target_filter_enabled(FilterTarget::Item { scene, id }, filter, on)
+    }
+
+    fn set_target_filter_enabled(&self, target: FilterTarget<'_>, filter: &str, on: bool) -> Result<(), StudioError> {
+        self.with_target_filter(target, filter, |f| f["enabled"] = json!(on))
     }
 
     pub fn filter_settings(&self, name: &str, filter: &str) -> Result<Value, StudioError> {
-        self.filter_list(name)?
-            .into_iter()
-            .find(|f| name_of(f) == filter)
-            .map(|f| with_defaults(&f))
-            .ok_or_else(|| fail(format!("\"{name}\" has no filter called \"{filter}\".")))
+        self.target_filter_settings(FilterTarget::Source(name), filter)
+    }
+
+    pub fn item_filter_settings(&self, scene: &str, id: i64, filter: &str) -> Result<Value, StudioError> {
+        self.target_filter_settings(FilterTarget::Item { scene, id }, filter)
+    }
+
+    fn target_filter_settings(&self, target: FilterTarget<'_>, filter: &str) -> Result<Value, StudioError> {
+        self.target_filter_value(target, filter).map(|f| with_defaults(&f))
     }
 
     /// A filter's settings form.
     pub fn filter_options(&self, name: &str, filter: &str) -> Result<Vec<crate::OptionInfo>, StudioError> {
-        let f = self
-            .filter_list(name)?
-            .into_iter()
-            .find(|f| name_of(f) == filter)
-            .ok_or_else(|| fail(format!("\"{name}\" has no filter called \"{filter}\".")))?;
+        self.target_filter_options(FilterTarget::Source(name), filter)
+    }
+
+    pub fn item_filter_options(
+        &self,
+        scene: &str,
+        id: i64,
+        filter: &str,
+    ) -> Result<Vec<crate::OptionInfo>, StudioError> {
+        self.target_filter_options(FilterTarget::Item { scene, id }, filter)
+    }
+
+    fn target_filter_options(
+        &self,
+        target: FilterTarget<'_>,
+        filter: &str,
+    ) -> Result<Vec<crate::OptionInfo>, StudioError> {
+        let owner = self.target_owner_label(target)?;
+        let f = self.target_filter_value(target, filter)?;
         let kind = kind_of(&f);
         let mut opts = crate::kinds::options(kind)
             .ok_or_else(|| fail(format!("Ferrocast's own engine doesn't run \"{filter}\" yet.")))?;
@@ -2073,7 +2372,7 @@ impl Stage {
         {
             let mut choices = vec!["None".to_string()];
             let mut values = vec![json!("none")];
-            let entries = self.audio_source_entries(name);
+            let entries = self.audio_source_entries(&owner);
             let saved = f
                 .pointer("/settings/sidechain_source")
                 .and_then(Value::as_str)
@@ -2147,8 +2446,21 @@ impl Stage {
     }
 
     pub fn update_filter(&self, name: &str, filter: &str, settings: &Value) -> Result<(), StudioError> {
+        self.update_target_filter(FilterTarget::Source(name), filter, settings)
+    }
+
+    pub fn update_item_filter(&self, scene: &str, id: i64, filter: &str, settings: &Value) -> Result<(), StudioError> {
+        self.update_target_filter(FilterTarget::Item { scene, id }, filter, settings)
+    }
+
+    fn update_target_filter(
+        &self,
+        target: FilterTarget<'_>,
+        filter: &str,
+        settings: &Value,
+    ) -> Result<(), StudioError> {
         let Some(new) = settings.as_object() else { return Err(fail("settings: an object.")) };
-        self.with_filter(name, filter, |f| {
+        self.with_target_filter(target, filter, |f| {
             if !f["settings"].is_object() {
                 f["settings"] = json!({});
             }
@@ -2160,7 +2472,15 @@ impl Stage {
 
     /// Moves a filter up or down its list (`Up`, `Down`, `Top`, `Bottom`).
     pub fn move_filter(&self, name: &str, filter: &str, edit: ItemEdit) -> Result<(), StudioError> {
-        self.with_filters(name, |l| {
+        self.move_target_filter(FilterTarget::Source(name), filter, edit)
+    }
+
+    pub fn move_item_filter(&self, scene: &str, id: i64, filter: &str, edit: ItemEdit) -> Result<(), StudioError> {
+        self.move_target_filter(FilterTarget::Item { scene, id }, filter, edit)
+    }
+
+    fn move_target_filter(&self, target: FilterTarget<'_>, filter: &str, edit: ItemEdit) -> Result<(), StudioError> {
+        self.with_target_filters(target, None, Some(filter), |l| {
             let Some(at) = l.iter().position(|f| name_of(f) == filter) else { return };
             let f = l.remove(at);
             let to = match edit {
@@ -2176,24 +2496,119 @@ impl Stage {
 
     /// Copies `from`'s filters onto `name` (OBS's Paste Filters), each its own copy.
     pub fn paste_filters(&self, name: &str, from: &str) -> Result<(), StudioError> {
-        let copies = self.filter_list(from)?;
-        let have: Vec<String> = self.filter_list(name)?.iter().map(|f| name_of(f).to_string()).collect();
-        self.with_filters(name, |l| {
-            for mut f in copies {
-                let mut n = name_of(&f).to_string();
-                while have.contains(&n) || l.iter().any(|g| name_of(g) == n) {
-                    n.push_str(" 2");
-                }
-                f["name"] = json!(n);
-                f["uuid"] = json!(uuid());
-                l.push(f);
-            }
-        })
+        self.paste_target_filters(FilterTarget::Source(name), FilterTarget::Source(from))
     }
 
-    fn with_filter(&self, name: &str, filter: &str, f: impl FnOnce(&mut Value)) -> Result<(), StudioError> {
-        let found = self.with_filters(name, |l| l.iter_mut().find(|x| name_of(x) == filter).map(f).is_some())?;
-        if found { Ok(()) } else { Err(fail(format!("\"{name}\" has no filter called \"{filter}\"."))) }
+    /// Copies filters from a source (`from_item: None`) or an item override (`from_item: Some`)
+    /// onto `name`.
+    pub fn paste_filters_from(
+        &self,
+        name: &str,
+        from: &str,
+        from_item: Option<(&str, i64)>,
+    ) -> Result<(), StudioError> {
+        let src = match from_item {
+            Some((scene, id)) => FilterTarget::Item { scene, id },
+            None => FilterTarget::Source(from),
+        };
+        self.paste_target_filters(FilterTarget::Source(name), src)
+    }
+
+    /// Copies `from`'s video (and when shared or audio, audio) filters onto a scene item.
+    pub fn paste_item_filters(&self, scene: &str, id: i64, from: &str) -> Result<(), StudioError> {
+        self.paste_target_filters(FilterTarget::Item { scene, id }, FilterTarget::Source(from))
+    }
+
+    /// Copies filters from a source (`from_item: None`) or another item override onto `(scene, id)`.
+    pub fn paste_item_filters_from(
+        &self,
+        scene: &str,
+        id: i64,
+        from: &str,
+        from_item: Option<(&str, i64)>,
+    ) -> Result<(), StudioError> {
+        let src = match from_item {
+            Some((fscene, fid)) => FilterTarget::Item { scene: fscene, id: fid },
+            None => FilterTarget::Source(from),
+        };
+        self.paste_target_filters(FilterTarget::Item { scene, id }, src)
+    }
+
+    fn target_filter_values(&self, target: FilterTarget<'_>) -> Result<Vec<Value>, StudioError> {
+        match target {
+            FilterTarget::Source(name) => self.filter_list(name),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src = self.filter_list(name_of(&it))?;
+                match it.get("ferrocast_filters").and_then(Value::as_array) {
+                    Some(ov) => {
+                        let mut out = ov.clone();
+                        out.extend(src.into_iter().filter(|f| ferrocore::obs::is_audio_filter_kind(kind_of(f))));
+                        Ok(out)
+                    }
+                    None => Ok(src),
+                }
+            }
+        }
+    }
+
+    fn paste_target_filters(&self, target: FilterTarget<'_>, from: FilterTarget<'_>) -> Result<(), StudioError> {
+        let copies = self.target_filter_values(from)?;
+        let mut have: Vec<String> = self.target_filters(target)?.into_iter().map(|f| f.name).collect();
+        let rename_unique = |f: &mut Value, have: &mut Vec<String>| {
+            let mut n = name_of(f).to_string();
+            while have.contains(&n) {
+                n.push_str(" 2");
+            }
+            have.push(n.clone());
+            f["name"] = json!(n);
+            f["uuid"] = json!(uuid());
+        };
+        if let FilterTarget::Item { scene, id } = target {
+            let it = self.item(scene, id)?;
+            if has_item_filter_override(&it) {
+                let (mut video, mut audio) = (Vec::new(), Vec::new());
+                for mut f in copies {
+                    rename_unique(&mut f, &mut have);
+                    if ferrocore::obs::is_audio_filter_kind(kind_of(&f)) {
+                        audio.push(f);
+                    } else {
+                        video.push(f);
+                    }
+                }
+                if !video.is_empty() {
+                    self.with_item(scene, id, |i| {
+                        let mut list =
+                            i.get("ferrocast_filters").and_then(Value::as_array).cloned().unwrap_or_default();
+                        list.extend(video);
+                        i["ferrocast_filters"] = Value::Array(list);
+                    })?;
+                }
+                if !audio.is_empty() {
+                    self.with_filters(name_of(&it), |l| l.extend(audio))?;
+                }
+                return Ok(());
+            }
+        }
+        let mut renamed = Vec::with_capacity(copies.len());
+        for mut f in copies {
+            rename_unique(&mut f, &mut have);
+            renamed.push(f);
+        }
+        self.with_target_filters(target, None, None, |l| l.extend(renamed))
+    }
+
+    fn with_target_filter(
+        &self,
+        target: FilterTarget<'_>,
+        filter: &str,
+        f: impl FnOnce(&mut Value),
+    ) -> Result<(), StudioError> {
+        let owner = self.target_owner_label(target)?;
+        let found = self.with_target_filters(target, None, Some(filter), |l| {
+            l.iter_mut().find(|x| name_of(x) == filter).map(f).is_some()
+        })?;
+        if found { Ok(()) } else { Err(fail(format!("\"{owner}\" has no filter called \"{filter}\"."))) }
     }
 
     // ------------------------------------------------------------------ pictures
@@ -2217,6 +2632,32 @@ impl Stage {
         Ok(self.source_picture_job(name, width, filters)?.and_then(|job| job()))
     }
 
+    /// [`Self::item_picture_job`] run on this thread.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_pixels(
+        &self,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<(Vec<u8>, u32, u32, (u32, u32))>, StudioError> {
+        Ok(self.item_picture_job(scene, id, width, filters)?.and_then(|job| job()))
+    }
+
+    /// Like [`Self::item_picture_pixels`], failing if `expected_source` is given and does not
+    /// match the item's source name.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_pixels_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<(Vec<u8>, u32, u32, (u32, u32))>, StudioError> {
+        Ok(self.item_picture_job_for(expected_source, scene, id, width, filters)?.and_then(|job| job()))
+    }
+
     /// [`Self::source_picture_pixels`] in two: what's needed is read here (on the window's
     /// thread), and the drawing and reading back off the graphics card is the job, for any
     /// thread: done on the window's thread it held the window up each time (the drawer and the
@@ -2225,6 +2666,54 @@ impl Stage {
     pub fn source_picture_job(
         &self,
         name: &str,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
+    {
+        self.picture_job_for(name, None, width, filters)
+    }
+
+    /// Like [`Self::source_picture_job`], using one scene item's video filter list when
+    /// `filters` is true.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_job(
+        &self,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
+    {
+        self.item_picture_job_for(None, scene, id, width, filters)
+    }
+
+    /// Like [`Self::item_picture_job`], verifying `expected_source` matches the item when given.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_job_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
+    {
+        let it = self.item(scene, id)?;
+        let src = name_of(&it);
+        if let Some(want) = expected_source
+            && want != src
+        {
+            return Err(fail(format!("There's no source called \"{want}\" for item {id} in \"{scene}\".")));
+        }
+        let home = self.home(scene, id);
+        self.picture_job_for(src, Some((home, id)), width, filters)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn picture_job_for(
+        &self,
+        name: &str,
+        item: Option<(String, i64)>,
         width: u32,
         filters: bool,
     ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
@@ -2246,7 +2735,10 @@ impl Stage {
         let (w, h) = (w as u32, h as u32);
         Ok(Some(move || {
             let px = if filters {
-                e.engine.snapshot_source_filtered(id, (w, h))
+                match &item {
+                    Some((home, item_id)) => e.engine.snapshot_item_filtered(home, *item_id, id, (w, h)),
+                    None => e.engine.snapshot_source_filtered(id, (w, h)),
+                }
             } else {
                 e.engine.snapshot_source_at(id, (w, h))
             };
@@ -2695,7 +3187,7 @@ impl Stage {
             return Err(fail(format!("\"{name}\" isn't a group.")));
         }
         let p = ferrocore::obs::placement_of(&g);
-        let (gw, gh) = self.size_of(&name);
+        let (gw, gh) = self.item_size_of(&name, Some(&g));
         let to_canvas = ferrocore::draw_transform(&p, gw, gh);
         // Each side on its own, so a group scaled more one way keeps its sources' shapes.
         let (scale, turn) = (self.group_scale(&g), p.rotation);
@@ -6231,5 +6723,170 @@ mod tests {
         // Creating a mutual loop Voice -> Music is surfaced by sidechain_cycles().
         ok(s.add_filter("Voice", "compressor_filter", "DuckBack", &json!({ "sidechain_source": "Music" })));
         assert_eq!(s.sidechain_cycles(), vec![("Voice".into(), "Music".into())]);
+    }
+
+    #[test]
+    fn adding_filtered_source_to_vertical_or_another_scene_copies_video_filters_only() {
+        let s = stage();
+        ok(s.start_vertical("Vertical"));
+        ok(s.add_scene("Other"));
+        let dev = json!({ "device": "cam-1" });
+        let main_cam = ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        assert!(!main_cam.own_filters);
+        ok(s.add_filter("Cam", "ferrocast_rounded_corners", "Round", &json!({ "radius": 12 })));
+        ok(s.add_filter("Cam", "gain_filter", "Boost", &json!({ "db": -3.0 })));
+
+        // Reusing an already-filtered camera onto Vertical detaches its video filters automatically.
+        let (vert_cam, reused) = ok(s.add_source_or_reuse("Vertical", "av_capture_input_v2", "Cam V", &dev, true));
+        assert!(reused);
+        assert!(vert_cam.own_filters, "Vertical gets its own copy of existing video filters");
+        let vert_flts = ok(s.item_filters("Vertical", vert_cam.id));
+        assert_eq!(vert_flts.len(), 2);
+        assert_eq!(vert_flts[0].name, "Round");
+        assert_eq!(vert_flts[0].scope.as_deref(), Some("item"));
+        assert_eq!(vert_flts[1].name, "Boost");
+        assert_eq!(vert_flts[1].scope.as_deref(), Some("source"));
+
+        // Editing Vertical's Round filter & adding Tint leaves Main/Cam untouched.
+        ok(s.update_item_filter("Vertical", vert_cam.id, "Round", &json!({ "radius": 4 })));
+        ok(s.add_item_filter("Vertical", vert_cam.id, "ferrocast_border", "Edge", &json!({ "width": 6 })));
+        assert_eq!(ok(s.item_filter_settings("Vertical", vert_cam.id, "Round"))["radius"], 4);
+        assert_eq!(ok(s.filter_settings("Cam", "Round"))["radius"], 12);
+        assert_eq!(ok(s.filters("Cam")).len(), 2);
+
+        // Adding Cam to another normal scene also copies Cam's current video filters cleanly.
+        let other_cam = ok(s.add_existing("Other", "Cam"));
+        assert!(other_cam.own_filters);
+        let other_flts = ok(s.item_filters("Other", other_cam.id));
+        assert_eq!(other_flts.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["Round", "Boost"]);
+        assert_eq!(ok(s.item_filter_settings("Other", other_cam.id, "Round"))["radius"], 12);
+
+        // Sources without video filters (even with audio filters) stay shared by default.
+        ok(s.add_source("Main", "coreaudio_input_capture", "Mic", &json!({}), false));
+        ok(s.add_filter("Mic", "gain_filter", "GateGain", &json!({ "db": 2.0 })));
+        let vert_mic = ok(s.add_existing("Vertical", "Mic"));
+        assert!(!vert_mic.own_filters);
+    }
+
+    #[test]
+    fn item_filter_scope_switches_cleanly_while_audio_stays_shared() {
+        let s = stage();
+        ok(s.add_scene("Two"));
+        let one = ok(s.add_source("Main", "ffmpeg_source", "Clip", &json!({ "local_file": "/a.mp4" }), false));
+        let two = ok(s.add_existing("Two", "Clip"));
+        assert!(!one.own_filters && !two.own_filters);
+
+        ok(s.add_filter("Clip", "ferrocast_rounded_corners", "Round", &json!({ "radius": 20 })));
+        assert_eq!(ok(s.item_filters("Two", two.id)).len(), 1);
+
+        // Detach Two's item, delete Round on Two, add Border on Two; audio filter stays shared.
+        let detached = ok(s.set_item_filter_scope("Two", two.id, true));
+        assert!(detached.own_filters);
+        ok(s.remove_item_filter("Two", two.id, "Round"));
+        ok(s.add_item_filter("Two", two.id, "ferrocast_border", "Edge", &json!({ "width": 5 })));
+        ok(s.add_item_filter("Two", two.id, "gain_filter", "Trim", &json!({ "db": -4.0 })));
+
+        assert_eq!(
+            ok(s.item_filters("Main", one.id)).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["Round", "Trim"],
+            "Main keeps Round and receives shared audio filter Trim"
+        );
+        assert_eq!(
+            ok(s.item_filters("Two", two.id)).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["Edge", "Trim"],
+            "Two has only Edge + shared Trim"
+        );
+
+        // Switching Two back to shared restores Cam's shared video filters.
+        let shared = ok(s.set_item_filter_scope("Two", two.id, false));
+        assert!(!shared.own_filters);
+        assert_eq!(
+            ok(s.item_filters("Two", two.id)).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["Round", "Trim"]
+        );
+    }
+
+    #[test]
+    fn item_override_crop_frames_independently_and_roundtrips_save_load() {
+        let s = stage();
+        ok(s.start_vertical("Vertical"));
+        let main_card = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Card",
+            &json!({ "color": 4278190335u32, "width": 1920, "height": 1080 }),
+            false,
+        ));
+        let vert_card = ok(s.add_existing("Vertical", "Card"));
+        let vert_card = ok(s.set_item_filter_scope("Vertical", vert_card.id, true));
+        ok(s.add_item_filter("Vertical", vert_card.id, "crop_filter", "Crop", &json!({ "left": 200, "top": 100 })));
+
+        let m = ok(s.items("Main")).into_iter().find(|i| i.id == main_card.id).unwrap();
+        let v = ok(s.items("Vertical")).into_iter().find(|i| i.id == vert_card.id).unwrap();
+        assert_eq!(m.frame[0..4], [1920.0, 0.0, 0.0, 1080.0]);
+        assert_eq!(v.frame[0..4], [1720.0, 0.0, 0.0, 980.0]);
+        let vt = ok(s.transform("Vertical", vert_card.id));
+        assert_eq!((vt.width, vt.height), (1720, 980));
+
+        // Save and reload preserves override and frame; old collection without override stays shared.
+        let saved = s.save("Roundtrip");
+        let imported = ferrocore::obs::import(&saved, (1920, 1080));
+        let main_imp = imported.scenes.iter().find(|(n, _)| n == "Main").unwrap().1.clone();
+        let vert_imp = imported.scenes.iter().find(|(n, _)| n == "Vertical").unwrap().1.clone();
+        assert!(main_imp[0].effects.is_empty());
+        assert_eq!(vert_imp[0].effects.len(), 1);
+
+        let reloaded = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &saved, "Main"));
+        let rv = ok(reloaded.items("Vertical")).into_iter().find(|i| i.id == vert_card.id).unwrap();
+        assert!(rv.own_filters);
+        assert_eq!(rv.frame[0..4], [1720.0, 0.0, 0.0, 980.0]);
+    }
+
+    #[test]
+    fn paste_move_duplicate_and_item_picture_respect_item_filter_overrides() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        ok(s.start_vertical("Vertical"));
+        let main_red = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Red",
+            &json!({ "color": 4278190335u32, "width": 320, "height": 180 }),
+            false,
+        ));
+        ok(s.add_source("Main", "color_source_v3", "Donor", &json!({ "width": 64, "height": 36 }), false));
+        ok(s.add_filter("Donor", "color_filter_v2", "Dim", &json!({ "brightness": -0.5 })));
+        ok(s.add_filter("Donor", "ferrocast_rounded_corners", "Round", &json!({ "radius": 30 })));
+
+        let vert_red = ok(s.add_existing("Vertical", "Red"));
+        ok(s.set_item_filter_scope("Vertical", vert_red.id, true));
+        ok(s.paste_item_filters("Vertical", vert_red.id, "Donor"));
+        ok(s.move_item_filter("Vertical", vert_red.id, "Round", ItemEdit::Top));
+        let flts = ok(s.item_filters("Vertical", vert_red.id));
+        assert_eq!(flts.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["Round", "Dim"]);
+        ok(s.set_item_filter_enabled("Vertical", vert_red.id, "Round", false));
+        assert!(!ok(s.item_filters("Vertical", vert_red.id))[0].enabled);
+
+        // Main item picture has no filters; Vertical item picture shows Dim only (not Round).
+        // Passing mismatched source name onto item picture fails cleanly.
+        assert!(s.item_picture_pixels_for(Some("Donor"), "Vertical", vert_red.id, 160, true).is_err());
+        let (main_px, _, _, _) = ok(s.item_picture_pixels("Main", main_red.id, 160, true)).unwrap();
+        let (vert_px, vw, vh, _) = ok(s.item_picture_pixels("Vertical", vert_red.id, 160, true)).unwrap();
+        let mid = ((vh as usize / 2) * vw as usize + (vw as usize / 2)) * 4;
+        assert!(main_px[mid] > vert_px[mid] + 40, "item picture renders item override");
+
+        // Paste filters directly from Vertical's item override back onto Main's item.
+        ok(s.paste_filters_from("Red", "", Some(("Vertical", vert_red.id))));
+        assert_eq!(ok(s.filters("Red")).len(), 2);
+
+        // Duplicating Vertical item copies its active item filters onto the duplicated source.
+        ok(s.edit_item("Vertical", vert_red.id, ItemEdit::Duplicate));
+        let vert_items = ok(s.items("Vertical"));
+        assert_eq!(vert_items.len(), 2);
+        let dup = vert_items.iter().find(|i| i.id != vert_red.id).unwrap();
+        assert!(!dup.own_filters);
+        assert_eq!(ok(s.filters(&dup.name)).len(), 2);
     }
 }

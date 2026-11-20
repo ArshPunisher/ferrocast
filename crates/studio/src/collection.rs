@@ -70,6 +70,9 @@ pub struct ItemInfo {
     pub top_field_first: bool,
     /// A video, playlist or slideshow with play controls.
     pub media: bool,
+    /// True when this scene item carries its own video filter list (`"This picture only"`)
+    /// rather than sharing the source's filters (`"Everywhere this source is used"`).
+    pub own_filters: bool,
 }
 
 /// `enum obs_deinterlace_mode`, in order.
@@ -268,12 +271,16 @@ pub struct SourceUse {
     pub capture: Option<u64>,
 }
 
-/// A filter on a source, in order.
+/// A filter on a source or scene item, in order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FilterInfo {
     pub name: String,
     pub kind: String,
     pub enabled: bool,
+    /// `"item"` when edited for this picture only, `"source"` when shared (all audio filters
+    /// are `"source"`). Omitted on plain source-level filter listings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 /// A sound's level now, dBFS (-100 is silence).

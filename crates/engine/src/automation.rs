@@ -422,9 +422,14 @@ impl Engine {
             }
             Step::Filter { source, filter, on } => {
                 let edit = if *on { FilterEdit::Enable } else { FilterEdit::Disable };
-                self.studio_act(StudioAct::EditFilter { name: source.clone(), filter: filter.clone(), edit })
-                    .await
-                    .map(drop)
+                self.studio_act(StudioAct::EditFilter {
+                    name: source.clone(),
+                    filter: filter.clone(),
+                    edit,
+                    item: None,
+                })
+                .await
+                .map(drop)
             }
             Step::SaveReplay => self.studio_replay_save().await.map(drop),
             Step::Record { on } => self.studio_record(*on).await.map(drop),

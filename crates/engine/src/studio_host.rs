@@ -1370,6 +1370,13 @@ pub struct NewSource {
     pub settings: Value,
 }
 
+/// Optional scene-item target for item-scoped video filter operations (`{ scene, id }`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ItemTarget {
+    pub scene: String,
+    pub id: i64,
+}
+
 /// One thing to do to the scene collection. The routes build these; [`StudioAct::check`]
 /// refuses bad input before the host sees it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1495,32 +1502,53 @@ pub enum StudioAct {
     },
     Filters {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     AddFilter {
         name: String,
         filter: NewSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     RemoveFilter {
         name: String,
         filter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     EditFilter {
         name: String,
         filter: String,
         edit: FilterEdit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     FilterSettings {
         name: String,
         filter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     FilterOptions {
         name: String,
         filter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     UpdateFilter {
         name: String,
         filter: String,
         settings: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
+    },
+    /// Switches one scene item between `"This picture only"` (`own: true`, copies source video
+    /// filters to an item override) and `"Everywhere this source is used"` (`own: false`).
+    SetItemFilterScope {
+        scene: String,
+        id: i64,
+        own: bool,
     },
     /// A PNG of a scene or source, saved where recordings go → `{ file }`.
     Screenshot {
@@ -1535,10 +1563,14 @@ pub enum StudioAct {
         name: String,
         what: WebAct,
     },
-    /// Copies every filter of `from` onto `name` (OBS's Copy / Paste Filters).
+    /// Copies every filter of `from` (or `from_item`) onto `name` or `item` (OBS's Copy / Paste Filters).
     PasteFilters {
         name: String,
         from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_item: Option<ItemTarget>,
     },
     /// Moves and sizes an item from the preview: its box's first corner to (`x`, `y`), its
     /// sides `w` and `h` long, in canvas pixels → the item. `save` at the end of a drag.
@@ -1632,6 +1664,8 @@ pub enum StudioAct {
         /// With its filters on (the drawer's result), as it shows in a scene.
         #[serde(default)]
         filters: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     /// How a source is doing, for its drawer → `{ web_text?: { at_ms, value, error } | null }`
     /// for a Web text (its last read), `{ page?: { ok, error } }` for a Browser source on the
@@ -1830,7 +1864,8 @@ impl StudioAct {
                 check_source_name(name)?;
                 check_source_name(new_name)
             }
-            A::Settings { name } | A::Options { name } | A::Filters { name } => check_source_name(name),
+            A::Settings { name } | A::Options { name } => check_source_name(name),
+            A::Filters { name, item } => check_filter_target(name, item.as_ref()),
             A::Update { name, settings } => {
                 check_source_name(name)?;
                 object(settings)
@@ -1875,27 +1910,28 @@ impl StudioAct {
                 }
                 names.iter().try_for_each(|n| check_source_name(n))
             }
-            A::AddFilter { name, filter } => {
-                check_source_name(name)?;
+            A::AddFilter { name, filter, item } => {
+                check_filter_target(name, item.as_ref())?;
                 new(filter)
             }
-            A::RemoveFilter { name, filter }
-            | A::EditFilter { name, filter, .. }
-            | A::FilterSettings { name, filter }
-            | A::FilterOptions { name, filter } => {
-                check_source_name(name)?;
+            A::RemoveFilter { name, filter, item }
+            | A::EditFilter { name, filter, item, .. }
+            | A::FilterSettings { name, filter, item }
+            | A::FilterOptions { name, filter, item } => {
+                check_filter_target(name, item.as_ref())?;
                 check_source_name(filter)
             }
-            A::UpdateFilter { name, filter, settings } => {
-                check_source_name(name)?;
+            A::UpdateFilter { name, filter, settings, item } => {
+                check_filter_target(name, item.as_ref())?;
                 check_source_name(filter)?;
                 object(settings)
             }
+            A::SetItemFilterScope { scene, .. } => check_source_name(scene),
             A::Web { name, .. } | A::Screenshot { name } => check_source_name(name),
-            A::PasteFilters { name, from } => {
-                check_source_name(name)?;
-                check_source_name(from)?;
-                if name == from {
+            A::PasteFilters { name, from, item, from_item } => {
+                check_filter_target(name, item.as_ref())?;
+                check_filter_target(from, from_item.as_ref())?;
+                if item.is_none() && from_item.is_none() && name == from {
                     return Err(EngineError::Invalid("from: another source than the one pasted onto.".into()));
                 }
                 Ok(())
@@ -1955,8 +1991,15 @@ impl StudioAct {
                 }
                 Ok(())
             }
-            A::Thumbnail { scene: name, width } | A::SourcePicture { name, width, .. } => {
+            A::Thumbnail { scene: name, width } => {
                 check_source_name(name)?;
+                if !(64..=640).contains(width) {
+                    return Err(EngineError::Invalid("w: 64 to 640 pixels.".into()));
+                }
+                Ok(())
+            }
+            A::SourcePicture { name, width, item, .. } => {
+                check_filter_target(name, item.as_ref())?;
                 if !(64..=640).contains(width) {
                     return Err(EngineError::Invalid("w: 64 to 640 pixels.".into()));
                 }
@@ -2105,6 +2148,18 @@ fn check_transition(t: &SceneTransition) -> Result<(), EngineError> {
 }
 
 /// A source or filter kind id from OBS (`color_source`, `com.example.thing`).
+fn check_filter_target(name: &str, item: Option<&ItemTarget>) -> Result<(), EngineError> {
+    match item {
+        Some(it) => {
+            if !name.is_empty() {
+                check_source_name(name)?;
+            }
+            check_source_name(&it.scene)
+        }
+        None => check_source_name(name),
+    }
+}
+
 fn check_kind(kind: &str) -> Result<(), EngineError> {
     if kind.is_empty() || kind.len() > 128 || !kind.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
         return Err(EngineError::Invalid("kind: an OBS source or filter id, like color_source.".into()));
@@ -3594,7 +3649,7 @@ mod tests {
         for bad in ["../Untitled", "", ".x", "a/b"] {
             assert!(matches!(e.studio_import_obs(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
         }
-        let mut same = StudioAct::PasteFilters { name: "Mic".into(), from: "Mic".into() };
+        let mut same = StudioAct::PasteFilters { name: "Mic".into(), from: "Mic".into(), item: None, from_item: None };
         assert!(matches!(same.check(), Err(EngineError::Invalid(_))));
         assert!(matches!(
             failed("\"Cam\" isn't a web page.".into()),
@@ -3870,7 +3925,10 @@ mod tests {
             (StudioAct::SetChannel { channel: 7, device: None }, "channel"),
             (StudioAct::Levels { names: vec!["x".into(); 65] }, "names"),
             (StudioAct::Items { scene: "a\nb".into() }, "name"),
-            (StudioAct::AddFilter { name: "Mic".into(), filter: src("bad id", "Gate", Value::Null) }, "kind"),
+            (
+                StudioAct::AddFilter { name: "Mic".into(), filter: src("bad id", "Gate", Value::Null), item: None },
+                "kind",
+            ),
         ] {
             let err = e.studio_act(bad).await.unwrap_err();
             assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{err:?}");
@@ -3979,5 +4037,54 @@ mod tests {
             assert!(message.ends_with('.') && !message.starts_with(char::is_lowercase), "{message}");
             assert!(!message.starts_with("Name:"), "{message}");
         }
+    }
+
+    #[test]
+    fn item_filter_acts_validate_and_track_changes() {
+        let tgt = ItemTarget { scene: "Vertical".into(), id: 2 };
+        let mut good = [
+            StudioAct::Filters { name: String::new(), item: Some(tgt.clone()) },
+            StudioAct::AddFilter {
+                name: String::new(),
+                filter: NewSource {
+                    kind: "ferrocast_rounded_corners".into(),
+                    name: "Round".into(),
+                    settings: Value::Null,
+                },
+                item: Some(tgt.clone()),
+            },
+            StudioAct::UpdateFilter {
+                name: String::new(),
+                filter: "Round".into(),
+                settings: serde_json::json!({ "radius": 8 }),
+                item: Some(tgt.clone()),
+            },
+            StudioAct::PasteFilters {
+                name: String::new(),
+                from: "Cam".into(),
+                item: Some(tgt.clone()),
+                from_item: None,
+            },
+            StudioAct::SourcePicture { name: "Cam".into(), width: 256, filters: true, item: Some(tgt.clone()) },
+            StudioAct::SetItemFilterScope { scene: "Vertical".into(), id: 2, own: true },
+        ];
+        for a in &mut good {
+            assert!(a.check().is_ok(), "{a:?}");
+        }
+        assert!(!good[0].changes());
+        assert!(!good[4].changes());
+        assert!(good[1].changes());
+        assert!(good[2].changes());
+        assert!(good[3].changes());
+        assert!(good[5].changes());
+
+        let mut bad_scope = StudioAct::SetItemFilterScope { scene: "bad\nscene".into(), id: 2, own: true };
+        assert!(matches!(bad_scope.check(), Err(EngineError::Invalid(_))));
+        let mut bad_target =
+            StudioAct::Filters { name: String::new(), item: Some(ItemTarget { scene: "".into(), id: 1 }) };
+        assert!(matches!(bad_target.check(), Err(EngineError::Invalid(_))));
+        let mut bad_pic_name =
+            StudioAct::SourcePicture { name: "a\nb".into(), width: 256, filters: true, item: Some(tgt) };
+        assert!(matches!(bad_pic_name.check(), Err(EngineError::Invalid(_))));
     }
 }

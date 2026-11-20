@@ -1367,12 +1367,25 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         | A::SourceStill { .. }
         | A::VstPlugins { .. }
         | A::Vst { .. } => Err(ferrocast_studio::StudioError::Failed("read off the main thread".into())),
-        A::SourcePicture { name, width, filters } => Ok(match c.source_picture_pixels(&name, width, filters)? {
-            Some((px, w, h, (sw, sh))) => {
-                json!({ "image": ferrocast_studio::png_data_url(&px, w, h, &name)?, "width": sw, "height": sh })
-            }
-            None => json!({ "image": null }),
-        }),
+        A::SourcePicture { name, width, filters, item } => {
+            let label = item.as_ref().map_or_else(|| name.clone(), |it| it.scene.clone());
+            let pixels = match item {
+                Some(it) => c.item_picture_pixels_for(
+                    (!name.is_empty()).then_some(name.as_str()),
+                    &it.scene,
+                    it.id,
+                    width,
+                    filters,
+                )?,
+                None => c.source_picture_pixels(&name, width, filters)?,
+            };
+            Ok(match pixels {
+                Some((px, w, h, (sw, sh))) => {
+                    json!({ "image": ferrocast_studio::png_data_url(&px, w, h, &label)?, "width": sw, "height": sh })
+                }
+                None => json!({ "image": null }),
+            })
+        }
         A::GroupItems { scene, ids, name } => v(to_json!(c.group_together(&scene, &ids, &name)?)),
         A::ItemOrder { scene, id, to } => done(c.item_order(&scene, id, to)),
         A::SetGroup { scene, id, group } => done(c.set_group(&scene, id, group)),
@@ -1500,10 +1513,26 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::SetAudioCare { care } => done(c.set_audio_care(&care)),
         A::Privacy => v(Ok(c.privacy())),
         A::SetPrivacy { privacy } => done(c.set_privacy(&privacy)),
-        A::Filters { name } => v(to_json!(c.filters(&name)?)),
-        A::AddFilter { name, filter } => done(c.add_filter(&name, &filter.kind, &filter.name, &filter.settings)),
-        A::RemoveFilter { name, filter } => done(c.remove_filter(&name, &filter)),
-        A::PasteFilters { name, from } => done(c.paste_filters(&name, &from)),
+        A::Filters { name, item } => match item {
+            Some(it) => v(to_json!(c.item_filters(&it.scene, it.id)?)),
+            None => v(to_json!(c.filters(&name)?)),
+        },
+        A::AddFilter { name, filter, item } => done(match item {
+            Some(it) => c.add_item_filter(&it.scene, it.id, &filter.kind, &filter.name, &filter.settings),
+            None => c.add_filter(&name, &filter.kind, &filter.name, &filter.settings),
+        }),
+        A::RemoveFilter { name, filter, item } => done(match item {
+            Some(it) => c.remove_item_filter(&it.scene, it.id, &filter),
+            None => c.remove_filter(&name, &filter),
+        }),
+        A::PasteFilters { name, from, item, from_item } => {
+            let src_item = from_item.as_ref().map(|f| (f.scene.as_str(), f.id));
+            done(match item {
+                Some(it) => c.paste_item_filters_from(&it.scene, it.id, &from, src_item),
+                None => c.paste_filters_from(&name, &from, src_item),
+            })
+        }
+        A::SetItemFilterScope { scene, id, own } => v(to_json!(c.set_item_filter_scope(&scene, id, own)?)),
         A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
         A::SetItemCrop { scene, id, crop, .. } => v(to_json!(c.set_item_crop(&scene, id, crop)?)),
         A::Transform { scene, id } => v(to_json!(c.transform(&scene, id)?)),
@@ -1535,17 +1564,33 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::Web { name, what } => done(c.web(&name, web_act(what))),
         // Handled in `act`, which knows where recordings go.
         A::Screenshot { .. } | A::ScreenshotProgram => Ok(Value::Null),
-        A::EditFilter { name, filter, edit } => done(match edit {
-            FilterEdit::Enable => c.set_filter_enabled(&name, &filter, true),
-            FilterEdit::Disable => c.set_filter_enabled(&name, &filter, false),
-            FilterEdit::Up => c.move_filter(&name, &filter, ItemEdit::Up),
-            FilterEdit::Down => c.move_filter(&name, &filter, ItemEdit::Down),
-            FilterEdit::Top => c.move_filter(&name, &filter, ItemEdit::Top),
-            FilterEdit::Bottom => c.move_filter(&name, &filter, ItemEdit::Bottom),
+        A::EditFilter { name, filter, edit, item } => {
+            let mv = match edit {
+                FilterEdit::Up => Some(ItemEdit::Up),
+                FilterEdit::Down => Some(ItemEdit::Down),
+                FilterEdit::Top => Some(ItemEdit::Top),
+                FilterEdit::Bottom => Some(ItemEdit::Bottom),
+                FilterEdit::Enable | FilterEdit::Disable => None,
+            };
+            done(match (item, mv) {
+                (Some(it), Some(m)) => c.move_item_filter(&it.scene, it.id, &filter, m),
+                (Some(it), None) => c.set_item_filter_enabled(&it.scene, it.id, &filter, edit == FilterEdit::Enable),
+                (None, Some(m)) => c.move_filter(&name, &filter, m),
+                (None, None) => c.set_filter_enabled(&name, &filter, edit == FilterEdit::Enable),
+            })
+        }
+        A::FilterSettings { name, filter, item } => match item {
+            Some(it) => c.item_filter_settings(&it.scene, it.id, &filter),
+            None => c.filter_settings(&name, &filter),
+        },
+        A::FilterOptions { name, filter, item } => match item {
+            Some(it) => v(to_json!(c.item_filter_options(&it.scene, it.id, &filter)?)),
+            None => v(to_json!(c.filter_options(&name, &filter)?)),
+        },
+        A::UpdateFilter { name, filter, settings, item } => done(match item {
+            Some(it) => c.update_item_filter(&it.scene, it.id, &filter, &settings),
+            None => c.update_filter(&name, &filter, &settings),
         }),
-        A::FilterSettings { name, filter } => c.filter_settings(&name, &filter),
-        A::FilterOptions { name, filter } => v(to_json!(c.filter_options(&name, &filter)?)),
-        A::UpdateFilter { name, filter, settings } => done(c.update_filter(&name, &filter, &settings)),
     }
 }
 
@@ -2559,20 +2604,30 @@ impl StudioHost for DesktopStudio {
         // Pictures: drawn on the main thread, turned into a PNG off it (a 1080p PNG took tens of
         // milliseconds there, and the scene grid asks for one every few seconds).
         // A source's own picture (the crop editor's): the same, without its filters.
-        if let StudioAct::SourcePicture { name, width, filters } = &act {
-            let (n, w, f) = (name.clone(), *width, *filters);
+        if let StudioAct::SourcePicture { name, width, filters, item } = &act {
+            let (n, w, f, it) = (name.clone(), *width, *filters, item.clone());
+            let label = it.as_ref().map_or_else(|| n.clone(), |t| t.scene.clone());
             // Only what's needed is read on the main thread; the drawing, the read back from the
             // graphics card and the PNG happen off it (they held the window up each time).
+            type PicJob = Box<dyn FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send>;
             let job = self
-                .on_main(move |h| -> Result<_, String> {
+                .on_main(move |h| -> Result<Option<PicJob>, String> {
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
-                    c.source_picture_job(&n, w, f).map_err(|e| e.to_string())
+                    match &it {
+                        Some(target) => c
+                            .item_picture_job_for((!n.is_empty()).then_some(n.as_str()), &target.scene, target.id, w, f)
+                            .map(|opt| opt.map(|j| Box::new(j) as PicJob))
+                            .map_err(|e| e.to_string()),
+                        None => c
+                            .source_picture_job(&n, w, f)
+                            .map(|opt| opt.map(|j| Box::new(j) as PicJob))
+                            .map_err(|e| e.to_string()),
+                    }
                 })
                 .await??;
             let Some(job) = job else { return Ok(json!({ "image": null })) };
-            let name = name.clone();
             let got = tokio::task::spawn_blocking(move || {
-                job().map(|(px, pw, ph, size)| ferrocast_studio::png_data_url(&px, pw, ph, &name).map(|i| (i, size)))
+                job().map(|(px, pw, ph, size)| ferrocast_studio::png_data_url(&px, pw, ph, &label).map(|i| (i, size)))
             })
             .await
             .map_err(|e| e.to_string())?;

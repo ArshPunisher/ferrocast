@@ -1059,6 +1059,116 @@ pub fn camera_device(kind: &str, settings: &Value) -> Option<String> {
     })
 }
 
+/// Whether `kind` is an OBS/Ferrocast audio filter id (lives on the source, never overridden
+/// per scene item).
+#[must_use]
+pub fn is_audio_filter_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "gain_filter"
+            | "invert_polarity_filter"
+            | "noise_gate_filter"
+            | "compressor_filter"
+            | "limiter_filter"
+            | "expander_filter"
+            | "upward_compressor_filter"
+            | "basic_eq_filter"
+            | "ferrocast_deepfilter"
+            | "noise_suppress_filter"
+            | "noise_suppress_filter_v2"
+            | "ferrocast_vst"
+    )
+}
+
+fn push_video_filter(
+    flt: &Value,
+    owner: &str,
+    next_id: &mut u64,
+    effects: &mut Vec<crate::Effect>,
+    out: &mut Imported,
+) -> bool {
+    if flt.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return true;
+    }
+    let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
+    let fs = flt.get("settings").cloned().unwrap_or(Value::Null);
+    if kind == "mask_filter" || kind == "mask_filter_v2" {
+        // Its picture becomes a source of its own, shown in no scene.
+        match mask_from(kind, &fs, *next_id) {
+            Some((e, path)) => {
+                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+                out.sources.push(ImportedSource {
+                    id: *next_id,
+                    name: format!("{owner}: {fname}"),
+                    kind: SourceKind::Image(path),
+                    sound: None,
+                    sound_effects: Vec::new(),
+                    global: false,
+                });
+                *next_id += 1;
+                effects.push(e);
+            }
+            None => out.skipped.push(format!("{owner}: the filter {kind} (no picture chosen)")),
+        }
+        return true;
+    }
+    if kind == "ferrocast_remove_background" && !cfg!(any(target_os = "macos", target_os = "windows")) {
+        out.skipped.push(format!("{owner}: the filter {kind} (on a Mac and Windows only so far)"));
+        return true;
+    }
+    if kind == "ferrocast_remove_background" {
+        let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+        out.sources.push(ImportedSource {
+            id: *next_id,
+            name: format!("{owner}: {fname}"),
+            kind: SourceKind::Fed { width: 320, height: 180 },
+            sound: None,
+            sound_effects: Vec::new(),
+            global: false,
+        });
+        let int = |k: &str, d: i64, lo: i64, hi: i64| fs.get(k).and_then(Value::as_i64).unwrap_or(d).clamp(lo, hi);
+        effects.push(Effect::Cutout {
+            mask: *next_id,
+            blur: int("mode", 0, 0, 1) == 1,
+            blur_px: int("blur", 24, 2, 100) as f32,
+            soft: int("soft", 10, 0, 40) as f32 / 100.0,
+        });
+        *next_id += 1;
+        return true;
+    }
+    if kind == "ferrocast_shader" {
+        let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
+        match shader_from(&fs) {
+            Ok(e) => effects.push(e),
+            Err(why) => out.skipped.push(format!("{owner}: the shader effect \"{fname}\" ({why})")),
+        }
+        return true;
+    }
+    if let Some(e) = effect_from(kind, &fs) {
+        effects.push(e);
+        return true;
+    }
+    false
+}
+
+fn parse_video_effects(
+    filters: &[Value],
+    owner: &str,
+    next_id: &mut u64,
+    effects: &mut Vec<crate::Effect>,
+    out: &mut Imported,
+) {
+    for flt in filters {
+        if push_video_filter(flt, owner, next_id, effects, out) {
+            continue;
+        }
+        let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
+        if !is_audio_filter_kind(kind) {
+            out.skipped.push(format!("{owner}: the filter {kind}"));
+        }
+    }
+}
+
 /// [`import`], with `before` giving what each source (by name) was running as: a capture
 /// waiting for its pick keeps that.
 pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Option<SourceKind>) -> Imported {
@@ -1107,62 +1217,12 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
         let settings = s.get("settings").cloned().unwrap_or(Value::Null);
         let (mut effects, mut sound_effects) = (Vec::new(), Vec::new());
         for flt in s.get("filters").and_then(Value::as_array).into_iter().flatten() {
-            if flt.get("enabled").and_then(Value::as_bool) == Some(false) {
+            if push_video_filter(flt, &name, &mut next_id, &mut effects, &mut out) {
                 continue;
             }
             let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
             let fs = flt.get("settings").cloned().unwrap_or(Value::Null);
-            if kind == "mask_filter" || kind == "mask_filter_v2" {
-                // Its picture becomes a source of its own, shown in no scene.
-                match mask_from(kind, &fs, next_id) {
-                    Some((e, path)) => {
-                        let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
-                        out.sources.push(ImportedSource {
-                            id: next_id,
-                            name: format!("{name}: {fname}"),
-                            kind: SourceKind::Image(path),
-                            sound: None,
-                            sound_effects: Vec::new(),
-                            global: false,
-                        });
-                        next_id += 1;
-                        effects.push(e);
-                    }
-                    None => out.skipped.push(format!("{name}: the filter {kind} (no picture chosen)")),
-                }
-            } else if kind == "ferrocast_remove_background" && !cfg!(any(target_os = "macos", target_os = "windows")) {
-                // Nothing finds the person here yet: left out, not a picture cut away.
-                out.skipped.push(format!("{name}: the filter {kind} (on a Mac and Windows only so far)"));
-            } else if kind == "ferrocast_remove_background" {
-                // The person mask comes in as a picture of its own (the app finds the person
-                // and hands it in), shown in no scene.
-                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
-                out.sources.push(ImportedSource {
-                    id: next_id,
-                    name: format!("{name}: {fname}"),
-                    kind: SourceKind::Fed { width: 320, height: 180 },
-                    sound: None,
-                    sound_effects: Vec::new(),
-                    global: false,
-                });
-                let int =
-                    |k: &str, d: i64, lo: i64, hi: i64| fs.get(k).and_then(Value::as_i64).unwrap_or(d).clamp(lo, hi);
-                effects.push(Effect::Cutout {
-                    mask: next_id,
-                    blur: int("mode", 0, 0, 1) == 1,
-                    blur_px: int("blur", 24, 2, 100) as f32,
-                    soft: int("soft", 10, 0, 40) as f32 / 100.0,
-                });
-                next_id += 1;
-            } else if kind == "ferrocast_shader" {
-                let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
-                match shader_from(&fs) {
-                    Ok(e) => effects.push(e),
-                    Err(why) => out.skipped.push(format!("{name}: the shader effect \"{fname}\" ({why})")),
-                }
-            } else if let Some(e) = effect_from(kind, &fs) {
-                effects.push(e);
-            } else if kind == "ferrocast_vst" {
+            if kind == "ferrocast_vst" {
                 let fname = flt.get("name").and_then(Value::as_str).unwrap_or(kind);
                 if crate::afx::plugins_disabled() {
                     out.skipped.push(format!("{name}: the VST plugin \"{fname}\" (disabled in Safe Mode)"));
@@ -1389,6 +1449,17 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
             };
             si.visible = it.get("visible").and_then(Value::as_bool).unwrap_or(true);
             si.item_id = it.get("id").and_then(Value::as_i64).unwrap_or(0);
+            if let Some(override_filters) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                let mut override_effects = Vec::new();
+                parse_video_effects(
+                    override_filters,
+                    &format!("{name}#{}", si.item_id),
+                    &mut next_id,
+                    &mut override_effects,
+                    &mut out,
+                );
+                si.effects = override_effects;
+            }
             si.filter = Filter::from_name(it.get("scale_filter").and_then(Value::as_str).unwrap_or("disable"));
             si.blend = Blend::from_name(it.get("blend_type").and_then(Value::as_str).unwrap_or("normal"));
             items.push(si);
@@ -2801,5 +2872,112 @@ mod tests {
             effect_from("sharpness_filter", &json!({ "sharpness": 0.25 })),
             Some(Effect::Sharpen { sharpness: 0.25 })
         );
+    }
+
+    #[test]
+    fn item_video_filter_override_replaces_source_filters_while_audio_stays_shared() {
+        assert!(is_audio_filter_kind("gain_filter"));
+        assert!(is_audio_filter_kind("ferrocast_deepfilter"));
+        assert!(is_audio_filter_kind("ferrocast_vst"));
+        assert!(!is_audio_filter_kind("ferrocast_rounded_corners"));
+        assert!(!is_audio_filter_kind("ferrocast_remove_background"));
+
+        let edge = json!([{ "id": "ferrocast_border", "name": "Edge", "settings": { "width": 6 } }]);
+        let doc = json!({
+            "current_program_scene": "Main",
+            "sources": [
+                {
+                    "id": "coreaudio_input_capture",
+                    "name": "MicAndCam",
+                    "settings": {},
+                    "mixers": 1,
+                    "filters": [
+                        { "id": "gain_filter", "name": "Boost", "settings": { "db": 3.0 } },
+                        { "id": "ferrocast_rounded_corners", "name": "Round", "settings": { "radius": 10 } }
+                    ]
+                },
+                {
+                    "id": "scene",
+                    "name": "Main",
+                    "settings": { "items": [{ "id": 1, "name": "MicAndCam" }] }
+                },
+                {
+                    "id": "scene",
+                    "name": "Vertical",
+                    "settings": { "items": [{ "id": 2, "name": "MicAndCam", "ferrocast_filters": edge }] }
+                },
+                {
+                    "id": "scene",
+                    "name": "Clean",
+                    "settings": { "items": [{ "id": 3, "name": "MicAndCam", "ferrocast_filters": [] }] }
+                }
+            ]
+        });
+        let im = import(&doc, (1920, 1080));
+        assert!(im.skipped.is_empty(), "{:?}", im.skipped);
+        let src = im.sources.iter().find(|s| s.name == "MicAndCam").unwrap();
+        assert!(matches!(src.sound_effects.as_slice(), [AudioEffect::Gain { db }] if (*db - 3.0).abs() < 0.01));
+        let main = im.scenes.iter().find(|(n, _)| n == "Main").unwrap().1.clone();
+        let vert = im.scenes.iter().find(|(n, _)| n == "Vertical").unwrap().1.clone();
+        let clean = im.scenes.iter().find(|(n, _)| n == "Clean").unwrap().1.clone();
+        assert!(
+            matches!(main[0].effects.as_slice(), [Effect::RoundedCorners { radius }] if (*radius - 10.0).abs() < 0.01)
+        );
+        assert!(matches!(vert[0].effects.as_slice(), [Effect::Border { width, .. }] if (*width - 6.0).abs() < 0.01));
+        assert!(clean[0].effects.is_empty(), "empty item override must clear source video filters for that item only");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn item_override_cutout_creates_distinct_mask_sources_per_item() {
+        let doc = json!({
+            "current_program_scene": "Main",
+            "sources": [
+                {
+                    "id": "color_source_v3",
+                    "name": "Cam",
+                    "settings": { "width": 320, "height": 180 },
+                    "filters": []
+                },
+                {
+                    "id": "scene",
+                    "name": "Main",
+                    "settings": {
+                        "items": [{
+                            "id": 1,
+                            "name": "Cam",
+                            "ferrocast_filters": [{ "id": "ferrocast_remove_background", "name": "Cut", "settings": { "soft": 10 } }]
+                        }]
+                    }
+                },
+                {
+                    "id": "scene",
+                    "name": "Vertical",
+                    "settings": {
+                        "items": [{
+                            "id": 2,
+                            "name": "Cam",
+                            "ferrocast_filters": [{ "id": "ferrocast_remove_background", "name": "Cut", "settings": { "soft": 20 } }]
+                        }]
+                    }
+                }
+            ]
+        });
+        let im = import(&doc, (1920, 1080));
+        let main = im.scenes.iter().find(|(n, _)| n == "Main").unwrap().1.clone();
+        let vert = im.scenes.iter().find(|(n, _)| n == "Vertical").unwrap().1.clone();
+        let m1 = match main[0].effects.as_slice() {
+            [Effect::Cutout { mask, .. }] => *mask,
+            other => panic!("expected main cutout, got {other:?}"),
+        };
+        let m2 = match vert[0].effects.as_slice() {
+            [Effect::Cutout { mask, .. }] => *mask,
+            other => panic!("expected vertical cutout, got {other:?}"),
+        };
+        assert_ne!(m1, m2);
+        let n1 = im.sources.iter().find(|s| s.id == m1).map(|s| s.name.as_str());
+        let n2 = im.sources.iter().find(|s| s.id == m2).map(|s| s.name.as_str());
+        assert_eq!(n1, Some("Main#1: Cut"));
+        assert_eq!(n2, Some("Vertical#2: Cut"));
     }
 }
