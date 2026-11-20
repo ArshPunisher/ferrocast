@@ -1230,6 +1230,23 @@ mod tests {
         assert_eq!(pick_output_pixel_format(&[kCVPixelFormatType_422YpCbCr8]), kCVPixelFormatType_422YpCbCr8);
     }
 
+    /// agy GAPS #10 said 10-bit (HDR) frames from a card would be dropped by `copy_video_frame`.
+    /// They never reach it: the output is told to deliver an 8-bit format, so AVFoundation
+    /// converts, and the choice never lands on a 10-bit one even when that is all the card lists.
+    #[test]
+    fn the_output_is_never_asked_for_a_ten_bit_format() {
+        use super::pick_output_pixel_format;
+        use objc2_core_video::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange};
+        let x420 = u32::from_be_bytes(*b"x420");
+        let l10r = u32::from_be_bytes(*b"l10r");
+        let p010 = u32::from_be_bytes(*b"p010");
+        assert_eq!(
+            pick_output_pixel_format(&[x420, l10r, p010, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]),
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        );
+        assert_eq!(pick_output_pixel_format(&[x420, l10r, p010]), kCVPixelFormatType_32BGRA);
+    }
+
     #[test]
     fn disconnect_and_runtime_error_end_capture_immediately() {
         use super::{OWN, Observer, Shared, handle_disconnect};
