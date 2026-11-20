@@ -3212,7 +3212,8 @@ fn preview_loop(
                 // selection boxes in the frame it draws the scene).
                 let mut look = p.look.clone();
                 if let Some(m) = &look.marks {
-                    look.outlines = outlines(&st, m, p.size, now_ns());
+                    let shown = p.scene.as_deref().or(st.on_air.as_deref()).unwrap_or("");
+                    look.outlines = outlines(&st, m, p.size, shown, now_ns());
                 }
                 (draw, look)
             })
@@ -3233,7 +3234,17 @@ fn preview_loop(
 
 /// The preview's outlines (canvas pixels) for `m`, from the engine's own items at `ts`: every
 /// shown source of `m.scene` in its colour, then the picked ones with handles on top.
-fn outlines(st: &State, m: &crate::preview::Marks, canvas: (u32, u32), ts: u64) -> Vec<crate::preview::Outline> {
+///
+/// Only for the scene this preview shows (`shown`): the main and the vertical picture each have
+/// scenes in the engine, and a box for a source picked in the vertical one was drawn on the main
+/// one's corner too (19 Nov).
+fn outlines(
+    st: &State,
+    m: &crate::preview::Marks,
+    canvas: (u32, u32),
+    shown: &str,
+    ts: u64,
+) -> Vec<crate::preview::Outline> {
     let corners = |scene: &str, it: &SceneItem| -> Option<[(f32, f32); 4]> {
         let (placement, _) = animated(it, scene_ms(st, scene, ts));
         let (w, h) = match (&it.scene, it.group) {
@@ -3253,7 +3264,7 @@ fn outlines(st: &State, m: &crate::preview::Marks, canvas: (u32, u32), ts: u64) 
     };
     let picked = |scene: &str, id: i64| m.picked.as_ref().is_some_and(|(s, p)| s == scene && p.contains(&id));
     let mut out = Vec::new();
-    if let Some(scene) = &m.scene
+    if let Some(scene) = m.scene.as_ref().filter(|s| s.as_str() == shown)
         && let Some(items) = st.scenes.get(scene)
     {
         for it in items.iter().filter(|i| i.visible && i.item_id != 0 && !picked(scene, i.item_id)) {
@@ -3262,7 +3273,7 @@ fn outlines(st: &State, m: &crate::preview::Marks, canvas: (u32, u32), ts: u64) 
             }
         }
     }
-    if let Some((scene, ids)) = &m.picked
+    if let Some((scene, ids)) = m.picked.as_ref().filter(|(s, _)| s == shown)
         && let Some(items) = st.scenes.get(scene)
     {
         for it in items.iter().filter(|i| i.item_id != 0 && ids.contains(&i.item_id)) {
@@ -6933,7 +6944,7 @@ mod tests {
         };
         let corners = |e: &Engine| {
             let st = e.lock();
-            let o = outlines(&st, &marks, (640, 360), now_ns());
+            let o = outlines(&st, &marks, (640, 360), "Main", now_ns());
             assert_eq!(o.len(), 1);
             assert!(o[0].handles);
             o[0].corners
@@ -6965,11 +6976,36 @@ mod tests {
             e.set_scene("Main", vec![it]);
             e.go("Main").unwrap_or_else(|x| panic!("{x}"));
             let st = e.lock();
-            outlines(&st, &marks, (640, 360), now_ns())[0].corners
+            outlines(&st, &marks, (640, 360), "Main", now_ns())[0].corners
         };
         assert_eq!(corners(&e, true, (10.0, 20.0)), [(10.0, 20.0), (110.0, 20.0), (110.0, 70.0), (10.0, 70.0)]);
         assert_eq!(corners(&e, true, (300.0, 100.0)), [(300.0, 100.0), (400.0, 100.0), (400.0, 150.0), (300.0, 150.0)]);
         assert_eq!(corners(&e, false, (10.0, 20.0))[2], (130.0, 90.0), "grown by 10 on every side");
+    }
+
+    /// A box for a source picked in one picture is drawn on that picture only: the main and the
+    /// vertical preview both read the marks, and the vertical one's selection was outlined in the
+    /// main one's corner too.
+    #[test]
+    fn a_selection_is_outlined_only_on_the_picture_that_shows_its_scene() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 100, height: 50, rgba: [200, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let mut it = SceneItem::new(1, Placement { x: 10.0, y: 20.0, ..Default::default() });
+        it.item_id = 7;
+        e.set_scene("Main", vec![]);
+        e.set_scene("Vertical", vec![it]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let marks = crate::preview::Marks {
+            scene: Some("Vertical".into()),
+            picked: Some(("Vertical".into(), vec![7])),
+            colors: vec![[1.0, 0.0, 0.0, 1.0]],
+        };
+        let st = e.lock();
+        assert!(outlines(&st, &marks, (640, 360), "Main", now_ns()).is_empty(), "nothing on the main picture");
+        let on_vertical = outlines(&st, &marks, (640, 360), "Vertical", now_ns());
+        assert_eq!(on_vertical.len(), 1);
+        assert!(on_vertical[0].handles);
     }
 
     /// A source picked inside a group is outlined on the canvas, through its group, with
@@ -6995,7 +7031,7 @@ mod tests {
             colors: vec![[1.0, 0.0, 0.0, 1.0]],
         };
         let st = e.lock();
-        let o = outlines(&st, &marks, (640, 360), now_ns());
+        let o = outlines(&st, &marks, (640, 360), "Main", now_ns());
         assert_eq!(o.len(), 1, "the source inside, outlined");
         assert!(o[0].handles);
         assert_eq!(o[0].corners, [(120.0, 140.0), (320.0, 140.0), (320.0, 240.0), (120.0, 240.0)]);
