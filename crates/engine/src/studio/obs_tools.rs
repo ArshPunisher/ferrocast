@@ -11,7 +11,7 @@ use ferrocast_core::moments::MomentKind;
 use ferrocast_core::show::ScenesConfig;
 use serde::Serialize;
 
-use super::{SCENES_KEY, obs_error, save_setting};
+use super::{BrbHold, SCENES_KEY, obs_error, save_setting};
 use crate::{Engine, EngineError, now};
 
 /// How often OBS is asked for its numbers while connected.
@@ -110,17 +110,24 @@ impl Engine {
     /// BRB on: remember the scene, switch to the BRB scene and mute the listed inputs.
     /// BRB off: back to the remembered scene (or the show's live scene) and unmute.
     pub async fn set_brb(&self, on: bool) -> Result<serde_json::Value, EngineError> {
-        self.set_brb_keeping(on, &[]).await
+        self.set_brb_for(BrbHold::Manual, on, &[]).await
     }
 
     /// BRB by Away: as BRB, but the mics it listens to stay on (muted, it could never hear
     /// you come back).
     pub(crate) async fn set_brb_away(&self, on: bool) -> Result<serde_json::Value, EngineError> {
         let mics = self.show_config().mic_sources;
-        self.set_brb_keeping(on, &mics).await
+        self.set_brb_for(BrbHold::Away, on, &mics).await
     }
 
-    async fn set_brb_keeping(&self, on: bool, keep: &[String]) -> Result<serde_json::Value, EngineError> {
+    /// Tagged BRB hold so automatic features (ads, away, black camera) only release their own
+    /// hold and never pull the streamer off a manual BRB or another active hold.
+    pub(crate) async fn set_brb_for(
+        &self,
+        hold: BrbHold,
+        on: bool,
+        keep: &[String],
+    ) -> Result<serde_json::Value, EngineError> {
         let cfg = self.scenes_config();
         let brb = cfg.brb_scene.clone().ok_or_else(|| EngineError::Refused {
             status: 422,
@@ -136,6 +143,7 @@ impl Engine {
             if current.as_deref() != Some(brb.as_str()) {
                 *self.studio().brb_from.lock().unwrap_or_else(|p| p.into_inner()) = current;
             }
+            self.studio().brb_holds.lock().unwrap_or_else(|p| p.into_inner()).insert(hold);
             for m in cfg.brb_mute.iter().filter(|m| !keep.contains(m)) {
                 if let Err(e) = self.rig_set_muted(&rig, m, true).await {
                     tracing::warn!(error = %e, input = %m, "couldn't mute for BRB");
@@ -144,6 +152,22 @@ impl Engine {
             self.studio_frame("brb", &serde_json::json!({ "on": true, "scene": brb }));
             Ok(serde_json::json!({ "on": true, "scene": brb }))
         } else {
+            let should_release = {
+                let mut holds = self.studio().brb_holds.lock().unwrap_or_else(|p| p.into_inner());
+                if hold == BrbHold::Manual {
+                    // Explicit user "Back" overrides all automatic holds.
+                    holds.clear();
+                    true
+                } else {
+                    let was_held = holds.remove(&hold);
+                    // Only release if we held it AND no other hold (e.g. Manual) remains.
+                    was_held && holds.is_empty()
+                }
+            };
+            if !should_release {
+                let still_on = !self.studio().brb_holds.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+                return Ok(serde_json::json!({ "on": still_on, "scene": brb }));
+            }
             let back = self
                 .studio()
                 .brb_from
@@ -239,12 +263,12 @@ impl Engine {
         let engine = self.clone();
         let wait = Duration::from_secs(u64::from(seconds.clamp(15, 600)));
         tokio::spawn(async move {
-            if let Err(err) = engine.set_brb(true).await {
+            if let Err(err) = engine.set_brb_for(BrbHold::AdBreak, true, &[]).await {
                 tracing::warn!(%err, "couldn't switch to BRB for an ad");
                 return;
             }
             tokio::time::sleep(wait).await;
-            if let Err(err) = engine.set_brb(false).await {
+            if let Err(err) = engine.set_brb_for(BrbHold::AdBreak, false, &[]).await {
                 tracing::warn!(%err, "couldn't switch back after an ad");
             }
         });

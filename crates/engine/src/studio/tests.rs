@@ -1652,3 +1652,78 @@ async fn a_black_camera_puts_the_show_on_brb_and_back() {
     // Asked for without a BRB scene: refused.
     assert!(e.patch_scenes_config(json!({ "brb_scene": null }).as_object().unwrap()).await.is_err());
 }
+
+/// M9-10: manual BRB holds survive automatic releases (ad break, black camera) and hotkeys
+/// route through the locked broadcast state machine.
+#[tokio::test]
+async fn brb_holds_isolate_manual_from_auto_and_hotkeys_run_the_show() {
+    use ferrocast_core::show::LiveAlert;
+    let (e, _d) = engine().await;
+    e.start_golive(0).await;
+    let studio =
+        Arc::new(FakeStudio { current: Mutex::new("Live".into()), cam_shown: Mutex::new(true), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_scenes_config(json!({ "brb_scene": "BRB", "brb_when_black": true }).as_object().unwrap()).await.unwrap();
+
+    // Streamer manually turns BRB on; a camera goes black and comes back — manual BRB stays!
+    e.set_brb(true).await.unwrap();
+    assert_eq!(*studio.current.lock().unwrap(), "BRB");
+    let alert = |cleared| LiveAlert {
+        id: "camera:Cam:black".into(),
+        level: "error",
+        message: String::new(),
+        detail: None,
+        cleared,
+    };
+    e.brb_when_black(&[alert(false)]).await;
+    e.brb_when_black(&[alert(true)]).await;
+    assert_eq!(*studio.current.lock().unwrap(), "BRB", "black-cam clear must not cancel manual BRB");
+    // Manual Back returns cleanly to "Live".
+    e.set_brb(false).await.unwrap();
+    assert_eq!(*studio.current.lock().unwrap(), "Live");
+
+    // Hotkey go_live with a Show style runs the Show (starting scene + stream + countdown)
+    // without mutating saved ShowConfig.start_stream.
+    e.patch_show_config(
+        json!({
+            "starting_scene": "Starting", "live_scene": "Live", "countdown_s": 10,
+            "start_stream": false, "stop_stream": false, "stop_delay_s": 0,
+            "discord": false, "alerts_on": false, "bot_on": false, "recap_message": null,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    e.go_live().await.unwrap();
+    assert!(!e.show_config().start_stream, "saved ShowConfig was not silently rewritten");
+    assert_eq!(e.show_run().unwrap().phase, super::show::Phase::Countdown);
+    assert_eq!(*studio.current.lock().unwrap(), "Starting");
+    assert!(*studio.streaming.lock().unwrap(), "go_live started streaming");
+    // Pressing go_live during the countdown advances to Live without conflict.
+    e.go_live().await.unwrap();
+    assert_eq!(e.show_run().unwrap().phase, super::show::Phase::Live);
+    assert_eq!(*studio.current.lock().unwrap(), "Live");
+    // Pressing end_live ends the Show and stops the stream.
+    e.end_live().await.unwrap();
+    assert_eq!(e.show_run().unwrap().phase, super::show::Phase::Ended);
+    assert!(!*studio.streaming.lock().unwrap());
+
+    // Plain "Just go live" style: go_live streams directly without starting a Show.
+    e.patch_show_config(
+        json!({
+            "starting_scene": null, "ending_scene": null, "countdown_s": 0,
+            "discord": false, "preset_id": null, "replay_buffer": false,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let prev_id = e.show_run().unwrap().id;
+    e.go_live().await.unwrap();
+    assert!(*studio.streaming.lock().unwrap());
+    assert_eq!(e.show_run().unwrap().id, prev_id, "plain go_live did not start a Show");
+    e.end_live().await.unwrap();
+    assert!(!*studio.streaming.lock().unwrap());
+}

@@ -226,7 +226,7 @@ impl Engine {
         };
         if was != now {
             tracing::info!(on = now, "live watch: BRB by itself (a camera went black, or came back)");
-            if let Err(e) = self.set_brb(now).await {
+            if let Err(e) = self.set_brb_for(super::BrbHold::BlackCam, now, &[]).await {
                 tracing::warn!(error = %e, "live watch: couldn't switch BRB");
             }
         }

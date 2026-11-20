@@ -355,6 +355,7 @@ impl Engine {
             }
         };
         *self.studio().brb_from.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.studio().brb_holds.lock().unwrap_or_else(|p| p.into_inner()).clear();
         self.studio().auto_brb.lock().unwrap_or_else(|p| p.into_inner()).clear();
         if let Some(run) = emit {
             self.emit_show(Some(run));
@@ -567,6 +568,57 @@ impl Engine {
             ));
         }
         Ok(self.preflight().await)
+    }
+
+    /// Unified Go live action (hotkeys & backend state machine): runs the Show when a Show
+    /// style is configured (without mutating saved `ShowConfig`), advances an active countdown
+    /// or Starting Soon to the live scene, or starts plain streaming for "Just go live".
+    pub async fn go_live(&self) -> Result<(), EngineError> {
+        let phase = {
+            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.ending_in_flight {
+                return Err(EngineError::Conflict("The show is ending. Wait a moment and try again.".into()));
+            }
+            m.phase
+        };
+        match phase {
+            BroadcastPhase::Preparing => Ok(()),
+            BroadcastPhase::Countdown => self.skip_countdown().await.map(drop),
+            BroadcastPhase::Starting => self.go_live_scene().await.map(drop),
+            BroadcastPhase::Live => {
+                if !self.studio_stream_stats().await.ok().is_some_and(|v| v["active"].as_bool() == Some(true)) {
+                    self.studio_stream(true).await?;
+                }
+                Ok(())
+            }
+            BroadcastPhase::Idle | BroadcastPhase::Ending => {
+                if self.show_config().is_show_style() {
+                    self.start_show_with(ShowStartOpts { force: true, stream: Some(true) }).await.map(drop)
+                } else {
+                    self.studio_stream(true).await.map(drop)
+                }
+            }
+        }
+    }
+
+    /// Unified End stream action (hotkeys & backend state machine): ends an active Show
+    /// (stopping the stream), stops immediately if already waiting on a stop delay, or stops
+    /// plain streaming when no Show is active.
+    pub async fn end_live(&self) -> Result<(), EngineError> {
+        let (phase, ending_in_flight, stop_waiting) = {
+            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            (m.phase, m.ending_in_flight, m.stop_waiting)
+        };
+        if ending_in_flight {
+            return Ok(());
+        }
+        match phase {
+            BroadcastPhase::Ending if stop_waiting => self.end_show_with(true).await.map(drop),
+            BroadcastPhase::Preparing | BroadcastPhase::Starting | BroadcastPhase::Countdown | BroadcastPhase::Live => {
+                self.end_show_opts(false, Some(true)).await.map(drop)
+            }
+            BroadcastPhase::Idle | BroadcastPhase::Ending => self.studio_stream(false).await.map(drop),
+        }
     }
 
     /// Starts the show. 409 while one is running or starting; 422 `preflight_failed` when a

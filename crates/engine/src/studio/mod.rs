@@ -56,6 +56,16 @@ pub(crate) const STREAM_INFO_KEY: &str = "stream_info";
 /// How often watch time is credited (minutes for everyone who chatted meanwhile).
 const WATCH_TICK: Duration = Duration::from_secs(300);
 
+/// Who currently holds BRB on air, so automatic releases (ads, away, black camera) never
+/// pull the streamer off a manual BRB or another active hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BrbHold {
+    Manual,
+    AdBreak,
+    Away,
+    BlackCam,
+}
+
 /// Studio's runtime state, one per engine.
 #[derive(Debug)]
 pub(crate) struct Studio {
@@ -86,6 +96,8 @@ pub(crate) struct Studio {
     pub health: Mutex<Option<(HealthSample, Health)>>,
     /// The scene to go back to after BRB.
     pub brb_from: Mutex<Option<String>>,
+    /// Active BRB holds (Manual, AdBreak, Away, BlackCam).
+    pub brb_holds: Mutex<HashSet<BrbHold>>,
     /// One health watcher per engine.
     pub health_watching: std::sync::atomic::AtomicBool,
     /// The live watch (a silent mic, a black or frozen camera, a destination down) and its
@@ -127,6 +139,7 @@ impl Default for Studio {
             show_wake: Notify::new(),
             health: Mutex::default(),
             brb_from: Mutex::default(),
+            brb_holds: Mutex::default(),
             health_watching: std::sync::atomic::AtomicBool::default(),
             live_watch: Mutex::default(),
             live_watching: std::sync::atomic::AtomicBool::default(),

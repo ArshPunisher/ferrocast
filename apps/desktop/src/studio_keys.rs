@@ -82,10 +82,10 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> boo
 async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineError> {
     match action {
         "go_live" => {
-            engine.studio_stream(true).await?;
+            engine.go_live().await?;
         }
         "end_stream" => {
-            engine.studio_stream(false).await?;
+            engine.end_live().await?;
         }
         "record" => {
             let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
