@@ -205,11 +205,24 @@ mod tests {
                  (func (export "on_event") (param i32 i32) (loop $l (br $l))))"#,
         ))
         .unwrap_or_else(|e| panic!("{e}"));
-        let t = std::time::Instant::now();
-        assert_eq!(p.tell(b"{}"), Err("it ran too long".to_string()));
-        assert!(t.elapsed() < std::time::Duration::from_secs(5), "stopped soon: {:?}", t.elapsed());
-        // And it can be told again afterwards (with fresh fuel), stopping again.
-        assert!(p.tell(b"{}").is_err());
+        // It is stopped by its fuel, not by the clock, so how long that takes depends on how busy the
+        // machine is (6 s seen with a whole workspace of tests running). What matters is that it stops
+        // at all and says why: run it where a plugin that is never stopped fails the test instead of
+        // hanging it, with a minute to do 5 s of work.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let first = p.tell(b"{}");
+            // And it can be told again afterwards (with fresh fuel), stopping again.
+            let again = p.tell(b"{}");
+            let _ = tx.send((first, again, t.elapsed()));
+        });
+        let (first, again, took) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("a plugin that loops for ever was not stopped within a minute"));
+        assert_eq!(first, Err("it ran too long".to_string()));
+        assert!(again.is_err());
+        eprintln!("both stops took {took:?}");
     }
 
     #[test]

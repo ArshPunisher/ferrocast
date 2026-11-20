@@ -145,6 +145,99 @@ impl std::io::Write for RotatingLogWriter {
     }
 }
 
+/// The file log's writer, to flush it at quit.
+static LOG_FILE: std::sync::OnceLock<NonBlockingLog> = std::sync::OnceLock::new();
+
+/// How many log lines wait for the writer thread before new ones are dropped.
+const LOG_QUEUE: usize = 8_192;
+
+enum LogMsg {
+    Line(Vec<u8>),
+    /// Everything before this is written; then it answers.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// The log file's writer, off the threads that log: `write` hands the line to a thread of its own and
+/// never waits (a full queue drops the line), so a slow disk, a rotation or a locked file can't park a
+/// runtime worker or the audio thread that happens to log. (A log line through the file layer used to
+/// be a `std` mutex and a write on the logging thread: with a single-worker runtime that was a way to
+/// stall the Studio's sender with nothing logged.)
+#[derive(Clone)]
+struct NonBlockingLog {
+    tx: std::sync::mpsc::SyncSender<LogMsg>,
+    /// Lines dropped because the queue was full, not yet said in the log.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl NonBlockingLog {
+    fn spawn(mut inner: impl std::io::Write + Send + 'static, queue: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(queue);
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let said = dropped.clone();
+        let _ = std::thread::Builder::new().name("ferrocast-log".into()).spawn(move || {
+            while let Ok(m) = rx.recv() {
+                match m {
+                    LogMsg::Line(l) => {
+                        let _ = inner.write_all(&l);
+                    }
+                    LogMsg::Flush(done) => {
+                        let _ = inner.flush();
+                        let _ = done.send(());
+                    }
+                }
+                // A gap in the log says so, once the writer has caught up enough to write it.
+                let n = said.swap(0, std::sync::atomic::Ordering::AcqRel);
+                if n > 0 {
+                    let _ =
+                        inner.write_all(format!("{n} log lines were dropped (the log couldn't keep up)\n").as_bytes());
+                }
+            }
+        });
+        Self { tx, dropped }
+    }
+
+    /// Waits (at most `wait`) until what was logged before is written: for a panic or a quit.
+    fn flush(&self, wait: std::time::Duration) {
+        let (done, rx) = std::sync::mpsc::sync_channel(1);
+        let deadline = std::time::Instant::now() + wait;
+        let mut msg = LogMsg::Flush(done);
+        // A full queue makes room as the writer goes on: try until the deadline.
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(m)) if std::time::Instant::now() < deadline => {
+                    msg = m;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => return,
+            }
+        }
+        let _ = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+    }
+}
+
+impl std::io::Write for NonBlockingLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Lossy by design: the queue being full means the disk is far behind.
+        if self.tx.try_send(LogMsg::Line(buf.to_vec())).is_err() {
+            self.dropped.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for NonBlockingLog {
+    type Writer = NonBlockingLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// The log goes to the terminal and to `<data>/logs/ferrocast.log` (kept under 5 MB, one old
 /// file beside it), so a restart or a crash can be looked into afterwards. A panic is written
 /// there too.
@@ -154,15 +247,24 @@ fn init_tracing(dir: &std::path::Path) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tao=warn,wry=warn"));
     let logs = dir.join("logs");
-    let writer = RotatingLogWriter::open(&logs, MAX_LOG_BYTES).ok();
-    let to_file =
-        writer.map(|w| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(w)));
-    let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
+    let writer = RotatingLogWriter::open(&logs, MAX_LOG_BYTES).ok().map(|w| NonBlockingLog::spawn(w, LOG_QUEUE));
+    let flush_log = writer.clone();
+    if let Some(w) = &writer {
+        let _ = LOG_FILE.set(w.clone());
+    }
+    let to_file = writer.map(|w| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(w));
+    // The terminal too: stdout may be a pipe nobody reads, and a write to it must not park a worker.
+    let to_terminal = tracing_subscriber::fmt::layer().with_writer(NonBlockingLog::spawn(std::io::stdout(), LOG_QUEUE));
+    let _ = tracing_subscriber::registry().with(filter).with(to_terminal).with(to_file).try_init();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Where it came from too (function names in builds with symbols, addresses without).
         let trace = std::backtrace::Backtrace::force_capture();
         tracing::error!(%info, %trace, "Ferrocast stopped unexpectedly");
+        // The line is queued: give the writer a moment to put it in the file before the process goes.
+        if let Some(l) = &flush_log {
+            l.flush(std::time::Duration::from_secs(2));
+        }
         default(info);
     }));
     tracing::info!(version = env!("CARGO_PKG_VERSION"), pid = std::process::id(), "Ferrocast starting");
@@ -335,6 +437,10 @@ fn main() {
                 || clear_run_markers(running.as_ref().map(|r| &r.engine)),
             );
             tracing::info!("the Studio closed");
+            // The file's writer is a thread of its own: the last lines are written before the process goes.
+            if let Some(l) = LOG_FILE.get() {
+                l.flush(std::time::Duration::from_secs(2));
+            }
         }
         _ => {}
     });
@@ -1523,6 +1629,36 @@ mod update_tests {
         );
         assert!(!failed);
         assert_eq!(*partial.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine"]);
+    }
+
+    /// A log writer whose disk is slow (or locked, or rotating) must not slow the threads that log:
+    /// writes return at once and a full queue drops lines; what was queued is written, in order.
+    #[test]
+    fn the_log_writer_never_makes_the_logging_thread_wait() {
+        use std::io::Write;
+        struct Slow(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Slow {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut log = NonBlockingLog::spawn(Slow(got.clone()), 16);
+        let t = std::time::Instant::now();
+        for i in 0..1_000 {
+            log.write_all(format!("line {i}\n").as_bytes()).unwrap();
+        }
+        assert!(t.elapsed() < std::time::Duration::from_millis(200), "1000 writes took {:?}", t.elapsed());
+        log.flush(std::time::Duration::from_secs(10));
+        let text = String::from_utf8(got.lock().unwrap().clone()).unwrap();
+        assert!(text.starts_with("line 0\n"), "the first lines are kept, in order");
+        assert!(text.lines().count() < 1_000, "a full queue drops lines instead of waiting");
+        assert!(text.contains("log lines were dropped"), "the gap is said in the log: {text}");
     }
 
     #[test]

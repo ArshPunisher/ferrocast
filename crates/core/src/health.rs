@@ -21,6 +21,8 @@ pub struct Sample {
     pub skipped: u64,
     /// Frames sent, and dropped on the way out (the Studio's own sender).
     pub sent: u64,
+    /// Bytes the sender has delivered (a stall shows here; frames drawn keep counting).
+    pub sent_bytes: u64,
     pub dropped: u64,
     /// Packets the platforms' senders dropped (all told).
     pub net_dropped: u64,
@@ -129,7 +131,11 @@ impl HealthMeter {
         // seconds: the stream (and a recording sharing its encoder) has silently stopped (a stall seen
         // after 26 minutes of a soak, with Health still 100).
         let span = s.at_ms.saturating_sub(first.at_ms);
-        if span >= STALL_AFTER_MS && first.sent > 0 && s.sent == first.sent && d(s.frames, first.frames) >= 60 {
+        if span >= STALL_AFTER_MS
+            && first.sent_bytes > 0
+            && s.sent_bytes == first.sent_bytes
+            && d(s.frames, first.frames) >= 60
+        {
             costs.push((
                 60.0,
                 "the stream has stopped sending".into(),
@@ -210,7 +216,7 @@ mod tests {
     #[test]
     fn a_stream_that_stops_sending_while_frames_are_drawn_is_not_great() {
         let mut m = HealthMeter::default();
-        let at = |n: u64, sent: u64| Sample { sent, at_ms: n * 1_000, ..at(n) };
+        let at = |n: u64, bytes: u64| Sample { sent_bytes: bytes, at_ms: n * 1_000, ..at(n) };
         let mut last = None;
         // Sending for 3 s, then drawing on with nothing sent.
         for n in 0..4 {

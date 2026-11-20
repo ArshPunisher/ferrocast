@@ -18,6 +18,12 @@ use crate::flv;
 /// dropping stale non-keyframe video before the channel ever overflows.
 pub const BACKLOG: usize = 1024;
 
+/// No packet for this long: the measured rate is 0.
+#[cfg(not(test))]
+const KBPS_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(test)]
+const KBPS_STALE: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Sentinel in `Hub::newest_video_ts` when no main-track video frame has arrived yet.
 const NO_TS: u64 = u64::MAX;
 
@@ -89,6 +95,8 @@ struct State {
     /// Bitrate window: its first packet's timestamp and the bytes since.
     window: Option<(u32, u64)>,
     last_key: Option<u32>,
+    /// When a packet last arrived (the rate is 0 once none has for a while).
+    last_packet: Option<std::time::Instant>,
 }
 
 /// What the incoming stream really is, measured from its packets (not OBS's settings), for
@@ -148,7 +156,17 @@ impl Hub {
     /// The incoming stream's measured numbers (all empty while nothing streams).
     pub fn stats(&self) -> StreamStats {
         let st = self.lock();
-        if st.live.on { st.stats } else { StreamStats::default() }
+        if !st.live.on {
+            return StreamStats::default();
+        }
+        let mut stats = st.stats;
+        // The rate is measured when packets arrive; with none arriving it must fall to 0, not stay at
+        // the last measurement (upload protection saw a "healthy" 6000 kbps from a stream that had
+        // stopped, then paused a destination for the wrong reason).
+        if st.last_packet.is_none_or(|at| at.elapsed() >= KBPS_STALE) {
+            stats.kbps = 0;
+        }
+        stats
     }
 
     pub fn subscribe(&self) -> Subscription {
@@ -254,6 +272,7 @@ impl Hub {
 impl State {
     /// Adds a packet to the bitrate window; every two seconds of stream time, the rate.
     fn count(&mut self, ts: u32, len: usize) {
+        self.last_packet = Some(std::time::Instant::now());
         let (start, bytes) = self.window.get_or_insert((ts, 0));
         *bytes += len as u64;
         let span = ts.wrapping_sub(*start);
@@ -270,6 +289,21 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_measured_rate_falls_to_zero_when_packets_stop() {
+        let hub = Hub::new();
+        hub.start();
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        for i in 0..=30u32 {
+            let mut d = vec![if i % 20 == 0 { 0x17 } else { 0x27 }, 0x01];
+            d.resize(75_000, 0);
+            hub.video(i * 100, Bytes::from(d));
+        }
+        assert!(hub.stats().kbps > 1_000, "measured: {}", hub.stats().kbps);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(hub.stats().kbps, 0, "nothing arrives: the rate is 0, not the last measurement");
+    }
 
     #[test]
     fn stats_measure_the_real_stream() {

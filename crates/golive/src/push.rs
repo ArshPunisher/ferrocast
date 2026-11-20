@@ -256,6 +256,27 @@ pub(crate) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 pub(crate) type Stream = Pin<Box<dyn Io>>;
 
+/// The runtime the Studio's own sender runs on. Two workers, not one: with a single worker any
+/// blocking call anywhere in what runs on it (a slow system call, a lock held a long time) parks
+/// everything it sends and every timer with nothing logged; with two the other keeps going.
+pub fn sender_runtime(name: &str) -> std::io::Result<tokio::runtime::Runtime> {
+    sender_runtime_with(name, SENDER_WORKERS)
+}
+
+/// [`sender_runtime`] with the workers given (the tests compare one with two).
+pub fn sender_runtime_with(name: &str, workers: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().worker_threads(workers).enable_all().thread_name(name).build()
+}
+
+/// Workers of the sender's runtime.
+const SENDER_WORKERS: usize = 2;
+
+/// The number of workers [`sender_runtime`] makes.
+#[must_use]
+pub fn sender_runtime_workers() -> usize {
+    SENDER_WORKERS
+}
+
 /// Runs one destination until `stop` turns true. Health is sent on `health`.
 pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>, mut stop: watch::Receiver<bool>) {
     let mut live = hub.live();
@@ -386,7 +407,13 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     // Never hop network interfaces on a server refusal or rapid policy close:
                     // the connection reached the server and the platform itself closed it.
                     if err.is_network() && !key_refused && !rapid_close && may_move(target) {
-                        via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
+                        // The system's connection list is asked off the async workers (system calls).
+                        let cur = via.clone();
+                        via = tokio::task::spawn_blocking(move || {
+                            links::next_after(cur.as_ref(), &links::fallbacks(), links::default_ip())
+                        })
+                        .await
+                        .unwrap_or(None);
                     }
                     let give_up = if net_down {
                         limit > 0 && down_since.is_some_and(|t| t.elapsed() >= NETWORK_PATIENCE)

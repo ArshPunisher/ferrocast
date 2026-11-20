@@ -126,6 +126,7 @@ impl Engine {
             encoded: n(&e["encoded"]),
             skipped: n(&e["skipped"]),
             sent: n(&s["frames"]),
+            sent_bytes: n(&s["bytes"]),
             dropped: n(&s["dropped"]),
             net_dropped,
             reconnecting: s["reconnecting"].as_bool() == Some(true) || self.golive_main_reconnecting().is_some(),
