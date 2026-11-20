@@ -3116,18 +3116,35 @@ impl Engine {
     /// source's filters are the same wherever it's shown), scaled to `size`, RGBA: the drawer's
     /// "with filters" look. As [`Self::snapshot_source_at`] when it's in no scene.
     pub fn snapshot_source_filtered(&self, id: u64, size: (u32, u32)) -> Option<Vec<u8>> {
+        self.snapshot_with_effects(id, size, |st| default_source_effects(st, id))
+    }
+
+    /// One scene item's own picture now (`snapshot_source_filtered` using the item's video
+    /// filter list — its override when set, otherwise the source's filters).
+    pub fn snapshot_item_filtered(
+        &self,
+        owner_scene: &str,
+        item_id: i64,
+        id: u64,
+        size: (u32, u32),
+    ) -> Option<Vec<u8>> {
+        self.snapshot_with_effects(id, size, |st| {
+            find_item_effects(st, owner_scene, item_id, id, 0).unwrap_or_else(|| default_source_effects(st, id))
+        })
+    }
+
+    fn snapshot_with_effects(
+        &self,
+        id: u64,
+        size: (u32, u32),
+        effects_of: impl FnOnce(&State) -> Vec<Effect>,
+    ) -> Option<Vec<u8>> {
         let (w, h) = (size.0.max(1), size.1.max(1));
         let item = {
             let mut st = self.lock();
             send_pending(&mut st, &self.gpu);
             st.sources.get(&id)?.size?;
-            let effects = st
-                .scenes
-                .values()
-                .flatten()
-                .find(|i| i.source == id && i.scene.is_none())
-                .map(|i| i.effects.clone())
-                .unwrap_or_default();
+            let effects = effects_of(&st);
             let mut one = SceneItem::new(
                 id,
                 Placement {
@@ -3155,6 +3172,35 @@ impl Engine {
             Draw::Moving(t) => self.gpu.render_transition(&t),
         }
     }
+}
+
+fn default_source_effects(st: &State, id: u64) -> Vec<Effect> {
+    st.scenes
+        .values()
+        .flatten()
+        .find(|i| i.source == id && i.scene.is_none())
+        .map(|i| i.effects.clone())
+        .unwrap_or_default()
+}
+
+fn find_item_effects(st: &State, scene: &str, item_id: i64, source_id: u64, depth: u8) -> Option<Vec<Effect>> {
+    if depth > 4 {
+        return None;
+    }
+    let items = st.scenes.get(scene)?;
+    for i in items {
+        if i.item_id == item_id && (i.source == source_id || i.scene.is_some()) {
+            return Some(i.effects.clone());
+        }
+    }
+    for i in items {
+        if let Some(sub) = &i.scene
+            && let Some(found) = find_item_effects(st, sub, item_id, source_id, depth + 1)
+        {
+            return Some(found);
+        }
+    }
+    None
 }
 
 impl Drop for Engine {
@@ -8755,5 +8801,78 @@ mod tests {
 
         e.remove_source(1);
         assert!(e.levels(1).is_none());
+    }
+
+    #[test]
+    fn same_source_with_per_item_video_filter_override_renders_differently() {
+        let Some(e) = engine() else { return };
+        let doc = |vert_brightness: f64| {
+            serde_json::json!({
+                "current_program_scene": "Main",
+                "sources": [
+                    {
+                        "id": "color_source_v3",
+                        "name": "Box",
+                        "settings": { "color": 0xFF00_00FFu32, "width": 320, "height": 180 },
+                        "filters": [
+                            { "id": "ferrocast_rounded_corners", "name": "Round", "settings": { "radius": 40 } }
+                        ]
+                    },
+                    {
+                        "id": "scene",
+                        "name": "Main",
+                        "settings": { "items": [{ "id": 1, "name": "Box" }] }
+                    },
+                    {
+                        "id": "scene",
+                        "name": "Vertical",
+                        "settings": {
+                            "items": [{
+                                "id": 2,
+                                "name": "Box",
+                                "ferrocast_filters": [
+                                    { "id": "color_filter_v2", "name": "Dim", "settings": { "brightness": vert_brightness } }
+                                ]
+                            }]
+                        }
+                    }
+                ]
+            })
+        };
+        assert!(e.load_obs(&doc(-0.5)).is_empty());
+        let main_px = e.snapshot_scene_at("Main", (320, 180), (320, 180)).unwrap_or_else(|x| panic!("{x}"));
+        let vert_px = e.snapshot_scene_at("Vertical", (320, 180), (320, 180)).unwrap_or_else(|x| panic!("{x}"));
+        // Main has RoundedCorners: top-left corner (2, 2) is clipped out, center (160, 90) is bright red.
+        let center = (90 * 320 + 160) * 4;
+        let corner = (2 * 320 + 2) * 4;
+        assert_eq!(main_px[corner + 3], 0, "Main item inherits rounded corners: corner clipped");
+        assert!(main_px[center] > 240, "Main center stays full red");
+        // Vertical overrides with brightness=-0.5 (no rounded corners): corner is opaque & dimmed red.
+        assert_eq!(vert_px[corner + 3], 255, "Vertical item replaces rounded corners: corner stays opaque");
+        assert!(vert_px[center] > 100 && vert_px[center] < 205, "Vertical center is dimmed red: {}", vert_px[center]);
+
+        // Item-scoped snapshot reflects each item's own effects.
+        let box_id = e.source_named("Box").map(|(id, _)| id).unwrap();
+        let snap_main = e.snapshot_item_filtered("Main", 1, box_id, (160, 90)).unwrap();
+        let snap_vert = e.snapshot_item_filtered("Vertical", 2, box_id, (160, 90)).unwrap();
+        let mid = (45 * 160 + 80) * 4;
+        assert!(
+            snap_main[mid] > snap_vert[mid] + 40,
+            "item filtered preview differs: {} vs {}",
+            snap_main[mid],
+            snap_vert[mid]
+        );
+
+        // Editing Vertical override in place keeps Main untouched.
+        assert!(e.apply_same_sources(&doc(-0.2)).is_some());
+        let main_after = e.snapshot_scene_at("Main", (320, 180), (320, 180)).unwrap();
+        let vert_after = e.snapshot_scene_at("Vertical", (320, 180), (320, 180)).unwrap();
+        assert_eq!(&main_after[corner..corner + 4], &main_px[corner..corner + 4]);
+        assert!(
+            vert_after[center] > vert_px[center] + 15,
+            "Vertical dimmed less: {} -> {}",
+            vert_px[center],
+            vert_after[center]
+        );
     }
 }
