@@ -781,7 +781,13 @@ async fn kick_refresh(
         return Err(ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick had a problem. Try again."));
     }
     if !res.status().is_success() {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "sign_in_needed", "Kick needs you to sign in again."));
+        // Kick answers a refused refresh token with an OAuth error in JSON; a gateway or proxy that
+        // answers 400/401 with anything else is not Kick's verdict.
+        let body = res.text().await.unwrap_or_default();
+        if serde_json::from_str::<Value>(&body).is_ok_and(|v| v.get("error").is_some()) {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "sign_in_needed", "Kick needs you to sign in again."));
+        }
+        return Err(ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick had a problem. Try again."));
     }
     let t: kick::TokenResponse = res
         .json()

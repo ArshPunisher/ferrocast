@@ -82,6 +82,10 @@ async fn fake_kick() -> String {
                 // A WAF or a gateway in front of Kick's token endpoint (Cloudflare): not Kick's verdict.
                 return (StatusCode::FORBIDDEN, axum::Json(json!({ "error": "blocked" })));
             }
+            if body.contains("refresh_token=kick-gateway") {
+                // A 401 that isn't Kick's own refusal (no OAuth `error`): a gateway or proxy.
+                return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "message": "blocked by a gateway" })));
+            }
             if body.contains("refresh_token=kick-timeout") {
                 return (StatusCode::REQUEST_TIMEOUT, axum::Json(json!({ "error": "timeout" })));
             }
@@ -245,7 +249,7 @@ async fn refresh_goes_through_the_relay_and_strangers_are_refused() {
     let down: Value = down.json().await.unwrap();
     assert_eq!(down["error"]["code"], "kick_unreachable");
     // A 403 or a 408 from in front of Kick isn't Kick refusing the token either.
-    for token in ["kick-waf", "kick-timeout"] {
+    for token in ["kick-waf", "kick-timeout", "kick-gateway"] {
         let res = http
             .post(format!("{}/v1/kick/refresh", r.base))
             .bearer_auth(&auth)
