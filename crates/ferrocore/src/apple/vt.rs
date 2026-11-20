@@ -106,6 +106,7 @@ unsafe extern "C" {
     static kCVImageBufferTransferFunctionKey: CFStringRef;
     static kCVImageBufferYCbCrMatrixKey: CFStringRef;
     fn CVPixelBufferPoolCreatePixelBuffer(alloc: CFTypeRef, pool: CFTypeRef, out: *mut CFTypeRef) -> i32;
+    fn CVPixelBufferGetIOSurface(buf: CFTypeRef) -> CFTypeRef;
     fn CVPixelBufferLockBaseAddress(buf: CFTypeRef, flags: u64) -> i32;
     fn CVPixelBufferUnlockBaseAddress(buf: CFTypeRef, flags: u64) -> i32;
     fn CVPixelBufferGetBaseAddress(buf: CFTypeRef) -> *mut u8;
@@ -183,6 +184,13 @@ pub(crate) struct Encoder {
     seen_callbacks: u64,
     /// Frames in a row the pool had none to give.
     pool_misses: u32,
+    /// What each frame costs, logged once a minute (`vt_cost`).
+    cost: Box<super::vt_cost::Cost>,
+}
+
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    fn IOSurfaceGetID(surface: CFTypeRef) -> u32;
 }
 
 /// What one pool miss means.
@@ -400,6 +408,7 @@ impl Encoder {
             quiet: (0, std::time::Instant::now()),
             seen_callbacks: 0,
             pool_misses: 0,
+            cost: Box::new(super::vt_cost::Cost::new()),
         })
     }
 
@@ -467,7 +476,16 @@ impl Encoder {
         }
     }
 
+    /// `encode_once_inner`, timed for the once-a-minute `vt_cost` line.
     fn encode_once(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
+        let t0 = std::time::Instant::now();
+        let out = self.encode_once_inner(frame, pts_us, key);
+        self.cost.encode(t0.elapsed());
+        self.cost.tick(std::time::Instant::now());
+        out
+    }
+
+    fn encode_once_inner(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
         // Has the session gone quiet? Frames go in, nothing ever comes back.
         let calls = self.sink.lock().map_or(self.seen_callbacks, |s| s.callbacks);
         if calls != self.seen_callbacks {
@@ -510,7 +528,13 @@ impl Encoder {
             }
         };
         self.pool_misses = 0;
+        // SAFETY: the buffer is live; the surface is only read for its id ("Get": not retained).
+        let surface = unsafe { CVPixelBufferGetIOSurface(buf.0) };
+        // SAFETY: a live IOSurface, or null (then 0).
+        self.cost.buffer(if surface.is_null() { 0 } else { unsafe { IOSurfaceGetID(surface) as usize } });
+        let (faults0, t_fill) = (super::vt_cost::process_faults(), std::time::Instant::now());
         self.fill(buf.0, frame)?;
+        self.cost.fill(t_fill.elapsed(), super::vt_cost::process_faults().saturating_sub(faults0));
         // SAFETY: CoreVideo's constant keys and values; the buffer is live.
         unsafe {
             CVBufferSetAttachment(

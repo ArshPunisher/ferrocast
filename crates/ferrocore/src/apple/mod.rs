@@ -8,6 +8,7 @@ pub mod media;
 pub(crate) mod power;
 pub mod screen;
 pub(crate) mod vt;
+pub(crate) mod vt_cost;
 pub mod zerocopy;
 
 use std::ffi::{c_char, c_void};
