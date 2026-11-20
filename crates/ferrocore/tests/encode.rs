@@ -30,6 +30,7 @@ fn config(codec: VideoCodec, input: PixelFormat) -> VideoConfig {
         rate: RateControl::Cbr,
         keyframe_secs: 1,
         software: false,
+        profile: ferrocore::video::H264Profile::High,
     }
 }
 
@@ -618,6 +619,7 @@ fn ffmpegs_bitrate_changes_on_the_run() {
     let cfg = VideoConfig {
         rate: RateControl::Cbr,
         software: true,
+        profile: ferrocore::video::H264Profile::High,
         // 10 s of frames between the encoder's own keyframes: more than this test ever feeds.
         keyframe_secs: 10,
         ..config(VideoCodec::H264, PixelFormat::Nv12)
@@ -715,6 +717,7 @@ fn capped_cbr_holds_peak_bitrate_under_limit_across_scene_cuts() {
         rate: RateControl::CappedCbr,
         keyframe_secs: 2,
         software: false,
+        profile: ferrocore::video::H264Profile::High,
     };
     let mut enc = VideoEncoder::new(cfg).unwrap_or_else(|e| panic!("{e}"));
     let mut packets = Vec::new();
@@ -753,4 +756,29 @@ fn capped_cbr_holds_peak_bitrate_under_limit_across_scene_cuts() {
         .unwrap_or(0);
     assert!(avg_kbps <= 6200, "avg {avg_kbps} kbps exceeded cap");
     assert!(peak_2s <= 6400, "2 s peak {peak_2s} kbps burst above Twitch slack (avg {avg_kbps})");
+}
+
+/// The profile the settings pick is the profile the stream's avcC says (it used to be High
+/// whatever was picked). avcC's second byte is `AVCProfileIndication`: 66 Baseline, 77 Main, 100 High.
+#[test]
+fn the_picked_h264_profile_reaches_the_encoder() {
+    if !encodes() {
+        return;
+    }
+    for (profile, idc) in [
+        (ferrocore::video::H264Profile::Baseline, 66u8),
+        (ferrocore::video::H264Profile::Main, 77),
+        (ferrocore::video::H264Profile::High, 100),
+    ] {
+        let mut enc = VideoEncoder::new(VideoConfig { profile, ..config(VideoCodec::H264, PixelFormat::Nv12) })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (y, uv) = (vec![100u8; 640 * 360], vec![128u8; 640 * 180]);
+        for i in 0..20u32 {
+            let f = Frame::Nv12 { y: &y, y_stride: 640, uv: &uv, uv_stride: 640 };
+            enc.encode(f, i64::from(i) * 33_333, false).unwrap_or_else(|e| panic!("{e}"));
+        }
+        enc.flush().unwrap_or_else(|e| panic!("{e}"));
+        let header = enc.header().unwrap_or_else(|| panic!("a codec header"));
+        assert_eq!(header[1], idc, "{profile:?}: avcC says profile {}", header[1]);
+    }
 }

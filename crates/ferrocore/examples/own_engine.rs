@@ -90,6 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate: RateControl::Cbr,
         keyframe_secs: 2,
         software: false,
+        profile: ferrocore::video::H264Profile::High,
     };
     let mut pipe =
         Pipeline::new(video, AudioConfig { sample_rate: RATE, channels: 2, bitrate_kbps: 160 }, Some(&recorded))?;

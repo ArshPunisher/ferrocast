@@ -51,11 +51,42 @@ pub struct VideoConfig {
     pub fps_den: u32,
     pub bitrate_kbps: u32,
     pub rate: RateControl,
-    /// Seconds between keyframes (platforms ask for 2).
+    /// Seconds between keyframes (platforms ask for 2); 0 lets the encoder pick (`gop_secs`).
     pub keyframe_secs: u32,
     /// x264 (through FFmpeg) instead of the system's own encoder: sharper at low bitrates, and
     /// lossless with `RateControl::Crf(0)`. H.264 only.
     pub software: bool,
+    /// The H.264 profile (HEVC is always Main). B-frames stay off in every profile: the encoders
+    /// give times back by order, which B-frames would break.
+    pub profile: H264Profile,
+}
+
+impl VideoConfig {
+    /// Seconds between keyframes as the encoders use it: 0 is "let the encoder pick", here 10 s
+    /// (a stream is always given 2 s by its caller: platforms ask for it).
+    pub fn gop_secs(&self) -> u32 {
+        if self.keyframe_secs == 0 { 10 } else { self.keyframe_secs }
+    }
+}
+
+/// H.264's profiles: what the settings' "profile" picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum H264Profile {
+    Baseline,
+    Main,
+    #[default]
+    High,
+}
+
+impl H264Profile {
+    /// The settings' word (`baseline`, `main`, `high`); anything else is High.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "baseline" => Self::Baseline,
+            "main" => Self::Main,
+            _ => Self::High,
+        }
+    }
 }
 
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

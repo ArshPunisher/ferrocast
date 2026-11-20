@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate: RateControl::Cbr,
         keyframe_secs: 2,
         software: false,
+        profile: ferrocore::video::H264Profile::High,
     };
     let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
     let e = Engine::new(EngineConfig { width: 320, height: 180, fps: 30, ..Default::default() }, video, audio)?;

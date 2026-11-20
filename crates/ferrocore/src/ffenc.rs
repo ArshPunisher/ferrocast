@@ -609,7 +609,7 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
     {
         let enc = enc.to_string();
         let kbps = cfg.bitrate_kbps;
-        let gop = (u64::from(cfg.keyframe_secs.max(1)) * u64::from(cfg.fps_num) / u64::from(cfg.fps_den.max(1))).max(1);
+        let gop = (u64::from(cfg.gop_secs()) * u64::from(cfg.fps_num) / u64::from(cfg.fps_den.max(1))).max(1);
         let mut a: Vec<String> = vec![
             "-f".into(),
             "rawvideo".into(),
@@ -639,6 +639,14 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
             gop.to_string(),
             "-bf".into(),
             "0".into(),
+            "-profile:v".into(),
+            match (cfg.codec, cfg.profile) {
+                (VideoCodec::Hevc, _) => "main",
+                (_, crate::video::H264Profile::Baseline) => "baseline",
+                (_, crate::video::H264Profile::Main) => "main",
+                (_, crate::video::H264Profile::High) => "high",
+            }
+            .into(),
             // One frame out for each in, in order: our own times are matched back by order.
             "-fps_mode".into(),
             "passthrough".into(),
@@ -1076,6 +1084,7 @@ mod tests {
             rate,
             keyframe_secs: 2,
             software: false,
+            profile: crate::video::H264Profile::High,
         }
     }
 

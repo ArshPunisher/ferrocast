@@ -61,6 +61,8 @@ unsafe extern "C" {
     static kVTCompressionPropertyKey_TransferFunction: CFStringRef;
     static kVTCompressionPropertyKey_YCbCrMatrix: CFStringRef;
     static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
+    static kVTProfileLevel_H264_Main_AutoLevel: CFStringRef;
+    static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
     static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
     fn VTCompressionSessionCreate(
@@ -337,7 +339,7 @@ impl Encoder {
             // SAFETY: the session is live; key is a VideoToolbox constant, value a live CF object.
             unsafe { VTSessionSetProperty(session.0, key, value) }
         };
-        let gop = float(f64::from(cfg.keyframe_secs.max(1))).ok_or_else(none)?;
+        let gop = float(f64::from(cfg.gop_secs())).ok_or_else(none)?;
         let rate = float(fps).ok_or_else(none)?;
         // SAFETY: reading VideoToolbox's and CoreVideo's constant CFStrings and CF booleans.
         let required = unsafe {
@@ -348,7 +350,11 @@ impl Encoder {
                 (
                     kVTCompressionPropertyKey_ProfileLevel,
                     if cfg.codec == VideoCodec::H264 {
-                        kVTProfileLevel_H264_High_AutoLevel
+                        match cfg.profile {
+                            crate::video::H264Profile::Baseline => kVTProfileLevel_H264_Baseline_AutoLevel,
+                            crate::video::H264Profile::Main => kVTProfileLevel_H264_Main_AutoLevel,
+                            crate::video::H264Profile::High => kVTProfileLevel_H264_High_AutoLevel,
+                        }
                     } else {
                         kVTProfileLevel_HEVC_Main_AutoLevel
                     },
@@ -364,7 +370,7 @@ impl Encoder {
         }
         set_rate(&session, cfg.bitrate_kbps, cfg.rate)?;
         // Hints and colour tags: the encoder may ignore them.
-        let key_frames = int(i32::try_from(cfg.keyframe_secs.max(1) * fps.round().max(1.0) as u32).unwrap_or(i32::MAX));
+        let key_frames = int(i32::try_from(cfg.gop_secs() * fps.round().max(1.0) as u32).unwrap_or(i32::MAX));
         // SAFETY: as above, constants only.
         unsafe {
             if let (Some(k), Some(kf)) = (string(c"MaxKeyFrameInterval"), key_frames) {
@@ -751,6 +757,7 @@ mod tests {
             rate: RateControl::Cbr,
             keyframe_secs: 2,
             software: false,
+            profile: crate::video::H264Profile::High,
         }
     }
 

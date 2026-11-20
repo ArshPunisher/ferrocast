@@ -500,6 +500,7 @@ mod tests {
             rate: ferrocore::video::RateControl::Cbr,
             keyframe_secs: 2,
             software: false,
+            profile: ferrocore::video::H264Profile::High,
         };
         let audio = ferrocore::audio::AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         let Ok(e) = Engine::new(EngineConfig { width: 320, height: 180, fps: 30, ..Default::default() }, video, audio)
