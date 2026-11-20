@@ -42,18 +42,23 @@ fn temp_path(path: &Path, tag: &str) -> PathBuf {
 /// Returns `true` when an I/O error is likely a transient lock held by Windows Defender, Search
 /// Indexer, or another reader racing a file swap.
 fn is_transient_lock_err(e: &io::Error) -> bool {
-    if matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::ResourceBusy | io::ErrorKind::WouldBlock) {
+    if matches!(e.kind(), io::ErrorKind::ResourceBusy | io::ErrorKind::WouldBlock) {
         return true;
     }
+    // "Permission denied" is only a passing lock on Windows (a scanner or the indexer has the file
+    // open). Elsewhere it is a folder or file the user can't write, which no wait mends: retrying
+    // it stalled every save by ~1.9 s, on the Studio's main thread, in a read-only data folder.
     #[cfg(windows)]
     {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            return true;
+        }
         // ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32),
         // ERROR_LOCK_VIOLATION (33), ERROR_USER_MAPPED_FILE (1224).
         if matches!(e.raw_os_error(), Some(5 | 32 | 33 | 1224)) {
             return true;
         }
     }
-    let _ = e;
     false
 }
 
@@ -99,7 +104,7 @@ pub fn remove_patiently(path: &Path) -> io::Result<()> {
 pub fn remove_with_backup(path: &Path) {
     for target in [path, &backup_path(path)] {
         if let Err(e) = remove_patiently(target) {
-            tracing::debug!(error = %e, file = %target.display(), "couldn't remove file");
+            tracing::warn!(error = %e, file = %target.display(), "couldn't remove file");
         }
     }
 }
@@ -296,7 +301,7 @@ mod tests {
         let out = retry_with(
             || {
                 attempts += 1;
-                if attempts <= 3 { Err(io::Error::from(io::ErrorKind::PermissionDenied)) } else { Ok("renamed") }
+                if attempts <= 3 { Err(io::Error::from(io::ErrorKind::ResourceBusy)) } else { Ok("renamed") }
             },
             |d| sleeps.push(d),
         )
@@ -323,7 +328,7 @@ mod tests {
         let err = retry_with(
             || -> io::Result<()> {
                 exhausted += 1;
-                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                Err(io::Error::from(io::ErrorKind::ResourceBusy))
             },
             |_| exhausted_sleeps += 1,
         );
@@ -339,5 +344,37 @@ mod tests {
         assert!(session.exists() && backup_path(&session).exists());
         remove_with_backup(&session);
         assert!(!session.exists() && !backup_path(&session).exists());
+    }
+
+    /// A folder the user can't write to fails at once (it used to wait out every retry first).
+    #[cfg(not(windows))]
+    #[test]
+    fn permission_denied_is_not_retried_off_windows() {
+        let mut attempts = 0usize;
+        let err = retry_with(
+            || -> io::Result<()> {
+                attempts += 1;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+            |_| panic!("waited on a permission error no wait will mend"),
+        );
+        assert!(err.is_err());
+        assert_eq!(attempts, 1);
+    }
+
+    /// On Windows the same error is a scanner's or the indexer's lock and passes: retried.
+    #[cfg(windows)]
+    #[test]
+    fn permission_denied_is_retried_on_windows() {
+        let mut attempts = 0usize;
+        let out = retry_with(
+            || {
+                attempts += 1;
+                if attempts < 3 { Err(io::Error::from(io::ErrorKind::PermissionDenied)) } else { Ok(()) }
+            },
+            |_| {},
+        );
+        assert!(out.is_ok());
+        assert_eq!(attempts, 3);
     }
 }
