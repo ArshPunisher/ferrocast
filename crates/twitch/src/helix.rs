@@ -77,7 +77,16 @@ impl Helix {
                 }
                 token = self.auth.refresh_after_401(&token).await?;
                 refreshed = true;
+                // A beat before using the new token: the API edge can take a moment to know it.
+                tokio::time::sleep(Duration::from_millis(400)).await;
                 continue;
+            }
+            if res.status().as_u16() == 401 && refreshed {
+                // Refused again with a token just issued: more likely the edge catching up than the
+                // streamer being signed out (a really revoked sign-in fails at the refresh itself).
+                // Said as a network trouble so the connector retries with its backoff instead of
+                // ending for good.
+                return Err(TwitchError::Network("Twitch didn't accept a fresh sign-in yet".into()));
             }
             if res.status().as_u16() == 429 {
                 // The request wasn't done: waiting until the budget is back (Ratelimit-Reset) and
