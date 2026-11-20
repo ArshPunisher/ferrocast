@@ -318,6 +318,7 @@ impl<W: Write> Mp4Writer<W> {
             return Ok(());
         }
         let start = *self.v_start.get_or_insert(p.dts_us);
+        let ticks = |us: i64| (us - start) * i64::from(VIDEO_SCALE) / 1_000_000;
         if p.key && !self.vq.is_empty() {
             self.fragment()?;
         }
@@ -326,7 +327,6 @@ impl<W: Write> Mp4Writer<W> {
             return Ok(());
         }
         self.last_us = self.last_us.max(p.pts_us - start);
-        let ticks = |us: i64| (us - start) * i64::from(VIDEO_SCALE) / 1_000_000;
         self.vq.push(Sample {
             dts: ticks(p.dts_us),
             cts: ticks(p.pts_us) - ticks(p.dts_us),
@@ -405,9 +405,10 @@ impl<W: Write> Mp4Writer<W> {
                 payload.extend_from_slice(&s.data);
             }
             let base = self.v_next.unwrap_or(vq[0].dts).max(vq[0].dts);
+            let sum_dur: i64 = rows.iter().map(|r| i64::from(r.0)).sum();
             adds.push((0, 0, base, rows.clone()));
             trafs.push((VIDEO, base, rows));
-            self.v_next = Some(vq.last().map_or(base, |s| s.dts) + i64::from(self.v_last_dur));
+            self.v_next = Some(base + sum_dur);
         }
         for (i, aq) in aqs.iter().enumerate().filter(|(_, q)| !q.is_empty()) {
             let mut rows = Vec::new();
@@ -1454,5 +1455,51 @@ mod finished_tests {
             assert!((o - w).abs() <= 1, "{o} vs {w}");
         }
         assert!(offsets.iter().any(|o| *o > 0));
+    }
+
+    #[test]
+    fn fragment_v_next_never_overlaps_when_base_advances() {
+        let (v, a) = tracks();
+        let mut w = Mp4Writer::new(Cursor::new(Vec::new()), Some(v), Some(a)).unwrap_or_else(|e| panic!("{e}"));
+        // Fragment 1: keyframe at 0, frame at 33_333 (last_dur becomes 3000 ticks = 33_333 us).
+        // Suppose frame 2 is a keyframe slightly early or base was pushed forward:
+        // e.g. force v_next ahead by pushing a single-frame fragment (dts=0 -> v_next=3000),
+        // then keyframe at 10_000 us (900 ticks) and 43_333 us (3900 ticks), then keyframe at 100_000 us.
+        w.video(&VideoPacket { pts_us: 0, dts_us: 0, key: true, data: vec![1; 20] }).unwrap_or_else(|e| panic!("{e}"));
+        w.video(&VideoPacket { pts_us: 10_000, dts_us: 10_000, key: true, data: vec![1; 20] })
+            .unwrap_or_else(|e| panic!("{e}"));
+        w.video(&VideoPacket { pts_us: 43_333, dts_us: 43_333, key: false, data: vec![1; 20] })
+            .unwrap_or_else(|e| panic!("{e}"));
+        w.video(&VideoPacket { pts_us: 75_000, dts_us: 75_000, key: true, data: vec![1; 20] })
+            .unwrap_or_else(|e| panic!("{e}"));
+        w.video(&VideoPacket { pts_us: 110_000, dts_us: 110_000, key: true, data: vec![1; 20] })
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (out, whole) = w.abandon();
+        let bytes = out.into_inner();
+        let top = boxes_in(&bytes, 0, whole as usize);
+        let mut ranges = Vec::new();
+        for moof in top.iter().filter(|b| &b.kind == b"moof") {
+            let traf = boxes_in(&bytes, moof.at, moof.end);
+            for t in traf.iter().filter(|b| &b.kind == b"traf") {
+                let parts = boxes_in(&bytes, t.at, t.end);
+                let tfhd = find(&parts, b"tfhd").unwrap_or_else(|| panic!("tfhd"));
+                if u32_at(&bytes, tfhd.at + 4) != VIDEO {
+                    continue;
+                }
+                let tfdt = find(&parts, b"tfdt").unwrap_or_else(|| panic!("tfdt"));
+                let base = u64::from_be_bytes(bytes[tfdt.at + 4..tfdt.at + 12].try_into().unwrap_or([0; 8]));
+                let trun = find(&parts, b"trun").unwrap_or_else(|| panic!("trun"));
+                let n = u32_at(&bytes, trun.at + 4) as usize;
+                let mut sum_dur = 0u64;
+                for i in 0..n {
+                    sum_dur += u64::from(u32_at(&bytes, trun.at + 12 + 16 * i));
+                }
+                ranges.push((base, base + sum_dur));
+            }
+        }
+        assert!(ranges.len() >= 2, "{ranges:?}");
+        for w in ranges.windows(2) {
+            assert!(w[1].0 >= w[0].1, "fragment tfdt overlapped: prev {:?} vs next {:?}", w[0], w[1]);
+        }
     }
 }

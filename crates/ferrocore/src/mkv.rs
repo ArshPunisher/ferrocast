@@ -60,6 +60,13 @@ fn string(id: u32, s: &str) -> Vec<u8> {
     element(id, s.as_bytes())
 }
 
+#[derive(Debug)]
+struct Cluster {
+    at: i64,
+    cue: i64,
+    blocks: Vec<(u8, i64, bool, Vec<u8>)>,
+}
+
 /// Writes an MKV to `out` as packets come.
 #[derive(Debug)]
 pub struct MkvWriter<W: Write> {
@@ -67,8 +74,10 @@ pub struct MkvWriter<W: Write> {
     has_video: bool,
     /// The first time (µs) in the file: it starts at 0 from there.
     start_us: Option<i64>,
-    /// The cluster being gathered: its time (ms) and its blocks.
-    cluster: Option<(i64, Vec<u8>)>,
+    /// The cluster being gathered.
+    cluster: Option<Cluster>,
+    /// Start time (ms) of the last flushed cluster, so clusters never move backwards.
+    last_cluster_at: i64,
     written: u64,
     /// How many sound tracks.
     tracks: usize,
@@ -214,6 +223,7 @@ impl<W: Write> MkvWriter<W> {
             has_video: video.is_some(),
             start_us: None,
             cluster: None,
+            last_cluster_at: 0,
             written: head.len() as u64,
             tracks: audio.len(),
             room_at,
@@ -246,8 +256,9 @@ impl<W: Write> MkvWriter<W> {
         }
         let start = *self.start_us.get_or_insert(p.pts_us.min(p.dts_us));
         self.last_us = self.last_us.max(p.pts_us - start);
-        let ms = (p.pts_us - start) / 1000;
-        self.block(VIDEO, ms, p.key, &p.data, p.key)
+        let pts_ms = (p.pts_us - start) / 1000;
+        let dts_ms = (p.dts_us - start) / 1000;
+        self.block(VIDEO, pts_ms, p.key, &p.data, p.key, dts_ms, pts_ms)
     }
 
     /// An AAC frame for the first sound track.
@@ -271,36 +282,56 @@ impl<W: Write> MkvWriter<W> {
         }
         self.last_us = self.last_us.max(p.pts_us - start);
         let ms = (p.pts_us - start) / 1000;
-        let new = !self.has_video
-            && track == 0
-            && self.cluster.as_ref().is_none_or(|(at, _)| ms - at >= AUDIO_ONLY_CLUSTER_MS);
-        self.block(AUDIO + track as u8, ms, true, &p.data, new)
+        let new =
+            !self.has_video && track == 0 && self.cluster.as_ref().is_none_or(|c| ms - c.at >= AUDIO_ONLY_CLUSTER_MS);
+        self.block(AUDIO + track as u8, ms, true, &p.data, new, ms, ms)
     }
 
-    fn block(&mut self, track: u8, ms: i64, key: bool, data: &[u8], new_cluster: bool) -> io::Result<()> {
-        let far = self.cluster.as_ref().is_some_and(|(at, _)| (ms - at).abs() >= CLUSTER_MS);
+    #[allow(clippy::too_many_arguments)]
+    fn block(
+        &mut self,
+        track: u8,
+        ms: i64,
+        key: bool,
+        data: &[u8],
+        new_cluster: bool,
+        cluster_at: i64,
+        cue_ms: i64,
+    ) -> io::Result<()> {
+        let far = self.cluster.as_ref().is_some_and(|c| (ms - c.at).abs() >= CLUSTER_MS);
         if new_cluster || far || self.cluster.is_none() {
             self.flush_cluster()?;
-            self.cluster = Some((ms.max(0), Vec::new()));
+            self.cluster =
+                Some(Cluster { at: cluster_at.max(self.last_cluster_at), cue: cue_ms.max(0), blocks: Vec::new() });
         }
-        let Some((at, blocks)) = self.cluster.as_mut() else { return Ok(()) };
-        let rel = i16::try_from(ms - *at).unwrap_or(if ms < *at { i16::MIN } else { i16::MAX });
-        let mut body = vec![0x80 | track];
-        body.extend_from_slice(&rel.to_be_bytes());
-        body.push(if key { 0x80 } else { 0 });
-        body.extend_from_slice(data);
-        blocks.extend(element(0xA3, &body));
+        let Some(c) = self.cluster.as_mut() else { return Ok(()) };
+        if ms < c.at {
+            c.at = ms.max(self.last_cluster_at);
+        }
+        c.blocks.push((track, ms, key, data.to_vec()));
         Ok(())
     }
 
     fn flush_cluster(&mut self) -> io::Result<()> {
-        if let Some((at, blocks)) = self.cluster.take() {
-            let c = element(0x1F43_B675, &[uint(0xE7, at.max(0) as u64), blocks].concat());
-            self.out.write_all(&c)?;
+        if let Some(c) = self.cluster.take() {
+            let at = c.at.max(0);
+            let mut blocks = Vec::new();
+            for (track, ms, key, data) in c.blocks {
+                let rel = i16::try_from(ms - at).unwrap_or(if ms < at { i16::MIN } else { i16::MAX });
+                let mut body = Vec::with_capacity(4 + data.len());
+                body.push(0x80 | track);
+                body.extend_from_slice(&rel.to_be_bytes());
+                body.push(if key { 0x80 } else { 0 });
+                body.extend_from_slice(&data);
+                blocks.extend(element(0xA3, &body));
+            }
+            let elem = element(0x1F43_B675, &[uint(0xE7, at as u64), blocks].concat());
+            self.out.write_all(&elem)?;
             self.out.flush()?;
             // Where it starts, for the index a finished file has.
-            self.cues.push((at.max(0), self.written));
-            self.written += c.len() as u64;
+            self.cues.push((c.cue.max(0), self.written));
+            self.last_cluster_at = at;
+            self.written += elem.len() as u64;
         }
         Ok(())
     }
@@ -582,5 +613,63 @@ mod tests {
         // Sound from pts 0 sits where the first picture (pts 0) is: one frame after the file's start.
         let first_audio = got.iter().find(|b| b.0 == AUDIO).map_or(-1, |b| b.1);
         assert!((first_audio - f / 1000).abs() <= 1, "sound starts at {first_audio} ms");
+    }
+
+    #[test]
+    fn clusters_never_write_negative_audio_offsets_at_keyframe_boundaries() {
+        use crate::audio::AudioPacket;
+        use crate::mp4::{AudioTrack, VideoTrack};
+        use crate::video::{VideoCodec, VideoPacket};
+        let v = VideoTrack {
+            codec: VideoCodec::H264,
+            width: 64,
+            height: 64,
+            config: vec![1, 100, 0, 31, 255, 225, 0, 0, 1, 0, 0],
+        };
+        let a = AudioTrack {
+            sample_rate: 48_000,
+            channels: 2,
+            config: vec![0x11, 0x90],
+            bitrate_kbps: 160,
+            name: String::new(),
+        };
+        let mut w =
+            MkvWriter::new(std::io::Cursor::new(Vec::new()), Some(v), Some(a)).unwrap_or_else(|e| panic!("{e}"));
+        w.video(&VideoPacket { pts_us: 0, dts_us: -100_000, key: true, data: vec![1; 50] })
+            .unwrap_or_else(|e| panic!("{e}"));
+        w.audio(&AudioPacket { pts_us: 0, data: vec![9; 20] }).unwrap_or_else(|e| panic!("{e}"));
+        // Keyframe with B-frame reordering: pts=2000ms, dts=1900ms, followed by trailing audio at 1950ms.
+        w.video(&VideoPacket { pts_us: 2_000_000, dts_us: 1_900_000, key: true, data: vec![1; 50] })
+            .unwrap_or_else(|e| panic!("{e}"));
+        w.audio(&AudioPacket { pts_us: 1_950_000, data: vec![9; 20] }).unwrap_or_else(|e| panic!("{e}"));
+        let bytes = w.finish().unwrap_or_else(|e| panic!("{e}")).into_inner();
+
+        // Parse raw SimpleBlock relative i16 timestamps inside each cluster.
+        let mut at = 0usize;
+        let mut rels = Vec::new();
+        while at < bytes.len() {
+            let n = bytes[at].leading_zeros() as usize + 1;
+            let tag = bytes[at..at + n].iter().fold(0u32, |a, x| a << 8 | u32::from(*x));
+            at += n;
+            let ln = bytes[at].leading_zeros() as usize + 1;
+            let mut size = u64::from(bytes[at]) & ((1u64 << (8 - ln)) - 1);
+            let all = size == (1u64 << (8 - ln)) - 1;
+            for x in &bytes[at + 1..at + ln] {
+                size = size << 8 | u64::from(*x);
+            }
+            let unknown = all && bytes[at + 1..at + ln].iter().all(|x| *x == 0xFF);
+            at += ln;
+            match tag {
+                0x1853_8067 | 0x1F43_B675 => {}
+                0xA3 if !unknown => {
+                    let rel = i16::from_be_bytes([bytes[at + 1], bytes[at + 2]]);
+                    rels.push((bytes[at] & 0x7F, rel));
+                    at += size as usize;
+                }
+                _ if !unknown => at += size as usize,
+                _ => break,
+            }
+        }
+        assert!(rels.iter().all(|(_, r)| *r >= 0), "negative cluster block offset found: {rels:?}");
     }
 }
