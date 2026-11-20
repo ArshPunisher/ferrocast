@@ -525,11 +525,19 @@ mod tests {
         let ready = |px: &[u8]| at(px, 40, 90) == Some(vec![255, 0, 0]) && at(px, 280, 90) == Some(vec![0, 0, 0]);
         let deadline = Instant::now() + Duration::from_secs(90);
         let mut px = Vec::new();
+        // On a busy machine the browser's first screencast frames are sometimes of its blank
+        // starting page (dark grey, 18) and no more come (seen on both branches, 1 run in 5 at a
+        // load of 20): a reload every 10 s asks it for fresh ones, as a person would.
+        let mut nudged = Instant::now();
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
             px = e.snapshot().unwrap_or_default();
             if ready(&px) {
                 break;
+            }
+            if nudged.elapsed() > Duration::from_secs(10) {
+                nudged = Instant::now();
+                page.act(Do::Reload).unwrap_or_else(|x| panic!("{x}"));
             }
         }
         page.act(Do::Reload).unwrap_or_else(|x| panic!("{x}"));
