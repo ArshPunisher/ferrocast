@@ -15,6 +15,17 @@ use crate::mkv::MkvWriter;
 use crate::mp4::{AudioTrack, Flavor, Mp4Writer, VideoTrack};
 use crate::video::{Frame, VideoConfig, VideoEncoder, VideoPacket};
 
+/// Maximum audio packets held while waiting for the first video codec header or post-resume
+/// keyframe (~10.9 s at 48 kHz AAC) so a stalled video encoder never grows RAM without bound.
+const MAX_HELD_AUDIO: usize = 512;
+
+fn push_held_audio(q: &mut VecDeque<(usize, AudioPacket)>, item: (usize, AudioPacket)) {
+    while q.len() >= MAX_HELD_AUDIO {
+        q.pop_front();
+    }
+    q.push_back(item);
+}
+
 /// An FLV tag body for the stream, with its time in milliseconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tag {
@@ -69,7 +80,7 @@ pub struct Pipeline {
     /// projects-60).
     rec_resume: Option<i64>,
     /// Sound that came while the cut's end wasn't known yet (resumed, no keyframe since).
-    rec_held: Vec<(usize, AudioPacket)>,
+    rec_held: VecDeque<(usize, AudioPacket)>,
     /// The newest frame given to the encoder (µs).
     last_in_us: i64,
 }
@@ -118,6 +129,20 @@ impl Replay {
         }
         self.bytes += p.data.len();
         self.audio.push_back((track, p.clone()));
+        // Enforce time window and byte cap even if video stalls and stops delivering keyframes
+        // (matching OBS `replay_buffer_purge` trimming audio alongside video).
+        let newest = p.pts_us;
+        let audio_keep = self.keep_us.saturating_add(2_000_000);
+        while self.audio.len() > 1 {
+            let too_old = self.audio.front().is_some_and(|(_, a)| newest.saturating_sub(a.pts_us) > audio_keep);
+            let too_big = self.max_bytes > 0 && self.bytes > self.max_bytes;
+            if !(too_old || too_big) {
+                break;
+            }
+            if let Some((_, a)) = self.audio.pop_front() {
+                self.bytes = self.bytes.saturating_sub(a.data.len());
+            }
+        }
     }
 }
 
@@ -169,7 +194,7 @@ enum Recording {
         file: BufWriter<File>,
         kind: Kind,
         /// Sound that came before the header, with its track.
-        held: Vec<(usize, AudioPacket)>,
+        held: VecDeque<(usize, AudioPacket)>,
     },
     On(Box<Writer>),
     /// The file couldn't be written (a full disk, a drive taken away): what is in it was kept,
@@ -363,7 +388,7 @@ impl Pipeline {
                 let f = File::create(p).map_err(|e| {
                     AvError::Encoder(format!("the recording can't be written at {} ({e})", p.display()))
                 })?;
-                Some(Recording::Waiting { file: BufWriter::new(f), kind: kind_of(p), held: Vec::new() })
+                Some(Recording::Waiting { file: BufWriter::new(f), kind: kind_of(p), held: VecDeque::new() })
             }
             None => None,
         };
@@ -388,7 +413,7 @@ impl Pipeline {
             stream_waits_key: false,
             rec_cuts: Vec::new(),
             rec_resume: None,
-            rec_held: Vec::new(),
+            rec_held: VecDeque::new(),
             last_in_us: 0,
         })
     }
@@ -970,7 +995,8 @@ impl Pipeline {
                 Self::forget_empty(&next.2);
                 return;
             }
-            self.recording = Some(Recording::Waiting { file: BufWriter::new(next.0), kind: next.1, held: Vec::new() });
+            self.recording =
+                Some(Recording::Waiting { file: BufWriter::new(next.0), kind: next.1, held: VecDeque::new() });
         }
         let rec = match self.recording.take() {
             Some(Recording::Waiting { file, kind, held }) => match header {
@@ -1020,14 +1046,14 @@ impl Pipeline {
         if !self.rec_cuts.is_empty() {
             // Resumed, the cut's end not known yet: held until the next frame says it.
             if self.rec_resume.is_some() && self.rec_cuts.last().is_some_and(|c| c.1.is_none() && p.pts_us >= c.0) {
-                self.rec_held.push((track, p));
+                push_held_audio(&mut self.rec_held, (track, p));
                 return;
             }
             let Some(at) = self.rec_time(p.pts_us) else { return };
             p.pts_us = at;
         }
         match &mut self.recording {
-            Some(Recording::Waiting { held, .. }) => held.push((track, p)),
+            Some(Recording::Waiting { held, .. }) => push_held_audio(held, (track, p)),
             Some(Recording::On(_)) => {
                 let Some(Recording::On(mut w)) = self.recording.take() else { return };
                 self.recording = Some(match w.audio(track, &p) {
@@ -1064,7 +1090,8 @@ impl Pipeline {
     /// Records into `file` (tests: a file that fails when it is told to).
     #[cfg(test)]
     fn record_into(&mut self, file: File) {
-        self.recording = Some(Recording::Waiting { file: BufWriter::new(file), kind: Kind::Mp4, held: Vec::new() });
+        self.recording =
+            Some(Recording::Waiting { file: BufWriter::new(file), kind: Kind::Mp4, held: VecDeque::new() });
     }
 }
 
@@ -1298,5 +1325,46 @@ mod cut_tests {
         assert_eq!(cut_step(from, Some(at), false, 3_933_333), CutStep::Leave, "not a keyframe");
         assert_eq!(cut_step(from, Some(at), true, 3_900_000), CutStep::End);
         assert_eq!(cut_step(from, Some(at), true, 4_000_000), CutStep::End);
+    }
+
+    #[test]
+    fn replay_audio_and_held_queues_stay_bounded_if_video_stalls() {
+        let mut r = super::Replay {
+            keep_us: 30_000_000,
+            max_bytes: 64 * 1024,
+            video: super::VecDeque::new(),
+            audio: super::VecDeque::new(),
+            bytes: 0,
+        };
+        // One video keyframe arrives, then video stalls completely while 100k audio packets arrive.
+        r.video(&super::VideoPacket { pts_us: 0, dts_us: 0, key: true, data: vec![0u8; 1024] });
+        for i in 0..100_000i64 {
+            r.audio(0, &super::AudioPacket { pts_us: i * 21_333, data: vec![0u8; 256] });
+        }
+        assert!(r.bytes <= r.max_bytes, "replay bytes stayed capped: {} > {}", r.bytes, r.max_bytes);
+        assert!(r.audio.len() <= 300, "replay audio count stayed bounded: {}", r.audio.len());
+
+        // Time-only bound (max_bytes = 0): still bounded by keep_us + 2 s margin.
+        let mut r_time = super::Replay {
+            keep_us: 10_000_000,
+            max_bytes: 0,
+            video: super::VecDeque::new(),
+            audio: super::VecDeque::new(),
+            bytes: 0,
+        };
+        r_time.video(&super::VideoPacket { pts_us: 0, dts_us: 0, key: true, data: vec![0u8; 1024] });
+        for i in 0..50_000i64 {
+            r_time.audio(0, &super::AudioPacket { pts_us: i * 21_333, data: vec![0u8; 128] });
+        }
+        let span = r_time.audio.back().unwrap().1.pts_us - r_time.audio.front().unwrap().1.pts_us;
+        assert!(span <= 12_050_000, "replay audio span bounded by keep_us + 2s: {span}");
+
+        // Held audio queue cap when waiting for video header / post-resume keyframe.
+        let mut held = super::VecDeque::new();
+        for i in 0..10_000i64 {
+            super::push_held_audio(&mut held, (0, super::AudioPacket { pts_us: i * 21_333, data: vec![1u8; 64] }));
+        }
+        assert_eq!(held.len(), super::MAX_HELD_AUDIO);
+        assert_eq!(held.back().unwrap().1.pts_us, 9_999 * 21_333);
     }
 }

@@ -76,6 +76,9 @@ pub struct Status {
     pub error: Option<String>,
 }
 
+/// Maximum `(url, path)` status entries retained in memory.
+const MAX_STATUS: usize = 256;
+
 /// The last read of each address and path being read.
 static STATUS: Mutex<Option<std::collections::HashMap<(String, String), Status>>> = Mutex::new(None);
 
@@ -95,6 +98,12 @@ fn note(url: &str, path: &str, got: &Result<String, String>) {
         Ok(v) => Some(v.clone()),
         Err(_) => map.get(&key).and_then(|s| s.value.clone()),
     };
+    if !map.contains_key(&key)
+        && map.len() >= MAX_STATUS
+        && let Some(oldest) = map.iter().min_by_key(|(_, s)| s.at_ms).map(|(k, _)| k.clone())
+    {
+        map.remove(&oldest);
+    }
     map.insert(key, Status { at_ms, value, error: got.as_ref().err().cloned() });
 }
 
@@ -275,5 +284,14 @@ mod tests {
         assert!(ok.at_ms > 0 && ok.error.is_none() && ok.value.is_some());
         let down = status("https://down.test/", "n").unwrap_or_else(|| panic!("a failed read noted"));
         assert!(down.error.is_some() && down.value.is_none());
+    }
+
+    #[test]
+    fn status_cache_stays_capped() {
+        for i in 0..1_000 {
+            note(&format!("https://cap-{i}.test/"), "v", &Ok(i.to_string()));
+        }
+        let len = STATUS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |m| m.len());
+        assert!(len <= MAX_STATUS, "STATUS len {len} exceeded {MAX_STATUS}");
     }
 }

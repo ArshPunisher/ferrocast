@@ -41,7 +41,7 @@ impl Ducker {
     /// One block of `secs`: whether a voice is heard → the music's gain at its start and end.
     pub fn step(&mut self, talking: bool, secs: f32) -> (f32, f32) {
         let from = self.gain;
-        self.quiet_s = if talking { 0.0 } else { self.quiet_s + secs };
+        self.quiet_s = if talking { 0.0 } else { (self.quiet_s + secs).min(DUCK_HOLD_S + 1.0) };
         let low = 10f32.powf(self.cfg.depth_db.min(0.0) / 20.0);
         let (want, take) = if self.quiet_s < DUCK_HOLD_S { (low, DUCK_ATTACK_S) } else { (1.0, DUCK_RELEASE_S) };
         // The whole way down (or up) in `take`, evenly: it arrives, no long tail.
@@ -339,5 +339,19 @@ mod tests {
         }
         // After ~10 s of silence, K-weighted windows have drained to silence (no phantom LUFS).
         assert!(l.lufs().is_none(), "3 s window drained to silence: {:?}", l.lufs());
+    }
+
+    #[test]
+    fn ducker_quiet_accumulator_stays_bounded_after_8_hours() {
+        let mut d = Ducker::new(Ducking::default());
+        let block = 1024.0 / RATE as f32;
+        // 8 hours of quiet music: ~1.35M blocks.
+        for _ in 0..1_350_000 {
+            let _ = d.step(false, block);
+        }
+        assert!(d.quiet_s <= DUCK_HOLD_S + 1.01, "quiet_s stayed bounded: {}", d.quiet_s);
+        // Voice returns: immediately ducks again.
+        let (_, g) = d.step(true, block);
+        assert!(g < 1.0, "ducker still responds immediately after 8 h: {g}");
     }
 }

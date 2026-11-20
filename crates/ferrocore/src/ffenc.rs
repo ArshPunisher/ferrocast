@@ -30,6 +30,37 @@ fn ffmpeg() -> Option<PathBuf> {
     ffmpeg_path()
 }
 
+/// Maximum bytes kept from an FFmpeg encoder's stderr across a multi-hour stream.
+const MAX_STDERR_BYTES: usize = 8 * 1024;
+
+/// Drains `r` into a bounded [`MAX_STDERR_BYTES`] ring buffer and returns the last 400 chars
+/// so verbose encoder warnings never accumulate without bound over a long stream.
+fn drain_stderr<R: Read>(mut r: R) -> String {
+    let mut ring = VecDeque::with_capacity(MAX_STDERR_BYTES);
+    let mut buf = [0u8; 4096];
+    loop {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let slice = if n > MAX_STDERR_BYTES {
+                    ring.clear();
+                    &buf[n - MAX_STDERR_BYTES..n]
+                } else {
+                    let drop = (ring.len() + n).saturating_sub(MAX_STDERR_BYTES);
+                    if drop > 0 {
+                        ring.drain(..drop);
+                    }
+                    &buf[..n]
+                };
+                ring.extend(slice.iter().copied());
+            }
+        }
+    }
+    let bytes: Vec<u8> = ring.into_iter().collect();
+    let s = String::from_utf8_lossy(&bytes);
+    s.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect()
+}
+
 /// FFmpeg's path, as set or found on the PATH.
 pub(crate) fn ffmpeg_path() -> Option<PathBuf> {
     if let Some(p) = FFMPEG.lock().ok().and_then(|p| p.clone()) {
@@ -207,13 +238,12 @@ impl Proc {
             }
         });
         let stderr = Arc::new(Mutex::new(String::new()));
-        if let Some(mut err) = child.stderr.take() {
+        if let Some(err) = child.stderr.take() {
             let keep = stderr.clone();
-            std::thread::spawn(move || {
-                let mut s = String::new();
-                let _ = err.read_to_string(&mut s);
+            let _ = std::thread::Builder::new().name("ferrocast-ffenc-err".into()).spawn(move || {
+                let tail = drain_stderr(err);
                 if let Ok(mut k) = keep.lock() {
-                    *k = s.chars().rev().take(400).collect::<Vec<_>>().into_iter().rev().collect();
+                    *k = tail;
                 }
             });
         }
@@ -1307,5 +1337,14 @@ sleep $slow"#;
         assert_eq!(pts, want, "every frame once, in order");
         assert!(got[0].key, "starts on a keyframe");
         assert_eq!(v.cfg.bitrate_kbps, 400, "the step happened");
+    }
+
+    #[test]
+    fn drain_stderr_stays_bounded_and_keeps_tail() {
+        let mut big = "x".repeat(1_000_000);
+        big.push_str("FINAL_ERROR_TAIL");
+        let got = drain_stderr(std::io::Cursor::new(big.as_bytes()));
+        assert_eq!(got.chars().count(), 400);
+        assert!(got.ends_with("FINAL_ERROR_TAIL"), "got tail: {got}");
     }
 }

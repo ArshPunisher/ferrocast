@@ -6,7 +6,7 @@
 //! scale filter's shader and the blend mode. Following the same path keeps every rounding the
 //! same, so both engines' pictures match pixel for pixel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -28,6 +28,51 @@ const BGRA_SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 const MAX: u32 = 16_384;
 /// libobs's `EPSILON` for "scaled at all".
 const EPSILON: f32 = 0.0001;
+/// Custom shader pipeline cache cap: live-editing WGSL code can never leak GPU pipelines forever.
+const MAX_CUSTOM_PIPELINES: usize = 64;
+/// Period at which custom shader `time()` wraps (1 hour in ms) so `f32` retains sub-millisecond
+/// precision and trig hashes stay crisp after 4–8+ hours live.
+pub const SHADER_TIME_WRAP_MS: u64 = 3_600_000;
+
+/// Shader `time()` in seconds, wrapped modulo [`SHADER_TIME_WRAP_MS`] in `f64` before narrowing
+/// to `f32` so 8-hour or week-long streams never lose millisecond step precision.
+pub fn shader_time_s(elapsed_ms: u64) -> f32 {
+    ((elapsed_ms % SHADER_TIME_WRAP_MS) as f64 / 1000.0) as f32
+}
+
+/// Bounded FIFO cache for compiled custom shader pipelines (or `None` when a shader failed validation).
+#[derive(Debug, Default)]
+struct CustomPipelineCache {
+    map: HashMap<u64, Option<wgpu::RenderPipeline>>,
+    order: VecDeque<u64>,
+}
+
+impl CustomPipelineCache {
+    fn get(&self, key: u64) -> Option<Option<wgpu::RenderPipeline>> {
+        self.map.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: u64, value: Option<wgpu::RenderPipeline>) {
+        if let Some(slot) = self.map.get_mut(&key) {
+            *slot = value;
+            return;
+        }
+        while self.map.len() >= MAX_CUSTOM_PIPELINES {
+            let Some(oldest) = self.order.pop_front() else {
+                self.map.clear();
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+        self.order.push_back(key);
+        self.map.insert(key, value);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
 
 /// Every transition pipeline the compositor makes: the fragment entry and whether it draws the
 /// linear view of its target.
@@ -249,7 +294,7 @@ pub struct Compositor {
     luts: Mutex<HashMap<usize, (std::sync::Weak<crate::lut::Lut>, wgpu::Texture)>>,
     effect_pipelines: Mutex<HashMap<(&'static str, bool), wgpu::RenderPipeline>>,
     /// Shader effects of one's own, by their code's key: None when the card refused it.
-    custom_pipelines: Mutex<HashMap<u64, Option<wgpu::RenderPipeline>>>,
+    custom_pipelines: Mutex<CustomPipelineCache>,
     /// Pictures kept on the card between frames, by the caller's id.
     uploads: Mutex<HashMap<u64, Upload>>,
     /// Buffers kept between frames to send each upload through (see `write_staged`).
@@ -573,7 +618,7 @@ impl Compositor {
             blank_cube,
             luts: Mutex::new(HashMap::new()),
             effect_pipelines: Mutex::new(HashMap::new()),
-            custom_pipelines: Mutex::new(HashMap::new()),
+            custom_pipelines: Mutex::new(CustomPipelineCache::default()),
             transition_module,
             transition_layout,
             transition_pipeline_layout,
@@ -1124,7 +1169,7 @@ impl Compositor {
             let (entry, p, color) = match e {
                 Effect::Custom { params, elapsed_ms, .. } => {
                     q = *params;
-                    ("fx_fs", [*elapsed_ms as f32 / 1000.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
+                    ("fx_fs", [shader_time_s(*elapsed_ms), 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4])
                 }
                 Effect::RoundedCorners { radius } => ("fs_rounded", [*radius, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0; 4]),
                 Effect::Border { width, rgba, radius } => {
@@ -1338,56 +1383,58 @@ impl Compositor {
     /// A shader effect's pipeline, made once per code; None when it doesn't pass `shaderfx::check`
     /// or the card refuses it (caught, never a crash), and not tried again.
     fn custom_pipeline(&self, code: &str) -> Option<wgpu::RenderPipeline> {
+        let key = crate::shaderfx::key(code);
         let mut cache = self.custom_pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        cache
-            .entry(crate::shaderfx::key(code))
-            .or_insert_with(|| {
-                if let Err(e) = crate::shaderfx::check(code) {
-                    tracing::warn!(error = %e, "a shader effect was left out");
-                    return None;
+        if let Some(hit) = cache.get(key) {
+            return hit;
+        }
+        let built = if let Err(e) = crate::shaderfx::check(code) {
+            tracing::warn!(error = %e, "a shader effect was left out");
+            None
+        } else {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("shader effect"),
+                source: wgpu::ShaderSource::Wgsl(crate::shaderfx::source(code).into()),
+            });
+            let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("shader effect"),
+                layout: Some(&self.effect_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("fx_vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("fx_fs"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: GAMMA,
+                        blend: Some(blend_state(Blend::Normal, self.metal_alpha)),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            match pollster::block_on(scope.pop()) {
+                None => Some(pipeline),
+                Some(e) => {
+                    tracing::warn!(error = %e, "the graphics card refused a shader effect: left out");
+                    None
                 }
-                let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-                let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("shader effect"),
-                    source: wgpu::ShaderSource::Wgsl(crate::shaderfx::source(code).into()),
-                });
-                let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("shader effect"),
-                    layout: Some(&self.effect_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &module,
-                        entry_point: Some("fx_vs"),
-                        buffers: &[],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &module,
-                        entry_point: Some("fx_fs"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: GAMMA,
-                            blend: Some(blend_state(Blend::Normal, self.metal_alpha)),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleStrip,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                });
-                match pollster::block_on(scope.pop()) {
-                    None => Some(pipeline),
-                    Some(e) => {
-                        tracing::warn!(error = %e, "the graphics card refused a shader effect: left out");
-                        None
-                    }
-                }
-            })
-            .clone()
+            }
+        };
+        cache.insert(key, built.clone());
+        built
     }
 
     fn effect_pipeline(&self, entry: &'static str, linear: bool) -> wgpu::RenderPipeline {
@@ -1453,6 +1500,9 @@ impl Compositor {
                 ups.insert(id, Upload { texture: tex, width: p.width, height: p.height, pinned: false });
             }
         }
+        drop(ups);
+        // Drop any NV12 Y/UV planes left over if this source id previously used `upload_nv12`.
+        self.planes.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         Ok(())
     }
 
@@ -1463,6 +1513,8 @@ impl Compositor {
     pub fn upload_surface(&self, id: u64, s: &crate::screen::Surface) -> Result<(), AvError> {
         let (w, h) = s.size();
         check_size(w, h)?;
+        // Drop any NV12 planes left over if this source id previously uploaded video via NV12.
+        self.planes.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         // On a Mac the frame's own memory becomes the texture: no copy at all.
         #[cfg(target_os = "macos")]
         if crate::apple::zerocopy::enabled()
@@ -1530,6 +1582,8 @@ impl Compositor {
             return Err(AvError::BadPixels(w, h));
         }
         let (pipeline, layout) = self.yuv_in.get_or_init(|| self.yuv_pipeline());
+        // Drop any RGBA/BGRA staging ring buffers left over if this source id previously used `upload`.
+        self.staging.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
         // The picture it becomes: the source's own texture, drawn into here.
         let target = {
             let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
@@ -2584,5 +2638,31 @@ mod mask_tests {
         let [mx, my, ax, ay] = mask_mapping((200, 100), (50, 50), false);
         assert_eq!((mx, my, ay), (2.0, 1.0, 0.0));
         assert!((ax + 0.5).abs() < 1e-6, "{ax}");
+    }
+
+    #[test]
+    fn shader_time_keeps_sub_millisecond_precision_after_hours_and_days() {
+        let eight_h = 8 * 3_600_000u64 + 123_456;
+        let seven_d = 7 * 24 * 3_600_000u64 + 3_599_000;
+        for base in [0u64, eight_h, seven_d] {
+            let t0 = super::shader_time_s(base);
+            let t1 = super::shader_time_s(base + 16);
+            assert!(t0 >= 0.0 && t0 < (super::SHADER_TIME_WRAP_MS as f32 / 1000.0));
+            let dt = t1 - t0;
+            assert!((dt - 0.016).abs() < 0.0005, "base={base}: t0={t0}, t1={t1}, dt={dt}");
+        }
+    }
+
+    #[test]
+    fn custom_pipeline_cache_evicts_at_cap() {
+        let mut cache = super::CustomPipelineCache::default();
+        for k in 0..10_000u64 {
+            cache.insert(k, None);
+            assert!(cache.len() <= super::MAX_CUSTOM_PIPELINES);
+        }
+        assert_eq!(cache.len(), super::MAX_CUSTOM_PIPELINES);
+        // Oldest keys were evicted; newest are retained.
+        assert!(cache.get(0).is_none());
+        assert!(cache.get(9_999).is_some());
     }
 }

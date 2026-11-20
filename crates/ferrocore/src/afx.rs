@@ -746,7 +746,7 @@ impl AudioFilter {
                     if self.is_open {
                         self.attenuation = (self.attenuation + attack_rate).min(1.0);
                     } else {
-                        self.held += rate_i;
+                        self.held = (self.held + rate_i).min(hold + 1.0);
                         if self.held > hold {
                             self.attenuation = (self.attenuation - release_rate).max(0.0);
                         }
@@ -824,7 +824,7 @@ impl AudioFilter {
         };
         let level_moved = self.nr_pitch_rms <= 0.0 || mul_to_db(rms / self.nr_pitch_rms).abs() > 1.0;
         if strength > 0.6 && lag.abs_diff(self.nr_pitch.0) <= 1 && !level_moved {
-            self.nr_pitch.1 += secs;
+            self.nr_pitch.1 = (self.nr_pitch.1 + secs).min(4.0);
         } else {
             self.nr_pitch.1 = 0.0;
         }
@@ -2742,5 +2742,26 @@ mod tests {
         // Pause tail (final 0.3 s, well past linear decay + hold + release) is gated silent in both.
         assert!(peak(&l[62 * r / 10..]) < 1e-5, "pause tail must be gated silent");
         assert!(peak(&obs[62 * r / 10..]) < 1e-5, "OBS ref pause tail must be gated silent");
+    }
+
+    #[test]
+    fn noise_gate_held_accumulator_stays_bounded_over_hours_of_silence() {
+        let mut f = AudioFilter::new(
+            AudioEffect::NoiseGate {
+                close_db: -40.0,
+                open_db: -30.0,
+                attack_ms: 10.0,
+                hold_ms: 200.0,
+                release_ms: 100.0,
+            },
+            48_000,
+        );
+        // Simulate 100 seconds of silent blocks (~4.8M samples): `held` must stay clamped near hold + 1s.
+        let mut l = vec![0.0f32; 1024];
+        let mut r = vec![0.0f32; 1024];
+        for _ in 0..4_700 {
+            f.process([&mut l, &mut r]);
+        }
+        assert!(f.held <= 1.25, "held accumulator stayed bounded: {}", f.held);
     }
 }

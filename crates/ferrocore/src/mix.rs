@@ -613,10 +613,10 @@ pub(crate) fn push_tap_interleaved(buf: &std::sync::Mutex<VecDeque<f32>>, stereo
 }
 
 /// Gives source `id`'s sound to its taps (at the mixer's rate only: every capture here gives
-/// it; other rates aren't tapped).
+/// it; other rates aren't tapped) and prunes dropped taps so dead `Weak`s don't accumulate.
 #[allow(clippy::type_complexity)]
 fn feed_taps(
-    taps: &[(u64, std::sync::Weak<std::sync::Mutex<std::collections::VecDeque<f32>>>)],
+    taps: &mut Vec<(u64, std::sync::Weak<std::sync::Mutex<std::collections::VecDeque<f32>>>)>,
     id: u64,
     (l, r): (&[f32], &[f32]),
     rate: u32,
@@ -625,10 +625,20 @@ fn feed_taps(
     if rate != mixer_rate {
         return;
     }
-    for (_, t) in taps.iter().filter(|(i, _)| *i == id) {
-        if let Some(buf) = t.upgrade() {
-            push_tap_planar(&buf, l, r, mixer_rate);
+    let mut any_dead = false;
+    for (i, t) in taps.iter() {
+        if *i == id {
+            if let Some(buf) = t.upgrade() {
+                push_tap_planar(&buf, l, r, mixer_rate);
+            } else {
+                any_dead = true;
+            }
+        } else if t.strong_count() == 0 {
+            any_dead = true;
         }
+    }
+    if any_dead {
+        taps.retain(|(_, t)| t.strong_count() > 0);
     }
 }
 
@@ -1042,7 +1052,18 @@ impl Mixer {
     }
 
     pub fn remove(&mut self, id: u64) -> Option<Vec<AudioFilter>> {
+        self.taps.retain(|(tid, t)| *tid != id && t.strong_count() > 0);
         self.sources.remove(&id).map(|s| s.filters)
+    }
+
+    /// Number of sources currently registered in the mixer.
+    pub fn source_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Number of registered tap entries currently held by the mixer.
+    pub fn tap_count(&self) -> usize {
+        self.taps.len()
     }
 
     /// Music quieter while the voices talk (None: off). Kept going when only its settings change.
@@ -1251,7 +1272,7 @@ impl Mixer {
             r.push(if channels > 1 { f[1] } else { f[0] });
         }
         if !self.taps.is_empty() && !src.settings.muted {
-            feed_taps(&self.taps, id, (&l[gap..], &r[gap..]), rate, out_rate);
+            feed_taps(&mut self.taps, id, (&l[gap..], &r[gap..]), rate, out_rate);
         }
         if let Some(t) = at {
             src.queue.clear();
@@ -2956,5 +2977,32 @@ mod steady_state_tests {
             assert!(step_on < 0.08, "{eff:?} clicked on add in mixer: max delta = {step_on:.4}");
             assert!(step_off < 0.08, "{eff:?} clicked on remove in mixer: max delta = {step_off:.4}");
         }
+    }
+
+    /// Dropping taps and removing sources keeps `Mixer::taps` and `Mixer::sources` at 0 over
+    /// 10,000 cycles (no dead `Weak` accumulation).
+    #[test]
+    fn mixer_taps_and_sources_stay_bounded_over_churn() {
+        let mut m = Mixer::new(48_000, 40);
+        let pcm = vec![0.1f32; BLOCK * 2];
+        let step = block_ns(48_000);
+        for i in 1..=10_000u64 {
+            m.set(i, SourceSettings::default());
+            let tap = m.tap(i);
+            m.push(i, &pcm, 2, 48_000, i * step);
+            drop(tap);
+            m.remove(i);
+        }
+        assert_eq!(m.source_count(), 0);
+        assert_eq!(m.tap_count(), 0);
+
+        // Even without remove(), feeding audio prunes dropped taps on the fly.
+        m.set(1, SourceSettings::default());
+        for _ in 0..100 {
+            let tap = m.tap(1);
+            drop(tap);
+        }
+        m.push(1, &pcm, 2, 48_000, 10_001 * step);
+        assert_eq!(m.tap_count(), 0);
     }
 }

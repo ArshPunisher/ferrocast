@@ -72,7 +72,7 @@ mod transform;
 pub mod video;
 
 pub use compose::bt709_limited;
-pub use compose::{Compositor, PendingNv12};
+pub use compose::{Compositor, PendingNv12, SHADER_TIME_WRAP_MS, shader_time_s};
 pub use transform::{Affine, BOTTOM, Bounds, LEFT, Placement, RIGHT, TOP, cropped, draw_transform, output_scale};
 
 /// Sleeps for `dur` with sub-millisecond timer granularity on Windows (a high-resolution waitable
