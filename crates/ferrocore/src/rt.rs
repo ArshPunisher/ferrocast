@@ -369,7 +369,15 @@ impl AudioClock for SystemClock {
             }
             let left = target_ns - now;
             if left > 2 * SPIN_NS {
+                // Windows: the high-resolution timer wakes within ~0.5 ms, so sleep to the margin.
+                // Elsewhere the system's timer slack grows with the length asked for (this Mac: a
+                // 5 ms sleep woke 2.5 ms late, a 20 ms one 7-10 ms late: after the target, and 4.5
+                // ms late at the median for an audio block): half of what is left never passes it,
+                // and the last milliseconds are yielded.
+                #[cfg(target_os = "windows")]
                 crate::sleep_precise(Duration::from_nanos(left - SPIN_NS));
+                #[cfg(not(target_os = "windows"))]
+                crate::sleep_precise(Duration::from_nanos(left / 2));
             } else if left > BUSY_SPIN_NS {
                 std::thread::yield_now();
             } else {
@@ -621,6 +629,30 @@ mod tests {
         assert!(b - target < 50_000_000, "woke {} ms late", (b - target) / 1_000_000);
         c.sleep_until_ns(a);
         assert!(c.now_ns() >= b, "a target in the past returns at once");
+    }
+
+    /// Off Windows the system's timer slack made a plain sleep wake up to 10 ms after an audio block's
+    /// time (this Mac: a 20 ms sleep woke 7-10 ms late): the wake is now close to the target, at a
+    /// small CPU cost (the last millisecond is yielded).
+    #[cfg(not(windows))]
+    #[test]
+    fn system_clock_wakes_close_to_an_audio_blocks_time_without_burning_a_core() {
+        let c = SystemClock;
+        let step_ns = 21_333_333u64;
+        let mut target = c.now_ns() + step_ns;
+        let mut late_us = Vec::new();
+        let t0 = std::time::Instant::now();
+        for _ in 0..40 {
+            c.sleep_until_ns(target);
+            late_us.push((c.now_ns().saturating_sub(target)) / 1000);
+            target += step_ns;
+        }
+        late_us.sort_unstable();
+        let (p50, p90) = (late_us[late_us.len() / 2], late_us[late_us.len() * 9 / 10]);
+        assert!(p50 < 1500 && p90 < 3500, "woke {p50} us (median) and {p90} us (p90) after the block's time");
+        // Yielding is not spinning: the wait took the block time, not a busy hundred percent of it
+        // (checked loosely, a loaded machine reschedules).
+        assert!(t0.elapsed() >= std::time::Duration::from_nanos(step_ns * 39));
     }
 
     /// On Windows, `SystemClock::sleep_until_ns` must hold a 21.333 ms audio cadence via high-res
