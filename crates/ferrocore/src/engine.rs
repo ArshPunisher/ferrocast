@@ -1895,6 +1895,13 @@ impl Engine {
         let (mut opened, mut missing, mut globals) = (HashMap::new(), HashMap::new(), std::collections::HashSet::new());
         for mut s in imported.sources {
             s.id = to(s.id);
+            for e in &mut s.sound_effects {
+                if let crate::afx::AudioEffect::Compressor { sidechain: Some(sc), .. } = e
+                    && *sc != 0
+                {
+                    *sc = to(*sc);
+                }
+            }
             let started = if keep.contains(&s.id) { Ok(()) } else { self.set_source(s.id, s.kind.clone()) };
             match started {
                 Ok(()) => {
@@ -2071,9 +2078,16 @@ impl Engine {
         skipped.extend(st.missing.values().map(|(.., why)| why.clone()));
         sync_heard(&mut st, &self.audio.cmd_sender());
         drop(st);
-        for s in imported.sources {
+        for mut s in imported.sources {
             if let Some(sound) = s.sound.filter(|_| running.contains(&s.name)) {
                 let id = to(s.id);
+                for e in &mut s.sound_effects {
+                    if let crate::afx::AudioEffect::Compressor { sidechain: Some(sc), .. } = e
+                        && *sc != 0
+                    {
+                        *sc = to(*sc);
+                    }
+                }
                 self.set_sound(id, sound);
                 self.set_sound_effects(id, &s.sound_effects);
             }

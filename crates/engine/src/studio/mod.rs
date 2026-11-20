@@ -106,6 +106,8 @@ pub(crate) struct Studio {
     pub live_watch: Mutex<ferrocast_core::show::LiveWatch>,
     /// What was said about the recording now (a stop, low room), so each is said once.
     pub record_watch: Mutex<record_watch::RecordWatch>,
+    /// What was said about broken sidechain loops, so each loop is reported once.
+    pub sidechain_watch: Mutex<record_watch::SidechainWatch>,
     pub live_watching: std::sync::atomic::AtomicBool,
     /// Cameras black now that put the show on BRB by itself (it comes back when none is).
     pub auto_brb: Mutex<std::collections::BTreeSet<String>>,
@@ -146,6 +148,7 @@ impl Default for Studio {
             health_watching: std::sync::atomic::AtomicBool::default(),
             live_watch: Mutex::default(),
             record_watch: Mutex::default(),
+            sidechain_watch: Mutex::default(),
             live_watching: std::sync::atomic::AtomicBool::default(),
             auto_brb: Mutex::default(),
             live_health: Mutex::default(),

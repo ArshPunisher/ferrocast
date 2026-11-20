@@ -895,6 +895,9 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("attack_time", "Attack", "int").range(1.0, 500.0, 1.0).unit(" ms"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
             opt("output_gain", "Volume after", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
+            opt("sidechain_source", "Duck under", "list")
+                .choices(&[("None", json!("none"))])
+                .hint("Lower this sound while another source plays, like your mic."),
         ],
         "limiter_filter" => vec![
             opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
@@ -1099,7 +1102,14 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "close_threshold": -32.0, "open_threshold": -26.0, "attack_time": 25, "hold_time": 200, "release_time": 150 })
         }
         "compressor_filter" => {
-            json!({ "ratio": 10.0, "threshold": -18.0, "attack_time": 6, "release_time": 60, "output_gain": 0.0 })
+            json!({
+                "ratio": 10.0,
+                "threshold": -18.0,
+                "attack_time": 6,
+                "release_time": 60,
+                "output_gain": 0.0,
+                "sidechain_source": "none"
+            })
         }
         "limiter_filter" => json!({ "threshold": -6.0, "release_time": 60 }),
         "expander_filter" => {

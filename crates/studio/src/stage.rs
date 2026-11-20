@@ -103,6 +103,44 @@ fn is_scene(s: &Value) -> bool {
     matches!(s.get("id").and_then(Value::as_str), Some("scene" | "group"))
 }
 
+/// Whether `kind` can produce audio (excludes picture-only sources and video-only cameras).
+fn is_audio_kind(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "scene"
+            | "group"
+            | "image_source"
+            | "color_source"
+            | "color_source_v2"
+            | "color_source_v3"
+            | "text_ft2_source"
+            | "text_ft2_source_v2"
+            | "text_gdiplus"
+            | "text_gdiplus_v2"
+            | "text_gdiplus_v3"
+            | "ferrocast_clone"
+            | "source-clone"
+            | "ferrocast_countdown"
+            | "ferrocast_visualizer"
+            | "ferrocast_web_text"
+            | "ferrocast_inputs"
+            | "slideshow"
+            | "slideshow_v2"
+            | "image_slide_show"
+    ) && !PICTURE_ONLY_DEVICES.contains(&kind)
+}
+
+/// Updates any compressor filter on `source` whose `sidechain_source` names `from` to `to`.
+fn rename_sidechain_refs(source: &mut Value, from: &str, to: &str) {
+    for flt in source.get_mut("filters").and_then(Value::as_array_mut).into_iter().flatten() {
+        if kind_of(flt) == "compressor_filter"
+            && flt.pointer("/settings/sidechain_source").and_then(Value::as_str) == Some(from)
+        {
+            flt["settings"]["sidechain_source"] = json!(to);
+        }
+    }
+}
+
 /// Takes out the sources no scene shows any more, as OBS does when a source's last item goes:
 /// a group too (and then its own sources). Scenes stay, and so do what a Copy of a source
 /// copies and the sound Sound bars show. Before, on 10 Nov on Windows, every removed source kept running in the engine (six
@@ -815,8 +853,11 @@ impl Stage {
                 }
             }
             for k in CHANNEL_KEYS {
-                if let Some(s) = d.get_mut(k).filter(|s| name_of(s) == name) {
-                    s["name"] = json!(new_name);
+                if let Some(s) = d.get_mut(k) {
+                    if name_of(s) == name {
+                        s["name"] = json!(new_name);
+                    }
+                    rename_sidechain_refs(s, name, new_name);
                 }
             }
             if let Some(l) = d["sources"].as_array_mut() {
@@ -824,6 +865,7 @@ impl Stage {
                     if name_of(s) == name {
                         s["name"] = json!(new_name);
                     }
+                    rename_sidechain_refs(s, name, new_name);
                     if let Some(items) = s.pointer_mut("/settings/items").and_then(Value::as_array_mut) {
                         for i in items.iter_mut().filter(|i| name_of(i) == name) {
                             i["name"] = json!(new_name);
@@ -1942,8 +1984,77 @@ impl Stage {
             .into_iter()
             .find(|f| name_of(f) == filter)
             .ok_or_else(|| fail(format!("\"{name}\" has no filter called \"{filter}\".")))?;
-        crate::kinds::options(kind_of(&f))
-            .ok_or_else(|| fail(format!("Ferrocast's own engine doesn't run \"{filter}\" yet.")))
+        let kind = kind_of(&f);
+        let mut opts = crate::kinds::options(kind)
+            .ok_or_else(|| fail(format!("Ferrocast's own engine doesn't run \"{filter}\" yet.")))?;
+        if kind == "compressor_filter"
+            && let Some(o) = opts.iter_mut().find(|o| o.key == "sidechain_source")
+        {
+            let mut choices = vec!["None".to_string()];
+            let mut values = vec![json!("none")];
+            let entries = self.audio_source_entries(name);
+            let saved = f
+                .pointer("/settings/sidechain_source")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+            let mut matched_saved = false;
+            for (src_name, uuid) in &entries {
+                choices.push(src_name.clone());
+                if let Some(sv) = saved
+                    && sv != src_name
+                    && uuid.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(sv))
+                {
+                    values.push(json!(sv));
+                    matched_saved = true;
+                } else {
+                    if saved == Some(src_name.as_str()) {
+                        matched_saved = true;
+                    }
+                    values.push(json!(src_name));
+                }
+            }
+            if let Some(sv) = saved
+                && !matched_saved
+            {
+                choices.push(format!("{sv} (missing)"));
+                values.push(json!(sv));
+            }
+            o.choices = choices;
+            o.values = values;
+        }
+        Ok(opts)
+    }
+
+    /// Other audio sources in this collection (global channels first, then scene sources),
+    /// excluding `exclude` and non-audio sources, for sidechain pickers.
+    fn audio_source_entries(&self, exclude: &str) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        for s in self.channels_list() {
+            let n = name_of(&s);
+            if n.is_empty() || n == exclude || out.iter().any(|(x, _)| x == n) {
+                continue;
+            }
+            let uuid = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string);
+            out.push((n.to_string(), uuid));
+        }
+        for s in self.sources_list() {
+            let n = name_of(&s);
+            if n.is_empty() || n == exclude || is_scene(&s) || out.iter().any(|(x, _)| x == n) {
+                continue;
+            }
+            if !is_audio_kind(kind_of(&s)) {
+                continue;
+            }
+            let uuid = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string);
+            out.push((n.to_string(), uuid));
+        }
+        out
+    }
+
+    /// Broken sidechain compressor loops in the current scene collection (`(source, key)`).
+    pub fn sidechain_cycles(&self) -> Vec<(String, String)> {
+        ferrocore::obs::sidechain_cycles(&self.doc.borrow())
     }
 
     pub fn update_filter(&self, name: &str, filter: &str, settings: &Value) -> Result<(), StudioError> {
@@ -5957,5 +6068,31 @@ mod tests {
             assert!(e.engine.scene(&scene).is_none(), "hidden solo scene removed at refcount 0");
         }
         assert_eq!(e.engine.scene_names().len(), base_scenes);
+    }
+
+    #[test]
+    fn compressor_filter_options_list_other_audio_sources_and_follow_renames() {
+        let s = stage();
+        ok(s.set_channel(3, Some(("coreaudio_input_capture", "Mic", &json!({ "device_id": "default" })))));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/a.mp3" }), false));
+        let _ = ok(s.add_source("Main", "color_source_v3", "Back", &json!({}), false));
+        ok(s.add_filter("Music", "compressor_filter", "Duck", &json!({})));
+
+        let opts = ok(s.filter_options("Music", "Duck"));
+        let sc = opts.iter().find(|o| o.key == "sidechain_source").expect("sidechain_source option");
+        assert_eq!(sc.label, "Duck under");
+        assert_eq!(sc.choices, vec!["None", "Mic"]);
+        assert_eq!(sc.values, vec![json!("none"), json!("Mic")]);
+        assert!(!sc.help.is_empty(), "Duck under carries (i) help text");
+
+        // Point Music's compressor at Mic, then rename Mic -> Voice: reference follows.
+        ok(s.update_filter("Music", "Duck", &json!({ "sidechain_source": "Mic" })));
+        ok(s.rename("Mic", "Voice"));
+        assert_eq!(ok(s.filter_settings("Music", "Duck"))["sidechain_source"], json!("Voice"));
+        assert!(s.sidechain_cycles().is_empty());
+
+        // Creating a mutual loop Voice -> Music is surfaced by sidechain_cycles().
+        ok(s.add_filter("Voice", "compressor_filter", "DuckBack", &json!({ "sidechain_source": "Music" })));
+        assert_eq!(s.sidechain_cycles(), vec![("Voice".into(), "Music".into())]);
     }
 }
