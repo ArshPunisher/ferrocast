@@ -32,6 +32,13 @@ pub struct Tokens {
     pub expires_at: i64,
 }
 
+/// When a token that lives `expires_in` seconds, got at `now` (ms), counts as expiring: never sooner
+/// than the refresh margin plus ten minutes, so a short-lived token (60 s, or 0) isn't "already
+/// expiring" and refreshed again at every call.
+pub(crate) fn expires_at(now: i64, expires_in: i64) -> i64 {
+    now + expires_in.clamp(600, 86_400) * 1000
+}
+
 impl Tokens {
     pub fn needs_refresh(&self, now: i64) -> bool {
         now >= self.expires_at - 300_000
@@ -162,11 +169,7 @@ pub async fn finish(
     let t: TokenResponse = res.json().await.map_err(YoutubeError::network)?;
     let refresh_token =
         t.refresh_token.ok_or_else(|| YoutubeError::SignIn("Google didn't grant offline access.".into()))?;
-    Ok(Tokens {
-        access_token: t.access_token,
-        refresh_token,
-        expires_at: now_ms() + t.expires_in.clamp(0, 86_400) * 1000,
-    })
+    Ok(Tokens { access_token: t.access_token, refresh_token, expires_at: expires_at(now_ms(), t.expires_in) })
 }
 
 /// Google keeps the same refresh token across refreshes unless it sends a new one.
@@ -193,7 +196,7 @@ pub async fn refresh(
             Ok(Tokens {
                 access_token: t.access_token,
                 refresh_token: t.refresh_token.unwrap_or_else(|| current.refresh_token.clone()),
-                expires_at: now_ms() + t.expires_in.clamp(0, 86_400) * 1000,
+                expires_at: expires_at(now_ms(), t.expires_in),
             })
         }
         400 | 401 => Err(YoutubeError::SignInNeeded),
@@ -218,4 +221,24 @@ async fn respond(socket: &mut tokio::net::TcpStream, status: u16, message: &str)
     socket.write_all(head.as_bytes()).await?;
     socket.write_all(body.as_bytes()).await?;
     socket.shutdown().await
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_lived_token_is_not_refreshed_again_at_once() {
+        let now = 1_000_000_000_000;
+        for lifetime in [0, 60, 299] {
+            let t =
+                Tokens { access_token: "a".into(), refresh_token: "r".into(), expires_at: expires_at(now, lifetime) };
+            assert!(!t.needs_refresh(now), "a token of {lifetime} s is used, not refreshed in a loop");
+        }
+        let hour = Tokens { access_token: "a".into(), refresh_token: "r".into(), expires_at: expires_at(now, 3600) };
+        assert!(
+            !hour.needs_refresh(now) && hour.needs_refresh(now + 3_400_000),
+            "a normal token still refreshes 5 min early"
+        );
+    }
 }
