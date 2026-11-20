@@ -2026,6 +2026,20 @@ impl Stage {
         Ok(opts)
     }
 
+    /// Whether `src` makes sound a compressor could duck under: it has a sound track, and when the
+    /// engine is running and has opened it, the engine has sound for it (a screen capture without
+    /// "capture audio" has none; the import would drop a compressor keyed to it).
+    fn has_sound_to_key(&self, src: &Value) -> bool {
+        if !src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0) {
+            return false;
+        }
+        let Some(e) = self.engine.borrow().clone() else { return true };
+        match e.engine.source_named(name_of(src)) {
+            Some((id, _)) => e.engine.levels(id).is_some(),
+            None => true,
+        }
+    }
+
     /// Other audio sources in this collection (global channels first, then scene sources),
     /// excluding `exclude` and non-audio sources, for sidechain pickers.
     fn audio_source_entries(&self, exclude: &str) -> Vec<(String, Option<String>)> {
@@ -2043,7 +2057,7 @@ impl Stage {
             if n.is_empty() || n == exclude || is_scene(&s) || out.iter().any(|(x, _)| x == n) {
                 continue;
             }
-            if !is_audio_kind(kind_of(&s)) {
+            if !is_audio_kind(kind_of(&s)) || !self.has_sound_to_key(&s) {
                 continue;
             }
             let uuid = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string);
@@ -6068,6 +6082,25 @@ mod tests {
             assert!(e.engine.scene(&scene).is_none(), "hidden solo scene removed at refcount 0");
         }
         assert_eq!(e.engine.scene_names().len(), base_scenes);
+    }
+
+    /// "Duck under" lists what can key: a source with no sound track (mixers 0) can't, and a
+    /// picture-only one never; a source whose sound is turned off again leaves the list.
+    #[test]
+    fn duck_under_lists_only_sources_that_have_sound() {
+        let s = stage();
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/a.mp3" }), false));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Voice", &json!({ "local_file": "/v.mp3" }), false));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Silent clip", &json!({ "local_file": "/s.mp4" }), false));
+        ok(s.set_tracks("Silent clip", &[]));
+        ok(s.add_filter("Music", "compressor_filter", "Duck", &json!({})));
+        let listed = |s: &Stage| {
+            let opts = ok(s.filter_options("Music", "Duck"));
+            opts.iter().find(|o| o.key == "sidechain_source").map(|o| o.choices.clone()).unwrap_or_default()
+        };
+        assert_eq!(listed(&s), vec!["None", "Voice"], "no sound track, no key");
+        ok(s.set_tracks("Silent clip", &[1]));
+        assert_eq!(listed(&s), vec!["None", "Voice", "Silent clip"]);
     }
 
     #[test]
