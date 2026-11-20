@@ -1,7 +1,8 @@
 //! Helix requests: one place that adds auth, retries once after a 401 with a refreshed
 //! token, and turns 403/429 into errors the dashboard can explain (R-19).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use reqwest::Method;
 use serde::Deserialize;
@@ -12,7 +13,16 @@ use crate::{Auth, TwitchError};
 #[derive(Debug, Clone)]
 pub struct Helix {
     pub(crate) auth: Arc<Auth>,
+    /// The ingest server last picked from Twitch's list, and when (see `nearest_ingest`).
+    pub(crate) ingest: Arc<Mutex<Option<(Instant, String)>>>,
+    /// How long a picked server is reused before the list is read again.
+    pub(crate) ingest_keep: Duration,
 }
+
+/// A 429 that asks for this long or less is waited out and tried again; a longer one is told.
+const RETRY_UP_TO: Duration = Duration::from_secs(5);
+/// How many times one request is tried again after a 429.
+const RATE_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct User {
@@ -25,7 +35,14 @@ pub struct User {
 
 impl Helix {
     pub fn new(auth: Arc<Auth>) -> Self {
-        Helix { auth }
+        Helix { auth, ingest: Arc::new(Mutex::new(None)), ingest_keep: crate::ingest::INGEST_KEEP }
+    }
+
+    /// How long a picked ingest server is reused (the default is an hour; zero reads the list each time).
+    #[must_use]
+    pub fn with_ingest_cache(mut self, keep: Duration) -> Self {
+        self.ingest_keep = keep;
+        self
     }
 
     /// Sends a request; on 401 refreshes the token once and tries again.
@@ -37,7 +54,8 @@ impl Helix {
         body: Option<Value>,
     ) -> Result<Value, TwitchError> {
         let mut token = self.auth.access().await?;
-        for attempt in 0..2 {
+        let (mut refreshed, mut limited) = (false, 0u32);
+        loop {
             let mut req = self
                 .auth
                 .http
@@ -49,7 +67,7 @@ impl Helix {
                 req = req.json(b);
             }
             let res = req.send().await.map_err(TwitchError::network)?;
-            if res.status().as_u16() == 401 && attempt == 0 {
+            if res.status().as_u16() == 401 && !refreshed {
                 // A missing scope is also a 401: refreshing wouldn't help, and each refresh spends
                 // Twitch's single-use refresh token (agy's M10 scan). Only an expired token is
                 // refreshed.
@@ -58,7 +76,23 @@ impl Helix {
                     return Err(err);
                 }
                 token = self.auth.refresh_after_401(&token).await?;
+                refreshed = true;
                 continue;
+            }
+            if res.status().as_u16() == 429 {
+                // The request wasn't done: waiting until the budget is back (Ratelimit-Reset) and
+                // sending it again is safe for any method, and a burst during a hype train is
+                // seconds. A longer wait is the person's to be told.
+                let err = TwitchError::from_response(res).await;
+                match err {
+                    TwitchError::RateLimited(wait) if wait <= RETRY_UP_TO && limited < RATE_RETRIES => {
+                        limited += 1;
+                        tracing::debug!(?wait, path, "Twitch asked for a pause; trying again");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    e => return Err(e),
+                }
             }
             if !res.status().is_success() {
                 return Err(TwitchError::from_response(res).await);
@@ -68,7 +102,6 @@ impl Helix {
             }
             return res.json().await.map_err(TwitchError::network);
         }
-        Err(TwitchError::SignInNeeded)
     }
 
     pub async fn me(&self) -> Result<User, TwitchError> {

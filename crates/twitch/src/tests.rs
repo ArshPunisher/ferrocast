@@ -463,3 +463,112 @@ fn ingest_lists_are_read_leniently() {
         Some("rtmps://b/app".into())
     );
 }
+
+// --- limits and the ingest list (M10-05, M10-07) ---------------------------------------
+
+/// A Twitch that answers Helix requests from a script (status, `ratelimit-reset` header, body) and
+/// counts them, and serves an ingest list that can be switched off. Plain HTTP over a socket.
+async fn scripted_twitch(
+    script: Vec<(u16, Option<i64>, serde_json::Value)>,
+    ingests_up: Arc<std::sync::atomic::AtomicBool>,
+) -> (Endpoints, Arc<std::sync::Mutex<(usize, usize)>>) {
+    use std::collections::VecDeque;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let queue = Arc::new(std::sync::Mutex::new(VecDeque::from(script)));
+    let hits = Arc::new(std::sync::Mutex::new((0usize, 0usize))); // (helix, ingests)
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let (q, h) = (queue.clone(), hits.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = l.accept().await else { return };
+            let (q, h, up) = (q.clone(), h.clone(), ingests_up.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (code, reset, body) = if path.starts_with("/ingests") {
+                    h.lock().unwrap().1 += 1;
+                    if up.load(Ordering::SeqCst) {
+                        (
+                            200,
+                            None,
+                            json!({ "ingests": [
+                                { "name": "US East: Old (deprecated)", "availability": 1.0, "url_template_secure": "rtmps://old.example:443/app/{stream_key}" },
+                                { "name": "US East: Ashburn", "availability": 1.0, "url_template_secure": "rtmps://ash.example:443/app/{stream_key}" },
+                            ] }),
+                        )
+                    } else {
+                        (502, None, json!({}))
+                    }
+                } else {
+                    h.lock().unwrap().0 += 1;
+                    q.lock().unwrap().pop_front().unwrap_or((
+                        200,
+                        None,
+                        json!({ "data": [{ "id": "1", "login": "l", "display_name": "L" }] }),
+                    ))
+                };
+                let body = body.to_string();
+                let reset = reset.map(|r| format!("ratelimit-reset: {r}\r\n")).unwrap_or_default();
+                let res = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\n{reset}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(res.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (Endpoints { ingest: base.clone(), id: base.clone(), api: base.clone(), eventsub: base }, hits)
+}
+
+fn helix_for(ep: Endpoints) -> Helix {
+    let tokens = Tokens {
+        access_token: "a".into(),
+        refresh_token: "r".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes: vec![],
+    };
+    Helix::new(Arc::new(Auth::new(http_client(), ep, "client".into(), tokens, Arc::new(|_: &Tokens| Ok(())))))
+}
+
+/// A 429 that asks for a second is waited out and the request sent again, wherever Helix is used;
+/// one that asks for longer is the person's to be told, not waited for.
+#[tokio::test]
+async fn a_short_429_is_waited_out_and_a_long_one_is_told() {
+    let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let soon = now_ms() / 1000 + 1;
+    let (ep, hits) =
+        scripted_twitch(vec![(429, Some(soon), json!({ "message": "Too many requests" }))], up.clone()).await;
+    let helix = helix_for(ep);
+    assert_eq!(helix.me().await.unwrap().id, "1", "the second try went through");
+    assert_eq!(hits.lock().unwrap().0, 2);
+
+    let far = now_ms() / 1000 + 40;
+    let (ep, hits) = scripted_twitch(vec![(429, Some(far), json!({}))], up).await;
+    let err = helix_for(ep).me().await.unwrap_err();
+    assert!(matches!(err, TwitchError::RateLimited(w) if w > Duration::from_secs(30)), "{err:?}");
+    assert_eq!(hits.lock().unwrap().0, 1, "not tried again: 40 s is too long to hold a click");
+}
+
+/// The nearest server is read from Twitch's list once, not on every Go live; a list that can't be
+/// read later uses the one picked before, and only with none ever read is it Twitch's own address.
+#[tokio::test]
+async fn the_ingest_list_is_read_once_and_a_blip_keeps_the_picked_server() {
+    let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (ep, hits) = scripted_twitch(vec![], up.clone()).await;
+    let helix = helix_for(ep.clone());
+    assert_eq!(helix.nearest_ingest().await, "rtmps://ash.example:443/app", "the retired server is skipped");
+    assert_eq!(helix.nearest_ingest().await, "rtmps://ash.example:443/app");
+    assert_eq!(hits.lock().unwrap().1, 1, "the list was read once for two Go lives");
+    // Kept for no time at all, with the list down: the one picked before, not the fallback.
+    let helix = helix_for(ep.clone()).with_ingest_cache(Duration::ZERO);
+    assert_eq!(helix.nearest_ingest().await, "rtmps://ash.example:443/app");
+    up.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(helix.nearest_ingest().await, "rtmps://ash.example:443/app", "a blip doesn't change the server");
+    // Never read, list down: Twitch's own secure address.
+    assert_eq!(helix_for(ep).nearest_ingest().await, crate::ingest::FALLBACK_INGEST);
+}
