@@ -96,6 +96,9 @@ pub struct Api {
     /// The last refreshed sign-in couldn't be saved (the Keychain): it is kept for this session and
     /// saved again at the next use.
     unsaved: AtomicBool,
+    /// When saving was last tried while `unsaved`: not again for a while (a locked Keychain would
+    /// otherwise be asked, under the token lock, at every call).
+    last_save_try: StdMutex<Option<std::time::Instant>>,
     /// Ban ids by banned channel, so "unban" can find the ban YouTube created.
     bans: StdMutex<HashMap<String, String>>,
     /// Finding or making the normal broadcast, one at a time (CodeRabbit): two calls at once
@@ -112,6 +115,9 @@ pub struct Api {
     /// How long a read is kept (ms; 0: never, as before).
     read_ttl_ms: i64,
 }
+
+/// How long to wait before asking the Keychain again to save a refreshed sign-in it refused.
+const SAVE_RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long a list of streams or broadcasts is kept for the next lookup.
 const READ_TTL_MS: i64 = 60_000;
@@ -156,6 +162,7 @@ impl Api {
             tokens: Mutex::new(tokens),
             on_tokens,
             unsaved: AtomicBool::new(false),
+            last_save_try: StdMutex::new(None),
             bans: StdMutex::new(HashMap::new()),
             made: Mutex::new(MadeSlot::default()),
             made_vertical: Mutex::new(MadeSlot::default()),
@@ -185,7 +192,11 @@ impl Api {
         if t.needs_refresh(now_ms()) {
             *t = self.refresh_locked(&t).await?;
         } else if self.unsaved.load(Ordering::Acquire) {
-            self.save(&t);
+            let mut last = self.last_save_try.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_none_or(|at| at.elapsed() >= SAVE_RETRY_EVERY) {
+                *last = Some(std::time::Instant::now());
+                self.save(&t);
+            }
         }
         Ok(t.access_token.clone())
     }
