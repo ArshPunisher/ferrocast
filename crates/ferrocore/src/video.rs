@@ -61,8 +61,9 @@ pub struct VideoConfig {
     pub profile: H264Profile,
     /// x264's speed preset and tune, when the settings pick them (`X264_PRESETS`, `X264_TUNES`);
     /// other encoders ignore them.
-    pub preset: Option<&'static str>,
-    pub tune: Option<&'static str>,
+    /// (indices into the lists, to keep this small).
+    pub preset: Option<u8>,
+    pub tune: Option<u8>,
 }
 
 /// x264's presets, fastest first, and its tunes (what the recording's "Your own" offers).
@@ -70,9 +71,9 @@ pub const X264_PRESETS: [&str; 9] =
     ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
 pub const X264_TUNES: [&str; 6] = ["film", "animation", "grain", "stillimage", "psnr", "zerolatency"];
 
-/// The static name of a preset or tune a settings file carries, or None if it isn't one.
-pub fn x264_name(list: &'static [&'static str], name: &str) -> Option<&'static str> {
-    list.iter().copied().find(|n| n.eq_ignore_ascii_case(name))
+/// The index in `list` of a preset or tune a settings file carries, or None if it isn't one.
+pub fn x264_index(list: &[&str], name: &str) -> Option<u8> {
+    list.iter().position(|n| n.eq_ignore_ascii_case(name)).and_then(|i| u8::try_from(i).ok())
 }
 
 impl VideoConfig {

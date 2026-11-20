@@ -685,7 +685,15 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
         if let Some(q) = cq {
             let q = q.to_string();
             let quality: Vec<String> = match enc.as_str() {
-                "libx264" => vec!["-crf".into(), q, "-preset".into(), cfg.preset.unwrap_or("veryfast").into()],
+                "libx264" => vec![
+                    "-crf".into(),
+                    q,
+                    "-preset".into(),
+                    cfg.preset
+                        .and_then(|i| crate::video::X264_PRESETS.get(usize::from(i)).copied())
+                        .unwrap_or("veryfast")
+                        .into(),
+                ],
                 "h264_nvenc" => ["-preset", "p4", "-rc", "vbr", "-cq", &q, "-b:v", "0"].map(String::from).to_vec(),
                 "h264_qsv" => {
                     ["-preset", "veryfast", "-look_ahead", "0", "-global_quality", &q].map(String::from).to_vec()
@@ -728,7 +736,9 @@ fn args(cfg: &VideoConfig, enc: &str) -> Vec<String> {
         let mut extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
         if enc == "libx264" {
             // The settings' own preset and tune replace the defaults above.
-            for (flag, pick) in [("-preset", cfg.preset), ("-tune", cfg.tune)] {
+            let preset = cfg.preset.and_then(|i| crate::video::X264_PRESETS.get(usize::from(i)).copied());
+            let tune = cfg.tune.and_then(|i| crate::video::X264_TUNES.get(usize::from(i)).copied());
+            for (flag, pick) in [("-preset", preset), ("-tune", tune)] {
                 if let Some(v) = pick {
                     if let Some(at) = extra.iter().position(|x| x == flag) {
                         extra[at + 1] = v.to_string();
@@ -1117,8 +1127,8 @@ mod tests {
     #[test]
     fn a_picked_x264_preset_and_tune_replace_the_defaults() {
         let mut c = cfg(RateControl::Crf(20));
-        c.preset = Some("slow");
-        c.tune = Some("film");
+        c.preset = crate::video::x264_index(&crate::video::X264_PRESETS, "slow");
+        c.tune = crate::video::x264_index(&crate::video::X264_TUNES, "film");
         let a = args(&c, "libx264");
         assert!(has(&a, ["-preset", "slow"]) && has(&a, ["-tune", "film"]), "{a:?}");
         assert!(!has(&a, ["-preset", "veryfast"]), "{a:?}");

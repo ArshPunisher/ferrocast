@@ -45,11 +45,11 @@ fn video_config(e: &EncodeSettings, width: u32, height: u32, fps: u32) -> VideoC
 }
 
 /// An x264 preset or tune the settings' encoder options carry (`encode.extra`); only x264 uses it.
-fn x264_option(e: &EncodeSettings, key: &str, list: &'static [&'static str]) -> Option<&'static str> {
+fn x264_option(e: &EncodeSettings, key: &str, list: &[&str]) -> Option<u8> {
     if !is_x264(&e.video_encoder) {
         return None;
     }
-    e.extra.get(key).and_then(|v| v.as_str()).and_then(|n| ferrocore::video::x264_name(list, n))
+    e.extra.get(key).and_then(|v| v.as_str()).and_then(|n| ferrocore::video::x264_index(list, n))
 }
 
 /// A stream's encoder: platforms ask for a keyframe every 2 s, so "let the encoder pick" (0) is 2.
@@ -1360,7 +1360,12 @@ mod tests {
         e.extra.insert("preset".into(), "SLOW".into());
         e.extra.insert("tune".into(), "film".into());
         let v = video_config(&e, 1280, 720, 30);
-        assert_eq!((v.preset, v.tune), (Some("slow"), Some("film")));
+        let at = |l: &[&str], n: &str| ferrocore::video::x264_index(l, n);
+        assert_eq!(
+            (v.preset, v.tune),
+            (at(&ferrocore::video::X264_PRESETS, "slow"), at(&ferrocore::video::X264_TUNES, "film"))
+        );
+        assert!(v.preset.is_some() && v.tune.is_some());
         e.extra.insert("preset".into(), "ludicrous".into());
         assert_eq!(video_config(&e, 1280, 720, 30).preset, None);
         let mut vt = EncodeSettings::with_encoder("com.apple.videotoolbox.videoencoder.ave.avc");
