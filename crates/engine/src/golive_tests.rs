@@ -1576,3 +1576,37 @@ async fn the_keys_set_for_the_vertical_canvas_are_told_to_the_platform_before_it
     e.resolve(&yt).await.unwrap();
     assert_eq!(VERTICAL_KEYS_TOLD.with(|t| t.borrow().clone()), vec!["vert-key".to_string()]);
 }
+
+/// The Studio's Advanced reconnect settings reach every Go live destination (they didn't: a
+/// platform always got six tries a second apart): off means no retry, tries and the first wait are
+/// the Studio's, a destination's own changed first wait wins, and OBS-only streaming keeps the defaults.
+#[tokio::test]
+async fn the_studios_reconnect_settings_govern_the_go_live_destinations() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    let cfg = e.golive_config();
+    let yt = cfg.destinations.iter().find(|d| d.id == "youtube").cloned().unwrap();
+    // No Studio: Go live's own defaults.
+    let plain = e.resolve(&yt).await.unwrap().retry;
+    assert_eq!(plain, ferrocast_golive::push::Retry::default());
+    let studio = Arc::new(DirectStudio::default());
+    e.set_studio_host(studio.clone());
+    // Reconnecting on, 2 tries, every 3 s.
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        reconnect: true,
+        reconnect_tries: 2,
+        reconnect_every_s: 3,
+        ..Default::default()
+    };
+    let r = e.resolve(&yt).await.unwrap().retry;
+    assert_eq!((r.max_attempts, r.first.as_secs()), (2, 3));
+    // A first wait set on the destination itself still wins.
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert("youtube".into(), crate::golive::DestAdvanced { first_retry_s: 7, ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+    let r = e.resolve(&yt).await.unwrap().retry;
+    assert_eq!((r.max_attempts, r.first.as_secs()), (2, 7));
+    // Off: no retry at all.
+    studio.settings.lock().unwrap().reconnect = false;
+    assert!(e.resolve(&yt).await.unwrap().retry.is_never());
+}

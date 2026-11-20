@@ -241,7 +241,9 @@ pub async fn run(d: Direct, hub: Arc<Hub>, health: watch::Sender<Health>, mut st
                     }
                     attempt = attempt.saturating_add(1);
                     let server_refused = matches!(err, DirectError::Refused(_) | DirectError::Address(_));
-                    let limit = if d.retry.max_attempts == 0 {
+                    let limit = if d.retry.is_never() {
+                        1
+                    } else if d.retry.max_attempts == 0 {
                         0
                     } else if server_refused {
                         d.retry.max_attempts.min(REFUSED_MAX_ATTEMPTS)

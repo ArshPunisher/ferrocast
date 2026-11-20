@@ -640,6 +640,47 @@ async fn a_destination_that_gave_up_probes_once_per_wait_and_stays_failed() {
     push::fault::set_no_name(dport, false);
 }
 
+/// Reconnecting turned off (the Studio's Advanced setting): the first failure is final: one try,
+/// Failed at once, and no slow probe afterwards either (it was six tries, then a probe each minute).
+#[tokio::test]
+async fn a_destination_with_reconnecting_off_tries_once_and_stays_failed() {
+    for no_name in [false, true] {
+        let w = world().await;
+        let l = free_listener().await;
+        let dport = l.local_addr().unwrap().port();
+        drop(l);
+        // Nothing listens there; or the name doesn't resolve (a network that is down is waited for
+        // otherwise: not when reconnecting is off).
+        push::fault::set_no_name(dport, no_name);
+        let mut d = destination(dport, "k");
+        d.retry = push::Retry::never();
+        let mut health = start(&w, d);
+        let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+        let s = state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+        assert!(matches!(s, PushState::Failed { attempts: 1, .. }), "{s:?}");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(push::fault::connects(dport), 1, "no_name={no_name}: one try, no probes after it");
+        assert!(matches!(health.borrow().state, PushState::Failed { .. }));
+        push::fault::set_no_name(dport, false);
+    }
+}
+
+/// Reconnect tries = 2 (the Studio's setting): the destination gives up after exactly two tries.
+#[tokio::test]
+async fn a_destination_with_two_tries_gives_up_after_two() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let s = state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+    assert!(matches!(s, PushState::Failed { attempts: 2, .. }), "{s:?}");
+    assert_eq!(push::fault::connects(dport), 2);
+}
+
 /// How many of the frames sent while one worker of a sender runtime is blocked (a call that never
 /// yields, for 2 s) reach the platform.
 fn frames_through_while_a_worker_is_blocked(workers: usize) -> (u32, u32) {

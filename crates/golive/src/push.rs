@@ -72,6 +72,21 @@ pub struct Retry {
     pub max_attempts: u32,
 }
 
+/// `Retry::max_attempts` of a destination that must not be retried at all (the streamer turned
+/// reconnecting off): it fails at the first failure and stays failed. (`0` is the opposite: no limit.)
+pub const NEVER_RETRY: u32 = u32::MAX;
+
+impl Retry {
+    /// No retry: the first failure is final.
+    pub fn never() -> Self {
+        Self { max_attempts: NEVER_RETRY, ..Self::default() }
+    }
+
+    pub fn is_never(&self) -> bool {
+        self.max_attempts == NEVER_RETRY
+    }
+}
+
 impl Default for Retry {
     fn default() -> Self {
         Self { first: Duration::from_secs(1), max: Duration::from_secs(30), max_attempts: DEFAULT_MAX_ATTEMPTS }
@@ -393,10 +408,17 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     let kick_refused = rapid_close && is_kick(&dest);
                     let server_refused = key_refused || matches!(err, PushError::Refused(..));
                     let is_refused = kick_refused || server_refused;
-                    let limit = if dest.retry.max_attempts == 0 {
+                    let never = dest.retry.is_never();
+                    let limit = if never {
+                        1
+                    } else if dest.retry.max_attempts == 0 {
                         0
                     } else if server_refused {
                         dest.retry.max_attempts.min(REFUSED_MAX_ATTEMPTS)
+                    } else if kick_refused {
+                        // A platform closing the stream at once is a refusal that takes a few tries
+                        // to be sure of, not the 25 an outage gets from the Studio's settings.
+                        dest.retry.max_attempts.min(DEFAULT_MAX_ATTEMPTS)
                     } else {
                         dest.retry.max_attempts
                     };
@@ -415,7 +437,9 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         .await
                         .unwrap_or(None);
                     }
-                    let give_up = if net_down {
+                    let give_up = if never {
+                        true
+                    } else if net_down {
                         limit > 0 && down_since.is_some_and(|t| t.elapsed() >= NETWORK_PATIENCE)
                     } else {
                         limit > 0 && attempt >= limit
@@ -443,7 +467,8 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         // change the answer. Anything else (an outage that outlasted the tries, a
                         // platform node down for minutes) is tried again slowly while the stream
                         // goes on, so one platform's bad half hour doesn't end it for the whole stream.
-                        if is_refused {
+                        // Reconnecting turned off: the same, the first failure is final.
+                        if is_refused || never {
                             tokio::select! {
                                 _ = stop.wait_for(|s| *s) => break 'streams,
                                 _ = live.wait_for(|l| !still_on(l)) => break,

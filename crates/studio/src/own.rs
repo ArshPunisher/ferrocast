@@ -1231,7 +1231,8 @@ fn sender(send_to: Option<Send<'_>>, target: Option<Target>, hub: &Arc<Hub>) -> 
             max_attempts: retries.max(1),
             ..Retry::default()
         },
-        None => Retry::default(),
+        // Reconnecting turned off: the first failure is final.
+        None => Retry::never(),
     };
     // Every track goes on (Go live then gives Twitch's VOD track and Enhanced Broadcasting's
     // other qualities to Twitch only); a stream without one has none to send.

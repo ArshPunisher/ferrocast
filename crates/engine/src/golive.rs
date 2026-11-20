@@ -1896,6 +1896,26 @@ impl Engine {
         Target::parse(&url).map_err(|e| e.to_string())
     }
 
+    /// How a destination reconnects: the Studio's Advanced settings (on or off, how many tries, how
+    /// long the first wait) govern every destination, so changing them there changes Twitch, YouTube
+    /// and Kick as well as the Studio's own feed. A destination's own first wait (Go live's advanced
+    /// settings) still wins when it was changed from the default; a server's refusal still caps the
+    /// tries at three. Streaming from OBS (no Studio) keeps Go live's own defaults.
+    async fn destination_retry(&self, id: &str) -> ferrocast_golive::push::Retry {
+        let advanced = self.golive_config().advanced;
+        let mut r = advanced.retry(id);
+        let Ok(host) = self.studio_host() else { return r };
+        let s = host.settings().await;
+        if !s.reconnect {
+            return ferrocast_golive::push::Retry::never();
+        }
+        r.max_attempts = s.reconnect_tries;
+        if advanced.per.get(id).is_none_or(|a| a.first_retry_s == DestAdvanced::default().first_retry_s) {
+            r.first = Duration::from_secs(u64::from(s.reconnect_every_s.max(1)));
+        }
+        r
+    }
+
     /// The saved stream keys of the custom servers on the vertical canvas.
     fn vertical_custom_keys(&self) -> Vec<String> {
         self.golive_config()
@@ -1957,7 +1977,7 @@ impl Engine {
             id: d.id.clone(),
             target,
             key,
-            retry: self.golive_config().advanced.retry(&d.id),
+            retry: self.destination_retry(&d.id).await,
             // Twitch's VOD track: only Twitch knows what to do with an extra audio track.
             extra_audio: d.kind == Service::Twitch,
             extra_video,
