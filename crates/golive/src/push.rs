@@ -289,9 +289,10 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                 _ => &dest.target,
             };
             set_state(&health, PushState::Connecting);
+            let mut live_at: Option<Instant> = None;
             let outcome = tokio::select! {
                 _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
-                r = session(&dest, target, &hub, &health, stream, via.as_ref()) => r,
+                r = session(&dest, target, &hub, &health, stream, via.as_ref(), &mut live_at) => r,
             };
             match outcome {
                 Ok(Ended::Stopped) => break 'streams,
@@ -305,9 +306,9 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     // the longest wait. One that took the stream and closed it at once doesn't
                     // (19 Nov, live: Kick took it and closed it every 8 s for the whole stream,
                     // always "attempt 1", never waiting longer and never saying why).
-                    let (was_live, live_for_ms) = {
-                        let h = health.borrow();
-                        (h.state == PushState::Live, now_ms().saturating_sub(h.since_ms))
+                    let (was_live, live_for_ms) = match live_at {
+                        Some(t) => (true, u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                        None => (false, 0),
                     };
                     ever_live |= was_live;
                     // A hang-up at the publish: a wrong key before the key ever worked in this
@@ -496,7 +497,10 @@ pub(crate) fn backoff(attempt: u32, retry: &Retry) -> Duration {
 }
 
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    #[cfg(test)]
+    let t = t.saturating_add_signed(fault::CLOCK_STEP_MS.with(std::cell::Cell::get));
+    t
 }
 
 /// What a failed TCP connect says: no route, no network or a name that can't be looked up is the
@@ -522,6 +526,10 @@ pub(crate) mod fault {
         if down {
             d.push(port);
         }
+    }
+    thread_local! {
+        /// The wall clock stepped by this many ms in this test (an NTP correction, a wake from sleep).
+        pub(crate) static CLOCK_STEP_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     }
     pub(crate) fn is_down(port: u16) -> bool {
         DOWN.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
@@ -570,6 +578,7 @@ async fn session(
     health: &watch::Sender<Health>,
     stream: u64,
     via: Option<&links::Network>,
+    live_at: &mut Option<Instant>,
 ) -> Result<Ended, PushError> {
     let mut p = Publisher::open(target, &dest.key, via).await?;
     // Its name asks the system (a quick command): off the async threads.
@@ -613,6 +622,8 @@ async fn session(
         }
     }
     set_state(health, PushState::Live);
+    // Measured on the monotonic clock: the wall clock steps (NTP, a wake from sleep).
+    *live_at = Some(Instant::now());
     let mut base: Option<u32> = None;
     let mut started = false;
     let mut video_drop = VideoDrop::default();

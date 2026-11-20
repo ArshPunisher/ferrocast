@@ -752,6 +752,29 @@ async fn a_platform_that_takes_the_stream_and_drops_it_at_once_waits_longer_each
     }
 }
 
+/// How long a session has been live is measured on the monotonic clock: an NTP step or a wake from
+/// sleep moves the wall clock, and a forward one made a session live for a moment count as one live
+/// for hours (the retry count started over and the waits never grew; a backward one made a long
+/// one count as a moment: a false "Kick refused the stream").
+#[tokio::test]
+async fn a_wall_clock_step_does_not_change_how_long_a_session_was_live() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops(l, "k", Duration::from_millis(400)).await;
+    let mut health = start(&w, destination(dport, "k"));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    for want in 1..=2u32 {
+        state_is(&mut health, |s| *s == PushState::Live).await;
+        // The clock jumps an hour ahead while it is live.
+        push::fault::CLOCK_STEP_MS.with(|c| c.set(c.get() + 3_600_000));
+        match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
+            PushState::Reconnecting { attempt, .. } => assert_eq!(attempt, want, "the count goes on"),
+            s => panic!("{s:?}"),
+        }
+    }
+}
+
 /// ffmpeg on this machine, for the cut-from-stream tests (skipped where there's none).
 fn ffmpeg() -> Option<std::path::PathBuf> {
     ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
