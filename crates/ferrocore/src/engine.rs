@@ -3189,7 +3189,9 @@ fn find_item_effects(st: &State, scene: &str, item_id: i64, source_id: u64, dept
     }
     let items = st.scenes.get(scene)?;
     for i in items {
-        if i.item_id == item_id && (i.source == source_id || i.scene.is_some()) {
+        // The item itself: same number AND the same source. Item numbers restart in every
+        // scene, so a nested scene's item with the same number is someone else's.
+        if i.item_id == item_id && i.source == source_id {
             return Some(i.effects.clone());
         }
     }
@@ -8801,6 +8803,46 @@ mod tests {
 
         e.remove_source(1);
         assert!(e.levels(1).is_none());
+    }
+
+    #[test]
+    fn an_items_preview_is_not_a_nested_scene_with_the_same_number() {
+        let Some(e) = engine() else { return };
+        // Item numbers restart in every scene: "Outer" item 1 is the nested scene "Inner", and
+        // "Inner" item 1 is the Box with its own dimming filter.
+        let doc = serde_json::json!({
+            "current_program_scene": "Outer",
+            "sources": [
+                {
+                    "id": "color_source_v3",
+                    "name": "Box",
+                    "settings": { "color": 0xFF00_00FFu32, "width": 320, "height": 180 },
+                    "filters": [
+                        { "id": "ferrocast_rounded_corners", "name": "Round", "settings": { "radius": 40 } }
+                    ]
+                },
+                {
+                    "id": "scene",
+                    "name": "Inner",
+                    "settings": { "items": [{
+                        "id": 1,
+                        "name": "Box",
+                        "ferrocast_filters": [
+                            { "id": "color_filter_v2", "name": "Dim", "settings": { "brightness": -0.5 } }
+                        ]
+                    }] }
+                },
+                { "id": "scene", "name": "Outer", "settings": { "items": [{ "id": 1, "name": "Inner" }] } }
+            ]
+        });
+        assert!(e.load_obs(&doc).is_empty());
+        let box_id = e.source_named("Box").map(|(id, _)| id).unwrap();
+        let via_outer = e.snapshot_item_filtered("Outer", 1, box_id, (160, 90)).unwrap();
+        let own = e.snapshot_item_filtered("Inner", 1, box_id, (160, 90)).unwrap();
+        let (mid, corner) = ((45 * 160 + 80) * 4, (160 + 1) * 4);
+        assert_eq!(via_outer[corner + 3], 255, "the Box's own filters (no rounded corners), not the nested scene's");
+        assert!(via_outer[mid] < 205, "the Box's own dimming: {}", via_outer[mid]);
+        assert_eq!(&via_outer[mid..mid + 4], &own[mid..mid + 4]);
     }
 
     #[test]
