@@ -468,6 +468,15 @@ fn main() {
             if let Some(l) = LOG_FILE.get() {
                 l.flush(std::time::Duration::from_secs(2));
             }
+            // Help > Restart in Safe Mode: now that the quit is clean, start again with the flag.
+            #[cfg(target_os = "macos")]
+            if quit::RELAUNCH_SAFE.load(Ordering::SeqCst) {
+                let mut env = app.env();
+                if !env.args_os.iter().any(|a| a == SAFE_MODE_ARG) {
+                    env.args_os.push(SAFE_MODE_ARG.into());
+                }
+                tauri::process::restart(&env);
+            }
         }
         _ => {}
     });
