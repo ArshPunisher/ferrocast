@@ -254,8 +254,9 @@ fn append(tap: &Tap, samples: &[f32]) {
     let Ok(f) = tap.feed.lock() else { return };
     let Some(request) = &f.request else { return };
     // SAFETY: a new buffer the size of the chunk; its one channel is filled before it's
-    // appended, and the request copies it.
-    unsafe {
+    // appended, and the request copies it. Wrap in an autorelease pool because `append()` runs
+    // 20×/s on a raw Rust thread without an NSRunLoop.
+    objc2::rc::autoreleasepool(|_| unsafe {
         let Some(buf) = AVAudioPCMBuffer::initWithPCMFormat_frameCapacity(AVAudioPCMBuffer::alloc(), &f.format, n)
         else {
             return;
@@ -267,5 +268,5 @@ fn append(tap: &Tap, samples: &[f32]) {
         }
         std::ptr::copy_nonoverlapping(samples.as_ptr(), (*chans).as_ptr(), samples.len());
         request.appendAudioPCMBuffer(&buf);
-    }
+    });
 }

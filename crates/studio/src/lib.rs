@@ -337,6 +337,20 @@ pub enum CameraShows {
     Source(String),
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) struct AloneGuard {
+    pub(crate) shared: std::sync::Arc<own::Shared>,
+    pub(crate) name: String,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for AloneGuard {
+    fn drop(&mut self) {
+        self.shared.release_alone(&self.name);
+    }
+}
+
 /// The virtual camera: on Linux what's on air sent to a v4l2loopback camera; on Windows
 /// Ferrocast Camera (`wincam`); a Mac needs a signed camera extension, not here yet, so
 /// turning it on there says why.
@@ -346,6 +360,10 @@ pub struct VirtualCamera {
     pub(crate) cam: virtualcam::Loopback,
     #[cfg(target_os = "windows")]
     pub(crate) cam: wincam::Camera,
+    // Declared AFTER `cam` so `wincam::Camera` stops and joins its thread before the solo scene
+    // is released (Rust drops fields in declaration order).
+    #[cfg(target_os = "windows")]
+    pub(crate) _alone: Option<AloneGuard>,
 }
 
 impl VirtualCamera {

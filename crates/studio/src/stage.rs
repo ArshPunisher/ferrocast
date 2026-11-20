@@ -376,6 +376,7 @@ impl Stage {
             .collect();
         let mut ndis = self.ndis.borrow_mut();
         ndis.retain(|name, (was, _)| want.iter().any(|(n, src)| n == name && src == was));
+        self.ndi_failed.borrow_mut().retain(|name, _| want.iter().any(|(n, _)| n == name));
         for (name, src) in want {
             let Some(feed) = e.engine.source_named(&name).and_then(|(id, _)| e.engine.fed(id)) else { continue };
             match ndis.get(&name) {
@@ -2877,8 +2878,10 @@ impl Stage {
             self.source(name)?;
             let e = self.engine()?;
             let (scene, w, h) = crate::own::show_alone(&e.engine, name, (self.canvas.width, self.canvas.height))?;
-            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()))?;
-            return Ok((px, (w, h)));
+            e.keep_alone(name);
+            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()));
+            e.release_alone(name);
+            return px.map(|px| (px, (w, h)));
         };
         let px = self.engine()?.engine.snapshot_scene_at(name, size, size).map_err(|e| fail(e.to_string()))?;
         Ok((px, size))
@@ -3118,7 +3121,7 @@ impl Stage {
     pub fn virtual_camera(&self, source: Option<&str>) -> Result<crate::VirtualCamera, StudioError> {
         let e = self.engine()?;
         let canvas = (self.canvas.width, self.canvas.height);
-        let (scene, size) = match source {
+        let (scene, size, alone) = match source {
             Some(name) => {
                 if e.engine.source_named(name).is_none()
                     && self.scene_index(name).is_err()
@@ -3127,12 +3130,13 @@ impl Stage {
                     return Err(fail(format!("There's no source called \"{name}\".")));
                 }
                 let (scene, w, h) = own::show_alone(&e.engine, name, canvas)?;
-                (Some(scene), (w, h))
+                e.keep_alone(name);
+                (Some(scene), (w, h), Some(crate::AloneGuard { shared: e.clone(), name: name.to_string() }))
             }
-            None => (None, canvas),
+            None => (None, canvas, None),
         };
         let cam = crate::wincam::Camera::start(Arc::downgrade(&e), scene, size, self.canvas.fps).map_err(fail)?;
-        Ok(crate::VirtualCamera { cam })
+        Ok(crate::VirtualCamera { cam, _alone: alone })
     }
 
     /// Listens to a source's sound (mono, 48 kHz) for anything that wants it: Whisper captions.
@@ -4246,6 +4250,8 @@ pub struct StageProjector {
     win: crate::ffi::projector_window::Win,
     /// A multiview's layout (shared with its window's clicks and resizes).
     multiview: Option<std::rc::Rc<RefCell<MultiviewState>>>,
+    /// Source name pinned via `keep_alone`, released on `Drop`.
+    alone: Option<String>,
 }
 
 /// What a multiview shows and where: the scenes, Studio Mode's preview, the look, the canvas
@@ -4359,16 +4365,16 @@ impl Stage {
         use crate::ProjectorOf as P;
         let shared = self.engine()?;
         let canvas = (self.canvas.width, self.canvas.height);
-        let (title, scene, size) = match of {
+        let (title, scene, size, alone) = match of {
             P::Program | P::Multiview => {
                 let title = if *of == P::Multiview { "Multiview" } else { "Projector: what's on air" };
-                (title.to_string(), None, canvas)
+                (title.to_string(), None, canvas, None)
             }
             P::Source(name) => {
                 let canvas = self.canvas_of(name);
                 let (scene, w, h) = own::show_alone(&shared.engine, name, canvas)?;
                 shared.keep_alone(name);
-                (format!("Projector: {name}"), Some(scene), (w, h))
+                (format!("Projector: {name}"), Some(scene), (w, h), Some(name.clone()))
             }
         };
         let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
@@ -4410,14 +4416,25 @@ impl Stage {
             None => Box::new(|_, _, _, _| {}),
         };
         let hooks = crate::ffi::projector_window::Hooks { click, close: on_close, resize };
-        let win = crate::ffi::projector_window::open(&title, aspect, screen, hooks)
-            .ok_or_else(|| fail("The projector's window couldn't be made."))?;
+        let Some(win) = crate::ffi::projector_window::open(&title, aspect, screen, hooks) else {
+            if let Some(name) = &alone {
+                shared.release_alone(name);
+            }
+            return Err(fail("The projector's window couldn't be made."));
+        };
         let (pw, ph) = win.pixels();
         // SAFETY: the window's view lives as long as the StageProjector, which stops the engine
         // drawing in it before the window goes (`Drop`).
         #[allow(unsafe_code)]
-        let id = unsafe { shared.engine.start_preview_of(win.view_ptr(), pw, ph, size, scene) }
-            .map_err(|e| fail(format!("the projector couldn't be drawn: {e}")))?;
+        let id = match unsafe { shared.engine.start_preview_of(win.view_ptr(), pw, ph, size, scene) } {
+            Ok(id) => id,
+            Err(e) => {
+                if let Some(name) = &alone {
+                    shared.release_alone(name);
+                }
+                return Err(fail(format!("the projector couldn't be drawn: {e}")));
+            }
+        };
         id_cell.set(Some(id));
         shared.engine.set_preview_look(
             id,
@@ -4427,7 +4444,7 @@ impl Stage {
             mv.borrow_mut().view = (pw, ph);
             mv.borrow().apply(&shared, id);
         }
-        Ok(StageProjector { shared, id, win, multiview })
+        Ok(StageProjector { shared, id, win, multiview, alone })
     }
 }
 
@@ -4460,6 +4477,9 @@ impl StageProjector {
 impl Drop for StageProjector {
     fn drop(&mut self) {
         self.shared.engine.stop_preview(self.id);
+        if let Some(name) = &self.alone {
+            self.shared.release_alone(name);
+        }
         self.win.close();
     }
 }
@@ -4588,13 +4608,19 @@ pub fn can_share(
 }
 
 /// Logs `what` the first time this run (a profile from before Ferrocore keeps its muxer
-/// settings, with no box left to clear them: said once, not at every recording).
+/// settings, with no box left to clear them: said once, not at every recording). Bounded so
+/// varied warnings over weeks never grow unboundedly.
 fn say_once(what: String) {
-    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    const MAX_SAID: usize = 256;
+    static SAID: std::sync::Mutex<std::collections::VecDeque<String>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
     if !said.contains(&what) {
         tracing::warn!("{what}");
-        said.push(what);
+        if said.len() >= MAX_SAID {
+            said.pop_front();
+        }
+        said.push_back(what);
     }
 }
 
@@ -5875,5 +5901,33 @@ mod tests {
         assert_eq!(s.scenes().len(), 1, "still not in the main list");
         ok(s.rename("Main", "First"));
         assert!(ok(s.scene_transition_of("First")).is_some(), "its override came along");
+    }
+
+    #[test]
+    fn solo_scenes_are_refcounted_and_removed_on_last_release() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        let _ = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Card",
+            &json!({ "color": 4278190335u32, "width": 160, "height": 90 }),
+            false,
+        ));
+        let base_scenes = e.engine.scene_names().len();
+        for _ in 0..1_000 {
+            let (scene, _, _) = ok(own::show_alone(&e.engine, "Card", (320, 180)));
+            e.keep_alone("Card");
+            e.keep_alone("Card");
+            assert_eq!(e.alone_count(), 1);
+            assert!(e.engine.scene(&scene).is_some());
+            e.release_alone("Card");
+            assert_eq!(e.alone_count(), 1, "still held by second owner");
+            assert!(e.engine.scene(&scene).is_some());
+            e.release_alone("Card");
+            assert_eq!(e.alone_count(), 0);
+            assert!(e.engine.scene(&scene).is_none(), "hidden solo scene removed at refcount 0");
+        }
+        assert_eq!(e.engine.scene_names().len(), base_scenes);
     }
 }

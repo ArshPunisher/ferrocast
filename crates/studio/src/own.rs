@@ -178,8 +178,10 @@ struct Seen {
     on_air: Option<String>,
     /// What couldn't come over.
     skipped: Vec<String>,
-    /// Sources shown on their own (Source Record): their scenes come back after a reopen.
-    alone: Vec<String>,
+    /// Sources shown on their own (Source Record, projectors, screenshots), reference-counted so
+    /// their hidden scenes survive reopens while any holder is open and are removed when the last
+    /// holder closes.
+    alone: std::collections::HashMap<String, usize>,
     /// Outputs showing the vertical picture: they follow its scene on air.
     vertical: Vec<u64>,
     /// Faded to black (OBS's Fade to Black): black stays on air until it fades back.
@@ -218,7 +220,7 @@ impl Shared {
                 opened: std::time::Instant::now(),
                 on_air,
                 skipped,
-                alone: Vec::new(),
+                alone: std::collections::HashMap::new(),
                 vertical: Vec::new(),
                 black: false,
             }),
@@ -229,13 +231,37 @@ impl Shared {
         self.seen.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Keeps a source shown alone (a projector of it) through reopens.
-    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    /// Keeps a source shown alone (a projector, screenshot, or Source Record) through reopens.
+    /// Pair every call with [`Self::release_alone`].
     pub(crate) fn keep_alone(&self, name: &str) {
         let mut seen = self.seen();
-        if !seen.alone.iter().any(|n| n == name) {
-            seen.alone.push(name.to_string());
+        *seen.alone.entry(name.to_string()).or_insert(0) += 1;
+    }
+
+    /// Releases one holder of `name`'s solo scene; removes the hidden scene once no holders remain.
+    pub(crate) fn release_alone(&self, name: &str) {
+        let remove = {
+            let mut seen = self.seen();
+            match seen.alone.get_mut(name) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                Some(_) => {
+                    seen.alone.remove(name);
+                    true
+                }
+                None => false,
+            }
+        };
+        if remove {
+            self.engine.remove_scene(&alone_scene(name));
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alone_count(&self) -> usize {
+        self.seen().alone.len()
     }
 
     pub(crate) fn skipped(&self) -> Vec<String> {
@@ -276,7 +302,8 @@ impl Shared {
             tracing::warn!("Ferrocast's own engine left this out: {s}");
         }
         seen.skipped = skipped;
-        for name in seen.alone.clone() {
+        let alone_names: Vec<String> = seen.alone.keys().cloned().collect();
+        for name in alone_names {
             if let Err(e) = keep_alone_scene(&self.engine, &name) {
                 tracing::warn!("Ferrocast's own engine lost the source it records: {e}");
             }
@@ -710,10 +737,7 @@ impl OwnStream {
             // The encoders' NV12 wants even sides: an odd last row or column is left out,
             // the picture never scaled for it.
             (out.scene, out.width, out.height, out.scaled_from) = (Some(scene), w.max(2) & !1, h.max(2) & !1, None);
-            let mut seen = shared.seen();
-            if !seen.alone.iter().any(|n| n == name) {
-                seen.alone.push(name.to_string());
-            }
+            shared.keep_alone(name);
         }
         // OBS's tracks (1 to 6): the first is the file's first sound track, the rest follow.
         let mut picked = tracks.iter().filter(|t| (1..=6).contains(*t)).map(|t| usize::from(*t) - 1);
@@ -727,7 +751,15 @@ impl OwnStream {
         if streaming {
             hub.metadata(metadata_of(&video, &audio, out.width, out.height, config.fps));
         }
-        let output = engine.start_output_with(kind, out, video, audio).map_err(|e| fail(e.to_string()))?;
+        let output = match engine.start_output_with(kind, out, video, audio) {
+            Ok(id) => id,
+            Err(e) => {
+                if let Some(name) = solo {
+                    shared.release_alone(name);
+                }
+                return Err(fail(e.to_string()));
+            }
+        };
         if vertical {
             shared.seen().vertical.push(output);
         }
@@ -1246,13 +1278,15 @@ impl Drop for OwnStream {
                     tracing::warn!(role = ?d.role, "a shared output's part didn't end cleanly: {e}");
                 }
             }
-            // A source no longer recorded alone needn't come back after a reopen.
-            if let Some(name) = &d.solo {
-                d.shared.seen().alone.retain(|n| n != name);
-            }
+            // A source no longer recorded alone needn't come back after a reopen; release after
+            // `drop(d)` stops the output so the hidden scene is never removed while still rendered.
+            let solo_release = d.solo.as_ref().map(|name| (d.shared.clone(), name.clone()));
             // The last holder's lease stops the output first, so its last tags reach the hub
             // before it ends.
             drop(d);
+            if let Some((shared, name)) = solo_release {
+                shared.release_alone(&name);
+            }
             if let Some(hub) = self.hub.take() {
                 hub.end();
             }
