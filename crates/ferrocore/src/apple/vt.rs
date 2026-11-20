@@ -145,6 +145,8 @@ struct Sink {
     packets: Vec<VideoPacket>,
     header: Option<Vec<u8>>,
     error: Option<String>,
+    /// The status behind `error`, to tell a lost session from a bad frame.
+    status: Option<OSStatus>,
 }
 
 /// One VideoToolbox session.
@@ -156,6 +158,12 @@ pub(crate) struct Encoder {
     input: PixelFormat,
     height: usize,
     frame_us: i64,
+    /// To make the session again when the system takes it away.
+    cfg: VideoConfig,
+    /// The bitrate now (it may have been changed live): what a new session starts with.
+    rate_now: (u32, RateControl),
+    /// The last failure was a lost session (see `recoverable`), not a bad frame.
+    lost: bool,
 }
 
 // SAFETY: the session is only used through `&mut self` (one thread at a time); VideoToolbox
@@ -227,6 +235,14 @@ fn set_rate(session: &Owned, kbps: u32, rate: RateControl) -> Result<(), AvError
         }
     }
     Ok(())
+}
+
+/// Statuses that mean the session is gone, not that the frame was bad: the system took it back
+/// (display sleep, screen lock, the media server restarting) and Apple's way is to make a new one.
+/// -12903 kVTInvalidSessionErr, -12911 kVTVideoEncoderMalfunctionErr,
+/// -12915 kVTVideoEncoderNotAvailableNowErr.
+fn recoverable(status: OSStatus) -> bool {
+    matches!(status, -12903 | -12911 | -12915)
 }
 
 fn fail(what: &str, status: OSStatus) -> AvError {
@@ -325,12 +341,17 @@ impl Encoder {
             input: cfg.input,
             height: cfg.height as usize,
             frame_us: (1_000_000.0 / fps).round() as i64,
+            cfg: *cfg,
+            rate_now: (cfg.bitrate_kbps, cfg.rate),
+            lost: false,
         })
     }
 
     /// A new bitrate for what's encoded from now on.
     pub(crate) fn set_rate(&mut self, kbps: u32, rate: RateControl) -> Result<(), AvError> {
-        set_rate(&self.session, kbps, rate)
+        set_rate(&self.session, kbps, rate)?;
+        self.rate_now = (kbps, rate);
+        Ok(())
     }
 
     pub(crate) fn header(&self) -> Option<Vec<u8>> {
@@ -338,9 +359,28 @@ impl Encoder {
     }
 
     pub(crate) fn encode(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
+        self.lost = false;
+        match self.encode_once(frame, pts_us, key) {
+            Err(first) if self.lost => {
+                // The system took the session back: a new one, and this frame goes in as a
+                // keyframe so the stream picks up at once. One try: a second loss is a real fault.
+                tracing::warn!(error = %first, "the Mac's video encoder session was lost; making a new one");
+                let mut fresh = Encoder::new(&self.cfg)?;
+                set_rate(&fresh.session, self.rate_now.0, self.rate_now.1)?;
+                fresh.rate_now = self.rate_now;
+                std::mem::swap(self, &mut fresh);
+                self.lost = false;
+                self.encode_once(frame, pts_us, true)
+            }
+            other => other,
+        }
+    }
+
+    fn encode_once(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
         // SAFETY: the session is live; the pool belongs to it (not retained: "Get").
         let pool = unsafe { VTCompressionSessionGetPixelBufferPool(self.session.0) };
         if pool.is_null() {
+            self.lost = true;
             return Err(AvError::Encoder("the Mac's video encoder lost its frame pool".into()));
         }
         let mut buf: CFTypeRef = ptr::null();
@@ -391,6 +431,7 @@ impl Encoder {
             )
         };
         if s != 0 {
+            self.lost = recoverable(s);
             return Err(fail("encode a frame", s));
         }
         self.take()
@@ -452,9 +493,10 @@ impl Encoder {
         self.take()
     }
 
-    fn take(&self) -> Result<Vec<VideoPacket>, AvError> {
+    fn take(&mut self) -> Result<Vec<VideoPacket>, AvError> {
         let mut sink = self.sink.lock().map_err(|_| AvError::Encoder("the video encoder stopped".into()))?;
         if let Some(e) = sink.error.take() {
+            self.lost = sink.status.take().is_some_and(recoverable);
             return Err(AvError::Encoder(e));
         }
         Ok(std::mem::take(&mut sink.packets))
@@ -479,6 +521,7 @@ extern "C" fn output(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus,
     let Ok(mut sink) = sink.lock() else { return };
     if status != 0 {
         sink.error = Some(format!("the Mac's video encoder failed a frame (error {status})"));
+        sink.status = Some(status);
         return;
     }
     if flags & DROPPED != 0 {
@@ -530,5 +573,66 @@ extern "C" fn output(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus,
             }
         }
         sink.packets.push(VideoPacket { pts_us: pts, dts_us: dts, key, data });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> VideoConfig {
+        VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 320,
+            height: 180,
+            fps_num: 30,
+            fps_den: 1,
+            bitrate_kbps: 1500,
+            rate: RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+        }
+    }
+
+    fn frame(buf: &(Vec<u8>, Vec<u8>)) -> Frame<'_> {
+        Frame::Nv12 { y: &buf.0, y_stride: 320, uv: &buf.1, uv_stride: 320 }
+    }
+
+    /// The system takes the session away (display sleep, screen lock, the media server restarting:
+    /// agy GAPS #4): the encoder makes a new one and goes on with a keyframe, not an error that
+    /// ends the stream.
+    #[test]
+    fn a_session_the_system_invalidated_is_made_again() {
+        let Ok(mut e) = Encoder::new(&config()) else { return };
+        let pix = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        let mut keys = 0;
+        for i in 0..5 {
+            e.encode(frame(&pix), i * 33_333, i == 0).unwrap_or_else(|x| panic!("before: {x}"));
+        }
+        // SAFETY: the session is live; the system does the same when it takes one back.
+        unsafe { VTCompressionSessionInvalidate(e.session.0) };
+        let mut failed = None;
+        for i in 5..40 {
+            match e.encode(frame(&pix), i * 33_333, false) {
+                Ok(packets) => keys += packets.iter().filter(|p| p.key).count(),
+                Err(x) => {
+                    failed = Some(x.to_string());
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(failed, None, "an invalidated session must be recreated, not fail the output");
+        assert!(keys >= 1, "the new session starts with a keyframe");
+    }
+
+    #[test]
+    fn only_a_lost_session_is_worth_recreating() {
+        assert!(recoverable(-12903), "kVTInvalidSessionErr");
+        assert!(recoverable(-12911), "kVTVideoEncoderMalfunctionErr");
+        assert!(recoverable(-12915), "kVTVideoEncoderNotAvailableNowErr");
+        assert!(!recoverable(0));
+        assert!(!recoverable(-12902), "a bad property won't mend with a new session");
     }
 }
