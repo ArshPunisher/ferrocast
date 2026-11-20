@@ -115,7 +115,7 @@ pub struct Stage {
     ndis: RefCell<std::collections::HashMap<String, (String, crate::ndi_io::NdiIn)>>,
     /// NDI sources that didn't start, with why (said once, tried again at each edit).
     ndi_failed: RefCell<std::collections::HashMap<String, String>>,
-    /// Remove background filters at work, by their mask picture's name.
+    /// Remove background at work: one worker for each source that has it, by the source's name.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     cutouts: RefCell<std::collections::HashMap<String, crate::cutout::Cutout>>,
     /// The frame rate as last worked out: when, the engine's frames and skipped count then,
@@ -323,6 +323,86 @@ fn video_filters_from(source: &Value) -> Vec<Value> {
     clone_filters_with_fresh_uuids(list, |f| !ferrocore::obs::is_audio_filter_kind(kind_of(f)))
 }
 
+/// What Remove background has to work on: each source and the mask pictures its filters feed
+/// (the engine names them: `source: filter` for the source's own filters, `scene#item: filter`
+/// for an item's own). The mask comes from the picture alone, so one worker serves all of them.
+/// Hidden items are left out. Studio Mode's copies of the scene on air count as scenes.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn cutout_plan(sources: &[Value], doc: &Value) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut want: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut add = |source: &str, mask: String| {
+        let l = want.entry(source.to_string()).or_default();
+        if !l.contains(&mask) {
+            l.push(mask);
+        }
+    };
+    let mut shared_users: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut clone_users: Vec<(String, String)> = Vec::new();
+    let mut containers: Vec<(String, Vec<Value>)> = Vec::new();
+    for s in sources {
+        let kind = kind_of(s);
+        if matches!(kind, "scene" | "group") {
+            let items = s.pointer("/settings/items").and_then(Value::as_array).cloned().unwrap_or_default();
+            containers.push((name_of(s).to_string(), items));
+        } else if matches!(kind, "ferrocast_clone" | "source-clone")
+            && s.pointer("/settings/filters").and_then(Value::as_bool) != Some(false)
+            && let Some(target) = s.pointer("/settings/clone").and_then(Value::as_str)
+        {
+            clone_users.push((name_of(s).to_string(), target.to_string()));
+        }
+    }
+    for k in ["program_copy", "program_prev"] {
+        let c = &doc["ferrocast"][k];
+        if let (Some(private), Some(items)) = (c["private"].as_str(), c["items"].as_array())
+            && PROGRAM_COPY.contains(&private)
+        {
+            containers.push((private.to_string(), items.clone()));
+        }
+    }
+    for (container, items) in &containers {
+        for it in items {
+            if it.get("visible").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let src_name = name_of(it).to_string();
+            if let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                let item_id = it.get("id").and_then(Value::as_i64).unwrap_or(0);
+                for f in ov.iter().filter(|f| is_active_cutout(f)) {
+                    add(&src_name, format!("{container}#{item_id}: {}", cutout_filter_name(f)));
+                }
+            } else {
+                shared_users.insert(src_name);
+            }
+        }
+    }
+    // Any clone that brings its target's filters keeps source-level cutouts on that target live
+    // when at least one placement uses the clone without an item override.
+    loop {
+        let mut changed = false;
+        for (clone_name, target) in &clone_users {
+            if shared_users.contains(clone_name) && shared_users.insert(target.clone()) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for s in sources {
+        if matches!(kind_of(s), "scene" | "group") {
+            continue;
+        }
+        let source = name_of(s).to_string();
+        if !shared_users.contains(&source) {
+            continue;
+        }
+        for f in s.get("filters").and_then(Value::as_array).into_iter().flatten().filter(|f| is_active_cutout(f)) {
+            add(&source, format!("{source}: {}", cutout_filter_name(f)));
+        }
+    }
+    want
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn is_active_cutout(f: &Value) -> bool {
     kind_of(f) == "ferrocast_remove_background" && f.get("enabled").and_then(Value::as_bool) != Some(false)
@@ -455,69 +535,21 @@ impl Stage {
         out
     }
 
-    /// Starts or stops finding the person for each Remove background filter that's on.
+    /// Starts or stops finding the person for each Remove background filter that's on: one
+    /// worker for each source, feeding every filter's mask picture.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sync_cutouts(&self, e: &Arc<own::Shared>) {
-        let mut want: Vec<(String, String)> = Vec::new();
-        let mut shared_users: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut clone_users: Vec<(String, String)> = Vec::new();
-        for s in self.sources_list() {
-            let kind = kind_of(&s);
-            if matches!(kind, "scene" | "group") {
-                let container = name_of(&s).to_string();
-                for it in s.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten() {
-                    let src_name = name_of(it).to_string();
-                    if let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) {
-                        let item_id = it.get("id").and_then(Value::as_i64).unwrap_or(0);
-                        for f in ov.iter().filter(|f| is_active_cutout(f)) {
-                            let fname = cutout_filter_name(f);
-                            want.push((format!("{container}#{item_id}: {fname}"), src_name.clone()));
-                        }
-                    } else {
-                        shared_users.insert(src_name);
-                    }
-                }
-            } else if matches!(kind, "ferrocast_clone" | "source-clone")
-                && s.pointer("/settings/filters").and_then(Value::as_bool) != Some(false)
-                && let Some(target) = s.pointer("/settings/clone").and_then(Value::as_str)
-            {
-                clone_users.push((name_of(&s).to_string(), target.to_string()));
-            }
-        }
-        // Any clone that brings its target's filters keeps source-level cutouts on that target live
-        // when at least one placement uses the clone without an item override.
-        loop {
-            let mut changed = false;
-            for (clone_name, target) in &clone_users {
-                if shared_users.contains(clone_name) && shared_users.insert(target.clone()) {
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        for s in self.sources_list() {
-            if matches!(kind_of(&s), "scene" | "group") {
-                continue;
-            }
-            let source = name_of(&s).to_string();
-            if !shared_users.contains(&source) {
-                continue;
-            }
-            for f in s.get("filters").and_then(Value::as_array).into_iter().flatten().filter(|f| is_active_cutout(f)) {
-                let fname = cutout_filter_name(f);
-                // The engine names the mask picture so (ferrocore::obs).
-                want.push((format!("{source}: {fname}"), source.clone()));
-            }
-        }
+        let want = cutout_plan(&self.sources_list(), &self.doc.borrow());
         let mut cutouts = self.cutouts.borrow_mut();
         // Gone, or working for an engine that's gone (a new canvas): stopped.
-        cutouts.retain(|mask, c| c.serves(e) && want.iter().any(|(m, _)| m == mask));
-        for (mask, source) in want {
-            cutouts
-                .entry(mask.clone())
-                .or_insert_with(|| crate::cutout::Cutout::start(Arc::downgrade(e), source, mask));
+        cutouts.retain(|source, c| c.serves(e) && want.contains_key(source));
+        for (source, masks) in want {
+            match cutouts.get(&source) {
+                Some(c) => c.set_masks(masks),
+                None => {
+                    cutouts.insert(source.clone(), crate::cutout::Cutout::start(Arc::downgrade(e), source, masks));
+                }
+            }
         }
     }
 
@@ -2327,8 +2359,43 @@ impl Stage {
         if gone { Ok(()) } else { Err(fail(format!("\"{owner}\" has no filter called \"{filter}\"."))) }
     }
 
+    /// Switches a source's filter. The item overrides that came from it (a copy made when the
+    /// source was added to another scene) have a filter of the same name and kind: they follow,
+    /// so a hotkey, a Stream Deck button or obs-websocket reaches every scene the source is in.
+    /// An item's own filter of that name that is a different kind is left alone.
     pub fn set_filter_enabled(&self, name: &str, filter: &str, on: bool) -> Result<(), StudioError> {
-        self.set_target_filter_enabled(FilterTarget::Source(name), filter, on)
+        let kind = self.filter_list(name)?.iter().find(|f| name_of(f) == filter).map(|f| kind_of(f).to_string());
+        self.set_target_filter_enabled(FilterTarget::Source(name), filter, on)?;
+        let Some(kind) = kind else { return Ok(()) };
+        let follows = |it: &Value| {
+            name_of(it) == name
+                && it.get("ferrocast_filters").and_then(Value::as_array).is_some_and(|l| {
+                    l.iter().any(|f| {
+                        name_of(f) == filter && kind_of(f) == kind && f["enabled"].as_bool().unwrap_or(true) != on
+                    })
+                })
+        };
+        let any = self
+            .sources_list()
+            .iter()
+            .any(|s| s.pointer("/settings/items").and_then(Value::as_array).is_some_and(|l| l.iter().any(follows)));
+        if any {
+            self.edit(|d| {
+                for s in d["sources"].as_array_mut().into_iter().flatten() {
+                    for it in s.pointer_mut("/settings/items").and_then(Value::as_array_mut).into_iter().flatten() {
+                        if !follows(it) {
+                            continue;
+                        }
+                        for f in it["ferrocast_filters"].as_array_mut().into_iter().flatten() {
+                            if name_of(f) == filter && kind_of(f) == kind {
+                                f["enabled"] = json!(on);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Ok(())
     }
 
     pub fn set_item_filter_enabled(&self, scene: &str, id: i64, filter: &str, on: bool) -> Result<(), StudioError> {
@@ -5886,6 +5953,64 @@ mod tests {
         assert_eq!(px(300, 10), [0, 0, 0], "hidden");
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn plan(s: &Stage) -> std::collections::BTreeMap<String, Vec<String>> {
+        super::cutout_plan(&s.sources_list(), &s.doc.borrow())
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn one_cutout_worker_serves_every_scene_a_camera_is_in() {
+        let s = stage();
+        let dev = json!({ "device": "cam-1" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        ok(s.add_filter("Cam", "ferrocast_remove_background", "Cut", &json!({})));
+        ok(s.add_scene("Other"));
+        let other = ok(s.add_existing("Other", "Cam"));
+        assert!(other.own_filters, "copy-on-add gave the item its own filters");
+        ok(s.duplicate_scene("Other", "Third"));
+        let p = plan(&s);
+        assert_eq!(p.len(), 1, "one worker for one camera: {p:?}");
+        let masks = &p["Cam"];
+        assert_eq!(masks.len(), 3, "{masks:?}");
+        assert!(masks.contains(&"Cam: Cut".to_string()));
+        assert!(masks.iter().any(|m| m.starts_with("Other#")));
+        assert!(masks.iter().any(|m| m.starts_with("Third#")));
+        // A hidden item feeds nothing.
+        ok(s.edit_item("Other", other.id, ItemEdit::Hide));
+        assert_eq!(plan(&s)["Cam"].len(), 2);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn renaming_a_source_moves_its_cutout_worker() {
+        let s = stage();
+        let dev = json!({ "device": "cam-1" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        ok(s.add_filter("Cam", "ferrocast_remove_background", "Cut", &json!({})));
+        ok(s.add_scene("Other"));
+        ok(s.add_existing("Other", "Cam"));
+        ok(s.rename("Cam", "Webcam"));
+        let p = plan(&s);
+        assert_eq!(p.keys().collect::<Vec<_>>(), vec!["Webcam"], "keyed by the source, so the old worker stops");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn studio_mode_copies_of_the_scene_on_air_get_their_masks() {
+        let s = stage();
+        let dev = json!({ "device": "cam-1" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        ok(s.add_filter("Cam", "ferrocast_remove_background", "Cut", &json!({})));
+        ok(s.add_scene("Other"));
+        let other = ok(s.add_existing("Other", "Cam"));
+        let items = s.scene_items("Other").unwrap_or_else(|e| panic!("{e}"));
+        s.doc.borrow_mut()["ferrocast"]["program_copy"] =
+            json!({ "scene": "Other", "items": items, "private": PROGRAM_COPY[0] });
+        let masks = plan(&s)["Cam"].clone();
+        assert!(masks.contains(&format!("{}#{}: Cut", PROGRAM_COPY[0], other.id)), "{masks:?}");
+    }
+
     #[test]
     #[cfg(target_os = "macos")]
     fn remove_background_takes_out_what_isnt_a_person() {
@@ -6820,6 +6945,28 @@ mod tests {
         ok(s.add_filter("Mic", "gain_filter", "GateGain", &json!({ "db": 2.0 })));
         let vert_mic = ok(s.add_existing("Vertical", "Mic"));
         assert!(!vert_mic.own_filters);
+    }
+
+    #[test]
+    fn a_source_filter_switch_reaches_item_copies_of_the_same_filter() {
+        let s = stage();
+        let dev = json!({ "device": "cam-1" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        ok(s.add_filter("Cam", "ferrocast_rounded_corners", "Round", &json!({ "radius": 12 })));
+        ok(s.add_scene("Other"));
+        let other = ok(s.add_existing("Other", "Cam"));
+        assert!(other.own_filters);
+        // A different kind under the same name on another item is left alone.
+        ok(s.add_scene("Third"));
+        let third = ok(s.add_existing("Third", "Cam"));
+        ok(s.remove_item_filter("Third", third.id, "Round"));
+        ok(s.add_item_filter("Third", third.id, "ferrocast_border", "Round", &json!({ "width": 3 })));
+        ok(s.set_filter_enabled("Cam", "Round", false));
+        assert!(!ok(s.filters("Cam"))[0].enabled);
+        assert!(!ok(s.item_filters("Other", other.id))[0].enabled, "the copy follows the source-level switch");
+        assert!(ok(s.item_filters("Third", third.id))[0].enabled, "another kind is not touched");
+        ok(s.set_filter_enabled("Cam", "Round", true));
+        assert!(ok(s.item_filters("Other", other.id))[0].enabled);
     }
 
     #[test]
