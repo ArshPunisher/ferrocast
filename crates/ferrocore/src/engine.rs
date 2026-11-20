@@ -4939,9 +4939,10 @@ fn frame(
                 if src.video_delay.as_ref().is_none_or(|d| d.delay_ms() != ms) {
                     src.video_delay = Some(crate::delay::FrameDelay::new(ms, config.fps));
                 }
-                match (audio, src.audio_delay.as_ref().map(crate::delay::AudioDelay::delay_ms)) {
-                    (true, Some(cur)) if cur == ms => {}
-                    (true, _) => src.audio_delay = Some(crate::delay::AudioDelay::new(ms)),
+                // A change of the delay fades the held sound out and in (no click).
+                match (audio, &mut src.audio_delay) {
+                    (true, Some(d)) => d.set_delay(ms),
+                    (true, None) => src.audio_delay = Some(crate::delay::AudioDelay::new(ms)),
                     (false, _) => src.audio_delay = None,
                 }
                 // Off air, its sound isn't taken in: what's held mustn't come back later.
@@ -5142,11 +5143,27 @@ fn frame(
                 {
                     // A pinned capture surface would starve its pool while held: copied out.
                     if let Some(f) = f.into_pending() {
+                        // Held as video (NV12: 1.5 bytes a pixel, not 4) when it's opaque; a
+                        // picture with transparency stays RGBA. The card turns it back.
+                        let f = match f {
+                            Fresh::Pic(p) => match crate::delay::rgba_to_nv12(p.width, p.height, &p.rgba) {
+                                Some(data) => Fresh::Yuv(crate::ffsrc::Nv12Picture {
+                                    width: p.width,
+                                    height: p.height,
+                                    data,
+                                    bt709: true,
+                                    full_range: false,
+                                }),
+                                None => Fresh::Pic(p),
+                            },
+                            other => other,
+                        };
                         let bytes = f.bytes();
                         if q.push(now, f, bytes) {
                             tracing::warn!(
                                 source = id,
-                                ms = q.delay_ms(),
+                                asked_ms = q.delay_ms(),
+                                longest_ms = crate::delay::longest_ms(bytes, config.fps, crate::delay::MAX_VIDEO_BYTES),
                                 "a video delay holds too much picture: its delay is cut short to stay in memory"
                             );
                         }
@@ -7883,7 +7900,12 @@ mod tests {
         assert_ne!(px(&e, 0), [0, 0, 255, 255], "held back");
         assert_eq!(px(&e, 330), [0, 0, 255, 255], "the other source isn't");
         std::thread::sleep(Duration::from_millis(700));
-        assert_eq!(px(&e, 0), [0, 0, 255, 255], "shown once the delay is up");
+        // Held as video, so within a step or two of the colour (not bit for bit).
+        let shown = px(&e, 0);
+        assert!(
+            shown[0] <= 3 && shown[1] <= 3 && shown[2] >= 252 && shown[3] == 255,
+            "shown once the delay is up: {shown:?}"
+        );
         // Off: pictures come straight through again.
         freeze_scene(&e, Vec::new());
         one.picture(Picture::solid(64, 36, [0, 255, 0, 255]));

@@ -543,7 +543,11 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
         "ferrocast_freeze" => vec![],
         // Pictures held in memory: the longer and bigger, the more it takes (capped).
         "ferrocast_video_delay" => vec![
-            opt("delay_ms", "Delay", "int").range(0.0, 20_000.0, 10.0).unit(" ms"),
+            opt("delay_ms", "Delay", "int").range(0.0, 20_000.0, 10.0).unit(" ms").hint(
+                "Pictures wait in memory, as video. The longest that fits: about 5.7 s at 1080p30, 2.9 s at 1080p60, \
+                 1.6 s at 1440p60, 0.7 s at 4K60 (a third of that for a picture with transparency). \
+                 Past it the delay is cut short.",
+            ),
             opt("audio", "Delay its sound too", "bool"),
         ],
         // Its choices are the collection's sources and scenes (Stage::options fills them in).

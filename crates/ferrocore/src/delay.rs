@@ -108,8 +108,14 @@ impl<T> FrameDelay<T> {
 /// The most sound one delay line holds, in samples across all channels: 20 s of stereo at 192 kHz.
 const MAX_AUDIO_SAMPLES: usize = 20 * 192_000 * 2;
 
+/// How long sound fades out and in around a change of the delay.
+const FADE_MS: u64 = 5;
+
 /// Sound held back by a whole number of frames: what goes in comes out that many frames later
 /// (silence at first), so its timestamps stay the same and the stream stays continuous.
+///
+/// Changing the delay while it runs doesn't cut the held sound off: the old line's sound fades
+/// out over 5 ms, the line is made again at the new length, and what goes in fades in over 5 ms.
 #[derive(Debug)]
 pub struct AudioDelay {
     ring: Vec<f32>,
@@ -117,6 +123,10 @@ pub struct AudioDelay {
     rate: u32,
     channels: usize,
     delay_ms: u32,
+    /// Frames of fade-out left before the line is rebuilt at `delay_ms` (0: no change waiting).
+    fade_out: usize,
+    /// Frames of fade-in left on what goes into the new line.
+    fade_in: usize,
     scratch: Vec<f32>,
     dirty: bool,
 }
@@ -129,14 +139,37 @@ impl AudioDelay {
             rate: 0,
             channels: 0,
             delay_ms: delay_ms.min(MAX_DELAY_MS),
+            fade_out: 0,
+            fade_in: 0,
             // Room for the usual piece, so the first ones don't grow it.
             scratch: Vec::with_capacity(16_384),
             dirty: false,
         }
     }
 
+    /// The delay asked for (a change still fading in counts).
     pub fn delay_ms(&self) -> u32 {
         self.delay_ms
+    }
+
+    /// Changes the delay: with sound already running, the old sound fades out and the new line's
+    /// fades in (a few ms each) instead of the held sound being cut.
+    pub fn set_delay(&mut self, delay_ms: u32) {
+        let ms = delay_ms.min(MAX_DELAY_MS);
+        if ms == self.delay_ms {
+            return;
+        }
+        self.delay_ms = ms;
+        if self.rate == 0 {
+            return;
+        }
+        if self.fade_out == 0 {
+            self.fade_out = self.fade_frames();
+        }
+    }
+
+    fn fade_frames(&self) -> usize {
+        ((u64::from(self.rate) * FADE_MS).div_ceil(1000) as usize).max(1)
     }
 
     /// Sound the delay line holds right now (false once it's been cleared or never fed).
@@ -151,41 +184,122 @@ impl AudioDelay {
             self.pos = 0;
             self.dirty = false;
         }
+        self.fade_out = 0;
+        self.fade_in = 0;
+    }
+
+    /// The line made again at the asked length, empty.
+    fn rebuild(&mut self) {
+        let frames = (u64::from(self.delay_ms) * u64::from(self.rate)).div_ceil(1000) as usize;
+        let len = (frames * self.channels).min(MAX_AUDIO_SAMPLES);
+        self.ring.clear();
+        self.ring.resize(len, 0.0);
+        self.pos = 0;
     }
 
     /// Delays `pcm` (interleaved, `channels` wide, at `rate`) and returns the delayed piece, the
     /// same length. The line is sized on the first piece (or when the format changes); after
-    /// that nothing is allocated.
+    /// that nothing is allocated until the delay is changed.
     pub fn process(&mut self, pcm: &[f32], channels: usize, rate: u32) -> &[f32] {
+        self.scratch.clear();
         if channels == 0 || rate == 0 {
-            self.scratch.clear();
             return &self.scratch;
         }
         if self.rate != rate || self.channels != channels {
-            let frames = (u64::from(self.delay_ms) * u64::from(rate)).div_ceil(1000) as usize;
-            let len = (frames * channels).min(MAX_AUDIO_SAMPLES);
-            self.ring.clear();
-            self.ring.resize(len, 0.0);
-            self.pos = 0;
             self.rate = rate;
             self.channels = channels;
-        }
-        self.scratch.clear();
-        if self.ring.is_empty() {
-            self.scratch.extend_from_slice(pcm);
-            return &self.scratch;
+            self.fade_out = 0;
+            self.fade_in = 0;
+            self.rebuild();
         }
         self.dirty = true;
-        let len = self.ring.len();
-        for &s in pcm {
-            self.scratch.push(std::mem::replace(&mut self.ring[self.pos], s));
-            self.pos += 1;
-            if self.pos == len {
-                self.pos = 0;
+        let fade = self.fade_frames();
+        for frame in pcm.chunks_exact(channels) {
+            // The old line's sound goes down; at the bottom the line is made again.
+            let mut out_gain = 1.0;
+            if self.fade_out > 0 {
+                out_gain = (self.fade_out - 1) as f32 / fade as f32;
+                self.fade_out -= 1;
+            }
+            let mut in_gain = 1.0;
+            if self.fade_out == 0 && self.fade_in > 0 {
+                in_gain = 1.0 - self.fade_in as f32 / fade as f32;
+                self.fade_in -= 1;
+            }
+            let was_fading = out_gain < 1.0;
+            for &s in frame {
+                let put = s * in_gain;
+                let out = if self.ring.is_empty() {
+                    put
+                } else {
+                    let o = std::mem::replace(&mut self.ring[self.pos], put);
+                    self.pos += 1;
+                    if self.pos == self.ring.len() {
+                        self.pos = 0;
+                    }
+                    o
+                };
+                self.scratch.push(out * out_gain);
+            }
+            if was_fading && self.fade_out == 0 {
+                // Silent now: the new line starts empty, and its input fades in.
+                self.rebuild();
+                self.fade_in = fade;
             }
         }
         &self.scratch
     }
+}
+
+/// Converts opaque RGBA to NV12 (BT.709, limited range: what the card reads back with
+/// `Nv12Picture { bt709: true, full_range: false }`), chroma from each 2x2 block. None when the
+/// picture has any transparency or an odd size: those stay RGBA (NV12 has no alpha).
+/// Holding a picture this way takes 1.5 bytes a pixel instead of 4.
+pub fn rgba_to_nv12(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || w % 2 != 0 || h % 2 != 0 || rgba.len() != w * h * 4 {
+        return None;
+    }
+    if rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255) {
+        return None;
+    }
+    let mut out = vec![0u8; w * h * 3 / 2];
+    let (y_plane, uv_plane) = out.split_at_mut(w * h);
+    for row in 0..h {
+        let src = &rgba[row * w * 4..(row + 1) * w * 4];
+        let dst = &mut y_plane[row * w..(row + 1) * w];
+        for (p, y) in src.as_chunks::<4>().0.iter().zip(dst.iter_mut()) {
+            let v = 47 * i32::from(p[0]) + 157 * i32::from(p[1]) + 16 * i32::from(p[2]) + 128;
+            *y = ((v >> 8) + 16).clamp(16, 235) as u8;
+        }
+    }
+    for row in 0..h / 2 {
+        let top = &rgba[(row * 2) * w * 4..(row * 2 + 1) * w * 4];
+        let bottom = &rgba[(row * 2 + 1) * w * 4..(row * 2 + 2) * w * 4];
+        let dst = &mut uv_plane[row * w..(row + 1) * w];
+        for (col, uv) in dst.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let at = col * 8;
+            let mut sum = [0i32; 3];
+            for px in [&top[at..at + 4], &top[at + 4..at + 8], &bottom[at..at + 4], &bottom[at + 4..at + 8]] {
+                for k in 0..3 {
+                    sum[k] += i32::from(px[k]);
+                }
+            }
+            let (r, g, b) = ((sum[0] + 2) / 4, (sum[1] + 2) / 4, (sum[2] + 2) / 4);
+            uv[0] = (((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+            uv[1] = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+        }
+    }
+    Some(out)
+}
+
+/// The longest delay, in ms, that `max_bytes` holds of pictures of `frame_bytes` at `fps`.
+pub fn longest_ms(frame_bytes: usize, fps: u32, max_bytes: usize) -> u32 {
+    if frame_bytes == 0 || fps == 0 {
+        return MAX_DELAY_MS;
+    }
+    let frames = (max_bytes / frame_bytes) as u64;
+    ((frames * 1000 / u64::from(fps)).min(u64::from(MAX_DELAY_MS))) as u32
 }
 
 #[cfg(test)]
@@ -306,5 +420,106 @@ mod tests {
             a.process(&pcm, 2, 48_000);
         }
         assert_eq!((a.ring.as_ptr(), a.scratch.as_ptr()), (ring, scratch), "the same buffers throughout");
+    }
+
+    fn sine(from: usize, n: usize) -> Vec<f32> {
+        (from..from + n)
+            .flat_map(|i| {
+                let v = 0.5 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48_000.0).sin();
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// The biggest step between neighbouring samples of one channel.
+    fn biggest_step(out: &[f32]) -> f32 {
+        out.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn changing_the_delay_while_it_runs_does_not_click() {
+        // A steady tone: its own biggest step is 0.029. A cut would be a jump of up to 0.5.
+        for (from, to) in [(100u32, 300u32), (300, 100), (100, 0), (0, 200)] {
+            let mut a = AudioDelay::new(from);
+            let mut out = Vec::new();
+            let mut at = 0;
+            for round in 0..120 {
+                if round == 20 {
+                    a.set_delay(to);
+                }
+                out.extend_from_slice(a.process(&sine(at, 480), 2, 48_000));
+                at += 480;
+            }
+            assert_eq!(a.delay_ms(), to);
+            let step = biggest_step(&out);
+            assert!(step < 0.06, "{from} -> {to} ms: a step of {step}");
+            // It settles at the new delay: the tone comes out `to` ms late, once it has faded in.
+            let late = (u64::from(to) * 48) as usize;
+            let tail = out.len() / 2 - 480;
+            let i = tail;
+            let want = 0.5 * (2.0 * std::f32::consts::PI * 440.0 * (i - late) as f32 / 48_000.0).sin();
+            assert!((out[i * 2] - want).abs() < 1e-3, "{from} -> {to}: {} vs {want}", out[i * 2]);
+        }
+    }
+
+    #[test]
+    fn the_old_sound_fades_out_in_five_ms() {
+        let mut a = AudioDelay::new(50);
+        for round in 0..10 {
+            a.process(&sine(round * 480, 480), 2, 48_000);
+        }
+        a.set_delay(100);
+        let out = a.process(&vec![0.5f32; 2 * 480], 2, 48_000).to_vec();
+        let first = out[0].abs();
+        let at_five = out[2 * 239].abs();
+        assert!(first > at_five, "going down: {first} then {at_five}");
+        assert!(out[2 * 240..].iter().all(|s| s.abs() < 1e-6), "silent once faded, until the new delay is up");
+    }
+
+    #[test]
+    fn a_picture_is_held_as_video_in_a_third_less_than_half_the_memory() {
+        let (w, h) = (64u32, 36u32);
+        let rgba: Vec<u8> = (0..w * h).flat_map(|i| [(i % 251) as u8, (i % 113) as u8 * 2, 200, 255]).collect();
+        let nv = rgba_to_nv12(w, h, &rgba).expect("opaque and even");
+        assert_eq!(nv.len(), (w * h * 3 / 2) as usize);
+        assert!(rgba.len() as f64 / nv.len() as f64 > 2.6, "2.67x as many pictures in the same memory");
+    }
+
+    #[test]
+    fn nv12_holds_the_colours_closely_and_leaves_transparent_pictures_alone() {
+        use crate::ffsrc::Nv12Picture;
+        let (w, h) = (32u32, 16u32);
+        for rgb in [[255u8, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255], [0, 0, 0], [90, 60, 30], [200, 120, 40]] {
+            let rgba: Vec<u8> = (0..w * h).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect();
+            let data = rgba_to_nv12(w, h, &rgba).expect("opaque");
+            let back = Nv12Picture { width: w, height: h, data, bt709: true, full_range: false }
+                .to_picture()
+                .expect("converts back");
+            for k in 0..3 {
+                let d = (i32::from(back.rgba[k]) - i32::from(rgb[k])).abs();
+                assert!(d <= 3, "{rgb:?} came back {:?}", &back.rgba[..4]);
+            }
+        }
+        // Any transparency keeps it RGBA, and so does an odd size.
+        let mut see_through = vec![255u8; (w * h * 4) as usize];
+        see_through[3] = 254;
+        assert!(rgba_to_nv12(w, h, &see_through).is_none());
+        assert!(rgba_to_nv12(31, 16, &vec![255u8; 31 * 16 * 4]).is_none());
+    }
+
+    #[test]
+    fn the_longest_delay_that_fits_is_worked_out_from_the_picture() {
+        let nv12_1080 = 1920 * 1080 * 3 / 2;
+        assert_eq!(longest_ms(nv12_1080, 30, MAX_VIDEO_BYTES), 5733);
+        assert_eq!(longest_ms(nv12_1080, 60, MAX_VIDEO_BYTES), 2866);
+        assert!(longest_ms(1920 * 1080 * 4, 60, MAX_VIDEO_BYTES) < 1100, "RGBA fits 2.7x less");
+        assert_eq!(longest_ms(100, 30, MAX_VIDEO_BYTES), MAX_DELAY_MS);
     }
 }
