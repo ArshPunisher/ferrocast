@@ -1733,6 +1733,15 @@ mod tests {
         assert_eq!((engine_config(&canvas).width, engine_config(&canvas).fps), (1920, 60));
         // Tracks 3 and 1, in the file's order: Game, Mic; track 2 has no name.
         assert_eq!(names_for(&[3, 1, 2]), vec!["Game", "Mic", ""]);
+        // The helper engines (the network-media probe, the headless page) build their own
+        // `EngineConfig` and never read these settings: they stay at 48 kHz and the plain clock
+        // while the Studio's is at 44.1 kHz / 59.94. (The statics are read in `engine_config`, which
+        // only `Shared::open_at` calls: the one engine the app makes outside tests.)
+        set_ntsc(true);
+        let helper = EngineConfig { width: 1280, height: 720, fps: 30, ..Default::default() };
+        assert_eq!((helper.sample_rate, helper.ntsc), (48_000, false));
+        assert_eq!(helper.frame_ns(), 33_333_333);
+        set_ntsc(false);
         // Anything but 44100 is 48000.
         set_audio_format(96_000, Vec::new());
         assert_eq!(engine_config(&canvas).sample_rate, 48_000);
