@@ -41,8 +41,12 @@ impl RateLimit {
 pub static CLIPPING: RateLimit = RateLimit::new(Duration::from_secs(60));
 
 /// A global filter for the log: the denoiser library's warnings pass through [`CLIPPING`].
+///
+/// A `dynamic_filter_fn`, not a `filter_fn`: a `filter_fn`'s answer is cached per call site
+/// (`Interest::always` or `never`), so a rate limit inside it would be asked once and then let
+/// every warning through for good (or none ever again).
 pub fn layer<S: tracing::Subscriber>() -> impl tracing_subscriber::Layer<S> {
-    tracing_subscriber::filter::filter_fn(|meta| {
+    tracing_subscriber::filter::dynamic_filter_fn(|meta, _| {
         if meta.level() == &tracing::Level::WARN && meta.target().starts_with("df") {
             return CLIPPING.allow(Instant::now());
         }
@@ -69,6 +73,29 @@ pub fn report_in_background() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The layer in a real subscriber: one call site warning 100 times in a row passes once.
+    #[test]
+    fn the_layer_holds_a_call_site_that_keeps_warning() {
+        use std::sync::atomic::AtomicUsize;
+        use tracing_subscriber::layer::SubscriberExt;
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        struct Count;
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+                if e.metadata().target().starts_with("df") {
+                    SEEN.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let subscriber = tracing_subscriber::registry().with(layer()).with(Count);
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..100 {
+                tracing::warn!(target: "df::tract", "Possible clipping detected");
+            }
+        });
+        assert_eq!(SEEN.load(Ordering::Relaxed), 1, "one of the 100 gets through");
+    }
 
     #[test]
     fn one_a_minute_gets_through_and_the_rest_are_counted() {
