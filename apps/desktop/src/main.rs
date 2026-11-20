@@ -311,6 +311,8 @@ impl QuitSignals {
 }
 
 /// Quits through the normal path (`RunEvent::Exit`, the clean-exit sequence) on the first signal.
+/// A second one means the quit is stuck (a drain that won't end, a window that won't close): the
+/// handlers stay installed, so without this only SIGKILL would end the process.
 #[cfg(unix)]
 async fn quit_on_signal(app: AppHandle) {
     let mut signals = match QuitSignals::register() {
@@ -320,9 +322,18 @@ async fn quit_on_signal(app: AppHandle) {
             return;
         }
     };
+    quit_then_force(&mut signals, || app.exit(0), || std::process::exit(1)).await;
+}
+
+/// `quit` on the first signal, `force` on the next.
+#[cfg(unix)]
+async fn quit_then_force(signals: &mut QuitSignals, quit: impl FnOnce(), force: impl FnOnce()) {
     let which = signals.next().await;
     tracing::info!(signal = which, "asked to quit by a signal");
-    app.exit(0);
+    quit();
+    let again = signals.next().await;
+    tracing::warn!(signal = again, "asked again while quitting: ending now, without the clean quit");
+    force();
 }
 
 /// The "Ferrocast is running" notes (the Studio's session and the engine's `running.json`) that
@@ -1328,16 +1339,49 @@ mod update_tests {
         engine.shutdown();
     }
 
+    /// A signal goes to every listener in the process: the tests that send one take turns.
+    #[cfg(unix)]
+    static SIGNAL_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// `kill` (SIGTERM) used to end Ferrocast with the run markers left behind; it is caught now.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_kill_signal_is_caught_so_the_quit_can_run_clean() {
+        let _turn = SIGNAL_TESTS.lock().await;
         let mut signals = QuitSignals::register().unwrap_or_else(|e| panic!("{e}"));
         let pid = std::process::id().to_string();
         let sent = std::process::Command::new("kill").args(["-TERM", &pid]).status().unwrap_or_else(|e| panic!("{e}"));
         assert!(sent.success());
         let which = tokio::time::timeout(Duration::from_secs(5), signals.next()).await;
         assert_eq!(which.ok(), Some("SIGTERM"));
+    }
+
+    /// A second signal while the quit is stuck ends the process (it used to be swallowed).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_signal_forces_the_exit_when_the_quit_is_stuck() {
+        let _turn = SIGNAL_TESTS.lock().await;
+        let mut signals = QuitSignals::register().unwrap_or_else(|e| panic!("{e}"));
+        let log = std::sync::Mutex::new(Vec::new());
+        let pid = std::process::id().to_string();
+        let term = || {
+            let sent =
+                std::process::Command::new("kill").args(["-TERM", &pid]).status().unwrap_or_else(|e| panic!("{e}"));
+            assert!(sent.success());
+        };
+        let task = quit_then_force(
+            &mut signals,
+            || log.lock().unwrap_or_else(|e| e.into_inner()).push("quit"),
+            || log.lock().unwrap_or_else(|e| e.into_inner()).push("force"),
+        );
+        tokio::pin!(task);
+        term();
+        // One signal: asked to quit, nothing forced.
+        assert!(tokio::time::timeout(Duration::from_millis(500), &mut task).await.is_err());
+        assert_eq!(*log.lock().unwrap_or_else(|e| e.into_inner()), vec!["quit"]);
+        term();
+        assert!(tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_ok());
+        assert_eq!(*log.lock().unwrap_or_else(|e| e.into_inner()), vec!["quit", "force"]);
     }
 
     #[test]
