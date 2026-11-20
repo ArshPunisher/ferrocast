@@ -901,7 +901,24 @@ impl Capture {
     pub fn microphone(id: &str) -> Result<Self, AvError> {
         ensure_hotplug_listener();
         let follows = if is_default(id) {
-            Some(default_microphone().ok_or_else(|| AvError::Source("there's no microphone".into()))?)
+            let default = default_microphone().ok_or_else(|| AvError::Source("there's no microphone".into()))?;
+            let inputs: Vec<(String, String)> = microphones().into_iter().map(|d| (d.id, d.name)).collect();
+            let last = LAST_PLAIN_MIC.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let pick = pick_default_mic(&default, &inputs, last.as_deref(), is_bluetooth_input);
+            if let Some(name) = &pick.swapped_from {
+                crate::notices::push(
+                    "mic-bluetooth",
+                    format!("Using {}: your AirPods mic would drop the sound to phone quality.", pick.name),
+                    format!(
+                        "The system's microphone is {name}, a Bluetooth headset: macOS would switch it to a \
+                         16 kHz call mode. Pick it by name in the source's settings to use it anyway."
+                    ),
+                );
+            }
+            if !is_bluetooth_input(&pick.id) {
+                *LAST_PLAIN_MIC.lock().unwrap_or_else(|p| p.into_inner()) = Some(pick.id.clone());
+            }
+            Some(pick.id)
         } else {
             None
         };
@@ -1038,6 +1055,41 @@ fn moved_on(follows: Option<&str>, now: Option<&str>, bluetooth: impl Fn(&str) -
     }
 }
 
+/// The last microphone a "default" source opened that wasn't a Bluetooth one.
+static LAST_PLAIN_MIC: Mutex<Option<String>> = Mutex::new(None);
+
+/// What a "default" microphone opens.
+#[derive(Debug, PartialEq, Eq)]
+struct DefaultPick {
+    id: String,
+    name: String,
+    /// The Bluetooth headset (its name) the system's microphone is, that this stays off.
+    swapped_from: Option<String>,
+}
+
+/// The system's microphone, unless it is a Bluetooth hands-free one and any other input exists:
+/// then the last plain one this source used, else the first plain one (macOS would drop a
+/// Bluetooth headset to a 16 kHz call mode). A Bluetooth mic picked by name never comes here.
+fn pick_default_mic(
+    default: &str,
+    inputs: &[(String, String)],
+    last: Option<&str>,
+    bluetooth: impl Fn(&str) -> bool,
+) -> DefaultPick {
+    let name_of = |id: &str| inputs.iter().find(|(i, _)| i == id).map(|(_, n)| n.clone()).unwrap_or_else(|| id.into());
+    if !bluetooth(default) {
+        return DefaultPick { id: default.into(), name: name_of(default), swapped_from: None };
+    }
+    let plain = last
+        .filter(|l| inputs.iter().any(|(i, _)| i == l) && !bluetooth(l))
+        .map(str::to_string)
+        .or_else(|| inputs.iter().find(|(i, _)| !bluetooth(i)).map(|(i, _)| i.clone()));
+    match plain {
+        Some(id) => DefaultPick { name: name_of(&id), id, swapped_from: Some(name_of(default)) },
+        None => DefaultPick { id: default.into(), name: name_of(default), swapped_from: None },
+    }
+}
+
 /// Whether the input with this unique id is a Bluetooth one.
 fn is_bluetooth_input(id: &str) -> bool {
     // SAFETY: looking a device up by id and reading its transport type.
@@ -1059,6 +1111,34 @@ mod tests {
         assert_eq!(moved_on(Some("a"), Some("a"), none), None);
         assert_eq!(moved_on(Some("a"), None, none), None, "no system mic now: keep what's open");
         assert!(moved_on(Some("a"), Some("b"), none).is_some(), "the system's changed: open the new one");
+    }
+
+    #[test]
+    fn a_default_mic_that_is_bluetooth_opens_another_input_when_there_is_one() {
+        use super::{DefaultPick, pick_default_mic};
+        let inputs: Vec<(String, String)> = [("usb", "KREO KAST"), ("builtin", "MacBook Mic"), ("pods", "AirPods")]
+            .into_iter()
+            .map(|(i, n)| (i.to_string(), n.to_string()))
+            .collect();
+        let bt = |id: &str| id == "pods";
+        // A plain default is used as is.
+        assert_eq!(
+            pick_default_mic("builtin", &inputs, None, bt),
+            DefaultPick { id: "builtin".into(), name: "MacBook Mic".into(), swapped_from: None }
+        );
+        // AirPods as the default: the first plain input...
+        let first = pick_default_mic("pods", &inputs, None, bt);
+        assert_eq!((first.id.as_str(), first.swapped_from.as_deref()), ("usb", Some("AirPods")));
+        // ...or the last plain one this source used.
+        let last = pick_default_mic("pods", &inputs, Some("builtin"), bt);
+        assert_eq!(last.id, "builtin");
+        // A remembered mic that's gone, or Bluetooth, isn't used.
+        assert_eq!(pick_default_mic("pods", &inputs, Some("gone"), bt).id, "usb");
+        assert_eq!(pick_default_mic("pods", &inputs, Some("pods"), bt).id, "usb");
+        // Only Bluetooth inputs: it opens it (there's nothing else).
+        let only = vec![("pods".to_string(), "AirPods".to_string())];
+        let p = pick_default_mic("pods", &only, None, bt);
+        assert_eq!((p.id.as_str(), p.swapped_from), ("pods", None));
     }
 
     #[test]

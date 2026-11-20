@@ -1791,3 +1791,26 @@ async fn a_new_stream_starts_with_empty_chat() {
     assert!(!again, "one stream, one clear");
     assert_eq!(e.stream_started_at(), Some(start));
 }
+
+#[tokio::test]
+async fn a_capture_notice_reaches_the_dashboard_once() {
+    let (e, _d) = engine().await;
+    let mut live = e.subscribe_live();
+    ferrocore::notices::push(
+        "mic-bluetooth",
+        "Using KREO KAST: your AirPods mic would drop the sound to phone quality.".into(),
+        "detail".into(),
+    );
+    e.record_watch_tick().await;
+    e.record_watch_tick().await;
+    let mut seen = Vec::new();
+    while let Ok(f) = live.try_recv() {
+        let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+        if v["type"] == "notice" && v["data"]["key"] == "mic-bluetooth" {
+            seen.push(v["data"].clone());
+        }
+    }
+    assert_eq!(seen.len(), 1, "said once: {seen:?}");
+    assert_eq!(seen[0]["level"], "info");
+    assert_eq!(seen[0]["detail"], "detail");
+}
