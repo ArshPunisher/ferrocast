@@ -23,6 +23,51 @@ pub(crate) struct RecordWatch {
     low_said: bool,
 }
 
+/// What was said about broken sidechain cycles so the user is told once per unique loop.
+#[derive(Debug, Default)]
+pub(crate) struct SidechainWatch {
+    reported: Vec<(String, String)>,
+}
+
+/// Checks broken sidechain cycles reported by the Studio and emits one concise notice when a new
+/// cycle appears, clearing once the loop is fixed.
+pub(crate) fn look_sidechains(w: &mut SidechainWatch, v: &Value) -> Option<Say> {
+    let cycles: Vec<(String, String)> = v
+        .get("sidechain_cycles")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let src = c.get("source").and_then(Value::as_str)?.to_string();
+            let key = c.get("key").and_then(Value::as_str)?.to_string();
+            Some((src, key))
+        })
+        .collect();
+    if cycles.is_empty() {
+        w.reported.clear();
+        return None;
+    }
+    let fresh = cycles.iter().find(|pair| !w.reported.contains(pair)).cloned();
+    w.reported = cycles;
+    let (src, key) = fresh?;
+    let (line, detail) = if src == key {
+        (
+            format!("Sidechain loop on {src} was broken"),
+            format!(
+                "{src} can't duck under itself. Its sidechain compressor gets silence until you pick another source."
+            ),
+        )
+    } else {
+        (
+            format!("Sidechain loop between {src} and {key} was broken"),
+            format!(
+                "{src} and {key} can't duck under each other. {src}'s sidechain compressor gets silence until you change one."
+            ),
+        )
+    };
+    Some(Say { key: "sidechain-cycle", level: NoticeLevel::Warn, line, detail })
+}
+
 /// A line for the dashboard: how bad, the line, and what is behind its (i).
 #[derive(Debug, PartialEq)]
 pub(crate) struct Say {
@@ -107,6 +152,17 @@ impl Engine {
             self.notice_detail(s.key, s.level, &s.line, &s.detail);
         }
     }
+
+    /// Observes `sidechain_cycles` in Studio stats and notifies the user once per unique loop.
+    pub(crate) fn observe_sidechain_cycles(&self, stats: &Value) {
+        let say = {
+            let mut w = self.studio().sidechain_watch.lock().unwrap_or_else(|p| p.into_inner());
+            look_sidechains(&mut w, stats)
+        };
+        if let Some(s) = say {
+            self.notice_detail(s.key, s.level, &s.line, &s.detail);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -170,5 +226,22 @@ mod tests {
         // The rate is not trusted in the first seconds.
         let mut w = RecordWatch::default();
         assert!(look(&mut w, &rec(true, None, 2500, 50_000_000, 2)).is_empty());
+    }
+
+    #[test]
+    fn a_sidechain_loop_is_reported_once_until_resolved() {
+        let mut w = SidechainWatch::default();
+        let loop_stats = json!({ "sidechain_cycles": [{ "source": "Voice", "key": "Music" }] });
+        let first = look_sidechains(&mut w, &loop_stats).expect("first notice");
+        assert_eq!(first.key, "sidechain-cycle");
+        assert_eq!(first.level, NoticeLevel::Warn);
+        assert!(first.line.contains("Voice") && first.line.contains("Music"));
+        assert!(first.detail.contains("silence"));
+        for _ in 0..50 {
+            assert!(look_sidechains(&mut w, &loop_stats).is_none(), "not repeated");
+        }
+        // Cleared -> forgets, so recreating it later tells the user once again.
+        assert!(look_sidechains(&mut w, &json!({})).is_none());
+        assert!(look_sidechains(&mut w, &loop_stats).is_some());
     }
 }

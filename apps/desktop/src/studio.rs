@@ -2718,7 +2718,7 @@ impl StudioHost for DesktopStudio {
                 let at = folder.ancestors().find(|p| p.exists()).map(PathBuf::from).unwrap_or(folder);
                 ferrocast_studio::system::free_disk_mb(&at)
             };
-            Ok(json!({
+            let mut out = json!({
                 "engine": studio.stats(),
                 // The scene on air, so the page notices switches made elsewhere (shortcuts,
                 // a multiview click).
@@ -2755,7 +2755,22 @@ impl StudioHost for DesktopStudio {
                     .collect::<Vec<_>>(),
                 // The last remux (OBS's Remux, or MKV made into MP4 after recording).
                 "remux": REMUX.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-            }))
+            });
+            let cycles = h.collection.as_ref().map(|c| c.sidechain_cycles()).unwrap_or_default();
+            if !cycles.is_empty()
+                && let Some(o) = out.as_object_mut()
+            {
+                o.insert(
+                    "sidechain_cycles".into(),
+                    json!(
+                        cycles
+                            .into_iter()
+                            .map(|(source, key)| json!({ "source": source, "key": key }))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+            }
+            Ok(out)
         })
         .await?
     }
