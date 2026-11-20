@@ -330,7 +330,12 @@ impl Engine {
         if let Some(cv) = &cloud {
             match self.cloud_speak(text, cv).await {
                 Ok(bytes) => {
-                    match self.db(move |s| Ok(repo::media::save(s, "speech.ogg", &bytes).ok())).await.ok().flatten() {
+                    match self
+                        .db(move |s| Ok(repo::media::save_speech(s, "speech.ogg", &bytes).ok()))
+                        .await
+                        .ok()
+                        .flatten()
+                    {
                         Some(m) => {
                             self.cloud_tts().noticed.store(false, Ordering::Relaxed);
                             *lock(&self.cloud_tts().last_fallback) = None;
@@ -359,7 +364,8 @@ impl Engine {
         }
         let bytes = tokio::fs::read(&out).await.ok()?;
         let _ = tokio::fs::remove_file(&out).await;
-        let saved = self.db(move |s| Ok(repo::media::save(s, "speech.wav", &bytes).ok())).await.ok().flatten()?;
+        let saved =
+            self.db(move |s| Ok(repo::media::save_speech(s, "speech.wav", &bytes).ok())).await.ok().flatten()?;
         Some(Spoken {
             url: format!("/api/v1/media/{}", saved.id),
             media_id: saved.id,

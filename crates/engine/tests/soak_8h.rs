@@ -181,7 +181,7 @@ fn eight_hour_stream_soak_keeps_all_collections_bounded() {
     let store = Store::open(dir.path()).unwrap();
     let user_sound = repo::media::save(&store, "fanfare.wav", b"RIFF\0\0\0\0WAVEfmt ").unwrap();
     for _ in 0..200 {
-        let _ = repo::media::save(&store, "speech.wav", b"RIFF\0\0\0\0WAVEfmt ").unwrap();
+        let _ = repo::media::save_speech(&store, "speech.wav", b"RIFF\0\0\0\0WAVEfmt ").unwrap();
     }
     let old = user_sound.created_at - 7_200_000;
     store

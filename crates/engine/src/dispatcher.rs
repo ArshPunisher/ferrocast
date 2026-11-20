@@ -287,9 +287,9 @@ mod tts_cleanup_tests {
         let secrets: Arc<dyn ferrocast_secrets::Secrets> = Arc::new(ferrocast_secrets::MemorySecrets::default());
         let engine = Engine::start_with_secrets(dir.path(), secrets).await.unwrap();
         let store = engine.store();
-        let m1 = repo::media::save(&store, "speech.wav", WAV).unwrap();
-        let m2 = repo::media::save(&store, "speech.ogg", b"OggS\0\0\0\0").unwrap();
-        let m3 = repo::media::save(&store, "speech.wav", WAV).unwrap();
+        let m1 = repo::media::save_speech(&store, "speech.wav", WAV).unwrap();
+        let m2 = repo::media::save_speech(&store, "speech.ogg", b"OggS\0\0\0\0").unwrap();
+        let m3 = repo::media::save_speech(&store, "speech.wav", WAV).unwrap();
 
         // Pause so we can queue 3 alerts with attached TTS media, then drive each exit path.
         engine.queue_pause().await;

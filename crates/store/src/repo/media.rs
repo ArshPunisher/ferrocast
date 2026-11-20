@@ -133,8 +133,22 @@ fn media_dir(store: &Store) -> PathBuf {
     store.dir().join("media")
 }
 
+/// The names the engine gives its synthesized alert speech; `prune_speech` removes only these.
+const SPEECH_NAMES: [&str; 2] = ["speech.wav", "speech.ogg"];
+
 /// Stores an uploaded file after checking its type and size.
+/// A file the streamer calls `speech.wav` or `speech.ogg` is kept under another name, so the
+/// cleanup of the engine's own speech (`prune_speech`) can never take their upload.
 pub fn save(store: &Store, name: &str, data: &[u8]) -> std::result::Result<Media, SaveError> {
+    save_as(store, name, data, false)
+}
+
+/// Stores the engine's synthesized alert speech (named `speech.wav` or `speech.ogg`).
+pub fn save_speech(store: &Store, name: &str, data: &[u8]) -> std::result::Result<Media, SaveError> {
+    save_as(store, name, data, true)
+}
+
+fn save_as(store: &Store, name: &str, data: &[u8], speech: bool) -> std::result::Result<Media, SaveError> {
     if data.is_empty() {
         return Err(SaveError::Upload(UploadError::Empty));
     }
@@ -148,7 +162,10 @@ pub fn save(store: &Store, name: &str, data: &[u8]) -> std::result::Result<Media
     let tmp = dir.join(format!("{id}.partial"));
     std::fs::write(&tmp, data).map_err(StoreError::from)?;
     crate::backup::rename_patiently(&tmp, &dir.join(&id)).map_err(StoreError::from)?;
-    let clean_name: String = name.chars().filter(|c| !c.is_control()).take(120).collect();
+    let mut clean_name: String = name.chars().filter(|c| !c.is_control()).take(120).collect();
+    if !speech && SPEECH_NAMES.contains(&clean_name.as_str()) {
+        clean_name = format!("upload {clean_name}");
+    }
     let m = Media {
         id,
         kind,
@@ -304,14 +321,36 @@ mod tests {
     }
 
     #[test]
+    fn prune_speech_spares_a_users_upload_named_speech_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let wav = b"RIFF\0\0\0\0WAVEfmt ";
+        // A streamer's own alert sound that happens to be called speech.wav, and the engine's.
+        let mine = save(&s, "speech.wav", wav).unwrap();
+        let mine_ogg = save(&s, "speech.ogg", b"OggS\0\0\0\0").unwrap();
+        let tts = save_speech(&s, "speech.wav", wav).unwrap();
+        s.write(|tx| {
+            tx.execute("UPDATE media SET created_at = ?1", [now_ms() - 7_200_000])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(prune_speech(&s, now_ms() - 3_600_000, &[]).unwrap(), 1, "only the synthesized one");
+        assert!(get(&s, &tts.id).unwrap().is_none());
+        assert!(get(&s, &mine.id).unwrap().is_some(), "an upload named speech.wav is theirs");
+        assert!(get(&s, &mine_ogg.id).unwrap().is_some());
+        assert!(dir.path().join("media").join(&mine.id).exists());
+        assert!(SPEECH_NAMES.contains(&tts.name.as_str()));
+    }
+
+    #[test]
     fn prune_speech_deletes_old_unkept_tts_only() {
         let dir = tempfile::tempdir().unwrap();
         let s = Store::open(dir.path()).unwrap();
         let wav = b"RIFF\0\0\0\0WAVEfmt ";
         let ogg = b"OggS\0\0\0\0";
-        let old_wav = save(&s, "speech.wav", wav).unwrap();
-        let old_ogg = save(&s, "speech.ogg", ogg).unwrap();
-        let kept_ogg = save(&s, "speech.ogg", ogg).unwrap();
+        let old_wav = save_speech(&s, "speech.wav", wav).unwrap();
+        let old_ogg = save_speech(&s, "speech.ogg", ogg).unwrap();
+        let kept_ogg = save_speech(&s, "speech.ogg", ogg).unwrap();
         let user_wav = save(&s, "alert.wav", wav).unwrap();
         // Backdate every row so `older_than_ms` selects only eligible speech files.
         let past = now_ms() - 7_200_000;
@@ -320,7 +359,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let fresh_wav = save(&s, "speech.wav", wav).unwrap();
+        let fresh_wav = save_speech(&s, "speech.wav", wav).unwrap();
 
         let removed = prune_speech(&s, now_ms() - 3_600_000, std::slice::from_ref(&kept_ogg.id)).unwrap();
         assert_eq!(removed, 2);
