@@ -203,7 +203,14 @@ async fn kick_takes_the_stream_and_closes_it_waits_longer_says_why_and_spares_th
             (base * 0.8 - 1.0..=base * 1.2 + 1.0).contains(&(retry_in_ms as f64)),
             "attempt {want} waits {retry_in_ms} ms, near {base} was expected"
         );
-        assert!(reason.contains("closed the connection"), "the reason says what happened: {reason}");
+        // Which of the two the sender meets first depends on timing: it was writing a frame as the
+        // server hung up (the write fails: "broke") or reading (the end of the stream: "closed").
+        // Either says the server dropped the connection; a close that isn't noticed says neither,
+        // and the count and the Kick advice below would not come at all.
+        assert!(
+            reason.contains("closed the connection") || reason.contains("connection to 127.0.0.1 broke"),
+            "the reason says what happened: {reason}"
+        );
         assert!(reason.contains("Allow multistreaming"), "and what to do about it: {reason}");
         seen.push((attempt, retry_in_ms));
         // Off the failed state before the next wait for it.
