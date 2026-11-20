@@ -1818,8 +1818,13 @@ async fn a_failed_background_save_gives_one_notice_and_a_later_success_replaces_
     let failed = notices(&mut live);
     assert_eq!(failed.len(), 1, "one notice per failing file, not per attempt: {failed:?}");
     assert_eq!(failed[0]["level"], "warn");
-    assert_eq!(failed[0]["message"], "Couldn't save your scenes: the file is in use by another program.");
+    // The parent being a file: NotADirectory/NotFound-class, not a lock.
+    assert!(failed[0]["message"].as_str().unwrap().starts_with("Couldn't save your scenes"));
     assert!(failed[0]["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    let text = failed[0].to_string();
+    let tmp = d.path().to_string_lossy().to_string();
+    assert!(!text.contains(&tmp) && !text.contains("savetest"), "no path in the notice: {text}");
+    assert_eq!(failed[0]["key"], "save:collections/main.json");
     // Fixed: the same key says it's saving again, replacing the warning on the dashboard.
     std::fs::remove_file(&blocker).unwrap();
     ferrocast_store::durable::queue_json_bytes(&file, b"{}".to_vec());

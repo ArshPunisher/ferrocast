@@ -193,7 +193,7 @@ pub fn save_json_compact<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -
     write_json_bytes(path, &bytes)
 }
 
-pub use queue::{SaveError, SaveEvent, flush_saves, set_save_observer, take_save_errors};
+pub use queue::{SaveError, SaveEvent, SaveFailure, flush_saves, set_save_observer, take_save_errors};
 
 /// Queues `bytes` to be saved to `path` (atomic, with `.bak`, same as [`write_json_bytes`]) on a
 /// background thread, and returns at once. The UI/async caller never waits out the Windows
@@ -232,12 +232,34 @@ mod queue {
         pub message: String,
     }
 
-    /// A queued file went from saving to failing (`error` is the OS error) or back (`None`).
-    /// Sent once per change, not once per attempt.
+    /// Why a queued save failed, without free text: an OS error's own words can carry a path
+    /// (the user's folder name), and this goes to dashboards.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SaveFailure {
+        pub kind: io::ErrorKind,
+        pub raw_os_error: Option<i32>,
+    }
+
+    impl SaveFailure {
+        fn of(e: &io::Error) -> Self {
+            Self { kind: e.kind(), raw_os_error: e.raw_os_error() }
+        }
+
+        /// Safe to show: the error kind and the OS error number, nothing else.
+        pub fn describe(&self) -> String {
+            match self.raw_os_error {
+                Some(n) => format!("{} (os error {n})", self.kind),
+                None => self.kind.to_string(),
+            }
+        }
+    }
+
+    /// A queued file went from saving to failing or back (`None`). Sent once per change (a new
+    /// kind of failure counts as a change), not once per attempt.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct SaveEvent {
         pub file: PathBuf,
-        pub error: Option<String>,
+        pub error: Option<SaveFailure>,
     }
 
     type WriteFn = fn(&Path, &[u8]) -> io::Result<()>;
@@ -259,7 +281,7 @@ mod queue {
         pending: HashMap<PathBuf, Entry>,
         order: VecDeque<PathBuf>,
         errors: HashMap<PathBuf, String>,
-        failing: HashMap<PathBuf, String>,
+        failing: HashMap<PathBuf, SaveFailure>,
         next_generation: u64,
         worker_started: bool,
     }
@@ -354,8 +376,9 @@ mod queue {
                 tracing::error!(error = %e, file = %path.display(), "a queued save failed after retrying");
                 st.errors
                     .insert(path.clone(), format!("Couldn't save: {e}. The file may be in use by another program."));
-                if st.failing.insert(path.clone(), e.to_string()).as_deref() != Some(&e.to_string()) {
-                    event = Some(SaveEvent { file: path.clone(), error: Some(e.to_string()) });
+                let failure = SaveFailure::of(&e);
+                if st.failing.insert(path.clone(), failure) != Some(failure) {
+                    event = Some(SaveEvent { file: path.clone(), error: Some(failure) });
                 }
             }
         }
