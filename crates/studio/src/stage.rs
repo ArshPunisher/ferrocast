@@ -2666,6 +2666,16 @@ impl Stage {
 
     // ------------------------------------------------------------------ the engine itself
 
+    /// What the engine running now mixes and paces at: the sound rate, and whether it runs at the
+    /// broadcast rate (29.97, 59.94, 23.976). None before it has started. These change only when
+    /// the engine opens again.
+    pub fn engine_format(&self) -> Option<(u32, bool)> {
+        self.engine.borrow().as_ref().map(|s| {
+            let c = s.engine.config();
+            (c.sample_rate, c.ntsc)
+        })
+    }
+
     /// The canvas everything is drawn at.
     pub fn canvas(&self) -> Canvas {
         self.canvas
