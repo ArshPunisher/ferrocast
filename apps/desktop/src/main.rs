@@ -165,11 +165,15 @@ enum LogMsg {
 #[derive(Clone)]
 struct NonBlockingLog {
     tx: std::sync::mpsc::SyncSender<LogMsg>,
+    /// Lines dropped because the queue was full, not yet said in the log.
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl NonBlockingLog {
     fn spawn(mut inner: impl std::io::Write + Send + 'static, queue: usize) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<LogMsg>(queue);
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let said = dropped.clone();
         let _ = std::thread::Builder::new().name("ferrocast-log".into()).spawn(move || {
             while let Ok(m) = rx.recv() {
                 match m {
@@ -181,9 +185,15 @@ impl NonBlockingLog {
                         let _ = done.send(());
                     }
                 }
+                // A gap in the log says so, once the writer has caught up enough to write it.
+                let n = said.swap(0, std::sync::atomic::Ordering::AcqRel);
+                if n > 0 {
+                    let _ =
+                        inner.write_all(format!("{n} log lines were dropped (the log couldn't keep up)\n").as_bytes());
+                }
             }
         });
-        Self { tx }
+        Self { tx, dropped }
     }
 
     /// Waits (at most `wait`) until what was logged before is written: for a panic or a quit.
@@ -209,7 +219,9 @@ impl NonBlockingLog {
 impl std::io::Write for NonBlockingLog {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // Lossy by design: the queue being full means the disk is far behind.
-        let _ = self.tx.try_send(LogMsg::Line(buf.to_vec()));
+        if self.tx.try_send(LogMsg::Line(buf.to_vec())).is_err() {
+            self.dropped.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         Ok(buf.len())
     }
 
@@ -241,7 +253,9 @@ fn init_tracing(dir: &std::path::Path) {
         let _ = LOG_FILE.set(w.clone());
     }
     let to_file = writer.map(|w| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(w));
-    let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
+    // The terminal too: stdout may be a pipe nobody reads, and a write to it must not park a worker.
+    let to_terminal = tracing_subscriber::fmt::layer().with_writer(NonBlockingLog::spawn(std::io::stdout(), LOG_QUEUE));
+    let _ = tracing_subscriber::registry().with(filter).with(to_terminal).with(to_file).try_init();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Where it came from too (function names in builds with symbols, addresses without).
@@ -1643,6 +1657,7 @@ mod update_tests {
         let text = String::from_utf8(got.lock().unwrap().clone()).unwrap();
         assert!(text.starts_with("line 0\n"), "the first lines are kept, in order");
         assert!(text.lines().count() < 1_000, "a full queue drops lines instead of waiting");
+        assert!(text.contains("log lines were dropped"), "the gap is said in the log: {text}");
     }
 
     #[test]
