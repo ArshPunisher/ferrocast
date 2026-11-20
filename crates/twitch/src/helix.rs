@@ -82,10 +82,17 @@ impl Helix {
                 continue;
             }
             if res.status().as_u16() == 401 && refreshed {
-                // Refused again with a token just issued: more likely the edge catching up than the
-                // streamer being signed out (a really revoked sign-in fails at the refresh itself).
-                // Said as a network trouble so the connector retries with its backoff instead of
-                // ending for good.
+                // Refused again with a token just issued. A missing scope says so (the permission
+                // to fix); otherwise the first times it is more likely the API edge catching up than
+                // the streamer being signed out, so it is said as a network trouble and the connector
+                // retries with its backoff; refused three times in a row, the sign-in no longer works.
+                let err = TwitchError::from_response(res).await;
+                if matches!(err, TwitchError::MissingScope(_)) {
+                    return Err(err);
+                }
+                if self.auth.note_fresh_refused() >= 3 {
+                    return Err(TwitchError::SignInNeeded);
+                }
                 return Err(TwitchError::Network("Twitch didn't accept a fresh sign-in yet".into()));
             }
             if res.status().as_u16() == 429 {
@@ -106,6 +113,7 @@ impl Helix {
             if !res.status().is_success() {
                 return Err(TwitchError::from_response(res).await);
             }
+            self.auth.note_accepted();
             if res.status().as_u16() == 204 {
                 return Ok(Value::Null);
             }

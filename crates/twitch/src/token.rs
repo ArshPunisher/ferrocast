@@ -25,6 +25,8 @@ pub struct Auth {
     /// When saving was last retried while `unsaved`: not again for a while, so a locked Keychain isn't
     /// asked, under the token lock, at every call.
     last_save_try: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Times in a row Helix refused a token just issued (reset when a call works).
+    fresh_refused: std::sync::atomic::AtomicU32,
 }
 
 impl fmt::Debug for Auth {
@@ -46,6 +48,7 @@ impl Auth {
             on_tokens,
             unsaved: AtomicBool::new(false),
             last_save_try: std::sync::Mutex::new(None),
+            fresh_refused: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -95,6 +98,16 @@ impl Auth {
                 }
             }
         }
+    }
+
+    /// Helix refused a token just issued: how many times in a row (this one included).
+    pub(crate) fn note_fresh_refused(&self) -> u32 {
+        self.fresh_refused.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// A call worked: the tokens are accepted.
+    pub(crate) fn note_accepted(&self) {
+        self.fresh_refused.store(0, Ordering::Release);
     }
 
     /// Lets the next use try saving again at once (tests; the wait is 30 s).

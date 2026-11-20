@@ -576,3 +576,55 @@ async fn the_ingest_list_is_read_once_and_a_blip_keeps_the_picked_server() {
     // Never read, list down: Twitch's own secure address.
     assert_eq!(helix_for(ep).nearest_ingest().await, crate::ingest::FALLBACK_INGEST);
 }
+
+/// A Helix that refuses the token just issued: a missing scope says so; a plain 401 is a network-style
+/// failure the first two times and a sign-out the third (not an endless loop of refreshes).
+#[tokio::test]
+async fn a_fresh_token_helix_refuses_names_the_scope_then_ends_in_a_sign_in() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn server(helix_body: &'static str) -> Endpoints {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (status, body) = if head.contains("/oauth2/token") {
+                        (
+                            200,
+                            r#"{"access_token":"fresh","refresh_token":"r2","expires_in":3600,"scope":[]}"#.to_string(),
+                        )
+                    } else {
+                        (401, helix_body.to_string())
+                    };
+                    let r = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(r.as_bytes()).await;
+                });
+            }
+        });
+        Endpoints { ingest: base.clone(), id: base.clone(), api: base.clone(), eventsub: base }
+    }
+    let tokens = || Tokens {
+        access_token: "old".into(),
+        refresh_token: "r".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes: vec![],
+    };
+    // (b) the permission to fix is named, not hidden as a network error.
+    let ep = server(r#"{"status":401,"message":"Missing scope: channel:read:stream_key"}"#).await;
+    let helix = Helix::new(Arc::new(Auth::new(http_client(), ep, "c".into(), tokens(), Arc::new(|_| Ok(())))));
+    let e = helix.me().await.unwrap_err();
+    assert!(matches!(e, TwitchError::MissingScope(_)), "{e:?}");
+    // (a) a token refused every time ends in a sign-in, after two network-style failures.
+    let ep = server(r#"{"status":401,"message":"Invalid OAuth token"}"#).await;
+    let helix = Helix::new(Arc::new(Auth::new(http_client(), ep, "c".into(), tokens(), Arc::new(|_| Ok(())))));
+    for _ in 0..2 {
+        assert!(matches!(helix.me().await.unwrap_err(), TwitchError::Network(_)));
+    }
+    assert_eq!(helix.me().await.unwrap_err(), TwitchError::SignInNeeded);
+}
