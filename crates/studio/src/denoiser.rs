@@ -72,6 +72,15 @@ impl Denoiser {
         self.inp.len()
     }
 
+    /// Samples never came between what it has taken in and what comes next: the half frame it
+    /// holds from before is let go, not joined to the sound after the hole (the frames after
+    /// would also have been misaligned until the next one).
+    pub(crate) fn gap(&mut self) {
+        for q in &mut self.inp {
+            q.clear();
+        }
+    }
+
     pub(crate) fn set_strength(&mut self, strength: u32) {
         if strength != self.strength {
             self.df.set_atten_lim(atten_db(strength));
@@ -128,6 +137,9 @@ trait WorkerEngine {
     fn latency(&self) -> usize;
     fn set_strength(&mut self, strength: u32);
     fn run(&mut self, planes: &mut [&mut [f32]]);
+    /// A block (or more) before the next one never came (the inbox dropped it): what the model
+    /// holds of the sound before it must not be joined to what comes now.
+    fn gap(&mut self) {}
 }
 
 impl WorkerEngine for Denoiser {
@@ -141,6 +153,10 @@ impl WorkerEngine for Denoiser {
 
     fn run(&mut self, planes: &mut [&mut [f32]]) {
         Denoiser::run(self, planes);
+    }
+
+    fn gap(&mut self) {
+        Denoiser::gap(self);
     }
 }
 
@@ -159,7 +175,12 @@ const MAX_INBOX: usize = 3;
 const MAX_OUTBOX: usize = 8;
 const MAX_RECYCLE: usize = 12;
 /// Samples a change to the sound as it came is eased over when there's no answer to fade from.
-const DECLICK: usize = 64;
+const DECLICK: usize = 480;
+/// After the model's answer was late, the sound stays dry at least this long (six blocks) before
+/// it goes back to the model's: answers late every few blocks flipped it between the two at
+/// block rate (a tear: the noise coming and going) and a stretch in the model's hands that short
+/// was not worth the change.
+const DRY_HOLD: usize = 6144;
 /// The longest the model may take to get ready before the light noise removal is used instead.
 const READY_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -257,6 +278,8 @@ struct Plugin {
     dry_scratch: [Vec<f32>; 2],
     /// The last block was the model's.
     was_wet: bool,
+    /// Samples left to stay dry after a late answer (see `DRY_HOLD`).
+    dry_hold: usize,
     /// Samples judged in this stretch, and how many of them passed dry, since the first wet block.
     judged: usize,
     dry_run: usize,
@@ -319,6 +342,8 @@ impl Plugin {
                         return;
                     }
                 }
+                // Where the next block should start, to tell when blocks were dropped before it.
+                let mut next_at: Option<u64> = None;
                 loop {
                     let (new_strength, blk) = {
                         let mut q = worker_shared.q.lock().unwrap_or_else(|e| e.into_inner());
@@ -334,6 +359,10 @@ impl Plugin {
                         d.set_strength(s);
                     }
                     if let Some(mut blk) = blk {
+                        if next_at.is_some_and(|e| e != blk.at) {
+                            d.gap();
+                        }
+                        next_at = Some(blk.at + blk.l.len() as u64);
                         d.run(&mut [&mut blk.l, &mut blk.r]);
                         let mut q = worker_shared.q.lock().unwrap_or_else(|e| e.into_inner());
                         if q.closed {
@@ -365,6 +394,7 @@ impl Plugin {
             dry: [silence(), silence()],
             dry_scratch: [Vec::with_capacity(1024), Vec::with_capacity(1024)],
             was_wet: false,
+            dry_hold: 0,
             judged: 0,
             dry_run: 0,
             gave_up: false,
@@ -475,6 +505,15 @@ impl ferrocore::afx::SoundPlugin for Plugin {
         }
         // The model's answers for this block are here (`have`), and they're played (`wet`).
         let have = wet;
+        // A late answer holds the sound dry for a while; one that is here again meanwhile is let go.
+        if self.ever_wet {
+            if !have {
+                self.dry_hold = DRY_HOLD;
+            } else if self.dry_hold > 0 {
+                self.dry_hold = self.dry_hold.saturating_sub(n);
+                wet = false;
+            }
+        }
         // Judging starts only after the first wet block arrives (never penalized during slow
         // startup or pipeline fill). One that gives up fades to dry here so `light_denoise`
         // starts from there with no step.
@@ -1067,5 +1106,134 @@ mod tests {
         assert!(!p.gave_up, "brief stall must not trigger permanent gave_up");
         let avg = recovered.iter().sum::<f32>() / recovered.len() as f32;
         assert!((avg - 0.1).abs() < 0.01, "recovered cleanly back to wet (0.1), got {avg:.4}");
+    }
+
+    /// A model that takes its sound in frames of `HOP` samples, like the real one: what's left over
+    /// of a block waits for the next. Fed a ramp (every sample one step above the one before), a
+    /// frame that is not a straight run of it was made of two stretches joined together.
+    struct HopEngine {
+        inp: Vec<f32>,
+        out: VecDeque<f32>,
+        joined: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        stall: Option<(usize, std::time::Duration)>,
+        calls: usize,
+    }
+
+    const HOP: usize = 480;
+
+    impl WorkerEngine for HopEngine {
+        fn latency(&self) -> usize {
+            MODEL_LATENCY
+        }
+        fn set_strength(&mut self, _: u32) {}
+        fn gap(&mut self) {
+            self.inp.clear();
+        }
+        fn run(&mut self, planes: &mut [&mut [f32]]) {
+            if let Some((at, dur)) = self.stall
+                && self.calls == at
+            {
+                std::thread::sleep(dur);
+            }
+            self.calls += 1;
+            let n = planes[0].len();
+            self.inp.extend_from_slice(planes[0]);
+            while self.inp.len() >= HOP {
+                let frame: Vec<f32> = self.inp.drain(..HOP).collect();
+                if frame.windows(2).any(|w| (w[1] - w[0] - 1e-5).abs() > 1e-7) {
+                    self.joined.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.out.extend(frame);
+            }
+            for s in planes[0].iter_mut() {
+                *s = self.out.pop_front().unwrap_or(0.0);
+            }
+            for s in planes[1].iter_mut() {
+                *s = 0.0;
+            }
+            let _ = n;
+        }
+    }
+
+    /// A stall long enough to make the inbox drop its oldest blocks must not join the sound before
+    /// the hole to the sound after it inside the model (a click through it, and its frames
+    /// misaligned for a stretch): the worker tells it, and it forgets the half frame it held.
+    #[test]
+    fn a_dropped_block_is_not_spliced_into_the_one_after_it() {
+        use ferrocore::afx::SoundPlugin as _;
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let j = joined.clone();
+        let Ok(mut p) = Plugin::start_with(65, READY_WITHIN, move |_| {
+            Ok(HopEngine {
+                inp: Vec::new(),
+                out: std::iter::repeat_n(0.0, MODEL_LATENCY).collect(),
+                joined: j,
+                stall: Some((10, std::time::Duration::from_millis(200))),
+                calls: 0,
+            })
+        }) else {
+            panic!("worker spawns");
+        };
+        let mut k = 0usize;
+        for _ in 0..40 {
+            let mut l: Vec<f32> = (0..1024).map(|i| (k + i) as f32 * 1e-5).collect();
+            let mut r = l.clone();
+            k += 1024;
+            assert!(p.process([&mut l, &mut r]));
+            std::thread::sleep(std::time::Duration::from_millis(21));
+        }
+        // (The first frames after the model is ready may start mid-ramp: that is a start, not a join.)
+        assert_eq!(joined.load(std::sync::atomic::Ordering::SeqCst), 0, "frames made of two stretches");
+    }
+
+    /// The output of a plugin whose answers are late now and then must not flip between the model's
+    /// sound and the dry one every few blocks (a "tear": the noise floor pumping at block rate),
+    /// nor jump between them in a millisecond: a wet to dry change takes at least 5 ms.
+    #[test]
+    fn late_answers_do_not_flip_flop_the_sound_or_jump_it() {
+        use ferrocore::afx::SoundPlugin as _;
+        // A model that is late (a stall) at several blocks close together.
+        struct Flaky {
+            inner: MockEngine,
+            stalls: Vec<usize>,
+        }
+        impl WorkerEngine for Flaky {
+            fn latency(&self) -> usize {
+                MODEL_LATENCY
+            }
+            fn set_strength(&mut self, _: u32) {}
+            fn run(&mut self, planes: &mut [&mut [f32]]) {
+                if self.stalls.contains(&self.inner.calls) {
+                    std::thread::sleep(std::time::Duration::from_millis(75));
+                }
+                self.inner.calls += 1;
+                for (c, p) in planes.iter_mut().take(2).enumerate() {
+                    for s in p.iter_mut() {
+                        self.inner.delay[c].push_back(*s * self.inner.gain);
+                        *s = self.inner.delay[c].pop_front().unwrap_or(0.0);
+                    }
+                }
+            }
+        }
+        let Ok(mut p) = Plugin::start_with(65, READY_WITHIN, |_| {
+            Ok(Flaky { inner: MockEngine::new(0.25, None), stalls: vec![14, 17, 20, 23, 26, 29, 32, 35, 38] })
+        }) else {
+            panic!("worker spawns");
+        };
+        let mut out = Vec::new();
+        for _ in 0..70 {
+            let (mut l, mut r) = (vec![0.4f32; 1024], vec![0.4f32; 1024]);
+            assert!(p.process([&mut l, &mut r]));
+            out.extend_from_slice(&l);
+            std::thread::sleep(std::time::Duration::from_millis(21));
+        }
+        let from = 40 * 1024; // once the model is running
+        let tail = &out[from..];
+        // Dry is 0.4, the model's 0.1. No step between neighbours steeper than a 0.3 change in 5 ms.
+        let steepest = tail.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(steepest <= 0.3 / 240.0, "a jump of {steepest:.4} in one sample: a change in under 5 ms");
+        // And it doesn't cross back and forth: the times the level passes 0.25 (halfway).
+        let crossings = tail.windows(2).filter(|w| (w[0] - 0.25) * (w[1] - 0.25) < 0.0).count();
+        assert!(crossings <= 4, "the sound changed between dry and wet {crossings} times in {} ms", tail.len() / 48);
     }
 }
