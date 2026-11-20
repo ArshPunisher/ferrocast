@@ -49,9 +49,13 @@ pub struct Imported {
     /// The scene shown over whatever is on air (`ferrocast_top_layer`: Exeldro's Downstream
     /// Keyer, built in), when it names one of `scenes`.
     pub top_layer: Option<String>,
-    /// Ducking derived from OBS sidechained compressors (`compressor_filter` with
-    /// `sidechain_source`), resolved to imported source IDs (M2-03).
+    /// Ducking derived from OBS sidechained compressors (retained for explicit ducking configs;
+    /// OBS `compressor_filter` with `sidechain_source` now maps directly to per-source
+    /// `AudioEffect::Compressor { sidechain: Some(id) }`).
     pub ducking: Option<crate::level::Ducking>,
+    /// Sidechain compressor cycles broken during import: `(source_name, key_source_name)` where
+    /// `source_name`'s compressor receives silence to break a loop.
+    pub sidechain_cycles: Vec<(String, String)>,
 }
 
 fn f(v: &Value, k: &str, d: f64) -> f32 {
@@ -307,6 +311,18 @@ fn sidechain_source(s: &Value) -> Option<&str> {
     (!name.is_empty() && !name.eq_ignore_ascii_case("none")).then_some(name)
 }
 
+fn compressor_from(s: &Value, sidechain: Option<u64>) -> AudioEffect {
+    let n = |k: &str, d: f64| f(s, k, d);
+    AudioEffect::Compressor {
+        ratio: n("ratio", 10.0).clamp(1.0, 32.0),
+        threshold_db: n("threshold", -18.0).clamp(-60.0, 0.0),
+        attack_ms: n("attack_time", 6.0).clamp(0.0, 500.0),
+        release_ms: n("release_time", 60.0).clamp(0.0, 1_000.0),
+        output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
+        sidechain,
+    }
+}
+
 pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
     let n = |k: &str, d: f64| f(s, k, d);
     Some(match kind {
@@ -321,17 +337,11 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
         },
         "compressor_filter" => {
             // A sidechained compressor ducks under another source; never turn it into a
-            // self-compressor (`import_with` maps it to our Ducking instead, M2-03).
+            // self-compressor (`import_with` resolves `sidechain_source` to a source ID).
             if sidechain_source(s).is_some() {
                 return None;
             }
-            AudioEffect::Compressor {
-                ratio: n("ratio", 10.0).clamp(1.0, 32.0),
-                threshold_db: n("threshold", -18.0).clamp(-60.0, 0.0),
-                attack_ms: n("attack_time", 6.0).clamp(0.0, 500.0),
-                release_ms: n("release_time", 60.0).clamp(0.0, 1_000.0),
-                output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
-            }
+            compressor_from(s, None)
         }
         "limiter_filter" => AudioEffect::Limiter {
             threshold_db: n("threshold", -6.0).clamp(-60.0, 0.0),
@@ -1066,10 +1076,12 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
     let mut clones: Vec<(String, String, bool, Vec<crate::Effect>)> = Vec::new();
     // Each camera or capture card opened, by device, and the source that opens it.
     let mut devices: Vec<(String, String)> = Vec::new();
-    // Sidechained compressors collected across all sources and global channels, then resolved to
-    // source IDs once every source has been imported (the sidechain mic often sits in
-    // `AuxAudioDevice1` after scene sources).
-    let mut sidechains: Vec<(String, String, f32, f32)> = Vec::new();
+    // OBS source UUIDs (for resolving `sidechain_source` when saved as a UUID instead of a name).
+    let mut source_uuids: Vec<(u64, String)> = Vec::new();
+    // Placeholder tokens (`u64::MAX - idx`) placed in `sound_effects` for sidechained compressors
+    // so filter-chain order is preserved and targets are resolved once every source and global
+    // channel has its ID (`AuxAudioDevice1` often sits after scene sources).
+    let mut pending_sidechains: Vec<(u64, String)> = Vec::new();
     for (s, global) in sources.iter().map(|s| (s, false)).chain(channels.iter().map(|s| (s, true))) {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
         let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -1147,12 +1159,9 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
             } else if kind == "compressor_filter"
                 && let Some(sc) = sidechain_source(&fs)
             {
-                let ratio = f(&fs, "ratio", 10.0).max(1.0);
-                let threshold = f(&fs, "threshold", -18.0).clamp(-60.0, 0.0);
-                let slope = 1.0 - 1.0 / ratio;
-                // Equivalent ducking depth for a typical -12 dBFS speech peak over `threshold`.
-                let depth_db = (-slope * (-12.0 - threshold).max(6.0)).clamp(-40.0, -3.0);
-                sidechains.push((name.clone(), sc.to_string(), threshold, depth_db));
+                let tok = u64::MAX - pending_sidechains.len() as u64;
+                pending_sidechains.push((tok, sc.to_string()));
+                sound_effects.push(compressor_from(&fs, Some(tok)));
             } else if let Some(e) = audio_effect_from(kind, &fs) {
                 sound_effects.push(e);
             } else if matches!(kind, "noise_suppress_filter" | "noise_suppress_filter_v2" | "ferrocast_deepfilter") {
@@ -1227,6 +1236,11 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                         _ => Monitoring::Off,
                     },
                 });
+                if sound.is_some()
+                    && let Some(u) = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty())
+                {
+                    source_uuids.push((next_id, u.to_string()));
+                }
                 out.sources.push(ImportedSource {
                     id: next_id,
                     name: name.clone(),
@@ -1241,39 +1255,79 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
             Err(what) => out.skipped.push(format!("{name}: {what}")),
         }
     }
-    // Resolve OBS sidechained compressors into our Ducking once every source and global channel
-    // has its ID (M2-03).
-    if !sidechains.is_empty() {
-        let mut voices: Vec<u64> = Vec::new();
-        let mut music: Vec<u64> = Vec::new();
-        let mut depth_db = -3.0f32;
-        let mut threshold_db = 0.0f32;
-        let mut any = false;
-        let sound_id =
-            |src_name: &str| out.sources.iter().find(|s| s.name == src_name && s.sound.is_some()).map(|s| s.id);
-        for (target_name, sc_name, thresh, depth) in sidechains {
-            if target_name == sc_name {
-                out.skipped.push(format!("{target_name}: sidechain compressor can't duck itself"));
-                continue;
-            }
-            let Some(music_id) = sound_id(&target_name) else { continue };
-            let Some(voice_id) = sound_id(&sc_name) else {
-                out.skipped.push(format!("{target_name}: sidechain source \"{sc_name}\" not found"));
-                continue;
-            };
-            if !voices.contains(&voice_id) {
-                voices.push(voice_id);
-            }
-            if !music.contains(&music_id) {
-                music.push(music_id);
-            }
-            depth_db = if any { depth_db.min(depth) } else { depth };
-            threshold_db = if any { threshold_db.min(thresh) } else { thresh };
-            any = true;
+    // Resolve OBS sidechained compressors (`sidechain_source` by name or UUID) directly onto each
+    // source's `AudioEffect::Compressor { sidechain: Some(target_id) }` once every source and
+    // global channel has its ID. Missing targets and self-loops are dropped (never self-compressed);
+    // multi-source cycles are detected with the same deterministic breaker `Mixer` uses.
+    if !pending_sidechains.is_empty() {
+        let audio_index: Vec<(u64, String)> =
+            out.sources.iter().filter(|s| s.sound.is_some()).map(|s| (s.id, s.name.clone())).collect();
+        let resolve_target = |sc_ref: &str| -> Option<u64> {
+            audio_index
+                .iter()
+                .find(|(_, n)| n == sc_ref)
+                .map(|(id, _)| *id)
+                .or_else(|| source_uuids.iter().find(|(_, u)| u.eq_ignore_ascii_case(sc_ref)).map(|(id, _)| *id))
+        };
+        let mut deps: Vec<(u64, u64)> = Vec::new();
+        for src in &mut out.sources {
+            let src_id = src.id;
+            let src_name = src.name.clone();
+            let has_sound = src.sound.is_some();
+            src.sound_effects.retain_mut(|eff| {
+                let AudioEffect::Compressor { sidechain: Some(sc), .. } = eff else {
+                    return true;
+                };
+                let Some((_, sc_ref)) = pending_sidechains.iter().find(|(tok, _)| tok == sc) else {
+                    return true;
+                };
+                if !has_sound {
+                    return false;
+                }
+                let Some(target_id) = resolve_target(sc_ref) else {
+                    out.skipped.push(format!("{src_name}: sidechain source \"{sc_ref}\" not found"));
+                    return false;
+                };
+                if target_id == src_id {
+                    out.skipped.push(format!("{src_name}: sidechain compressor can't duck itself"));
+                    if !out.sidechain_cycles.iter().any(|(a, b)| a == &src_name && b == &src_name) {
+                        out.sidechain_cycles.push((src_name.clone(), src_name.clone()));
+                    }
+                    return false;
+                }
+                *sc = target_id;
+                deps.push((src_id, target_id));
+                true
+            });
         }
-        music.retain(|m| !voices.contains(m));
-        if any && !voices.is_empty() && !music.is_empty() {
-            out.ducking = Some(crate::level::Ducking { voices, music, depth_db, threshold_db });
+        if !deps.is_empty() {
+            let mut nodes: Vec<u64> = audio_index.iter().map(|(id, _)| *id).collect();
+            nodes.sort_unstable();
+            let mut order = Vec::new();
+            let mut broken = Vec::new();
+            let mut scratch = crate::mix::TopoScratch::default();
+            crate::mix::resolve_sidechain_order(&nodes, &deps, &mut order, &mut broken, &mut scratch);
+            for &(src_id, key_id) in &broken {
+                let src_name = audio_index.iter().find(|(id, _)| *id == src_id).map(|(_, n)| n.clone());
+                let key_name = audio_index.iter().find(|(id, _)| *id == key_id).map(|(_, n)| n.clone());
+                if let (Some(src_name), Some(key_name)) = (src_name, key_name) {
+                    out.skipped.push(format!("{src_name}: sidechain loop with \"{key_name}\" was broken"));
+                    if !out.sidechain_cycles.iter().any(|(a, b)| a == &src_name && b == &key_name) {
+                        out.sidechain_cycles.push((src_name, key_name));
+                    }
+                }
+                // Silence the exact edge reported in `sidechain_cycles` (ID 0 is never a valid
+                // source ID, so `Mixer` routes `KeyRoute::Silence` regardless of live ID order).
+                if let Some(src) = out.sources.iter_mut().find(|s| s.id == src_id) {
+                    for eff in &mut src.sound_effects {
+                        if let AudioEffect::Compressor { sidechain: Some(sc), .. } = eff
+                            && *sc == key_id
+                        {
+                            *sc = 0;
+                        }
+                    }
+                }
+            }
         }
     }
     // Clones show their source's picture (no second copy of it, no second sound) with their own
@@ -1337,6 +1391,72 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
         out.scenes.sort_by_key(|(n, _)| names.iter().position(|o| o == n).unwrap_or(usize::MAX));
     }
     out
+}
+
+/// Detects sidechain compressor cycles directly from an OBS scene collection document, using the
+/// same deterministic cycle-breaking order as [`crate::mix::Mixer`]. Returns `(source, key)` pairs
+/// whose sidechain edge is severed to silence.
+pub fn sidechain_cycles(doc: &Value) -> Vec<(String, String)> {
+    let sources = doc.get("sources").and_then(Value::as_array).cloned().unwrap_or_default();
+    let channels: Vec<Value> = CHANNELS.iter().filter_map(|k| doc.get(*k).cloned()).collect();
+    let mut entries: Vec<(u64, String, Option<String>, Vec<String>)> = Vec::new();
+    let mut next_id = 1u64;
+    for s in sources.iter().chain(channels.iter()) {
+        let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
+        if id == "scene" || id == "group" {
+            continue;
+        }
+        let name = s.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let uuid = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string);
+        let mut keys = Vec::new();
+        for flt in s.get("filters").and_then(Value::as_array).into_iter().flatten() {
+            if flt.get("enabled").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let kind = flt.get("versioned_id").or_else(|| flt.get("id")).and_then(Value::as_str).unwrap_or_default();
+            if kind == "compressor_filter"
+                && let Some(fs) = flt.get("settings")
+                && let Some(sc) = sidechain_source(fs)
+            {
+                keys.push(sc.to_string());
+            }
+        }
+        entries.push((next_id, name, uuid, keys));
+        next_id += 1;
+    }
+    let mut deps: Vec<(u64, u64)> = Vec::new();
+    for (src_id, _, _, keys) in &entries {
+        for sc_ref in keys {
+            let target = entries.iter().find(|(_, n, _, _)| n == sc_ref).map(|(id, ..)| *id).or_else(|| {
+                entries
+                    .iter()
+                    .find(|(_, _, u, _)| u.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(sc_ref)))
+                    .map(|(id, ..)| *id)
+            });
+            if let Some(tid) = target {
+                deps.push((*src_id, tid));
+            }
+        }
+    }
+    if deps.is_empty() {
+        return Vec::new();
+    }
+    let nodes: Vec<u64> = entries.iter().map(|(id, ..)| *id).collect();
+    let mut order = Vec::new();
+    let mut broken = Vec::new();
+    let mut scratch = crate::mix::TopoScratch::default();
+    crate::mix::resolve_sidechain_order(&nodes, &deps, &mut order, &mut broken, &mut scratch);
+    broken
+        .into_iter()
+        .filter_map(|(u, v)| {
+            let sn = entries.iter().find(|(id, ..)| *id == u).map(|(_, n, ..)| n.clone())?;
+            let kn = entries.iter().find(|(id, ..)| *id == v).map(|(_, n, ..)| n.clone())?;
+            Some((sn, kn))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1992,12 +2112,13 @@ mod tests {
         assert_eq!(mic.sound_effects.len(), 2, "the gain stays");
     }
 
-    /// An OBS compressor with `sidechain_source` imports as our Ducking instead of a
-    /// self-compressor (even when the sidechain mic sits later in `AuxAudioDevice1`), while
-    /// `"none"` / `""` still import as a normal compressor and a missing sidechain is skipped
-    /// rather than self-compressing (M2-03).
+    /// An OBS compressor with `sidechain_source` imports as a sidechained `AudioEffect::Compressor`
+    /// keyed by the target source ID (by name or UUID, even when the mic sits later in
+    /// `AuxAudioDevice1`) instead of the global `level::Ducker`, while `"none"` / `""` stay a
+    /// self-compressor, missing targets and self-loops are skipped (never self-compressing), and
+    /// A↔B cycles are detected and broken deterministically.
     #[test]
-    fn sidechain_compressor_imports_as_ducking_not_self_compressor() {
+    fn sidechain_compressor_imports_as_sidechain_effect_not_global_ducker() {
         // Direct unit check on audio_effect_from.
         assert_eq!(
             audio_effect_from(
@@ -2013,28 +2134,52 @@ mod tests {
             json!({ "ratio": 4.0, "sidechain_source": "none" }),
         ] {
             assert!(
-                matches!(audio_effect_from("compressor_filter", &no_sc), Some(AudioEffect::Compressor { .. })),
+                matches!(
+                    audio_effect_from("compressor_filter", &no_sc),
+                    Some(AudioEffect::Compressor { sidechain: None, .. })
+                ),
                 "normal compressor stays: {no_sc}"
             );
         }
 
         // Full OBS collection import (works on every OS via `ffmpeg_source` media audio).
+        let mic_uuid = "11111111-2222-3333-4444-555555555555";
         let doc = json!({
             "sources": [
                 {
                     "id": "ffmpeg_source",
                     "name": "Game Audio",
                     "settings": { "local_file": "/game.mp4" },
+                    "filters": [
+                        { "id": "gain_filter", "name": "Pre", "settings": { "db": 0.0 } },
+                        {
+                            "id": "compressor_filter",
+                            "name": "Lower when I talk",
+                            "settings": {
+                                "ratio": 20.0,
+                                "threshold": -32.0,
+                                "attack_time": 10,
+                                "release_time": 600,
+                                "output_gain": 0.0,
+                                "sidechain_source": "Mic/Aux"
+                            }
+                        },
+                        { "id": "limiter_filter", "name": "Post", "settings": { "threshold": -1.0 } }
+                    ]
+                },
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Music By UUID",
+                    "settings": { "local_file": "/uuid-music.mp4" },
                     "filters": [{
                         "id": "compressor_filter",
-                        "name": "Lower when I talk",
+                        "name": "Duck by UUID",
                         "settings": {
-                            "ratio": 20.0,
-                            "threshold": -32.0,
-                            "attack_time": 10,
-                            "release_time": 600,
-                            "output_gain": 0.0,
-                            "sidechain_source": "Mic/Aux"
+                            "ratio": 10.0,
+                            "threshold": -24.0,
+                            "attack_time": 6,
+                            "release_time": 200,
+                            "sidechain_source": "11111111-2222-3333-4444-555555555555"
                         }
                     }]
                 },
@@ -2049,46 +2194,99 @@ mod tests {
                     }]
                 },
                 {
+                    "id": "ffmpeg_source",
+                    "name": "Self Duck",
+                    "settings": { "local_file": "/self.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "Loop",
+                        "settings": { "ratio": 10.0, "threshold": -24.0, "sidechain_source": "Self Duck" }
+                    }]
+                },
+                {
                     "id": "scene",
                     "name": "Main",
-                    "settings": { "items": [{ "name": "Game Audio" }, { "name": "Music Missing SC" }] }
+                    "settings": {
+                        "items": [
+                            { "name": "Game Audio" },
+                            { "name": "Music By UUID" },
+                            { "name": "Music Missing SC" },
+                            { "name": "Self Duck" }
+                        ]
+                    }
                 }
             ],
             "AuxAudioDevice1": {
                 "id": "ffmpeg_source",
                 "name": "Mic/Aux",
+                "uuid": mic_uuid,
                 "settings": { "local_file": "/mic.mp4" }
             }
         });
         let got = import(&doc, (1920, 1080));
-        let Some(game) = got.sources.iter().find(|s| s.name == "Game Audio") else { panic!("game missing") };
-        let Some(mic) = got.sources.iter().find(|s| s.name == "Mic/Aux") else { panic!("mic missing") };
-        let Some(broken) = got.sources.iter().find(|s| s.name == "Music Missing SC") else { panic!("broken missing") };
-        assert!(game.sound_effects.is_empty(), "game must NOT get a self-compressor: {:?}", game.sound_effects);
+        let game = got.sources.iter().find(|s| s.name == "Game Audio").expect("game missing");
+        let uuid_music = got.sources.iter().find(|s| s.name == "Music By UUID").expect("uuid music missing");
+        let mic = got.sources.iter().find(|s| s.name == "Mic/Aux").expect("mic missing");
+        let broken = got.sources.iter().find(|s| s.name == "Music Missing SC").expect("broken missing");
+        let self_duck = got.sources.iter().find(|s| s.name == "Self Duck").expect("self duck missing");
+
+        assert!(got.ducking.is_none(), "OBS sidechain must NOT go to global Ducker: {:?}", got.ducking);
+        assert_eq!(
+            game.sound_effects,
+            vec![
+                AudioEffect::Gain { db: 0.0 },
+                AudioEffect::Compressor {
+                    ratio: 20.0,
+                    threshold_db: -32.0,
+                    attack_ms: 10.0,
+                    release_ms: 600.0,
+                    output_db: 0.0,
+                    sidechain: Some(mic.id),
+                },
+                AudioEffect::Limiter { threshold_db: -1.0, release_ms: 60.0 },
+            ],
+            "sidechained compressor keeps exact OBS parameters and filter chain position"
+        );
+        assert_eq!(
+            uuid_music.sound_effects,
+            vec![AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -24.0,
+                attack_ms: 6.0,
+                release_ms: 200.0,
+                output_db: 0.0,
+                sidechain: Some(mic.id),
+            }],
+            "sidechain_source resolves source UUIDs too"
+        );
         assert!(
             broken.sound_effects.is_empty(),
             "missing sidechain must NOT self-compress: {:?}",
             broken.sound_effects
         );
         assert!(
+            self_duck.sound_effects.is_empty(),
+            "self-sidechain must NOT self-compress: {:?}",
+            self_duck.sound_effects
+        );
+        assert!(
             got.skipped.iter().any(|s| s.contains("DeletedMic")),
             "missing sidechain reported in skipped: {:?}",
             got.skipped
         );
-        let Some(duck) = got.ducking.clone() else { panic!("expected imported ducking") };
-        assert_eq!(duck.voices, vec![mic.id]);
-        assert_eq!(duck.music, vec![game.id]);
-        assert_eq!(duck.threshold_db, -32.0);
-        assert!((-20.0..=-18.0).contains(&duck.depth_db), "expected ~-19 dB depth, got {}", duck.depth_db);
+        assert!(
+            got.sidechain_cycles.contains(&("Self Duck".into(), "Self Duck".into())),
+            "self-loop reported in sidechain_cycles: {:?}",
+            got.sidechain_cycles
+        );
 
         // Behavioral check through Mixer: loud Game Audio with silent Mic is NOT self-compressed,
-        // and ducks cleanly once Mic speaks.
+        // and ducks cleanly via OBS sidechain compression once Mic speaks (without global Ducker).
         let rate = 48_000u32;
         let mut m = crate::mix::Mixer::new(rate, 0);
         m.set(game.id, SourceSettings { tracks: 0b01, ..Default::default() });
         m.set(mic.id, SourceSettings { tracks: 0b10, ..Default::default() });
         m.set_effects(game.id, &game.sound_effects);
-        m.set_ducking(Some(duck));
         let t0 = 1_000_000_000u64;
         m.mix_until(t0);
         let secs = 2 * rate as usize;
@@ -2115,6 +2313,37 @@ mod tests {
             "game audio ducked when mic speaks: {}",
             talking_mic_block.tracks[0][0]
         );
+
+        // Mutual A <-> B cycle is detected and broken deterministically in both import() and sidechain_cycles().
+        let cycle_doc = json!({
+            "sources": [
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Music",
+                    "settings": { "local_file": "/a.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "DuckA",
+                        "settings": { "ratio": 10.0, "threshold": -24.0, "sidechain_source": "Voice" }
+                    }]
+                },
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Voice",
+                    "settings": { "local_file": "/b.mp4" },
+                    "filters": [{
+                        "id": "compressor_filter",
+                        "name": "DuckB",
+                        "settings": { "ratio": 10.0, "threshold": -24.0, "sidechain_source": "Music" }
+                    }]
+                },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Music" }, { "name": "Voice" }] } }
+            ]
+        });
+        let cyc = import(&cycle_doc, (1920, 1080));
+        assert_eq!(cyc.sidechain_cycles, vec![("Voice".into(), "Music".into())]);
+        assert!(cyc.skipped.iter().any(|s| s.contains("Voice") && s.contains("Music")), "{:?}", cyc.skipped);
+        assert_eq!(sidechain_cycles(&cycle_doc), vec![("Voice".into(), "Music".into())]);
     }
 
     /// Every OBS audio filter JSON imports into the exact `AudioEffect` parameters in OBS units
@@ -2144,6 +2373,7 @@ mod tests {
                 attack_ms: 6.0,
                 release_ms: 60.0,
                 output_db: 0.0,
+                sidechain: None,
             })
         );
         assert_eq!(
@@ -2214,6 +2444,7 @@ mod tests {
                 attack_ms: 15.0,
                 release_ms: 120.0,
                 output_db: 3.5,
+                sidechain: None,
             })
         );
         assert_eq!(
@@ -2271,6 +2502,7 @@ mod tests {
                 attack_ms: 500.0,
                 release_ms: 1000.0,
                 output_db: 32.0,
+                sidechain: None,
             })
         );
         assert_eq!(
@@ -2360,6 +2592,7 @@ mod tests {
                 attack_ms: 6.0,
                 release_ms: 60.0,
                 output_db: 0.0,
+                sidechain: None,
             },
             AudioEffect::Limiter { threshold_db: -1.0, release_ms: 60.0 },
         ];
