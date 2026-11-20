@@ -284,6 +284,11 @@ pub struct AudioFilter {
     /// After a plugin that held the sound back gave way (the strong noise removal too slow
     /// here): the sound is held back as long still, so the source doesn't jump in time.
     delay: Option<[std::collections::VecDeque<f32>; 2]>,
+    /// True once a plugin inside this filter failed or gave up, so non-blocking filter edits
+    /// don't re-request plugin construction for a filter that intentionally fell back.
+    plugin_gave_up: bool,
+    /// Identifier of an in-flight off-thread plugin build awaiting attachment.
+    pub(crate) pending_build: Option<u64>,
 }
 
 /// Samples (at 8 kHz) the voice detector looks at: 40 ms.
@@ -299,7 +304,9 @@ fn coefficient(rate: f32, secs: f32) -> f32 {
 }
 
 impl AudioFilter {
-    pub fn new(effect: AudioEffect, rate: u32) -> Self {
+    /// Builds the filter without constructing any external [`SoundPlugin`] (`Denoise` model or
+    /// VST host), so real-time threads can update filter chains without blocking.
+    pub fn new_without_plugin(effect: AudioEffect, rate: u32) -> Self {
         Self {
             effect,
             rate: rate as f32,
@@ -311,16 +318,7 @@ impl AudioFilter {
             runave: [0.0; 2],
             gain_db: [0.0; 2],
             eq: [EqState::default(); 2],
-            plugin: match effect {
-                // Its model works at 48 kHz only; elsewhere the sound passes as it is.
-                AudioEffect::Denoise { strength } if rate == 48_000 => {
-                    DENOISER.get().and_then(|make| make(strength.clamp(1, 100)))
-                }
-                AudioEffect::Plugin { slot } => {
-                    (!plugins_disabled()).then(|| PLUGIN_MAKER.get().and_then(|make| make(slot, rate))).flatten()
-                }
-                _ => None,
-            },
+            plugin: None,
             plugin_ran: false,
             floor: 0.0,
             nr_steady_rms: 0.0,
@@ -332,7 +330,48 @@ impl AudioFilter {
             nr_pitch: (0, 0.0),
             nr_pitch_rms: 0.0,
             delay: None,
+            plugin_gave_up: false,
+            pending_build: None,
         }
+    }
+
+    /// Whether `effect` at `rate` expects an external [`SoundPlugin`] to be built.
+    #[must_use]
+    pub fn effect_needs_plugin(effect: AudioEffect, rate: u32) -> bool {
+        match effect {
+            AudioEffect::Denoise { .. } => rate == 48_000 && denoiser_available(),
+            AudioEffect::Plugin { .. } => plugins_available(),
+            _ => false,
+        }
+    }
+
+    /// Builds an external [`SoundPlugin`] for `effect` at `rate` (may block; run off RT threads).
+    #[must_use]
+    pub fn build_plugin(effect: AudioEffect, rate: u32) -> Option<Box<dyn SoundPlugin>> {
+        match effect {
+            // Its model works at 48 kHz only; elsewhere the sound passes as it is.
+            AudioEffect::Denoise { strength } if rate == 48_000 => {
+                DENOISER.get().and_then(|make| make(strength.clamp(1, 100)))
+            }
+            AudioEffect::Plugin { slot } => {
+                (!plugins_disabled()).then(|| PLUGIN_MAKER.get().and_then(|make| make(slot, rate))).flatten()
+            }
+            _ => None,
+        }
+    }
+
+    /// Installs a plugin constructed off-thread into this filter.
+    pub fn install_plugin(&mut self, plugin: Box<dyn SoundPlugin>) {
+        self.plugin = Some(plugin);
+        self.plugin_ran = false;
+        self.plugin_gave_up = false;
+        self.pending_build = None;
+    }
+
+    pub fn new(effect: AudioEffect, rate: u32) -> Self {
+        let mut f = Self::new_without_plugin(effect, rate);
+        f.plugin = Self::build_plugin(effect, rate);
+        f
     }
 
     /// Takes `effect`'s settings when it's the same kind of filter, keeping what it remembers
@@ -392,6 +431,7 @@ impl AudioFilter {
                 return;
             }
             tracing::warn!("the strong noise removal fell behind or stopped: the light one takes over");
+            self.plugin_gave_up = true;
             let mut gone = self.plugin.take();
             // Only keep a handover delay line when the plugin actually ran and delayed audio;
             // a failed init never delayed the stream and must not leave an 82.7 ms delay behind.
