@@ -184,6 +184,8 @@ pub(crate) struct OwnStream {
     hub: Option<Arc<Hub>>,
     /// The delayed tail of the stream, sent after it ended.
     drain: Arc<DrainGate>,
+    /// Starts a delayed stream on its hub when its first packet is let go.
+    begin: Arc<Begin>,
     /// SRT, RIST and WHIP destinations beside the stream, by id: their stop and health.
     directs:
         std::collections::HashMap<String, (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<Health>)>,
@@ -645,19 +647,48 @@ struct Delayed {
 /// hangs up on a publisher that sends nothing: mediamtx after 10 s, and the local server after 25;
 /// every destination reconnected over and over, and auto quality saw it as a struggling upload).
 #[derive(Default)]
-struct Begin(Mutex<Option<Starter>>);
+struct Begin {
+    start: Mutex<Option<Starter>>,
+    /// Changes to the stream's metadata made (a reshape) before it started: applied once it has.
+    patches: Mutex<Vec<Patch>>,
+    started: AtomicBool,
+}
 
 type Starter = Box<dyn FnOnce(&Hub) + std::marker::Send>;
+type Patch = Box<dyn Fn(&mut ferrocast_golive::hub::StreamMetadata) + std::marker::Send>;
+
+impl std::fmt::Debug for Begin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Begin").field("started", &self.started.load(Ordering::Relaxed)).finish_non_exhaustive()
+    }
+}
 
 impl Begin {
     fn set(&self, f: impl FnOnce(&Hub) + std::marker::Send + 'static) {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(f));
+        *self.start.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(f));
+    }
+
+    /// Changes the metadata platforms are told: now when the stream is live on its hub, else when it
+    /// goes live (the hub's start would erase a change made before it).
+    fn change(&self, hub: &Hub, f: impl Fn(&mut ferrocast_golive::hub::StreamMetadata) + std::marker::Send + 'static) {
+        let mut patches = self.patches.lock().unwrap_or_else(|p| p.into_inner());
+        if self.start.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+            patches.push(Box::new(f));
+        } else {
+            drop(patches);
+            hub.metadata_changed(f);
+        }
     }
 
     fn run(&self, hub: &Hub) {
-        let f = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let f = self.start.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(f) = f {
             f(hub);
+            let patches = std::mem::take(&mut *self.patches.lock().unwrap_or_else(|p| p.into_inner()));
+            for p in patches {
+                hub.metadata_changed(p);
+            }
+            self.started.store(true, Ordering::Release);
         }
     }
 }
@@ -1099,6 +1130,7 @@ impl OwnStream {
             }),
             hub: Some(hub),
             drain,
+            begin,
             directs: Default::default(),
         })
     }
@@ -1136,6 +1168,7 @@ impl OwnStream {
             }),
             hub: None,
             drain: Arc::new(DrainGate::default()),
+            begin: Arc::new(Begin::default()),
             directs: Default::default(),
         })
     }
@@ -1174,8 +1207,13 @@ impl OwnStream {
             hub.metadata(meta);
         }
         discard_delay();
-        let mut out =
-            Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(u64::from(delay_s)), drain.clone(), begin);
+        let mut out = Delayed::new(
+            hub.clone(),
+            counts.clone(),
+            Duration::from_secs(u64::from(delay_s)),
+            drain.clone(),
+            begin.clone(),
+        );
         if let Err(err) = d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))) {
             // The push started above ends with it (projects-60).
             hub.end();
@@ -1206,6 +1244,7 @@ impl OwnStream {
             }),
             hub: Some(hub),
             drain,
+            begin,
             directs: Default::default(),
         })
     }
@@ -1237,12 +1276,13 @@ impl OwnStream {
             .map_err(|e| StudioError::Failed(format!("The stream couldn't change while live: {e}")))?;
         // A platform that reconnects from now on is told the new picture, not the old one.
         if let Some(hub) = &self.hub {
-            hub.metadata_changed(|m| {
+            let (rate, kbps, codec) = (fps_f32(fps, config.ntsc), video.bitrate_kbps, video.codec);
+            self.begin.change(hub, move |m| {
                 m.video_width = Some(w);
                 m.video_height = Some(h);
-                m.video_frame_rate = Some(fps_f32(fps, config.ntsc));
-                m.video_bitrate_kbps = Some(video.bitrate_kbps);
-                m.video_codec_id = Some(if video.codec == VideoCodec::Hevc { 12 } else { 7 });
+                m.video_frame_rate = Some(rate);
+                m.video_bitrate_kbps = Some(kbps);
+                m.video_codec_id = Some(if codec == VideoCodec::Hevc { 12 } else { 7 });
             });
         }
         Ok(())
@@ -1808,12 +1848,18 @@ mod tests {
     fn a_delayed_stream_goes_live_on_its_hub_when_its_first_packet_is_let_go() {
         let (mut out, _) = delayed(300);
         let hub = out.hub.clone();
-        out.begin.set(|hub| hub.start());
+        out.begin.set(|hub| {
+            hub.start();
+            hub.metadata(ferrocast_golive::hub::StreamMetadata::new());
+        });
+        // A reshape while everything is held isn't lost when the hub starts.
+        out.begin.change(&hub, |m| m.video_width = Some(1280));
         out.send(video(0, true, 10));
         assert!(!hub.live().borrow().on, "nothing is live while everything is held");
         std::thread::sleep(Duration::from_millis(350));
         out.send(video(350, false, 10));
         assert!(hub.live().borrow().on, "live when the first is let go");
+        assert_eq!(hub.subscribe().headers.metadata.and_then(|m| m.video_width), Some(1280), "the reshape was kept");
         // Stopped while still holding: the tail goes out as a stream of its own, started by its first.
         let (mut out, _) = delayed(200);
         let (hub, gate) = (out.hub.clone(), out.gate.clone());
