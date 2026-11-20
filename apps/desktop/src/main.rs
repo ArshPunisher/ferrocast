@@ -22,8 +22,8 @@ use std::time::Duration;
 
 #[cfg(any(windows, test))]
 mod crash;
-#[cfg(target_os = "macos")]
 mod log_limit;
+#[cfg(target_os = "macos")]
 mod mac_update;
 mod store;
 mod studio;
