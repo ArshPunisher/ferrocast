@@ -486,6 +486,39 @@ mod timer_tests {
         assert!(Timer { message: "{bad".into(), ..timer() }.validate().is_err());
     }
 
+    /// Past the cap only the oldest half of the cooldowns still running goes; the recent ones keep
+    /// blocking their viewers (the oldest are the nearest to being over anyway).
+    #[test]
+    fn at_the_cap_the_recent_cooldowns_still_block() {
+        let c = Command {
+            id: "hi".into(),
+            name: "!hi".into(),
+            aliases: vec![],
+            response: "hi".into(),
+            access: Access::Everyone,
+            cooldown_s: 0,
+            user_cooldown_s: 3600,
+            platforms: vec![],
+            enabled: true,
+        };
+        let mut cd = Cooldowns::default();
+        let actor = |i: usize| {
+            let mut a = Actor::named(Platform::Twitch, &format!("u{i}"));
+            a.id = Some(format!("u{i}"));
+            a
+        };
+        for i in 0..=MAX_COOLDOWN_ENTRIES {
+            let at = Millis(i as i64 * 10);
+            assert!(
+                run(std::slice::from_ref(&c), &mut cd, Platform::Twitch, &actor(i), "!hi", &Vars::new(), at).is_ok()
+            );
+        }
+        let now = Millis(MAX_COOLDOWN_ENTRIES as i64 * 10 + 10);
+        for i in [MAX_COOLDOWN_ENTRIES, MAX_COOLDOWN_ENTRIES - 1, MAX_COOLDOWN_ENTRIES - 5_000] {
+            assert!(!cd.ready(&c, &actor(i), now), "u{i} ran seconds ago, still waiting");
+        }
+    }
+
     #[test]
     fn command_cooldowns_stay_bounded_and_prune_deleted_commands() {
         let mut c = Command {
