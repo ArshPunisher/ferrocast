@@ -208,7 +208,7 @@ fn main() {
             tauri::async_runtime::spawn(install_when_asked(app.handle().clone(), engine.clone(), pending.clone()));
             tauri::async_runtime::spawn(restart_when_asked(app.handle().clone(), engine.clone(), pending));
             tauri::async_runtime::spawn(notify_when_hidden(app.handle().clone(), engine));
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             tauri::async_runtime::spawn(quit_on_signal(app.handle().clone()));
             // Started minimized (at login) with no tray, or offering/running Safe Mode: shown so
             // the prompt is never hidden in the tray.
@@ -310,15 +310,56 @@ impl QuitSignals {
     }
 }
 
+/// Windows console / session termination events (`SetConsoleCtrlHandler` via Tokio): Ctrl-C,
+/// Ctrl-Break, closing a console window, user logoff, and system shutdown. Tokio parks the OS
+/// handler thread on `CTRL_CLOSE`/`CTRL_LOGOFF`/`CTRL_SHUTDOWN` so `app.exit(0)` has Windows'
+/// shutdown grace period to run `RunEvent::Exit` and clear the run markers instead of triggering
+/// Safe Mode on the next launch (GUI logoff/shutdown also arrives via `WM_ENDSESSION` → `tao` →
+/// `RunEvent::Exit`).
+#[cfg(windows)]
+struct QuitSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    ctrl_close: tokio::signal::windows::CtrlClose,
+    ctrl_logoff: tokio::signal::windows::CtrlLogoff,
+    ctrl_shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+#[cfg(windows)]
+impl QuitSignals {
+    /// Must run inside the async runtime.
+    fn register() -> std::io::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        Ok(Self {
+            ctrl_c: ctrl_c()?,
+            ctrl_break: ctrl_break()?,
+            ctrl_close: ctrl_close()?,
+            ctrl_logoff: ctrl_logoff()?,
+            ctrl_shutdown: ctrl_shutdown()?,
+        })
+    }
+
+    /// The first of them to arrive.
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.ctrl_c.recv() => "CTRL_C",
+            _ = self.ctrl_break.recv() => "CTRL_BREAK",
+            _ = self.ctrl_close.recv() => "CTRL_CLOSE",
+            _ = self.ctrl_logoff.recv() => "CTRL_LOGOFF",
+            _ = self.ctrl_shutdown.recv() => "CTRL_SHUTDOWN",
+        }
+    }
+}
+
 /// Quits through the normal path (`RunEvent::Exit`, the clean-exit sequence) on the first signal.
 /// A second one means the quit is stuck (a drain that won't end, a window that won't close): the
-/// handlers stay installed, so without this only SIGKILL would end the process.
-#[cfg(unix)]
+/// handlers stay installed, so without this only SIGKILL / TerminateProcess would end the process.
+#[cfg(any(unix, windows))]
 async fn quit_on_signal(app: AppHandle) {
     let mut signals = match QuitSignals::register() {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(error = %e, "couldn't listen for quit signals: kill ends Ferrocast without a clean quit");
+            tracing::warn!(error = %e, "couldn't listen for quit signals: termination may skip clean quit");
             return;
         }
     };
@@ -326,7 +367,7 @@ async fn quit_on_signal(app: AppHandle) {
 }
 
 /// `quit` on the first signal, `force` on the next.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn quit_then_force(signals: &mut QuitSignals, quit: impl FnOnce(), force: impl FnOnce()) {
     let which = signals.next().await;
     tracing::info!(signal = which, "asked to quit by a signal");
@@ -1382,6 +1423,14 @@ mod update_tests {
         term();
         assert!(tokio::time::timeout(Duration::from_secs(5), &mut task).await.is_ok());
         assert_eq!(*log.lock().unwrap_or_else(|e| e.into_inner()), vec!["quit", "force"]);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_quit_signals_register_cleanly() {
+        let mut signals = QuitSignals::register().unwrap_or_else(|e| panic!("SetConsoleCtrlHandler failed: {e}"));
+        // No signal sent: polling times out cleanly rather than firing spuriously.
+        assert!(tokio::time::timeout(Duration::from_millis(50), signals.next()).await.is_err());
     }
 
     #[test]

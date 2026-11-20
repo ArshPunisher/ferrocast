@@ -127,11 +127,51 @@ pub(crate) fn format_dump_path_utf16(prefix: &[u16], stamp: CrashStamp, dst: &mu
     true
 }
 
+/// Legacy Win32 `MAX_PATH` limit (excluding NUL); paths whose full dump filename reaches this
+/// length need a verbatim (`\\?\` / `\\?\UNC\`) prefix so `CreateFileW` does not fail with
+/// `ERROR_PATH_NOT_FOUND` when Windows `LongPathsEnabled` is unset.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WIN_MAX_PATH: usize = 259;
+
+/// Adds a Win32 extended-length prefix (`\\?\` or `\\?\UNC\`) when `path` + `SUFFIX_LEN` would
+/// exceed legacy `MAX_PATH` (260), normalizing `/` to `\` so `CreateFileW` accepts long paths.
+/// Leaves already-prefixed paths, short paths, and paths containing `.`/`..` segments untouched.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn verbatim_win_path(path: &str) -> String {
+    if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
+        return path.to_string();
+    }
+    let norm = path.replace('/', "\\");
+    if norm.encode_utf16().count() + SUFFIX_LEN <= WIN_MAX_PATH {
+        return norm;
+    }
+    if norm.split('\\').any(|seg| seg == "." || seg == "..") {
+        return norm;
+    }
+    if let Some(rest) = norm.strip_prefix(r"\\") {
+        if rest.is_empty() {
+            return norm;
+        }
+        return format!(r"\\?\UNC\{rest}");
+    }
+    let bytes = norm.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        return format!(r"\\?\{norm}");
+    }
+    norm
+}
+
 #[cfg(windows)]
 fn encode_prefix_utf16(dir: &Path) -> Option<([u16; PATH_CAP], usize)> {
     use std::os::windows::ffi::OsStrExt;
-    let file_prefix = dir.join(format!("ferrocast {} ", env!("CARGO_PKG_VERSION")));
-    let units: Vec<u16> = file_prefix.as_os_str().encode_wide().collect();
+    // `canonicalize` resolves symlinks and returns a `\\?\` verbatim path on Windows; if it fails
+    // (e.g. a virtual mount), fall back to `verbatim_win_path` for paths past `MAX_PATH`.
+    let base = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let file_prefix = base.join(format!("ferrocast {} ", env!("CARGO_PKG_VERSION")));
+    let units: Vec<u16> = match file_prefix.to_str() {
+        Some(s) => verbatim_win_path(s).encode_utf16().collect(),
+        None => file_prefix.as_os_str().encode_wide().collect(),
+    };
     if units.len() + SUFFIX_LEN > PATH_CAP {
         return None;
     }
@@ -294,7 +334,8 @@ fn report_earlier(dir: &Path) {
             && !stem.ends_with(" seen")
         {
             let seen = path.with_file_name(format!("{stem} seen.dmp"));
-            let shown = if std::fs::rename(&path, &seen).is_ok() { seen } else { path.clone() };
+            let shown =
+                if ferrocast_store::durable::rename_patiently(&path, &seen).is_ok() { seen } else { path.clone() };
             tracing::error!(file = %shown.display(), "Ferrocast crashed last time: a crash report was saved");
         }
     }
@@ -354,5 +395,36 @@ mod tests {
 
         let too_long = vec![b'a' as u16; PATH_CAP - SUFFIX_LEN + 1];
         assert!(!format_dump_path_utf16(&too_long, stamp, &mut dst));
+    }
+
+    #[test]
+    fn verbatim_win_path_adds_extended_prefix_past_max_path() {
+        let short = r"C:\Users\Streamer\AppData\Local\Ferrocast\crashes\ferrocast 3.4.0 ";
+        assert_eq!(verbatim_win_path(short), short);
+
+        let deep = format!(r"C:/Users/Streamer/{}/crashes/ferrocast 3.4.0 ", "segment/".repeat(35));
+        let fixed = verbatim_win_path(&deep);
+        assert!(fixed.starts_with(r"\\?\C:\Users\Streamer\"), "expected verbatim prefix: {fixed}");
+        assert!(!fixed.contains('/'), "forward slashes must be normalized for verbatim paths");
+
+        let deep_unc = format!(r"\\fileserver\share\{}\crashes\ferrocast 3.4.0 ", "dir\\".repeat(65));
+        let fixed_unc = verbatim_win_path(&deep_unc);
+        assert!(fixed_unc.starts_with(r"\\?\UNC\fileserver\share\"), "expected UNC verbatim prefix: {fixed_unc}");
+
+        let already = format!(r"\\?\C:\{}\crashes\ferrocast 3.4.0 ", "a\\".repeat(140));
+        assert_eq!(verbatim_win_path(&already), already);
+
+        let with_dotdot = format!(r"C:\Users\{}\..\crashes\ferrocast 3.4.0 ", "a\\".repeat(130));
+        assert!(!verbatim_win_path(&with_dotdot).starts_with(r"\\?\"), "never verbatim-prefix unnormalized .. paths");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encode_prefix_formats_a_create_file_w_ready_path() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (prefix, len) = encode_prefix_utf16(dir.path()).unwrap_or_else(|| panic!("expected encoded prefix"));
+        let stamp = CrashStamp { year: 2026, month: 11, day: 20, hour: 12, minute: 0, second: 0 };
+        let mut dst = [0u16; PATH_CAP];
+        assert!(format_dump_path_utf16(&prefix[..len], stamp, &mut dst));
     }
 }

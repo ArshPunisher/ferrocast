@@ -21,6 +21,36 @@ pub struct Shelf {
     pub list: Vec<Entry>,
 }
 
+/// Windows reserves these stems (even with an extension like `.json`) for DOS devices: creating
+/// `con.json` or `nul.json` fails or writes to a device instead of a file.
+fn is_win_reserved_device(id: &str) -> bool {
+    matches!(
+        id,
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
+}
+
 impl Shelf {
     fn first() -> Shelf {
         Shelf { current: "untitled".into(), list: vec![Entry { id: "untitled".into(), name: "Untitled".into() }] }
@@ -53,8 +83,10 @@ impl Shelf {
         if slug.is_empty() {
             slug = "set".into();
         }
-        // "current" and "import" are words in the routes (/library/{kind}/current): never ids.
-        let free = |id: &str| !matches!(id, "current" | "import") && self.get(id).is_none();
+        // "current" and "import" are words in the routes (/library/{kind}/current), and Windows
+        // reserves DOS device names (con, nul, com1..com9, lpt1..lpt9) even with `.json`: never ids.
+        let free =
+            |id: &str| !matches!(id, "current" | "import") && !is_win_reserved_device(id) && self.get(id).is_none();
         if free(&slug) {
             return slug;
         }
@@ -202,6 +234,10 @@ mod tests {
         assert_eq!(s.new_id("✨✨"), "set");
         assert_eq!(s.new_id("Current"), "current-2", "route words aren't ids");
         assert_eq!(s.new_id("import"), "import-2");
+        assert_eq!(s.new_id("CON"), "con-2", "Windows DOS device names aren't ids");
+        assert_eq!(s.new_id("nul"), "nul-2");
+        assert_eq!(s.new_id("COM1"), "com1-2");
+        assert_eq!(s.new_id("lpt9"), "lpt9-2");
         assert_eq!(s.free_name("untitled"), "untitled 2");
         s.list.push(Entry { id: "show".into(), name: "Show".into() });
         assert_eq!(s.free_name("Show"), "Show 2");
