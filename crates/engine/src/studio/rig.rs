@@ -41,9 +41,10 @@ fn studio_items_have_visible(items: &Value, nested: &mut Vec<String>) -> bool {
             continue;
         }
         let kind = item.get("kind").and_then(Value::as_str);
-        let is_group = item.get("group").and_then(Value::as_bool) == Some(true)
-            || kind == Some("group")
-            || item.get("children").is_some_and(Value::is_array);
+        // The Studio's own items carry `"group": false, "children": []` on every ordinary source,
+        // so an array of children says nothing: a group says so itself (20 Nov, the real app called
+        // every scene empty and the Show never switched to its starting or live scene).
+        let is_group = item.get("group").and_then(Value::as_bool) == Some(true) || kind == Some("group");
         if is_group {
             if let Some(children) = item.get("children")
                 && studio_items_have_visible(children, nested)
@@ -407,6 +408,29 @@ mod tests {
         assert_eq!(find_item(&items, "Camera"), Some((5, false)));
         assert_eq!(find_item(&items, "Mic"), None);
         assert_eq!(find_item(&Value::Null, "Game"), None);
+    }
+
+    /// The shape the Studio's items route really answers with: every ordinary source has
+    /// `"group": false` and an empty `"children"` array. A scene of them is not empty.
+    #[test]
+    fn a_scene_of_ordinary_studio_sources_is_not_empty() {
+        let mut nested = Vec::new();
+        let colour = serde_json::json!([{
+            "audio": false, "blend": "normal", "children": [], "group": false, "id": 1,
+            "kind": "color_source_v3", "locked": false, "name": "Blue", "visible": true
+        }]);
+        assert!(studio_items_have_visible(&colour, &mut nested), "one visible colour source is a picture");
+        let mixed = serde_json::json!([
+            { "children": [], "group": false, "id": 2, "kind": "coreaudio_input_capture", "name": "Mic", "visible": true },
+            { "children": [], "group": false, "id": 1, "kind": "screen_capture", "name": "Screen", "visible": true }
+        ]);
+        assert!(studio_items_have_visible(&mixed, &mut nested));
+        // Hidden ones, and a group with nothing in it, still count as empty.
+        let empty = serde_json::json!([
+            { "children": [], "group": false, "id": 3, "kind": "av_capture_input", "name": "Cam", "visible": false },
+            { "children": [], "group": true, "id": 4, "kind": "group", "name": "Nothing", "visible": true }
+        ]);
+        assert!(!studio_items_have_visible(&empty, &mut nested));
     }
 
     #[test]
