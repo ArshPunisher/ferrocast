@@ -2227,9 +2227,8 @@ impl Engine {
         // Cancel any active Show, countdown, or pending delayed stop immediately (even before
         // acquiring output_lock) so an in-flight start_show / go_live_now sees the generation
         // bump at once and never posts Discord/chat or resurrects Live after Studio stops.
-        if was_running {
-            self.cancel_show_on_studio_stop("Studio stopped.");
-        }
+        // Even when it had already gone (a crash): a show with no Studio under it is over.
+        self.cancel_show_on_studio_stop("Studio stopped.");
         let _out = self.studio().output_lock.lock().await;
         if was_running {
             *crate::golive::lock_enhanced(self) = None;
@@ -2535,6 +2534,9 @@ impl Engine {
             // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
             *crate::golive::lock_enhanced(self) = None;
             host.stream_stop().await.map_err(failed)?;
+            // A countdown (or a show waiting for its live scene) with no stream is over: Go
+            // live again must start a new show, not say one is running.
+            self.end_show_whose_stream_stopped();
             self.send_golive_pub();
             // The stream has ended either way; what didn't stop with it comes back in words.
             return Ok(follow_stream(host.as_ref(), false, &s)

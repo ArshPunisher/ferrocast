@@ -32,6 +32,23 @@ impl Rig {
     }
 }
 
+/// Sources that make sound but draw nothing: a scene holding only these shows black.
+pub(crate) fn audio_only_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "coreaudio_input_capture"
+            | "coreaudio_output_capture"
+            | "sck_audio_capture"
+            | "wasapi_input_capture"
+            | "wasapi_output_capture"
+            | "wasapi_process_output_capture"
+            | "pulse_input_capture"
+            | "pulse_output_capture"
+            | "alsa_input_capture"
+            | "jack_output_capture"
+    )
+}
+
 /// Scans a Studio scene's items JSON for any visible non-group, non-scene source.
 /// Visible nested scenes are pushed into `nested` for the caller to inspect with cycle detection.
 fn studio_items_have_visible(items: &Value, nested: &mut Vec<String>) -> bool {
@@ -59,6 +76,10 @@ fn studio_items_have_visible(items: &Value, nested: &mut Vec<String>) -> bool {
             }
             continue;
         }
+        // A mic or desktop sound is no picture (19 Nov: a scene with only a mic counted as shown).
+        if kind.is_some_and(audio_only_kind) {
+            continue;
+        }
         return true;
     }
     false
@@ -83,6 +104,9 @@ fn obs_scene_is_empty(scenes: &ferrocast_obs::control::Scenes, scene: &str) -> O
                 if visited.insert(sub.name.as_str()) {
                     todo.push(sub.name.as_str());
                 }
+                continue;
+            }
+            if item.kind.as_deref().is_some_and(audio_only_kind) {
                 continue;
             }
             return Some(false);

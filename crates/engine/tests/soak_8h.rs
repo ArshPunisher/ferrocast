@@ -168,6 +168,7 @@ fn eight_hour_stream_soak_keeps_all_collections_bounded() {
             mics: vec![(format!("Mic-{epoch}"), -25.0)],
             cameras: vec![(format!("Cam-{epoch}"), false, tick as u64)],
             destinations: vec![(format!("Dest-{epoch}"), true)],
+            ..Default::default()
         };
         let _ = watch.tick(&cfg, &s);
         let (h, c, d, sn) = watch.tracked_counts();

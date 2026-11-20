@@ -199,6 +199,8 @@ pub const SILENT_DB: f32 = -60.0;
 
 // ------------------------------------------------------------------ live watch
 
+pub mod audio_watch;
+
 /// One look at what's going out, every couple of seconds while live (ms since the epoch).
 #[derive(Debug, Clone, Default)]
 pub struct WatchSample {
@@ -209,6 +211,10 @@ pub struct WatchSample {
     pub cameras: Vec<(String, bool, u64)>,
     /// Each running destination (its name) and whether it's sending.
     pub destinations: Vec<(String, bool)>,
+    /// Every mic's levels (the auto-discovered ones too).
+    pub levels: Vec<audio_watch::MicLevel>,
+    /// The scene on air, when it could be read.
+    pub scene: Option<audio_watch::SceneLook>,
 }
 
 /// A live mistake to tell the streamer about, or that it's fixed (`cleared`).
@@ -223,17 +229,31 @@ pub struct LiveAlert {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     pub cleared: bool,
+    /// The source (or scene) this is about, for a one-tap fix; an older dashboard ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The one-tap fix the page may offer: `unmute`, `gain_up` (+6 dB) or `pick_scene`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<&'static str>,
 }
 
 impl LiveAlert {
     /// Something wrong, in one line.
     pub fn raised(id: impl Into<String>, level: &'static str, message: impl Into<String>) -> Self {
-        Self { id: id.into(), level, message: message.into(), detail: None, cleared: false }
+        Self { id: id.into(), level, message: message.into(), detail: None, cleared: false, source: None, action: None }
     }
 
     /// It's fine again, in one line.
     pub fn fixed(id: impl Into<String>, level: &'static str, message: impl Into<String>) -> Self {
-        Self { id: id.into(), level, message: message.into(), detail: None, cleared: true }
+        Self { id: id.into(), level, message: message.into(), detail: None, cleared: true, source: None, action: None }
+    }
+
+    /// The one-tap fix for `source`.
+    #[must_use]
+    pub fn action(mut self, source: &str, action: &'static str) -> Self {
+        self.source = Some(source.to_string());
+        self.action = Some(action);
+        self
     }
 
     /// What the line leaves out.
@@ -256,6 +276,10 @@ pub struct LiveWatch {
     sending: std::collections::HashMap<String, i64>,
     /// Alerts raised and not yet cleared.
     raised: std::collections::BTreeSet<String>,
+    /// Per-mic history (muted talk, silence, the voice's level) and since when the scene on air
+    /// has had no picture.
+    mics: std::collections::HashMap<String, audio_watch::MicTrack>,
+    empty_since: Option<i64>,
 }
 
 impl LiveWatch {
@@ -362,6 +386,7 @@ impl LiveWatch {
                 format!("{name} is getting your stream again."),
             );
         }
+        self.tick_audio(cfg, s, &mut out);
         // Gone from the sample (a camera removed, a destination stopped): not watched, so
         // drop its tracking state and clear whatever it raised (BRB by itself comes back too).
         let live_mics: std::collections::HashSet<&str> = s.mics.iter().map(|(n, _)| n.as_str()).collect();
@@ -381,6 +406,14 @@ impl LiveWatch {
         }
         for (n, _) in &s.destinations {
             present.insert(format!("destination:{n}"));
+        }
+        for m in &s.levels {
+            for kind in ["muted", "quiet", "silent"] {
+                present.insert(format!("mic:{kind}:{}", m.name));
+            }
+        }
+        if s.scene.is_some() || self.empty_since.is_some() {
+            present.insert("scene:empty".to_string());
         }
         let gone: Vec<String> = self.raised.iter().filter(|id| !present.contains(*id)).cloned().collect();
         for id in gone {
@@ -1057,6 +1090,7 @@ mod watch_tests {
             mics: vec![("Mic".into(), db)],
             cameras: vec![("Cam".into(), black, sig)],
             destinations: vec![("Twitch".into(), up)],
+            ..Default::default()
         };
         // All fine, the picture moving.
         for t in 0..10 {
@@ -1121,6 +1155,7 @@ mod watch_tests {
                 mics: vec![(format!("Mic {i}"), -90.0)],
                 cameras: vec![(format!("Cam {i}"), true, i as u64)],
                 destinations: vec![(format!("Dest {i}"), false)],
+                ..Default::default()
             };
             let _ = w.tick(&cfg, &s);
             assert_eq!(w.tracked_counts(), (1, 1, 1, 1));
