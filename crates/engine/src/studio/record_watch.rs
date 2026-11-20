@@ -21,6 +21,8 @@ pub(crate) struct RecordWatch {
     file: String,
     stopped_said: bool,
     low_said: bool,
+    /// Automatic new files already said (the count is the recording's, over its files).
+    splits_said: u64,
 }
 
 /// A line for the dashboard: how bad, the line, and what is behind its (i).
@@ -41,7 +43,20 @@ pub(crate) fn look(w: &mut RecordWatch, v: &Value) -> Vec<Say> {
         return out;
     };
     if w.file != file {
-        *w = RecordWatch { file: file.to_string(), ..RecordWatch::default() };
+        *w = RecordWatch { file: file.to_string(), splits_said: w.splits_said, ..RecordWatch::default() };
+    }
+    // The encoder was rebuilt and the recording went on in a new file: said once each time.
+    let splits = v["auto_splits"].as_u64().unwrap_or(0);
+    if splits > w.splits_said {
+        w.splits_said = splits;
+        out.push(Say {
+            key: "recording-split",
+            level: NoticeLevel::Info,
+            line: "Recording continued in a new file".into(),
+            detail: "The video encoder was restarted (the display woke, or the system reset it), \
+                     so a new file keeps every part playable."
+                .into(),
+        });
     }
     let active = v["active"].as_bool() == Some(true);
     if !active {
@@ -119,6 +134,20 @@ mod tests {
         json!({ "file": "/r/a.mp4", "active": active, "error": error,
                 "disk_free_mb": free_mb, "bytes": bytes, "seconds": seconds,
                 "error_detail": "Free some space or choose another drive, then record again." })
+    }
+
+    #[test]
+    fn a_new_file_for_a_rebuilt_encoder_is_said_once_each_time() {
+        let mut w = RecordWatch::default();
+        let v = |file: &str, splits: u64| json!({ "file": file, "active": true, "auto_splits": splits, "bytes": 0, "seconds": 0 });
+        assert!(look(&mut w, &v("/r/a.mp4", 0)).is_empty());
+        let first = look(&mut w, &v("/r/a-2.mp4", 1));
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].key, first[0].level), ("recording-split", NoticeLevel::Info));
+        assert_eq!(first[0].line, "Recording continued in a new file");
+        assert!(look(&mut w, &v("/r/a-2.mp4", 1)).is_empty(), "not again at the next look");
+        assert!(look(&mut w, &v("/r/a-3.mp4", 1)).is_empty(), "the new file name doesn't say it again");
+        assert_eq!(look(&mut w, &v("/r/a-4.mp4", 2)).len(), 1, "a second time is said");
     }
 
     #[test]
