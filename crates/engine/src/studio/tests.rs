@@ -1693,6 +1693,8 @@ async fn a_black_camera_puts_the_show_on_brb_and_back() {
         message: String::new(),
         detail: None,
         cleared,
+        source: None,
+        action: None,
     };
     e.brb_when_black(&[alert(false)]).await;
     assert_eq!(*studio.current.lock().unwrap(), "BRB");
@@ -1726,6 +1728,8 @@ async fn brb_holds_isolate_manual_from_auto_and_hotkeys_run_the_show() {
         message: String::new(),
         detail: None,
         cleared,
+        source: None,
+        action: None,
     };
     e.brb_when_black(&[alert(false)]).await;
     e.brb_when_black(&[alert(true)]).await;
