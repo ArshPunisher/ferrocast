@@ -479,9 +479,15 @@ impl Stage {
         }
         // Any clone that brings its target's filters keeps source-level cutouts on that target live
         // when at least one placement uses the clone without an item override.
-        for (clone_name, target) in clone_users {
-            if shared_users.contains(&clone_name) {
-                shared_users.insert(target);
+        loop {
+            let mut changed = false;
+            for (clone_name, target) in &clone_users {
+                if shared_users.contains(clone_name) && shared_users.insert(target.clone()) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
             }
         }
         for s in self.sources_list() {
@@ -2490,16 +2496,64 @@ impl Stage {
 
     /// Copies `from`'s filters onto `name` (OBS's Paste Filters), each its own copy.
     pub fn paste_filters(&self, name: &str, from: &str) -> Result<(), StudioError> {
-        self.paste_target_filters(FilterTarget::Source(name), from)
+        self.paste_target_filters(FilterTarget::Source(name), FilterTarget::Source(from))
+    }
+
+    /// Copies filters from a source (`from_item: None`) or an item override (`from_item: Some`)
+    /// onto `name`.
+    pub fn paste_filters_from(
+        &self,
+        name: &str,
+        from: &str,
+        from_item: Option<(&str, i64)>,
+    ) -> Result<(), StudioError> {
+        let src = match from_item {
+            Some((scene, id)) => FilterTarget::Item { scene, id },
+            None => FilterTarget::Source(from),
+        };
+        self.paste_target_filters(FilterTarget::Source(name), src)
     }
 
     /// Copies `from`'s video (and when shared or audio, audio) filters onto a scene item.
     pub fn paste_item_filters(&self, scene: &str, id: i64, from: &str) -> Result<(), StudioError> {
-        self.paste_target_filters(FilterTarget::Item { scene, id }, from)
+        self.paste_target_filters(FilterTarget::Item { scene, id }, FilterTarget::Source(from))
     }
 
-    fn paste_target_filters(&self, target: FilterTarget<'_>, from: &str) -> Result<(), StudioError> {
-        let copies = self.filter_list(from)?;
+    /// Copies filters from a source (`from_item: None`) or another item override onto `(scene, id)`.
+    pub fn paste_item_filters_from(
+        &self,
+        scene: &str,
+        id: i64,
+        from: &str,
+        from_item: Option<(&str, i64)>,
+    ) -> Result<(), StudioError> {
+        let src = match from_item {
+            Some((fscene, fid)) => FilterTarget::Item { scene: fscene, id: fid },
+            None => FilterTarget::Source(from),
+        };
+        self.paste_target_filters(FilterTarget::Item { scene, id }, src)
+    }
+
+    fn target_filter_values(&self, target: FilterTarget<'_>) -> Result<Vec<Value>, StudioError> {
+        match target {
+            FilterTarget::Source(name) => self.filter_list(name),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src = self.filter_list(name_of(&it))?;
+                match it.get("ferrocast_filters").and_then(Value::as_array) {
+                    Some(ov) => {
+                        let mut out = ov.clone();
+                        out.extend(src.into_iter().filter(|f| ferrocore::obs::is_audio_filter_kind(kind_of(f))));
+                        Ok(out)
+                    }
+                    None => Ok(src),
+                }
+            }
+        }
+    }
+
+    fn paste_target_filters(&self, target: FilterTarget<'_>, from: FilterTarget<'_>) -> Result<(), StudioError> {
+        let copies = self.target_filter_values(from)?;
         let mut have: Vec<String> = self.target_filters(target)?.into_iter().map(|f| f.name).collect();
         let rename_unique = |f: &mut Value, have: &mut Vec<String>| {
             let mut n = name_of(f).to_string();
@@ -2590,6 +2644,20 @@ impl Stage {
         Ok(self.item_picture_job(scene, id, width, filters)?.and_then(|job| job()))
     }
 
+    /// Like [`Self::item_picture_pixels`], failing if `expected_source` is given and does not
+    /// match the item's source name.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_pixels_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<(Vec<u8>, u32, u32, (u32, u32))>, StudioError> {
+        Ok(self.item_picture_job_for(expected_source, scene, id, width, filters)?.and_then(|job| job()))
+    }
+
     /// [`Self::source_picture_pixels`] in two: what's needed is read here (on the window's
     /// thread), and the drawing and reading back off the graphics card is the job, for any
     /// thread: done on the window's thread it held the window up each time (the drawer and the
@@ -2616,9 +2684,29 @@ impl Stage {
         filters: bool,
     ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
     {
+        self.item_picture_job_for(None, scene, id, width, filters)
+    }
+
+    /// Like [`Self::item_picture_job`], verifying `expected_source` matches the item when given.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_job_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
+    {
         let it = self.item(scene, id)?;
+        let src = name_of(&it);
+        if let Some(want) = expected_source
+            && want != src
+        {
+            return Err(fail(format!("There's no source called \"{want}\" for item {id} in \"{scene}\".")));
+        }
         let home = self.home(scene, id);
-        self.picture_job_for(name_of(&it), Some((home, id)), width, filters)
+        self.picture_job_for(src, Some((home, id)), width, filters)
     }
 
     #[allow(clippy::type_complexity)]
@@ -6782,10 +6870,16 @@ mod tests {
         assert!(!ok(s.item_filters("Vertical", vert_red.id))[0].enabled);
 
         // Main item picture has no filters; Vertical item picture shows Dim only (not Round).
+        // Passing mismatched source name onto item picture fails cleanly.
+        assert!(s.item_picture_pixels_for(Some("Donor"), "Vertical", vert_red.id, 160, true).is_err());
         let (main_px, _, _, _) = ok(s.item_picture_pixels("Main", main_red.id, 160, true)).unwrap();
         let (vert_px, vw, vh, _) = ok(s.item_picture_pixels("Vertical", vert_red.id, 160, true)).unwrap();
         let mid = ((vh as usize / 2) * vw as usize + (vw as usize / 2)) * 4;
         assert!(main_px[mid] > vert_px[mid] + 40, "item picture renders item override");
+
+        // Paste filters directly from Vertical's item override back onto Main's item.
+        ok(s.paste_filters_from("Red", "", Some(("Vertical", vert_red.id))));
+        assert_eq!(ok(s.filters("Red")).len(), 2);
 
         // Duplicating Vertical item copies its active item filters onto the duplicated source.
         ok(s.edit_item("Vertical", vert_red.id, ItemEdit::Duplicate));
