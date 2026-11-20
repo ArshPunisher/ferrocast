@@ -73,6 +73,12 @@ pub enum AudioCmd {
         id: u64,
         capture: Option<OutputCapture>,
     },
+    /// A push-to-talk (`talk`) or push-to-mute key went down or up.
+    PushKey {
+        id: u64,
+        talk: bool,
+        down: bool,
+    },
     SetEffects {
         id: u64,
         effects: Vec<AudioEffect>,
@@ -118,6 +124,9 @@ impl std::fmt::Debug for AudioCmd {
             Self::SetTone { id, tone, .. } => f.debug_struct("SetTone").field("id", id).field("tone", tone).finish(),
             Self::SetSettings { id, settings, .. } => {
                 f.debug_struct("SetSettings").field("id", id).field("settings", settings).finish()
+            }
+            Self::PushKey { id, talk, down } => {
+                f.debug_struct("PushKey").field("id", id).field("talk", talk).field("down", down).finish()
             }
             Self::SetOutputCapture { id, capture } => {
                 f.debug_struct("SetOutputCapture").field("id", id).field("capture", capture).finish()
@@ -476,6 +485,7 @@ impl<C: AudioClock> AudioRunner<C> {
                 self.mixer.set(id, settings);
                 self.levels.insert(id, levels);
             }
+            AudioCmd::PushKey { id, talk, down } => self.mixer.push_key(id, talk, down),
             AudioCmd::SetOutputCapture { id, capture } => {
                 self.mixer.set_output_capture(id, capture);
             }

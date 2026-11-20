@@ -1714,6 +1714,12 @@ impl Engine {
         self.audio.send(AudioCmd::SetSettings { id, settings, levels });
     }
 
+    /// A push-to-talk (`talk`) or push-to-mute key went down or up for a source: the mixer gates its
+    /// sound while it is held and for the source's release delay after (the audio thread counts it).
+    pub fn push_key(&self, id: u64, talk: bool, down: bool) {
+        self.audio.send(AudioCmd::PushKey { id, talk, down });
+    }
+
     /// Low latency sound (Settings): the mixer waits at most 60 ms past its filters' delay.
     pub fn set_low_latency(&self, on: bool) {
         self.audio.send(AudioCmd::SetLowLatency(on));

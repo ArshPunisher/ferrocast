@@ -86,6 +86,11 @@ pub struct SourceSettings {
     /// Which tracks it's in: bit 0 is track 1.
     pub tracks: u8,
     pub monitoring: Monitoring,
+    /// Push-to-talk (OBS): the sound is muted unless the key is held, and for this many ms after
+    /// it is let go. None: off.
+    pub push_to_talk: Option<u32>,
+    /// Push-to-mute (OBS): the sound is muted while the key is held, and for this many ms after.
+    pub push_to_mute: Option<u32>,
 }
 
 impl Default for SourceSettings {
@@ -98,6 +103,8 @@ impl Default for SourceSettings {
             sync_offset_ns: 0,
             tracks: 1,
             monitoring: Monitoring::Off,
+            push_to_talk: None,
+            push_to_mute: None,
         }
     }
 }
@@ -111,11 +118,18 @@ pub struct Levels {
     /// The highest the sound came in at, before its filters and its fader (a noise gate's
     /// threshold is set against this: the meter after the gate shows nothing while it's shut).
     pub input_peak: [f32; 2],
+    /// Muted by a push-to-talk or push-to-mute key right now (the meter shows it dim).
+    pub gated: bool,
 }
 
 impl Default for Levels {
     fn default() -> Self {
-        Self { peak: [f32::NEG_INFINITY; 2], rms: [f32::NEG_INFINITY; 2], input_peak: [f32::NEG_INFINITY; 2] }
+        Self {
+            peak: [f32::NEG_INFINITY; 2],
+            rms: [f32::NEG_INFINITY; 2],
+            input_peak: [f32::NEG_INFINITY; 2],
+            gated: false,
+        }
     }
 }
 
@@ -454,6 +468,14 @@ struct Source {
     /// The gain (volume or mute) the last block ended on; a change ramps from it. None: the
     /// source's first block, which starts at its gain.
     gain_applied: Option<f32>,
+    /// Push-to-talk / push-to-mute: the keys held, and the samples each stays in effect after its
+    /// key was let go (the release delay, counted down per block).
+    ptt_down: bool,
+    ptm_down: bool,
+    ptt_hold: u32,
+    ptm_hold: u32,
+    /// Muted by one of them as of the last block.
+    gated: bool,
     levels: Levels,
     /// The last [`METER_BLOCKS`] blocks' measures, newest last.
     recent: VecDeque<Measured>,
@@ -1028,6 +1050,7 @@ impl Mixer {
             s.active
                 && s.settings.monitoring != Monitoring::Off
                 && !s.settings.muted
+                && !s.gated
                 && s.settings.volume > 0.0
                 && !s.output_capture.as_ref().is_some_and(|oc| !oc.excludes_self && mon_dev == Some(oc.device.as_str()))
         })
@@ -1123,6 +1146,11 @@ impl Mixer {
                         last_post_filter: [0.0; 2],
                         filter_declick: false,
                         gain_applied: None,
+                        ptt_down: false,
+                        ptm_down: false,
+                        ptt_hold: 0,
+                        ptm_hold: 0,
+                        gated: false,
                         levels: Levels::default(),
                         recent: VecDeque::new(),
                         tp: [[0.0; TP_TAPS]; 2],
@@ -1133,6 +1161,24 @@ impl Mixer {
                 );
                 self.rebuild_mix_plan();
             }
+        }
+    }
+
+    /// A push-to-talk (`talk`) or push-to-mute key went down or up for source `id`: while it is
+    /// held, and for the source's release delay after, it gates the sound (in samples, from the
+    /// next block; the gain moves over 8 ms, no click).
+    pub fn push_key(&mut self, id: u64, talk: bool, down: bool) {
+        let rate = self.rate;
+        let Some(src) = self.sources.get_mut(&id) else { return };
+        let delay_ms = if talk { src.settings.push_to_talk } else { src.settings.push_to_mute }.unwrap_or(0);
+        let held =
+            if down { 0 } else { (u64::from(delay_ms) * u64::from(rate) / 1000).min(u64::from(u32::MAX)) as u32 };
+        if talk {
+            src.ptt_down = down;
+            src.ptt_hold = held;
+        } else {
+            src.ptm_down = down;
+            src.ptm_hold = held;
         }
     }
 
@@ -1370,6 +1416,7 @@ impl Mixer {
             peak: m.peak.map(db),
             rms: [db((m.sq[0] / n).sqrt()), db((m.sq[1] / n).sqrt())],
             input_peak: m.input.map(db),
+            gated: s.gated,
         })
     }
 
@@ -1535,7 +1582,7 @@ impl Mixer {
             l.push(f[0]);
             r.push(if channels > 1 { f[1] } else { f[0] });
         }
-        if !self.taps.is_empty() && !src.settings.muted {
+        if !self.taps.is_empty() && !src.settings.muted && !src.gated {
             feed_taps(&mut self.taps, id, (&l[gap..], &r[gap..]), rate, out_rate);
         }
         if let Some(t) = at {
@@ -1696,6 +1743,7 @@ impl Mixer {
             for s in sources.values() {
                 if s.active
                     && !s.settings.muted
+                    && !s.gated
                     && s.settings.volume > 0.0001
                     && s.settings.monitoring != Monitoring::Only
                     && s.output_capture.as_ref().is_some_and(|oc| !oc.excludes_self && oc.device == mon)
@@ -1733,13 +1781,24 @@ impl Mixer {
                 input[1] = input[1].max(f[1].abs());
             }
             let s = src.settings;
+            // Push-to-talk shuts it unless the key is held (or was, within the release delay);
+            // push-to-mute shuts it while its key is held (or was). The delays count down here.
+            let gated = (s.push_to_talk.is_some() && !(src.ptt_down || src.ptt_hold > 0))
+                || (s.push_to_mute.is_some() && (src.ptm_down || src.ptm_hold > 0));
+            if !src.ptt_down {
+                src.ptt_hold = src.ptt_hold.saturating_sub(BLOCK as u32);
+            }
+            if !src.ptm_down {
+                src.ptm_hold = src.ptm_hold.saturating_sub(BLOCK as u32);
+            }
+            src.gated = gated;
             let (gl, gr) = if (s.balance - 0.5).abs() > 0.01 {
                 let b = s.balance.clamp(0.0, 1.0);
                 (((1.0 - b) * std::f32::consts::FRAC_PI_2).sin(), (b * std::f32::consts::FRAC_PI_2).sin())
             } else {
                 (1.0, 1.0)
             };
-            let vol = if s.muted { 0.0 } else { s.volume.max(0.0) };
+            let vol = if s.muted || gated { 0.0 } else { s.volume.max(0.0) };
             for f in buf.as_chunks_mut::<2>().0 {
                 if s.mono {
                     let m = (f[0] + f[1]) * 0.5;
@@ -1820,7 +1879,7 @@ impl Mixer {
             // writes silence when muted. Sample-aligned within this block; zero allocations.
             if let Some(slot) = src.key_slot {
                 let (kl, kr) = &mut *key_bufs[slot];
-                if s.muted {
+                if s.muted || gated {
                     kl.fill(0.0);
                     kr.fill(0.0);
                 } else {
@@ -1874,6 +1933,7 @@ impl Mixer {
                 peak: [db(peak[0]), db(peak[1])],
                 rms: [db((sq[0] / BLOCK as f32).sqrt()), db((sq[1] / BLOCK as f32).sqrt())],
                 input_peak: input.map(db),
+                gated,
             };
             src.recent.push_back(Measured { peak: shown, sq, input });
             if src.recent.len() > METER_BLOCKS {
@@ -3196,6 +3256,121 @@ mod steady_state_tests {
         assert!(worst < 0.04, "a gain drag clicked: max step {worst:.4}");
         let end = out[out.len() - 480..].iter().fold(0.0f32, |a, x| a.max(x.abs()));
         assert!(end > 0.7, "and reached +12 dB: peak {end:.3}");
+    }
+
+    /// Runs a 0.5 tone at 220 Hz through source 1 for `blocks` blocks, calling `before(b, mixer)` ahead
+    /// of each; the mixed left side and what the source's levels said (gated) at each block's end.
+    fn gated_run(
+        settings: SourceSettings,
+        blocks: u64,
+        mut before: impl FnMut(u64, &mut Mixer),
+    ) -> (Vec<f32>, Vec<bool>) {
+        let mut m = Mixer::new(48_000, 0);
+        m.set(1, settings);
+        let step = block_ns(48_000);
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let (mut out, mut gated, mut k) = (Vec::new(), Vec::new(), 0usize);
+        for b in 0..blocks {
+            before(b, &mut m);
+            let mut pcm = Vec::with_capacity(BLOCK * 2);
+            for _ in 0..BLOCK {
+                let v = 0.5 * (std::f32::consts::TAU * 220.0 * k as f32 / 48_000.0).sin();
+                pcm.push(v);
+                pcm.push(v);
+                k += 1;
+            }
+            m.push(1, &pcm, 2, 48_000, t0 + b * step);
+            for blk in m.mix_until(t0 + (b + 1) * step) {
+                out.extend(blk.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+            }
+            gated.push(m.sources[&1].gated);
+        }
+        (out, gated)
+    }
+
+    fn block_rms(out: &[f32], b: usize) -> f32 {
+        let s = &out[b * BLOCK + BLOCK / 2..(b + 1) * BLOCK];
+        (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt()
+    }
+
+    /// Push-to-talk: silent until the key is held, heard while it is, and for the release delay
+    /// (counted in samples: 100 ms = 4800) after it is let go; then shut again. A press inside the
+    /// delay keeps it open and starts the delay again at the next release. Never a click.
+    #[test]
+    fn push_to_talk_opens_on_press_and_closes_after_the_release_delay() {
+        let ptt = SourceSettings { push_to_talk: Some(100), ..SourceSettings::default() };
+        let (out, gated) = gated_run(ptt, 16, |b, m| match b {
+            2 => m.push_key(1, true, true),
+            5 => m.push_key(1, true, false),
+            _ => {}
+        });
+        // Shut before the key, open from it.
+        assert!(block_rms(&out, 0) < 1e-4 && block_rms(&out, 1) < 1e-4, "silent until the key");
+        assert!(gated[0] && gated[1] && !gated[2], "{gated:?}");
+        for b in 3..=9 {
+            assert!(block_rms(&out, b) > 0.3, "block {b} heard: held, then within the 100 ms");
+        }
+        // 100 ms is 4800 samples: open through block 9 (counted per 1024-sample block), shut at 10.
+        assert!(block_rms(&out, 10) < 1e-3, "shut after the delay: {}", block_rms(&out, 10));
+        assert!(gated[10] && gated[15]);
+        // No step bigger than the tone's own slope (0.5 * 2π * 220 / 48000 = 0.0144) plus the ramp's share.
+        let worst = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.04, "a click of {worst:.3}");
+    }
+
+    #[test]
+    fn a_press_inside_the_release_delay_keeps_push_to_talk_open() {
+        let ptt = SourceSettings { push_to_talk: Some(100), ..SourceSettings::default() };
+        let (out, _) = gated_run(ptt, 20, |b, m| match b {
+            1 => m.push_key(1, true, true),
+            3 => m.push_key(1, true, false),
+            5 => m.push_key(1, true, true),
+            9 => m.push_key(1, true, false),
+            _ => {}
+        });
+        // Down 5..9 (held), then 4800 samples (five blocks) after the second release at block 9.
+        for b in 2..=13 {
+            assert!(block_rms(&out, b) > 0.3, "block {b} open");
+        }
+        assert!(block_rms(&out, 14) < 1e-3, "shut 100 ms after the last release");
+    }
+
+    /// Push-to-mute: heard until the key is held; muted while it is and for the delay after.
+    #[test]
+    fn push_to_mute_shuts_on_press_and_opens_after_the_release_delay() {
+        let ptm = SourceSettings { push_to_mute: Some(50), ..SourceSettings::default() };
+        let (out, gated) = gated_run(ptm, 14, |b, m| match b {
+            3 => m.push_key(1, false, true),
+            6 => m.push_key(1, false, false),
+            _ => {}
+        });
+        for b in 0..3 {
+            assert!(block_rms(&out, b) > 0.3, "block {b} heard before the key");
+        }
+        // Held at blocks 3..6, then 50 ms (2400 samples) after: muted through block 8.
+        for b in 4..=8 {
+            assert!(block_rms(&out, b) < 1e-3, "block {b} muted: held, then within 50 ms ({})", block_rms(&out, b));
+        }
+        assert!(gated[4] && !gated[11]);
+        assert!(block_rms(&out, 10) > 0.3, "heard again after the delay");
+        let worst = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.04, "a click of {worst:.3}");
+    }
+
+    /// A key for a source that has neither switched on does nothing (the old mute-toggle shortcut
+    /// handles those).
+    #[test]
+    fn a_push_key_does_nothing_for_a_source_without_it_on() {
+        let (out, gated) = gated_run(SourceSettings::default(), 6, |b, m| match b {
+            1 => m.push_key(1, true, false),
+            3 => m.push_key(1, false, true),
+            _ => {}
+        });
+        for b in 1..6 {
+            assert!(block_rms(&out, b) > 0.3, "block {b} heard");
+        }
+        assert!(gated.iter().all(|g| !g));
     }
 
     /// Muting, unmuting and moving the fader mid-sound used to step the gain at a block boundary

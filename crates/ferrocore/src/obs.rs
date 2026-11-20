@@ -421,6 +421,15 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
     })
 }
 
+/// A source's push-to-talk or push-to-mute (OBS saves `<key>` on or off and `<key>-delay` in ms): its
+/// release delay when it is on (at most 5 s), else None.
+fn push_gate(s: &Value, key: &str) -> Option<u32> {
+    s.get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        .then(|| s.get(format!("{key}-delay")).and_then(Value::as_u64).unwrap_or(0).min(5_000) as u32)
+}
+
 /// Default denoiser strength: 40, 24 dB (what RNNoise takes off), gentle on the voice. (A strength
 /// means the same dB as it always did: 0.6 a step up to 50, then 0.1.)
 const DEFAULT_DENOISE_STRENGTH: u32 = 40;
@@ -1235,6 +1244,9 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
                         Some(2) => Monitoring::AndOutput,
                         _ => Monitoring::Off,
                     },
+                    // OBS's per-source push-to-talk / push-to-mute, with their release delays (ms).
+                    push_to_talk: push_gate(s, "push-to-talk"),
+                    push_to_mute: push_gate(s, "push-to-mute"),
                 });
                 if sound.is_some()
                     && let Some(u) = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty())
@@ -2089,6 +2101,23 @@ mod tests {
         assert_eq!(desk.and_then(|d| d.sound.as_ref()).map(|s| s.volume), Some(0.5));
         assert!(got.sources.iter().any(|s| s.name == "Mic/Aux" && s.global));
         assert!(got.skipped.iter().any(|s| s.starts_with("One app")));
+    }
+
+    /// OBS's per-source push-to-talk and push-to-mute, with their release delays, come over: on
+    /// only when its switch is on, the delay in ms (at most 5 s), none when it is off or absent.
+    #[test]
+    fn push_to_talk_and_push_to_mute_come_over_with_their_delays() {
+        use super::push_gate;
+        let s = json!({ "push-to-talk": true, "push-to-talk-delay": 250, "push-to-mute": false,
+            "push-to-mute-delay": 400 });
+        assert_eq!(push_gate(&s, "push-to-talk"), Some(250));
+        assert_eq!(push_gate(&s, "push-to-mute"), None, "its switch is off: the delay alone means nothing");
+        assert_eq!(push_gate(&json!({}), "push-to-talk"), None);
+        assert_eq!(push_gate(&json!({ "push-to-mute": true }), "push-to-mute"), Some(0), "no delay saved");
+        assert_eq!(
+            push_gate(&json!({ "push-to-mute": true, "push-to-mute-delay": 999_999 }), "push-to-mute"),
+            Some(5000)
+        );
     }
 
     #[test]
