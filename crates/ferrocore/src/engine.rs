@@ -843,6 +843,9 @@ struct Watch {
     denied: bool,
     /// The permission is back: the next look restarts it at once.
     regained: bool,
+    /// Since when frames have been coming without a break (0: not yet). `tries` only goes back
+    /// to 0 after [`STABLE_NS`] of that: one frame from a flapping HDMI link isn't a recovery.
+    flowing_since: u64,
 }
 
 impl Watch {
@@ -876,6 +879,8 @@ const STALL_NS: u64 = 5_000_000_000;
 const FIRST_FRAME_NS: u64 = 10_000_000_000;
 /// Maximum fruitless zero-frame tries for a capture card/camera before waiting in "no signal".
 const NO_SIGNAL_MAX_TRIES: u32 = 3;
+/// How long a capture must keep sending before its failed tries are forgotten.
+const STABLE_NS: u64 = 10_000_000_000;
 /// The longest wait between tries at a capture card that has worked before.
 const CARD_RETRY_MAX_NS: u64 = 3_000_000_000;
 /// Hard deadline before the watchdog clears a stalled reopen worker slot.
@@ -4168,10 +4173,17 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
     if count != w.count {
         w.count = count;
         w.since = now;
-        w.tries = 0;
-        w.next_try = 0;
+        if w.flowing_since == 0 {
+            w.flowing_since = now.max(1);
+        }
+        // A link that comes and goes (a loose HDMI cable) is retried on its growing backoff; only
+        // a capture that has kept sending for a while starts afresh.
+        if now.saturating_sub(w.flowing_since) >= STABLE_NS {
+            w.tries = 0;
+            w.next_try = 0;
+        }
     }
-    ended.or_else(|| {
+    let why = ended.or_else(|| {
         if !steady {
             return None;
         }
@@ -4179,7 +4191,11 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
         let limit = if count > 0 { STALL_NS } else { FIRST_FRAME_NS };
         (now.saturating_sub(w.since) > limit)
             .then(|| if count > 0 { "it stopped sending" } else { "it never sent a first frame" }.into())
-    })
+    });
+    if why.is_some() {
+        w.flowing_since = 0;
+    }
+    why
 }
 
 /// Whether a capture ended because its permission was turned off.
@@ -4409,12 +4425,12 @@ fn watchdog_step(
                             src.audio_tx = None;
                             src.watch.count = 0;
                             src.watch.since = now_ns();
-                            src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                            src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
                             st.stats.restarts += 1;
                             let _ = audio_w.send(AudioCmd::SetOutputCapture { id, capture: oc });
                         }
                         Some(Err(e)) => {
-                            src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                            src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
                             tracing::warn!(source = id, error = %e, "the source didn't start again; it's tried later");
                         }
                         None => {}
@@ -4428,7 +4444,7 @@ fn watchdog_step(
                 if let Some(src) = st.sources.get_mut(&id).filter(|s| s.opening == Some(token)) {
                     src.opening = None;
                     src.opening_since = 0;
-                    src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                    src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
                 }
             }
         });
@@ -4438,7 +4454,7 @@ fn watchdog_step(
             if let Some(src) = st.sources.get_mut(&id).filter(|s| s.opening == Some(token)) {
                 src.opening = None;
                 src.opening_since = 0;
-                src.watch.next_try = now_ns() + backoff_ns(prev_tries);
+                src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
             }
         }
     }
@@ -5276,7 +5292,9 @@ mod tests {
         );
         assert!(look(&mut w, true, Some((0, true, None)), 60 * s).is_some());
         assert_eq!(look(&mut w, true, Some((5, true, None)), 61 * s), None);
-        assert_eq!(w.tries, 0);
+        assert_eq!(w.tries, 2, "one frame isn't a recovery: the tries stay");
+        assert_eq!(look(&mut w, true, Some((300, true, None)), 72 * s), None);
+        assert_eq!(w.tries, 0, "10 s of frames: afresh");
         // Tries wait 2, 4, 8… seconds, a minute at most.
         assert_eq!((backoff_ns(0), backoff_ns(2), backoff_ns(9)), (2 * s, 8 * s, 60 * s));
     }
@@ -5357,6 +5375,25 @@ mod tests {
         assert!(look(&mut w, true, Some((30, true, None)), 97 * s).is_some());
     }
 
+    /// An HDMI link that flaps (one frame, then nothing, again and again) keeps its tries, so the
+    /// backoff grows instead of a restart every few seconds for ever (agy review R8).
+    #[test]
+    fn a_flapping_link_does_not_reset_its_backoff() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.ever_sent = true;
+        let mut count = 0;
+        let mut now = 100 * s;
+        for _ in 0..5 {
+            count += 1;
+            assert_eq!(look(&mut w, true, Some((count, true, None)), now), None, "one frame");
+            now += 6 * s;
+            assert!(look(&mut w, true, Some((count, true, None)), now).is_some(), "stalled again");
+            w.tries += 1; // the watchdog's reopen
+        }
+        assert_eq!(w.tries, 5, "the failed tries were kept");
+    }
+
     /// A card that has worked is looked for again within a few seconds when its HDMI comes back
     /// from a long drop, not up to 30-60 s later; other sources keep the longer wait.
     #[test]
@@ -5431,6 +5468,36 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(e.lock().stats.restarts, restarts_before);
+    }
+
+    /// Driven through the real watchdog step, not `Watch::backoff` alone: a mic that has worked
+    /// and whose reopen fails is looked for again within seconds (the worker's own writes of
+    /// `next_try` used the long backoff and overwrote the short one; agy review R7).
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn a_mic_that_worked_is_retried_within_seconds_after_a_failed_reopen_too() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            let mut src = Src::new(Live::Still, None, Some(SourceKind::Microphone("usb".into())));
+            src.watch.ever_sent = true;
+            src.watch.tries = 9;
+            st.sources.insert(1, src);
+        }
+        let reopen: Reopener = Arc::new(|_| Some(Err(AvError::Source("still unplugged".into()))));
+        let cmd = e.audio.cmd_sender();
+        let now = now_ns();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while e.lock().sources[&1].opening.is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (next, at) = (e.lock().sources[&1].watch.next_try, now_ns());
+        assert!(
+            next.saturating_sub(at) <= CARD_RETRY_MAX_NS + 500_000_000,
+            "next try in {} ms",
+            next.saturating_sub(at) / 1_000_000
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
