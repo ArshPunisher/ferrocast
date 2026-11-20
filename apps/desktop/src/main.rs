@@ -22,6 +22,7 @@ use std::time::Duration;
 
 #[cfg(any(windows, test))]
 mod crash;
+mod log_limit;
 #[cfg(target_os = "macos")]
 mod mac_update;
 mod store;
@@ -255,7 +256,10 @@ fn init_tracing(dir: &std::path::Path) {
     let to_file = writer.map(|w| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(w));
     // The terminal too: stdout may be a pipe nobody reads, and a write to it must not park a worker.
     let to_terminal = tracing_subscriber::fmt::layer().with_writer(NonBlockingLog::spawn(std::io::stdout(), LOG_QUEUE));
-    let _ = tracing_subscriber::registry().with(filter).with(to_terminal).with(to_file).try_init();
+    // A line repeated many times a second (DeepFilterNet's clipping warning) passes once a minute.
+    let _ =
+        tracing_subscriber::registry().with(filter).with(log_limit::layer()).with(to_terminal).with(to_file).try_init();
+    log_limit::report_in_background();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Where it came from too (function names in builds with symbols, addresses without).

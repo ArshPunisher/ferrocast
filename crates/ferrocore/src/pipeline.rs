@@ -52,6 +52,9 @@ pub struct Pipeline {
     /// Tests: every video frame fails, as a faulting encoder's would.
     #[cfg(test)]
     fail_video: bool,
+    /// Tests: the next video frame fails once.
+    #[cfg(test)]
+    fail_video_once: bool,
     #[cfg(test)]
     video_calls: u64,
     /// Time spent paused so far, taken off every later frame's time (no gap in the file).
@@ -417,6 +420,8 @@ impl Pipeline {
             #[cfg(test)]
             fail_video: false,
             #[cfg(test)]
+            fail_video_once: false,
+            #[cfg(test)]
             video_calls: 0,
             paused_ns: 0,
             key_next: false,
@@ -681,6 +686,25 @@ impl Pipeline {
         Ok(tags)
     }
 
+    /// Makes the encoders again after one failed, and goes on: a stream sends its new header and
+    /// a keyframe from the next frame (the clock and the sound carry on); a recording asks for a
+    /// new part (`split_wanted`, the caller names the file), since a file can't change its codec
+    /// config halfway. The old encoders are dropped as they are: they failed, nothing is
+    /// flushed out of them.
+    pub fn heal(&mut self) -> Result<(), AvError> {
+        let video = VideoEncoder::new(*self.video.config())?;
+        let audio = AudioEncoder::new(*self.audio.config())?;
+        self.video = video;
+        self.audio = audio;
+        self.sent_video_header = false;
+        self.sent_audio_header = false;
+        self.key_next = true;
+        if matches!(self.recording, Some(Recording::On(_) | Recording::Waiting { .. })) {
+            self.split_wanted = true;
+        }
+        Ok(())
+    }
+
     /// A frame at `ts_ns`. The first one is a keyframe and starts the clock.
     pub fn video(&mut self, frame: Frame<'_>, ts_ns: u64) -> Result<Vec<Tag>, AvError> {
         if self.paused_at.is_some() {
@@ -689,6 +713,10 @@ impl Pipeline {
         #[cfg(test)]
         {
             self.video_calls += 1;
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_video_once) {
+            return Err(AvError::Source("an injected encoder fault (once)".into()));
         }
         #[cfg(test)]
         if self.fail_video {
@@ -1180,6 +1208,12 @@ impl Pipeline {
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn lose_video_session_for_test(&mut self) {
         self.video.lose_session_for_test(false);
+    }
+
+    /// Tests: the next video frame fails, once.
+    #[cfg(test)]
+    pub(crate) fn fail_video_once_for_test(&mut self) {
+        self.fail_video_once = true;
     }
 
     /// Tests: this output's encoder faults on every frame from now on.

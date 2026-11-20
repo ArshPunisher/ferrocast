@@ -943,6 +943,8 @@ struct State {
     stats: Stats,
     /// Why an output failed, by id, until it stops (`deliver`).
     errors: HashMap<u64, String>,
+    /// Outputs whose encoder failed and are being made again (see `heal_outputs`).
+    heal: HashMap<u64, Heal>,
     /// Things captures want said (see `Engine::take_notices`).
     notices: crate::notices::Notices,
     /// The previews windows show, by id.
@@ -1196,6 +1198,7 @@ impl Engine {
             last_heard: Vec::new(),
             stats: Stats::default(),
             errors: HashMap::new(),
+            heal: HashMap::new(),
             notices: Default::default(),
             previews: HashMap::new(),
             in_flight: std::collections::VecDeque::new(),
@@ -2902,6 +2905,7 @@ impl Engine {
             tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stops: its last frames handed over");
             let taken = st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at));
             st.errors.remove(&id);
+            st.heal.remove(&id);
             sync_heard(&mut st, &self.audio.cmd_sender());
             self.show(&st);
             let ticket = st.sleep_ticket();
@@ -2950,6 +2954,15 @@ impl Engine {
         let mut st = self.lock();
         if let Some((_, pipe, ..)) = st.outputs.iter_mut().find(|(i, ..)| *i == id) {
             pipe.lose_video_session_for_test();
+        }
+    }
+
+    /// Tests: this output's next video frame fails, once.
+    #[cfg(test)]
+    fn fail_output_once_for_test(&self, id: u64) {
+        let mut st = self.lock();
+        if let Some((_, pipe, ..)) = st.outputs.iter_mut().find(|(i, ..)| *i == id) {
+            pipe.fail_video_once_for_test();
         }
     }
 
@@ -4602,8 +4615,74 @@ struct InFlight {
 
 /// Hands the frames that came back to their outputs and taps, oldest first: those ready, and
 /// any past [`IN_FLIGHT`] (waiting for the card); every one with `flush`.
+/// An output's failures, and when it is next tried again.
+#[derive(Debug, Default)]
+struct Heal {
+    /// When it failed lately (the last [`HEAL_WINDOW`]).
+    fails: std::collections::VecDeque<Instant>,
+    /// Set while waiting to be made again; the output isn't fed meanwhile.
+    retry_at: Option<Instant>,
+}
+
+/// Waits before the 1st, 2nd and later tries, as OBS reconnects: 1 s, 2 s, then 5 s.
+const HEAL_WAITS: [Duration; 3] = [Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(5)];
+/// Failures within this long are counted...
+const HEAL_WINDOW: Duration = Duration::from_secs(300);
+/// ...and this many give up: the output keeps its error (Health shows it).
+const HEAL_GIVE_UP: usize = 5;
+
+/// Notes a failure of output `id`: tried again after a wait, or given up on.
+fn note_failure(st: &mut State, id: u64, why: &str) {
+    let now = Instant::now();
+    let h = st.heal.entry(id).or_default();
+    while h.fails.front().is_some_and(|t| now.duration_since(*t) > HEAL_WINDOW) {
+        h.fails.pop_front();
+    }
+    h.fails.push_back(now);
+    let n = h.fails.len();
+    if n >= HEAL_GIVE_UP {
+        h.retry_at = None;
+        tracing::error!(output = id, failures = n, error = %why, "an output keeps failing; giving up on it");
+        st.errors.entry(id).or_insert_with(|| format!("it kept failing ({n} times in 5 minutes): {why}"));
+    } else {
+        let wait = HEAL_WAITS[(n - 1).min(HEAL_WAITS.len() - 1)];
+        h.retry_at = Some(now + wait);
+        tracing::error!(
+            output = id,
+            failure = n,
+            wait_ms = wait.as_millis() as u64,
+            error = %why,
+            "an output's encoder failed; making it again"
+        );
+    }
+}
+
+/// Makes the encoders again of every output whose wait is over. A stream resumes at a keyframe; a
+/// recording asks for a new part (the caller names the file).
+fn heal_outputs(st: &mut State) {
+    let now = Instant::now();
+    let due: Vec<u64> =
+        st.heal.iter().filter(|(_, h)| h.retry_at.is_some_and(|t| t <= now)).map(|(id, _)| *id).collect();
+    for id in due {
+        let result = st.outputs.iter_mut().find(|(i, ..)| *i == id).map(|(_, pipe, ..)| pipe.heal());
+        match result {
+            Some(Ok(())) => {
+                if let Some(h) = st.heal.get_mut(&id) {
+                    h.retry_at = None;
+                }
+                tracing::info!(output = id, "an output's encoder was made again; it goes on");
+            }
+            Some(Err(e)) => note_failure(st, id, &e.to_string()),
+            None => {
+                st.heal.remove(&id);
+            }
+        }
+    }
+}
+
 fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::SyncSender<Block>) {
     let _ = gpu.device.poll(wgpu::PollType::Poll);
+    heal_outputs(st);
     if st.outputs.is_empty() {
         // Nothing encodes: the next output's time starts afresh.
         st.stats.encode_ms = 0.0;
@@ -4620,7 +4699,13 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             .map(|(c, f)| (c, f.and_then(|p| gpu.finish_nv12(p).map_err(|e| e.to_string()))))
             .collect();
         let mut failures: Vec<(u64, String)> = Vec::new();
-        let dead: Vec<u64> = st.errors.keys().copied().collect();
+        // Given up on (an error stays) or waiting to be made again: not fed meanwhile.
+        let dead: Vec<u64> = st
+            .errors
+            .keys()
+            .copied()
+            .chain(st.heal.iter().filter(|(_, h)| h.retry_at.is_some()).map(|(id, _)| *id))
+            .collect();
         let mut encoding = Duration::ZERO;
         for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
             if !outputs.contains(id) {
@@ -4689,7 +4774,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
         // Each fault goes on its own output (the first one stays): the main stream and the
         // recording aren't marked dead by a vertical stream's or the replay buffer's.
         for (id, why) in failures {
-            st.errors.entry(id).or_insert(why);
+            note_failure(st, id, &why);
         }
         // Only frames that went through an encoder count (a canvas drawn every other frame, or
         // one that failed to draw, would pull the average down by half).
@@ -6354,7 +6439,7 @@ mod tests {
         e.go("Wide").unwrap_or_else(|x| panic!("{x}"));
         let id = e.start_output(OutputKind::Replay { seconds: 5, mb: 0 }).unwrap_or_else(|x| panic!("{x}"));
         e.fail_output_for_test(id);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(40);
         while e.output_error(id).is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -6390,6 +6475,72 @@ mod tests {
         }
     }
 
+    /// An encoder that fails once is made again and the output goes on by itself: a stream
+    /// resumes within seconds (new header, a keyframe), a recording asks for a new part and ends up
+    /// as two playable files (the soak's silent stall: an output that errored just stopped).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_stream_and_a_recording_heal_themselves_after_an_encoder_fault() {
+        if !encodes_here() {
+            return;
+        }
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Wide", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Wide").unwrap_or_else(|x| panic!("{x}"));
+        let tags = Arc::new(AtomicU64::new(0));
+        let counter = tags.clone();
+        let stream = e
+            .start_output(OutputKind::Stream(Box::new(move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            })))
+            .unwrap_or_else(|x| panic!("{x}"));
+        let dir = std::env::temp_dir().join(format!("ferrocore-heal-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (one, two) = (dir.join("part1.mp4"), dir.join("part2.mp4"));
+        let record = e.start_output(OutputKind::Record(one.clone())).unwrap_or_else(|x| panic!("{x}"));
+        std::thread::sleep(Duration::from_millis(1200));
+        let before = tags.load(Ordering::Relaxed);
+        assert!(before > 0, "the stream flows before the fault");
+        e.fail_output_once_for_test(stream);
+        e.fail_output_once_for_test(record);
+        // Within a few seconds (the 1 s wait, then a new encoder) both flow again.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut named = false;
+        let mut resumed_at = None;
+        while Instant::now() < deadline {
+            if !named && e.output_record_state(record).is_ok_and(|r| r.split_wanted) {
+                e.split_output(record, &two).unwrap_or_else(|x| panic!("{x}"));
+                named = true;
+            }
+            let now = tags.load(Ordering::Relaxed);
+            if resumed_at.is_none() && now > before + 60 && named {
+                resumed_at = Some(Instant::now());
+            }
+            if resumed_at.is_some_and(|t| t.elapsed() > Duration::from_millis(800)) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(named, "the recording asked for a new part");
+        assert!(resumed_at.is_some(), "the stream flowed again by itself");
+        assert_eq!(e.output_error(stream), None);
+        assert_eq!(e.output_error(record), None);
+        e.stop_output(stream).unwrap_or_else(|x| panic!("{x}"));
+        e.stop_output(record).unwrap_or_else(|x| panic!("{x}"));
+        for f in [&one, &two] {
+            assert!(std::fs::metadata(f).map_or(0, |m| m.len()) > 1_000, "{f:?} has content");
+        }
+        if let Ok(out) = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration"])
+            .arg(&two)
+            .output()
+        {
+            assert!(out.status.success(), "the second part plays: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
     /// One output's encoder fault marks that output, not the others (agy GAPS #3): the main
     /// stream stays well, and a new output starts with no error.
     #[test]
@@ -6403,7 +6554,7 @@ mod tests {
         let main = e.start_output(OutputKind::Stream(Box::new(|_| {}))).unwrap_or_else(|x| panic!("{x}"));
         let second = e.start_output(OutputKind::Replay { seconds: 5, mb: 0 }).unwrap_or_else(|x| panic!("{x}"));
         e.fail_output_for_test(second);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(40);
         while e.output_error(second).is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }

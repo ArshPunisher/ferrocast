@@ -147,6 +147,12 @@ struct Sink {
     error: Option<String>,
     /// The status behind `error`, to tell a lost session from a bad frame.
     status: Option<OSStatus>,
+    /// Times VideoToolbox has called back (a frame, a drop, an error: anything), to tell a
+    /// session that went quiet from one that is working.
+    callbacks: u64,
+    /// Tests: the session stops answering (callbacks return at once, as a wedged one's would).
+    #[cfg(test)]
+    mute: bool,
 }
 
 /// One VideoToolbox session.
@@ -170,7 +176,36 @@ pub(crate) struct Encoder {
     /// When sessions were rebuilt lately (at most [`REBUILDS`] in [`REBUILD_WINDOW`], then the
     /// output gives up: a machine whose encoder keeps dying would else rebuild every frame).
     rebuilt_at: std::collections::VecDeque<std::time::Instant>,
+    /// Frames handed in since VideoToolbox last called back, and since when it has been quiet.
+    quiet: (u32, std::time::Instant),
+    seen_callbacks: u64,
+    /// Frames in a row the pool had none to give.
+    pool_misses: u32,
 }
+
+/// What one pool miss means.
+#[derive(Debug, PartialEq, Eq)]
+enum PoolMiss {
+    /// Leave this frame out.
+    Drop,
+    /// Too many in a row: the session isn't giving frames back.
+    Wedged,
+}
+
+/// Counts a miss: dropped until [`POOL_MISSES`] in a row, then a wedge.
+fn pool_miss(misses: &mut u32) -> PoolMiss {
+    *misses += 1;
+    if *misses >= POOL_MISSES { PoolMiss::Wedged } else { PoolMiss::Drop }
+}
+
+/// Pool misses in a row that mean the session is wedged.
+const POOL_MISSES: u32 = 30;
+
+/// A session that takes this many frames and this long with no callback at all (no packet, no
+/// dropped frame, no error) has wedged: it is treated as lost and built again. (A 1440p60 stream
+/// stopped sending at 25 min with rendering fine and nothing in the log.)
+const QUIET_FRAMES: u32 = 90;
+const QUIET_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Rebuilds of a lost session allowed in the window.
 const REBUILDS: usize = 3;
@@ -356,6 +391,9 @@ impl Encoder {
             lost: false,
             prior_header: None,
             rebuilt_at: std::collections::VecDeque::new(),
+            quiet: (0, std::time::Instant::now()),
+            seen_callbacks: 0,
+            pool_misses: 0,
         })
     }
 
@@ -424,6 +462,22 @@ impl Encoder {
     }
 
     fn encode_once(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
+        // Has the session gone quiet? Frames go in, nothing ever comes back.
+        let calls = self.sink.lock().map_or(self.seen_callbacks, |s| s.callbacks);
+        if calls != self.seen_callbacks {
+            self.seen_callbacks = calls;
+            self.quiet = (0, std::time::Instant::now());
+        } else {
+            self.quiet.0 += 1;
+            if self.quiet.0 >= QUIET_FRAMES && self.quiet.1.elapsed() >= QUIET_FOR {
+                self.lost = true;
+                return Err(AvError::Encoder(format!(
+                    "the Mac's video encoder stopped answering ({} frames, {:.1} s)",
+                    self.quiet.0,
+                    self.quiet.1.elapsed().as_secs_f32()
+                )));
+            }
+        }
         // SAFETY: the session is live; the pool belongs to it (not retained: "Get").
         let pool = unsafe { VTCompressionSessionGetPixelBufferPool(self.session.0) };
         if pool.is_null() {
@@ -433,7 +487,23 @@ impl Encoder {
         let mut buf: CFTypeRef = ptr::null();
         // SAFETY: the pool is live; the new buffer is +1.
         let s = unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &raw mut buf) };
-        let buf = Owned::new(buf).ok_or_else(|| fail("make a frame", s))?;
+        let Some(buf) = Owned::new(buf) else {
+            // No frame left in the session's pool: it isn't getting them back (a session that
+            // stopped answering). A few misses are a busy moment; many in a row is a wedge.
+            match pool_miss(&mut self.pool_misses) {
+                // A busy moment: this frame is left out and counted, the output goes on (before,
+                // one miss tore the output down for a second and made its encoders again).
+                PoolMiss::Drop => {
+                    crate::video::note_dropped(1);
+                    return Ok(Vec::new());
+                }
+                PoolMiss::Wedged => {
+                    self.lost = true;
+                    return Err(fail("make a frame", s));
+                }
+            }
+        };
+        self.pool_misses = 0;
         self.fill(buf.0, frame)?;
         // SAFETY: CoreVideo's constant keys and values; the buffer is live.
         unsafe {
@@ -562,6 +632,14 @@ impl Encoder {
         }
     }
 
+    /// Tests: the session stops answering.
+    #[cfg(test)]
+    pub(crate) fn mute_for_test(&mut self) {
+        if let Ok(mut sink) = self.sink.lock() {
+            sink.mute = true;
+        }
+    }
+
     /// Tests: the system takes the session back.
     #[cfg(test)]
     pub(crate) fn invalidate_for_test(&mut self) {
@@ -595,6 +673,11 @@ extern "C" fn output(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus,
     // invalidated (Drop), after which this isn't called.
     let sink = unsafe { &*refcon.cast::<Mutex<Sink>>() };
     let Ok(mut sink) = sink.lock() else { return };
+    #[cfg(test)]
+    if sink.mute {
+        return;
+    }
+    sink.callbacks += 1;
     if status != 0 {
         sink.error = Some(format!("the Mac's video encoder failed a frame (error {status})"));
         sink.status = Some(status);
@@ -745,6 +828,47 @@ mod tests {
         e.invalidate_for_test();
         e.encode(frame(&pix), 6 * 33_333, false).unwrap_or_else(|x| panic!("{x}"));
         assert!(e.header().is_some(), "the lost session's header stands in");
+    }
+
+    /// A session that accepts frames and never answers (no packet, no drop, no error) is built
+    /// again instead of silently ending the stream (the 25 min stall in Sonnet 1's soak).
+    #[test]
+    fn a_session_that_goes_quiet_is_built_again_and_packets_flow() {
+        let Ok(mut e) = Encoder::new(&config()) else { return };
+        let pix = (vec![90u8; 320 * 180], vec![128u8; 320 * 90]);
+        for i in 0..5 {
+            e.encode(frame(&pix), i * 33_333, i == 0).unwrap_or_else(|x| panic!("{x}"));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        e.mute_for_test();
+        let mut packets_after = 0;
+        let mut failed = None;
+        for i in 5..400 {
+            match e.encode(frame(&pix), i * 33_333, false) {
+                Ok(p) => packets_after += p.len(),
+                Err(x) => {
+                    failed = Some(x.to_string());
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if packets_after > 3 {
+                break;
+            }
+        }
+        assert_eq!(failed, None, "a quiet session must be rebuilt, not fail the output");
+        assert!(packets_after > 3, "packets flow again after the rebuild: {packets_after}");
+    }
+
+    /// A few pool misses drop frames; 30 in a row are a wedge (D1F-05: the first one used to be an
+    /// error, so the 30 were unreachable).
+    #[test]
+    fn a_few_pool_misses_drop_frames_and_thirty_are_a_wedge() {
+        let mut misses = 0;
+        for _ in 0..(POOL_MISSES - 1) {
+            assert_eq!(pool_miss(&mut misses), PoolMiss::Drop);
+        }
+        assert_eq!(pool_miss(&mut misses), PoolMiss::Wedged);
     }
 
     #[test]
