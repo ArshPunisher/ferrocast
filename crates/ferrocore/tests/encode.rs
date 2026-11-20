@@ -2,6 +2,7 @@
 //! FERROCAST_AV_ENCODER=ffmpeg): frames in, a stream FFmpeg reads back out.
 
 use std::process::Command;
+use std::time::Duration;
 
 use ferrocore::flv::{FlvFile, video_header, video_tag};
 use ferrocore::video::{Frame, PixelFormat, RateControl, VideoCodec, VideoConfig, VideoEncoder};
@@ -601,22 +602,31 @@ fn x264_lossless_gives_back_the_picture() {
 
 /// A bitrate change while encoding through FFmpeg: another encoder takes over at a keyframe,
 /// and the stream plays straight through, every frame there once, in order.
+///
+/// The new encoder is another FFmpeg process, started on a thread of its own: how many frames go
+/// by before it has started (and so where the keyframe it takes over at falls) depends on how busy
+/// the machine is. So this test doesn't say which frame that is (it used to say 30 and 60, and
+/// failed whenever six of them ran at once): after each change it keeps feeding frames, a little
+/// apart, until the takeover has happened, and the keyframe interval is long enough that every
+/// keyframe after the first is a takeover and none is the old encoder's own.
 #[test]
 fn ffmpegs_bitrate_changes_on_the_run() {
     if !ferrocore::ffenc::available() {
         eprintln!("skipped: FFmpeg isn't here");
         return;
     }
-    let cfg = VideoConfig { rate: RateControl::Cbr, software: true, ..config(VideoCodec::H264, PixelFormat::Nv12) };
+    let cfg = VideoConfig {
+        rate: RateControl::Cbr,
+        software: true,
+        // 10 s of frames between the encoder's own keyframes: more than this test ever feeds.
+        keyframe_secs: 10,
+        ..config(VideoCodec::H264, PixelFormat::Nv12)
+    };
     let mut enc = VideoEncoder::new(cfg).unwrap_or_else(|e| panic!("{e}"));
     let mut packets = Vec::new();
-    for i in 0..90u32 {
-        if i == 30 {
-            assert!(enc.set_kbps(1200).unwrap_or_else(|e| panic!("{e}")), "taken on the run");
-        }
-        if i == 60 {
-            assert!(enc.set_kbps(4000).unwrap_or_else(|e| panic!("{e}")));
-        }
+    let mut fed = 0u32;
+    let mut feed = |enc: &mut VideoEncoder, packets: &mut Vec<_>| {
+        let i = fed;
         // A moving bar, so frames differ.
         let y: Vec<u8> = (0..640 * 360).map(|n: u32| if (n % 640 + i * 7) % 640 < 60 { 235 } else { 40 }).collect();
         let uv = vec![128u8; 640 * 180];
@@ -624,11 +634,33 @@ fn ffmpegs_bitrate_changes_on_the_run() {
             enc.encode(Frame::Nv12 { y: &y, y_stride: 640, uv: &uv, uv_stride: 640 }, i64::from(i) * 33_333, false)
                 .unwrap_or_else(|e| panic!("{e}")),
         );
+        fed += 1;
+    };
+    let keys = |packets: &[ferrocore::video::VideoPacket]| packets.iter().filter(|p| p.key).count();
+    for _ in 0..30 {
+        feed(&mut enc, &mut packets);
+    }
+    // Each change: ask, then feed frames (a few ms apart, so the process has time to start) until the
+    // takeover shows as one more keyframe, at most 20 s.
+    for (kbps, keys_after) in [(1200, 2usize), (4000, 3)] {
+        assert!(enc.set_kbps(kbps).unwrap_or_else(|e| panic!("{e}")), "taken on the run");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while keys(&packets) < keys_after {
+            assert!(std::time::Instant::now() < deadline, "{kbps} kbps never took over ({} frames fed)", fed);
+            std::thread::sleep(Duration::from_millis(5));
+            feed(&mut enc, &mut packets);
+        }
+    }
+    // The stream goes on after the last change.
+    for _ in 0..15 {
+        feed(&mut enc, &mut packets);
     }
     packets.extend(enc.flush().unwrap_or_else(|e| panic!("{e}")));
-    assert_eq!(packets.len(), 90, "every frame once");
+    assert_eq!(packets.len(), fed as usize, "every frame once");
     assert!(packets.windows(2).all(|w| w[0].pts_us < w[1].pts_us), "in order");
-    assert!(packets[30].key && packets[60].key, "each new encoder starts on a keyframe");
+    let at: Vec<usize> = packets.iter().enumerate().filter(|(_, p)| p.key).map(|(i, _)| i).collect();
+    assert_eq!(at.len(), 3, "the first frame and one takeover for each change: {at:?}");
+    assert!(at[0] == 0 && at[1] >= 30 && at[2] > at[1], "each new encoder starts on a keyframe: {at:?}");
     let header = enc.header().unwrap_or_else(|| panic!("a codec header"));
     let mut flv = FlvFile::new(false, true);
     flv.tag(9, 0, &video_header(VideoCodec::H264, &header));
@@ -636,7 +668,8 @@ fn ffmpegs_bitrate_changes_on_the_run() {
         let (ms, body) = video_tag(VideoCodec::H264, p, 0);
         flv.tag(9, ms, &body);
     }
-    let file = std::env::temp_dir().join("ferrocore-rate-change.flv");
+    // Its own file: another run of this test (another session's, say) must not write over it.
+    let file = std::env::temp_dir().join(format!("ferrocore-rate-change-{}.flv", std::process::id()));
     std::fs::write(&file, &flv.bytes).unwrap_or_else(|e| panic!("{e}"));
     let out = Command::new("ffprobe")
         .args([
@@ -653,9 +686,10 @@ fn ffmpegs_bitrate_changes_on_the_run() {
         .arg(&file)
         .output()
         .unwrap_or_else(|e| panic!("{e}"));
+    let _ = std::fs::remove_file(&file);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "90",
+        fed.to_string(),
         "it decodes whole: {}",
         String::from_utf8_lossy(&out.stderr)
     );

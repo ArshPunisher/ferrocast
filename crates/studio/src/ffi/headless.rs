@@ -514,11 +514,18 @@ mod tests {
         let page = FedPage::open(html, 320, 180, "body { background: transparent }", 30, feed)
             .unwrap_or_else(|| panic!("no page"));
         let at = |px: &[u8], x: usize, y: usize| px.get((y * 320 + x) * 4..(y * 320 + x) * 4 + 3).map(<[u8]>::to_vec);
+        // Until the picture is what the page should look like: the red box AND clear where the page
+        // is clear. The first pictures a starting browser sends can show the box before the page's
+        // own CSS (transparent) has taken effect, with white beside it: waiting for the red alone
+        // read that frame. However long the browser takes to start (a busy machine: several
+        // seconds, twice if its first start fails), not a fixed number of tries.
+        let ready = |px: &[u8]| at(px, 40, 90) == Some(vec![255, 0, 0]) && at(px, 280, 90) == Some(vec![0, 0, 0]);
+        let deadline = Instant::now() + Duration::from_secs(90);
         let mut px = Vec::new();
-        for _ in 0..80 {
-            std::thread::sleep(Duration::from_millis(250));
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
             px = e.snapshot().unwrap_or_default();
-            if at(&px, 40, 90) == Some(vec![255, 0, 0]) {
+            if ready(&px) {
                 break;
             }
         }

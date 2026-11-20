@@ -6295,8 +6295,13 @@ mod tests {
         std::thread::sleep(Duration::from_secs(secs));
         e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
 
-        let flashes = flash_times(&rec);
         let beeps = beep_times(&rec);
+        // A flash in the last moments of the picture has its beep after the sound ended (the
+        // recording stops a few frames' worth earlier in the sound than in the picture): it would
+        // pair with the beep before it, or with the end of the sound that silencedetect reports as
+        // a beep's end, and read as 100 ms out of sync (seen in a full workspace run under load).
+        let sound_ends = audio_secs(&rec);
+        let flashes: Vec<f64> = flash_times(&rec).into_iter().filter(|f| *f + 0.05 < sound_ends).collect();
         let offsets: Vec<f64> = flashes
             .iter()
             .filter_map(|f| beeps.iter().map(|b| b - f).min_by(|a, b| a.abs().total_cmp(&b.abs())))
@@ -6331,6 +6336,25 @@ mod tests {
             }
         }
         times
+    }
+
+    /// How long the recording's sound lasts, in seconds.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn audio_secs(file: &std::path::Path) -> f64 {
+        let out = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "packet=pts_time,duration_time"])
+            .args(["-of", "csv=p=0"])
+            .arg(file)
+            .output()
+            .unwrap_or_else(|x| panic!("{x}"));
+        // The end of the last packet.
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let (t, d) = l.split_once(',')?;
+                Some(t.trim().parse::<f64>().ok()? + d.trim().parse::<f64>().unwrap_or(0.0))
+            })
+            .fold(0.0, f64::max)
     }
 
     /// When the recording's sound starts after a silence (a beep starts), in seconds.
