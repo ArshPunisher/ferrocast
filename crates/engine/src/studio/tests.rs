@@ -1263,6 +1263,10 @@ struct FakeStudio {
     current: Mutex<String>,
     muted: Mutex<bool>,
     streaming: Mutex<bool>,
+    /// The Studio isn't running (it crashed).
+    studio_down: Mutex<bool>,
+    /// The next stream starts fail (the ingest refuses).
+    stream_fails: Mutex<bool>,
     /// The camera shown in its scene.
     cam_shown: Mutex<bool>,
     /// What the mic hears (dBFS), and whether the camera's picture is black.
@@ -1291,12 +1295,19 @@ impl crate::studio_host::StudioHost for FakeStudio {
         Ok(self.record_now.lock().unwrap().clone())
     }
     async fn status(&self) -> crate::studio_host::StudioStatus {
-        crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+        crate::studio_host::StudioStatus {
+            available: true,
+            running: !*self.studio_down.lock().unwrap(),
+            ..Default::default()
+        }
     }
     async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
         Ok(self.status().await)
     }
     async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        if *self.studio_down.lock().unwrap() {
+            return Ok(self.status().await);
+        }
         Err("no".into())
     }
     async fn kinds(&self) -> Result<Value, String> {
@@ -1427,6 +1438,9 @@ impl crate::studio_host::StudioHost for FakeStudio {
         _key: String,
         _tracks: Vec<(u32, u32, u32)>,
     ) -> Result<Value, String> {
+        if *self.stream_fails.lock().unwrap() {
+            return Err("the server refused the key".into());
+        }
         self.acts.lock().unwrap().push("stream true".into());
         *self.streaming.lock().unwrap() = true;
         Ok(json!({ "active": true }))
@@ -1459,6 +1473,7 @@ async fn a_show_never_goes_to_an_empty_scene_and_a_stopped_one_is_over() {
         ..Default::default()
     });
     e.set_studio_host(studio.clone());
+    e.set_test_ingest();
     e.patch_show_config(
         json!({
             "live_scene": "Live", "countdown_s": 0, "discord": false, "alerts_on": false, "bot_on": false,
@@ -1894,10 +1909,11 @@ async fn the_live_watch_reads_every_mic_on_air_and_the_scene_picture() {
     assert!(m.name == "Mic" && m.muted && m.input_db == -22.0 && m.peak_db == -100.0, "{m:?}");
     // "Live" has a camera shown; a scene with only a mic is "empty".
     assert_eq!(sample.scene.as_ref().map(|s| s.empty), Some(false));
-    studio.scene_items.lock().unwrap().insert(
-        "Live".into(),
-        json!([{ "id": 1, "name": "Mic", "kind": "coreaudio_input_capture", "visible": true }]),
-    );
+    studio
+        .scene_items
+        .lock()
+        .unwrap()
+        .insert("Live".into(), json!([{ "id": 1, "name": "Mic", "kind": "coreaudio_input_capture", "visible": true }]));
     let sample = e.watch_sample(2000, &e.show_config()).await;
     assert_eq!(sample.scene.as_ref().map(|s| s.empty), Some(true), "a mic alone is no picture");
     // Speaking into it twice: one notice, naming the mic, with its one-tap fix.
@@ -1920,10 +1936,11 @@ async fn preflight_warns_about_a_black_scene_and_a_muted_mic() {
         mic_db: Mutex::new(-100.0),
         ..Default::default()
     });
-    studio.scene_items.lock().unwrap().insert(
-        "Live".into(),
-        json!([{ "id": 1, "name": "Mic", "kind": "coreaudio_input_capture", "visible": true }]),
-    );
+    studio
+        .scene_items
+        .lock()
+        .unwrap()
+        .insert("Live".into(), json!([{ "id": 1, "name": "Mic", "kind": "coreaudio_input_capture", "visible": true }]));
     e.set_studio_host(studio.clone());
     let p = e.preflight().await;
     let c = |id: &str| p.checks.iter().find(|c| c.id == id);
@@ -1939,4 +1956,87 @@ async fn preflight_warns_about_a_black_scene_and_a_muted_mic() {
     *studio.cam_shown.lock().unwrap() = true;
     let p = e.preflight().await;
     assert!(p.checks.iter().all(|c| c.id != "picture:Live" && c.id != "mic:Mic"), "{:?}", p.checks);
+}
+
+fn countdown_cfg() -> serde_json::Value {
+    json!({ "countdown_s": 30, "discord": false, "alerts_on": false, "bot_on": false })
+}
+
+/// 19 Nov, path 1: the stream wouldn't start but the show sat in Countdown, so the next Go live
+/// said "A show is already running". A show whose stream can't start never begins.
+#[tokio::test]
+async fn a_failed_stream_start_never_leaves_a_countdown_behind() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        stream_fails: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    let opts = || crate::studio::show::ShowStartOpts { force: true, stream: Some(true) };
+    for _ in 0..2 {
+        let err = e.start_show_with(opts()).await.expect_err("the stream can't start");
+        assert!(!err.to_string().contains("already running"), "{err}");
+        assert!(err.to_string().contains("refused"), "says why: {err}");
+        assert!(!e.is_show_active(), "no show is left running");
+    }
+    // The key works again: Go live starts cleanly.
+    *studio.stream_fails.lock().unwrap() = false;
+    assert!(e.start_show_with(opts()).await.is_ok());
+}
+
+/// Paths 2 and 4: the stream stopped (or the Studio went away) during the countdown; Go live
+/// again must start a new show, not say one is running.
+#[tokio::test]
+async fn a_stream_stopped_in_the_countdown_ends_that_show() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    let opts = || crate::studio::show::ShowStartOpts { force: true, stream: Some(true) };
+    e.start_show_with(opts()).await.unwrap();
+    assert!(e.is_show_active());
+    e.studio_stream_stop(false).await.unwrap();
+    assert!(!e.is_show_active(), "the countdown went with the stream");
+    assert!(e.start_show_with(opts()).await.is_ok(), "Go live again works");
+    // Same, when the stream stopped behind our back (the rig says it's off).
+    *studio.streaming.lock().unwrap() = false;
+    assert!(e.start_show_with(opts()).await.is_ok(), "a countdown with no stream is stale");
+}
+
+/// Path 3: a show started without the stream (Show tab) and then Go live from the desk.
+#[tokio::test]
+async fn go_live_from_a_show_that_runs_without_the_stream_starts_the_stream() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(
+        json!({ "discord": false, "alerts_on": false, "bot_on": false, "start_stream": false }).as_object().unwrap(),
+    )
+    .await
+    .unwrap();
+    e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(false) }).await.unwrap();
+    assert!(!*studio.streaming.lock().unwrap());
+    let r = e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(true) }).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert!(*studio.streaming.lock().unwrap(), "the stream is on");
+}
+
+/// Path 5: the Studio crashed (it isn't running any more) and is then stopped: the show still ends.
+#[tokio::test]
+async fn stopping_the_studio_ends_a_show_even_when_it_had_already_gone() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Live".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.set_test_ingest();
+    e.patch_show_config(countdown_cfg().as_object().unwrap()).await.unwrap();
+    e.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(true) }).await.unwrap();
+    assert!(e.is_show_active());
+    *studio.studio_down.lock().unwrap() = true;
+    e.studio_stop().await.unwrap();
+    assert!(!e.is_show_active(), "a show with no Studio under it is over");
 }

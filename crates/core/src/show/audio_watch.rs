@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), false)], "{a:?}");
         assert_eq!(a[0].action, Some("gain_up"));
         // Said once.
-        assert!(feed(&mut w, &mut t, 60, |i| quiet(i)).is_empty());
+        assert!(feed(&mut w, &mut t, 60, quiet).is_empty());
         // Gain raised: peaks at -12 for a while → cleared.
         let a = feed(&mut w, &mut t, 30, |i| {
             let p = if i % 2 == 0 { -12.0 } else { -60.0 };

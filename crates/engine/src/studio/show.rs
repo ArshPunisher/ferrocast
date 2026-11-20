@@ -312,6 +312,20 @@ impl Engine {
     }
 
     /// Cancels any active Show, countdown, or pending delayed stop when the Studio stops.
+    /// The stream stopped: a show still counting down, or waiting for its first scene, has nothing
+    /// to go live with and ends. A live show stays (its own ending, or the next Go live, takes it).
+    pub(crate) fn end_show_whose_stream_stopped(&self) {
+        let counting = {
+            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            matches!(m.phase, BroadcastPhase::Countdown | BroadcastPhase::Starting)
+                && m.started_stream
+                && !m.ending_in_flight
+        };
+        if counting {
+            self.cancel_show_on_studio_stop("The stream stopped.");
+        }
+    }
+
     pub(crate) fn cancel_show_on_studio_stop(&self, reason: &str) {
         let emit = {
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
@@ -634,45 +648,55 @@ impl Engine {
         let cfg = self.show_config();
         let start_stream = opts.stream.unwrap_or(cfg.start_stream);
 
-        // A show whose stream stopped some other way (the stream dropping, external stop) is
-        // over: it no longer blocks a new one (19 Nov, live). A countdown still blocks until
-        // cancelled. (Only a show that streamed: one that didn't may run with the stream off.)
+        // A show whose stream stopped some other way (the stream dropping, external stop, a
+        // failed start) is over: it no longer blocks a new one (19 Nov, live). Go live from the
+        // desk (`stream: Some(true)`) also takes over a show that runs without the stream. A
+        // countdown with its stream running still blocks until cancelled.
         let stale_candidate = {
             let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
-            if (m.started_stream || cfg.start_stream)
-                && matches!(m.phase, BroadcastPhase::Live | BroadcastPhase::Starting)
+            if (m.started_stream || cfg.start_stream || opts.stream == Some(true))
+                && matches!(m.phase, BroadcastPhase::Live | BroadcastPhase::Starting | BroadcastPhase::Countdown)
             {
                 Some(m.epoch)
             } else {
                 None
             }
         };
-        if let Some(old_gen) = stale_candidate
-            && let Ok(rig) = self.rig().await
-            && matches!(self.rig_streaming(&rig).await, Ok(false))
-        {
-            let ended = {
-                let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
-                if m.epoch == old_gen && matches!(m.phase, BroadcastPhase::Live | BroadcastPhase::Starting) {
-                    m.phase = BroadcastPhase::Idle;
-                    m.epoch += 1;
-                    m.countdown = None;
-                    m.transitioning_live = None;
-                    m.started_stream = false;
-                    if let Some(r) = m.run.as_mut() {
-                        r.phase = Phase::Ended;
-                        r.ended_at = Some(now().0);
-                        r.countdown_ends_at = None;
-                        Some(r.clone())
+        if let Some(old_gen) = stale_candidate {
+            // With no Studio (or OBS) to ask, nothing is streaming: the old show is over too.
+            let streaming = match self.rig().await {
+                Ok(rig) => self.rig_streaming(&rig).await.unwrap_or(true),
+                Err(_) => false,
+            };
+            if !streaming {
+                let ended = {
+                    let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+                    if m.epoch == old_gen
+                        && matches!(
+                            m.phase,
+                            BroadcastPhase::Live | BroadcastPhase::Starting | BroadcastPhase::Countdown
+                        )
+                    {
+                        m.phase = BroadcastPhase::Idle;
+                        m.epoch += 1;
+                        m.countdown = None;
+                        m.transitioning_live = None;
+                        m.started_stream = false;
+                        if let Some(r) = m.run.as_mut() {
+                            r.phase = Phase::Ended;
+                            r.ended_at = Some(now().0);
+                            r.countdown_ends_at = None;
+                            Some(r.clone())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
+                };
+                if let Some(r) = ended {
+                    self.emit_show(Some(r));
                 }
-            };
-            if let Some(r) = ended {
-                self.emit_show(Some(r));
             }
         }
 
@@ -823,6 +847,7 @@ impl Engine {
         if !self.is_show_epoch(my_gen) {
             return Err(EngineError::Conflict("Show start was cancelled.".into()));
         }
+        let mut stream_error: Option<String> = None;
         if start_stream {
             steps.push(match &client {
                 Some(Ok(r)) => match self.rig_set_streaming(r, true).await {
@@ -830,11 +855,28 @@ impl Engine {
                         stream_started_by_us = true;
                         Step::new("stream", "Go live", "done", format!("{} is streaming.", r.title()))
                     }
-                    Err(e) => Step::new("stream", "Go live", "failed", e.to_string()),
+                    Err(e) => {
+                        stream_error = Some(e.to_string());
+                        Step::new("stream", "Go live", "failed", e.to_string())
+                    }
                 },
-                Some(Err(e)) => Step::new("stream", "Go live", "failed", e.to_string()),
+                Some(Err(e)) => {
+                    stream_error = Some(e.to_string());
+                    Step::new("stream", "Go live", "failed", e.to_string())
+                }
                 None => Step::new("stream", "Go live", "skipped", ""),
             });
+            // A show that can't get its stream out never begins: no countdown, no "Live" with
+            // nothing going out, and the next Go live starts clean (the guard resets it).
+            if let Some(e) = stream_error {
+                return Err(EngineError::Refused {
+                    status: 502,
+                    code: "stream_start_failed",
+                    message: format!("The stream didn't start: {e}"),
+                    hint: "Check the stream key and your internet in Go live, then press Go live again.".into(),
+                    retry_after: None,
+                });
+            }
         }
         if !self.is_show_epoch(my_gen) {
             if stream_started_by_us

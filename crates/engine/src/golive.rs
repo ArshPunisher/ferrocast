@@ -882,6 +882,12 @@ impl Engine {
         Ok((server, self.ingest_key()?))
     }
 
+    /// Tests: pretend the local stream server runs, so a stream can "start".
+    #[cfg(test)]
+    pub(crate) fn set_test_ingest(&self) {
+        *lock(&self.golive().ingest) = Some("rtmp://127.0.0.1:1935/live".into());
+    }
+
     /// The key for OBS's vertical canvas: the same local server, its own key.
     pub async fn golive_vertical_ingest(&self) -> Result<(String, String), EngineError> {
         let (server, key) = self.golive_ingest().await?;
