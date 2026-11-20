@@ -268,7 +268,7 @@ mod mac {
 
     fn native(app: &AppHandle, n: Native) {
         match n {
-            Native::Quit => app.exit(0),
+            Native::Quit => crate::quit::request(app),
             Native::ShowSettingsFolder => reveal(app, crate::data_dir()),
             Native::ShowLogs => reveal(app, crate::data_dir().join("logs")),
             Native::ShowRecordings => {

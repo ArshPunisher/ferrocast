@@ -28,6 +28,7 @@ mod mac_update;
 #[cfg(any(target_os = "macos", test))]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod menu;
+mod quit;
 mod store;
 mod studio;
 mod studio_history;
@@ -421,7 +422,9 @@ fn main() {
                     api.prevent_close();
                     let _ = window.hide();
                 } else {
-                    app.exit(0);
+                    // Closing the window quits: asked first when something is on air.
+                    api.prevent_close();
+                    quit::request(app);
                 }
             }
         })
@@ -439,6 +442,10 @@ fn main() {
         // window really exits.
         RunEvent::ExitRequested { api, code: None, .. } if app.try_state::<Running>().is_some() => {
             api.prevent_exit();
+            // macOS: the Dock's Quit (and a Quit from Activity Monitor or a logout) arrives here;
+            // it is a quit request like any other, asked about when something is on air.
+            #[cfg(target_os = "macos")]
+            quit::request(app);
         }
         // macOS: clicking the Dock icon of a running app brings back the hidden window.
         #[cfg(target_os = "macos")]
@@ -1248,7 +1255,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
             }
         }),
         "panic" => toggle_panic(app),
-        "quit" => app.exit(0),
+        "quit" => quit::request(app),
         _ => {}
     })
     .build(app)?;
