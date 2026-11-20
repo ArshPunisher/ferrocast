@@ -4188,6 +4188,7 @@ fn is_permission_end(why: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// A source that stopped for a turned-off permission is tried again once `granted()` says it's
 /// back (asked without prompting), not before.
 fn retry_if_permission_back(w: &mut Watch, granted: impl FnOnce() -> bool) {
