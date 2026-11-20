@@ -1362,7 +1362,17 @@ fn usable(s: &Value) -> Option<ferrocast_connector::Ingest> {
                 .map(str::trim)
                 .filter(|u| u.starts_with("rtmp://") || u.starts_with("rtmps://"))
         })?;
-    Some(ferrocast_connector::Ingest { url: url.trim_end_matches('/').to_string(), key: key.to_string() })
+    // YouTube's second ingest for the same key, of the same kind as the one chosen (secure when
+    // that is): where the stream goes when the first can't be reached.
+    let backup = if url.starts_with("rtmps://") {
+        info.get("rtmpsBackupIngestionAddress").and_then(Value::as_str)
+    } else {
+        info.get("backupIngestionAddress").and_then(Value::as_str)
+    }
+    .map(str::trim)
+    .filter(|b| b.starts_with(if url.starts_with("rtmps://") { "rtmps://" } else { "rtmp://" }))
+    .map(|b| b.trim_end_matches('/').to_string());
+    Some(ferrocast_connector::Ingest { url: url.trim_end_matches('/').to_string(), key: key.to_string(), backup })
 }
 
 #[cfg(test)]

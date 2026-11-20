@@ -913,7 +913,7 @@ async fn youtube_test_preflight_and_upload_check_make_zero_writes_and_403_blocks
             Ok(())
         }
         async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
-            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "tw-k".into() })
+            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "tw-k".into(), backup: None })
         }
     }
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -1195,7 +1195,10 @@ impl ferrocast_connector::Connector for SignedIn {
         Ok(())
     }
     async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
-        Ok(ferrocast_connector::Ingest { url: "rtmp://127.0.0.1:9/app".into(), key: "k".into() })
+        // YouTube gives a backup server beside its own; the others don't.
+        let backup =
+            (self.0 == ferrocast_core::event::Platform::Youtube).then(|| "rtmp://127.0.0.1:10/app".to_string());
+        Ok(ferrocast_connector::Ingest { url: "rtmp://127.0.0.1:9/app".into(), key: "k".into(), backup })
     }
 }
 
@@ -1276,4 +1279,29 @@ async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
     let v = e.golive_view().await;
     assert!(twitch(&v).capped.is_some() && twitch(&v).issues.is_empty());
     e.studio_stream(false).await.unwrap();
+}
+
+/// YouTube's backup server reaches the forwarder as a second target for the same key; a server the
+/// person typed in themselves, and the platforms that have none, get none.
+#[tokio::test]
+async fn a_backup_server_reaches_the_destination_for_youtube_only() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    let cfg = e.golive_config();
+    let dest = |id: &str| cfg.destinations.iter().find(|d| d.id == id).cloned().unwrap();
+    let yt = e.resolve(&dest("youtube")).await.unwrap();
+    assert_eq!(yt.backup.as_ref().map(|t| t.port), Some(10), "{:?}", yt.backup);
+    assert_eq!(yt.target.port, 9);
+    assert_eq!(yt.key, "k", "the same key");
+    assert!(e.resolve(&dest("twitch")).await.unwrap().backup.is_none());
+    // Its own address chosen for YouTube: no backup beside it.
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert(
+        "youtube".into(),
+        crate::golive::DestAdvanced { server: Some("rtmp://127.0.0.1:11/app".into()), ..Default::default() },
+    );
+    e.set_golive_advanced(adv).await.unwrap();
+    let own = e.resolve(&dest("youtube")).await.unwrap();
+    assert!(own.backup.is_none() && own.target.port == 11);
 }

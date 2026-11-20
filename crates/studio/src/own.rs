@@ -1178,6 +1178,7 @@ fn sender(send_to: Option<Send<'_>>, target: Option<Target>, hub: &Arc<Hub>) -> 
         retry,
         extra_audio: true,
         extra_video: true,
+        backup: None,
     };
     let (health_tx, h) = tokio::sync::watch::channel(Health {
         state: PushState::Waiting,

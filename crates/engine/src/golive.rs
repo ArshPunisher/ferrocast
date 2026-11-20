@@ -1874,8 +1874,8 @@ impl Engine {
 
     /// A destination's server and key: fetched from its platform (write path, only when actually
     /// going live), or the saved custom one. The error is a clear one-line reason for the streamer.
-    async fn resolve(&self, d: &DestinationConfig) -> Result<Destination, String> {
-        let (url, key) = match platform_of(d.kind) {
+    pub(crate) async fn resolve(&self, d: &DestinationConfig) -> Result<Destination, String> {
+        let (url, key, backup) = match platform_of(d.kind) {
             Some(p) => {
                 let c = self.connector(p).ok_or_else(|| format!("Connect {p} in Settings, Accounts first."))?;
                 let got = match d.canvas {
@@ -1884,7 +1884,11 @@ impl Engine {
                 };
                 let own_server = self.golive_config().advanced.per.get(&d.id).and_then(|a| a.server.clone());
                 match got {
-                    Ok(i) => (own_server.unwrap_or(i.url), i.key),
+                    // A server the person chose themselves has no backup.
+                    Ok(i) => {
+                        let backup = if own_server.is_some() { None } else { i.backup };
+                        (own_server.unwrap_or(i.url), i.key, backup)
+                    }
                     Err(e) => return Err(format_platform_error(p, e, true)),
                 }
             }
@@ -1894,7 +1898,7 @@ impl Engine {
                     self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().ok_or_else(
                         || "This server's stream key is missing: remove it and add it again.".to_string(),
                     )?;
-                (url, key)
+                (url, key, None)
             }
         };
         // Twitch Enhanced Broadcasting: to the address Twitch's plan gave, with every quality.
@@ -1906,6 +1910,8 @@ impl Engine {
             None => (url, key, false),
         };
         let target = Target::parse(&url).map_err(|e| e.to_string())?;
+        // One that doesn't parse is left out: the primary is what matters.
+        let backup = backup.as_deref().and_then(|b| Target::parse(b).ok());
         Ok(Destination {
             id: d.id.clone(),
             target,
@@ -1914,6 +1920,7 @@ impl Engine {
             // Twitch's VOD track: only Twitch knows what to do with an extra audio track.
             extra_audio: d.kind == Service::Twitch,
             extra_video,
+            backup,
         })
     }
 

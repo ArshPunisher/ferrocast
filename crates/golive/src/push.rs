@@ -79,6 +79,9 @@ pub struct Destination {
     /// Gets the stream's extra video tracks (Twitch Enhanced Broadcasting's other qualities);
     /// others get only the main picture.
     pub extra_video: bool,
+    /// A second server for the same key, tried after [`BACKUP_AFTER`] failures to connect to
+    /// `target` (YouTube's backup ingest), and `target` again once the backup has held.
+    pub backup: Option<Target>,
 }
 
 impl std::fmt::Debug for Destination {
@@ -176,7 +179,17 @@ impl PushError {
     fn is_network(&self) -> bool {
         matches!(self, Self::Unreachable(_) | Self::Slow(_) | Self::Closed(_) | Self::Stalled(_) | Self::Broken(_))
     }
+
+    /// The server could not be had at all (not a no to this stream or its key): another server
+    /// for the same key may answer.
+    fn is_connect_failure(&self) -> bool {
+        !matches!(self, Self::Refused(..) | Self::KeyRefused(_))
+    }
 }
+
+/// How many tries in a row, before the stream is live, may fail on one server before the other is
+/// tried (when a destination has a backup).
+pub const BACKUP_AFTER: u32 = 3;
 
 /// Whether a destination may move to another connection: not one on this computer or network.
 fn may_move(t: &Target) -> bool {
@@ -218,11 +231,19 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         let mut attempt = 0u32;
         // The connection used: the system's default until that fails, then the next one.
         let mut via: Option<links::Network> = None;
+        // The server used: the destination's own, until it can't be reached `BACKUP_AFTER` times in
+        // a row, then its backup (and back, the same way); each stream starts on the own one.
+        let mut on_backup = false;
+        let mut connect_failures = 0u32;
         loop {
+            let target = match (&dest.backup, on_backup) {
+                (Some(b), true) => b,
+                _ => &dest.target,
+            };
             set_state(&health, PushState::Connecting);
             let outcome = tokio::select! {
                 _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
-                r = session(&dest, &hub, &health, stream, via.as_ref()) => r,
+                r = session(&dest, target, &hub, &health, stream, via.as_ref()) => r,
             };
             match outcome {
                 Ok(Ended::Stopped) => break 'streams,
@@ -240,16 +261,45 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         let h = health.borrow();
                         (h.state == PushState::Live, now_ms().saturating_sub(h.since_ms))
                     };
-                    if was_live && live_for_ms >= STAYED_LIVE_MS {
+                    let stayed = was_live && live_for_ms >= STAYED_LIVE_MS;
+                    if stayed {
                         attempt = 0;
+                    }
+                    // The server: after a backup that held, the destination's own again (it may
+                    // have come back); after enough failures to connect, the other one.
+                    let mut switched = false;
+                    if dest.backup.is_some() {
+                        if stayed && on_backup {
+                            on_backup = false;
+                            connect_failures = 0;
+                            switched = true;
+                        } else if !was_live && err.is_connect_failure() {
+                            connect_failures += 1;
+                            if connect_failures >= BACKUP_AFTER {
+                                on_backup = !on_backup;
+                                connect_failures = 0;
+                                switched = true;
+                            }
+                        } else {
+                            connect_failures = 0;
+                        }
                     }
                     attempt = attempt.saturating_add(1);
                     let wait = backoff(attempt, &dest.retry);
-                    if err.is_network() && may_move(&dest.target) {
+                    let target = match (&dest.backup, on_backup) {
+                        (Some(b), true) => b,
+                        _ => &dest.target,
+                    };
+                    if err.is_network() && may_move(target) {
                         via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
                     }
-                    tracing::info!(dest = %dest.id, attempt, error = %err, via = ?via.as_ref().map(|n| &n.name), "golive: destination failed, retrying");
-                    let reason = if was_live && live_for_ms < STAYED_LIVE_MS && dest.id.starts_with("kick") {
+                    tracing::info!(dest = %dest.id, attempt, error = %err, via = ?via.as_ref().map(|n| &n.name), on_backup, "golive: destination failed, retrying");
+                    let reason = if switched {
+                        format!(
+                            "{err} Trying {}.",
+                            if on_backup { "its backup server" } else { "its main server again" }
+                        )
+                    } else if was_live && live_for_ms < STAYED_LIVE_MS && dest.id.starts_with("kick") {
                         format!(
                             "{err} Kick took the stream and closed it at once: streaming to other platforms too \
                              needs \"Allow multistreaming\" in Kick's settings (Kick Partners), else turn Kick off."
@@ -332,12 +382,13 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
 /// One connection: connect, publish, forward until the stream ends, `stop`, or an error.
 async fn session(
     dest: &Destination,
+    target: &Target,
     hub: &Hub,
     health: &watch::Sender<Health>,
     stream: u64,
     via: Option<&links::Network>,
 ) -> Result<Ended, PushError> {
-    let mut p = Publisher::open(&dest.target, &dest.key, via).await?;
+    let mut p = Publisher::open(target, &dest.key, via).await?;
     // Its name asks the system (a quick command): off the async threads.
     let label = match via {
         Some(n) => {

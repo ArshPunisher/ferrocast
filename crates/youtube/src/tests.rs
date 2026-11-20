@@ -1765,3 +1765,40 @@ async fn units_for_a_whole_go_live() {
     eprintln!("units for a whole Go live (title, thumbnail, normal and vertical): {before} before, {after} after");
     assert!(after < before, "{log:?}");
 }
+
+/// YouTube's second ingest for the same key rides along, of the same kind as the first (secure when
+/// that is); one of another kind, or none, leaves the stream with just the first.
+#[test]
+fn the_backup_ingest_comes_with_the_stream_key() {
+    let item = |info: serde_json::Value| {
+        json!({ "items": [{ "id": "s1", "snippet": { "title": "Default", "isDefaultStream": true },
+            "cdn": { "ingestionType": "rtmp", "resolution": "variable", "frameRate": "variable", "ingestionInfo": info } }] })
+    };
+    let secure = item(json!({
+        "streamName": "k",
+        "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com:443/live2",
+        "rtmpsBackupIngestionAddress": "rtmps://b.rtmps.youtube.com:443/live2?backup=1",
+        "ingestionAddress": "rtmp://a.rtmp.youtube.com/live2",
+        "backupIngestionAddress": "rtmp://b.rtmp.youtube.com/live2?backup=1"
+    }));
+    let i = api::pick_stream(&secure, None).unwrap();
+    assert_eq!(i.url, "rtmps://a.rtmps.youtube.com:443/live2");
+    assert_eq!(i.backup.as_deref(), Some("rtmps://b.rtmps.youtube.com:443/live2?backup=1"));
+    // Plain RTMP only: the plain backup.
+    let plain = item(json!({
+        "streamName": "k",
+        "ingestionAddress": "rtmp://a.rtmp.youtube.com/live2",
+        "backupIngestionAddress": "rtmp://b.rtmp.youtube.com/live2?backup=1"
+    }));
+    let i = api::pick_stream(&plain, None).unwrap();
+    assert_eq!(i.backup.as_deref(), Some("rtmp://b.rtmp.youtube.com/live2?backup=1"));
+    // A secure first server never gets a plain backup, and none given is none.
+    let mixed = item(json!({
+        "streamName": "k",
+        "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com:443/live2",
+        "backupIngestionAddress": "rtmp://b.rtmp.youtube.com/live2?backup=1"
+    }));
+    assert_eq!(api::pick_stream(&mixed, None).unwrap().backup, None);
+    let alone = item(json!({ "streamName": "k", "rtmpsIngestionAddress": "rtmps://a.rtmps.youtube.com:443/live2" }));
+    assert_eq!(api::pick_stream(&alone, None).unwrap().backup, None);
+}

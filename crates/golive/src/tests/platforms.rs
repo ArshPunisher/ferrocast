@@ -420,3 +420,151 @@ async fn a_stalled_writer_reports_no_rate_within_a_couple_of_seconds() {
     assert_eq!(h.state, PushState::Live, "still within the write deadline");
     feeder.abort();
 }
+
+// --- a backup server for the same key (YouTube's backup ingest, M10-05) ---------------------
+
+/// A destination with a backup server beside its own.
+fn with_backup(primary: u16, backup: u16) -> Destination {
+    Destination {
+        backup: Some(Target::parse(&format!("rtmp://127.0.0.1:{backup}/app")).unwrap()),
+        ..destination_with(primary, "youtube", 20, 100)
+    }
+}
+
+/// A port nothing listens on.
+async fn dead_port() -> u16 {
+    let l = free_listener().await;
+    let p = l.local_addr().unwrap().port();
+    drop(l);
+    p
+}
+
+/// A main server that can't be reached: after `BACKUP_AFTER` tries the stream goes to the backup,
+/// said in words, and it is live there.
+#[tokio::test]
+async fn a_dead_main_server_goes_to_the_backup_after_a_few_tries() {
+    let w = world().await;
+    let primary = dead_port().await;
+    let l = free_listener().await;
+    let bport = l.local_addr().unwrap().port();
+    let mut got = platform(l, "k").await;
+    let mut health = start(&w, with_backup(primary, bport));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    // The third failure says it is switching.
+    let said = state_within(
+        &mut health,
+        LONG,
+        |s| matches!(s, PushState::Reconnecting { reason, .. } if reason.contains("backup server")),
+    )
+    .await;
+    match said.state {
+        PushState::Reconnecting { attempt, .. } => {
+            assert_eq!(attempt, push::BACKUP_AFTER, "after {} tries", push::BACKUP_AFTER)
+        }
+        s => panic!("{s:?}"),
+    }
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()), "the same key, at the backup");
+}
+
+/// A destination without a backup (every one but YouTube) is as it was: it keeps trying its one
+/// server and never says anything about another.
+#[tokio::test]
+async fn a_destination_without_a_backup_keeps_trying_its_own_server() {
+    let w = world().await;
+    let primary = dead_port().await;
+    let mut health = start(&w, destination_with(primary, "twitch", 20, 100));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    for _ in 0..2 * push::BACKUP_AFTER {
+        match state_within(&mut health, LONG, |s| matches!(s, PushState::Reconnecting { .. })).await.state {
+            PushState::Reconnecting { reason, .. } => assert!(!reason.contains("backup"), "{reason}"),
+            s => panic!("{s:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    let attempt = match &health.borrow().state {
+        PushState::Reconnecting { attempt, .. } => *attempt,
+        s => panic!("{s:?}"),
+    };
+    assert!(attempt > push::BACKUP_AFTER, "{attempt}");
+}
+
+/// A key the server refuses isn't a server that can't be reached: no backup is tried for it.
+#[tokio::test]
+async fn a_refused_key_does_not_move_to_the_backup() {
+    let w = world().await;
+    let (lp, lb) = (free_listener().await, free_listener().await);
+    let (pport, bport) = (lp.local_addr().unwrap().port(), lb.local_addr().unwrap().port());
+    let _p = platform(lp, "right-key").await;
+    let mut b = platform(lb, "right-key").await;
+    let dest = Destination { key: "wrong-key".into(), ..with_backup(pport, bport) };
+    let mut health = start(&w, dest);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    for _ in 0..push::BACKUP_AFTER + 2 {
+        match state_within(&mut health, LONG, |s| matches!(s, PushState::Reconnecting { .. })).await.state {
+            PushState::Reconnecting { reason, .. } => assert!(!reason.contains("backup"), "{reason}"),
+            s => panic!("{s:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    assert!(timeout(Duration::from_millis(200), b.recv()).await.is_err(), "the backup was never asked");
+}
+
+/// The main server comes back: the next stream starts on it, not on the backup that held before.
+#[tokio::test]
+async fn the_next_stream_starts_on_the_main_server_again() {
+    let w = world().await;
+    let primary = dead_port().await;
+    let l = free_listener().await;
+    let bport = l.local_addr().unwrap().port();
+    let mut backup_got = platform(l, "k").await;
+    let mut health = start(&w, with_backup(primary, bport));
+    let obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut backup_got).await, Got::Publish("k".into()));
+    // The stream ends; the main server is back before the next one.
+    drop(obs);
+    state_within(&mut health, LONG, |s| *s == PushState::Waiting).await;
+    let mut main_got = platform(TcpListener::bind(("127.0.0.1", primary)).await.unwrap(), "k").await;
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut main_got).await, Got::Publish("k".into()), "the main server, the backup not needed");
+}
+
+/// A backup that held for a while and then dropped: the main server first again (it may have
+/// come back meanwhile), not the backup that just failed.
+#[tokio::test]
+async fn a_backup_that_held_then_dropped_gives_way_to_the_main_server() {
+    let w = world().await;
+    let primary = dead_port().await;
+    let l = free_listener().await;
+    let bport = l.local_addr().unwrap().port();
+    // It takes the stream and hangs up after 31 s (STAYED_LIVE_MS is 30).
+    let mut backup_got = platform_that_drops(l, "k", Duration::from_secs(31)).await;
+    let mut health = start(&w, with_backup(primary, bport));
+    // OBS keeps sending (the ingest hangs up on a silent one after 30 s).
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    obs.meta().await;
+    obs.video(0, AVC_HEADER).await;
+    tokio::spawn(async move {
+        let mut ts = 10;
+        loop {
+            obs.video(ts, if ts % 2000 == 0 { KEY } else { INTER }).await;
+            ts += 1000;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut backup_got).await, Got::Publish("k".into()));
+    // The main server is up now.
+    let mut main_got = platform(TcpListener::bind(("127.0.0.1", primary)).await.unwrap(), "k").await;
+    let said = state_within(
+        &mut health,
+        Duration::from_secs(40),
+        |s| matches!(s, PushState::Reconnecting { reason, .. } if reason.contains("main server again")),
+    )
+    .await;
+    assert!(matches!(said.state, PushState::Reconnecting { .. }));
+    state_within(&mut health, LONG, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut main_got).await, Got::Publish("k".into()));
+}

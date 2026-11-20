@@ -143,6 +143,9 @@ pub struct Ingest {
     /// `rtmp://` or `rtmps://` server address, without the key.
     pub url: String,
     pub key: String,
+    /// Another server for the same key, tried when this one can't be reached (YouTube's backup
+    /// ingest). The same scheme as `url`.
+    pub backup: Option<String>,
 }
 
 impl std::fmt::Debug for Ingest {

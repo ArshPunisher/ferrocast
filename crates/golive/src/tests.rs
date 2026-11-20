@@ -215,6 +215,7 @@ fn destination(port: u16, key: &str) -> Destination {
         retry: Default::default(),
         extra_audio: false,
         extra_video: false,
+        backup: None,
     }
 }
 
