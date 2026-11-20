@@ -98,6 +98,7 @@ impl Engine {
             aq.tick(now().0, s)
         };
         let Some(pct) = changed else { return };
+        tracing::info!(pct, "auto quality changed the stream's bitrate share");
         if let Err(e) = host.set_live_quality(pct).await {
             tracing::warn!(error = %e, "auto quality couldn't change the bitrate");
             return;
