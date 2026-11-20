@@ -127,7 +127,7 @@ impl Engine {
             sent: n(&s["frames"]),
             dropped: n(&s["dropped"]),
             net_dropped,
-            reconnecting: s["reconnecting"].as_bool() == Some(true),
+            reconnecting: s["reconnecting"].as_bool() == Some(true) || self.golive_main_reconnecting().is_some(),
             paused,
             quality_pct: self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct(),
             cpu: e["cpu"].as_f64().unwrap_or(0.0),

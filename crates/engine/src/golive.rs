@@ -2342,6 +2342,22 @@ impl Engine {
         first_reason
     }
 
+    /// The reason when every enabled main destination is waiting to connect again (none Live) and at
+    /// least one is Reconnecting: the Studio's own stream still runs into Go live's local server, so
+    /// without this the status bar shows LIVE, Health 100 and "not reconnecting" through a whole outage.
+    pub(crate) fn golive_main_reconnecting(&self) -> Option<String> {
+        let cfg = self.golive_config();
+        let g = self.golive();
+        let running = lock(&g.running);
+        let states: Vec<PushState> = cfg
+            .destinations
+            .iter()
+            .filter(|d| d.canvas == Canvas::Main && d.enabled && !backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
+            .filter_map(|d| running.get(&d.id).map(|r| r.health.borrow().state.clone()))
+            .collect();
+        reconnecting_reason(&states)
+    }
+
     /// Records any destination that reached `PushState::Failed`, alerts the dashboard once per
     /// stream, and stops the Studio stream when every enabled main destination has failed so the
     /// Studio stops showing LIVE for a dead broadcast.
@@ -2706,5 +2722,35 @@ mod picture_tests {
         let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&b));
         assert_eq!(super::png_size(&url), Some((256, 144)));
         assert_eq!(super::png_size("data:image/jpeg;base64,AAAA"), None);
+    }
+}
+
+/// The reason of the first Reconnecting destination when none of `states` is Live (or paused) and at
+/// least one is Reconnecting.
+fn reconnecting_reason(states: &[PushState]) -> Option<String> {
+    if states.iter().any(|s| matches!(s, PushState::Live | PushState::Paused { .. })) {
+        return None;
+    }
+    states.iter().find_map(|s| match s {
+        PushState::Reconnecting { reason, .. } => Some(reason.clone()),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod reconnecting_tests {
+    use super::*;
+
+    fn re() -> PushState {
+        PushState::Reconnecting { attempt: 3, retry_in_ms: 1000, reason: "Your network is down".into() }
+    }
+
+    #[test]
+    fn the_studio_is_reconnecting_only_while_no_main_destination_is_live() {
+        assert_eq!(reconnecting_reason(&[re()]).as_deref(), Some("Your network is down"));
+        assert_eq!(reconnecting_reason(&[re(), PushState::Connecting]).as_deref(), Some("Your network is down"));
+        assert!(reconnecting_reason(&[re(), PushState::Live]).is_none(), "one platform is still live");
+        assert!(reconnecting_reason(&[PushState::Connecting]).is_none(), "a first connect isn't a reconnect");
+        assert!(reconnecting_reason(&[]).is_none());
     }
 }
