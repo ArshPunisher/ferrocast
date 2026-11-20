@@ -10,12 +10,13 @@ use serde_json::Value;
 
 use crate::{Engine, EngineError};
 
-/// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch or Kick is enabled.
+/// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch, Kick, or WebRTC (WHIP) is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamCap {
-    pub max_kbps: u32,
+    pub max_kbps: Option<u32>,
     pub h264_only: bool,
     pub keyframe_secs: u32,
+    pub no_bframes: bool,
 }
 
 /// What `GET /studio/engine` shows.

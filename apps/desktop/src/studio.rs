@@ -52,6 +52,8 @@ struct Held {
     vstream: Option<Streaming>,
     /// The lighter copy of what's on air, for platforms that take it (720p).
     lstream: Option<Streaming>,
+    /// Whether `lstream` was started/reshaped with `no_bframes` (WHIP simulcast).
+    lstream_no_bframes: bool,
     record: Option<(Recording, PathBuf, std::time::Instant)>,
     /// Sources recorded on their own (Source Record): name, recording, file.
     source_records: Vec<(String, Recording, PathBuf)>,
@@ -512,19 +514,35 @@ fn h264_encoder_for(id: &str) -> String {
 fn effective_stream_encode(s: &StudioSettings, cap: Option<StreamCap>, live_pct: Option<u8>) -> EncodeSettings {
     let mut e = encode_of(s);
     if let Some(cap) = cap {
-        e.video_kbps = e.video_kbps.min(cap.max_kbps);
+        if let Some(max_kbps) = cap.max_kbps {
+            e.video_kbps = e.video_kbps.min(max_kbps);
+            // Strict CBR with 1x VBV (FFmpeg) / DataRateLimits (VideoToolbox) prevents platform peaks.
+            e.vbr = false;
+            e.strict_cbr = true;
+        }
         if cap.h264_only {
             e.video_encoder = h264_encoder_for(&e.video_encoder);
         }
         if cap.keyframe_secs > 0 {
             e.keyframe_s = cap.keyframe_secs;
         }
-        // Strict CBR with 1x VBV (FFmpeg) / DataRateLimits (VideoToolbox) prevents platform peaks.
-        e.vbr = false;
-        e.strict_cbr = true;
+        if cap.no_bframes {
+            e.bframes = false;
+        }
     }
     e.video_kbps = at_pct(e.video_kbps, live_pct);
     e
+}
+
+fn light_stream_settings(s: &StudioSettings, canvas: Canvas, no_bframes: bool) -> StreamSettings {
+    let mut settings = stream_settings(s, None);
+    settings.encode.scale = light_size(canvas.width, canvas.height);
+    settings.encode.video_kbps = settings.encode.video_kbps.min(3000);
+    if no_bframes {
+        settings.encode.bframes = false;
+    }
+    settings.vod_track = None;
+    settings
 }
 
 fn shape_differs(a: &EncodeSettings, b: &EncodeSettings) -> bool {
@@ -3561,6 +3579,19 @@ impl StudioHost for DesktopStudio {
                     w.encode.video_kbps = target.video_kbps;
                 }
             }
+            let no_bframes = cap.is_some_and(|c| c.no_bframes);
+            if s.bframes && no_bframes {
+                tracing::info!("B-frames turned off for this stream: a WebRTC (WHIP) destination can't carry them");
+            }
+            if h.lstream.as_ref().is_some_and(|l| l.stats().active)
+                && h.lstream_no_bframes != no_bframes
+                && let Some(canvas) = h.collection.as_ref().map(|c| c.canvas())
+                && let Some(ls) = h.lstream.as_ref()
+            {
+                let l_encode = light_stream_settings(&s, canvas, no_bframes).encode;
+                ls.reshape(&l_encode, s.fps).map_err(|e| e.to_string())?;
+                h.lstream_no_bframes = no_bframes;
+            }
             Ok(())
         })
         .await?
@@ -3569,7 +3600,7 @@ impl StudioHost for DesktopStudio {
     async fn set_live_quality(&self, pct: u8) -> Result<(), String> {
         self.on_main(move |h| {
             let set = h.settings.as_ref().map_or(6000, |s| s.video_kbps);
-            let capped = h.stream_cap.map_or(set, |c| set.min(c.max_kbps));
+            let capped = h.stream_cap.and_then(|c| c.max_kbps).map_or(set, |max| set.min(max));
             h.live_pct = (pct < 100).then_some(pct);
             let kbps = at_pct(capped, h.live_pct);
             if let Some(st) = h.stream.as_mut() {
@@ -4032,6 +4063,9 @@ impl StudioHost for DesktopStudio {
             // A frame rate chosen during the last stream, still waiting.
             apply_waiting_canvas(&app, h);
             let s = h.settings.clone().unwrap_or_default();
+            if s.bframes && h.stream_cap.is_some_and(|c| c.no_bframes) {
+                tracing::info!("B-frames turned off for this stream: a WebRTC (WHIP) destination can't carry them");
+            }
             let mut settings = stream_settings(&s, h.stream_cap);
             settings.video_tracks = tracks;
             tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, qualities = settings.video_tracks.len() + 1, "the Studio starts streaming into Go live");
@@ -4090,6 +4124,7 @@ impl StudioHost for DesktopStudio {
         self.on_main(move |h| {
             h.vstream = None;
             h.lstream = None;
+            h.lstream_no_bframes = false;
             h.stream = None;
             apply_waiting_canvas(&app, h);
         })
@@ -4103,16 +4138,19 @@ impl StudioHost for DesktopStudio {
                 return Ok(());
             }
             h.lstream = None;
+            h.lstream_no_bframes = false;
             let s = h.settings.clone().unwrap_or_default();
-            let mut settings = stream_settings(&s, None);
-            // 720 high at the canvas's shape (even sizes), 3,000 kbps at most; one sound.
-            let canvas = studio.canvas();
-            settings.encode.scale = light_size(canvas.width, canvas.height);
-            settings.encode.video_kbps = settings.encode.video_kbps.min(3000);
-            settings.vod_track = None;
+            let no_bframes = h.stream_cap.is_some_and(|c| c.no_bframes);
+            if s.bframes && no_bframes {
+                tracing::info!(
+                    "B-frames turned off for the lighter stream: a WebRTC (WHIP) destination can't carry them"
+                );
+            }
+            let settings = light_stream_settings(&s, studio.canvas(), no_bframes);
             tracing::info!(kbps = settings.encode.video_kbps, "the Studio's lighter stream starts into Go live");
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             h.lstream = Some(c.stream_drawn(&server, &key, &settings).map_err(|e| e.to_string())?);
+            h.lstream_no_bframes = no_bframes;
             Ok(())
         })
         .await?
@@ -4121,6 +4159,7 @@ impl StudioHost for DesktopStudio {
     async fn light_stream_stop(&self) -> Result<(), String> {
         self.on_main(|h| {
             h.lstream = None;
+            h.lstream_no_bframes = false;
         })
         .await
     }
@@ -4584,7 +4623,7 @@ mod budget_tests {
             record_quality: "stream".into(),
             ..StudioSettings::default()
         };
-        let twitch = StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 };
+        let twitch = StreamCap { max_kbps: Some(6_000), h264_only: true, keyframe_secs: 2, no_bframes: false };
         let stream = stream_settings(&s, Some(twitch));
         let capped = record_encode_capped(&s, Some(twitch));
         assert!(capped.strict_cbr && capped.scale.is_none());
@@ -4613,7 +4652,7 @@ mod budget_tests {
             video_encoder: Some("com.apple.videotoolbox.videoencoder.ave.hevc".into()),
             ..StudioSettings::default()
         };
-        let twitch = StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 };
+        let twitch = StreamCap { max_kbps: Some(6_000), h264_only: true, keyframe_secs: 2, no_bframes: false };
         let capped = effective_stream_encode(&s, Some(twitch), None);
         assert_eq!(capped.video_kbps, 6_000);
         assert!(!capped.vbr, "CBR forced when capped");
@@ -4629,6 +4668,15 @@ mod budget_tests {
         s.video_kbps = 4_500;
         assert_eq!(effective_stream_encode(&s, Some(twitch), Some(50)).video_kbps, 2_250);
         assert_eq!(effective_stream_encode(&s, None, None).video_kbps, 4_500);
+
+        // WebRTC (WHIP) turns off B-frames on both main and light streams without forcing CBR.
+        s.bframes = true;
+        s.vbr = true;
+        let whip = StreamCap { max_kbps: None, h264_only: false, keyframe_secs: 0, no_bframes: true };
+        let whip_main = effective_stream_encode(&s, Some(whip), None);
+        assert!(!whip_main.bframes && whip_main.vbr && !whip_main.strict_cbr);
+        let whip_light = light_stream_settings(&s, Canvas { width: 1920, height: 1080, fps: 60 }, true);
+        assert!(!whip_light.encode.bframes);
     }
 }
 

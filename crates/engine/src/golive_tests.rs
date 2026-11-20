@@ -1350,7 +1350,15 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
 
     e.studio_stream(true).await.unwrap();
     let last_cap = studio.caps.lock().unwrap().last().copied().flatten();
-    assert_eq!(last_cap, Some(crate::studio_host::StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 }));
+    assert_eq!(
+        last_cap,
+        Some(crate::studio_host::StreamCap {
+            max_kbps: Some(6_000),
+            h264_only: true,
+            keyframe_secs: 2,
+            no_bframes: false
+        })
+    );
 
     // While Studio holds the live stream, small VT accounting above 6,000 produces zero nagging warnings.
     let hub = &e.golive().hub;
@@ -1370,7 +1378,15 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
     // Switching to Kick only updates cap to 8,000 kbps.
     e.set_golive_destinations(enable_only("kick")).await.unwrap();
     let last_cap = studio.caps.lock().unwrap().last().copied().flatten();
-    assert_eq!(last_cap, Some(crate::studio_host::StreamCap { max_kbps: 8_000, h264_only: true, keyframe_secs: 2 }));
+    assert_eq!(
+        last_cap,
+        Some(crate::studio_host::StreamCap {
+            max_kbps: Some(8_000),
+            h264_only: true,
+            keyframe_secs: 2,
+            no_bframes: false
+        })
+    );
     let v = e.golive_view().await;
     let kick = v.destinations.iter().find(|d| d.id == "kick").unwrap();
     assert_eq!(kick.capped.as_ref().map(|c| c.summary.as_str()), Some("Capped at 8,000 kbps for Kick"));
@@ -1632,4 +1648,28 @@ async fn the_ip_version_and_connection_chosen_reach_the_destinations() {
     let mut bad = e.golive_config().advanced;
     bad.bind = Some("  ".into());
     assert!(e.set_golive_advanced(bad).await.unwrap_err().to_string().contains("bind"));
+}
+
+#[tokio::test]
+async fn whip_disables_bframes_even_with_ignore_service_limits_and_shows_capped_notice() {
+    use crate::golive::Canvas;
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings { bframes: true, ..Default::default() };
+    e.set_studio_host(studio.clone());
+    let whip = e.add_golive_destination("WebRTC", "https://whip.example.com/whip", "tok", Canvas::Main).await.unwrap();
+
+    // Even when ignore_service_limits is true, WHIP cannot carry B-frames so Studio must be told.
+    let mut adv = e.golive_config().advanced;
+    adv.ignore_service_limits = true;
+    e.set_golive_advanced(adv).await.unwrap();
+
+    assert_eq!(
+        studio.caps.lock().unwrap().last().copied().flatten(),
+        Some(crate::studio_host::StreamCap { max_kbps: None, h264_only: false, keyframe_secs: 0, no_bframes: true })
+    );
+    let v = e.golive_view().await;
+    let row = v.destinations.iter().find(|d| d.id == whip.id).unwrap();
+    let cap = row.capped.as_ref().expect("WHIP with b_frames on must explain why B-frames are off");
+    assert!(cap.summary.to_ascii_lowercase().contains("b-frames"), "{}", cap.summary);
 }
