@@ -1497,3 +1497,152 @@ async fn pagination_finds_streams_and_broadcasts_on_later_pages_and_guards_verti
     assert!(alog.contains(&"POST /liveBroadcasts/bind b-unbound->s1".to_string()), "{alog:?}");
     assert!(alog.contains(&"PUT /liveBroadcasts bv-manual".to_string()), "{alog:?}");
 }
+
+// --- limits: a burst is not the day's quota (M10-06) ------------------------------------
+
+/// A REST API that answers each request from a script, in order, then with an empty list.
+async fn rest_that_answers(script: Vec<(u16, serde_json::Value)>) -> (Endpoints, Arc<Mutex<usize>>) {
+    use std::collections::VecDeque;
+    let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+    let count = Arc::new(Mutex::new(0usize));
+    let (q, n) = (queue.clone(), count.clone());
+    let app = axum::Router::new().fallback(move || {
+        let (q, n) = (q.clone(), n.clone());
+        async move {
+            *n.lock().unwrap() += 1;
+            let next = q.lock().unwrap().pop_front();
+            let (code, body) = next.unwrap_or((200, json!({ "items": [] })));
+            let mut res = axum::response::Response::new(axum::body::Body::from(body.to_string()));
+            *res.status_mut() = axum::http::StatusCode::from_u16(code).unwrap();
+            res.headers_mut().insert("content-type", "application/json".parse().unwrap());
+            if code == 429 {
+                res.headers_mut().insert("retry-after", "120".parse().unwrap());
+            }
+            res
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let ep = Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    };
+    (ep, count)
+}
+
+fn google_error(reason: &str) -> serde_json::Value {
+    json!({ "error": { "code": 403, "message": "No.", "errors": [{ "reason": reason }] } })
+}
+
+#[tokio::test]
+async fn a_burst_limit_and_the_days_quota_are_told_apart() {
+    for (script, want) in [
+        ((403, google_error("rateLimitExceeded")), YoutubeError::RateLimited(Duration::from_secs(5))),
+        ((403, google_error("userRateLimitExceeded")), YoutubeError::RateLimited(Duration::from_secs(5))),
+        ((403, google_error("quotaExceeded")), YoutubeError::QuotaExceeded),
+        ((403, google_error("dailyLimitExceeded")), YoutubeError::QuotaExceeded),
+        // A 429 says how long (120 s): never more than a minute.
+        ((429, json!({})), YoutubeError::RateLimited(Duration::from_secs(60))),
+    ] {
+        let (ep, _) = rest_that_answers(vec![script.clone()]).await;
+        let got = video_api(ep).active_live_chat().await.unwrap_err();
+        assert_eq!(got, want, "{script:?}");
+    }
+    // What the rest of the app hears: seconds for a burst, until Pacific midnight for the day.
+    let burst: ferrocast_connector::ConnectorError = YoutubeError::RateLimited(Duration::from_secs(7)).into();
+    assert!(
+        matches!(burst, ferrocast_connector::ConnectorError::RateLimited { retry_after, .. } if retry_after == Duration::from_secs(7))
+    );
+    let day: ferrocast_connector::ConnectorError = YoutubeError::QuotaExceeded.into();
+    let ferrocast_connector::ConnectorError::RateLimited { retry_after, .. } = day else { panic!("{day:?}") };
+    assert!(retry_after != Duration::from_secs(3600), "not a blind hour");
+    assert!(retry_after <= Duration::from_secs(86_400 + 300), "{retry_after:?}");
+}
+
+#[test]
+fn the_quota_is_back_at_midnight_pacific_time() {
+    let at = |s: &str| api::parse_rfc3339_ms(s).unwrap();
+    let hours = |now: &str| quota_resets_in(at(now), 0).as_secs_f64() / 3600.0;
+    // Winter (PST, UTC-8): noon in Los Angeles is 20:00 UTC, midnight 12 hours on.
+    assert_eq!(hours("2026-11-20T20:00:00Z"), 12.0);
+    // Summer (PDT, UTC-7).
+    assert_eq!(hours("2026-07-01T12:00:00Z"), 19.0);
+    // The night the clocks go forward (second Sunday of March, 2:00): 23:00 PST, an hour to midnight.
+    assert_eq!(hours("2026-03-08T07:00:00Z"), 1.0);
+    // The morning after it, in PDT.
+    assert_eq!(hours("2026-03-08T12:00:00Z"), 19.0);
+    // And back (first Sunday of November): still PDT on the Saturday, PST by Sunday noon.
+    assert_eq!(hours("2026-10-31T20:00:00Z"), 11.0);
+    assert_eq!(hours("2026-11-01T12:00:00Z"), 20.0);
+    // The spread is added.
+    assert_eq!(quota_resets_in(at("2026-11-20T20:00:00Z"), 90).as_secs(), 12 * 3600 + 90);
+}
+
+/// The statuses a run said, until `n` of them or the time is up.
+async fn statuses(
+    api: Arc<crate::api::Api>,
+    waits: stream::Waits,
+    n: usize,
+) -> (Vec<ferrocast_core::event::ConnectorStatus>, Duration) {
+    let (sink, mut rx) = mpsc::channel(64);
+    let task = tokio::spawn(stream::run_with(api, sink, Arc::new(Notify::new()), Arc::default(), waits));
+    let t0 = std::time::Instant::now();
+    let mut got = Vec::new();
+    while got.len() < n {
+        let Ok(Some(e)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await else { break };
+        if let EventKind::Connector(s) = e.kind {
+            got.push(s);
+        }
+    }
+    task.abort();
+    (got, t0.elapsed())
+}
+
+#[tokio::test]
+async fn a_burst_limit_retries_in_seconds_and_never_says_connected_between_failures() {
+    use ferrocast_core::event::ConnectorStatus as S;
+    let limited = || (403, google_error("rateLimitExceeded"));
+    let (ep, _) = rest_that_answers(vec![limited(), limited(), limited()]).await;
+    let waits = stream::Waits { rate: Some(Duration::from_millis(40)), quota: None };
+    let (got, took) = statuses(Arc::new(video_api(ep)), waits, 5).await;
+    assert_eq!(
+        got,
+        vec![
+            S::Connected,
+            S::Reconnecting { attempt: 1 },
+            S::Reconnecting { attempt: 2 },
+            S::Reconnecting { attempt: 3 },
+            S::Connected,
+        ],
+        "one Connected to start, none between the failures, one when it worked"
+    );
+    assert!(took < Duration::from_secs(3), "a burst limit isn't an hour: {took:?}");
+}
+
+#[tokio::test]
+async fn the_days_quota_pauses_and_says_so_without_connected_between_attempts() {
+    use ferrocast_core::event::ConnectorStatus as S;
+    let gone = || (403, google_error("quotaExceeded"));
+    let (ep, calls) = rest_that_answers(vec![gone(), gone()]).await;
+    let waits = stream::Waits { rate: None, quota: Some(Duration::from_millis(40)) };
+    let (got, _) = statuses(Arc::new(video_api(ep)), waits, 4).await;
+    assert!(
+        matches!(&got[..], [S::Connected, S::Disconnected { .. }, S::Disconnected { .. }, S::Connected]),
+        "{got:?}"
+    );
+    assert_eq!(*calls.lock().unwrap(), 3, "asked three times: it didn't poll while it waited");
+}
+
+#[test]
+fn a_burst_backs_off_from_five_seconds_to_a_minute() {
+    let s = Duration::from_secs;
+    assert_eq!(stream::rate_backoff(1, s(0)), s(5));
+    assert_eq!(stream::rate_backoff(2, s(0)), s(10));
+    assert_eq!(stream::rate_backoff(5, s(0)), s(60));
+    assert_eq!(stream::rate_backoff(9, s(0)), s(60));
+    assert_eq!(stream::rate_backoff(1, s(30)), s(30), "never less than YouTube asked");
+    assert_eq!(stream::rate_backoff(1, s(300)), s(60));
+}

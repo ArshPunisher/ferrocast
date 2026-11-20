@@ -1135,7 +1135,7 @@ fn one_line(s: &str) -> String {
 
 fn wrap_broadcast_error(action: &str, err: YoutubeError) -> YoutubeError {
     match err {
-        YoutubeError::SignInNeeded | YoutubeError::QuotaExceeded => err,
+        YoutubeError::SignInNeeded | YoutubeError::QuotaExceeded | YoutubeError::RateLimited(_) => err,
         YoutubeError::Network(m) => YoutubeError::Network(one_line(&m)),
         YoutubeError::SignIn(m) => YoutubeError::SignIn(one_line(&m)),
         YoutubeError::Refused(m) | YoutubeError::Protocol(m) => {

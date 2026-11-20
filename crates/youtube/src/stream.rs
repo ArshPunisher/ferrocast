@@ -28,7 +28,26 @@ enum End {
     ChatEnded,
     Lost(String),
     SignInNeeded,
+    /// The day's units are gone.
     Quota,
+    /// A burst limit: try again in seconds.
+    RateLimited(Duration),
+}
+
+/// How long the loop waits after a limit (None: as it should; tests shorten them).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Waits {
+    /// After a burst limit.
+    pub rate: Option<Duration>,
+    /// After the day's quota is used up.
+    pub quota: Option<Duration>,
+}
+
+/// The wait before the `attempt`th try after a burst limit: 5 s, doubling to a minute, never less
+/// than YouTube asked for.
+pub fn rate_backoff(attempt: u32, asked: Duration) -> Duration {
+    let own = Duration::from_secs(5u64 << attempt.saturating_sub(1).min(4)).min(Duration::from_secs(60));
+    own.max(asked).min(Duration::from_secs(60))
 }
 
 async fn emit(sink: &EventSink, kind: EventKind) -> bool {
@@ -38,15 +57,27 @@ async fn emit(sink: &EventSink, kind: EventKind) -> bool {
 /// Runs until the sink closes or sign-in is needed. `wake` asks for an immediate look
 /// (another platform just went live).
 pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveChat) {
+    run_with(api, sink, wake, live, Waits::default()).await;
+}
+
+/// [`run`] with its waits given.
+pub async fn run_with(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveChat, waits: Waits) {
     let mut attempt = 0u32;
     let mut eager = 0u32;
     if !emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await {
         return;
     }
+    // Connected is said when it starts and again only after a call worked following a failure:
+    // never between failed attempts (it flashed green, then red, every time it woke up).
+    let mut connected = true;
     loop {
         match api.active_live_chat().await {
             Ok(Some(chat)) => {
                 attempt = 0;
+                if !connected {
+                    emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
+                    connected = true;
+                }
                 *live.write().unwrap_or_else(|p| p.into_inner()) = Some(chat.clone());
                 emit(&sink, EventKind::StreamOnline { title: None }).await;
                 let end = follow(&api, &chat, &sink).await;
@@ -59,8 +90,18 @@ pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveCh
                         emit(&sink, EventKind::Connector(ConnectorStatus::SignInNeeded)).await;
                         return;
                     }
-                    End::Quota => quota_pause(&sink).await,
+                    End::Quota => {
+                        connected = false;
+                        quota_pause(&sink, waits).await;
+                    }
+                    End::RateLimited(asked) => {
+                        connected = false;
+                        attempt += 1;
+                        emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
+                        tokio::time::sleep(waits.rate.unwrap_or_else(|| rate_backoff(attempt, asked))).await;
+                    }
                     End::Lost(reason) => {
+                        connected = false;
                         attempt += 1;
                         tracing::warn!(%reason, attempt, "YouTube chat stream lost");
                         emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
@@ -69,6 +110,10 @@ pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveCh
                 }
             }
             Ok(None) => {
+                if !connected {
+                    emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
+                    connected = true;
+                }
                 let wait = if eager > 0 {
                     eager -= 1;
                     EAGER_EVERY
@@ -84,8 +129,19 @@ pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveCh
                 emit(&sink, EventKind::Connector(ConnectorStatus::SignInNeeded)).await;
                 return;
             }
-            Err(YoutubeError::QuotaExceeded) => quota_pause(&sink).await,
+            Err(YoutubeError::QuotaExceeded) => {
+                connected = false;
+                quota_pause(&sink, waits).await;
+            }
+            Err(YoutubeError::RateLimited(asked)) => {
+                connected = false;
+                attempt += 1;
+                tracing::warn!(attempt, "YouTube asked for a moment's pause");
+                emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
+                tokio::time::sleep(waits.rate.unwrap_or_else(|| rate_backoff(attempt, asked))).await;
+            }
             Err(e) => {
+                connected = false;
                 attempt += 1;
                 emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
                 tracing::warn!(error = %e, "couldn't check YouTube for a live stream");
@@ -95,7 +151,6 @@ pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveCh
         if sink.is_closed() {
             return;
         }
-        emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
     }
 }
 
@@ -104,10 +159,19 @@ pub async fn run(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: LiveCh
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(20);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn quota_pause(sink: &EventSink) {
+/// The day's units are used up: said, then nothing is asked until they are back (midnight in
+/// Pacific time, and a few minutes of spread), not every hour for nothing.
+async fn quota_pause(sink: &EventSink, waits: Waits) {
     emit(sink, EventKind::Connector(ConnectorStatus::Disconnected { reason: YoutubeError::QuotaExceeded.to_string() }))
         .await;
-    tokio::time::sleep(Duration::from_secs(3600)).await;
+    let wait = waits.quota.unwrap_or_else(|| crate::quota_resets_in(now_ms(), crate::quota_jitter_s()));
+    tokio::time::sleep(wait).await;
+}
+
+/// A gRPC "resource exhausted" is the day's quota when it says so, else a burst.
+fn exhausted(status: &tonic::Status) -> End {
+    let m = status.message().to_ascii_lowercase();
+    if m.contains("quota") || m.contains("daily") { End::Quota } else { End::RateLimited(Duration::from_secs(5)) }
 }
 
 pub fn backoff(attempt: u32) -> Duration {
@@ -177,7 +241,7 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                     }
                     continue;
                 }
-                Code::ResourceExhausted => return End::Quota,
+                Code::ResourceExhausted => return exhausted(&status),
                 Code::NotFound | Code::FailedPrecondition => return End::ChatEnded,
                 _ => return End::Lost(status.message().to_string()),
             },
@@ -212,7 +276,7 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                     }
                 }
                 Ok(None) => break,
-                Err(status) if status.code() == Code::ResourceExhausted => return End::Quota,
+                Err(status) if status.code() == Code::ResourceExhausted => return exhausted(&status),
                 Err(status) => {
                     tracing::debug!(message = %status.message(), "YouTube stream dropped");
                     break;
