@@ -2349,12 +2349,21 @@ impl Engine {
         let cfg = self.golive_config();
         let g = self.golive();
         let running = lock(&g.running);
-        let states: Vec<PushState> = cfg
+        let main: Vec<&DestinationConfig> = cfg
             .destinations
             .iter()
             .filter(|d| d.canvas == Canvas::Main && d.enabled && !backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
-            .filter_map(|d| running.get(&d.id).map(|r| r.health.borrow().state.clone()))
             .collect();
+        // A backup that is live carries the stream for its destination: nothing to report.
+        for d in &main {
+            if let Some(backup_id) = cfg.advanced.per.get(&d.id).and_then(|a| a.backup.as_deref())
+                && running.get(backup_id).is_some_and(|r| matches!(r.health.borrow().state, PushState::Live))
+            {
+                return None;
+            }
+        }
+        let states: Vec<PushState> =
+            main.iter().filter_map(|d| running.get(&d.id).map(|r| r.health.borrow().state.clone())).collect();
         reconnecting_reason(&states)
     }
 
