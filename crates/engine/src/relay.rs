@@ -324,6 +324,19 @@ impl Engine {
         Ok(())
     }
 
+    /// Kick refused the refresh: the connector says "sign in again" (the dashboard banner), not only
+    /// the call that failed.
+    async fn kick_sign_in_needed(&self) {
+        let _ = self
+            .submit(ferrocast_core::event::Event::live(
+                Platform::Kick,
+                None,
+                Millis(0),
+                ferrocast_core::event::EventKind::Connector(ConnectorStatus::SignInNeeded),
+            ))
+            .await;
+    }
+
     fn kick_api(&self, tokens: KickTokens) -> Result<Arc<KickApi>, EngineError> {
         let relay = self.relay_url()?;
         let engine = self.clone();
@@ -349,7 +362,10 @@ impl Engine {
                             .ok()
                             .and_then(|v| v.pointer("/error/code").and_then(|c| c.as_str()).map(String::from));
                         match kick_refresh_401(code.as_deref()) {
-                            Kick401::SignInAgain => Err(KickError::SignInNeeded),
+                            Kick401::SignInAgain => {
+                                engine.kick_sign_in_needed().await;
+                                Err(KickError::SignInNeeded)
+                            }
                             Kick401::InstallForgotten => {
                                 // Forget it so the next try registers again, but only if it is
                                 // still the install this call used: the link may have
@@ -357,6 +373,7 @@ impl Engine {
                                 if engine.inner.secrets.get(INSTALL).ok().flatten().as_deref() == Some(auth.as_str()) {
                                     let _ = engine.inner.secrets.delete(INSTALL);
                                 }
+                                engine.kick_sign_in_needed().await;
                                 Err(KickError::SignInNeeded)
                             }
                             Kick401::Unclear => Err(KickError::Refused("the relay answered 401".into())),
