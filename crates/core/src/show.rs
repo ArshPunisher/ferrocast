@@ -104,7 +104,7 @@ impl Default for ShowConfig {
         ShowConfig {
             preset_id: None,
             starting_scene: None,
-            // no countdown until a live scene is chosen, so the default config is valid
+            // no countdown by default
             countdown_s: 0,
             live_scene: None,
             alerts_on: true,
@@ -146,9 +146,6 @@ impl ShowConfig {
             && (m.trim().is_empty() || m.chars().count() > 400 || m.chars().any(char::is_control))
         {
             return Err("at_zero.chat: 1 to 400 characters on one line, or turn it off.".into());
-        }
-        if self.countdown_s > 0 && self.at_zero.switch && self.live_scene.is_none() {
-            return Err("live_scene: pick the scene to switch to when the countdown ends.".into());
         }
         if let Some(m) = &self.recap_message {
             if m.trim().is_empty() || m.chars().count() > 400 {
@@ -890,7 +887,7 @@ mod tests {
         let mut c = ShowConfig::default();
         assert!(c.validate().is_ok(), "the default config saves as it is");
         c.countdown_s = 300;
-        assert!(c.validate().unwrap_err().starts_with("live_scene"), "a countdown needs a live scene");
+        assert!(c.validate().is_ok(), "a countdown without live_scene uses the scene on air at Go live");
         c.live_scene = Some("Gameplay".into());
         assert!(c.validate().is_ok());
         c.countdown_s = 5;

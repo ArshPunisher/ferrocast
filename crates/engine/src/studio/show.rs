@@ -126,8 +126,10 @@ impl Engine {
         }
         if let Ok(r) = &rig {
             let app = r.name();
+            let mut on_air = None;
             match self.rig_scenes(r).await {
-                Ok((_, names)) => {
+                Ok((current, names)) => {
+                    on_air = current.filter(|s| !s.is_empty());
                     for (id, label, scene) in [
                         ("starting_scene", "Starting scene", &cfg.starting_scene),
                         ("live_scene", "Live scene", &cfg.live_scene),
@@ -179,7 +181,7 @@ impl Engine {
                     ),
                 });
             }
-            let scene = cfg.live_scene.clone().or(cfg.starting_scene.clone());
+            let scene = cfg.live_scene.clone().or(on_air).or(cfg.starting_scene.clone());
             for cam in &cfg.cam_sources {
                 let Some(scene) = &scene else { break };
                 let black = looks.as_ref().is_some_and(|l| {
@@ -396,12 +398,30 @@ impl Engine {
                 }
             });
         }
-        let client =
-            if cfg.starting_scene.is_some() || cfg.live_scene.is_some() || cfg.replay_buffer || cfg.start_stream {
-                Some(self.rig().await)
-            } else {
-                None
-            };
+        let client = if cfg.starting_scene.is_some()
+            || cfg.live_scene.is_some()
+            || cfg.countdown_s > 0
+            || cfg.replay_buffer
+            || cfg.start_stream
+        {
+            Some(self.rig().await)
+        } else {
+            None
+        };
+        // Capture the scene on air before switching to Starting Soon: when `live_scene` isn't
+        // explicitly configured, the Show returns here instead of guessing a scene by name.
+        let on_air_at_start = if cfg.live_scene.is_none()
+            && let Some(Ok(r)) = &client
+        {
+            self.rig_scenes(r).await.ok().and_then(|(cur, _)| cur).filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        let live_scene = cfg.live_scene.clone().or_else(|| {
+            on_air_at_start.filter(|s| {
+                cfg.starting_scene.as_deref() != Some(s.as_str()) && cfg.ending_scene.as_deref() != Some(s.as_str())
+            })
+        });
         if cfg.replay_buffer {
             steps.push(match &client {
                 Some(Ok(r)) => match self.rig_start_replay(r).await {
@@ -457,34 +477,27 @@ impl Engine {
                 _ => Step::new("discord", "Discord post", "skipped", "No Discord webhook (Settings, Discord)."),
             });
         }
-        // A countdown runs with a live scene to switch to, or with the switch turned off.
-        let counts = cfg.countdown_s > 0 && (cfg.live_scene.is_some() || !cfg.at_zero.switch);
-        let (phase, ends) = match (&cfg.live_scene, cfg.countdown_s) {
-            (_, n) if counts => {
-                steps.push(Step::new(
-                    "countdown",
-                    "Countdown",
-                    "waiting",
-                    if cfg.at_zero.switch {
-                        format!("{n} seconds, then the live scene.")
-                    } else {
-                        format!("{n} seconds.")
-                    },
-                ));
-                (Phase::Countdown, Some(at + i64::from(n) * 1000))
-            }
-            (Some(scene), _) => {
-                steps.push(self.switch_step(&client, "live_scene", "Live scene", scene).await);
-                (Phase::Live, None)
-            }
-            (None, _) => (Phase::Starting, None),
+        let (phase, ends) = if cfg.countdown_s > 0 {
+            let n = cfg.countdown_s;
+            steps.push(Step::new(
+                "countdown",
+                "Countdown",
+                "waiting",
+                if cfg.at_zero.switch { format!("{n} seconds, then the live scene.") } else { format!("{n} seconds.") },
+            ));
+            (Phase::Countdown, Some(at + i64::from(n) * 1000))
+        } else if let Some(scene) = &cfg.live_scene {
+            steps.push(self.switch_step(&client, "live_scene", "Live scene", scene).await);
+            (Phase::Live, None)
+        } else {
+            (Phase::Starting, None)
         };
         let run = ShowRun {
             id: ferrocast_store::new_id(),
             phase,
             started_at: at,
             countdown_ends_at: ends,
-            live_scene: cfg.live_scene.clone(),
+            live_scene,
             ended_at: None,
             steps,
         };
@@ -505,9 +518,9 @@ impl Engine {
                 Err(e) => return Step::new(id, label, "failed", e.to_string()),
             },
         };
-        // Never onto a scene with nothing in it: the stream would go black (19 Nov, live: a
-        // show's guessed live scene "Main" was empty, and five minutes in the stream went black).
-        if self.rig_scene_items(r, scene).await == Some(0) {
+        // Never onto a scene with no visible source (empty, all hidden, empty/hidden groups):
+        // the stream would go black (19 Nov, live: a guessed empty "Main" blacked out at 5:23).
+        if self.rig_scene_is_empty(r, scene).await == Some(true) {
             return Step::new(
                 id,
                 label,

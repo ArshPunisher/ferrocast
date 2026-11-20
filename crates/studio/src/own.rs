@@ -335,7 +335,9 @@ impl Shared {
             if !path.is_empty() {
                 match self.engine.go_stinger(scene, std::path::Path::new(path), cut_ms) {
                     Ok(()) => {
-                        self.seen().on_air = Some(scene.to_string());
+                        let mut seen = self.seen();
+                        seen.on_air = Some(scene.to_string());
+                        seen.black = false;
                         return Ok(());
                     }
                     // A video that's gone or broken mustn't stop the switch: it fades instead.
@@ -345,7 +347,9 @@ impl Shared {
         }
         let (kind, ms) = transition_of(id, ms, settings);
         self.engine.go_with(scene, kind, ms).map_err(fail)?;
-        self.seen().on_air = Some(scene.to_string());
+        let mut seen = self.seen();
+        seen.on_air = Some(scene.to_string());
+        seen.black = false;
         Ok(())
     }
 }

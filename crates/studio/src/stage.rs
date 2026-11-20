@@ -754,8 +754,8 @@ impl Stage {
             // the preview wait for the next transition.
             return self.send_copy_on_air(name, &t.kind, u64::from(t.ms));
         }
-        if was != name
-            && let Some(e) = self.engine.borrow().as_ref()
+        if let Some(e) = self.engine.borrow().as_ref()
+            && (was != name || e.is_black())
         {
             e.go_with(name, &t.kind, u64::from(t.ms), &self.transition_settings(&t.kind))?;
         }
@@ -5719,6 +5719,34 @@ mod tests {
         assert!(!ok(s.fade_to_black()));
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert_eq!(px(), [255, 0, 0], "back");
+    }
+
+    #[test]
+    fn switching_scene_clears_fade_to_black() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "color": 4278190335u32 }), false));
+        ok(s.add_scene("Blue"));
+        ok(s.add_source("Blue", "color_source_v3", "BlueSrc", &json!({ "color": 4294901760u32 }), false));
+        ok(s.set_transition(&TransitionInfo { kind: "cut_transition".into(), ms: 0 }));
+        let px = || {
+            e.engine.snapshot().map(|p| p[(90 * 320 + 160) * 4..(90 * 320 + 160) * 4 + 3].to_vec()).unwrap_or_default()
+        };
+        assert!(ok(s.fade_to_black()) && s.is_black());
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        assert_eq!(px(), [0, 0, 0]);
+        // Switching to another scene clears `seen.black` so edits don't restore black.
+        ok(s.set_current("Blue"));
+        assert!(!s.is_black(), "go_with cleared seen.black");
+        ok(s.add_scene("Extra"));
+        assert_eq!(px(), [0, 0, 255], "stays on Blue after edit");
+        // Fading to black and re-selecting the current scene also brings it back.
+        assert!(ok(s.fade_to_black()) && s.is_black());
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        assert_eq!(px(), [0, 0, 0]);
+        ok(s.set_current("Blue"));
+        assert!(!s.is_black(), "set_current on same scene cleared seen.black");
+        assert_eq!(px(), [0, 0, 255], "restored Blue");
     }
 
     #[test]

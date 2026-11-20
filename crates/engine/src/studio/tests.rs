@@ -1243,6 +1243,8 @@ struct FakeStudio {
     lagged: Mutex<u64>,
     /// A scene with nothing in it (its source count is given only when this is set).
     empty_scene: Mutex<Option<String>>,
+    /// Per-scene item list overrides for deep emptiness tests.
+    scene_items: Mutex<std::collections::HashMap<String, Value>>,
 }
 
 #[async_trait]
@@ -1304,7 +1306,17 @@ impl crate::studio_host::StudioHost for FakeStudio {
                 }
                 Value::Null
             }
-            A::Items { .. } => json!([{ "id": 7, "name": "Camera", "visible": *self.cam_shown.lock().unwrap() }]),
+            A::Items { scene } => {
+                if let Some(v) = self.scene_items.lock().unwrap().get(&scene) {
+                    v.clone()
+                } else if self.empty_scene.lock().unwrap().as_deref() == Some(scene.as_str()) {
+                    json!([])
+                } else if scene == "Live" {
+                    json!([{ "id": 7, "name": "Camera", "kind": "av_capture_input", "visible": *self.cam_shown.lock().unwrap() }])
+                } else {
+                    json!([{ "id": 1, "name": "Bg", "kind": "image_source", "visible": true }])
+                }
+            }
             A::Levels { .. } => {
                 let db = *self.mic_db.lock().unwrap();
                 json!({ "Mic": { "peak": [db, db], "magnitude": [db, db] } })
@@ -1315,6 +1327,13 @@ impl crate::studio_host::StudioHost for FakeStudio {
             }
             A::EditItem { scene, id, edit } => {
                 self.acts.lock().unwrap().push(format!("edit {scene} {id} {edit:?}"));
+                if id == 7 {
+                    match edit {
+                        crate::studio_host::ItemEdit::Show => *self.cam_shown.lock().unwrap() = true,
+                        crate::studio_host::ItemEdit::Hide => *self.cam_shown.lock().unwrap() = false,
+                        _ => {}
+                    }
+                }
                 Value::Null
             }
             other => return Err(format!("not faked: {other:?}")),
@@ -1406,6 +1425,63 @@ async fn a_show_never_goes_to_an_empty_scene_and_a_stopped_one_is_over() {
     // The stream stops some other way (the Studio stopped): a new show may start.
     *studio.streaming.lock().unwrap() = false;
     assert!(e.start_show(true).await.is_ok(), "the old show was over");
+}
+
+/// M9-03: when `live_scene` isn't picked, the Show remembers whatever scene was on air when
+/// Go live was pressed (never guessing a name), and the empty check looks inside groups and
+/// hidden items.
+#[tokio::test]
+async fn show_picks_on_air_scene_and_checks_empty_deeply() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio { current: Mutex::new("Desk Cam".into()), ..Default::default() });
+    e.set_studio_host(studio.clone());
+    e.patch_show_config(
+        json!({
+            "starting_scene": "Starting", "live_scene": null, "countdown_s": 10,
+            "discord": false, "alerts_on": false, "bot_on": false,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let run = e.start_show(true).await.unwrap();
+    assert_eq!(run.phase, super::show::Phase::Countdown);
+    assert_eq!(run.live_scene.as_deref(), Some("Desk Cam"), "captured the scene on air at Go live");
+    assert_eq!(*studio.current.lock().unwrap(), "Starting");
+    let live = e.skip_countdown().await.unwrap();
+    assert_eq!(live.phase, super::show::Phase::Live);
+    assert_eq!(*studio.current.lock().unwrap(), "Desk Cam", "returned to the on-air scene");
+    e.end_show().await.unwrap();
+
+    // Deep emptiness: a group with only hidden children is treated as empty and skipped.
+    studio.scene_items.lock().unwrap().insert(
+        "Live".into(),
+        json!([{
+            "id": 2, "name": "Group", "kind": "group", "group": true, "visible": true,
+            "children": [{ "id": 3, "name": "Cam", "kind": "av_capture_input", "visible": false }]
+        }]),
+    );
+    *studio.current.lock().unwrap() = "Starting".into();
+    e.patch_show_config(json!({ "live_scene": "Live", "countdown_s": 0 }).as_object().unwrap()).await.unwrap();
+    let run = e.start_show(true).await.unwrap();
+    let step = run.steps.iter().find(|s| s.id == "live_scene").unwrap();
+    assert_eq!(step.status, "skipped", "{step:?}");
+    assert_eq!(*studio.current.lock().unwrap(), "Starting", "group of hidden items stays off air");
+    e.end_show().await.unwrap();
+
+    // A visible group with a visible child is non-empty and switches cleanly.
+    studio.scene_items.lock().unwrap().insert(
+        "Live".into(),
+        json!([{
+            "id": 2, "name": "Group", "kind": "group", "group": true, "visible": true,
+            "children": [{ "id": 3, "name": "Cam", "kind": "av_capture_input", "visible": true }]
+        }]),
+    );
+    let run = e.start_show(true).await.unwrap();
+    let step = run.steps.iter().find(|s| s.id == "live_scene").unwrap();
+    assert_eq!(step.status, "done", "{step:?}");
+    assert_eq!(*studio.current.lock().unwrap(), "Live");
 }
 
 #[tokio::test]

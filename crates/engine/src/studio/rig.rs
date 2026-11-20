@@ -32,6 +32,64 @@ impl Rig {
     }
 }
 
+/// Scans a Studio scene's items JSON for any visible non-group, non-scene source.
+/// Visible nested scenes are pushed into `nested` for the caller to inspect with cycle detection.
+fn studio_items_have_visible(items: &Value, nested: &mut Vec<String>) -> bool {
+    let Some(list) = items.as_array() else { return false };
+    for item in list {
+        if item.get("visible").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let kind = item.get("kind").and_then(Value::as_str);
+        let is_group = item.get("group").and_then(Value::as_bool) == Some(true)
+            || kind == Some("group")
+            || item.get("children").is_some_and(Value::is_array);
+        if is_group {
+            if let Some(children) = item.get("children")
+                && studio_items_have_visible(children, nested)
+            {
+                return true;
+            }
+            continue;
+        }
+        if kind == Some("scene") {
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                nested.push(name.to_string());
+            }
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Deep emptiness check for OBS scenes: ignores disabled items and recurses into nested scenes
+/// with cycle protection. Returns `None` if `scene` isn't in `scenes`.
+fn obs_scene_is_empty(scenes: &ferrocast_obs::control::Scenes, scene: &str) -> Option<bool> {
+    scenes.scenes.iter().find(|s| s.name == scene)?;
+    let mut visited = std::collections::HashSet::new();
+    let mut todo = vec![scene];
+    visited.insert(scene);
+    while let Some(name) = todo.pop() {
+        let Some(sc) = scenes.scenes.iter().find(|s| s.name == name) else { continue };
+        for item in &sc.items {
+            if !item.enabled {
+                continue;
+            }
+            if item.kind.is_none()
+                && let Some(sub) = scenes.scenes.iter().find(|s| s.name == item.source)
+            {
+                if visited.insert(sub.name.as_str()) {
+                    todo.push(sub.name.as_str());
+                }
+                continue;
+            }
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 /// A source called `name` among a scene's items (groups' children too) → its id and whether
 /// it shows.
 fn find_item(items: &Value, name: &str) -> Option<(i64, bool)> {
@@ -81,18 +139,35 @@ impl Engine {
         }
     }
 
-    /// How many sources `scene` has (the Studio's; None for OBS or a scene not found).
-    pub(crate) async fn rig_scene_items(&self, rig: &Rig, scene: &str) -> Option<u64> {
+    /// Whether `scene` has no visible sources at all (recursing through groups and nested scenes,
+    /// ignoring hidden items and empty groups). `None` if the scene list can't be read or the
+    /// scene doesn't exist, so `rig_switch` surfaces the real error.
+    pub(crate) async fn rig_scene_is_empty(&self, rig: &Rig, scene: &str) -> Option<bool> {
         match rig {
-            Rig::Obs(_) => None,
+            Rig::Obs(c) => {
+                let scenes = ferrocast_obs::control::scenes(c).await.ok()?;
+                obs_scene_is_empty(&scenes, scene)
+            }
             Rig::Studio => {
-                let v = self.studio_act(StudioAct::Scenes).await.ok()?;
-                v.get("scenes")?
-                    .as_array()?
-                    .iter()
-                    .find(|s| s.get("name").and_then(Value::as_str) == Some(scene))?
-                    .get("items")?
-                    .as_u64()
+                let root = self.studio_act(StudioAct::Items { scene: scene.into() }).await.ok()?;
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(scene.to_string());
+                let mut nested = Vec::new();
+                if studio_items_have_visible(&root, &mut nested) {
+                    return Some(false);
+                }
+                while let Some(sub) = nested.pop() {
+                    if !visited.insert(sub.clone()) {
+                        continue;
+                    }
+                    let Ok(items) = self.studio_act(StudioAct::Items { scene: sub }).await else {
+                        continue;
+                    };
+                    if studio_items_have_visible(&items, &mut nested) {
+                        return Some(false);
+                    }
+                }
+                Some(true)
             }
         }
     }
@@ -322,5 +397,89 @@ mod tests {
         assert_eq!(find_item(&items, "Camera"), Some((5, false)));
         assert_eq!(find_item(&items, "Mic"), None);
         assert_eq!(find_item(&Value::Null, "Game"), None);
+    }
+
+    #[test]
+    fn studio_deep_empty_check_handles_hidden_items_groups_and_nested_scenes() {
+        let mut nested = Vec::new();
+        assert!(!studio_items_have_visible(&serde_json::json!([]), &mut nested));
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([{ "id": 1, "name": "Cam", "kind": "av_capture_input", "visible": false }]),
+            &mut nested,
+        ));
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([{ "id": 2, "name": "EmptyGrp", "kind": "group", "group": true, "visible": true, "children": [] }]),
+            &mut nested,
+        ));
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([{
+                "id": 3, "name": "AllHidden", "kind": "group", "group": true, "visible": true,
+                "children": [{ "id": 4, "name": "Cam", "kind": "av_capture_input", "visible": false }]
+            }]),
+            &mut nested,
+        ));
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([{
+                "id": 5, "name": "HiddenGrp", "kind": "group", "group": true, "visible": false,
+                "children": [{ "id": 6, "name": "Cam", "kind": "av_capture_input", "visible": true }]
+            }]),
+            &mut nested,
+        ));
+        assert!(studio_items_have_visible(
+            &serde_json::json!([{
+                "id": 7, "name": "Outer", "kind": "group", "group": true, "visible": true,
+                "children": [{
+                    "id": 8, "name": "Inner", "kind": "group", "group": true, "visible": true,
+                    "children": [{ "id": 9, "name": "Cam", "kind": "av_capture_input", "visible": true }]
+                }]
+            }]),
+            &mut nested,
+        ));
+        // Visible nested scene is queued; hidden nested scene is ignored.
+        nested.clear();
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([
+                { "id": 10, "name": "SubHidden", "kind": "scene", "visible": false },
+                { "id": 11, "name": "SubVisible", "kind": "scene", "visible": true }
+            ]),
+            &mut nested,
+        ));
+        assert_eq!(nested, vec!["SubVisible"]);
+    }
+
+    #[test]
+    fn obs_deep_empty_check_handles_disabled_items_and_cycles() {
+        use ferrocast_obs::control::{Scene, SceneItem, Scenes};
+        let scenes = Scenes {
+            current: Some("A".into()),
+            scenes: vec![
+                Scene { name: "Empty".into(), items: vec![] },
+                Scene {
+                    name: "Hidden".into(),
+                    items: vec![SceneItem { id: 1, source: "Cam".into(), enabled: false, kind: Some("dshow".into()) }],
+                },
+                Scene {
+                    name: "CycleA".into(),
+                    items: vec![SceneItem { id: 1, source: "CycleB".into(), enabled: true, kind: None }],
+                },
+                Scene {
+                    name: "CycleB".into(),
+                    items: vec![SceneItem { id: 1, source: "CycleA".into(), enabled: true, kind: None }],
+                },
+                Scene {
+                    name: "ViaNested".into(),
+                    items: vec![SceneItem { id: 1, source: "Leaf".into(), enabled: true, kind: None }],
+                },
+                Scene {
+                    name: "Leaf".into(),
+                    items: vec![SceneItem { id: 1, source: "Cam".into(), enabled: true, kind: Some("dshow".into()) }],
+                },
+            ],
+        };
+        assert_eq!(obs_scene_is_empty(&scenes, "Missing"), None);
+        assert_eq!(obs_scene_is_empty(&scenes, "Empty"), Some(true));
+        assert_eq!(obs_scene_is_empty(&scenes, "Hidden"), Some(true));
+        assert_eq!(obs_scene_is_empty(&scenes, "CycleA"), Some(true));
+        assert_eq!(obs_scene_is_empty(&scenes, "ViaNested"), Some(false));
     }
 }
