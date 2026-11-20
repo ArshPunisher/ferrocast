@@ -750,6 +750,18 @@ fn load_settings(data: &std::path::Path) -> StudioSettings {
     s
 }
 
+/// What the running engine can't take until Ferrocast restarts: its sound rate and its broadcast
+/// timing are fixed when it opens. A line for the settings' answer (the dashboard offers Restart).
+fn restart_note((rate, ntsc): (u32, bool), s: &StudioSettings) -> Option<String> {
+    let want_ntsc = s.fps_ntsc && matches!(s.fps, 24 | 30 | 60);
+    match (rate != s.sample_rate, ntsc != want_ntsc) {
+        (false, false) => None,
+        (true, false) => Some("The sound rate applies after Ferrocast restarts.".into()),
+        (false, true) => Some("Broadcast timing applies after Ferrocast restarts.".into()),
+        (true, true) => Some("The sound rate and broadcast timing apply after Ferrocast restarts.".into()),
+    }
+}
+
 /// The sound's rate and the audio tracks' names, which the engine and the recording files read.
 fn apply_audio_format(s: &StudioSettings) {
     ferrocast_studio::set_audio_format(s.sample_rate, s.audio_track_names.clone());
@@ -2614,6 +2626,9 @@ impl StudioHost for DesktopStudio {
         let note = self
             .on_main(move |h| {
                 let mut notes: Vec<String> = Vec::new();
+                // The sound rate and broadcast timing are read when the engine opens (a new canvas opens
+                // it again just below): set first, so that reopening takes them.
+                apply_audio_format(&s);
                 // Streaming now: what Optimize changes (frame rate, size, encoder) goes to the
                 // stream on air at once (owner, 15 Nov: "I have to end and stream again").
                 let live = h.stream.as_ref().is_some_and(|st| st.stats().active);
@@ -2652,6 +2667,11 @@ impl StudioHost for DesktopStudio {
                     }
                     c.set_true_peak(s.true_peak);
                     c.set_low_latency(s.low_latency_audio);
+                }
+                if let Some(running) = h.collection.as_ref().and_then(|c| c.engine_format())
+                    && let Some(note) = restart_note(running, &s)
+                {
+                    notes.push(note);
                 }
                 // The stream on air takes a new encoder, size or frame rate at once, without
                 // stopping; a new bitrate alone just changes the bitrate.
@@ -4268,6 +4288,22 @@ mod budget_tests {
             (Some(0.0), Some("limit")),
             "{lossless}"
         );
+    }
+
+    /// A save that changes what only a restart can (the sound rate, broadcast timing) says so; a
+    /// save that doesn't, or whose engine already runs that way, says nothing.
+    #[test]
+    fn a_save_the_running_engine_cannot_take_yet_says_it_applies_after_a_restart() {
+        let at =
+            |rate, ntsc, fps| StudioSettings { sample_rate: rate, fps_ntsc: ntsc, fps, ..StudioSettings::default() };
+        assert_eq!(restart_note((48_000, false), &at(48_000, false, 60)), None);
+        assert!(restart_note((48_000, false), &at(44_100, false, 60)).unwrap().starts_with("The sound rate applies"));
+        assert!(restart_note((48_000, false), &at(48_000, true, 60)).unwrap().starts_with("Broadcast timing applies"));
+        assert!(restart_note((48_000, false), &at(44_100, true, 30)).unwrap().contains("and broadcast timing apply"));
+        // Already running that way (it restarted, or the canvas change reopened the engine).
+        assert_eq!(restart_note((44_100, true), &at(44_100, true, 60)), None);
+        // A rate with no broadcast form (50 fps) is not asked for.
+        assert_eq!(restart_note((48_000, false), &at(48_000, true, 50)), None);
     }
 
     #[test]
