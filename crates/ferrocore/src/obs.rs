@@ -266,14 +266,14 @@ fn sidechain_source(s: &Value) -> Option<&str> {
 pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
     let n = |k: &str, d: f64| f(s, k, d);
     Some(match kind {
-        "gain_filter" => AudioEffect::Gain { db: n("db", 0.0) },
+        "gain_filter" => AudioEffect::Gain { db: n("db", 0.0).clamp(-30.0, 30.0) },
         "invert_polarity_filter" => AudioEffect::InvertPolarity,
         "noise_gate_filter" => AudioEffect::NoiseGate {
             open_db: n("open_threshold", -26.0).clamp(-96.0, 0.0),
             close_db: n("close_threshold", -32.0).clamp(-96.0, 0.0),
-            attack_ms: n("attack_time", 25.0).max(0.0),
-            hold_ms: n("hold_time", 200.0).max(0.0),
-            release_ms: n("release_time", 150.0).max(0.0),
+            attack_ms: n("attack_time", 25.0).clamp(0.0, 10_000.0),
+            hold_ms: n("hold_time", 200.0).clamp(0.0, 10_000.0),
+            release_ms: n("release_time", 150.0).clamp(0.0, 10_000.0),
         },
         "compressor_filter" => {
             // A sidechained compressor ducks under another source; never turn it into a
@@ -282,41 +282,46 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
                 return None;
             }
             AudioEffect::Compressor {
-                ratio: n("ratio", 10.0).max(1.0),
+                ratio: n("ratio", 10.0).clamp(1.0, 32.0),
                 threshold_db: n("threshold", -18.0).clamp(-60.0, 0.0),
-                attack_ms: n("attack_time", 6.0).max(0.0),
-                release_ms: n("release_time", 60.0).max(0.0),
+                attack_ms: n("attack_time", 6.0).clamp(0.0, 500.0),
+                release_ms: n("release_time", 60.0).clamp(0.0, 1_000.0),
                 output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
             }
         }
         "limiter_filter" => AudioEffect::Limiter {
             threshold_db: n("threshold", -6.0).clamp(-60.0, 0.0),
-            release_ms: n("release_time", 60.0).max(0.0),
+            release_ms: n("release_time", 60.0).clamp(0.0, 1_000.0),
         },
         "expander_filter" => {
             let gate = s.get("presets").and_then(Value::as_str) == Some("gate");
+            let peak = s.get("detector").and_then(Value::as_str).is_some_and(|d| d.eq_ignore_ascii_case("peak"));
             AudioEffect::Expander {
-                ratio: n("ratio", if gate { 10.0 } else { 2.0 }).max(1.0),
+                ratio: n("ratio", if gate { 10.0 } else { 2.0 }).clamp(1.0, 20.0),
                 threshold_db: n("threshold", -40.0).clamp(-60.0, 0.0),
-                attack_ms: n("attack_time", 10.0).max(0.0),
-                release_ms: n("release_time", if gate { 125.0 } else { 50.0 }).max(0.0),
+                attack_ms: n("attack_time", 10.0).clamp(0.0, 100.0),
+                release_ms: n("release_time", if gate { 125.0 } else { 50.0 }).clamp(0.0, 1_000.0),
                 output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
-                rms: s.get("detector").and_then(Value::as_str) != Some("peak"),
+                rms: !peak,
             }
         }
         "upward_compressor_filter" => AudioEffect::UpwardCompressor {
             // OBS takes 0 to 1 here; more boosts quiet sound past clipping.
             ratio: n("ratio", 0.5).clamp(0.0, 1.0),
             threshold_db: n("threshold", -20.0).clamp(-60.0, 0.0),
-            attack_ms: n("attack_time", 10.0).max(0.0),
-            release_ms: n("release_time", 50.0).max(0.0),
+            attack_ms: n("attack_time", 10.0).clamp(0.0, 100.0),
+            release_ms: n("release_time", 50.0).clamp(0.0, 1_000.0),
             output_db: n("output_gain", 0.0).clamp(-32.0, 32.0),
-            knee_db: n("knee_width", 10.0).max(0.0),
+            knee_db: n("knee_width", 10.0).clamp(0.0, 20.0),
         },
-        "basic_eq_filter" => AudioEffect::Eq3 { low_db: n("low", 0.0), mid_db: n("mid", 0.0), high_db: n("high", 0.0) },
+        "basic_eq_filter" => AudioEffect::Eq3 {
+            low_db: n("low", 0.0).clamp(-20.0, 20.0),
+            mid_db: n("mid", 0.0).clamp(-20.0, 20.0),
+            high_db: n("high", 0.0).clamp(-20.0, 20.0),
+        },
         // Strong noise removal where the app has it; the light one elsewhere.
-        // Default 65 (~19.5 dB attenuation limit) keeps voice natural instead of maxing out;
-        // 0 turns the filter off (no delay, no CPU).
+        // Default 40 (24 dB attenuation limit, matching RNNoise) keeps voice natural instead of
+        // muffling speech; 0 turns the filter off (no delay, no CPU).
         "ferrocast_deepfilter" => {
             let raw = s.get("strength").and_then(Value::as_u64).unwrap_or(u64::from(DEFAULT_DENOISE_STRENGTH));
             if raw == 0 {
@@ -325,13 +330,12 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
             AudioEffect::Denoise { strength: raw.clamp(1, 100) as u32 }
         }
         // OBS's Noise Suppression (RNNoise, Speex, or NVAFX) becomes our denoiser too.
-        // DeepFilterNet maps strength 1..=100 smoothly onto 0.3..=30 dB (no cliff at 100).
-        // Every slider step from -60..0 dB maps monotonically (no dead zone), and 0 dB turns
-        // it off completely:
-        // - RNNoise (v2 default): stays gentle (up to strength 80 = 24 dB, matching RNNoise);
-        //   when OBS omitted `suppress_level` (OBS hides it for RNNoise), uses the 19.5 dB default.
-        // - Speex (v1 default): full 1..=100 range (up to 30 dB).
-        // - NVAFX: intensity 0..1 mapped to 1..=80 (0 turns it off).
+        // DeepFilterNet maps strength 1..=50 at 0.6 dB/step (up to 30 dB) and 50..=100 at
+        // 0.1 dB/step (up to 35 dB cap). 0 dB turns it off completely:
+        // - RNNoise (v2 default): capped at strength 40 (24 dB, matching RNNoise);
+        //   when OBS omitted `suppress_level` (OBS hides it for RNNoise), uses strength 40 (24 dB).
+        // - Speex (v1 default): full 1..=100 range at 0.6 dB/step.
+        // - NVAFX: intensity 0..1 mapped to 1..=40 (0 turns it off).
         "noise_suppress_filter" | "noise_suppress_filter_v2" => {
             let method = match s.get("method").and_then(Value::as_str) {
                 Some(m) => m,
@@ -2067,5 +2071,273 @@ mod tests {
             "game audio ducked when mic speaks: {}",
             talking_mic_block.tracks[0][0]
         );
+    }
+
+    /// Every OBS audio filter JSON imports into the exact `AudioEffect` parameters in OBS units
+    /// (ms, dB, ratio), with OBS defaults when omitted and OBS range clamping on extreme values.
+    #[test]
+    fn obs_audio_filters_import_exact_units_defaults_and_ranges() {
+        let empty = json!({});
+
+        // Defaults (omitted settings match OBS C defaults verbatim).
+        assert_eq!(audio_effect_from("gain_filter", &empty), Some(AudioEffect::Gain { db: 0.0 }));
+        assert_eq!(audio_effect_from("invert_polarity_filter", &empty), Some(AudioEffect::InvertPolarity));
+        assert_eq!(
+            audio_effect_from("noise_gate_filter", &empty),
+            Some(AudioEffect::NoiseGate {
+                open_db: -26.0,
+                close_db: -32.0,
+                attack_ms: 25.0,
+                hold_ms: 200.0,
+                release_ms: 150.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("compressor_filter", &empty),
+            Some(AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -18.0,
+                attack_ms: 6.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("limiter_filter", &empty),
+            Some(AudioEffect::Limiter { threshold_db: -6.0, release_ms: 60.0 })
+        );
+        assert_eq!(
+            audio_effect_from("expander_filter", &empty),
+            Some(AudioEffect::Expander {
+                ratio: 2.0,
+                threshold_db: -40.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                rms: true,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("expander_filter", &json!({ "presets": "gate" })),
+            Some(AudioEffect::Expander {
+                ratio: 10.0,
+                threshold_db: -40.0,
+                attack_ms: 10.0,
+                release_ms: 125.0,
+                output_db: 0.0,
+                rms: true,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("upward_compressor_filter", &empty),
+            Some(AudioEffect::UpwardCompressor {
+                ratio: 0.5,
+                threshold_db: -20.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                knee_db: 10.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("basic_eq_filter", &empty),
+            Some(AudioEffect::Eq3 { low_db: 0.0, mid_db: 0.0, high_db: 0.0 })
+        );
+
+        // Explicit OBS settings preserve units cleanly (dB, ms, ratio, peak detector).
+        assert_eq!(audio_effect_from("gain_filter", &json!({ "db": 6.5 })), Some(AudioEffect::Gain { db: 6.5 }));
+        assert_eq!(
+            audio_effect_from(
+                "noise_gate_filter",
+                &json!({ "open_threshold": -24.5, "close_threshold": -28.0, "attack_time": 12, "hold_time": 180, "release_time": 90 })
+            ),
+            Some(AudioEffect::NoiseGate {
+                open_db: -24.5,
+                close_db: -28.0,
+                attack_ms: 12.0,
+                hold_ms: 180.0,
+                release_ms: 90.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "compressor_filter",
+                &json!({ "ratio": 4.5, "threshold": -22.0, "attack_time": 15, "release_time": 120, "output_gain": 3.5 })
+            ),
+            Some(AudioEffect::Compressor {
+                ratio: 4.5,
+                threshold_db: -22.0,
+                attack_ms: 15.0,
+                release_ms: 120.0,
+                output_db: 3.5,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("limiter_filter", &json!({ "threshold": -1.0, "release_time": 80 })),
+            Some(AudioEffect::Limiter { threshold_db: -1.0, release_ms: 80.0 })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "expander_filter",
+                &json!({ "presets": "expander", "ratio": 3.5, "threshold": -35.0, "attack_time": 8, "release_time": 90, "output_gain": 1.5, "detector": "Peak" })
+            ),
+            Some(AudioEffect::Expander {
+                ratio: 3.5,
+                threshold_db: -35.0,
+                attack_ms: 8.0,
+                release_ms: 90.0,
+                output_db: 1.5,
+                rms: false,
+            })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "upward_compressor_filter",
+                &json!({ "ratio": 0.35, "threshold": -25.0, "attack_time": 15, "release_time": 75, "output_gain": -2.0, "knee_width": 6.0 })
+            ),
+            Some(AudioEffect::UpwardCompressor {
+                ratio: 0.35,
+                threshold_db: -25.0,
+                attack_ms: 15.0,
+                release_ms: 75.0,
+                output_db: -2.0,
+                knee_db: 6.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("basic_eq_filter", &json!({ "low": 4.0, "mid": -2.5, "high": 3.0 })),
+            Some(AudioEffect::Eq3 { low_db: 4.0, mid_db: -2.5, high_db: 3.0 })
+        );
+
+        // Out-of-range hand-edited values clamp to OBS bounds.
+        assert_eq!(audio_effect_from("gain_filter", &json!({ "db": 99.0 })), Some(AudioEffect::Gain { db: 30.0 }));
+        assert_eq!(audio_effect_from("gain_filter", &json!({ "db": -99.0 })), Some(AudioEffect::Gain { db: -30.0 }));
+        assert_eq!(
+            audio_effect_from("basic_eq_filter", &json!({ "low": -50.0, "mid": 0.0, "high": 50.0 })),
+            Some(AudioEffect::Eq3 { low_db: -20.0, mid_db: 0.0, high_db: 20.0 })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "compressor_filter",
+                &json!({ "ratio": 100.0, "threshold": 12.0, "attack_time": 9000, "release_time": 9000, "output_gain": 60.0 })
+            ),
+            Some(AudioEffect::Compressor {
+                ratio: 32.0,
+                threshold_db: 0.0,
+                attack_ms: 500.0,
+                release_ms: 1000.0,
+                output_db: 32.0,
+            })
+        );
+        assert_eq!(
+            audio_effect_from(
+                "expander_filter",
+                &json!({ "ratio": 50.0, "threshold": -99.0, "attack_time": 500, "release_time": 5000, "output_gain": -50.0 })
+            ),
+            Some(AudioEffect::Expander {
+                ratio: 20.0,
+                threshold_db: -60.0,
+                attack_ms: 100.0,
+                release_ms: 1000.0,
+                output_db: -32.0,
+                rms: true,
+            })
+        );
+        assert_eq!(
+            audio_effect_from("upward_compressor_filter", &json!({ "ratio": 2.0, "knee_width": 99.0 })),
+            Some(AudioEffect::UpwardCompressor {
+                ratio: 1.0,
+                threshold_db: -20.0,
+                attack_ms: 10.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                knee_db: 20.0,
+            })
+        );
+    }
+
+    /// Importing an OBS scene collection with a full voice chain (gain +6, gate -32/-26,
+    /// compressor 10:1 @ -18, limiter -1) yields identical filter order, parameters, and audio output.
+    #[test]
+    fn obs_voice_chain_json_import_produces_same_sound_as_obs() {
+        let doc = json!({
+            "sources": [
+                {
+                    "id": "ffmpeg_source",
+                    "name": "Mic",
+                    "settings": { "local_file": "/mic.wav" },
+                    "filters": [
+                        { "id": "gain_filter", "name": "Gain", "enabled": true, "settings": { "db": 6.0 } },
+                        {
+                            "id": "noise_gate_filter",
+                            "name": "Gate",
+                            "enabled": true,
+                            "settings": {
+                                "open_threshold": -26.0,
+                                "close_threshold": -32.0,
+                                "attack_time": 25,
+                                "hold_time": 200,
+                                "release_time": 150
+                            }
+                        },
+                        { "id": "invert_polarity_filter", "name": "Bypassed", "enabled": false, "settings": {} },
+                        {
+                            "id": "compressor_filter",
+                            "name": "Comp",
+                            "enabled": true,
+                            "settings": {
+                                "ratio": 10.0,
+                                "threshold": -18.0,
+                                "attack_time": 6,
+                                "release_time": 60,
+                                "output_gain": 0.0
+                            }
+                        },
+                        { "id": "limiter_filter", "name": "Lim", "enabled": true, "settings": { "threshold": -1.0, "release_time": 60 } }
+                    ]
+                },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Mic" }] } }
+            ]
+        });
+        let got = import(&doc, (1920, 1080));
+        let mic = got.sources.iter().find(|s| s.name == "Mic").expect("Mic imported");
+        let expected = [
+            AudioEffect::Gain { db: 6.0 },
+            AudioEffect::NoiseGate {
+                open_db: -26.0,
+                close_db: -32.0,
+                attack_ms: 25.0,
+                hold_ms: 200.0,
+                release_ms: 150.0,
+            },
+            AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -18.0,
+                attack_ms: 6.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+            },
+            AudioEffect::Limiter { threshold_db: -1.0, release_ms: 60.0 },
+        ];
+        assert_eq!(mic.sound_effects, expected, "imported chain must match OBS order and skip disabled filters");
+
+        // Run a dynamic signal through imported chain vs direct chain and confirm bit-identical audio.
+        let mut sig = vec![0.0f32; 48_000];
+        for (i, v) in sig.iter_mut().enumerate().take(24_000) {
+            *v = 0.4 * (std::f32::consts::TAU * 300.0 * i as f32 / 48_000.0).sin();
+        }
+        let run_chain = |effects: &[AudioEffect]| {
+            let mut fs: Vec<_> = effects.iter().map(|&e| crate::afx::AudioFilter::new(e, 48_000)).collect();
+            let (mut l, mut r) = (sig.clone(), sig.clone());
+            for (a, b) in l.chunks_mut(480).zip(r.chunks_mut(480)) {
+                for f in &mut fs {
+                    f.process([a, b]);
+                }
+            }
+            l
+        };
+        let a = run_chain(&mic.sound_effects);
+        let b = run_chain(&expected);
+        assert_eq!(a, b);
     }
 }
