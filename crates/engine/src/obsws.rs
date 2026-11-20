@@ -1154,7 +1154,7 @@ impl Engine {
             // ---- filters ----
             "GetSourceFilterList" => {
                 let name = str_field(d, "sourceName").or_else(|_| str_field(d, "inputName"))?.to_string();
-                let v = self.studio_act(StudioAct::Filters { name }).await.map_err(obs_error)?;
+                let v = self.studio_act(StudioAct::Filters { name, item: None }).await.map_err(obs_error)?;
                 let list: Vec<Value> = v
                     .as_array()
                     .into_iter()
@@ -1171,12 +1171,12 @@ impl Engine {
                 let name = str_field(d, "sourceName")?.to_string();
                 let filter = str_field(d, "filterName")?.to_string();
                 let on = bool_field(d, "filterEnabled")?;
-                let list = self.studio_act(StudioAct::Filters { name: name.clone() }).await.map_err(obs_error)?;
+                let list = self.studio_act(StudioAct::Filters { name: name.clone(), item: None }).await.map_err(obs_error)?;
                 if !list.as_array().is_some_and(|l| l.iter().any(|f| f["name"].as_str() == Some(filter.as_str()))) {
                     return Err(fail(ST_NOT_FOUND, "No filter was found by that name."));
                 }
                 let edit = if on { FilterEdit::Enable } else { FilterEdit::Disable };
-                self.studio_act(StudioAct::EditFilter { name, filter, edit }).await.map_err(obs_error)?;
+                self.studio_act(StudioAct::EditFilter { name, filter, edit, item: None }).await.map_err(obs_error)?;
                 Ok(Value::Null)
             }
             _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
