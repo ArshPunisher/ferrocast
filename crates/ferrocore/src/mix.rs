@@ -14,6 +14,9 @@ use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolat
 
 /// Frames per block (libobs's `AUDIO_OUTPUT_FRAMES`).
 pub const BLOCK: usize = 1024;
+
+/// A volume, fader or mute change ramps over this long (the same 8 ms as the filters' parameters).
+const GAIN_RAMP_S: f32 = 0.008;
 /// Tracks (libobs's `MAX_AUDIO_MIXES`).
 pub const TRACKS: usize = 6;
 /// Timestamps closer than this to where a source's sound would continue are taken as continuing
@@ -439,6 +442,9 @@ struct Source {
     /// armed a 4 ms raised-cosine step de-click so toggling filters live never pops.
     last_post_filter: [f32; 2],
     filter_declick: bool,
+    /// The gain (volume or mute) the last block ended on; a change ramps from it. None: the
+    /// source's first block, which starts at its gain.
+    gain_applied: Option<f32>,
     levels: Levels,
     /// The last [`METER_BLOCKS`] blocks' measures, newest last.
     recent: VecDeque<Measured>,
@@ -854,6 +860,7 @@ impl Mixer {
                         filters: Vec::new(),
                         last_post_filter: [0.0; 2],
                         filter_declick: false,
+                        gain_applied: None,
                         levels: Levels::default(),
                         recent: VecDeque::new(),
                         tp: [[0.0; TP_TAPS]; 2],
@@ -1513,9 +1520,21 @@ impl Mixer {
             let (mut peak, mut sq) = ([0f32; 2], [0f32; 2]);
             // A volume that isn't a number (a bad saved setting) is silence, not NaN.
             let vol = if vol.is_finite() { vol } else { 0.0 };
-            for f in buf.as_chunks_mut::<2>().0 {
-                f[0] = clip_wide(f[0] * vol);
-                f[1] = clip_wide(f[1] * vol);
+            // A mute, an unmute or the fader moved changes the gain over 8 ms (like the filters'
+            // parameters), not in one step at the block's edge: that was a click as loud as the
+            // sound. No allocation: a start, a slope and a count.
+            let from = src.gain_applied.unwrap_or(vol);
+            src.gain_applied = Some(vol);
+            let ramp = if (from - vol).abs() > f32::EPSILON {
+                ((rate as f32 * GAIN_RAMP_S) as usize).clamp(1, BLOCK)
+            } else {
+                0
+            };
+            let slope = if ramp > 0 { (vol - from) / ramp as f32 } else { 0.0 };
+            for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                let g = if i < ramp { from + slope * (i + 1) as f32 } else { vol };
+                f[0] = clip_wide(f[0] * g);
+                f[1] = clip_wide(f[1] * g);
                 for c in 0..2 {
                     peak[c] = peak[c].max(f[c].abs());
                     sq[c] += f[c] * f[c];
@@ -2842,6 +2861,54 @@ mod steady_state_tests {
         assert!(worst < 0.04, "a gain drag clicked: max step {worst:.4}");
         let end = out[out.len() - 480..].iter().fold(0.0f32, |a, x| a.max(x.abs()));
         assert!(end > 0.7, "and reached +12 dB: peak {end:.3}");
+    }
+
+    /// Muting, unmuting and moving the fader mid-sound used to step the gain at a block boundary
+    /// (a click as loud as the sound, the biggest spike in a measured stream). The change now
+    /// ramps over 8 ms inside the mixer.
+    #[test]
+    fn muting_unmuting_and_the_fader_ramp_instead_of_clicking() {
+        let mut m = Mixer::new(48_000, 0);
+        m.set(1, SourceSettings::default());
+        let step = block_ns(48_000);
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let mut sample_idx = 0usize;
+        let mut out = Vec::new();
+        // Tone 0.5 at 220 Hz; blocks 0-2 as is, 3-5 muted, 6-8 back, 9-11 the fader at 0.25.
+        let settings = |muted: bool, volume: f32| SourceSettings { muted, volume, ..SourceSettings::default() };
+        for b in 0..12u64 {
+            match b {
+                3 => m.set(1, settings(true, 1.0)),
+                6 => m.set(1, settings(false, 1.0)),
+                9 => m.set(1, settings(false, 0.25)),
+                _ => {}
+            }
+            let mut pcm = Vec::with_capacity(BLOCK * 2);
+            for _ in 0..BLOCK {
+                let v = 0.5 * (std::f32::consts::TAU * 220.0 * sample_idx as f32 / 48_000.0).sin();
+                pcm.push(v);
+                pcm.push(v);
+                sample_idx += 1;
+            }
+            m.push(1, &pcm, 2, 48_000, t0 + b * step);
+            for blk in m.mix_until(t0 + (b + 1) * step) {
+                out.extend(blk.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+            }
+        }
+        // A 220 Hz tone at 0.5 moves 0.015 a sample; a step of the gain at 0.5 moves it by ~0.5.
+        for (name, block) in [("mute", 3usize), ("unmute", 6), ("fader", 9)] {
+            let at = block * BLOCK;
+            let worst = out[at - 2..at + 800].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 0.04, "{name} clicked: max step {worst:.4}");
+        }
+        // Gone within 10 ms, back within 10 ms at the right level.
+        let muted = &out[3 * BLOCK + 480..4 * BLOCK];
+        assert!(muted.iter().all(|v| v.abs() < 1e-6), "silent 10 ms after the mute");
+        let back = out[7 * BLOCK..8 * BLOCK].iter().fold(0.0f32, |a, x| a.max(x.abs()));
+        assert!((back - 0.5).abs() < 0.01, "unmuted level {back}");
+        let faded = out[10 * BLOCK..11 * BLOCK].iter().fold(0.0f32, |a, x| a.max(x.abs()));
+        assert!((faded - 0.125).abs() < 0.005, "fader level {faded}");
     }
 
     /// Toggling a filter on/off via `set_effects` (eye icon in UI) eases out the step jump so
