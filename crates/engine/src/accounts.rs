@@ -449,6 +449,36 @@ impl Engine {
         );
     }
 
+    /// Turns the Studio's background saves into dashboard notices: one calm line per file that
+    /// can't be saved (the OS error behind the (i)), replaced by a one-line "saving again" when it
+    /// works. Call once at start-up; a later call replaces the earlier watcher.
+    pub fn watch_saves(&self) {
+        let engine = self.clone();
+        ferrocast_store::durable::set_save_observer(move |e| engine.save_notice(e));
+    }
+
+    fn save_notice(&self, e: &ferrocast_store::durable::SaveEvent) {
+        let name = e.file.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let folder = e.file.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+        let what = match (folder, name) {
+            (Some("collections"), _) => "your scenes",
+            (Some("profiles"), _) => "your Studio settings",
+            (_, "library.json") => "your list of scenes and settings",
+            (_, "session.json") => "the Studio's session note",
+            _ => "a Studio file",
+        };
+        let key = format!("save:{}", e.file.display());
+        match &e.error {
+            Some(err) => self.notice_detail(
+                &key,
+                NoticeLevel::Warn,
+                &format!("Couldn't save {what}: the file is in use by another program."),
+                err,
+            ),
+            None => self.notice(&key, NoticeLevel::Info, &format!("Saving {what} again.")),
+        }
+    }
+
     /// One line on the dashboard. Notices with the same `key` replace each other there.
     pub(crate) fn notice(&self, key: &str, level: NoticeLevel, message: &str) {
         self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key)));

@@ -359,12 +359,8 @@ mod queue {
                 }
             }
         }
-        // Only forget the operation if nothing newer arrived while it ran.
-        if st.pending.get(&path).is_some_and(|e| e.generation == generation) {
-            st.pending.remove(&path);
-        }
         drop(st);
-        s.changed.notify_all();
+        // Told before the operation counts as finished, so whoever flushes sees the notice too.
         if let Some(ev) = event {
             let observer = s.observer.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(f) = observer {
@@ -372,6 +368,13 @@ mod queue {
                 let _ = catch_unwind(AssertUnwindSafe(|| f(&ev)));
             }
         }
+        // Only forget the operation if nothing newer arrived while it ran.
+        let mut st = lock(s);
+        if st.pending.get(&path).is_some_and(|e| e.generation == generation) {
+            st.pending.remove(&path);
+        }
+        drop(st);
+        s.changed.notify_all();
     }
 
     /// What a read of `path` should see while an operation on it is queued.
