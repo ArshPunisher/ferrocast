@@ -183,14 +183,24 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                 };
                 engine.studio_act(StudioAct::Media { name: name.to_string(), what: Some(what), seek_ms: None }).await?;
             } else if let Some(name) = a.strip_prefix("push_to_mute:") {
-                // Held: muted; let go: heard.
-                engine.studio_act(audio(name, pressed)).await?;
+                // Switched on for the sound: the mixer gates it (with its release delay, in samples).
+                // Not: held mutes it, let go hears it, as before.
+                let gated = engine
+                    .studio_act(StudioAct::PushKey { name: name.to_string(), talk: false, down: pressed })
+                    .await?;
+                if gated != Value::Bool(true) {
+                    engine.studio_act(audio(name, pressed)).await?;
+                }
             } else if let Some(name) = a.strip_prefix("mute:") {
                 let muted = muted(engine, name).await?;
                 engine.studio_act(audio(name, !muted)).await?;
             } else if let Some(name) = a.strip_prefix("push_to_talk:") {
-                // Held: heard; let go: muted.
-                engine.studio_act(audio(name, !pressed)).await?;
+                let gated =
+                    engine.studio_act(StudioAct::PushKey { name: name.to_string(), talk: true, down: pressed }).await?;
+                if gated != Value::Bool(true) {
+                    // Held: heard; let go: muted.
+                    engine.studio_act(audio(name, !pressed)).await?;
+                }
             }
         }
     }

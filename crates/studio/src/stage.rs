@@ -56,6 +56,7 @@ fn read_levels(
                     peak: floor(l.peak),
                     magnitude: floor(l.rms),
                     input_peak: floor(l.input_peak),
+                    gated: l.gated,
                 },
             ))
         })
@@ -72,7 +73,10 @@ fn publish_engine(shared: Option<&Arc<own::Shared>>) {
 
 /// The meters (the long window, or `fast` over a few blocks), read without the Studio's main thread. None when no engine
 /// is running (the caller then asks the main thread, which says why).
-pub fn levels_now(names: &[String], fast: bool) -> Option<std::collections::HashMap<String, crate::collection::LevelInfo>> {
+pub fn levels_now(
+    names: &[String],
+    fast: bool,
+) -> Option<std::collections::HashMap<String, crate::collection::LevelInfo>> {
     let e = LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()).upgrade()?;
     Some(read_levels(&e, names, fast))
 }
@@ -1888,6 +1892,10 @@ impl Stage {
             tracks: (1..=6u8).filter(|t| mixers & (1 << (t - 1)) != 0).collect(),
             // Making sound: our engine has it running (a device opened, a file playing).
             active: self.engine.borrow().as_ref().is_some_and(|e| e.engine.source_named(name_of(s)).is_some()),
+            push_to_talk: s.get("push-to-talk").and_then(Value::as_bool).unwrap_or(false),
+            push_to_talk_ms: s.get("push-to-talk-delay").and_then(Value::as_u64).unwrap_or(0).min(5_000) as u32,
+            push_to_mute: s.get("push-to-mute").and_then(Value::as_bool).unwrap_or(false),
+            push_to_mute_ms: s.get("push-to-mute-delay").and_then(Value::as_u64).unwrap_or(0).min(5_000) as u32,
         }
     }
 
@@ -1915,6 +1923,36 @@ impl Stage {
 
     pub fn set_muted(&self, name: &str, muted: bool) -> Result<(), StudioError> {
         self.with_source(name, |s| s["muted"] = json!(muted))
+    }
+
+    /// Push-to-talk (`talk`) or push-to-mute on or off for a sound, and its release delay (OBS's
+    /// keys: `push-to-talk`, `push-to-talk-delay`, in ms, at most 5 s).
+    pub fn set_push(&self, name: &str, talk: bool, on: Option<bool>, delay_ms: Option<u32>) -> Result<(), StudioError> {
+        let key = if talk { "push-to-talk" } else { "push-to-mute" };
+        self.with_source(name, |s| {
+            if let Some(on) = on {
+                s[key] = json!(on);
+            }
+            if let Some(ms) = delay_ms {
+                s[format!("{key}-delay")] = json!(ms.min(5_000));
+            }
+        })
+    }
+
+    /// A push-to-talk (`talk`) or push-to-mute key went down or up for a sound. False when the
+    /// sound hasn't that switched on (the caller then does what a key did before: toggles the mute).
+    pub fn push_key(&self, name: &str, talk: bool, down: bool) -> Result<bool, StudioError> {
+        let on = {
+            let src = self.source(name)?;
+            src.get(if talk { "push-to-talk" } else { "push-to-mute" }).and_then(Value::as_bool).unwrap_or(false)
+        };
+        if on
+            && let Some(e) = self.engine.borrow().clone()
+            && let Some((id, _)) = e.engine.source_named(name)
+        {
+            e.engine.push_key(id, talk, down);
+        }
+        Ok(on)
     }
 
     pub fn set_balance(&self, name: &str, balance: f32) -> Result<(), StudioError> {
@@ -5964,6 +6002,30 @@ mod tests {
         assert!((ok(s.audio_of("Mic/Aux")).volume_db + 3.0).abs() < 0.01);
         ok(s.set_channel(4, None));
         assert!(s.channels().is_empty());
+    }
+
+    /// Push-to-talk and push-to-mute are kept in the sound's own settings (OBS's keys), clamped to
+    /// 5 s, and a key for a sound without them on answers false (the old mute shortcut then runs).
+    #[test]
+    fn a_sounds_push_to_talk_and_push_to_mute_are_kept_and_asked() {
+        let s = stage();
+        ok(s.set_channel(3, Some(("coreaudio_input_capture", "Mic/Aux", &json!({})))));
+        let a = ok(s.audio_of("Mic/Aux"));
+        assert!(!a.push_to_talk && !a.push_to_mute && a.push_to_talk_ms == 0);
+        assert!(!ok(s.push_key("Mic/Aux", true, true)), "not switched on: the caller mutes as before");
+        ok(s.set_push("Mic/Aux", true, Some(true), Some(250)));
+        ok(s.set_push("Mic/Aux", false, Some(true), Some(99_999)));
+        let a = ok(s.audio_of("Mic/Aux"));
+        assert_eq!((a.push_to_talk, a.push_to_talk_ms), (true, 250));
+        assert_eq!((a.push_to_mute, a.push_to_mute_ms), (true, 5_000), "at most 5 s");
+        assert!(ok(s.push_key("Mic/Aux", true, true)));
+        // Only the delay changes when only it is sent.
+        ok(s.set_push("Mic/Aux", true, None, Some(100)));
+        assert_eq!(ok(s.audio_of("Mic/Aux")).push_to_talk_ms, 100);
+        assert!(ok(s.audio_of("Mic/Aux")).push_to_talk);
+        // And they survive a save and a load.
+        let again = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &s.save("x"), "Scene"));
+        assert_eq!(ok(again.audio_of("Mic/Aux")).push_to_talk_ms, 100);
     }
 
     #[test]

@@ -248,6 +248,12 @@ pub struct AudioInfo {
     pub tracks: Vec<u8>,
     /// Making sound now (OBS's "active": a playing file, an open device).
     pub active: bool,
+    /// Push-to-talk: muted unless its key is held (and `push_to_talk_ms` after it is let go).
+    pub push_to_talk: bool,
+    pub push_to_talk_ms: u32,
+    /// Push-to-mute: muted while its key is held (and `push_to_mute_ms` after).
+    pub push_to_mute: bool,
+    pub push_to_mute_ms: u32,
 }
 
 /// A source and the scenes it's in.
@@ -278,6 +284,8 @@ pub struct LevelInfo {
     /// The highest the sound came in at, before its filters and fader (a gate's threshold
     /// is set against it).
     pub input_peak: [f32; 2],
+    /// Muted by a push-to-talk or push-to-mute key right now (the meter shows it dim).
+    pub gated: bool,
 }
 
 /// How the picture goes from one scene to the next.

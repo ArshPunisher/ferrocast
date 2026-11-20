@@ -46,7 +46,9 @@ fn a_steady_mix_allocates_nothing() {
     let mut m = Mixer::new(48_000, 40_000_000);
     m.set(1, SourceSettings::default());
     m.set(2, SourceSettings::default());
-    m.set(3, SourceSettings::default());
+    // Source 3 is on push-to-talk and source 2 on push-to-mute: their keys go up and down below.
+    m.set(2, SourceSettings { push_to_mute: Some(200), ..SourceSettings::default() });
+    m.set(3, SourceSettings { push_to_talk: Some(150), ..SourceSettings::default() });
     m.set_effects(
         3,
         &[
@@ -104,6 +106,11 @@ fn a_steady_mix_allocates_nothing() {
     let _ = m.mix_until(t0);
     let mut step = |m: &mut Mixer, k: u64| {
         let at = t0 + k * 20_000_000;
+        // A key pressed and let go over and over (the gate, its delay counters and the levels).
+        if k.is_multiple_of(25) {
+            m.push_key(3, true, (k / 25).is_multiple_of(2));
+            m.push_key(2, false, (k / 25).is_multiple_of(3));
+        }
         m.push(1, &mic, 2, 48_000, at);
         m.push(2, &card, 2, 44_100, at);
         m.push(3, &mic, 2, 48_000, at);
