@@ -564,6 +564,32 @@ async fn a_server_that_was_live_and_refuses_connections_for_a_while_is_waited_fo
 /// A name that never resolved (a typo in a custom server) or an address that never answered is not a
 /// network being down: it fails in the few ordinary tries with the real reason, not after ten minutes
 /// of "your network is down". Only a destination that took the stream earlier gets the long wait.
+/// While the network is waited for, the destination shows Reconnecting (with why) the whole time:
+/// a try in progress doesn't turn it back into a bare Connecting (it did for the length of every
+/// connect timeout, 10 of every 18 seconds).
+#[tokio::test]
+async fn a_destination_waiting_for_the_network_stays_reconnecting_while_a_try_is_made() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set(dport, true);
+    push::fault::set_slow(dport, 150);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(30), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(900);
+    while tokio::time::Instant::now() < deadline {
+        let s = health.borrow().state.clone();
+        assert!(matches!(s, PushState::Reconnecting { .. }), "turned back into {s:?} during a try");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    push::fault::set_slow(dport, 0);
+    push::fault::set(dport, false);
+}
+
 #[tokio::test]
 async fn a_name_that_never_resolved_fails_fast_a_destination_that_was_live_waits() {
     let w = world().await;

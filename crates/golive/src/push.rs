@@ -288,7 +288,11 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                 (Some(b), true) => b,
                 _ => &dest.target,
             };
-            set_state(&health, PushState::Connecting);
+            // A retry doesn't blank "Reconnecting" (and why) for the length of the try: only a
+            // first connect, or one after a live session, shows Connecting.
+            if !matches!(health.borrow().state, PushState::Reconnecting { .. }) {
+                set_state(&health, PushState::Connecting);
+            }
             let mut live_at: Option<Instant> = None;
             let outcome = tokio::select! {
                 _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
@@ -548,6 +552,18 @@ pub(crate) mod fault {
     pub(crate) fn is_down(port: u16) -> bool {
         DOWN.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
     }
+    static SLOW: Mutex<Vec<(u16, u64)>> = Mutex::new(Vec::new());
+    /// Connecting to this port takes this long (ms) before it fails: a connect that hangs.
+    pub(crate) fn set_slow(port: u16, ms: u64) {
+        let mut d = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|(p, _)| *p != port);
+        if ms > 0 {
+            d.push((port, ms));
+        }
+    }
+    pub(crate) fn slow_ms(port: u16) -> u64 {
+        SLOW.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map_or(0, |(_, m)| *m)
+    }
     static NO_NAME: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     /// The destination's name can't be looked up (a typo, or no DNS).
     pub(crate) fn set_no_name(port: u16, on: bool) {
@@ -565,6 +581,13 @@ pub(crate) mod fault {
 /// Connects to `t`, over `via` when given (else the system's default way).
 pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
+    #[cfg(test)]
+    {
+        let ms = fault::slow_ms(t.port);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+    }
     #[cfg(test)]
     if fault::is_down(t.port) {
         return Err(PushError::NetworkDown(host));
