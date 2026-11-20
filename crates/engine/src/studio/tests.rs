@@ -1267,6 +1267,8 @@ struct FakeStudio {
     cam_shown: Mutex<bool>,
     /// What the mic hears (dBFS), and whether the camera's picture is black.
     mic_db: Mutex<f32>,
+    /// What the mic hears before its mute and fader (default: `mic_db`).
+    mic_input: Mutex<Option<f32>>,
     cam_black: Mutex<bool>,
     /// How many pictures each `focus` call got.
     focus_batches: Mutex<Vec<usize>>,
@@ -1337,7 +1339,10 @@ impl crate::studio_host::StudioHost for FakeStudio {
                 *self.current.lock().unwrap() = scene;
                 Value::Null
             }
-            A::Audio { .. } => json!([{ "name": "Mic", "muted": *self.muted.lock().unwrap() }]),
+            A::Audio { .. } => json!([
+                { "name": "Mic", "kind": "coreaudio_input_capture", "volume_db": 0.0, "muted": *self.muted.lock().unwrap() },
+                { "name": "Desktop", "kind": "coreaudio_output_capture", "channel": 1, "muted": false },
+            ]),
             A::SetAudio { name, change } => {
                 if let Some(m) = change.muted {
                     self.acts.lock().unwrap().push(format!("mute {name} {m}"));
@@ -1358,7 +1363,8 @@ impl crate::studio_host::StudioHost for FakeStudio {
             }
             A::Levels { .. } => {
                 let db = *self.mic_db.lock().unwrap();
-                json!({ "Mic": { "peak": [db, db], "magnitude": [db, db] } })
+                let input = self.mic_input.lock().unwrap().unwrap_or(db);
+                json!({ "Mic": { "peak": [db, db], "magnitude": [db, db], "input_peak": [input, input] } })
             }
             A::Look { .. } => {
                 let black = *self.cam_black.lock().unwrap();
@@ -1864,4 +1870,73 @@ async fn a_sidechain_cycle_is_noticed_once_through_studio_stats() {
     *studio.sidechain_cycles.lock().unwrap() = vec![json!({ "source": "Voice", "key": "Music" })];
     let _ = e.studio_stats().await.unwrap();
     assert_eq!(notices(&mut live).len(), 1);
+}
+
+/// 19 Nov: a muted mic, a quiet one and a scene with only a mic went unnoticed because the watch
+/// looked only at the Show's own mic list. Every mic on air is read now, the Show's list empty.
+#[tokio::test]
+async fn the_live_watch_reads_every_mic_on_air_and_the_scene_picture() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        muted: Mutex::new(true),
+        mic_db: Mutex::new(-100.0),
+        mic_input: Mutex::new(Some(-22.0)),
+        cam_shown: Mutex::new(true),
+        ..Default::default()
+    });
+    e.set_studio_host(studio.clone());
+    assert!(e.show_config().mic_sources.is_empty());
+    let sample = e.watch_sample(0, &e.show_config()).await;
+    // The mic is found (the desktop sound is not a mic), muted, hearing speech.
+    assert_eq!(sample.levels.len(), 1, "{:?}", sample.levels);
+    let m = &sample.levels[0];
+    assert!(m.name == "Mic" && m.muted && m.input_db == -22.0 && m.peak_db == -100.0, "{m:?}");
+    // "Live" has a camera shown; a scene with only a mic is "empty".
+    assert_eq!(sample.scene.as_ref().map(|s| s.empty), Some(false));
+    studio.scene_items.lock().unwrap().insert(
+        "Live".into(),
+        json!([{ "id": 1, "name": "Mic", "kind": "coreaudio_input_capture", "visible": true }]),
+    );
+    let sample = e.watch_sample(2000, &e.show_config()).await;
+    assert_eq!(sample.scene.as_ref().map(|s| s.empty), Some(true), "a mic alone is no picture");
+    // Speaking into it twice: one notice, naming the mic, with its one-tap fix.
+    let first = e.live_watch_tick().await;
+    assert!(first.iter().all(|a| a.id != "mic:muted:Mic"), "not on the first look: {first:?}");
+    let second = e.live_watch_tick().await;
+    let a = second.iter().find(|a| a.id == "mic:muted:Mic").unwrap_or_else(|| panic!("{second:?}"));
+    assert_eq!((a.action, a.source.as_deref()), (Some("unmute"), Some("Mic")));
+    assert!(e.live_watch_tick().await.iter().all(|a| a.id != "mic:muted:Mic"), "said once");
+}
+
+/// Before Go live: an on-air scene with only a mic, and a muted mic that isn't on the Show's list,
+/// are warned about (never blocked).
+#[tokio::test]
+async fn preflight_warns_about_a_black_scene_and_a_muted_mic() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio {
+        current: Mutex::new("Live".into()),
+        muted: Mutex::new(true),
+        mic_db: Mutex::new(-100.0),
+        ..Default::default()
+    });
+    studio.scene_items.lock().unwrap().insert(
+        "Live".into(),
+        json!([{ "id": 1, "name": "Mic", "kind": "coreaudio_input_capture", "visible": true }]),
+    );
+    e.set_studio_host(studio.clone());
+    let p = e.preflight().await;
+    let c = |id: &str| p.checks.iter().find(|c| c.id == id);
+    let pic = c("picture:Live").unwrap_or_else(|| panic!("{:?}", p.checks));
+    assert_eq!(pic.status, ferrocast_core::show::CheckStatus::Warn);
+    let mic = c("mic:Mic").unwrap_or_else(|| panic!("{:?}", p.checks));
+    assert_eq!(mic.fix.as_ref().map(|f| f.href.as_str()), Some("action:unmute:Mic"));
+    assert!(p.ready, "warnings never stop Go live");
+    // A camera in the scene and the mic on: both lines go.
+    *studio.muted.lock().unwrap() = false;
+    *studio.mic_db.lock().unwrap() = -30.0;
+    studio.scene_items.lock().unwrap().clear();
+    *studio.cam_shown.lock().unwrap() = true;
+    let p = e.preflight().await;
+    assert!(p.checks.iter().all(|c| c.id != "picture:Live" && c.id != "mic:Mic"), "{:?}", p.checks);
 }

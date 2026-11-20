@@ -438,7 +438,7 @@ impl Engine {
                     ),
                 });
             }
-            let scene = cfg.live_scene.clone().or(on_air).or(cfg.starting_scene.clone());
+            let scene = cfg.live_scene.clone().or(on_air.clone()).or(cfg.starting_scene.clone());
             for cam in &cfg.cam_sources {
                 let Some(scene) = &scene else { break };
                 let black = looks.as_ref().is_some_and(|l| {
@@ -473,6 +473,7 @@ impl Engine {
                     Err(e) => Check::new(&format!("cam:{cam}"), cam, CheckStatus::Warn, e.to_string(), None),
                 });
             }
+            self.preflight_picture_and_mics(r, &cfg, on_air.as_deref(), &mut checks).await;
             if cfg.replay_buffer {
                 checks.push(match self.rig_replay_active(r).await {
                     Ok(true) => Check::new("replay", "Replay buffer", CheckStatus::Ok, "Running.", None),

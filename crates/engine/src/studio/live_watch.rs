@@ -6,6 +6,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use ferrocast_core::show::audio_watch::{MicLevel, SceneLook};
 use ferrocast_core::show::{LiveAlert, WatchSample};
 use serde_json::Value;
 
@@ -18,6 +19,42 @@ const EVERY: Duration = Duration::from_secs(2);
 /// A gap longer than this between 2-second ticks means the system slept or froze: reset
 /// pending silence/black/frozen durations so wake never fires false live alerts.
 const WAKE_JUMP_MS: i64 = 10_000;
+
+/// Whether a mixer row is a microphone: a mic input, or one of the global mic channels (3 to 6).
+fn is_mic(row: &Value) -> bool {
+    let kind = row["kind"].as_str().unwrap_or("");
+    let channel = row["channel"].as_u64();
+    matches!(kind, "coreaudio_input_capture" | "wasapi_input_capture" | "pulse_input_capture" | "alsa_input_capture")
+        || channel.is_some_and(|c| (3..=6).contains(&c))
+}
+
+/// The loudest channel (dBFS) of a `[l, r]` level, None when absent.
+fn loudest(v: &Value) -> Option<f32> {
+    let m = v.as_array()?.iter().filter_map(Value::as_f64).fold(f64::MIN, f64::max);
+    (m > f64::MIN).then_some(m as f32)
+}
+
+/// Every mic of a scene's mixer with its levels now. `listed` are the Show's own watched mics
+/// (they keep their own "no sound" notice).
+pub(crate) fn mic_levels(mixer: &Value, levels: &Value, listed: &[String]) -> Vec<MicLevel> {
+    let mut out = Vec::new();
+    for row in mixer.as_array().into_iter().flatten().filter(|r| is_mic(r)) {
+        let Some(name) = row["name"].as_str() else { continue };
+        // A mic nobody has measured yet (just added) says nothing.
+        let Some(peak) = loudest(&levels[name]["peak"]) else { continue };
+        let input = loudest(&levels[name]["input_peak"]).unwrap_or(peak);
+        out.push(MicLevel {
+            name: name.to_string(),
+            peak_db: peak,
+            input_db: input,
+            muted: row["muted"].as_bool() == Some(true),
+            gated: levels[name]["gated"].as_bool() == Some(true),
+            volume_db: row["volume_db"].as_f64().unwrap_or(0.0) as f32,
+            listed: listed.iter().any(|l| l == name),
+        });
+    }
+    out
+}
 
 impl Engine {
     /// Starts the live watch's loop (once per engine). It looks only while the Studio streams.
@@ -161,24 +198,33 @@ impl Engine {
         );
     }
 
-    /// One look → the alerts it raises or clears, sent on.
-    pub(crate) async fn live_watch_tick(&self) -> Vec<LiveAlert> {
-        let cfg = self.show_config().watch;
-        if !cfg.on {
-            return Vec::new();
-        }
-        let show = self.show_config();
-        let mono = self.mono_ms();
-        let wake_jumped = {
-            let mut last = self.studio().last_watch_mono.lock().unwrap_or_else(|p| p.into_inner());
-            let jumped = last.is_some_and(|prev| mono - prev > WAKE_JUMP_MS);
-            *last = Some(mono);
-            jumped
-        };
-        if wake_jumped {
-            self.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).reset();
-        }
+    /// What goes out now: every mic on air with its levels, the scene on air, the Show's cameras
+    /// and Go live's destinations.
+    pub(crate) async fn watch_sample(&self, mono: i64, show: &ferrocast_core::show::ShowConfig) -> WatchSample {
         let mut sample = WatchSample { at: mono, ..Default::default() };
+        // Every mic on air (not only the Show's list), and the scene they're in.
+        let scenes = self.studio_act(StudioAct::Scenes).await.ok();
+        let on_air = scenes.as_ref().and_then(|v| v["current"].as_str()).filter(|n| !n.is_empty()).map(String::from);
+        if let Some(scene) = &on_air {
+            if let Ok(mixer) = self.studio_act(StudioAct::Audio { scene: scene.clone() }).await {
+                let names: Vec<String> = mixer
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|r| is_mic(r))
+                    .filter_map(|r| r["name"].as_str().map(String::from))
+                    .collect();
+                if !names.is_empty()
+                    && let Ok(v) = self.studio_levels(names, false).await
+                {
+                    sample.levels = mic_levels(&mixer, &v, &show.mic_sources);
+                }
+            }
+            if let Some(empty) = self.rig_scene_is_empty(&crate::studio::rig::Rig::Studio, scene).await {
+                let faded = scenes.as_ref().is_some_and(|v| v["black"].as_bool() == Some(true));
+                sample.scene = Some(SceneLook { name: scene.clone(), empty, faded });
+            }
+        }
         if !show.mic_sources.is_empty()
             && let Ok(v) = self.studio_act(StudioAct::Levels { names: show.mic_sources.clone() }).await
         {
@@ -203,6 +249,95 @@ impl Engine {
             }
         }
         sample.destinations = self.golive_sending();
+        sample
+    }
+
+    /// Before Go live: a scene that will be on air with no picture, and a mic (not on the Show's
+    /// own list, which has its checks) that is muted or sends nothing. Warnings: they never block.
+    pub(crate) async fn preflight_picture_and_mics(
+        &self,
+        rig: &crate::studio::rig::Rig,
+        cfg: &ferrocast_core::show::ShowConfig,
+        on_air: Option<&str>,
+        checks: &mut Vec<ferrocast_core::show::Check>,
+    ) {
+        use ferrocast_core::show::{Check, CheckStatus, fix};
+        if !matches!(rig, crate::studio::rig::Rig::Studio) {
+            return;
+        }
+        // The scenes viewers will see: the starting one (when there is one), then the live one,
+        // or whatever is on air now.
+        let mut scenes: Vec<&str> = Vec::new();
+        for s in [cfg.starting_scene.as_deref(), cfg.live_scene.as_deref().or(on_air)].into_iter().flatten() {
+            if !scenes.contains(&s) {
+                scenes.push(s);
+            }
+        }
+        for s in &scenes {
+            if self.rig_scene_is_empty(rig, s).await == Some(true) {
+                checks.push(Check::new(
+                    &format!("picture:{s}"),
+                    "Picture",
+                    CheckStatus::Warn,
+                    format!("\"{s}\" has no camera, screen or image: viewers will see black."),
+                    fix("Pick another scene", "#/studio/show"),
+                ));
+            }
+        }
+        let Some(scene) = cfg.live_scene.as_deref().or(on_air) else { return };
+        let Ok(mixer) = self.studio_act(StudioAct::Audio { scene: scene.into() }).await else { return };
+        let names: Vec<String> = mixer
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| is_mic(r))
+            .filter_map(|r| r["name"].as_str().map(String::from))
+            .filter(|n| !cfg.mic_sources.contains(n))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let levels = self.studio_levels(names, false).await.unwrap_or(Value::Null);
+        for m in mic_levels(&mixer, &levels, &cfg.mic_sources) {
+            let id = format!("mic:{}", m.name);
+            if m.muted && !m.gated {
+                checks.push(Check::new(
+                    &id,
+                    &m.name,
+                    CheckStatus::Warn,
+                    "Muted: nobody will hear you.",
+                    fix("Unmute", format!("action:unmute:{}", m.name)),
+                ));
+            } else if !m.muted && !m.gated && m.input_db <= ferrocast_core::show::audio_watch::DEAD_DB {
+                checks.push(Check::new(
+                    &id,
+                    &m.name,
+                    CheckStatus::Warn,
+                    "Not muted, but it sends nothing: check the cable and the input.",
+                    fix("Check the mic", "#/studio/engine"),
+                ));
+            }
+        }
+    }
+
+    /// One look → the alerts it raises or clears, sent on.
+    pub(crate) async fn live_watch_tick(&self) -> Vec<LiveAlert> {
+        let cfg = self.show_config().watch;
+        if !cfg.on {
+            return Vec::new();
+        }
+        let show = self.show_config();
+        let mono = self.mono_ms();
+        let wake_jumped = {
+            let mut last = self.studio().last_watch_mono.lock().unwrap_or_else(|p| p.into_inner());
+            let jumped = last.is_some_and(|prev| mono - prev > WAKE_JUMP_MS);
+            *last = Some(mono);
+            jumped
+        };
+        if wake_jumped {
+            self.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).reset();
+        }
+        let sample = self.watch_sample(mono, &show).await;
         let alerts = self.studio().live_watch.lock().unwrap_or_else(|p| p.into_inner()).tick(&cfg, &sample);
         for a in &alerts {
             tracing::info!(id = %a.id, cleared = a.cleared, "live watch: {}", a.message);
