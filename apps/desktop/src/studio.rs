@@ -4258,6 +4258,25 @@ mod budget_tests {
         assert_eq!((load_settings(dir.path()).width, load_settings(dir.path()).fps), (2560, 60));
     }
 
+    /// An undo or redo storm saves after every step: through the queue the file ends as the last
+    /// state, whole, and no step waits on a disk write (agy GAPS #22).
+    #[test]
+    fn a_storm_of_steps_leaves_the_last_state_on_disk() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let file = dir.path().join("scenes.json");
+        let Ok(c) = Collection::new(Canvas { width: 640, height: 360, fps: 30 }, FIRST_SCENE) else { return };
+        let started = std::time::Instant::now();
+        for i in 0..100 {
+            let _ = c.add_scene(&format!("Scene {i}"));
+            save_confirmed(false, &c, &file);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "the steps didn't wait for the disk");
+        assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(20)));
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap_or_else(|e| panic!("{e}")))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(on_disk, c.save(COLLECTION), "the last state is what is on disk");
+    }
+
     #[test]
     fn deferred_safe_mode_collection_never_overwrites_saved_scenes() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));

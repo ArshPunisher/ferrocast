@@ -796,4 +796,28 @@ mod tests {
         assert_eq!(mine.len(), 2, "{mine:?}");
         assert!(mine[0].error.is_some() && mine[1].error.is_none());
     }
+
+    static STORM_WRITES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+        STORM_WRITES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(40));
+        write_json_bytes(path, bytes)
+    }
+
+    /// An undo storm (a key held down) saves the collection on every step: the writer coalesces
+    /// them, so a hundred quick saves are a handful of disk writes, and the last one is what is
+    /// on disk (agy GAPS #22).
+    #[test]
+    fn a_hundred_rapid_saves_are_a_few_writes_and_the_last_one_wins() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let path = dir.path().join("storm.json");
+        for v in 0..100 {
+            submit_with(&path, format!(r#"{{"v":{v}}}"#).into_bytes(), counting_write);
+        }
+        assert!(flush_saves(Duration::from_secs(20)));
+        let writes = STORM_WRITES.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(writes <= 5, "{writes} disk writes for 100 saves");
+        assert_eq!(std::fs::read(&path).unwrap_or_else(|e| panic!("{e}")), br#"{"v":99}"#);
+    }
 }
