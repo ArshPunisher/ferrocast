@@ -78,6 +78,73 @@ fn data_dir() -> PathBuf {
     dirs::data_dir().unwrap_or_else(std::env::temp_dir).join(name)
 }
 
+/// Maximum bytes in `ferrocast.log` before it rotates to `ferrocast.1.log` while running.
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Size-capped rotating log writer: keeps `ferrocast.log` under `max_bytes` with at most one
+/// rotated backup (`ferrocast.1.log`) even across week-long sessions.
+struct RotatingLogWriter {
+    path: PathBuf,
+    backup: PathBuf,
+    max_bytes: u64,
+    written: u64,
+    file: Option<std::fs::File>,
+}
+
+impl RotatingLogWriter {
+    fn open(dir: &std::path::Path, max_bytes: u64) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("ferrocast.log");
+        let backup = dir.join("ferrocast.1.log");
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() >= max_bytes) {
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::rename(&path, &backup);
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self { path, backup, max_bytes: max_bytes.max(1), written, file: Some(file) })
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        if let Some(mut f) = self.file.take() {
+            let _ = std::io::Write::flush(&mut f);
+        }
+        // Remove previous backup first so rename succeeds on Windows as well as Unix.
+        let _ = std::fs::remove_file(&self.backup);
+        let _ = std::fs::rename(&self.path, &self.backup);
+        let file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&self.path)?;
+        self.written = 0;
+        self.file = Some(file);
+        Ok(())
+    }
+}
+
+impl std::io::Write for RotatingLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written > 0 && self.written.saturating_add(buf.len() as u64) > self.max_bytes {
+            let _ = self.rotate();
+        }
+        let f = match self.file.as_mut() {
+            Some(f) => f,
+            None => {
+                let file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+                self.written = file.metadata().map(|m| m.len()).unwrap_or(0);
+                self.file.insert(file)
+            }
+        };
+        let n = f.write(buf)?;
+        self.written = self.written.saturating_add(n as u64);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(f) = self.file.as_mut() {
+            f.flush()?;
+        }
+        Ok(())
+    }
+}
+
 /// The log goes to the terminal and to `<data>/logs/ferrocast.log` (kept under 5 MB, one old
 /// file beside it), so a restart or a crash can be looked into afterwards. A panic is written
 /// there too.
@@ -87,14 +154,9 @@ fn init_tracing(dir: &std::path::Path) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,tao=warn,wry=warn"));
     let logs = dir.join("logs");
-    let file = std::fs::create_dir_all(&logs).ok().and_then(|()| {
-        let path = logs.join("ferrocast.log");
-        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
-            let _ = std::fs::rename(&path, logs.join("ferrocast.1.log"));
-        }
-        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
-    });
-    let to_file = file.map(|f| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)));
+    let writer = RotatingLogWriter::open(&logs, MAX_LOG_BYTES).ok();
+    let to_file =
+        writer.map(|w| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(w)));
     let _ = tracing_subscriber::registry().with(filter).with(tracing_subscriber::fmt::layer()).with(to_file).try_init();
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1460,5 +1522,28 @@ mod update_tests {
         );
         assert!(!failed);
         assert_eq!(*partial.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine"]);
+    }
+
+    #[test]
+    fn rotating_log_writer_caps_active_and_backup_while_running() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("ferrocast-log-rot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cap = 64 * 1024u64;
+        let mut w = RotatingLogWriter::open(&dir, cap).unwrap();
+        let line = vec![b'a'; 1024];
+        // Write 1 MB through a 64 KB cap (~16 rotations during a single live session).
+        for _ in 0..1024 {
+            w.write_all(&line).unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+        let cur_len = std::fs::metadata(dir.join("ferrocast.log")).unwrap().len();
+        let bak_len = std::fs::metadata(dir.join("ferrocast.1.log")).unwrap().len();
+        let file_count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(file_count, 2, "only active log and one backup");
+        assert!(cur_len <= cap, "active log exceeded cap: {cur_len} > {cap}");
+        assert!(bak_len <= cap, "backup log exceeded cap: {bak_len} > {cap}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

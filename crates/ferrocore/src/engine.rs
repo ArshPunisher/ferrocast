@@ -1402,6 +1402,7 @@ impl Engine {
                 (Live::Fed(Feed::default()), Some(Picture::solid(width.max(1), height.max(1), [0, 0, 0, 0])))
             }
         };
+        let clear_gpu = picture.is_none() && restart.is_none();
         let size = match &picture {
             Some(p) => {
                 self.gpu.upload(id, p)?;
@@ -1422,6 +1423,9 @@ impl Engine {
             prev
         };
         drop(gone);
+        if clear_gpu {
+            self.gpu.forget(id);
+        }
         Ok(())
     }
 
@@ -1575,7 +1579,13 @@ impl Engine {
             }
         });
         if let Err(e) = spawned {
-            self.lock().sources.remove(&id);
+            let mut st = self.lock();
+            st.sources.remove(&id);
+            self.levels.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
+            self.audio.send(AudioCmd::RemoveSource(id));
+            sync_heard(&mut st, &self.audio.cmd_sender());
+            drop(st);
+            self.gpu.forget(id);
             return Err(AvError::Source(format!("couldn't start opening it: {e}")));
         }
         match rx.recv_timeout(OPEN_WAIT) {
@@ -1787,6 +1797,15 @@ impl Engine {
         let mut st = self.lock();
         st.scenes.insert(name.to_string(), items);
         sync_heard(&mut st, &self.audio.cmd_sender());
+    }
+
+    /// Removes a scene by name (used to clean up temporary solo scenes after projectors,
+    /// screenshots, or isolated recordings finish).
+    pub fn remove_scene(&self, name: &str) {
+        let mut st = self.lock();
+        if st.scenes.remove(name).is_some() {
+            sync_heard(&mut st, &self.audio.cmd_sender());
+        }
     }
 
     /// Opens an OBS scene collection (the JSON OBS and Ferrocast's Studio save): its sources,

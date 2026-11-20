@@ -33,16 +33,53 @@ fn day_file(dir: &Path, at: i64) -> Option<PathBuf> {
     Some(dir.join(format!("{y:04}-{m:02}-{d:02}.jsonl")))
 }
 
-/// Appends lines to their day's file.
+/// Appends lines to their day's file, pruning files past the 30-day search window when a new
+/// day's file is started.
 pub(crate) fn keep(dir: &Path, lines: &[Line]) -> std::io::Result<()> {
     use std::io::Write;
     std::fs::create_dir_all(dir)?;
+    let mut created_day = None;
     for l in lines {
         let Some(file) = day_file(dir, l.at) else { continue };
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+        let is_new = !file.exists();
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&file)?;
         writeln!(f, "{}", serde_json::to_string(l).unwrap_or_default())?;
+        if is_new {
+            created_day = Some(created_day.map_or(l.at, |prev: i64| prev.max(l.at)));
+        }
+    }
+    if let Some(at) = created_day {
+        let _ = prune(dir, at);
     }
     Ok(())
+}
+
+/// Deletes daily transcript `.jsonl` files older than [`DAYS`] + 1 days (past the search window)
+/// so `<data>/transcripts/` stays bounded over months of streams. Returns how many files were
+/// removed.
+pub(crate) fn prune(dir: &Path, now: i64) -> usize {
+    let cutoff_ms = now.saturating_sub((DAYS + 1) * 86_400_000);
+    let (y, m, d) = ferrocast_core::chatbot::ymd(cutoff_ms);
+    let cutoff = format!("{y:04}-{m:02}-{d:02}.jsonl");
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let b = name.as_bytes();
+        // Match only `YYYY-MM-DD.jsonl` (16 bytes) so unrelated files are never touched.
+        let is_day_file = b.len() == 16
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && &b[10..] == b".jsonl"
+            && b[0..4].iter().all(u8::is_ascii_digit)
+            && b[5..7].iter().all(u8::is_ascii_digit)
+            && b[8..10].iter().all(u8::is_ascii_digit);
+        if is_day_file && name < cutoff.as_str() && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Lines said since `since` (Unix ms) whose words hold every word of `query` (any case, in any
@@ -138,5 +175,27 @@ mod tests {
         body.push_str("{not json\n");
         std::fs::write(&f, body).unwrap();
         assert_eq!(search(dir.path(), "hello", now - DAY, now).len(), 1);
+    }
+
+    #[test]
+    fn prune_removes_transcripts_beyond_30_day_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_793_300_000_000;
+        // Write 60 days of transcripts plus an unrelated note file.
+        std::fs::write(dir.path().join("notes.txt"), "keep").unwrap();
+        for d in 0..60 {
+            let at = now - d * DAY;
+            let f = day_file(dir.path(), at).unwrap();
+            std::fs::write(f, "{\"at\":1,\"text\":\"hi\"}\n").unwrap();
+        }
+        let removed = prune(dir.path(), now);
+        assert!(removed >= 28, "expected ~28 old day files pruned, got {removed}");
+        let remaining_jsonl = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+            .count();
+        assert!(remaining_jsonl <= (DAYS as usize) + 2, "kept {remaining_jsonl} day files");
+        assert!(dir.path().join("notes.txt").exists(), "unrelated files preserved");
     }
 }

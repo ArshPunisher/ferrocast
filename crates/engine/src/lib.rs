@@ -642,7 +642,8 @@ impl Engine {
     }
 }
 
-/// Deletes old chat from the log at start and every six hours (alerts and tips are kept).
+/// Deletes old chat, stale ephemeral TTS audio, and expired daily transcripts at start and every
+/// six hours (alerts, tips, and user-uploaded media are kept).
 async fn prune(engine: Engine) {
     loop {
         let days = engine.settings().keep_chat_days.max(1);
@@ -650,6 +651,34 @@ async fn prune(engine: Engine) {
             Ok(n) if n > 0 => tracing::info!(removed = n, "pruned old chat"),
             Ok(_) => {}
             Err(err) => tracing::warn!(%err, "couldn't prune old chat"),
+        }
+        // Clean up orphaned ephemeral TTS files older than 1 hour, preserving any alert still in
+        // the queue and any cached voice previews.
+        let mut keep_ids = engine.cloud_tts().preview_ids();
+        {
+            let q = engine.inner.queue.lock().await;
+            if let Some(id) = q.playing().and_then(|p| p.alert.tts_audio.as_ref()) {
+                keep_ids.push(id.clone());
+            }
+            for w in q.waiting() {
+                if let Some(id) = w.alert.tts_audio.as_ref() {
+                    keep_ids.push(id.clone());
+                }
+            }
+        }
+        let cutoff = now().0 - 3_600_000;
+        match engine.db(move |s| repo::media::prune_speech(s, cutoff, &keep_ids)).await {
+            Ok(n) if n > 0 => tracing::info!(removed = n, "pruned old tts audio"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(%err, "couldn't prune old tts audio"),
+        }
+        if let Some(dir) = engine.transcript_dir() {
+            let now_ms = now().0;
+            if let Ok(n) = tokio::task::spawn_blocking(move || crate::studio::transcript::prune(&dir, now_ms)).await
+                && n > 0
+            {
+                tracing::info!(removed = n, "pruned old transcripts");
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
     }

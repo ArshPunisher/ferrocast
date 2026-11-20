@@ -316,9 +316,10 @@ impl Media {
             }
         }
         let url_text = path.to_string_lossy().to_string();
-        // Probe on this thread, so a bad or unsupported file falls back to FFmpeg at once.
+        // Probe on this thread inside an autorelease pool so playlist item opens on raw Rust
+        // threads never leak Objective-C temporaries.
         // SAFETY: AVFoundation objects made and read on this thread.
-        let av_probe: Result<(bool, bool, u64), String> = unsafe {
+        let av_probe: Result<(bool, bool, u64), String> = objc2::rc::autoreleasepool(|_| unsafe {
             let url = NSURL::fileURLWithPath(&NSString::from_str(&url_text));
             let asset = AVURLAsset::URLAssetWithURL_options(&url, None);
             #[allow(deprecated)]
@@ -336,7 +337,7 @@ impl Media {
             } else {
                 can_read_with_avfoundation(&asset).map(|()| (v, a, dur))
             }
-        };
+        });
         let (has_video, has_audio, duration_ns) = match av_probe {
             Ok(info) => info,
             Err(av_why) => match crate::ffsrc::Media::open_for_card_with(path, options, start_stopped) {
@@ -525,9 +526,12 @@ fn read(
     shared: &Shared,
     stop: &AtomicBool,
 ) {
-    // SAFETY: AVFoundation objects made and used on this thread only.
-    let asset =
-        unsafe { AVURLAsset::URLAssetWithURL_options(&NSURL::fileURLWithPath(&NSString::from_str(url_text)), None) };
+    // SAFETY: AVFoundation objects made and used on this thread only; wrap asset creation, each
+    // pass setup, and each decoded sample in an autorelease pool so looping media never leaks
+    // Objective-C temporaries on this raw Rust thread.
+    let asset = objc2::rc::autoreleasepool(|_| unsafe {
+        AVURLAsset::URLAssetWithURL_options(&NSURL::fileURLWithPath(&NSString::from_str(url_text)), None)
+    });
     let clear = || {
         if let Ok(mut q) = shared.frames.lock() {
             q.clear();
@@ -592,7 +596,7 @@ fn read(
             }
             follows = None;
         }
-        let pass = match open_pass(&asset, from) {
+        let pass = match objc2::rc::autoreleasepool(|_| open_pass(&asset, from)) {
             Ok(p) => p,
             Err(e) => {
                 shared.give_up(&e);
@@ -606,8 +610,9 @@ fn read(
         }
         resampler.reset();
         let base_host_ns = follows.unwrap_or_else(|| host_ns() + 100_000_000);
-        let (mut v_next, mut a_next) =
-            (pass.video.as_ref().and_then(|o| next(o)), pass.audio.as_ref().and_then(|o| next(o)));
+        let (mut v_next, mut a_next) = objc2::rc::autoreleasepool(|_| {
+            (pass.video.as_ref().and_then(|o| next(o)), pass.audio.as_ref().and_then(|o| next(o)))
+        });
         // Anchor on the first sample's PTS when playing from 0 so trimmed files with non-zero
         // container start_pts (e.g. 5 s) start immediately rather than waiting 5 s.
         let base_pts_ns: i128 = if from == 0 {
@@ -653,48 +658,51 @@ fn read(
                 }
             }
             let horizon = host_ns() + AHEAD_NS;
-            let mut moved = false;
-            if let Some(s) = &v_next {
-                let pts = pts_signed_ns(s);
-                let at = schedule_at(base_host_ns, base_pts_ns, pts, speed_percent);
-                let room = shared.frames.lock().map(|q| frame_queue_has_room(&q)).unwrap_or(false);
-                if at <= horizon && room {
-                    // SAFETY: the decoded frame's pixel buffer is live with its sample buffer.
-                    if let Some(img) = unsafe { s.image_buffer() }
-                        && let Some(p) = super::screen::copy_bgra(&img)
-                        && let Ok(mut q) = shared.frames.lock()
-                    {
-                        let pos_ns = pts.max(0) as u64;
-                        q.push_back((Picture { premultiplied: false, ..p }, at, pos_ns));
-                    }
-                    last_end = last_end.max(pts);
-                    v_next = pass.video.as_ref().and_then(|o| next(o));
-                    moved = true;
-                }
-            }
-            if let Some(s) = &a_next {
-                let pts = pts_signed_ns(s);
-                let at = schedule_at(base_host_ns, base_pts_ns, pts, speed_percent);
-                let room = shared.sound.lock().map(|q| q.len() < MAX_SOUND).unwrap_or(false);
-                if at <= horizon && room {
-                    if let Some(raw) = sound_of(s) {
-                        let orig_frames = (raw.len() / 2) as i128;
-                        last_end = last_end.max(pts + orig_frames * 1_000_000_000 / 48_000);
-                        // A file with no picture keeps its place by its sound.
-                        if pass.video.is_none() {
-                            shared.position.store(pts.max(0) as u64, Ordering::Relaxed);
-                        }
-                        let pcm = resampler.process(raw);
-                        if !pcm.is_empty()
-                            && let Ok(mut q) = shared.sound.lock()
+            let moved = objc2::rc::autoreleasepool(|_| {
+                let mut moved = false;
+                if let Some(s) = &v_next {
+                    let pts = pts_signed_ns(s);
+                    let at = schedule_at(base_host_ns, base_pts_ns, pts, speed_percent);
+                    let room = shared.frames.lock().map(|q| frame_queue_has_room(&q)).unwrap_or(false);
+                    if at <= horizon && room {
+                        // SAFETY: the decoded frame's pixel buffer is live with its sample buffer.
+                        if let Some(img) = unsafe { s.image_buffer() }
+                            && let Some(p) = super::screen::copy_bgra(&img)
+                            && let Ok(mut q) = shared.frames.lock()
                         {
-                            q.push_back((pcm, at));
+                            let pos_ns = pts.max(0) as u64;
+                            q.push_back((Picture { premultiplied: false, ..p }, at, pos_ns));
                         }
+                        last_end = last_end.max(pts);
+                        v_next = pass.video.as_ref().and_then(|o| next(o));
+                        moved = true;
                     }
-                    a_next = pass.audio.as_ref().and_then(|o| next(o));
-                    moved = true;
                 }
-            }
+                if let Some(s) = &a_next {
+                    let pts = pts_signed_ns(s);
+                    let at = schedule_at(base_host_ns, base_pts_ns, pts, speed_percent);
+                    let room = shared.sound.lock().map(|q| q.len() < MAX_SOUND).unwrap_or(false);
+                    if at <= horizon && room {
+                        if let Some(raw) = sound_of(s) {
+                            let orig_frames = (raw.len() / 2) as i128;
+                            last_end = last_end.max(pts + orig_frames * 1_000_000_000 / 48_000);
+                            // A file with no picture keeps its place by its sound.
+                            if pass.video.is_none() {
+                                shared.position.store(pts.max(0) as u64, Ordering::Relaxed);
+                            }
+                            let pcm = resampler.process(raw);
+                            if !pcm.is_empty()
+                                && let Ok(mut q) = shared.sound.lock()
+                            {
+                                q.push_back((pcm, at));
+                            }
+                        }
+                        a_next = pass.audio.as_ref().and_then(|o| next(o));
+                        moved = true;
+                    }
+                }
+                moved
+            });
             if !moved
                 && let Ok(st) = shared.cmd.lock()
                 && st.queue.is_empty()
@@ -704,19 +712,24 @@ fn read(
             }
         }
         // A reader that failed part way ends the pass as the end of the file does; say why.
-        // SAFETY: the reader belongs to this thread.
-        let failed = unsafe { pass.reader.status() == AVAssetReaderStatus::Failed };
-        if failed
-            && !stop.load(Ordering::Acquire)
-            && let Ok(mut err) = shared.error.lock()
-        {
-            // SAFETY: as above.
-            let why = unsafe { pass.reader.error() }.map(|e| e.localizedDescription().to_string());
-            *err =
-                Some(format!("the media stopped being readable ({})", why.unwrap_or_else(|| "no reason given".into())));
-        }
-        // SAFETY: the reader belongs to this thread.
-        unsafe { pass.reader.cancelReading() };
+        let failed = objc2::rc::autoreleasepool(|_| {
+            // SAFETY: the reader belongs to this thread.
+            let failed = unsafe { pass.reader.status() == AVAssetReaderStatus::Failed };
+            if failed
+                && !stop.load(Ordering::Acquire)
+                && let Ok(mut err) = shared.error.lock()
+            {
+                // SAFETY: as above.
+                let why = unsafe { pass.reader.error() }.map(|e| e.localizedDescription().to_string());
+                *err = Some(format!(
+                    "the media stopped being readable ({})",
+                    why.unwrap_or_else(|| "no reason given".into())
+                ));
+            }
+            // SAFETY: the reader belongs to this thread.
+            unsafe { pass.reader.cancelReading() };
+            failed
+        });
         if stop.load(Ordering::Acquire) {
             return;
         }

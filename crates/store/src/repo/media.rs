@@ -233,6 +233,33 @@ pub fn delete(store: &Store, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Removes synthesized alert TTS files (`speech.wav`, `speech.ogg`) older than `older_than_ms`
+/// (Unix ms) that are not in `keep_ids`, deleting both their database rows and disk files.
+pub fn prune_speech(store: &Store, older_than_ms: i64, keep_ids: &[String]) -> Result<usize> {
+    let candidates: Vec<String> = store.read(|c| {
+        let mut st = c.prepare(
+            "SELECT id FROM media WHERE kind = 'sound' AND name IN ('speech.wav', 'speech.ogg') AND created_at < ?1",
+        )?;
+        Ok(st.query_map([older_than_ms], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    })?;
+    let victims: Vec<String> = candidates.into_iter().filter(|id| !keep_ids.iter().any(|k| k == id)).collect();
+    if victims.is_empty() {
+        return Ok(0);
+    }
+    let removed = store.write(|tx| {
+        let mut n = 0usize;
+        for id in &victims {
+            n += tx.execute("DELETE FROM media WHERE id = ?1", [id])?;
+        }
+        Ok(n)
+    })?;
+    let dir = media_dir(store);
+    for id in &victims {
+        let _ = std::fs::remove_file(dir.join(id));
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +301,35 @@ mod tests {
         let mut big = b"ID3".to_vec();
         big.resize(6 * 1024 * 1024, 0);
         assert!(matches!(save(&s, "a.mp3", &big), Err(SaveError::Upload(UploadError::TooBig(_)))));
+    }
+
+    #[test]
+    fn prune_speech_deletes_old_unkept_tts_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let wav = b"RIFF\0\0\0\0WAVEfmt ";
+        let ogg = b"OggS\0\0\0\0";
+        let old_wav = save(&s, "speech.wav", wav).unwrap();
+        let old_ogg = save(&s, "speech.ogg", ogg).unwrap();
+        let kept_ogg = save(&s, "speech.ogg", ogg).unwrap();
+        let user_wav = save(&s, "alert.wav", wav).unwrap();
+        // Backdate every row so `older_than_ms` selects only eligible speech files.
+        let past = now_ms() - 7_200_000;
+        s.write(|tx| {
+            tx.execute("UPDATE media SET created_at = ?1", [past])?;
+            Ok(())
+        })
+        .unwrap();
+        let fresh_wav = save(&s, "speech.wav", wav).unwrap();
+
+        let removed = prune_speech(&s, now_ms() - 3_600_000, std::slice::from_ref(&kept_ogg.id)).unwrap();
+        assert_eq!(removed, 2);
+        assert!(get(&s, &old_wav.id).unwrap().is_none());
+        assert!(!dir.path().join("media").join(&old_wav.id).exists());
+        assert!(get(&s, &old_ogg.id).unwrap().is_none());
+        assert!(!dir.path().join("media").join(&old_ogg.id).exists());
+        assert!(get(&s, &kept_ogg.id).unwrap().is_some(), "kept preview/active alert preserved");
+        assert!(get(&s, &user_wav.id).unwrap().is_some(), "user upload preserved");
+        assert!(get(&s, &fresh_wav.id).unwrap().is_some(), "fresh tts preserved");
     }
 }

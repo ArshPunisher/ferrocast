@@ -5,7 +5,7 @@
 //! API call needs a session token, the `Host` header must name this server, and a present
 //! `Origin` must be our own.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -19,12 +19,18 @@ use crate::error::ApiError;
 pub const PAIR_TTL: Duration = Duration::from_secs(120);
 /// More failed pairings than this in a minute locks pairing for that minute.
 const MAX_PAIR_FAILURES: usize = 10;
+/// Maximum paired browser/phone session tokens kept alongside the desktop token (oldest evicted).
+const MAX_PAIRED_TOKENS: usize = 64;
+/// Maximum outstanding unredeemed pairing codes at once.
+const MAX_PENDING_CODES: usize = 64;
 /// Alphabet without look-alikes (no 0/O, 1/I/L) so codes can be typed from a phone.
 const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 
 #[derive(Debug)]
 pub struct Sessions {
-    tokens: Mutex<HashSet<String>>,
+    /// Paired browser/phone tokens (oldest evicted at [`MAX_PAIRED_TOKENS`]); the desktop token
+    /// is checked directly and never evicted.
+    tokens: Mutex<VecDeque<String>>,
     codes: Mutex<HashMap<String, Instant>>,
     failures: Mutex<VecDeque<Instant>>,
     desktop: String,
@@ -33,10 +39,8 @@ pub struct Sessions {
 impl Sessions {
     pub fn new() -> Self {
         let desktop = random_hex(32);
-        let mut tokens = HashSet::new();
-        tokens.insert(desktop.clone());
         Sessions {
-            tokens: Mutex::new(tokens),
+            tokens: Mutex::new(VecDeque::new()),
             codes: Mutex::new(HashMap::new()),
             failures: Mutex::new(VecDeque::new()),
             desktop,
@@ -50,6 +54,9 @@ impl Sessions {
 
     /// Constant-time check so response timing doesn't leak how much of a token matched.
     pub fn valid(&self, token: &str) -> bool {
+        if bool::from(self.desktop.as_bytes().ct_eq(token.as_bytes())) {
+            return true;
+        }
         let tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
         tokens.iter().any(|t| t.as_bytes().ct_eq(token.as_bytes()).into())
     }
@@ -62,6 +69,12 @@ impl Sessions {
         let mut codes = self.codes.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
         codes.retain(|_, at| now.duration_since(*at) < PAIR_TTL);
+        while codes.len() >= MAX_PENDING_CODES {
+            let Some(oldest) = codes.iter().min_by_key(|(_, at)| **at).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            codes.remove(&oldest);
+        }
         codes.insert(code.clone(), now);
         code
     }
@@ -96,7 +109,11 @@ impl Sessions {
             .hint("Make a new link in the app: Settings → Open in browser."));
         }
         let token = random_hex(32);
-        self.tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(token.clone());
+        let mut tokens = self.tokens.lock().unwrap_or_else(|p| p.into_inner());
+        while tokens.len() >= MAX_PAIRED_TOKENS {
+            tokens.pop_front();
+        }
+        tokens.push_back(token.clone());
         Ok(token)
     }
 }
@@ -212,5 +229,23 @@ mod tests {
         assert_eq!(bearer(&headers(&[(AUTHORIZATION, "Bearer abc")])), Some("abc"));
         assert_eq!(bearer(&headers(&[(AUTHORIZATION, "Basic abc")])), None);
         assert_eq!(bearer(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn sessions_and_codes_stay_capped_and_keep_desktop_token() {
+        let s = Sessions::new();
+        for _ in 0..200 {
+            let _ = s.new_code();
+        }
+        assert!(s.codes.lock().unwrap().len() <= MAX_PENDING_CODES);
+        let mut issued = Vec::new();
+        for _ in 0..200 {
+            let code = s.new_code();
+            issued.push(s.pair(&code).unwrap());
+        }
+        assert_eq!(s.tokens.lock().unwrap().len(), MAX_PAIRED_TOKENS);
+        assert!(s.valid(s.desktop_token()), "desktop token is never evicted");
+        assert!(!s.valid(&issued[0]), "oldest paired token was evicted");
+        assert!(s.valid(issued.last().unwrap()), "newest paired token remains valid");
     }
 }

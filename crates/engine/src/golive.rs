@@ -1686,6 +1686,8 @@ impl Engine {
         self.save_golive(cfg).await?;
         drop(one_at_a_time);
         let _ = self.inner.secrets.delete(&format!("{CUSTOM_KEY_PREFIX}{id}"));
+        lock(&self.golive().failed).remove(id);
+        lock(&self.golive().failed_alerted).remove(id);
         self.reconcile().await;
         Ok(())
     }

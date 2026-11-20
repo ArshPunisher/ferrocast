@@ -1321,21 +1321,45 @@ fn follow_apps(
             if stopped.load(Ordering::Acquire) || shared.has_stopped.load(Ordering::Acquire) {
                 return;
             }
-            let Ok(c) = content() else { continue };
-            // SAFETY: the content is live; the stream is live (this thread holds it).
-            unsafe {
-                let Ok((filter, pids)) = apps_filter(&c, display, &names, only) else { continue };
-                if pids == hidden || stopped.load(Ordering::Acquire) || shared.has_stopped.load(Ordering::Acquire) {
-                    continue;
+            // Drain Objective-C autoreleased objects every poll tick on this raw Rust thread
+            // (matches OBS `mac-window-capture.m` `@autoreleasepool`), and skip allocating a new
+            // `SCContentFilter` when the matching PIDs haven't changed.
+            objc2::rc::autoreleasepool(|_| {
+                let Ok(c) = content() else { return };
+                // SAFETY: the content is live; the stream is live (this thread holds it).
+                unsafe {
+                    let (apps, pids) = hidden_apps(&c, &names);
+                    if pids == hidden || stopped.load(Ordering::Acquire) || shared.has_stopped.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(d) = c.displays().iter().find(|d| d.displayID() == display) else {
+                        return;
+                    };
+                    let none: Retained<NSArray<SCWindow>> = NSArray::new();
+                    let filter = if only {
+                        SCContentFilter::initWithDisplay_includingApplications_exceptingWindows(
+                            SCContentFilter::alloc(),
+                            &d,
+                            &apps,
+                            &none,
+                        )
+                    } else {
+                        SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                            SCContentFilter::alloc(),
+                            &d,
+                            &apps,
+                            &none,
+                        )
+                    };
+                    if apply_filter_update(
+                        &shared,
+                        |done| stream.0.updateContentFilter_completionHandler(&filter, Some(&done)),
+                        FILTER_WAIT,
+                    ) {
+                        hidden = pids;
+                    }
                 }
-                if apply_filter_update(
-                    &shared,
-                    |done| stream.0.updateContentFilter_completionHandler(&filter, Some(&done)),
-                    FILTER_WAIT,
-                ) {
-                    hidden = pids;
-                }
-            }
+            });
         }
     });
     PrivacyStop { flag, wake }
