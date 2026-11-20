@@ -5112,7 +5112,8 @@ impl Stage {
             }
             None => Box::new(|_, _, _, _| {}),
         };
-        let hooks = crate::ffi::projector_window::Hooks { click, close: on_close, resize };
+        let hooks =
+            crate::ffi::projector_window::Hooks { click, close: on_close, resize, hide_cursor: Default::default() };
         let Some(win) = crate::ffi::projector_window::open(&title, aspect, screen, hooks) else {
             if let Some(name) = &alone {
                 shared.release_alone(name);
@@ -5155,6 +5156,11 @@ impl StageProjector {
     /// Keeps the window above the others, or not.
     pub fn set_on_top(&self, on: bool) {
         self.win.set_on_top(on);
+    }
+
+    /// Hides the pointer while it is over the window (OBS's "Hide cursor over projectors").
+    pub fn set_hide_cursor(&self, on: bool) {
+        self.win.set_hide_cursor(on);
     }
 
     /// A multiview follows the scenes, Studio Mode's preview and its look (nothing to do when
