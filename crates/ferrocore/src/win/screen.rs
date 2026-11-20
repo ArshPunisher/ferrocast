@@ -2,7 +2,7 @@
 //! else a display through Desktop Duplication (FFmpeg's `ddagrab`; GDI's `gdigrab` where that
 //! isn't there) and a window through GDI; and what the computer plays through WASAPI's loopback.
 
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
@@ -19,7 +19,7 @@ use windows::core::BOOL;
 
 use crate::ffsrc::Live;
 use crate::sound_in::{Heal, SoundIn, Which};
-use crate::win_logic::{WinMonitor, pick_win_monitor};
+use crate::win_logic::{WinMonitor, pick_win_monitor, strip_exe_suffix};
 use crate::{AvError, Picture};
 
 /// A frame of the screen as BGRA, sent to the card without a colour swap.
@@ -158,22 +158,35 @@ fn app_of(hwnd: HWND) -> String {
     let mut pid = 0u32;
     // SAFETY: a window handle from EnumWindows; `pid` is ours.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    // SAFETY: opening for a query only; the handle is closed by its own drop.
+    // SAFETY: opening for a query only; the handle is closed unconditionally below.
     let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { return String::new() };
-    let mut buf = [0u16; 520];
-    let mut len = buf.len() as u32;
-    // SAFETY: the buffer and its length are ours.
-    let ok =
-        unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len) };
+    let mut buf = vec![0u16; 520];
+    let mut path_len = None;
+    loop {
+        let mut len = buf.len() as u32;
+        // SAFETY: `buf` is uniquely owned and `len` matches its capacity.
+        match unsafe {
+            QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len)
+        } {
+            Ok(()) => {
+                path_len = Some(len as usize);
+                break;
+            }
+            Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() && buf.len() < 32_768 => {
+                buf.resize((buf.len() * 2).min(32_768), 0);
+            }
+            Err(_) => break,
+        }
+    }
     // SAFETY: closing the handle opened above.
     unsafe {
         let _ = windows::Win32::Foundation::CloseHandle(h);
     }
-    if ok.is_err() {
+    let Some(len) = path_len else {
         return String::new();
-    }
-    let path = String::from_utf16_lossy(&buf[..len as usize]);
-    path.rsplit(['\\', '/']).next().unwrap_or("").trim_end_matches(".exe").to_string()
+    };
+    let path = String::from_utf16_lossy(&buf[..len]);
+    strip_exe_suffix(path.rsplit(['\\', '/']).next().unwrap_or("")).to_string()
 }
 
 /// A window someone would pick, by OBS's rules: not a tool window (tray helpers, overlays like
@@ -445,6 +458,13 @@ impl ScreenCapture {
             }
         };
         Ok(ScreenCapture { live: Some(Pictures::Ffmpeg(live)), sound })
+    }
+
+    /// What the computer plays (Desktop Audio) directly via WASAPI loopback, without touching
+    /// display or window enumeration so headless and monitor-off Windows PCs still work.
+    pub fn start_desktop_sound() -> Result<Self, AvError> {
+        let sound = SoundIn::start(Which::Loopback)?;
+        Ok(ScreenCapture { live: None, sound: Some(Heal::new(sound, Which::Loopback, false)) })
     }
 
     /// One app's sound only (OBS's Application Audio Capture), by its program's name ("chrome"):

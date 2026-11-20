@@ -161,9 +161,7 @@ impl SoundIn {
                     crate::win::app_sound::run(pid, st.clone(), tx, |data| keep(&s2, conv.push(data)));
                     // Back while not asked to stop: the app's sound ended (it quit, or Windows
                     // let go of it). Said, so the watchdog starts it again.
-                    if !st.load(Ordering::Acquire) {
-                        fault(&s, "the app's sound stopped".into());
-                    }
+                    note_unexpected_exit(&st, &s, "the app's sound stopped");
                 },
             );
         }
@@ -176,7 +174,11 @@ impl SoundIn {
                 |st, tx, s| {
                     crate::afx::enable_ftz_daz();
                     let mut conv = Convert::new(2, RATE);
-                    crate::win::app_sound::run_excluding_self(st, tx, |data| keep(&s, conv.push(data)));
+                    let s2 = s.clone();
+                    crate::win::app_sound::run_excluding_self(st.clone(), tx, |data| keep(&s2, conv.push(data)));
+                    // Back while not asked to stop: audio service restarted or endpoint dropped.
+                    // Record the fault so `Heal` or the watchdog restarts desktop audio.
+                    note_unexpected_exit(&st, &s, "the computer's sound stopped");
                 },
             ) {
                 Ok(si) => return Ok(si),
@@ -473,6 +475,13 @@ fn open(which: &Which, sound: Pieces) -> Result<(cpal::Stream, Option<String>), 
     Ok((stream, device_id))
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn note_unexpected_exit(stop: &AtomicBool, sound: &Pieces, why: &str) {
+    if !stop.load(Ordering::Acquire) {
+        fault(sound, why.into());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +578,22 @@ mod tests {
         let p = c.push(&six);
         assert_eq!(p.len(), 2, "2048 frames: two pieces of 1024");
         assert_eq!(&p[0][2..4], &[0.25, 0.5]);
+    }
+
+    #[test]
+    fn unexpected_loopback_exit_records_fault_while_requested_stop_does_not() {
+        let sound: Pieces = Arc::default();
+        let stop = AtomicBool::new(true);
+        note_unexpected_exit(&stop, &sound, "the computer's sound stopped");
+        assert_eq!(sound.fault.lock().ok().and_then(|e| e.clone()), None, "normal stop leaves fault empty");
+
+        let crashed: Pieces = Arc::default();
+        let running = AtomicBool::new(false);
+        note_unexpected_exit(&running, &crashed, "the computer's sound stopped");
+        assert_eq!(
+            crashed.fault.lock().ok().and_then(|e| e.clone()).as_deref(),
+            Some("the computer's sound stopped"),
+            "unexpected exit reports a fault so Heal/watchdog restarts desktop audio"
+        );
     }
 }

@@ -75,6 +75,15 @@ pub use compose::bt709_limited;
 pub use compose::{Compositor, PendingNv12};
 pub use transform::{Affine, BOTTOM, Bounds, LEFT, Placement, RIGHT, TOP, cropped, draw_transform, output_scale};
 
+/// Sleeps for `dur` with sub-millisecond timer granularity on Windows (a high-resolution waitable
+/// timer instead of the 15.625 ms default `Sleep` tick) and `std::thread::sleep` elsewhere.
+pub(crate) fn sleep_precise(dur: std::time::Duration) {
+    #[cfg(target_os = "windows")]
+    win::timer::sleep(dur);
+    #[cfg(not(target_os = "windows"))]
+    std::thread::sleep(dur);
+}
+
 /// Reads a file a collection names, safely: a plain file only (never a device or a pipe, which
 /// could be read forever) and at most `max` bytes (more is an error saying so).
 pub fn read_file(path: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {

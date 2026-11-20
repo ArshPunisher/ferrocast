@@ -3754,7 +3754,7 @@ fn run(
     while !stop.load(Ordering::Acquire) {
         let now = now_ns();
         if now < next {
-            std::thread::sleep(Duration::from_nanos((next - now).min(5_000_000)));
+            crate::sleep_precise(Duration::from_nanos((next - now).min(5_000_000)));
             continue;
         }
         // Fell behind by more than a frame: skip ahead instead of rushing (as libobs does).
@@ -3782,7 +3782,7 @@ fn run(
         // on GitHub's runner, every Studio call stuck behind it (19 Nov). On time, the loop
         // sleeps until the next frame anyway.
         if now_ns() >= next {
-            std::thread::sleep(Duration::from_millis(1));
+            crate::sleep_precise(Duration::from_millis(1));
         }
         if let Err(p) = ok {
             // A fault in a frame is that frame lost, not the engine: the next one is drawn.
@@ -3976,8 +3976,11 @@ fn open_capture(config: &EngineConfig, kind: &SourceKind) -> Option<Result<Live,
         SourceKind::DesktopSound => {
             ScreenCapture::start_with(Target::Display(0), 2, 2, 1, false, true, &[]).map(Live::Screen)
         }
+        // Windows reads WASAPI loopback directly without enumerating displays or windows.
+        #[cfg(target_os = "windows")]
+        SourceKind::DesktopSound => ScreenCapture::start_desktop_sound().map(Live::Screen),
         // ScreenCaptureKit gives the sound with a display's picture: the smallest, slowest one.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         SourceKind::DesktopSound => crate::screen::shareable()
             .and_then(|s| {
                 s.0.first()
@@ -4561,7 +4564,10 @@ fn frame(
                 #[cfg(target_os = "windows")]
                 if let Some((p, _)) = cap.take_nv12() {
                     uploads.push((*id, Fresh::Yuv(p)));
+                } else if let Some((p, _)) = cap.take_frame() {
+                    uploads.push((*id, Fresh::Pic(p)));
                 }
+                #[cfg(not(target_os = "windows"))]
                 if let Some((p, _)) = cap.take_frame() {
                     uploads.push((*id, Fresh::Pic(p)));
                 }

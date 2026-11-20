@@ -782,7 +782,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                             let mut parts = t.split(':').map(|p| p.replace("#3A", ":"));
                             let title = parts.next().unwrap_or_default();
                             let exe = parts.nth(1).unwrap_or_default();
-                            (exe.trim_end_matches(".exe").to_string(), title)
+                            (crate::win_logic::strip_exe_suffix(&exe).to_string(), title)
                         }
                         _ => (text_of("owner_name"), text_of("window_name")),
                     };
@@ -800,7 +800,7 @@ fn kind_from(id: &str, s: &Value, canvas: (u32, u32), hide: &[String]) -> Result
                 // program is what's heard (its first open window's process).
                 let w = text_of("window");
                 let app = w.rsplit(':').next().unwrap_or("").replace("#3A", ":");
-                let app = app.trim_end_matches(".exe").trim_end_matches(".EXE").to_string();
+                let app = crate::win_logic::strip_exe_suffix(&app).to_string();
                 if app.is_empty() {
                     return Err("an Application Audio Capture with no app picked".into());
                 }

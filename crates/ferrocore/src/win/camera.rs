@@ -119,9 +119,14 @@ impl Capture {
         Ok(Capture { live: None, sound: Some(SoundIn::start(Which::Input(Some(id.to_string())))?) })
     }
 
-    /// The newest picture and when it came (taken).
+    /// The newest picture and when it came (taken), converting NV12 to RGBA when the camera
+    /// delivers NV12 (e.g. one-shot picker thumbnails).
     pub fn take_frame(&self) -> Option<(Picture, u64)> {
-        self.live.as_ref()?.take()
+        let live = self.live.as_ref()?;
+        live.take().or_else(|| {
+            let (nv12, t) = live.take_nv12()?;
+            Some((nv12.to_picture()?, t))
+        })
     }
 
     /// The newest NV12 picture and when it came (taken), for GPU upload without CPU RGBA copy.

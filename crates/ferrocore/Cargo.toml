@@ -42,6 +42,8 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
+    # Needed by CreateWaitableTimerExW's optional SECURITY_ATTRIBUTES parameter (high-res timers).
+    "Win32_Security",
     # Whether a window is cloaked (left out of the window list).
     "Win32_Graphics_Dwm",
     # Windows' own capture (Windows.Graphics.Capture) through Direct3D 11.

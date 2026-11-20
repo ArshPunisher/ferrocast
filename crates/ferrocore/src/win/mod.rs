@@ -9,6 +9,7 @@ pub mod app_sound;
 pub mod camera;
 pub(crate) mod power;
 pub mod screen;
+pub(crate) mod timer;
 pub mod wgc;
 
 /// Video and sound files.

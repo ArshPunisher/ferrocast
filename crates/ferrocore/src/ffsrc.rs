@@ -82,6 +82,51 @@ pub struct Nv12Picture {
     pub full_range: bool,
 }
 
+impl Nv12Picture {
+    /// Converts this NV12 frame into an RGBA [`Picture`] on the CPU using the same BT.709/BT.601
+    /// and TV/full-range matrix as the GPU compositor (`compose::yuv_rows`). Used for one-shot
+    /// camera picker thumbnails on Windows where capture streams stay in NV12.
+    pub fn to_picture(&self) -> Option<Picture> {
+        let w = usize::try_from(self.width).ok()?;
+        let h = usize::try_from(self.height).ok()?;
+        if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+            return None;
+        }
+        let y_len = w.checked_mul(h)?;
+        let uv_len = y_len / 2;
+        let need = y_len.checked_add(uv_len)?;
+        if self.data.len() < need {
+            return None;
+        }
+        let rgba_len = y_len.checked_mul(4)?;
+        let mut rgba = vec![0u8; rgba_len];
+        let m = crate::compose::yuv_rows(self.bt709, self.full_range);
+        let y_plane = &self.data[..y_len];
+        let uv_plane = &self.data[y_len..need];
+        const INV_255: f32 = 1.0 / 255.0;
+        for row in 0..h {
+            let y_row = &y_plane[row * w..(row + 1) * w];
+            let uv_row = &uv_plane[(row / 2) * w..(row / 2 + 1) * w];
+            let dst_row = &mut rgba[row * w * 4..(row + 1) * w * 4];
+            let (dst_pixels, _) = dst_row.as_chunks_mut::<4>();
+            for (col, (&y_byte, dst)) in y_row.iter().zip(dst_pixels.iter_mut()).enumerate() {
+                let uv_at = col & !1;
+                let y = f32::from(y_byte) * INV_255;
+                let u = f32::from(uv_row[uv_at]) * INV_255;
+                let v = f32::from(uv_row[uv_at + 1]) * INV_255;
+                let r = (m[0] * y + m[1] * u + m[2] * v + m[3]).clamp(0.0, 1.0);
+                let g = (m[4] * y + m[5] * u + m[6] * v + m[7]).clamp(0.0, 1.0);
+                let b = (m[8] * y + m[9] * u + m[10] * v + m[11]).clamp(0.0, 1.0);
+                dst[0] = (r * 255.0).round() as u8;
+                dst[1] = (g * 255.0).round() as u8;
+                dst[2] = (b * 255.0).round() as u8;
+                dst[3] = 255;
+            }
+        }
+        Some(Picture { width: self.width, height: self.height, rgba, premultiplied: false })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProbeFail {
     Timeout,
@@ -2345,5 +2390,54 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nv12_to_picture_converts_tv_and_full_range_and_rejects_invalid_buffers() {
+        let make = |y: u8, u: u8, v: u8, bt709: bool, full_range: bool| {
+            let mut data = vec![y; 4 * 4];
+            for _ in 0..(2 * 2) {
+                data.push(u);
+                data.push(v);
+            }
+            Nv12Picture { width: 4, height: 4, data, bt709, full_range }
+        };
+
+        // TV-range black (Y=16, UV=128) and white (Y=235, UV=128).
+        let black = make(16, 128, 128, true, false).to_picture().unwrap_or_else(|| panic!("expected picture"));
+        assert_eq!(&black.rgba[..4], &[0, 0, 0, 255]);
+        let white = make(235, 128, 128, true, false).to_picture().unwrap_or_else(|| panic!("expected picture"));
+        assert_eq!(&white.rgba[..4], &[255, 255, 255, 255]);
+
+        // Full-range MJPEG black (Y=0, UV=128) and white (Y=255, UV=128).
+        let pc_black = make(0, 128, 128, false, true).to_picture().unwrap_or_else(|| panic!("expected picture"));
+        assert_eq!(&pc_black.rgba[..4], &[0, 0, 0, 255]);
+        let pc_white = make(255, 128, 128, false, true).to_picture().unwrap_or_else(|| panic!("expected picture"));
+        assert_eq!(&pc_white.rgba[..4], &[255, 255, 255, 255]);
+
+        // BT.709 TV red (R=255, G=0, B=0 -> Y≈63, U≈102, V≈240).
+        let red = make(63, 102, 240, true, false).to_picture().unwrap_or_else(|| panic!("expected picture"));
+        assert!(
+            red.rgba[0] >= 250 && red.rgba[1] <= 5 && red.rgba[2] <= 5 && red.rgba[3] == 255,
+            "{:?}",
+            &red.rgba[..4]
+        );
+
+        // Invalid dimensions or truncated buffers return None without panicking.
+        assert!(
+            Nv12Picture { width: 3, height: 4, data: vec![0; 18], bt709: true, full_range: false }
+                .to_picture()
+                .is_none()
+        );
+        assert!(
+            Nv12Picture { width: 4, height: 4, data: vec![0; 10], bt709: true, full_range: false }
+                .to_picture()
+                .is_none()
+        );
+        assert!(
+            Nv12Picture { width: 0, height: 0, data: Vec::new(), bt709: true, full_range: false }
+                .to_picture()
+                .is_none()
+        );
     }
 }

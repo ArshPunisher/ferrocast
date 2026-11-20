@@ -355,7 +355,13 @@ impl AudioClock for SystemClock {
     }
 
     fn sleep_until_ns(&self, target_ns: u64) {
+        // High-res waitable timers on Windows wake within ~0.5 ms; leave 1.5 ms of margin there
+        // (1 ms elsewhere) so coarse sleeps never overshoot a 21.333 ms audio block.
+        #[cfg(target_os = "windows")]
+        const SPIN_NS: u64 = 1_500_000;
+        #[cfg(not(target_os = "windows"))]
         const SPIN_NS: u64 = 1_000_000;
+        const BUSY_SPIN_NS: u64 = 200_000;
         loop {
             let now = self.now_ns();
             if now >= target_ns {
@@ -363,9 +369,11 @@ impl AudioClock for SystemClock {
             }
             let left = target_ns - now;
             if left > 2 * SPIN_NS {
-                std::thread::sleep(Duration::from_nanos(left - SPIN_NS));
-            } else {
+                crate::sleep_precise(Duration::from_nanos(left - SPIN_NS));
+            } else if left > BUSY_SPIN_NS {
                 std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
             }
         }
     }
@@ -613,5 +621,31 @@ mod tests {
         assert!(b - target < 50_000_000, "woke {} ms late", (b - target) / 1_000_000);
         c.sleep_until_ns(a);
         assert!(c.now_ns() >= b, "a target in the past returns at once");
+    }
+
+    /// On Windows, `SystemClock::sleep_until_ns` must hold a 21.333 ms audio cadence via high-res
+    /// waitable timers instead of slipping onto the 15.625 ms default `Sleep` tick (~10 ms late
+    /// every block).
+    #[cfg(windows)]
+    #[test]
+    fn system_clock_holds_audio_block_cadence_on_windows() {
+        let c = SystemClock;
+        let step_ns = 21_333_333u64;
+        let mut target = c.now_ns() + step_ns;
+        let mut overshoots_ns = Vec::with_capacity(15);
+        for _ in 0..15 {
+            c.sleep_until_ns(target);
+            let now = c.now_ns();
+            assert!(now >= target, "woke early: {now} < {target}");
+            overshoots_ns.push(now - target);
+            target = now.max(target) + step_ns;
+        }
+        overshoots_ns.sort_unstable();
+        let median = overshoots_ns[overshoots_ns.len() / 2];
+        assert!(
+            median < 5_000_000,
+            "median audio wakeup overshoot was {} ms (stuck on 15.6 ms timer tick?): {overshoots_ns:?}",
+            median / 1_000_000
+        );
     }
 }

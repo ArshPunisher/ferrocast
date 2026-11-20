@@ -131,6 +131,26 @@ pub fn is_fatal_wgc_hresult(code: i32) -> bool {
     code < 0
 }
 
+/// Converts a positive sleep duration into a negative 100-nanosecond relative due time for Win32
+/// `SetWaitableTimer`, clamping huge durations so the value never wraps positive (an absolute date).
+pub fn relative_due_100ns(dur: Duration) -> Option<i64> {
+    if dur.is_zero() {
+        return None;
+    }
+    let ticks = (dur.as_nanos() / 100).clamp(1, i64::MAX as u128) as i64;
+    Some(-ticks)
+}
+
+/// Strips a single trailing `.exe` suffix ASCII case-insensitively (`"GAME.EXE"` → `"GAME"`),
+/// leaving earlier `.exe` segments untouched.
+pub fn strip_exe_suffix(name: &str) -> &str {
+    if name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".exe") {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
+}
+
 /// DirectShow format/codec family parsed from `ffmpeg -list_options true`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DshowFormat {
@@ -583,5 +603,26 @@ mod tests {
         assert_eq!(resolve_dshow_list(DshowListStatus::TimedOut), Ok(Vec::new()));
         assert_eq!(resolve_dshow_list(DshowListStatus::Failed), Ok(Vec::new()));
         assert_eq!(resolve_dshow_list(DshowListStatus::Missing), Err("that camera isn't connected"));
+    }
+
+    #[test]
+    fn relative_due_100ns_handles_zero_subtick_cadence_and_overflow() {
+        assert_eq!(relative_due_100ns(Duration::ZERO), None);
+        assert_eq!(relative_due_100ns(Duration::from_nanos(50)), Some(-1));
+        // 21.3333 ms audio block minus 1.5 ms spin margin (~19.8333 ms).
+        assert_eq!(relative_due_100ns(Duration::from_nanos(19_833_333)), Some(-198_333));
+        assert_eq!(relative_due_100ns(Duration::from_millis(5)), Some(-50_000));
+        assert_eq!(relative_due_100ns(Duration::MAX), Some(-i64::MAX));
+    }
+
+    #[test]
+    fn strip_exe_suffix_is_case_insensitive_and_strips_once() {
+        assert_eq!(strip_exe_suffix("chrome.exe"), "chrome");
+        assert_eq!(strip_exe_suffix("VALORANT-Win64-Shipping.EXE"), "VALORANT-Win64-Shipping");
+        assert_eq!(strip_exe_suffix("Steam.Exe"), "Steam");
+        assert_eq!(strip_exe_suffix("nested.exe.exe"), "nested.exe");
+        assert_eq!(strip_exe_suffix("notepad"), "notepad");
+        assert_eq!(strip_exe_suffix(".exe"), "");
+        assert_eq!(strip_exe_suffix("ゲーム.EXE"), "ゲーム");
     }
 }

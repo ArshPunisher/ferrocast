@@ -23,11 +23,35 @@ use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::Interface;
 
 use crate::win_logic::{WgcPacer, is_fatal_wgc_hresult};
 use crate::{AvError, Picture};
+
+struct WinRtGuard(bool);
+
+impl Drop for WinRtGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: balances the single successful `RoInitialize` call on this thread.
+            unsafe { RoUninitialize() };
+        }
+    }
+}
+
+thread_local! {
+    static WINRT_THREAD: WinRtGuard = {
+        // SAFETY: initializes WinRT MTA once per thread; `S_OK`/`S_FALSE` return `Ok(())` and are
+        // balanced by `RoUninitialize` when the thread exits, while `RPC_E_CHANGED_MODE` returns
+        // `Err` (apartment already initialized differently) and must not be uninitialized.
+        WinRtGuard(unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok())
+    };
+}
+
+fn ensure_winrt_init() {
+    let _ = WINRT_THREAD.try_with(|_| ());
+}
 
 /// What the frames leave for the engine.
 #[derive(Debug, Default)]
@@ -180,9 +204,8 @@ impl Wgc {
         cursor: bool,
     ) -> Result<Self, AvError> {
         let fail = |what: &str, e: windows::core::Error| AvError::Source(format!("Windows' capture {what} ({e})"));
-        // WinRT on this thread (already set up a different way is fine too).
-        // SAFETY: initialises this thread's apartment; a second call is harmless.
-        let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+        // WinRT once per thread (already set up a different way is fine too; uninitialized on exit).
+        ensure_winrt_init();
         if !Self::supported() {
             return Err(AvError::Source("this Windows has no capture of its own (it needs 10, 1903 or later)".into()));
         }

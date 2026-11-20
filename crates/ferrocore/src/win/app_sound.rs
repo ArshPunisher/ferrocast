@@ -196,7 +196,7 @@ fn run_target(
     let mut ticks = 0u32;
     'hear: while !stop.load(Ordering::Acquire) {
         // Windows hands sound over every 10 ms or so; nothing comes while the app is quiet.
-        std::thread::sleep(Duration::from_millis(5));
+        crate::sleep_precise(Duration::from_millis(5));
         ticks = ticks.wrapping_add(1);
         // SAFETY: a live process handle of ours; a zero wait only looks.
         if ticks.is_multiple_of(40) && app.is_some_and(|h| unsafe { WaitForSingleObject(h, 0) } == WAIT_OBJECT_0) {
