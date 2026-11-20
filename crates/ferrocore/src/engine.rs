@@ -2071,6 +2071,8 @@ impl Engine {
         // Every source the same one by name and kind; its id here (the imported ids are the
         // order the document lists them in).
         let mut ids: HashMap<u64, u64> = HashMap::new();
+        // Sources whose words or colour changed: redrawn in place (no capture, no sound).
+        let mut retarget: Vec<(u64, String, SourceKind)> = Vec::new();
         for src in &imported.sources {
             let here = st
                 .opened
@@ -2081,7 +2083,18 @@ impl Engine {
                 Some((id, kind)) if kind == &src.kind => {
                     ids.insert(src.id, *id);
                 }
+                Some((id, kind))
+                    if st.opened.contains_key(&src.name) && is_in_place_kind(kind) && is_in_place_kind(&src.kind) =>
+                {
+                    ids.insert(src.id, *id);
+                    retarget.push((*id, src.name.clone(), src.kind.clone()));
+                }
                 _ => return None,
+            }
+        }
+        for (_, name, kind) in &retarget {
+            if let Some(o) = st.opened.get_mut(name) {
+                o.1 = kind.clone();
             }
         }
         let to = |id: u64| ids.get(&id).copied().unwrap_or(id);
@@ -2111,6 +2124,11 @@ impl Engine {
         skipped.extend(st.missing.values().map(|(.., why)| why.clone()));
         sync_heard(&mut st, &self.audio.cmd_sender());
         drop(st);
+        for (id, name, kind) in retarget {
+            if let Err(e) = self.set_source(id, kind) {
+                skipped.push(format!("{name}: {e}"));
+            }
+        }
         for s in imported.sources {
             if let Some(sound) = s.sound.filter(|_| running.contains(&s.name)) {
                 let id = to(s.id);
@@ -4257,6 +4275,12 @@ fn retry_if_permission_back(w: &mut Watch, granted: impl FnOnce() -> bool) {
     }
 }
 
+/// Kinds an edit changes without opening or closing anything: a text's words or look, a colour,
+/// a picture file. Their sources have no device and no sound.
+fn is_in_place_kind(k: &SourceKind) -> bool {
+    matches!(k, SourceKind::Text { .. } | SourceKind::Color { .. } | SourceKind::Image(_))
+}
+
 /// Opens a slow source on its own thread: what it plays, and whether it has sound to mix.
 type Opener = Box<dyn FnOnce() -> Result<(Live, bool), AvError> + Send>;
 
@@ -5942,6 +5966,34 @@ mod tests {
         assert!(e.apply_same_sources(&doc(7.0, 4, false)).is_some());
         assert_eq!(e.lock().on_air.as_deref(), Some("black"));
         assert!(e.lock().scenes.contains_key("black"), "the engine's own scene is kept");
+    }
+
+    /// Editing a text's words or a colour while live is applied in place too: no source is opened
+    /// or closed, so no full load, no sound reset (agy GAPS #21).
+    #[test]
+    fn a_text_or_colour_edit_applies_in_place() {
+        let Some(e) = engine() else { return };
+        let doc = |words: &str, color: u32| {
+            serde_json::json!({ "current_program_scene": "Main", "sources": [
+                { "id": "color_source", "name": "Back", "settings": { "color": color, "width": 64, "height": 64 } },
+                { "id": "text_ft2_source_v2", "name": "Title", "settings": { "text": words } },
+                { "id": "scene", "name": "Main", "settings": { "items": [ { "name": "Back" }, { "name": "Title" } ] } },
+            ] })
+        };
+        e.load_obs(&doc("one", 0xFF00_00FF));
+        let ids = |e: &Engine| {
+            let st = e.lock();
+            (st.opened.get("Back").map(|(i, _)| *i), st.opened.get("Title").map(|(i, _)| *i))
+        };
+        let (before, started) = (ids(&e), e.lock().started.get("Main").copied());
+        let size = |e: &Engine, id: Option<u64>| id.and_then(|id| e.lock().sources.get(&id).and_then(|s| s.size));
+        let was = size(&e, before.1);
+        assert!(e.apply_same_sources(&doc("two words now", 0xFF00_FF00)).is_some(), "applied in place");
+        assert_eq!(ids(&e), before, "the same sources keep running");
+        assert_eq!(e.lock().started.get("Main").copied(), started, "the scene's clock goes on");
+        assert_ne!(size(&e, before.1), was, "the text is redrawn with the new words");
+        // The next identical edit is also in place (the loaded kinds were updated).
+        assert!(e.apply_same_sources(&doc("two words now", 0xFF00_FF00)).is_some());
     }
 
     /// A full load (a source added or removed) swaps the collection in at once: nothing is
