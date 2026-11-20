@@ -1791,3 +1791,46 @@ async fn a_new_stream_starts_with_empty_chat() {
     assert!(!again, "one stream, one clear");
     assert_eq!(e.stream_started_at(), Some(start));
 }
+
+#[tokio::test]
+async fn a_failed_background_save_gives_one_notice_and_a_later_success_replaces_it() {
+    let (e, d) = engine().await;
+    e.watch_saves();
+    let mut live = e.subscribe_live();
+    // The folder's place is taken by a file, so the save fails at once (not a passing lock).
+    let blocker = d.path().join("savetest");
+    std::fs::write(&blocker, b"x").unwrap();
+    let file = blocker.join("collections").join("main.json");
+    for _ in 0..3 {
+        ferrocast_store::durable::queue_json_bytes(&file, b"{}".to_vec());
+        assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)));
+    }
+    let notices = |live: &mut tokio::sync::broadcast::Receiver<crate::frames::LiveFrame>| {
+        let mut out = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["key"].as_str().is_some_and(|k| k.starts_with("save:")) {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    };
+    let failed = notices(&mut live);
+    assert_eq!(failed.len(), 1, "one notice per failing file, not per attempt: {failed:?}");
+    assert_eq!(failed[0]["level"], "warn");
+    // The parent being a file: NotADirectory/NotFound-class, not a lock.
+    assert!(failed[0]["message"].as_str().unwrap().starts_with("Couldn't save your scenes"));
+    assert!(failed[0]["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    let text = failed[0].to_string();
+    let tmp = d.path().to_string_lossy().to_string();
+    assert!(!text.contains(&tmp) && !text.contains("savetest"), "no path in the notice: {text}");
+    assert_eq!(failed[0]["key"], "save:collections/main.json");
+    // Fixed: the same key says it's saving again, replacing the warning on the dashboard.
+    std::fs::remove_file(&blocker).unwrap();
+    ferrocast_store::durable::queue_json_bytes(&file, b"{}".to_vec());
+    assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)));
+    let back = notices(&mut live);
+    assert_eq!(back.len(), 1, "{back:?}");
+    assert_eq!(back[0]["key"], failed[0]["key"]);
+    assert_eq!(back[0]["level"], "info");
+}

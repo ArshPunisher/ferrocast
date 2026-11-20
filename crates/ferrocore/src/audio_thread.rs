@@ -1151,4 +1151,98 @@ mod tests {
         let b = bridge_rx.try_recv().unwrap_or_else(|e| panic!("{e}"));
         assert!(b.tracks[0].iter().all(|v| *v == 0.0), "flushed source emitted silence");
     }
+
+    /// Sidechain compression runs on `ferrocast-audio` via `AudioCmd::SetEffects`: source 2's
+    /// signal keys source 1's compressor in topological order, and `AudioCmd::RemoveSource(2)`
+    /// cleanly falls back to a silent key so source 1 recovers without crashing.
+    #[test]
+    fn sidechain_ducks_music_under_voice_and_recovers_on_remove() {
+        let t0 = 4_000_000_000u64;
+        let clock = SimClock::at(t0);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
+        let (bridge_tx, bridge_rx) = mpsc::sync_channel(BRIDGE_CAP);
+        let mut runner = AudioRunner::new(
+            clock,
+            RATE,
+            0,
+            cmd_rx,
+            recycle_rx,
+            Some(bridge_tx),
+            None,
+            AudioFilter::effect_needs_plugin,
+        );
+
+        let music_levels = AtomicLevels::shared();
+        let voice_levels = AtomicLevels::shared();
+        let (mut music_prod, music_cons) = SpscAudioRing::for_seconds(2, RATE, 2, 1024);
+        let (mut voice_prod, voice_cons) = SpscAudioRing::for_seconds(2, RATE, 2, 1024);
+
+        // Music (id 1) goes to track 1; Voice (id 2) goes to track 2 (so track 1 isolates Music).
+        cmd_tx
+            .send(AudioCmd::SetSettings {
+                id: 1,
+                settings: SourceSettings { tracks: 0b01, ..Default::default() },
+                levels: music_levels,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx
+            .send(AudioCmd::SetSettings {
+                id: 2,
+                settings: SourceSettings { tracks: 0b10, ..Default::default() },
+                levels: voice_levels,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::AttachRing { id: 1, consumer: music_cons }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::AttachRing { id: 2, consumer: voice_cons }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::SetHeard(Arc::from([1, 2]))).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx
+            .send(AudioCmd::SetEffects {
+                id: 1,
+                effects: vec![AudioEffect::Compressor {
+                    ratio: 10.0,
+                    threshold_db: -30.0,
+                    attack_ms: 5.0,
+                    release_ms: 20.0,
+                    output_db: 0.0,
+                    sidechain: Some(2),
+                }],
+                levels: None,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let music_pcm = [0.5f32; BLOCK * 2];
+        let voice_pcm = [0.5f32; BLOCK * 2];
+        let mut t = t0;
+        let mut last_ducked = 0.0f32;
+        for _ in 0..8 {
+            music_prod.push(&music_pcm, 2, RATE, t).unwrap_or_else(|e| panic!("{e:?}"));
+            voice_prod.push(&voice_pcm, 2, RATE, t).unwrap_or_else(|e| panic!("{e:?}"));
+            runner.tick();
+            while let Ok(b) = bridge_rx.try_recv() {
+                last_ducked = b.tracks[0][BLOCK - 1].abs();
+                let _ = recycle_tx.try_send(b);
+            }
+            t += STEP_NS;
+        }
+        assert!(last_ducked < 0.08, "music must duck deeply while voice keys it, got {last_ducked}");
+
+        // Removing the key source switches to silence immediately; music recovers cleanly.
+        cmd_tx.send(AudioCmd::RemoveSource(2)).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::SetHeard(Arc::from([1]))).unwrap_or_else(|e| panic!("{e}"));
+        let mut last_recovered = 0.0f32;
+        for _ in 0..10 {
+            music_prod.push(&music_pcm, 2, RATE, t).unwrap_or_else(|e| panic!("{e:?}"));
+            runner.tick();
+            while let Ok(b) = bridge_rx.try_recv() {
+                last_recovered = b.tracks[0][BLOCK - 1].abs();
+                let _ = recycle_tx.try_send(b);
+            }
+            t += STEP_NS;
+        }
+        assert!(
+            (last_recovered - 0.5).abs() < 0.03,
+            "music must recover to full level after key removal, got {last_recovered}"
+        );
+    }
 }

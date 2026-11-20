@@ -438,6 +438,10 @@ struct Source {
     resampler: Option<SourceResampler>,
     /// Its filters, in order (after mono and balance, before volume, as OBS runs them).
     filters: Vec<AudioFilter>,
+    /// Pre-resolved sidechain key routing per filter (parallel to `filters`), updated on topology edits.
+    key_routes: Vec<KeyRoute>,
+    /// Pre-allocated key buffer slot in `Mixer::key_bufs` when another source ducks under this one.
+    key_slot: Option<usize>,
     /// Last post-filter (pre-volume) sample, and whether a structural filter add/remove/reorder
     /// armed a 4 ms raised-cosine step de-click so toggling filters live never pops.
     last_post_filter: [f32; 2],
@@ -539,10 +543,163 @@ pub struct Mixer {
     monitor_device: Option<String>,
     /// Working space kept between blocks, so a steady mix allocates nothing (D1).
     scratch: Scratch,
+    /// Topologically sorted source IDs for `mix_block` (key sources before dependents).
+    mix_order: Vec<u64>,
+    /// Pre-allocated planar stereo post-filter, pre-fader key buffers for active sidechain targets.
+    key_bufs: Vec<Box<([f32; BLOCK], [f32; BLOCK])>>,
+    /// Sidechain dependency edges `(dependent, key)` severed to break cycles.
+    broken_cycles: Vec<(u64, u64)>,
+    /// Reusable topology planner scratch buffers (zero steady-state allocs).
+    plan_scratch: PlanScratch,
     /// Blocks given back by [`Mixer::recycle`], made again instead of allocated.
     pool: Vec<Block>,
     /// Blocks allocated new (not found in the pool) so far.
     allocated: usize,
+}
+
+/// Silence key fed to a sidechained compressor whose key source is missing, muted, or cycle-broken.
+static SILENCE_KEY: [f32; BLOCK] = [0.0; BLOCK];
+
+/// Pre-resolved sidechain routing for one filter in a source's chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyRoute {
+    /// Normal self-keyed filter.
+    SelfKey,
+    /// Sidechained compressor reading `Mixer::key_bufs[slot]`.
+    Slot(usize),
+    /// Sidechained compressor whose key source is missing, self, or cycle-broken: feed silence.
+    Silence,
+}
+
+/// Reusable topological-sort scratch buffers for [`resolve_sidechain_order`].
+#[derive(Debug, Default)]
+pub(crate) struct TopoScratch {
+    in_deg: Vec<usize>,
+    placed: Vec<bool>,
+    edges: Vec<(usize, usize, bool)>,
+    visit_step: Vec<usize>,
+    path: Vec<usize>,
+}
+
+/// Reusable scratch buffers for `Mixer::rebuild_mix_plan`.
+#[derive(Debug, Default)]
+struct PlanScratch {
+    nodes: Vec<u64>,
+    deps: Vec<(u64, u64)>,
+    prev_broken: Vec<(u64, u64)>,
+    slot_by_node: Vec<Option<usize>>,
+    topo: TopoScratch,
+}
+
+/// Resolves a deterministic topological processing order (dependencies before dependents) over
+/// sorted unique `nodes` and directed dependency edges `(dependent, dependency)`.
+///
+/// Self-loops `(u, u)` and multi-node cycles are detected and broken deterministically by severing
+/// the cycle-closing edge on the highest-ID node in each cycle. Edges targeting a missing node
+/// (not in `nodes`) are ignored here and routed to silence by the caller.
+pub(crate) fn resolve_sidechain_order(
+    nodes: &[u64],
+    deps: &[(u64, u64)],
+    order: &mut Vec<u64>,
+    broken: &mut Vec<(u64, u64)>,
+    scratch: &mut TopoScratch,
+) {
+    order.clear();
+    broken.clear();
+    let n = nodes.len();
+    if n == 0 {
+        return;
+    }
+    if deps.is_empty() {
+        order.extend_from_slice(nodes);
+        return;
+    }
+    scratch.in_deg.clear();
+    scratch.in_deg.resize(n, 0);
+    scratch.placed.clear();
+    scratch.placed.resize(n, false);
+    scratch.edges.clear();
+    for &(u, v) in deps {
+        let Ok(ui) = nodes.binary_search(&u) else { continue };
+        if u == v {
+            broken.push((u, v));
+            continue;
+        }
+        let Ok(vi) = nodes.binary_search(&v) else { continue };
+        if !scratch.edges.iter().any(|&(eu, ev, _)| eu == ui && ev == vi) {
+            scratch.edges.push((ui, vi, true));
+            scratch.in_deg[ui] += 1;
+        }
+    }
+    if scratch.edges.is_empty() {
+        order.extend_from_slice(nodes);
+        broken.sort_unstable();
+        broken.dedup();
+        return;
+    }
+    scratch.visit_step.clear();
+    scratch.visit_step.resize(n, 0);
+    while order.len() < n {
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for (i, &node) in nodes.iter().enumerate() {
+                if !scratch.placed[i] && scratch.in_deg[i] == 0 {
+                    scratch.placed[i] = true;
+                    order.push(node);
+                    progress = true;
+                    for &(eu, ev, active) in &scratch.edges {
+                        if active && ev == i {
+                            scratch.in_deg[eu] -= 1;
+                        }
+                    }
+                }
+            }
+        }
+        if order.len() == n {
+            break;
+        }
+        // Every remaining unplaced node has `in_deg > 0`, so walking active unplaced dependency
+        // edges is guaranteed to revisit a node on the path and isolate a true cycle without
+        // disturbing downstream acyclic dependents.
+        let Some(mut cur) = (0..n).find(|&i| !scratch.placed[i]) else { break };
+        scratch.visit_step.fill(0);
+        scratch.path.clear();
+        let cycle_start = loop {
+            if scratch.visit_step[cur] != 0 {
+                break scratch.visit_step[cur] - 1;
+            }
+            scratch.path.push(cur);
+            scratch.visit_step[cur] = scratch.path.len();
+            let next = scratch
+                .edges
+                .iter()
+                .filter(|&&(eu, ev, active)| active && eu == cur && !scratch.placed[ev])
+                .map(|&(_, ev, _)| ev)
+                .min();
+            match next {
+                Some(v) => cur = v,
+                None => break 0,
+            }
+        };
+        let cycle = &scratch.path[cycle_start..];
+        if cycle.is_empty() {
+            break;
+        }
+        let best_k = (0..cycle.len()).max_by_key(|&k| nodes[cycle[k]]).unwrap_or(0);
+        let u_idx = cycle[best_k];
+        let v_idx = cycle[(best_k + 1) % cycle.len()];
+        for (eu, ev, active) in &mut scratch.edges {
+            if *active && *eu == u_idx && *ev == v_idx {
+                *active = false;
+                scratch.in_deg[u_idx] = scratch.in_deg[u_idx].saturating_sub(1);
+                broken.push((nodes[u_idx], nodes[v_idx]));
+                break;
+            }
+        }
+    }
+    broken.sort_unstable();
+    broken.dedup();
 }
 
 /// Working buffers of the mixer, made once and grown only when a bigger piece comes.
@@ -696,9 +853,97 @@ impl Mixer {
                 fl: Vec::with_capacity(BLOCK),
                 fr: Vec::with_capacity(BLOCK),
             },
+            mix_order: Vec::new(),
+            key_bufs: Vec::new(),
+            broken_cycles: Vec::new(),
+            plan_scratch: PlanScratch::default(),
             pool: Vec::new(),
             allocated: 0,
         }
+    }
+
+    /// Sidechain dependency edges `(dependent, key)` currently severed to break cycles.
+    #[must_use]
+    pub fn broken_sidechains(&self) -> &[(u64, u64)] {
+        &self.broken_cycles
+    }
+
+    /// Recomputes topological mix order, cycle breaks, and pre-allocated key buffer slots after a
+    /// source or filter topology edit. Never called during steady-state `mix_block`.
+    fn rebuild_mix_plan(&mut self) {
+        let mut scratch = std::mem::take(&mut self.plan_scratch);
+        scratch.nodes.clear();
+        scratch.deps.clear();
+        scratch.prev_broken.clear();
+        scratch.prev_broken.extend_from_slice(&self.broken_cycles);
+
+        for (&id, src) in &self.sources {
+            scratch.nodes.push(id);
+            for f in &src.filters {
+                if let AudioEffect::Compressor { sidechain: Some(key_id), .. } = f.effect {
+                    scratch.deps.push((id, key_id));
+                }
+            }
+        }
+        resolve_sidechain_order(
+            &scratch.nodes,
+            &scratch.deps,
+            &mut self.mix_order,
+            &mut self.broken_cycles,
+            &mut scratch.topo,
+        );
+        for &(u, v) in &self.broken_cycles {
+            if !scratch.prev_broken.contains(&(u, v)) {
+                tracing::warn!(
+                    source = u,
+                    sidechain = v,
+                    "sidechain cycle detected and broken; compressor receives silence"
+                );
+            }
+        }
+
+        scratch.slot_by_node.clear();
+        scratch.slot_by_node.resize(scratch.nodes.len(), None);
+        let mut next_slot = 0usize;
+        for (&id, src) in &self.sources {
+            for f in &src.filters {
+                if let AudioEffect::Compressor { sidechain: Some(key_id), .. } = f.effect
+                    && !self.broken_cycles.contains(&(id, key_id))
+                    && let Ok(ki) = scratch.nodes.binary_search(&key_id)
+                    && scratch.slot_by_node[ki].is_none()
+                {
+                    scratch.slot_by_node[ki] = Some(next_slot);
+                    next_slot += 1;
+                }
+            }
+        }
+        while self.key_bufs.len() < next_slot {
+            self.key_bufs.push(Box::new(([0.0; BLOCK], [0.0; BLOCK])));
+        }
+        for (idx, &id) in scratch.nodes.iter().enumerate() {
+            let Some(src) = self.sources.get_mut(&id) else { continue };
+            src.key_slot = scratch.slot_by_node[idx];
+            src.key_routes.clear();
+            src.key_routes.reserve(src.filters.len());
+            for f in &src.filters {
+                let route = match f.effect {
+                    AudioEffect::Compressor { sidechain: Some(key_id), .. } => {
+                        if self.broken_cycles.contains(&(id, key_id)) {
+                            KeyRoute::Silence
+                        } else if let Ok(ki) = scratch.nodes.binary_search(&key_id)
+                            && let Some(slot) = scratch.slot_by_node[ki]
+                        {
+                            KeyRoute::Slot(slot)
+                        } else {
+                            KeyRoute::Silence
+                        }
+                    }
+                    _ => KeyRoute::SelfKey,
+                };
+                src.key_routes.push(route);
+            }
+        }
+        self.plan_scratch = scratch;
     }
 
     /// Gives a block back once it has been used, to be made again by a later mix. Blocks of
@@ -868,6 +1113,8 @@ impl Mixer {
                         start_ns: None,
                         resampler: None,
                         filters: Vec::new(),
+                        key_routes: Vec::new(),
+                        key_slot: None,
                         last_post_filter: [0.0; 2],
                         filter_declick: false,
                         gain_applied: None,
@@ -879,6 +1126,7 @@ impl Mixer {
                         drift: DriftTrack::default(),
                     },
                 );
+                self.rebuild_mix_plan();
             }
         }
     }
@@ -972,6 +1220,7 @@ impl Mixer {
         // needs (its usual wait plus that), not the sum of them all.
         let now = held(&s.filters);
         self.raise_latency_for_filters(before, now);
+        self.rebuild_mix_plan();
         evicted
     }
 
@@ -1053,7 +1302,11 @@ impl Mixer {
 
     pub fn remove(&mut self, id: u64) -> Option<Vec<AudioFilter>> {
         self.taps.retain(|(tid, t)| *tid != id && t.strong_count() > 0);
-        self.sources.remove(&id).map(|s| s.filters)
+        let removed = self.sources.remove(&id).map(|s| s.filters);
+        if removed.is_some() {
+            self.rebuild_mix_plan();
+        }
+        removed
     }
 
     /// Number of sources currently registered in the mixer.
@@ -1421,13 +1674,15 @@ impl Mixer {
             });
             d.step(talking, BLOCK as f32 / rate as f32)
         });
-        let mon_dev = self.monitor_device.as_deref();
+        let true_peak = self.true_peak;
+        let Mixer { sources, ducker, mix_order, key_bufs, monitor_device, .. } = self;
+        let mon_dev = monitor_device.as_deref();
         // OBS `should_silence_monitored_source`: when an active, unmuted non-self-excluding output
         // capture shares the monitoring device, suppress direct track output of other monitored
         // sources on the tracks it covers (preventing echo / double audio).
         let mut dup_tracks_mask = 0u8;
         if let Some(mon) = mon_dev {
-            for s in self.sources.values() {
+            for s in sources.values() {
                 if s.active
                     && !s.settings.muted
                     && s.settings.volume > 0.0001
@@ -1438,7 +1693,8 @@ impl Mixer {
                 }
             }
         }
-        for (id, src) in self.sources.iter_mut() {
+        for &id in mix_order.iter() {
+            let Some(src) = sources.get_mut(&id) else { continue };
             buf.clear();
             buf.resize(BLOCK * 2, 0.0);
             if let Some(s0) = src.start_ns {
@@ -1483,7 +1739,7 @@ impl Mixer {
                 f[1] *= gr;
             }
             if let Some((from, to)) = &duck
-                && self.ducker.as_ref().is_some_and(|d| d.cfg.music.contains(id))
+                && ducker.as_ref().is_some_and(|d| d.cfg.music.contains(&id))
                 && (from - 1.0).abs().max((to - 1.0).abs()) > 1e-4
             {
                 // Smoothly across the block, no click.
@@ -1505,8 +1761,18 @@ impl Mixer {
                     fl.push(f[0]);
                     fr.push(f[1]);
                 }
-                for f in &mut src.filters {
-                    f.process([&mut fl, &mut fr]);
+                for (idx, f) in src.filters.iter_mut().enumerate() {
+                    let route = src.key_routes.get(idx).copied().unwrap_or(KeyRoute::SelfKey);
+                    match route {
+                        KeyRoute::SelfKey => f.process([&mut fl, &mut fr]),
+                        KeyRoute::Slot(slot) => {
+                            let (kl, kr) = &*key_bufs[slot];
+                            f.process_sidechain([&mut fl, &mut fr], [kl.as_slice(), kr.as_slice()]);
+                        }
+                        KeyRoute::Silence => {
+                            f.process_sidechain([&mut fl, &mut fr], [&SILENCE_KEY, &SILENCE_KEY]);
+                        }
+                    }
                     // Between filters too: one that makes NaN mustn't poison the next one's state.
                     finite(&mut fl);
                     finite(&mut fr);
@@ -1538,6 +1804,21 @@ impl Mixer {
                 src.last_post_filter =
                     [if last[0].is_finite() { last[0] } else { 0.0 }, if last[1].is_finite() { last[1] } else { 0.0 }];
             }
+            // Sidechain tap: OBS `obs_source_output_audio` -> `source_output_audio_data` ->
+            // `source_signal_audio_data` fires post-filter, pre-fader, and `sidechain_capture`
+            // writes silence when muted. Sample-aligned within this block; zero allocations.
+            if let Some(slot) = src.key_slot {
+                let (kl, kr) = &mut *key_bufs[slot];
+                if s.muted {
+                    kl.fill(0.0);
+                    kr.fill(0.0);
+                } else {
+                    for (i, frame) in buf.as_chunks::<2>().0.iter().enumerate() {
+                        kl[i] = frame[0];
+                        kr[i] = frame[1];
+                    }
+                }
+            }
             let (mut peak, mut sq) = ([0f32; 2], [0f32; 2]);
             // A volume that isn't a number (a bad saved setting) is silence, not NaN.
             let vol = if vol.is_finite() { vol } else { 0.0 };
@@ -1564,7 +1845,7 @@ impl Mixer {
             // Between samples too, for meters only (the ducker hears sample peaks: turning true
             // peak on mustn't change when music ducks; CodeRabbit).
             let mut shown = peak;
-            if self.true_peak {
+            if true_peak {
                 let phases = tp_phases();
                 for f in buf.as_chunks::<2>().0 {
                     for c in 0..2 {
@@ -2339,6 +2620,7 @@ mod tests {
                 attack_ms: 6.0,
                 release_ms: 60.0,
                 output_db: 0.0,
+                sidechain: None,
             }],
         );
         m.set(2, SourceSettings::default());
@@ -3004,5 +3286,429 @@ mod steady_state_tests {
         }
         m.push(1, &pcm, 2, 48_000, 10_001 * step);
         assert_eq!(m.tap_count(), 0);
+    }
+
+    /// Sidechain compression through `Mixer` matches OBS `compressor-filter.c:analyze_sidechain`
+    /// sample-for-sample (with B ordered before A even when B has a higher ID), hits nominal
+    /// attack and release times within 10%, and taps B's post-filter, pre-fader signal.
+    #[test]
+    fn sidechain_compressor_matches_obs_reference_with_attack_and_release() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let r = rate as usize;
+        let music_amp = crate::afx::db_to_mul(-12.0);
+        let voice_amp = crate::afx::db_to_mul(-6.0);
+
+        // Music = ID 1, Voice = ID 2 (higher ID than dependent -> proves topological reordering).
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set(2, SourceSettings { tracks: 0b10, ..Default::default() });
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -24.0,
+                attack_ms: 20.0,
+                release_ms: 100.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+
+        let total = 2 * r;
+        let mut music_mono = vec![0.0f32; total];
+        let mut voice_mono = vec![0.0f32; total];
+        let mut music_pcm = vec![0.0f32; total * 2];
+        let mut voice_pcm = vec![0.0f32; total * 2];
+        for i in 0..total {
+            let mv = music_amp * (std::f32::consts::TAU * 300.0 * i as f32 / rate as f32).sin();
+            music_mono[i] = mv;
+            music_pcm[i * 2] = mv;
+            music_pcm[i * 2 + 1] = mv;
+            // Voice bursts at full DC-like step from 0.25 s to 0.75 s so attack/release 63.2% points
+            // are measured cleanly, then silent again until 2.0 s.
+            let vv = if i >= r / 4 && i < 3 * r / 4 { voice_amp } else { 0.0 };
+            voice_mono[i] = vv;
+            voice_pcm[i * 2] = vv;
+            voice_pcm[i * 2 + 1] = vv;
+        }
+
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        m.push(1, &music_pcm, 2, rate, t0);
+        m.push(2, &voice_pcm, 2, rate, t0);
+        let blocks = m.mix_until(t0 + (total / BLOCK) as u64 * step);
+        let got_l: Vec<f32> = blocks.iter().flat_map(|b| b.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0])).collect();
+        assert!(got_l.len() >= r + r / 2, "expected >= 1.5 s of mixed output, got {}", got_l.len());
+
+        // Independent OBS `compressor-filter.c:analyze_sidechain` reference.
+        let ag = (-1.0f32 / (rate as f32 * 0.020)).exp();
+        let rg = (-1.0f32 / (rate as f32 * 0.100)).exp();
+        let slope = 1.0 - 1.0 / 10.0;
+        let thresh_lin = crate::afx::db_to_mul(-24.0);
+        let mut env = 0.0f32;
+        let mut max_diff = 0.0f32;
+        for (i, &got) in got_l.iter().enumerate() {
+            let x = voice_mono[i].abs();
+            env = if env < x { x + ag * (env - x) } else { x + rg * (env - x) };
+            let g = if env > 0.0 {
+                crate::afx::db_to_mul((slope * (-24.0 - crate::afx::mul_to_db(env))).min(0.0))
+            } else {
+                1.0
+            };
+            let expected = music_mono[i] * g;
+            max_diff = max_diff.max((got - expected).abs());
+        }
+        assert!(max_diff < 1e-4, "mixer sidechain diverged from OBS reference: max_diff={max_diff}");
+
+        // Measure 63.2% attack and release times directly from the mixer's gain reduction.
+        // At 0.25 s voice steps 0 -> voice_amp; 63.2% of envelope is voice_amp * (1 - 1/e).
+        let burst_start = r / 4;
+        let burst_end = 3 * r / 4;
+        let target_atk_env = voice_amp * (1.0 - (-1.0f32).exp());
+        let atk_idx = (burst_start..burst_end)
+            .find(|&i| {
+                if music_mono[i].abs() < 0.05 {
+                    return false;
+                }
+                let gain = (got_l[i] / music_mono[i]).abs().clamp(1e-6, 1.0);
+                let rec_env = thresh_lin * gain.powf(-1.0 / slope);
+                rec_env >= target_atk_env
+            })
+            .expect("sidechain attack crossed 63.2%");
+        let atk_ms = (atk_idx - burst_start) as f32 * 1000.0 / rate as f32;
+        assert!((atk_ms - 20.0).abs() <= 2.0, "sidechain attack 63%: {atk_ms:.2} ms (want 20 ± 10%)");
+
+        // At 0.75 s voice drops voice_amp -> 0; 63.2% decay leaves env = voice_amp / e (> thresh_lin).
+        let target_rel_env = voice_amp * (-1.0f32).exp();
+        let rel_idx = (burst_end..got_l.len())
+            .find(|&i| {
+                if music_mono[i].abs() < 0.05 {
+                    return false;
+                }
+                let gain = (got_l[i] / music_mono[i]).abs().clamp(1e-6, 1.0);
+                let rec_env = thresh_lin * gain.powf(-1.0 / slope);
+                rec_env <= target_rel_env
+            })
+            .expect("sidechain release crossed 63.2%");
+        let rel_ms = (rel_idx - burst_end) as f32 * 1000.0 / rate as f32;
+        assert!((rel_ms - 100.0).abs() <= 10.0, "sidechain release 63%: {rel_ms:.2} ms (want 100 ± 10%)");
+
+        // Post-filter, pre-fader tap check (OBS `obs_source_output_audio` -> `source_signal_audio_data`):
+        // Voice has Gain +12 dB filter AND fader turned to 0.0 (unmuted). Music MUST still duck
+        // because the tap is post-filter and pre-fader, while track 2 (Voice) is silent!
+        let mut pf = Mixer::new(rate, 0);
+        pf.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        pf.set(2, SourceSettings { volume: 0.0, muted: false, tracks: 0b10, ..Default::default() });
+        pf.set_effects(2, &[AudioEffect::Gain { db: 12.0 }]);
+        pf.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -24.0,
+                attack_ms: 1.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+        let _ = pf.mix_until(t0);
+        // Voice input is -28 dBFS (below -24 dB threshold on its own), boosted by +12 dB filter to -16 dBFS!
+        let quiet_voice = vec![crate::afx::db_to_mul(-28.0); BLOCK * 10 * 2];
+        let steady_music = vec![0.5f32; BLOCK * 10 * 2];
+        pf.push(1, &steady_music, 2, rate, t0);
+        pf.push(2, &quiet_voice, 2, rate, t0);
+        let pf_blocks = pf.mix_until(t0 + 10 * step);
+        let last = pf_blocks.last().expect("mixed blocks");
+        assert!(last.tracks[1].iter().all(|v| v.abs() < 1e-6), "voice fader at 0.0 must silence voice on its track");
+        // -16 dBFS key over -24 dB threshold at 10:1 -> -7.2 dB reduction -> 0.5 * 10^(-7.2/20) ≈ 0.218.
+        let ducked = last.tracks[0][BLOCK * 2 - 2].abs();
+        assert!(
+            (ducked - 0.5 * crate::afx::db_to_mul(-7.2)).abs() < 0.02,
+            "music must duck by post-filter pre-fader key even with fader=0: got {ducked:.4}"
+        );
+    }
+
+    /// A key that stops delivering (a stalled device, a paused file: the source stays, its ring
+    /// runs dry) is silence for the blocks it misses: the music comes back up as the compressor
+    /// releases, it never stays ducked on the key's last block. A key that arrives half a block
+    /// late ducks only from where its samples start.
+    #[test]
+    fn sidechain_key_that_stops_or_arrives_late_never_leaves_the_music_ducked() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set(2, SourceSettings { volume: 0.0, tracks: 0b10, ..Default::default() });
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -30.0,
+                attack_ms: 1.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let blocks = 200usize;
+        m.push(1, &vec![0.5f32; BLOCK * blocks * 2], 2, rate, t0);
+        // The key: 10 blocks of loud tone, then nothing at all (its ring runs dry).
+        m.push(2, &vec![0.4f32; BLOCK * 10 * 2], 2, rate, t0);
+        let out = m.mix_until(t0 + blocks as u64 * step);
+        let level = |i: usize| out[i].tracks[0].iter().fold(0f32, |a, v| a.max(v.abs()));
+        assert!(level(8) < 0.2, "ducked while the key plays: {}", level(8));
+        assert!(level(blocks - 5) > 0.49, "music back after the key stops: {}", level(blocks - 5));
+
+        // A key 512 frames late: the first half block is unducked, the rest ducked.
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set(2, SourceSettings { volume: 0.0, tracks: 0b10, ..Default::default() });
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 20.0,
+                threshold_db: -40.0,
+                attack_ms: 1.0,
+                release_ms: 60.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+        let _ = m.mix_until(t0);
+        m.push(1, &vec![0.5f32; BLOCK * 20 * 2], 2, rate, t0);
+        let late = 512u64;
+        m.push(2, &vec![0.4f32; BLOCK * 20 * 2], 2, rate, t0 + late * 1_000_000_000 / u64::from(rate));
+        let out = m.mix_until(t0 + 20 * step);
+        let first = &out[0].tracks[0];
+        let head = first[..(late as usize - 8) * 2].iter().fold(0f32, |a, v| a.max(v.abs()));
+        let tail = first[(late as usize + 400) * 2..].iter().fold(0f32, |a, v| a.max(v.abs()));
+        assert!(head > 0.49, "before the key's first sample the music is untouched: {head}");
+        assert!(tail < 0.25, "from the key on it is ducked: {tail}");
+    }
+
+    /// Missing, muted, or removed sidechain key sources feed silence (no ducking, no crash).
+    #[test]
+    fn sidechain_missing_muted_and_removed_key_feeds_silence() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 20.0,
+                threshold_db: -30.0,
+                attack_ms: 1.0,
+                release_ms: 20.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let music = vec![0.5f32; BLOCK * 2];
+        let voice = vec![0.5f32; BLOCK * 2];
+        let mut t = t0;
+        let mut mix_n = |m: &mut Mixer, n: usize, push_voice: bool| -> f32 {
+            let mut last = 0.0f32;
+            for _ in 0..n {
+                m.push(1, &music, 2, rate, t);
+                if push_voice {
+                    m.push(2, &voice, 2, rate, t);
+                }
+                t += step;
+                for b in m.mix_until(t) {
+                    last = b.tracks[0][BLOCK * 2 - 2].abs();
+                }
+            }
+            last
+        };
+
+        // 1. Key source 2 does not exist yet -> silence key -> music untouched at 0.5.
+        let missing_lvl = mix_n(&mut m, 6, false);
+        assert!((missing_lvl - 0.5).abs() < 1e-4, "missing key must not duck: {missing_lvl}");
+
+        // 2. Add key source 2 unmuted -> music ducks sharply.
+        m.set(2, SourceSettings { tracks: 0b10, ..Default::default() });
+        let active_lvl = mix_n(&mut m, 6, true);
+        assert!(active_lvl < 0.06, "active key must duck music: {active_lvl}");
+
+        // 3. Mute key source 2 -> silence key -> music recovers to 0.5 (OBS `sidechain_capture` muted=true).
+        m.set(2, SourceSettings { muted: true, tracks: 0b10, ..Default::default() });
+        let muted_lvl = mix_n(&mut m, 15, true);
+        assert!((muted_lvl - 0.5).abs() < 0.01, "muted key must release ducking: {muted_lvl}");
+
+        // 4. Unmute key source 2 -> ducks again.
+        m.set(2, SourceSettings { muted: false, tracks: 0b10, ..Default::default() });
+        let unmuted_lvl = mix_n(&mut m, 6, true);
+        assert!(unmuted_lvl < 0.06, "unmuted key must resume ducking: {unmuted_lvl}");
+
+        // 5. Remove key source 2 -> silence key -> recovers to 0.5, no crash.
+        m.remove(2);
+        let removed_lvl = mix_n(&mut m, 15, false);
+        assert!((removed_lvl - 0.5).abs() < 0.01, "removed key must release ducking: {removed_lvl}");
+
+        // 6. Re-add key source 2 -> reconnects automatically and ducks again.
+        m.set(2, SourceSettings { tracks: 0b10, ..Default::default() });
+        let readded_lvl = mix_n(&mut m, 6, true);
+        assert!(readded_lvl < 0.06, "re-added key must resume ducking: {readded_lvl}");
+    }
+
+    /// 10,000 add/remove cycles of the sidechain key source stay crash-free, keep pre-allocated
+    /// key buffers bounded, and never leak or drift.
+    #[test]
+    fn sidechain_ten_thousand_add_remove_cycles_stay_stable() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -24.0,
+                attack_ms: 1.0,
+                release_ms: 10.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let pcm = vec![0.5f32; BLOCK * 2];
+        let mut out: Vec<Block> = Vec::with_capacity(4);
+        let mut t = t0;
+        for cycle in 0..10_000u64 {
+            m.set(2, SourceSettings { tracks: 0b10, ..Default::default() });
+            if cycle % 250 == 0 {
+                m.push(1, &pcm, 2, rate, t);
+                m.push(2, &pcm, 2, rate, t);
+                t += step;
+                out.clear();
+                m.mix_until_into(t, &mut out);
+                for b in out.drain(..) {
+                    assert!(b.tracks[0].iter().all(|v| v.is_finite()));
+                    m.recycle(b);
+                }
+            }
+            m.remove(2);
+            if cycle % 250 == 0 {
+                m.push(1, &pcm, 2, rate, t);
+                t += step;
+                out.clear();
+                m.mix_until_into(t, &mut out);
+                for b in out.drain(..) {
+                    assert!(b.tracks[0].iter().all(|v| v.is_finite()));
+                    m.recycle(b);
+                }
+            }
+        }
+        assert_eq!(m.source_count(), 1);
+        assert!(m.key_bufs.len() <= 1, "key_bufs grew unexpectedly over 10k cycles: {}", m.key_bufs.len());
+        assert!(m.broken_sidechains().is_empty());
+    }
+
+    /// Sidechain cycles (self-loop, 2-cycle A↔B, 3-cycle, and cycle with downstream dependent C)
+    /// are detected and broken deterministically so non-cyclic edges still duck cleanly.
+    #[test]
+    fn sidechain_cycle_is_detected_broken_and_preserves_downstream() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let mut m = Mixer::new(rate, 0);
+        let comp = |sc: u64| AudioEffect::Compressor {
+            ratio: 20.0,
+            threshold_db: -30.0,
+            attack_ms: 1.0,
+            release_ms: 10.0,
+            output_db: 0.0,
+            sidechain: Some(sc),
+        };
+        // C(3) -> A(1) <-> B(2): B's cyclic edge (2, 1) breaks; B runs first (silence key),
+        // A ducks under B, and downstream C still ducks under A!
+        m.set(1, SourceSettings { tracks: 0b001, ..Default::default() });
+        m.set(2, SourceSettings { tracks: 0b010, ..Default::default() });
+        m.set(3, SourceSettings { tracks: 0b100, ..Default::default() });
+        m.set_effects(1, &[comp(2)]);
+        m.set_effects(2, &[comp(1)]);
+        m.set_effects(3, &[comp(1)]);
+        assert_eq!(m.broken_sidechains(), &[(2, 1)]);
+        assert_eq!(m.mix_order, vec![2, 1, 3]);
+
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        // Push 0.5 on A, 0.25 on B (above -30 dB so B ducks A), and 0.5 on C.
+        let a_in = vec![0.5f32; BLOCK * 8 * 2];
+        let b_in = vec![0.25f32; BLOCK * 8 * 2];
+        let c_in = vec![0.5f32; BLOCK * 8 * 2];
+        m.push(1, &a_in, 2, rate, t0);
+        m.push(2, &b_in, 2, rate, t0);
+        m.push(3, &c_in, 2, rate, t0);
+        let blocks = m.mix_until(t0 + 8 * step);
+        let last = blocks.last().expect("blocks");
+        let out_a = last.tracks[0][BLOCK * 2 - 2].abs();
+        let out_b = last.tracks[1][BLOCK * 2 - 2].abs();
+        let out_c = last.tracks[2][BLOCK * 2 - 2].abs();
+        // B's cyclic edge broke to silence -> B is untouched at 0.25.
+        assert!((out_b - 0.25).abs() < 1e-4, "cycle-broken source B must stay untouched: {out_b}");
+        // A ducks under B (0.25 ≈ -12 dBFS, 18 dB over -30 dB @ 20:1 -> -17.1 dB -> ~0.070).
+        assert!(out_a < 0.09, "A must still duck under B: {out_a}");
+        // C ducks under A's post-filter output (~0.070 ≈ -23 dBFS, 7 dB over -30 dB @ 20:1 -> -6.65 dB -> ~0.23).
+        assert!(out_c < 0.30, "downstream C must still duck under A: {out_c}");
+
+        // Self-loop on source 4 is also detected and broken to silence.
+        m.set(4, SourceSettings::default());
+        m.set_effects(4, &[comp(4)]);
+        assert_eq!(m.broken_sidechains(), &[(2, 1), (4, 4)]);
+
+        // Removing the cyclic filter on B clears (2, 1).
+        m.set_effects(2, &[]);
+        assert_eq!(m.broken_sidechains(), &[(4, 4)]);
+    }
+
+    /// Sidechain routing preserves exact A/V block timestamps and latency accounting even when
+    /// the key source arrives at a different sample rate (44.1 kHz -> 48 kHz) and carries a
+    /// latency-inducing filter.
+    #[test]
+    fn sidechain_preserves_av_sync_block_timestamps() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let mut m = Mixer::new(rate, 40_000_000);
+        m.set(1, SourceSettings { tracks: 0b01, ..Default::default() });
+        m.set(2, SourceSettings { tracks: 0b10, ..Default::default() });
+        m.set_effects(
+            1,
+            &[AudioEffect::Compressor {
+                ratio: 10.0,
+                threshold_db: -24.0,
+                attack_ms: 5.0,
+                release_ms: 50.0,
+                output_db: 0.0,
+                sidechain: Some(2),
+            }],
+        );
+        let t0 = 1_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let music_chunk = vec![0.4f32; 960 * 2]; // 20 ms at 48 kHz
+        let voice_chunk = vec![0.4f32; 882 * 2]; // 20 ms at 44.1 kHz
+        let mut produced = Vec::new();
+        for k in 0..50u64 {
+            let at = t0 + k * 20_000_000;
+            m.push(1, &music_chunk, 2, 48_000, at);
+            m.push(2, &voice_chunk, 2, 44_100, at);
+            produced.extend(m.mix_until(at + 20_000_000));
+        }
+        assert!(produced.len() >= 40, "expected >= 40 blocks, got {}", produced.len());
+        // Exact monotonic block cadence with zero drift or sidechain-induced timestamp shift.
+        for pair in produced.windows(2) {
+            assert_eq!(pair[1].ts_ns - pair[0].ts_ns, step, "block cadence drifted under sidechain");
+        }
+        // Latency stayed at baseline 40 ms (sidechain adds zero extra buffering).
+        assert_eq!(m.latency_ns(), 40_000_000);
+        // Music actually ducked under the 44.1 kHz resampled voice!
+        let tail_music = produced.last().unwrap().tracks[0][BLOCK * 2 - 2].abs();
+        assert!(tail_music < 0.15, "music should duck under 44.1 kHz key: {tail_music}");
     }
 }

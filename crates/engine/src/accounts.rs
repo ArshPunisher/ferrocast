@@ -449,6 +449,27 @@ impl Engine {
         );
     }
 
+    /// Turns the Studio's background saves into dashboard notices: one calm line per file that
+    /// can't be saved (the OS error behind the (i)), replaced by a one-line "saving again" when it
+    /// works. Call once at start-up; a later call replaces the earlier watcher.
+    pub fn watch_saves(&self) {
+        let engine = self.clone();
+        ferrocast_store::durable::set_save_observer(move |e| engine.save_notice(e));
+    }
+
+    fn save_notice(&self, e: &ferrocast_store::durable::SaveEvent) {
+        let (key, what) = save_subject(&e.file);
+        match &e.error {
+            Some(f) => {
+                let notice = Notice::new(NoticeLevel::Warn, save_failure_message(what, f.kind, f.raw_os_error))
+                    .key(key)
+                    .detail(f.describe());
+                self.send_live(LiveFrame::new("notice", &notice));
+            }
+            None => self.notice(&key, NoticeLevel::Info, &format!("Saving {what} again.")),
+        }
+    }
+
     /// One line on the dashboard. Notices with the same `key` replace each other there.
     pub(crate) fn notice(&self, key: &str, level: NoticeLevel, message: &str) {
         self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key)));
@@ -457,5 +478,70 @@ impl Engine {
     /// The same with what the line leaves out (the engine's own words), behind an (i) on the page.
     pub(crate) fn notice_detail(&self, key: &str, level: NoticeLevel, message: &str, detail: &str) {
         self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key).detail(detail)));
+    }
+}
+
+/// A stable, non-personal key for a saved file (its folder and name, never the full path, which
+/// holds the user's home folder) and what to call it.
+fn save_subject(file: &std::path::Path) -> (String, &'static str) {
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let folder = file.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+    let what = match (folder, name) {
+        ("collections", _) => "your scenes",
+        ("profiles", _) => "your Studio settings",
+        (_, "library.json") => "your list of scenes and settings",
+        (_, "session.json") => "the Studio's session note",
+        _ => "a Studio file",
+    };
+    (format!("save:{folder}/{name}"), what)
+}
+
+/// What to tell the person for a failed save, by why it failed.
+fn save_failure_message(what: &str, kind: std::io::ErrorKind, raw: Option<i32>) -> String {
+    use std::io::ErrorKind as K;
+    // Windows: a file another program holds open (sharing 32, lock 33) or a busy one.
+    if matches!(raw, Some(32 | 33)) || matches!(kind, K::ResourceBusy | K::WouldBlock) {
+        return format!("Couldn't save {what}: the file is in use by another program.");
+    }
+    match kind {
+        K::StorageFull | K::QuotaExceeded => format!("Couldn't save {what}: the disk is full. Free some space."),
+        K::PermissionDenied => format!("Couldn't save {what}: Ferrocast isn't allowed to write there."),
+        K::NotFound => format!("Couldn't save {what}: its folder is missing."),
+        _ => format!("Couldn't save {what}."),
+    }
+}
+
+#[cfg(test)]
+mod save_notice_tests {
+    use super::*;
+    use std::io::ErrorKind as K;
+
+    #[test]
+    fn each_failure_has_its_own_plain_reason() {
+        let m = |k, r| save_failure_message("your scenes", k, r);
+        assert_eq!(m(K::StorageFull, None), "Couldn't save your scenes: the disk is full. Free some space.");
+        assert_eq!(m(K::QuotaExceeded, None), "Couldn't save your scenes: the disk is full. Free some space.");
+        assert_eq!(
+            m(K::PermissionDenied, Some(13)),
+            "Couldn't save your scenes: Ferrocast isn't allowed to write there."
+        );
+        assert_eq!(
+            m(K::PermissionDenied, Some(32)),
+            "Couldn't save your scenes: the file is in use by another program."
+        );
+        assert_eq!(
+            m(K::PermissionDenied, Some(33)),
+            "Couldn't save your scenes: the file is in use by another program."
+        );
+        assert_eq!(m(K::ResourceBusy, None), "Couldn't save your scenes: the file is in use by another program.");
+        assert_eq!(m(K::NotFound, None), "Couldn't save your scenes: its folder is missing.");
+        assert_eq!(m(K::InvalidData, None), "Couldn't save your scenes.");
+    }
+
+    #[test]
+    fn the_key_has_no_home_folder_in_it() {
+        let (key, what) = save_subject(std::path::Path::new("/Users/someone/Library/studio/collections/main.json"));
+        assert_eq!((key.as_str(), what), ("save:collections/main.json", "your scenes"));
+        assert!(!key.contains("someone"));
     }
 }

@@ -1279,6 +1279,8 @@ struct FakeStudio {
     scene_items: Mutex<std::collections::HashMap<String, Value>>,
     /// What the recording's stats say now (null: no recording).
     record_now: Mutex<serde_json::Value>,
+    /// Broken sidechain loops reported in `stats()`.
+    sidechain_cycles: Mutex<Vec<serde_json::Value>>,
 }
 
 #[async_trait]
@@ -1389,12 +1391,19 @@ impl crate::studio_host::StudioHost for FakeStudio {
             *f
         };
         let lagged = *self.lagged.lock().unwrap();
-        Ok(json!({
+        let cycles = self.sidechain_cycles.lock().unwrap().clone();
+        let mut out = json!({
             "disk_free_mb": 500_000.0,
             "replay": null,
             "engine": { "frames": frames, "lagged": lagged, "encoded": frames, "skipped": 0, "cpu": 20.0 },
             "stream": { "frames": frames, "dropped": 0, "reconnecting": false },
-        }))
+        });
+        if !cycles.is_empty()
+            && let Some(o) = out.as_object_mut()
+        {
+            o.insert("sidechain_cycles".into(), Value::Array(cycles));
+        }
+        Ok(out)
     }
     async fn record(&self, on: bool) -> Result<Value, String> {
         self.acts.lock().unwrap().push(format!("record {on}"));
@@ -1812,4 +1821,43 @@ async fn a_recording_that_stops_is_said_once_and_low_room_before_it() {
     assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("record-stopped"), Some("error")));
     assert_eq!(n[0]["message"], "Recording stopped: the disk is full");
     assert!(n[0]["detail"].as_str().unwrap().contains("Free some space"), "{n:?}");
+}
+
+/// A broken sidechain cycle reported by Studio stats is broadcast to the dashboard once with a
+/// concise line and `(i)` detail, stays silent on repeated polls, and forgets once cleared.
+#[tokio::test]
+async fn a_sidechain_cycle_is_noticed_once_through_studio_stats() {
+    let (e, _d) = engine().await;
+    let studio = Arc::new(FakeStudio::default());
+    e.set_studio_host(studio.clone());
+    let mut live = e.subscribe_live();
+    let notices = |live: &mut tokio::sync::broadcast::Receiver<crate::frames::LiveFrame>| {
+        let mut out = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    };
+
+    *studio.sidechain_cycles.lock().unwrap() = vec![json!({ "source": "Voice", "key": "Music" })];
+    for _ in 0..20 {
+        let _ = e.studio_stats().await.unwrap();
+    }
+    let n = notices(&mut live);
+    assert_eq!(n.len(), 1, "sidechain loop reported once across 20 polls: {n:?}");
+    assert_eq!((n[0]["key"].as_str(), n[0]["level"].as_str()), (Some("sidechain-cycle"), Some("warn")));
+    assert_eq!(n[0]["message"], "Sidechain loop between Voice and Music was broken");
+    assert!(n[0]["detail"].as_str().unwrap().contains("silence"), "{n:?}");
+
+    // Clearing the loop lets a future recurrence notify once again.
+    studio.sidechain_cycles.lock().unwrap().clear();
+    let _ = e.studio_stats().await.unwrap();
+    assert!(notices(&mut live).is_empty());
+
+    *studio.sidechain_cycles.lock().unwrap() = vec![json!({ "source": "Voice", "key": "Music" })];
+    let _ = e.studio_stats().await.unwrap();
+    assert_eq!(notices(&mut live).len(), 1);
 }

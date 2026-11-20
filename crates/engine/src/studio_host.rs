@@ -2185,6 +2185,7 @@ impl Engine {
     /// The Studio's stats, with the stream's health while it's live.
     pub async fn studio_stats(&self) -> Result<Value, EngineError> {
         let mut v = self.studio_host()?.stats().await.map_err(failed)?;
+        self.observe_sidechain_cycles(&v);
         let health = self.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()).1.clone();
         if let (Some(o), Some(h)) = (v.as_object_mut(), health) {
             o.insert("health".into(), serde_json::json!(h));

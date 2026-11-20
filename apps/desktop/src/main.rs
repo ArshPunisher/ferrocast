@@ -234,6 +234,7 @@ fn main() {
             let show_for_safe_mode = engine.safe_mode_status().active || engine.safe_mode_status().offer;
             app.manage(running);
             app.manage(studio_keys::StudioKeys::new(engine.clone()));
+            engine.watch_saves();
             engine.set_studio_host(Arc::new(studio::DesktopStudio::new(app.handle().clone(), dir.clone())));
             // The Studio's saved shortcuts work from the start, Studio running or not.
             {
