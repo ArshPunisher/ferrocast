@@ -257,17 +257,45 @@ fn main() {
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
         RunEvent::Exit => {
-            studio::end_session();
             tracing::info!("Ferrocast quitting");
-            // Before the main thread's own end, which can't run the engine's GPU cleanup.
-            studio::close();
-            if let Some(r) = app.try_state::<Running>() {
-                r.engine.clear_running_marker();
-            }
+            let running = app.try_state::<Running>();
+            clean_exit_sequence(
+                studio::mark_quitting,
+                studio::close,
+                || {
+                    if let Some(r) = running.as_ref() {
+                        r.engine.shutdown();
+                    }
+                },
+                || {
+                    studio::end_session();
+                    if let Some(r) = running.as_ref() {
+                        r.engine.clear_running_marker();
+                    }
+                },
+            );
             tracing::info!("the Studio closed");
         }
         _ => {}
     });
+}
+
+fn clean_exit_sequence(
+    mark_quitting: impl FnOnce(),
+    close_studio: impl FnOnce() -> bool,
+    shutdown_engine: impl FnOnce(),
+    clear_markers: impl FnOnce(),
+) -> bool {
+    mark_quitting();
+    // Before the main thread's own end, which can't run the engine's GPU cleanup.
+    let closed = close_studio();
+    shutdown_engine();
+    if closed {
+        clear_markers();
+    } else {
+        tracing::warn!("clean quit markers preserved: Studio did not finish closing cleanly");
+    }
+    closed
 }
 
 fn shortcut_of(s: &str) -> Shortcut {
@@ -1201,5 +1229,34 @@ mod update_tests {
         let cut = release_notes(Some(&long)).unwrap();
         assert_eq!(cut.chars().count(), NOTES_MAX + 1);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn clean_exit_sequence_deletes_markers_only_after_clean_close() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let ok = clean_exit_sequence(
+            || log.borrow_mut().push("mark_quitting"),
+            || {
+                log.borrow_mut().push("close_studio");
+                true
+            },
+            || log.borrow_mut().push("shutdown_engine"),
+            || log.borrow_mut().push("clear_markers"),
+        );
+        assert!(ok);
+        assert_eq!(*log.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine", "clear_markers"]);
+
+        let partial = std::cell::RefCell::new(Vec::new());
+        let failed = clean_exit_sequence(
+            || partial.borrow_mut().push("mark_quitting"),
+            || {
+                partial.borrow_mut().push("close_studio");
+                false
+            },
+            || partial.borrow_mut().push("shutdown_engine"),
+            || partial.borrow_mut().push("clear_markers"),
+        );
+        assert!(!failed);
+        assert_eq!(*partial.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine"]);
     }
 }

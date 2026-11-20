@@ -153,7 +153,7 @@ impl Engine {
 
     pub(crate) fn safe_mode_option(&self) -> Option<SafeModeStatus> {
         let s = self.safe_mode_status();
-        (s.unclean_exit || s.active || s.offer || s.collection_pending).then_some(s)
+        (s.active || s.offer || s.collection_pending).then_some(s)
     }
 
     pub(crate) fn safe_mode_plugins_disabled(&self) -> bool {
@@ -475,5 +475,21 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("--safe-mode"));
         ferrocore::afx::set_plugins_disabled(false);
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_running_marker_until_explicit_clear() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = Engine::start_with(dir.path(), Arc::new(MemorySecrets::default()), PlatformApps::default())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        engine.init_safe_mode(dir.path(), false);
+        assert!(has_unclean_exit(dir.path()), "running.json stays while live");
+
+        engine.shutdown();
+        assert!(has_unclean_exit(dir.path()), "WAL checkpoint shutdown alone must not clear running.json");
+
+        engine.clear_running_marker();
+        assert!(!has_unclean_exit(dir.path()), "explicit clear after clean close removes running.json");
     }
 }

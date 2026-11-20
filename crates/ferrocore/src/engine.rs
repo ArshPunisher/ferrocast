@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -808,6 +808,28 @@ struct PreviewThread {
     thread: JoinHandle<()>,
 }
 
+/// Maximum time `Engine::drop` waits for the watchdog thread (which may be blocked in a slow OS
+/// capture driver open) before detaching it cleanly so quit never hangs.
+const WATCHDOG_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn join_bounded(handle: JoinHandle<()>, done: &(Mutex<bool>, Condvar), timeout: Duration) -> bool {
+    let guard = done.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (guard, _timed_out) =
+        done.1.wait_timeout_while(guard, timeout, |finished| !*finished).unwrap_or_else(|e| e.into_inner());
+    let finished = *guard;
+    drop(guard);
+    if finished {
+        let _ = handle.join();
+        true
+    } else {
+        tracing::warn!(
+            timeout_ms = timeout.as_millis() as u64,
+            "engine watchdog did not finish before shutdown deadline; detaching"
+        );
+        false
+    }
+}
+
 /// The engine. Dropping it stops its thread and closes its outputs.
 pub struct Engine {
     config: EngineConfig,
@@ -826,6 +848,7 @@ pub struct Engine {
     seen: Arc<Seen>,
     thread: Option<JoinHandle<()>>,
     watchdog: Option<JoinHandle<()>>,
+    watchdog_done: Arc<(Mutex<bool>, Condvar)>,
     sleep: Arc<crate::sleep::SleepMonitor>,
     preview: Mutex<HashMap<u64, PreviewThread>>,
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
@@ -904,11 +927,12 @@ impl Engine {
                 .spawn(move || run(config, &state, &gpu, &mixer, &stop, &seen, &sleep))
                 .map_err(|e| AvError::Source(format!("the engine's thread didn't start ({e})")))?
         };
+        let watchdog_done = Arc::new((Mutex::new(false), Condvar::new()));
         let watchdog = {
-            let (state, mixer, stop) = (state.clone(), mixer.clone(), stop.clone());
+            let (state, mixer, stop, done) = (state.clone(), mixer.clone(), stop.clone(), watchdog_done.clone());
             std::thread::Builder::new()
                 .name("ferrocast-watchdog".into())
-                .spawn(move || watchdog(config, &state, &mixer, &stop))
+                .spawn(move || watchdog(config, &state, &mixer, &stop, &done))
                 .ok()
         };
         Ok(Self {
@@ -923,6 +947,7 @@ impl Engine {
             seen,
             thread: Some(thread),
             watchdog,
+            watchdog_done,
             sleep,
             preview: Mutex::new(HashMap::new()),
             next_preview: AtomicU64::new(1),
@@ -1176,6 +1201,7 @@ impl Engine {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), AvError>>();
         let state = self.state.clone();
         let mixer = self.mixer.clone();
+        let stop = self.stop.clone();
         let spawned = std::thread::Builder::new().name("ferrocore-open".into()).spawn(move || {
             // A panic opening it is an error like any other: the token is cleared below and the
             // watchdog tries again (CodeRabbit), instead of a source stuck "opening".
@@ -1184,8 +1210,10 @@ impl Engine {
             let mut leftover = None;
             let mut discard = false;
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            // Still the same source (not removed or replaced while it opened)?
-            let mine = st.sources.get_mut(&id).filter(|s| s.opening == Some(token));
+            // Do not accept late captures once Engine shutdown has started.
+            let mine = (!stop.load(Ordering::Acquire))
+                .then(|| st.sources.get_mut(&id).filter(|s| s.opening == Some(token)))
+                .flatten();
             let answer = match (opened, mine) {
                 (Ok((live, heard)), Some(src)) => {
                     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -2523,21 +2551,29 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
         let ids: Vec<u64> = self.preview_threads().keys().copied().collect();
         for id in ids {
             self.stop_preview(id);
         }
-        self.stop.store(true, Ordering::Release);
+        // Join the render/encode loop first so it stops feeding outputs/captures.
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
-        if let Some(t) = self.watchdog.take() {
-            let _ = t.join();
-        }
+        // Stop remaining outputs BEFORE releasing sources/parked captures so encoders flush cleanly.
         let ids: Vec<u64> = self.lock().outputs.iter().map(|(i, ..)| *i).collect();
         for id in ids {
             let _ = self.stop_output(id);
         }
+        if let Some(t) = self.watchdog.take() {
+            join_bounded(t, &self.watchdog_done, WATCHDOG_STOP_TIMEOUT);
+        }
+        let (sources, parked) = {
+            let mut st = self.lock();
+            (std::mem::take(&mut st.sources), std::mem::take(&mut st.parked))
+        };
+        drop(sources);
+        drop(parked);
         self.sleep.release_all();
     }
 }
@@ -3546,7 +3582,23 @@ fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[Strin
 /// The watchdog: once a second (or right away when a device connects) it looks at every capture,
 /// and one that faulted, ended or went quiet is started again (waiting longer after each try that
 /// didn't hold).
-fn watchdog(config: EngineConfig, state: &Mutex<State>, mixer: &Mutex<Mixer>, stop: &AtomicBool) {
+struct SignalDone<'a>(&'a (Mutex<bool>, Condvar));
+
+impl Drop for SignalDone<'_> {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.1.notify_all();
+    }
+}
+
+fn watchdog(
+    config: EngineConfig,
+    state: &Mutex<State>,
+    mixer: &Mutex<Mixer>,
+    stop: &AtomicBool,
+    done: &(Mutex<bool>, Condvar),
+) {
+    let _signal_done = SignalDone(done);
     let mut hotplug_seq = 0u64;
     let _ = poll_hotplug(&mut hotplug_seq);
     while !stop.load(Ordering::Acquire) {
@@ -3603,9 +3655,16 @@ fn watchdog(config: EngineConfig, state: &Mutex<State>, mixer: &Mutex<Mixer>, st
         drop(expired);
         for (id, kind, why, old) in todo {
             drop(old);
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
             tracing::warn!(source = id, %why, "the watchdog starts a source again");
             match open_capture(&config, &kind) {
                 Some(Ok(live)) => {
+                    if stop.load(Ordering::Acquire) {
+                        drop(live);
+                        return;
+                    }
                     let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(src) = st.sources.get_mut(&id).filter(|s| s.kind.as_ref() == Some(&kind)) {
                         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -6295,6 +6354,51 @@ mod tests {
         assert!(!engine.sleep_inhibited(), "releasing last recording frees sleep inhibition");
 
         let _ = engine.stop_output(replay);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn join_bounded_returns_within_timeout_without_hanging_on_stalled_thread() {
+        // Fast worker finishes cleanly and joins within the timeout.
+        let done_fast = Arc::new((Mutex::new(false), Condvar::new()));
+        let tx = done_fast.clone();
+        let h_fast = std::thread::spawn(move || {
+            *tx.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            tx.1.notify_all();
+        });
+        assert!(join_bounded(h_fast, &done_fast, Duration::from_secs(1)));
+
+        // Stalled worker (e.g., wedged OS camera open in watchdog) detaches cleanly at the bound.
+        let done_slow = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_worker = release.clone();
+        let h_slow = std::thread::spawn(move || {
+            let g = release_worker.0.lock().unwrap_or_else(|e| e.into_inner());
+            drop(release_worker.1.wait_while(g, |stop| !*stop));
+        });
+        let started = Instant::now();
+        assert!(!join_bounded(h_slow, &done_slow, Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_millis(400), "must not hang waiting on stalled thread");
+        *release.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        release.1.notify_all();
+    }
+
+    #[test]
+    fn engine_drop_stops_active_outputs_and_joins_promptly() {
+        if !encodes_here() {
+            return;
+        }
+        let Some(engine) = engine() else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ferrocore-drop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let rec_path = dir.join("rec.mp4");
+        let _ = engine.start_output(OutputKind::Record(rec_path)).unwrap_or_else(|e| panic!("{e}"));
+
+        let started = Instant::now();
+        drop(engine);
+        assert!(started.elapsed() < Duration::from_secs(5), "Engine::drop must finish cleanly and quickly");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

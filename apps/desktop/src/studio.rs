@@ -38,10 +38,6 @@ use crate::studio_library::{self as library, Kind};
 /// it either). Stop takes the scenes and preview away; Start loads them back on the same engine.
 #[derive(Default)]
 struct Held {
-    collection: Option<Collection>,
-    /// True in Safe Mode when a temporary empty collection is running until the user confirms
-    /// loading the saved collection; guards against overwriting the saved file on disk.
-    collection_deferred: bool,
     preview: Option<Preview>,
     /// Where the preview is, to make it again when the canvas changes.
     preview_at: Option<(Rect, f64)>,
@@ -118,6 +114,11 @@ struct Held {
     follow_run: u64,
     /// Auto quality's share of the set bitrate on the stream now (None: all of it).
     live_pct: Option<u8>,
+    /// Kept LAST so Rust's implicit drop order always drops outputs before the collection.
+    collection: Option<Collection>,
+    /// True in Safe Mode when a temporary empty collection is running until the user confirms
+    /// loading the saved collection; guards against overwriting the saved file on disk.
+    collection_deferred: bool,
 }
 
 /// `kbps` at auto quality's share `pct` (the floor a stream never goes under: 300).
@@ -779,22 +780,156 @@ fn write_session(now: Option<&ferrocast_engine::studio_host::Recovered>) {
     }
 }
 
+/// Maximum time `close()` / `stop()` waits for parallel off-main-thread output drains (exceeds
+/// `OwnStream`'s internal 5 s tokio runtime shutdown timeout so normal drains finish cleanly).
+const QUIT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+fn push_opt_drain<T: Send + 'static>(jobs: &mut Vec<Box<dyn FnOnce() + Send>>, slot: &mut Option<T>) {
+    if let Some(item) = slot.take() {
+        jobs.push(Box::new(move || {
+            let _dropped = item;
+        }));
+    }
+}
+
+fn push_vec_drain<T: Send + 'static>(jobs: &mut Vec<Box<dyn FnOnce() + Send>>, items: &mut Vec<T>) {
+    for item in items.drain(..) {
+        jobs.push(Box::new(move || {
+            let _dropped = item;
+        }));
+    }
+}
+
+fn take_outputs_from_held(h: &mut Held) -> Vec<Box<dyn FnOnce() + Send>> {
+    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+    h.stream_with = None;
+    h.record_with = None;
+    h.replay_shown = None;
+    h.replay_back = None;
+    h.replay_wait = None;
+    h.live_pct = None;
+    push_opt_drain(&mut jobs, &mut h.vstream);
+    push_opt_drain(&mut jobs, &mut h.lstream);
+    push_opt_drain(&mut jobs, &mut h.stream);
+    push_opt_drain(&mut jobs, &mut h.record);
+    push_vec_drain(&mut jobs, &mut h.source_records);
+    push_opt_drain(&mut jobs, &mut h.replay);
+    push_opt_drain(&mut jobs, &mut h.virtualcam);
+    push_opt_drain(&mut jobs, &mut h.ndi);
+    push_vec_drain(&mut jobs, &mut h.guests);
+    jobs
+}
+
+struct DrainGuard {
+    tx: std::sync::mpsc::Sender<bool>,
+    ok: bool,
+}
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(self.ok);
+    }
+}
+
+/// Drops each extracted output on its own worker thread in parallel off the main thread, returning
+/// `true` iff every output finished within `timeout` without panicking.
+fn drain_outputs_bounded(jobs: Vec<Box<dyn FnOnce() + Send>>, timeout: std::time::Duration) -> bool {
+    if jobs.is_empty() {
+        return true;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let mut started = 0usize;
+    let mut all_ok = true;
+    for job in jobs {
+        let tx = tx.clone();
+        match std::thread::Builder::new().name("ferrocast-drain".into()).spawn(move || {
+            let mut guard = DrainGuard { tx, ok: false };
+            job();
+            guard.ok = true;
+        }) {
+            Ok(_) => started += 1,
+            Err(err) => {
+                tracing::warn!(%err, "failed to spawn Studio output drain thread");
+                all_ok = false;
+            }
+        }
+    }
+    drop(tx);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut finished = 0usize;
+    while finished < started {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            tracing::warn!(
+                finished,
+                total = started,
+                timeout_ms = timeout.as_millis() as u64,
+                "Studio outputs exceeded shutdown drain deadline"
+            );
+            return false;
+        }
+        match rx.recv_timeout(deadline - now) {
+            Ok(ok) => {
+                finished += 1;
+                all_ok &= ok;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    finished,
+                    total = started,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Studio outputs exceeded shutdown drain deadline"
+                );
+                return false;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    all_ok && finished == started
+}
+
+fn clear_non_output_held(h: &mut Held) {
+    h.preview = None;
+    h.preview_at = None;
+    h.program_view = None;
+    h.program_at = None;
+    h.vertical = VerticalView::default();
+    h.projectors.clear();
+    h.history.clear();
+    h.captions = None;
+    if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
+        c.stop_follow(&f);
+    }
+}
+
+/// Prevents session persistence updates from clearing `session.json` prematurely while outputs are
+/// stopping during an application quit. Call `end_session()` strictly after clean close completes.
+pub fn mark_quitting() {
+    QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Ferrocast is quitting normally: the note goes, so the next launch isn't taken for a crash.
 pub fn end_session() {
-    QUITTING.store(true, std::sync::atomic::Ordering::Relaxed);
+    mark_quitting();
     if let Some(file) = SESSION.get() {
         ferrocast_store::durable::remove_with_backup(file);
     }
 }
 
-/// Closes the Studio (its engine, outputs and preview) now, on the main thread while it's still
-/// whole. Left to the thread's own end, the engine's graphics queue waited for the GPU inside an
-/// Objective-C autorelease pool whose thread-local list was already gone: a panic in a
-/// thread-local destructor, and Ferrocast aborted on every quit with the Studio running (9 Nov).
-pub fn close() {
-    // Taken out first, then dropped: nothing borrows HELD while the engine closes.
-    let held = HELD.with(|h| h.try_borrow_mut().ok().map(|mut h| std::mem::take(&mut *h)));
+/// Closes the Studio cleanly before exit on the main thread while AppKit/GPU state is still whole:
+/// stops and drains active outputs in parallel off the main thread (bounded) BEFORE dropping the
+/// scene collection. Returns `true` when outputs drained cleanly within the bound.
+pub fn close() -> bool {
+    // Taken out first, then drained/dropped: nothing borrows HELD while the engine closes.
+    let Some(mut held) = HELD.with(|h| h.try_borrow_mut().ok().map(|mut h| std::mem::take(&mut *h))) else {
+        tracing::warn!("Studio state is still borrowed on close");
+        return false;
+    };
+    let jobs = take_outputs_from_held(&mut held);
+    let clean = drain_outputs_bounded(jobs, QUIT_DRAIN_TIMEOUT);
+    clear_non_output_held(&mut held);
     drop(held);
+    clean
 }
 
 /// What live captions last heard, as the "Captions" text source shows it.
@@ -1719,31 +1854,17 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn stop(&self) -> Result<StudioStatus, String> {
+        // Extract active outputs on main thread without blocking UI, then drain them in parallel
+        // off the main thread BEFORE saving and dropping the scene collection.
+        let jobs = self.on_main(take_outputs_from_held).await?;
+        if !jobs.is_empty() {
+            let _ = tokio::task::spawn_blocking(move || drain_outputs_bounded(jobs, QUIT_DRAIN_TIMEOUT)).await;
+        }
         let data = self.data.clone();
         self.on_main(move |h| {
             let file = scenes_file(&data);
             let deferred = h.collection_deferred;
-            // The stream, the recording, the preview and the scenes go (saved first); the engine
-            // stays loaded for the next Start.
-            h.vstream = None;
-            h.lstream = None;
-            h.stream = None;
-            h.record = None;
-            h.source_records.clear();
-            h.replay = None;
-            h.virtualcam = None;
-            h.ndi = None;
-            h.preview = None;
-            h.preview_at = None;
-            h.program_view = None;
-            h.program_at = None;
-            h.vertical = VerticalView::default();
-            h.projectors.clear();
-            h.history.clear();
-            h.captions = None;
-            if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
-                c.stop_follow(&f);
-            }
+            clear_non_output_held(h);
             if let Some(c) = h.collection.take() {
                 save_confirmed(deferred, &c, &file);
             }
@@ -3794,6 +3915,64 @@ mod budget_tests {
                 serde_json::from_slice(&std::fs::read(&scenes_path).unwrap_or_else(|e| panic!("{e}")))
                     .unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(still_on_disk["current_scene"], "Main Show");
+        }
+    }
+
+    #[test]
+    fn drain_outputs_bounded_runs_off_main_in_parallel_and_bounds_stalls() {
+        use std::sync::{Arc, Barrier, Condvar, Mutex};
+
+        let caller_tid = std::thread::current().id();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_tids = Arc::new(Mutex::new(Vec::new()));
+
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..2)
+            .map(|_| {
+                let b = barrier.clone();
+                let tids = worker_tids.clone();
+                Box::new(move || {
+                    tids.lock().unwrap_or_else(|e| e.into_inner()).push(std::thread::current().id());
+                    // Barrier proves both drains execute concurrently off the caller thread.
+                    b.wait();
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+
+        assert!(drain_outputs_bounded(jobs, std::time::Duration::from_secs(2)));
+        let tids = worker_tids.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(tids.len(), 2);
+        assert!(tids.iter().all(|&tid| tid != caller_tid));
+        assert_ne!(tids[0], tids[1]);
+
+        // Stalled drain returns false at the bound instead of wedging the main thread.
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_worker = gate.clone();
+        let stalled: Vec<Box<dyn FnOnce() + Send>> = vec![Box::new(move || {
+            let g = gate_worker.0.lock().unwrap_or_else(|e| e.into_inner());
+            drop(gate_worker.1.wait_while(g, |done| !*done));
+        })];
+        let started = std::time::Instant::now();
+        assert!(!drain_outputs_bounded(stalled, std::time::Duration::from_millis(40)));
+        assert!(started.elapsed() < std::time::Duration::from_millis(400));
+        *gate.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        gate.1.notify_all();
+    }
+
+    #[test]
+    fn take_outputs_keeps_collection_alive_until_drain_and_close_clears_held() {
+        if let Ok(collection) = Collection::new(Canvas { width: 640, height: 360, fps: 30 }, FIRST_SCENE) {
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                h.collection = Some(collection);
+            });
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                let jobs = take_outputs_from_held(&mut h);
+                assert!(jobs.is_empty());
+                assert!(h.collection.is_some(), "collection stays intact until outputs finish");
+            });
+            assert!(close());
+            assert!(HELD.with(|h| h.borrow().collection.is_none()));
         }
     }
 }

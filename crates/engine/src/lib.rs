@@ -462,6 +462,14 @@ impl Engine {
         self.inner.store.clone()
     }
 
+    /// Flushes persistent engine state (SQLite WAL) cleanly during application quit, before
+    /// deleting clean-exit markers.
+    pub fn shutdown(&self) {
+        if let Err(err) = self.inner.store.checkpoint() {
+            tracing::warn!(%err, "SQLite WAL checkpoint failed during engine shutdown");
+        }
+    }
+
     pub(crate) fn state(&self) -> std::sync::RwLockReadGuard<'_, State> {
         self.inner.state.read().unwrap_or_else(|p| p.into_inner())
     }
