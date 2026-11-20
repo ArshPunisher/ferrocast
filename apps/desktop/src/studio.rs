@@ -991,6 +991,10 @@ pub fn close() -> bool {
     let clean = drain_outputs_bounded(jobs, quit_drain_for(cfg!(windows)));
     clear_non_output_held(&mut held);
     drop(held);
+    // The queued scene saves land before the process goes (bounded).
+    if !ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(6)) {
+        tracing::warn!("a scene save was still waiting at exit");
+    }
     clean
 }
 
@@ -1518,7 +1522,9 @@ fn save_confirmed(deferred: bool, c: &Collection, file: &std::path::Path) {
         return;
     }
     let doc = c.save(COLLECTION);
-    if let Err(e) = ferrocast_store::durable::save_json_pretty(file, &doc) {
+    // Queued, not written here: this runs on the main thread, and a locked file (antivirus,
+    // indexer) would make the write wait out its retries (~5.7 s) with the UI frozen.
+    if let Err(e) = ferrocast_store::durable::queue_json_pretty(file, &doc) {
         tracing::warn!(error = %e, file = %file.display(), "the Studio's scenes couldn't be saved");
     }
 }
@@ -1939,18 +1945,29 @@ impl StudioHost for DesktopStudio {
             let _ = tokio::task::spawn_blocking(move || drain_outputs_bounded(jobs, QUIT_DRAIN_TIMEOUT)).await;
         }
         let data = self.data.clone();
-        self.on_main(move |h| {
-            let file = scenes_file(&data);
-            let deferred = h.collection_deferred;
-            clear_non_output_held(h);
-            if let Some(c) = h.collection.take() {
-                save_confirmed(deferred, &c, &file);
-            }
-            h.collection_deferred = false;
-            write_session(None);
-            Self::status_of(h)
-        })
-        .await
+        let status = self
+            .on_main(move |h| {
+                let file = scenes_file(&data);
+                let deferred = h.collection_deferred;
+                clear_non_output_held(h);
+                if let Some(c) = h.collection.take() {
+                    save_confirmed(deferred, &c, &file);
+                }
+                h.collection_deferred = false;
+                write_session(None);
+                Self::status_of(h)
+            })
+            .await?;
+        // The scenes' save was queued: wait for it here, off the main thread, so Stop still means
+        // "saved" without the UI waiting on a locked file.
+        let landed =
+            tokio::task::spawn_blocking(|| ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)))
+                .await
+                .unwrap_or(false);
+        if !landed {
+            tracing::warn!("the Studio's scenes were still saving when it stopped");
+        }
+        Ok(status)
     }
 
     async fn kinds(&self) -> Result<Value, String> {
