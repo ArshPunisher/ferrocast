@@ -391,13 +391,13 @@ impl Engine {
 
     /// On start: Kick saved from an earlier run.
     pub(crate) async fn resume_kick(&self, account: repo::settings::Account) {
-        let saved = self.inner.secrets.get(KICK_TOKENS).ok().flatten();
-        match saved.and_then(|j| serde_json::from_str::<KickTokens>(&j).ok()) {
-            Some(t) => match self.kick_api(t) {
+        match crate::accounts::saved_tokens::<KickTokens>(&*self.inner.secrets, KICK_TOKENS) {
+            crate::accounts::Saved::Unreadable => {}
+            crate::accounts::Saved::Found(t) => match self.kick_api(t) {
                 Ok(api) => self.start_kick(api, account),
                 Err(e) => tracing::warn!(%e, "Kick is saved but can't start"),
             },
-            None => {
+            crate::accounts::Saved::Missing => {
                 let _ = self
                     .submit(ferrocast_core::event::Event::live(
                         Platform::Kick,

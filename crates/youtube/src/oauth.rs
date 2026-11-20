@@ -32,6 +32,13 @@ pub struct Tokens {
     pub expires_at: i64,
 }
 
+/// When a token that lives `expires_in` seconds, got at `now` (ms), counts as expiring: never sooner
+/// than the refresh margin plus ten minutes, so a short-lived token (60 s, or 0) isn't "already
+/// expiring" and refreshed again at every call.
+pub(crate) fn expires_at(now: i64, expires_in: i64) -> i64 {
+    now + expires_in.clamp(600, 86_400) * 1000
+}
+
 impl Tokens {
     pub fn needs_refresh(&self, now: i64) -> bool {
         now >= self.expires_at - 300_000
@@ -162,11 +169,7 @@ pub async fn finish(
     let t: TokenResponse = res.json().await.map_err(YoutubeError::network)?;
     let refresh_token =
         t.refresh_token.ok_or_else(|| YoutubeError::SignIn("Google didn't grant offline access.".into()))?;
-    Ok(Tokens {
-        access_token: t.access_token,
-        refresh_token,
-        expires_at: now_ms() + t.expires_in.clamp(0, 86_400) * 1000,
-    })
+    Ok(Tokens { access_token: t.access_token, refresh_token, expires_at: expires_at(now_ms(), t.expires_in) })
 }
 
 /// Google keeps the same refresh token across refreshes unless it sends a new one.
@@ -193,10 +196,19 @@ pub async fn refresh(
             Ok(Tokens {
                 access_token: t.access_token,
                 refresh_token: t.refresh_token.unwrap_or_else(|| current.refresh_token.clone()),
-                expires_at: now_ms() + t.expires_in.clamp(0, 86_400) * 1000,
+                expires_at: expires_at(now_ms(), t.expires_in),
             })
         }
-        400 | 401 => Err(YoutubeError::SignInNeeded),
+        400 | 401 => {
+            // Google answers a refused refresh token with JSON (invalid_grant...). A proxy, a captive
+            // portal or a gateway answers with a page, which is not the streamer being signed out.
+            let body = res.text().await.unwrap_or_default();
+            if serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|v| v.get("error").is_some()) {
+                Err(YoutubeError::SignInNeeded)
+            } else {
+                Err(YoutubeError::network("the sign-in server sent an unexpected answer"))
+            }
+        }
         _ => Err(YoutubeError::from_response(res).await),
     }
 }
@@ -218,4 +230,70 @@ async fn respond(socket: &mut tokio::net::TcpStream, status: u16, message: &str)
     socket.write_all(head.as_bytes()).await?;
     socket.write_all(body.as_bytes()).await?;
     socket.shutdown().await
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[test]
+    fn a_short_lived_token_is_not_refreshed_again_at_once() {
+        let now = 1_000_000_000_000;
+        for lifetime in [0, 60, 299] {
+            let t =
+                Tokens { access_token: "a".into(), refresh_token: "r".into(), expires_at: expires_at(now, lifetime) };
+            assert!(!t.needs_refresh(now), "a token of {lifetime} s is used, not refreshed in a loop");
+        }
+        let hour = Tokens { access_token: "a".into(), refresh_token: "r".into(), expires_at: expires_at(now, 3600) };
+        assert!(
+            !hour.needs_refresh(now) && hour.needs_refresh(now + 3_400_000),
+            "a normal token still refreshes 5 min early"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refresh_answer_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn answering(status: u16, ctype: &'static str, body: &'static str) -> Endpoints {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let r = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(r.as_bytes()).await;
+                });
+            }
+        });
+        Endpoints { authorize: base.clone(), token: format!("{base}/token"), api: base.clone(), grpc: base }
+    }
+
+    #[tokio::test]
+    async fn only_googles_own_answer_signs_the_streamer_out() {
+        let http = reqwest::Client::new();
+        let app = AppCredentials { client_id: "c".into(), client_secret: "s".into() };
+        let t = Tokens { access_token: "a".into(), refresh_token: "r".into(), expires_at: 1 };
+        let g = answering(
+            400,
+            "application/json",
+            r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#,
+        )
+        .await;
+        assert!(matches!(refresh(&http, &g, &app, &t).await, Err(YoutubeError::SignInNeeded)));
+        for page in [
+            answering(400, "text/html", "<html>proxy</html>").await,
+            answering(401, "text/html", "<html>wifi login</html>").await,
+        ] {
+            let e = refresh(&http, &page, &app, &t).await.unwrap_err();
+            assert!(!matches!(e, YoutubeError::SignInNeeded), "a page from a proxy is not a sign-out: {e:?}");
+        }
+    }
 }

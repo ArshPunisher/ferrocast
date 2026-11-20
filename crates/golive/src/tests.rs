@@ -546,7 +546,9 @@ async fn a_server_that_was_live_and_refuses_connections_for_a_while_is_waited_fo
     let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
     state_is(&mut health, |s| *s == PushState::Live).await;
     assert_eq!(next(&mut got).await, Got::Publish("k".into()));
-    // The server goes: its listener and connections close; nothing listens for a while.
+    // It has been live a while (not a moment), then the server goes: its listener and connections
+    // close; nothing listens for a while.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
     server.abort();
     let _ = server.await;
     let state = state_is(&mut health, |s| {
@@ -588,6 +590,76 @@ async fn a_destination_waiting_for_the_network_stays_reconnecting_while_a_try_is
     }
     push::fault::set_slow(dport, 0);
     push::fault::set(dport, false);
+}
+
+/// One platform's bad half hour: it gives up after its tries (the stream goes on to the others), and
+/// then tries again by itself every so often: when the platform is back it is live again without
+/// anyone toggling it. (A refusal stays parked: see the key tests.)
+#[tokio::test]
+async fn a_destination_that_gave_up_tries_again_slowly_and_comes_back() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Failed { refused: false, .. })).await;
+    let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    obs.video(10, KEY).await;
+}
+
+/// After giving up, a destination probes once per wait, and stays Failed while it does: it doesn't
+/// start the whole retry loop again (a connect storm for hours, Health and the status flickering
+/// between Failed and Connecting, and two out-of-phase platforms never being Failed together).
+#[tokio::test]
+async fn a_destination_that_gave_up_probes_once_per_wait_and_stays_failed() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    drop(l);
+    push::fault::set_no_name(dport, true);
+    let mut d = destination(dport, "k");
+    d.retry = push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await;
+    let before = push::fault::connects(dport);
+    // Three waits' worth of time.
+    let until = tokio::time::Instant::now() + Duration::from_millis(1_500);
+    while tokio::time::Instant::now() < until {
+        let s = health.borrow().state.clone();
+        assert!(matches!(s, PushState::Failed { .. }), "left Failed for {s:?} while probing");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let probes = push::fault::connects(dport) - before;
+    assert!((1..=4).contains(&probes), "one probe per wait, not a retry loop each time: {probes}");
+    push::fault::set_no_name(dport, false);
+}
+
+/// Kick taking the stream and closing it at once (no multistreaming, 40 ms) has
+/// not shown that it works: the next refusal to connect is an ordinary failure, not a ten-minute wait.
+#[tokio::test]
+async fn a_stream_taken_and_closed_at_once_does_not_earn_the_long_wait() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let got = platform_that_drops(l, "k", Duration::from_millis(40)).await;
+    let mut d = destination(dport, "k");
+    d.id = "kick".into();
+    d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
+    let mut health = start(&w, d);
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    state_is(&mut health, |s| *s == PushState::Live).await;
+    // Nothing listens any more after the first take.
+    drop(got);
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { attempts, .. } => assert!(attempts <= 3, "{attempts}"),
+        s => panic!("{s:?}"),
+    }
 }
 
 #[tokio::test]

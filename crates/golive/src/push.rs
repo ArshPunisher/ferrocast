@@ -283,7 +283,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         // a row, then its backup (and back, the same way); each stream starts on the own one.
         let mut on_backup = false;
         let mut connect_failures = 0u32;
-        loop {
+        'connect: loop {
             let target = match (&dest.backup, on_backup) {
                 (Some(b), true) => b,
                 _ => &dest.target,
@@ -314,7 +314,10 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         Some(t) => (true, u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)),
                         None => (false, 0),
                     };
-                    ever_live |= was_live;
+                    // Kick taking the stream and closing it at once (no multistream) doesn't prove the
+                    // key or the address works; any other session that was live does, however short
+                    // (a drop half a second in, then a reconnect, is still a server that took the key).
+                    ever_live |= was_live && !(live_for_ms < STAYED_LIVE_MS && is_kick(&dest));
                     // A hang-up at the publish: a wrong key before the key ever worked in this
                     // stream (what it was always taken for), a server dropping the connection after.
                     let err = match err {
@@ -409,9 +412,47 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                                 refused: is_refused,
                             },
                         );
-                        tokio::select! {
-                            _ = stop.wait_for(|s| *s) => break 'streams,
-                            _ = live.wait_for(|l| !still_on(l)) => break,
+                        // A refusal (a bad key, Kick's multistream) stays parked: asking again won't
+                        // change the answer. Anything else (an outage that outlasted the tries, a
+                        // platform node down for minutes) is tried again slowly while the stream
+                        // goes on, so one platform's bad half hour doesn't end it for the whole stream.
+                        if is_refused {
+                            tokio::select! {
+                                _ = stop.wait_for(|s| *s) => break 'streams,
+                                _ = live.wait_for(|l| !still_on(l)) => break,
+                            }
+                        }
+                        // One try per wait (1, 2, then 5 minutes), still Failed while it runs; only a
+                        // session that really goes live starts the ordinary loop again.
+                        let mut step = 0usize;
+                        loop {
+                            let wait = SLOW_RETRY[step.min(SLOW_RETRY.len() - 1)].mul_f64(0.8 + fastrand::f64() * 0.4);
+                            tokio::select! {
+                                _ = stop.wait_for(|s| *s) => break 'streams,
+                                _ = live.wait_for(|l| !still_on(l)) => break 'connect,
+                                _ = tokio::time::sleep(wait) => {}
+                            }
+                            let mut probe_live: Option<Instant> = None;
+                            let probed = tokio::select! {
+                                _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
+                                r = session(&dest, target, &hub, &health, stream, via.as_ref(), &mut probe_live) => r,
+                            };
+                            match probed {
+                                Ok(Ended::Stopped) => break 'streams,
+                                Ok(Ended::StreamEnded) => break 'connect,
+                                Err(_) => {
+                                    if !still_on(&live.borrow()) {
+                                        break 'connect;
+                                    }
+                                    if probe_live.is_some() {
+                                        attempt = 0;
+                                        net_tries = 0;
+                                        down_since = None;
+                                        continue 'connect;
+                                    }
+                                    step += 1;
+                                }
+                            }
                         }
                     }
                     let shown = if net_down { net_tries } else { attempt };
@@ -459,6 +500,13 @@ pub(crate) fn set_state(health: &watch::Sender<Health>, state: PushState) {
         }
     });
 }
+
+/// How long a destination that gave up (not for a refusal) waits before each single try, for as long
+/// as the stream goes on: it stays Failed meanwhile.
+#[cfg(not(test))]
+const SLOW_RETRY: [Duration; 3] = [Duration::from_secs(60), Duration::from_secs(120), Duration::from_secs(300)];
+#[cfg(test)]
+const SLOW_RETRY: [Duration; 3] = [Duration::from_millis(150), Duration::from_millis(300), Duration::from_millis(600)];
 
 /// How long a session stays live before its failure starts the retry count over.
 pub(crate) const STAYED_LIVE_MS: u64 = 30_000;
@@ -564,6 +612,18 @@ pub(crate) mod fault {
     pub(crate) fn slow_ms(port: u16) -> u64 {
         SLOW.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map_or(0, |(_, m)| *m)
     }
+    static CONNECTS: Mutex<Vec<(u16, u32)>> = Mutex::new(Vec::new());
+    /// Counts a connect attempt to this port.
+    pub(crate) fn count_connect(port: u16) {
+        let mut d = CONNECTS.lock().unwrap_or_else(|e| e.into_inner());
+        match d.iter_mut().find(|(p, _)| *p == port) {
+            Some((_, n)) => *n += 1,
+            None => d.push((port, 1)),
+        }
+    }
+    pub(crate) fn connects(port: u16) -> u32 {
+        CONNECTS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map_or(0, |(_, n)| *n)
+    }
     static NO_NAME: Mutex<Vec<u16>> = Mutex::new(Vec::new());
     /// The destination's name can't be looked up (a typo, or no DNS).
     pub(crate) fn set_no_name(port: u16, on: bool) {
@@ -581,6 +641,8 @@ pub(crate) mod fault {
 /// Connects to `t`, over `via` when given (else the system's default way).
 pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<Stream, PushError> {
     let host = t.host.clone();
+    #[cfg(test)]
+    fault::count_connect(t.port);
     #[cfg(test)]
     {
         let ms = fault::slow_ms(t.port);

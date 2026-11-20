@@ -775,8 +775,9 @@ async fn kick_refresh(
         st.http.post(format!("{}/oauth/token", st.cfg.kick_id_url)).form(&form).send().await.map_err(|_| {
             ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Couldn't reach Kick. Try again.")
         })?;
-    // Kick refusing the refresh token is a sign-out; Kick being down or busy is not.
-    if res.status().is_server_error() || res.status().as_u16() == 429 {
+    // Kick refusing the refresh token (400 or 401) is a sign-out; Kick being down or busy, or a
+    // gateway in front of it answering 403, 404 or 408, is not.
+    if !res.status().is_success() && !matches!(res.status().as_u16(), 400 | 401) {
         return Err(ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick had a problem. Try again."));
     }
     if !res.status().is_success() {

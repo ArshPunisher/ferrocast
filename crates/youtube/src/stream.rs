@@ -295,6 +295,19 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                 }
                 Ok(None) => break,
                 Err(status) if status.code() == Code::ResourceExhausted => return exhausted(&status),
+                // The token expiring while the stream is open (often at the hour): the refusal comes
+                // on the stream, not at its start. Refresh and reopen, as at the start.
+                Err(status) if status.code() == Code::Unauthenticated => {
+                    refused += 1;
+                    if refused > 2 {
+                        return End::SignInNeeded;
+                    }
+                    match api.refresh_after_401(&token).await {
+                        Ok(_) => break,
+                        Err(YoutubeError::SignInNeeded) => return End::SignInNeeded,
+                        Err(e) => return End::Lost(e.to_string()),
+                    }
+                }
                 Err(status) => {
                     tracing::debug!(message = %status.message(), "YouTube stream dropped");
                     break;

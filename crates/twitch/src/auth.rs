@@ -159,7 +159,16 @@ pub async fn refresh(
         .map_err(TwitchError::network)?;
     match res.status().as_u16() {
         200..=299 => Ok(tokens(res.json().await.map_err(TwitchError::network)?)),
-        400 | 401 => Err(TwitchError::SignInNeeded),
+        400 | 401 => {
+            // Twitch answers a refused refresh token with JSON; a proxy, a captive portal or a
+            // gateway answers with a page, which is not the streamer being signed out.
+            let body = res.text().await.unwrap_or_default();
+            if serde_json::from_str::<serde_json::Value>(&body).is_ok_and(|v| v.is_object()) {
+                Err(TwitchError::SignInNeeded)
+            } else {
+                Err(TwitchError::Network("the sign-in server sent an unexpected answer".into()))
+            }
+        }
         _ => Err(TwitchError::from_response(res).await),
     }
 }
@@ -185,5 +194,45 @@ fn tokens(t: TokenResponse) -> Tokens {
         refresh_token: t.refresh_token,
         expires_at: now_ms() + t.expires_in.clamp(0, 365 * 86_400) * 1000,
         scopes: t.scope,
+    }
+}
+
+#[cfg(test)]
+mod refresh_answer_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server answering every request with `status` and `body`.
+    async fn answering(status: u16, ctype: &'static str, body: &'static str) -> Endpoints {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = s.read(&mut buf).await;
+                    let r = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(r.as_bytes()).await;
+                });
+            }
+        });
+        Endpoints { ingest: base.clone(), id: base.clone(), api: base.clone(), eventsub: base }
+    }
+
+    #[tokio::test]
+    async fn only_twitchs_own_answer_signs_the_streamer_out() {
+        let http = reqwest::Client::new();
+        let json = answering(400, "application/json", r#"{"status":400,"message":"Invalid refresh token"}"#).await;
+        assert_eq!(refresh(&http, &json, "c", "r").await.unwrap_err(), TwitchError::SignInNeeded);
+        for page in [
+            answering(400, "text/html", "<html>proxy error</html>").await,
+            answering(401, "text/html", "<html>log in to the wifi</html>").await,
+        ] {
+            let e = refresh(&http, &page, "c", "r").await.unwrap_err();
+            assert_ne!(e, TwitchError::SignInNeeded, "a page from a proxy is not a sign-out");
+        }
     }
 }

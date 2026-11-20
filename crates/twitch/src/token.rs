@@ -22,6 +22,11 @@ pub struct Auth {
     /// that was only briefly locked has them before the app quits (the saved refresh token is
     /// one Twitch already retired).
     unsaved: AtomicBool,
+    /// When saving was last retried while `unsaved`: not again for a while, so a locked Keychain isn't
+    /// asked, under the token lock, at every call.
+    last_save_try: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Times in a row Helix refused a token just issued (reset when a call works).
+    fresh_refused: std::sync::atomic::AtomicU32,
 }
 
 impl fmt::Debug for Auth {
@@ -35,7 +40,16 @@ impl Auth {
     /// `on_tokens` must persist new tokens (the secret store) and return an error if it couldn't;
     /// a refresh whose result can't be saved would lose the account at the next restart.
     pub fn new(http: reqwest::Client, ep: Endpoints, client_id: String, tokens: Tokens, on_tokens: OnTokens) -> Self {
-        Auth { http, ep, client_id, tokens: Mutex::new(tokens), on_tokens, unsaved: AtomicBool::new(false) }
+        Auth {
+            http,
+            ep,
+            client_id,
+            tokens: Mutex::new(tokens),
+            on_tokens,
+            unsaved: AtomicBool::new(false),
+            last_save_try: std::sync::Mutex::new(None),
+            fresh_refused: std::sync::atomic::AtomicU32::new(0),
+        }
     }
 
     /// A valid access token, refreshing first when it's about to expire.
@@ -86,9 +100,29 @@ impl Auth {
         }
     }
 
+    /// Helix refused a token just issued: how many times in a row (this one included).
+    pub(crate) fn note_fresh_refused(&self) -> u32 {
+        self.fresh_refused.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// A call worked: the tokens are accepted.
+    pub(crate) fn note_accepted(&self) {
+        self.fresh_refused.store(0, Ordering::Release);
+    }
+
+    /// Lets the next use try saving again at once (tests; the wait is 30 s).
+    #[cfg(test)]
+    pub(crate) fn forget_save_cooldown(&self) {
+        *self.last_save_try.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
     fn save_again(&self, t: &Tokens) {
         if self.unsaved.load(Ordering::Acquire) {
-            self.save(t);
+            let mut last = self.last_save_try.lock().unwrap_or_else(|p| p.into_inner());
+            if last.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(30)) {
+                *last = Some(std::time::Instant::now());
+                self.save(t);
+            }
         }
     }
 }

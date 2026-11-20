@@ -401,7 +401,12 @@ async fn a_refreshed_sign_in_the_keychain_wouldnt_save_is_kept_for_the_session()
     assert_eq!(api.access().await.expect("the refreshed token is used"), "access-0");
     assert_eq!(api.access().await.unwrap(), "access-0", "and kept: no second refresh");
     assert_eq!(forms.lock().unwrap().len(), 1, "refreshed once");
-    assert!(*saves.lock().unwrap() >= 2, "saving is tried again at the next use: {}", saves.lock().unwrap());
+    // Tried again, but not at every call: a locked Keychain isn't asked under the lock each time.
+    for _ in 0..10 {
+        api.access().await.unwrap();
+    }
+    let n = *saves.lock().unwrap();
+    assert!((2..=2).contains(&n), "saved once, retried once, then left alone for a while: {n}");
 }
 
 // ---------------------------------------------------------------- stream info (Studio)

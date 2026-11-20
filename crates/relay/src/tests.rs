@@ -78,6 +78,13 @@ async fn fake_kick() -> String {
             if body.contains("refresh_token=revoked") {
                 return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": "invalid" })));
             }
+            if body.contains("refresh_token=kick-waf") {
+                // A WAF or a gateway in front of Kick's token endpoint (Cloudflare): not Kick's verdict.
+                return (StatusCode::FORBIDDEN, axum::Json(json!({ "error": "blocked" })));
+            }
+            if body.contains("refresh_token=kick-timeout") {
+                return (StatusCode::REQUEST_TIMEOUT, axum::Json(json!({ "error": "timeout" })));
+            }
             if body.contains("refresh_token=kick-down") {
                 return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({ "error": "busy" })));
             }
@@ -237,6 +244,17 @@ async fn refresh_goes_through_the_relay_and_strangers_are_refused() {
     assert_eq!(down.status(), 502);
     let down: Value = down.json().await.unwrap();
     assert_eq!(down["error"]["code"], "kick_unreachable");
+    // A 403 or a 408 from in front of Kick isn't Kick refusing the token either.
+    for token in ["kick-waf", "kick-timeout"] {
+        let res = http
+            .post(format!("{}/v1/kick/refresh", r.base))
+            .bearer_auth(&auth)
+            .json(&json!({ "refresh_token": token }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 502, "{token} must not sign the streamer out");
+    }
     let (id, _) = auth.split_once('.').unwrap();
     for bad in ["".to_string(), "nodot".into(), format!("{id}.wrong-secret"), "ghost.secret".into()] {
         let res = http
