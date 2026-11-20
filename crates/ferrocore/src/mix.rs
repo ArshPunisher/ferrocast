@@ -435,6 +435,10 @@ struct Source {
     resampler: Option<SourceResampler>,
     /// Its filters, in order (after mono and balance, before volume, as OBS runs them).
     filters: Vec<AudioFilter>,
+    /// Last post-filter (pre-volume) sample, and whether a structural filter add/remove/reorder
+    /// armed a 4 ms raised-cosine step de-click so toggling filters live never pops.
+    last_post_filter: [f32; 2],
+    filter_declick: bool,
     levels: Levels,
     /// The last [`METER_BLOCKS`] blocks' measures, newest last.
     recent: VecDeque<Measured>,
@@ -848,6 +852,8 @@ impl Mixer {
                         start_ns: None,
                         resampler: None,
                         filters: Vec::new(),
+                        last_post_filter: [0.0; 2],
+                        filter_declick: false,
                         levels: Levels::default(),
                         recent: VecDeque::new(),
                         tp: [[0.0; TP_TAPS]; 2],
@@ -908,29 +914,40 @@ impl Mixer {
         let Some(s) = self.sources.get_mut(&id) else { return Vec::new() };
         let held = |fs: &[AudioFilter]| fs.iter().map(AudioFilter::latency_frames).sum::<usize>();
         let before = held(&s.filters);
-        let mut old: Vec<Option<AudioFilter>> = std::mem::take(&mut s.filters).into_iter().map(Some).collect();
+        let old_len = s.filters.len();
+        let mut old: Vec<(usize, Option<AudioFilter>)> =
+            std::mem::take(&mut s.filters).into_iter().enumerate().map(|(i, f)| (i, Some(f))).collect();
         // The same settings first, so a moved filter is found as it was…
-        let mut made: Vec<Option<AudioFilter>> = effects
+        let mut made: Vec<Option<(usize, AudioFilter)>> = effects
             .iter()
-            .map(|e| old.iter_mut().find(|o| o.as_ref().is_some_and(|f| f.effect == *e)).and_then(Option::take))
+            .map(|e| {
+                old.iter_mut()
+                    .find(|(_, o)| o.as_ref().is_some_and(|f| f.effect == *e))
+                    .and_then(|(idx, o)| o.take().map(|f| (*idx, f)))
+            })
             .collect();
         // …then one of the same kind takes the new settings…
         for (slot, e) in made.iter_mut().zip(effects) {
             if slot.is_some() {
                 continue;
             }
-            for o in old.iter_mut() {
+            for (idx, o) in old.iter_mut() {
                 if let Some(f) = o.as_mut()
                     && f.retune(*e)
                 {
-                    *slot = o.take();
+                    *slot = o.take().map(|f| (*idx, f));
                     break;
                 }
             }
         }
+        let pure_in_place = effects.len() == old_len
+            && made.iter().enumerate().all(|(i, slot)| matches!(slot, Some((idx, _)) if *idx == i));
         // …and the rest are made.
-        s.filters = made.into_iter().zip(effects).map(|(f, e)| f.unwrap_or_else(|| make_new(e))).collect();
-        let evicted: Vec<AudioFilter> = old.into_iter().flatten().collect();
+        s.filters = made.into_iter().zip(effects).map(|(f, e)| f.map_or_else(|| make_new(e), |(_, f)| f)).collect();
+        if !pure_in_place {
+            s.filter_declick = true;
+        }
+        let evicted: Vec<AudioFilter> = old.into_iter().filter_map(|(_, o)| o).collect();
         // A filter that holds the sound back (the strong noise removal) files the source's sound
         // that much earlier: the mixer waits that much longer at once, rather than finding the
         // sound late and cutting its start.
@@ -1471,6 +1488,27 @@ impl Mixer {
                     f[1] = fr[i];
                 }
                 finite(&mut buf);
+            }
+            // When a filter was added, removed, or reordered mid-stream (e.g. toggling the eye
+            // icon in the UI), ease out the step discontinuity over 4 ms so it never pops.
+            if src.filter_declick {
+                src.filter_declick = false;
+                let [pl, pr] = src.last_post_filter;
+                if (pl != 0.0 || pr != 0.0) && buf.len() >= 2 && buf[0].is_finite() && buf[1].is_finite() {
+                    let dl = pl - buf[0];
+                    let dr = pr - buf[1];
+                    const FILTER_DECLICK: usize = 192;
+                    let fade = FILTER_DECLICK.min(BLOCK);
+                    for (i, f) in buf.as_chunks_mut::<2>().0.iter_mut().take(fade).enumerate() {
+                        let w = 0.5 * (1.0 + (std::f32::consts::PI * i as f32 / fade as f32).cos());
+                        f[0] += dl * w;
+                        f[1] += dr * w;
+                    }
+                }
+            }
+            if let Some(last) = buf.as_chunks::<2>().0.last() {
+                src.last_post_filter =
+                    [if last[0].is_finite() { last[0] } else { 0.0 }, if last[1].is_finite() { last[1] } else { 0.0 }];
             }
             let (mut peak, mut sq) = ([0f32; 2], [0f32; 2]);
             // A volume that isn't a number (a bad saved setting) is silence, not NaN.
@@ -2702,5 +2740,52 @@ mod steady_state_tests {
         let again = m.take_block(5);
         assert_eq!(again.ts_ns, 5);
         assert!(again.tracks.iter().all(|t| t.iter().all(|v| *v == 0.0)) && again.monitor.iter().all(|v| *v == 0.0));
+    }
+
+    /// Toggling a filter on/off via `set_effects` (eye icon in UI) eases out the step jump so
+    /// adding or removing `Gain +10 dB` or `InvertPolarity` mid-tone produces no click.
+    #[test]
+    fn toggling_filters_in_mixer_produces_no_click() {
+        for eff in [AudioEffect::Gain { db: 10.0 }, AudioEffect::InvertPolarity] {
+            let mut m = Mixer::new(48_000, 0);
+            m.set(1, SourceSettings::default());
+            let step = block_ns(48_000);
+            let t0 = 1_000_000_000u64;
+            let _ = m.mix_until(t0);
+
+            // Feed continuous 220 Hz sine across 6 blocks (128 ms): blocks 0..2 dry, 2..4 wet, 4..6 dry.
+            let mut sample_idx = 0usize;
+            let mut make_block = || {
+                let mut pcm = Vec::with_capacity(BLOCK * 2);
+                for _ in 0..BLOCK {
+                    let s = 0.25 * (std::f32::consts::TAU * 220.0 * sample_idx as f32 / 48_000.0).sin();
+                    pcm.push(s);
+                    pcm.push(s);
+                    sample_idx += 1;
+                }
+                pcm
+            };
+
+            let mut out_l = Vec::new();
+            for b in 0..6u64 {
+                if b == 2 {
+                    m.set_effects(1, &[eff]);
+                } else if b == 4 {
+                    m.set_effects(1, &[]);
+                }
+                let pcm = make_block();
+                m.push(1, &pcm, 2, 48_000, t0 + b * step);
+                for blk in m.mix_until(t0 + (b + 1) * step) {
+                    out_l.extend(blk.tracks[0].as_chunks::<2>().0.iter().map(|f| f[0]));
+                }
+            }
+            let b_on = 2 * BLOCK;
+            let b_off = 4 * BLOCK;
+            // Measure max sample-to-sample delta right across the on/off block boundaries.
+            let step_on = out_l[b_on - 2..b_on + 200].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+            let step_off = out_l[b_off - 2..b_off + 200].windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+            assert!(step_on < 0.08, "{eff:?} clicked on add in mixer: max delta = {step_on:.4}");
+            assert!(step_off < 0.08, "{eff:?} clicked on remove in mixer: max delta = {step_off:.4}");
+        }
     }
 }

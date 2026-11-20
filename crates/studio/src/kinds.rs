@@ -900,17 +900,22 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
         ],
-        "expander_filter" | "upward_compressor_filter" => vec![
-            // OBS's ranges: an expander's ratio is 1 to 20, an upward compressor's 0 to 1.
-            if kind == "upward_compressor_filter" {
-                opt("ratio", "Ratio", "float").range(0.0, 1.0, 0.01).slider().unit(":1")
-            } else {
-                opt("ratio", "Ratio", "float").range(1.0, 20.0, 0.1).slider().unit(":1")
-            },
+        "expander_filter" => vec![
+            opt("presets", "Preset", "list").choices(&[("Expander", json!("expander")), ("Gate", json!("gate"))]),
+            opt("ratio", "Ratio", "float").range(1.0, 20.0, 0.1).slider().unit(":1"),
             opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
             opt("attack_time", "Attack", "int").range(1.0, 100.0, 1.0).unit(" ms"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
             opt("output_gain", "Volume after", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
+            opt("detector", "Detection", "list").choices(&[("RMS", json!("RMS")), ("Peak", json!("peak"))]),
+        ],
+        "upward_compressor_filter" => vec![
+            opt("ratio", "Ratio", "float").range(0.0, 1.0, 0.01).slider().unit(":1"),
+            opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
+            opt("attack_time", "Attack", "int").range(1.0, 100.0, 1.0).unit(" ms"),
+            opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
+            opt("output_gain", "Volume after", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
+            opt("knee_width", "Knee width", "float").range(0.0, 20.0, 0.5).slider().unit(" dB"),
         ],
         "basic_eq_filter" => vec![
             opt("low", "Low", "float").range(-20.0, 20.0, 0.1).slider().unit(" dB"),
@@ -1098,10 +1103,10 @@ pub fn defaults(kind: &str) -> Option<Value> {
         }
         "limiter_filter" => json!({ "threshold": -6.0, "release_time": 60 }),
         "expander_filter" => {
-            json!({ "ratio": 2.0, "threshold": -40.0, "attack_time": 10, "release_time": 50, "output_gain": 0.0 })
+            json!({ "presets": "expander", "ratio": 2.0, "threshold": -40.0, "attack_time": 10, "release_time": 50, "output_gain": 0.0, "detector": "RMS" })
         }
         "upward_compressor_filter" => {
-            json!({ "ratio": 0.5, "threshold": -20.0, "attack_time": 10, "release_time": 50, "output_gain": 0.0 })
+            json!({ "ratio": 0.5, "threshold": -20.0, "attack_time": 10, "release_time": 50, "output_gain": 0.0, "knee_width": 10.0 })
         }
         "basic_eq_filter" => json!({ "low": 0.0, "mid": 0.0, "high": 0.0 }),
         "invert_polarity_filter" => json!({}),

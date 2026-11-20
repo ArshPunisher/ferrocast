@@ -413,6 +413,52 @@ fn color_correction_contrast_turns_round_mid_grey() {
     assert!(dark[0] < 60, "darks go darker: {dark:?}");
     assert!(light[0] > 220, "lights go lighter: {light:?}");
     assert!(near(through(&c, [150, 150, 150], cc(0.0)), [150, 150, 150], 2), "0 changes nothing");
+    // Negative contrast below -1.0 (down to OBS's -4.0) flattens toward mid-grey instead of inverting.
+    for neg in [-2.0f32, -4.0] {
+        let d = through(&c, [40, 40, 40], cc(neg));
+        let l = through(&c, [220, 220, 220], cc(neg));
+        assert!(
+            d[0] > 40 && l[0] < 220 && d[0] < l[0],
+            "contrast={neg} must flatten without inverting: d={d:?}, l={l:?}"
+        );
+    }
+}
+
+/// ChromaKey and ColorKey with smoothness/spill at 0 (avoiding 0/0 NaN) key out the key colour
+/// and preserve foreground pixels cleanly.
+#[test]
+fn chroma_and_color_key_zero_smoothness_stay_clean() {
+    let Some(c) = gpu() else { return };
+    let ck = ferrocore::Effect::ChromaKey {
+        key: [0, 255, 0],
+        similarity: 400.0,
+        smoothness: 0.0,
+        spill: 0.0,
+        opacity: 1.0,
+        contrast: 0.0,
+        brightness: 0.0,
+        gamma: 0.0,
+    };
+    let keyed = through(&c, [0, 255, 0], ck.clone());
+    let kept = through(&c, [200, 40, 40], ck);
+    assert_eq!(keyed[3], 0, "green keyed out cleanly at smoothness=0: {keyed:?}");
+    assert_eq!(kept[3], 255, "red foreground stays opaque at smoothness=0: {kept:?}");
+    assert!(kept[0] > 180, "red foreground stays clean (no NaN black): {kept:?}");
+
+    let col = ferrocore::Effect::ColorKey {
+        key: [0, 255, 0],
+        similarity: 80.0,
+        smoothness: 0.0,
+        opacity: 1.0,
+        contrast: 0.0,
+        brightness: 0.0,
+        gamma: 0.0,
+    };
+    let keyed2 = through(&c, [0, 255, 0], col.clone());
+    let kept2 = through(&c, [200, 40, 40], col);
+    assert_eq!(keyed2[3], 0, "ColorKey green keyed out at smoothness=0: {keyed2:?}");
+    assert_eq!(kept2[3], 255, "ColorKey red stays opaque at smoothness=0: {kept2:?}");
+    assert!(kept2[0] > 180, "ColorKey red stays clean: {kept2:?}");
 }
 
 /// Lifting the shadows on near-black camera noise brightens it as grey, not as a coloured

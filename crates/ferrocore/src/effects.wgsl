@@ -283,13 +283,13 @@ fn fs_chroma_key(i: Out) -> @location(0) vec4<f32> {
     d += chroma_dist(nonlinear3(rgba.rgb));
     d /= 9.0;
     let base = d - f.r.x;
-    let full = pow(saturate(base / f.r.y), 1.5);
-    let spill = pow(saturate(base / f.r.z), 1.5);
+    let full = pow(saturate(base / max(f.r.y, 0.0001)), 1.5);
+    let spill = pow(saturate(base / max(f.r.z, 0.0001)), 1.5);
     rgba.a *= f.r.w;
     rgba.a *= full;
     let desat = dot(rgba.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
     rgba = vec4<f32>(mix(vec3<f32>(desat), rgba.rgb, spill), rgba.a);
-    rgba = vec4<f32>(pow(rgba.rgb, vec3<f32>(f.p2)) * f.p0 + f.p1, rgba.a);
+    rgba = vec4<f32>(pow(max(rgba.rgb, vec3<f32>(0.0)), vec3<f32>(f.p2)) * f.p0 + f.p1, rgba.a);
     return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
 }
 
@@ -302,7 +302,7 @@ fn fs_color_correction(i: Out) -> @location(0) vec4<f32> {
     } else {
         c = vec4<f32>(0.0, 0.0, 0.0, c.a);
     }
-    c = vec4<f32>(pow(c.rgb, vec3<f32>(f.p0)), c.a);
+    c = vec4<f32>(pow(max(c.rgb, vec3<f32>(0.0)), vec3<f32>(f.p0)), c.a);
     c = f.m * c;
     return vec4<f32>(c.rgb * c.a, c.a);
 }
@@ -321,8 +321,8 @@ fn fs_color_key(i: Out) -> @location(0) vec4<f32> {
     var rgba = unpremultiplied(textureSampleLevel(image, pick, i.uv, 0.0));
     rgba.a *= f.r.z;
     let dist = distance(f.q.rgb, nonlinear3(rgba.rgb));
-    rgba.a *= saturate(max(dist - f.r.x, 0.0) / f.r.y);
-    rgba = vec4<f32>(pow(rgba.rgb, vec3<f32>(f.p2)) * f.p0 + f.p1, rgba.a);
+    rgba.a *= saturate(max(dist - f.r.x, 0.0) / max(f.r.y, 0.0001));
+    rgba = vec4<f32>(pow(max(rgba.rgb, vec3<f32>(0.0)), vec3<f32>(f.p2)) * f.p0 + f.p1, rgba.a);
     return vec4<f32>(rgba.rgb * rgba.a, rgba.a);
 }
 
