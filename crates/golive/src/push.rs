@@ -197,6 +197,11 @@ pub enum PushError {
     Stalled(String),
     #[error("The connection to {0} broke.")]
     Broken(String),
+    /// The server hung up when the stream key was sent (Twitch does this for a wrong key, and an
+    /// ingest node that is draining does it for anything). Which one is only known from whether
+    /// the key worked before in this stream.
+    #[error("{0} closed the connection when the stream started.")]
+    PublishDropped(String),
     /// No way out to the internet (no route, no DNS, nothing answering): a Wi-Fi drop or a router
     /// reboot. Not the platform's doing, so it isn't counted against the destination.
     #[error("Your network is down: waiting for it to reach {0}.")]
@@ -209,6 +214,7 @@ impl PushError {
         matches!(
             self,
             Self::Unreachable(_)
+                | Self::PublishDropped(_)
                 | Self::NetworkDown(_)
                 | Self::Slow(_)
                 | Self::Closed(_)
@@ -269,6 +275,8 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
         // Tries made while the network was down (not counted in `attempt`), and since when it is.
         let mut net_tries = 0u32;
         let mut down_since: Option<Instant> = None;
+        // This stream has been live on this destination: its key works.
+        let mut ever_live = false;
         // The connection used: the system's default until that fails, then the next one.
         let mut via: Option<links::Network> = None;
         // The server used: the destination's own, until it can't be reached `BACKUP_AFTER` times in
@@ -301,6 +309,14 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         let h = health.borrow();
                         (h.state == PushState::Live, now_ms().saturating_sub(h.since_ms))
                     };
+                    ever_live |= was_live;
+                    // A hang-up at the publish: a wrong key before the key ever worked in this
+                    // stream (what it was always taken for), a server dropping the connection after.
+                    let err = match err {
+                        PushError::PublishDropped(h) if !ever_live => PushError::KeyRefused(h),
+                        e => e,
+                    };
+                    let key_refused = matches!(err, PushError::KeyRefused(_));
                     let rapid_close = was_live && live_for_ms < STAYED_LIVE_MS;
                     let stayed = was_live && live_for_ms >= STAYED_LIVE_MS;
                     if stayed {
@@ -314,7 +330,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                             on_backup = false;
                             connect_failures = 0;
                             switched = true;
-                        } else if !was_live && err.is_connect_failure() {
+                        } else if !was_live && err.is_connect_failure() && !key_refused {
                             connect_failures += 1;
                             if connect_failures >= BACKUP_AFTER {
                                 on_backup = !on_backup;
@@ -338,7 +354,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         down_since = None;
                     }
                     let kick_refused = rapid_close && is_kick(&dest);
-                    let server_refused = matches!(err, PushError::KeyRefused(_) | PushError::Refused(..));
+                    let server_refused = key_refused || matches!(err, PushError::Refused(..));
                     let is_refused = kick_refused || server_refused;
                     let limit = if dest.retry.max_attempts == 0 {
                         0
@@ -353,7 +369,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     };
                     // Never hop network interfaces on a server refusal or rapid policy close:
                     // the connection reached the server and the platform itself closed it.
-                    if err.is_network() && !rapid_close && may_move(target) {
+                    if err.is_network() && !key_refused && !rapid_close && may_move(target) {
                         via = links::next_after(via.as_ref(), &links::fallbacks(), links::default_ip());
                     }
                     let give_up = if net_down {
@@ -905,9 +921,9 @@ impl Publisher {
             _ => None,
         })
         .await
-        // Twitch over rtmps:// resets the connection instead of closing it cleanly.
+        // Twitch over rtmps:// resets the connection instead of closing it cleanly, for a bad key.
         .map_err(|e| match e {
-            PushError::Closed(h) | PushError::Broken(h) => PushError::KeyRefused(h),
+            PushError::Closed(h) | PushError::Broken(h) => PushError::PublishDropped(h),
             e => e,
         })?;
         Ok(p)
