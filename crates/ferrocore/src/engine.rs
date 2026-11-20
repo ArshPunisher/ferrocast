@@ -5346,9 +5346,10 @@ mod tests {
             w.tries = tries;
             assert!(look(w, false, None, (tries as u64 + 1) * sec).is_some());
         }
-        // After 3 zero-frame tries with no signal ever seen, stops auto-retrying until hotplug.
+        // After 3 zero-frame tries with no signal ever seen, a card whose session is open waits
+        // (see a_no_signal_wait_without_a_session_is_retried_slowly for the one without).
         w.tries = NO_SIGNAL_MAX_TRIES;
-        assert_eq!(look(w, false, None, 10 * sec), None);
+        assert_eq!(look(w, true, Some((0, true, None)), 10 * sec), None);
         assert!(w.no_signal);
 
         // Once frames flow at least once (`ever_sent`), disconnects keep retrying past 3 tries.
