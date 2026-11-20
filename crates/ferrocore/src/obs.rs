@@ -1397,11 +1397,12 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
 /// same deterministic cycle-breaking order as [`crate::mix::Mixer`]. Returns `(source, key)` pairs
 /// whose sidechain edge is severed to silence.
 pub fn sidechain_cycles(doc: &Value) -> Vec<(String, String)> {
-    let sources = doc.get("sources").and_then(Value::as_array).cloned().unwrap_or_default();
-    let channels: Vec<Value> = CHANNELS.iter().filter_map(|k| doc.get(*k).cloned()).collect();
+    // Borrowed, not cloned: the Studio asks on every stats poll (about once a second).
+    let sources: &[Value] = doc.get("sources").and_then(Value::as_array).map_or(&[], Vec::as_slice);
+    let channels = CHANNELS.iter().filter_map(|k| doc.get(*k));
     let mut entries: Vec<(u64, String, Option<String>, Vec<String>)> = Vec::new();
     let mut next_id = 1u64;
-    for s in sources.iter().chain(channels.iter()) {
+    for s in sources.iter().chain(channels) {
         let id = s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default();
         if id == "scene" || id == "group" {
             continue;
