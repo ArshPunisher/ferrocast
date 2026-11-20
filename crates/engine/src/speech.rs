@@ -112,10 +112,29 @@ pub async fn voices() -> Vec<Voice> {
 const MAX_QUEUED: usize = 16;
 
 /// One line is spoken at a time: each is a `say` or a PowerShell with the .NET runtime (60-100 MB
-/// and a core on Windows).
-static GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-/// Lines in the gate's line, the one being spoken included.
-static LINE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// and a core on Windows). The app has one [`Line`]; a test can make its own, so a flood of lines
+/// in one test never fills the line another is waiting in.
+#[derive(Debug)]
+pub struct Line {
+    gate: tokio::sync::Semaphore,
+    /// Lines in the line, the one being spoken included.
+    line: std::sync::atomic::AtomicUsize,
+}
+
+impl Line {
+    pub const fn new() -> Self {
+        Self { gate: tokio::sync::Semaphore::const_new(1), line: std::sync::atomic::AtomicUsize::new(0) }
+    }
+}
+
+impl Default for Line {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The app's line of text waiting for the voice.
+static VOICE: Line = Line::new();
 
 /// How many lines are being spoken at once and the most there were (tests count their own: a
 /// process-wide counter picked up other tests' calls and cancelled futures).
@@ -153,23 +172,23 @@ impl Drop for Counted<'_> {
     }
 }
 
-/// Takes a place in line, or says there's no room.
-struct Place;
+/// Takes a place in a voice's line, or says there's no room.
+struct Place<'a>(&'a Line);
 
-impl Place {
-    fn take() -> Option<Self> {
-        let before = LINE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+impl<'a> Place<'a> {
+    fn take(voice: &'a Line) -> Option<Self> {
+        let before = voice.line.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         if before >= MAX_QUEUED {
-            LINE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            voice.line.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             return None;
         }
-        Some(Place)
+        Some(Place(voice))
     }
 }
 
-impl Drop for Place {
+impl Drop for Place<'_> {
     fn drop(&mut self) {
-        LINE.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.0.line.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -195,10 +214,22 @@ pub async fn synthesize_counted(
     out: &Path,
     gauge: Option<&Gauge>,
 ) -> Result<(), SpeechError> {
-    let Some(_place) = Place::take() else {
+    synthesize_in(&VOICE, text, voice, work, out, gauge).await
+}
+
+/// As [`synthesize_counted`] in a line of its own (tests).
+pub async fn synthesize_in(
+    line: &Line,
+    text: &str,
+    voice: Option<&str>,
+    work: &Path,
+    out: &Path,
+    gauge: Option<&Gauge>,
+) -> Result<(), SpeechError> {
+    let Some(_place) = Place::take(line) else {
         return Err(SpeechError::Failed("too many lines are waiting to be read".into()));
     };
-    let _turn = GATE.acquire().await.map_err(|_| SpeechError::Failed("the voice is closed".into()))?;
+    let _turn = line.gate.acquire().await.map_err(|_| SpeechError::Failed("the voice is closed".into()))?;
     let _counted = Counted::new(gauge);
     synthesize_inner(text, voice, work, out).await
 }
@@ -338,12 +369,15 @@ mod tests {
         }
         assert!(ungated_gauge.peak() > 1, "without the gate, voices overlap");
         let gauge = std::sync::Arc::new(Gauge::default());
+        // This test's own line: its flood never fills the global one other tests wait in.
+        let own = std::sync::Arc::new(Line::new());
         let work = dir.path().to_path_buf();
         let tasks: Vec<_> = (0..40)
             .map(|i| {
                 let (work, out) = (work.clone(), dir.path().join(format!("{i}.wav")));
                 let gauge = gauge.clone();
-                tokio::spawn(async move { synthesize_counted("hi", None, &work, &out, Some(&gauge)).await })
+                let own = own.clone();
+                tokio::spawn(async move { synthesize_in(&own, "hi", None, &work, &out, Some(&gauge)).await })
             })
             .collect();
         let mut done = 0;
