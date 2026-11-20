@@ -183,6 +183,21 @@ pub(crate) struct Encoder {
     pool_misses: u32,
 }
 
+/// What one pool miss means.
+#[derive(Debug, PartialEq, Eq)]
+enum PoolMiss {
+    /// Leave this frame out.
+    Drop,
+    /// Too many in a row: the session isn't giving frames back.
+    Wedged,
+}
+
+/// Counts a miss: dropped until [`POOL_MISSES`] in a row, then a wedge.
+fn pool_miss(misses: &mut u32) -> PoolMiss {
+    *misses += 1;
+    if *misses >= POOL_MISSES { PoolMiss::Wedged } else { PoolMiss::Drop }
+}
+
 /// Pool misses in a row that mean the session is wedged.
 const POOL_MISSES: u32 = 30;
 
@@ -475,11 +490,18 @@ impl Encoder {
         let Some(buf) = Owned::new(buf) else {
             // No frame left in the session's pool: it isn't getting them back (a session that
             // stopped answering). A few misses are a busy moment; many in a row is a wedge.
-            self.pool_misses += 1;
-            if self.pool_misses >= POOL_MISSES {
-                self.lost = true;
+            match pool_miss(&mut self.pool_misses) {
+                // A busy moment: this frame is left out and counted, the output goes on (before,
+                // one miss tore the output down for a second and made its encoders again).
+                PoolMiss::Drop => {
+                    crate::video::note_dropped(1);
+                    return Ok(Vec::new());
+                }
+                PoolMiss::Wedged => {
+                    self.lost = true;
+                    return Err(fail("make a frame", s));
+                }
             }
-            return Err(fail("make a frame", s));
         };
         self.pool_misses = 0;
         self.fill(buf.0, frame)?;
@@ -836,6 +858,17 @@ mod tests {
         }
         assert_eq!(failed, None, "a quiet session must be rebuilt, not fail the output");
         assert!(packets_after > 3, "packets flow again after the rebuild: {packets_after}");
+    }
+
+    /// A few pool misses drop frames; 30 in a row are a wedge (D1F-05: the first one used to be an
+    /// error, so the 30 were unreachable).
+    #[test]
+    fn a_few_pool_misses_drop_frames_and_thirty_are_a_wedge() {
+        let mut misses = 0;
+        for _ in 0..(POOL_MISSES - 1) {
+            assert_eq!(pool_miss(&mut misses), PoolMiss::Drop);
+        }
+        assert_eq!(pool_miss(&mut misses), PoolMiss::Wedged);
     }
 
     #[test]
