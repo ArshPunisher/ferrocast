@@ -23,7 +23,7 @@ use ferrocast_store::repo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::frames::{LiveFrame, Notice, NoticeAction, NoticeLevel};
+use crate::frames::{LiveFrame, Notice, NoticeLevel};
 use crate::{Engine, EngineError, now, platform_key};
 
 pub(crate) const SAVE_KEY: &str = "discord_pro";
@@ -382,12 +382,10 @@ impl Engine {
     fn discord_role_notice(&self, message: &str) {
         self.send_live(LiveFrame::new(
             "notice",
-            &Notice {
-                key: Some("discord-pro".into()),
-                level: NoticeLevel::Warn,
-                message: format!("The Discord bot couldn't finish: {message}"),
-                action: Some(NoticeAction { label: "Discord settings".into(), href: "#/settings/discord".into() }),
-            },
+            &Notice::new(NoticeLevel::Warn, "The Discord bot couldn't finish")
+                .key("discord-pro")
+                .detail(message)
+                .action("Discord settings", "#/settings/discord"),
         ));
     }
 

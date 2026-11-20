@@ -18,7 +18,7 @@ use ferrocast_store::repo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::frames::{LiveFrame, Notice, NoticeAction, NoticeLevel};
+use crate::frames::{LiveFrame, Notice, NoticeLevel};
 use crate::{Engine, EngineError, now};
 
 /// Ferrocast voice ids start with their provider: `google:hi-IN-Neural2-A`.
@@ -299,12 +299,10 @@ impl Engine {
         let end = if why.ends_with('.') { "" } else { "." };
         self.send_live(LiveFrame::new(
             "notice",
-            &Notice {
-                key: Some(NOTICE_KEY.into()),
-                level: NoticeLevel::Warn,
-                message: format!("{why}{end} Reading with {instead} for now."),
-                action: Some(NoticeAction { label: "Voice settings".into(), href: "#/settings/tts".into() }),
-            },
+            &Notice::new(NoticeLevel::Warn, "Reading with this PC's voice for now")
+                .key(NOTICE_KEY)
+                .detail(format!("{why}{end} Reading with {instead} for now."))
+                .action("Voice settings", "#/settings/tts"),
         ));
     }
 

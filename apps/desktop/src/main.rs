@@ -680,7 +680,19 @@ async fn notify_when_hidden(app: AppHandle, engine: Engine) {
         if visible {
             continue;
         }
-        let body = v["data"]["message"].as_str().unwrap_or("").chars().take(300).collect::<String>();
+        // The line, then its detail (the dashboard keeps that behind an (i); a system
+        // notification has no such place).
+        let line = v["data"]["message"].as_str().unwrap_or("");
+        let body = match v["data"]["detail"].as_str() {
+            Some(d) if !d.is_empty() => {
+                let stop = if line.ends_with(['.', '!', '?']) { "" } else { "." };
+                format!("{line}{stop} {d}")
+            }
+            _ => line.to_string(),
+        }
+        .chars()
+        .take(300)
+        .collect::<String>();
         if let Err(e) = app.notification().builder().title("Ferrocast").body(body).show() {
             tracing::debug!(error = %e, "couldn't show a notification");
         }

@@ -1,7 +1,10 @@
 //! Cameras (DirectShow, read by FFmpeg) and microphones (WASAPI, through cpal) on Windows.
 
-use crate::ffsrc::{Live, ffmpeg};
+use std::time::Duration;
+
+use crate::ffsrc::{Live, Nv12Picture, OpenFail, ProbeFail, ffmpeg, stderr_within};
 use crate::sound_in::{SoundIn, Which};
+use crate::win_logic::{DshowListStatus, DshowOption, dshow_attempts, parse_dshow_options, resolve_dshow_list};
 use crate::{AvError, Picture};
 
 /// A camera or microphone.
@@ -56,23 +59,59 @@ pub struct Capture {
     sound: Option<SoundIn>,
 }
 
+fn list_dshow_options(dev: &str) -> Result<Vec<DshowOption>, ProbeFail> {
+    let ff = ffmpeg().map_err(|e| ProbeFail::Error(e.to_string()))?;
+    let args: Vec<String> =
+        ["-hide_banner", "-nostdin", "-f", "dshow", "-list_options", "true", "-i", &format!("video={dev}")]
+            .into_iter()
+            .map(String::from)
+            .collect();
+    let text = stderr_within(&ff, &args, Duration::from_secs(4))?;
+    if text.contains("Could not find video device") {
+        return Err(ProbeFail::Missing);
+    }
+    Ok(parse_dshow_options(&text))
+}
+
+fn resolve_dshow_options(res: Result<Vec<DshowOption>, ProbeFail>, dev: &str) -> Result<Vec<DshowOption>, AvError> {
+    let status = match res {
+        Ok(opts) => DshowListStatus::Ok(opts),
+        Err(ProbeFail::Missing) => DshowListStatus::Missing,
+        Err(ProbeFail::Timeout) => {
+            tracing::warn!(dev, "listing camera options timed out; opening with default formats");
+            DshowListStatus::TimedOut
+        }
+        Err(ProbeFail::Error(_)) => DshowListStatus::Failed,
+    };
+    resolve_dshow_list(status).map_err(|msg| AvError::Source(msg.into()))
+}
+
 impl Capture {
     /// A camera by its id (an OBS-style "Name:\\?\usb#…" works too: its name is used).
+    /// Queries DirectShow options first so USB2 capture cards pick high-fps MJPEG (e.g.
+    /// 1080p60) instead of throttled uncompressed YUY2, falling back through MJPEG + asked,
+    /// asked, and device default, and reading NV12 through the pipe.
     pub fn camera(spec: &crate::engine::CameraSpec) -> Result<Self, AvError> {
         let id = spec.id.as_str();
         let dev = if id.starts_with('@') { id.to_string() } else { id.split(":\\\\").next().unwrap_or(id).to_string() };
-        let open = |asked: bool| {
+        let options = resolve_dshow_options(list_dshow_options(&dev), &dev)?;
+        let max = spec.size.unwrap_or((1920, 1080));
+        let mut last_err = AvError::Source("FFmpeg couldn't open it".into());
+        for attempt in dshow_attempts(spec, &options) {
             let mut input: Vec<String> = vec!["-f".into(), "dshow".into(), "-rtbufsize".into(), "256M".into()];
-            if asked {
-                input.extend(crate::engine::camera_args(spec));
-            }
+            input.extend(attempt.args);
             input.extend(["-i".into(), format!("video={dev}")]);
-            Live::start(&input, spec.size.unwrap_or((1920, 1080)), spec.fps.unwrap_or(60), None)
-        };
-        // A size or rate the camera can't do: its own instead.
-        let live =
-            open(true).or_else(|e| if spec.size.is_some() || spec.fps.is_some() { open(false) } else { Err(e) })?;
-        Ok(Capture { live: Some(live), sound: None })
+            let fps = attempt.fps_hint.or(spec.fps).unwrap_or(60);
+            match Live::start_nv12_checked(&input, max, fps, None) {
+                Ok(live) => return Ok(Capture { live: Some(live), sound: None }),
+                Err(OpenFail::Timeout) => {
+                    return Err(AvError::Source("FFmpeg timed out opening the camera".into()));
+                }
+                Err(OpenFail::Missing(e)) => return Err(e),
+                Err(OpenFail::Rejected(e)) => last_err = e,
+            }
+        }
+        Err(last_err)
     }
 
     /// A microphone by name ("default" or empty: the system's).
@@ -83,6 +122,11 @@ impl Capture {
     /// The newest picture and when it came (taken).
     pub fn take_frame(&self) -> Option<(Picture, u64)> {
         self.live.as_ref()?.take()
+    }
+
+    /// The newest NV12 picture and when it came (taken), for GPU upload without CPU RGBA copy.
+    pub fn take_nv12(&self) -> Option<(Nv12Picture, u64)> {
+        self.live.as_ref()?.take_nv12()
     }
 
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {

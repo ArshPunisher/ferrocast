@@ -75,6 +75,10 @@ pub struct Hub {
     live: watch::Sender<Live>,
     /// Newest main-track video frame timestamp (ms), or `NO_TS` before the first frame.
     newest_video_ts: AtomicU64,
+    /// Previous main-track keyframe timestamp (ms) before [`Self::newest_key_ts`], or `NO_TS`.
+    prev_key_ts: AtomicU64,
+    /// Newest main-track keyframe timestamp (ms), or `NO_TS` before the first keyframe.
+    newest_key_ts: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -108,7 +112,14 @@ impl Hub {
     pub fn new() -> Arc<Self> {
         let (tx, _) = broadcast::channel(BACKLOG);
         let (live, _) = watch::channel(Live::default());
-        Arc::new(Self { tx, state: Mutex::new(State::default()), live, newest_video_ts: AtomicU64::new(NO_TS) })
+        Arc::new(Self {
+            tx,
+            state: Mutex::new(State::default()),
+            live,
+            newest_video_ts: AtomicU64::new(NO_TS),
+            prev_key_ts: AtomicU64::new(NO_TS),
+            newest_key_ts: AtomicU64::new(NO_TS),
+        })
     }
 
     /// The newest main-track video frame's timestamp (ms) in the current stream, if any has
@@ -116,6 +127,17 @@ impl Hub {
     /// far behind live video they are without locking.
     pub fn newest_video_ts(&self) -> Option<u32> {
         u32::try_from(self.newest_video_ts.load(Ordering::Acquire)).ok()
+    }
+
+    /// The newest main-track keyframe timestamp (ms) in the current stream, if any has arrived.
+    pub fn newest_key_ts(&self) -> Option<u32> {
+        u32::try_from(self.newest_key_ts.load(Ordering::Acquire)).ok()
+    }
+
+    /// The previous main-track keyframe timestamp (ms) before [`Self::newest_key_ts`], if at
+    /// least two main keyframes have arrived in the current stream.
+    pub fn prev_key_ts(&self) -> Option<u32> {
+        u32::try_from(self.prev_key_ts.load(Ordering::Acquire)).ok()
     }
 
     /// Which stream is on; changes when a publisher starts or stops.
@@ -143,6 +165,8 @@ impl Hub {
         let stream = st.live.stream + 1;
         *st = State { live: Live { stream, on: true }, ..State::default() };
         self.newest_video_ts.store(NO_TS, Ordering::Release);
+        self.prev_key_ts.store(NO_TS, Ordering::Release);
+        self.newest_key_ts.store(NO_TS, Ordering::Release);
         self.live.send_replace(st.live);
     }
 
@@ -196,8 +220,10 @@ impl Hub {
             if key {
                 if let Some(prev) = st.last_key {
                     st.stats.keyframe_interval_ms = Some(ts.wrapping_sub(prev));
+                    self.prev_key_ts.store(u64::from(prev), Ordering::Release);
                 }
                 st.last_key = Some(ts);
+                self.newest_key_ts.store(u64::from(ts), Ordering::Release);
             }
             self.newest_video_ts.store(u64::from(ts), Ordering::Release);
         }
@@ -302,5 +328,30 @@ mod tests {
         // A new stream clears it.
         hub.start();
         assert_eq!(hub.newest_video_ts(), None);
+        assert_eq!(hub.newest_key_ts(), None);
+        assert_eq!(hub.prev_key_ts(), None);
+    }
+
+    #[test]
+    fn key_timestamps_track_last_two_main_keyframes_only() {
+        let hub = Hub::new();
+        hub.start();
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, None));
+
+        // Headers, inter frames and extra track keyframes never count as main keyframes.
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        hub.video(50, Bytes::from_static(&[0x27, 0x01, 0, 0, 0]));
+        hub.video(100, Bytes::from_static(b"\x96\x01avc1\x01\x00\x00\x00\x01"));
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, None));
+
+        hub.video(0, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, Some(0)));
+        hub.video(1000, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (Some(0), Some(1000)));
+        hub.video(2000, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (Some(1000), Some(2000)));
+
+        hub.start();
+        assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, None));
     }
 }

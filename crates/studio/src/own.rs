@@ -94,6 +94,7 @@ fn rate_of(e: &EncodeSettings) -> RateControl {
         Some(q) if is_x264(&e.video_encoder) => RateControl::Crf(q.min(51) as u8),
         Some(q) => RateControl::Quality((100 - q.min(51) * 100 / 51) as f32 / 100.0),
         None if e.vbr => RateControl::Average,
+        None if e.strict_cbr => RateControl::CappedCbr,
         None => RateControl::Cbr,
     }
 }
@@ -968,7 +969,9 @@ impl OwnStream {
         let Some(d) = &self.drawn else { return false };
         let Some((plan, since)) = &d.plan else { return false };
         let Ok(state) = d.shared.engine.output_record_state(d.output) else { return false };
-        if state.splitting {
+        // A recording that stopped has nothing to split (and no new file to try for, ten times a
+        // second: M7-01).
+        if state.splitting || state.failed.is_some() {
             return false;
         }
         let bytes = state.bytes;
@@ -981,6 +984,14 @@ impl OwnStream {
         self.drawn.as_ref().map(|d| d.shared.skipped()).unwrap_or_default()
     }
 
+    /// Why this recording stopped by itself (a full disk, a drive taken away), if it did. Only
+    /// for a recording's own handle: the stream that shares its output goes on.
+    pub(crate) fn record_problem(&self) -> Option<ferrocore::pipeline::RecordProblem> {
+        let d = self.drawn.as_ref()?;
+        d.plan.as_ref()?;
+        d.shared.engine.output_record_state(d.output).ok()?.failed
+    }
+
     pub(crate) fn stats(&self) -> StreamStats {
         let state = self.health.as_ref().map(|h| h.borrow().state.clone());
         // Dropped, as OBS means it: what the network side couldn't send. Frames drawn late are
@@ -990,7 +1001,7 @@ impl OwnStream {
         if let Some(d) = &self.drawn {
             let s = d.shared.engine.stats();
             return StreamStats {
-                active: d.shared.engine.error().is_none(),
+                active: d.shared.engine.error().is_none() && self.record_problem().is_none(),
                 reconnecting: matches!(state, Some(PushState::Reconnecting { .. } | PushState::Connecting)),
                 bytes: self.counts.bytes.load(Ordering::Relaxed),
                 frames: s.frames.saturating_sub(d.from.0).min(u64::from(u32::MAX)) as u32,
@@ -1085,11 +1096,12 @@ impl OwnStream {
     pub(crate) fn record_stats(&self) -> RecordStats {
         let s = self.stats();
         let state = self.drawn.as_ref().and_then(|d| d.shared.engine.output_record_state(d.output).ok());
-        let paused = state.is_some_and(|r| r.paused);
+        let paused = state.as_ref().is_some_and(|r| r.paused);
         // A recording our engine writes counts its bytes in the file itself (nothing is sent):
         // the Stats panel's recording size and rate were always 0 before.
-        let bytes = state.map_or(s.bytes, |r| r.bytes.max(s.bytes));
-        RecordStats { active: s.active, paused, bytes, frames: s.frames }
+        let bytes = state.as_ref().map_or(s.bytes, |r| r.bytes.max(s.bytes));
+        let error = state.and_then(|r| r.failed).filter(|_| self.plan().is_some()).map(|p| p.reason);
+        RecordStats { active: s.active, paused, bytes, frames: s.frames, error }
     }
 
     /// Which encoder our engine's output uses ("h264_nvenc"…), while it runs.
@@ -1371,6 +1383,9 @@ mod tests {
         assert_eq!(rate_of(&cq.encode), RateControl::Quality(0.69));
         cq.encode.quality = None;
         assert_eq!(rate_of(&cq.encode), RateControl::Cbr);
+        cq.encode.strict_cbr = true;
+        assert_eq!(rate_of(&cq.encode), RateControl::CappedCbr);
+        cq.encode.strict_cbr = false;
         // Lossless: x264 at rate factor 0.
         cq.encode.video_encoder = "obs_x264".into();
         cq.encode.quality = Some(0);

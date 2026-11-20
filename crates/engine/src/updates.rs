@@ -311,12 +311,12 @@ impl Engine {
 
     /// The shell couldn't download or install: say why on the dashboard.
     pub fn update_install_failed(&self, problem: UpdateProblem) {
-        let line = format!("The update wasn't installed: {} {}", problem.message, problem.hint);
+        let detail = format!("{} {}", problem.message, problem.hint);
         self.with_update(|s| {
             s.install.phase = InstallPhase::Failed;
             s.install.error = Some(problem);
         });
-        self.notice("update", NoticeLevel::Warn, &line);
+        self.notice_detail("update", NoticeLevel::Warn, "The update wasn't installed", &detail);
     }
 
     /// Older name for a failed install with a plain reason.

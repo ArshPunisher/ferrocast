@@ -1618,8 +1618,21 @@ async fn live_scene(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "show": app.engine.go_live_scene().await? })))
 }
 
-async fn end_show(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!({ "show": app.engine.end_show().await? })))
+#[derive(Deserialize, Default)]
+struct EndBody {
+    /// Stop the stream at once, without the show's `stop_delay_s` wait.
+    #[serde(default)]
+    now: bool,
+}
+
+/// The body is optional (older callers send none): without `now` the show ends as before.
+async fn end_show(State(app): State<AppState>, body: axum::body::Bytes) -> ApiResult<Json<Value>> {
+    let b: EndBody = if body.iter().all(u8::is_ascii_whitespace) {
+        EndBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("A field is wrong: {e}")))?
+    };
+    Ok(Json(json!({ "show": app.engine.end_show_with(b.now).await? })))
 }
 
 // ------------------------------------------------------------------ OBS

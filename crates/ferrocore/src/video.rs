@@ -27,6 +27,10 @@ pub enum RateControl {
     /// Where the encoder can't (Intel Macs), an average held under the bitrate each second.
     #[default]
     Cbr,
+    /// Steady at the bitrate and held strictly under `bitrate_kbps` per second (1× VBV on
+    /// FFmpeg, `AverageBitRate` + 1 s `DataRateLimits` on VideoToolbox so transitions cannot burst
+    /// past a strict platform ceiling like Twitch 6,000 kbps).
+    CappedCbr,
     /// About the bitrate on average, less when the picture is simple (recordings).
     Average,
     /// A steady quality, 0 to 1, the bitrate following the picture (recordings).

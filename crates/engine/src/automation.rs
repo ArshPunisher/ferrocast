@@ -389,15 +389,10 @@ impl Engine {
                     tracing::warn!(rule = %rule.name, step = i + 1, "an automation step failed: {e}");
                     engine.send_live(LiveFrame::new(
                         "notice",
-                        &Notice {
-                            key: Some(format!("automation:{}", rule.id)),
-                            level: NoticeLevel::Warn,
-                            message: format!("\"{}\" stopped at step {}: {e}", rule.name, i + 1),
-                            action: Some(crate::frames::NoticeAction {
-                                label: "Edit".into(),
-                                href: "#/settings/automations".into(),
-                            }),
-                        },
+                        &Notice::new(NoticeLevel::Warn, format!("\"{}\" stopped", rule.name))
+                            .key(format!("automation:{}", rule.id))
+                            .detail(format!("It stopped at step {}: {e}", i + 1))
+                            .action("Edit", "#/settings/automations"),
                     ));
                     return;
                 }

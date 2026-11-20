@@ -17,6 +17,7 @@ pub use ferrocast_golive::cut::{CutBox, CutConfig, Layout};
 pub use ferrocast_golive::cutter::CutState as CutStateView;
 use ferrocast_golive::cutter::CutState;
 use ferrocast_golive::probe::{self, Need, Service, TWITCH_BANDWIDTH_TEST};
+pub use ferrocast_golive::probe::{CappedInfo, PlatformLimit, RuleCode, RuleNotice};
 use ferrocast_golive::{Destination, Health, Hub, Ingest, PushState, StreamStats, Target, Verdict};
 use ferrocast_obs::control::{self as obs, StreamService};
 use serde::{Deserialize, Serialize};
@@ -42,8 +43,6 @@ const HEALTH_EVERY: Duration = Duration::from_secs(1);
 const DEFAULT_NEED_KBPS: u32 = 6_160;
 /// The same for an upright 1080×1920 stream from OBS's vertical canvas.
 const DEFAULT_VERTICAL_NEED_KBPS: u32 = 4_660;
-/// YouTube's ingest, for the upload check of the vertical stream (resolving it would make one).
-const YOUTUBE_INGEST: &str = "rtmps://a.rtmps.youtube.com/live2";
 
 /// Which picture a destination gets: OBS's normal stream, or its vertical canvas (A2.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -165,6 +164,9 @@ pub struct Advanced {
     pub port: u16,
     /// Per destination: its own server address and retry timing.
     pub per: HashMap<String, DestAdvanced>,
+    /// Power-user override matching OBS `IgnoreRecommended` (C-6): disables automatic Twitch/Kick
+    /// Studio encoding caps so the user's configured bitrate/codec go out untouched.
+    pub ignore_service_limits: bool,
 }
 
 impl Default for Advanced {
@@ -174,6 +176,7 @@ impl Default for Advanced {
             keep_free_pct: 20,
             port: ferrocast_golive::ingest::DEFAULT_PORT,
             per: HashMap::new(),
+            ignore_service_limits: false,
         }
     }
 }
@@ -457,8 +460,14 @@ pub struct DestinationView {
     pub health: Option<Health>,
     /// Why this destination can't start (no account, a missing permission), in words.
     pub blocked: Option<String>,
-    /// Its rules broken by the stream OBS is sending.
+    /// Its rules broken by the stream OBS is sending (kept in sync with `issues` for older clients).
     pub rules: Vec<String>,
+    /// Structured rules broken by the active stream (Contract C-2).
+    #[serde(default)]
+    pub issues: Vec<RuleNotice>,
+    /// Calm cap badge shown when Studio fits its shared encode to Twitch/Kick limits (Contract C-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capped: Option<CappedInfo>,
     /// Sent straight from the Ferrocast Studio by this protocol ("srt", "rist", "whip");
     /// absent for RTMP.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -492,7 +501,7 @@ pub(crate) struct GoLive {
     pub cfg: RwLock<GoLiveConfig>,
     ingest: Mutex<Option<String>>,
     running: Mutex<HashMap<String, Running>>,
-    blocked: Mutex<HashMap<String, String>>,
+    pub(crate) blocked: Mutex<HashMap<String, String>>,
     upload: Mutex<Option<UploadCheck>>,
     /// The last stream's measured rate, for planning the next one (0: none yet).
     last_kbps: std::sync::atomic::AtomicU32,
@@ -522,6 +531,33 @@ pub(crate) struct GoLive {
     tested: Mutex<HashMap<String, (std::time::Instant, ferrocast_golive::reach::Reach)>>,
     /// Twitch Enhanced Broadcasting's plan for the stream on now (None: a normal stream).
     pub(crate) enhanced: Mutex<Option<ferrocast_golive::twitch_eb::Plan>>,
+    /// Cached Studio encode settings so `view_with` can build the C-2 cap badge synchronously.
+    studio_video: Mutex<Option<StudioCapConfig>>,
+    /// Whether Ferrocast Studio itself started the live main stream (vs external OBS ingest).
+    studio_live: std::sync::atomic::AtomicBool,
+    /// The Studio couldn't put the platform's cap on the stream on air (its encoder is shared with
+    /// a recording, say): the stream isn't held to it, so no badge says it is and no warning about
+    /// its bitrate is held back.
+    cap_failed: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StudioCapConfig {
+    video_kbps: u32,
+    is_hevc: bool,
+    keyframe_s: u32,
+    vbr: bool,
+}
+
+impl From<&crate::studio_host::StudioSettings> for StudioCapConfig {
+    fn from(s: &crate::studio_host::StudioSettings) -> Self {
+        Self {
+            video_kbps: s.video_kbps,
+            is_hevc: s.video_encoder.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("hevc")),
+            keyframe_s: s.keyframe_s,
+            vbr: s.vbr,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -563,6 +599,9 @@ impl Default for GoLive {
             quality: Mutex::new(Default::default()),
             tested: Mutex::new(HashMap::new()),
             enhanced: Mutex::new(None),
+            studio_video: Mutex::new(None),
+            studio_live: std::sync::atomic::AtomicBool::new(false),
+            cap_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -654,7 +693,7 @@ fn refused(code: &'static str, message: impl Into<String>, hint: impl Into<Strin
 }
 
 impl Engine {
-    fn golive(&self) -> &GoLive {
+    pub(crate) fn golive(&self) -> &GoLive {
         &self.inner.golive
     }
 
@@ -865,8 +904,73 @@ impl Engine {
         self.golive().cfg.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    pub(crate) fn note_studio_settings(&self, s: &crate::studio_host::StudioSettings) {
+        *lock(&self.golive().studio_video) = Some(StudioCapConfig::from(s));
+    }
+
+    pub(crate) fn set_studio_live(&self, on: bool) {
+        self.golive().studio_live.store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Active platform ceiling for Studio's shared main stream (Twitch 6,000 kbps / Kick
+    /// 8,000 kbps H.264 2 s), or `None` when disabled by `ignore_service_limits`, Enhanced
+    /// Broadcasting, manual light routing, or when only uncapped destinations are enabled.
+    pub fn studio_limit(&self) -> Option<PlatformLimit> {
+        let cfg = self.golive_config();
+        if cfg.advanced.ignore_service_limits {
+            return None;
+        }
+        // One that can't start (no account, no key) isn't on this stream, so it sets no limit: a
+        // YouTube stream was held to 6,000 kbps by a Twitch switch with nobody signed in.
+        let blocked = lock(&self.golive().blocked).clone();
+        probe::effective_limit(
+            cfg.destinations
+                .iter()
+                .filter(|d| {
+                    d.enabled
+                        && d.canvas == Canvas::Main
+                        && d.url.as_deref().and_then(direct_kind).is_none()
+                        && !self.wants_light_now(d)
+                        && !blocked.contains_key(&d.id)
+                })
+                .map(|d| (d.kind, d.enhanced)),
+        )
+    }
+
+    pub(crate) async fn sync_stream_cap(&self) {
+        let Ok(host) = self.studio_host() else { return };
+        let cap = self.studio_limit().map(|l| crate::studio_host::StreamCap {
+            max_kbps: l.max_kbps,
+            h264_only: l.h264_only,
+            keyframe_secs: l.keyframe_secs,
+        });
+        let failed = &self.golive().cap_failed;
+        match host.set_stream_cap(cap).await {
+            Ok(()) => failed.store(false, std::sync::atomic::Ordering::Release),
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't update the Studio's stream cap");
+                // The stream on air isn't held to the platform's limit: said, and the view stops
+                // claiming it is (the badge, the held-back bitrate warning).
+                failed.store(true, std::sync::atomic::Ordering::Release);
+                let what = cap.map_or("the platform".to_string(), |c| format!("{} kbps", c.max_kbps));
+                self.notice_detail(
+                    "stream-cap",
+                    crate::frames::NoticeLevel::Warn,
+                    "This stream isn't held to its platform's limit",
+                    &format!("Ferrocast couldn't set {what} on the stream on air: {e}"),
+                );
+            }
+        }
+        self.send_golive_pub();
+    }
+
     /// The Go live tab: destinations with their health, OBS's setting, the stream's numbers.
     pub async fn golive_view(&self) -> GoLiveView {
+        if lock(&self.golive().studio_video).is_none()
+            && let Ok(host) = self.studio_host()
+        {
+            self.note_studio_settings(&host.settings().await);
+        }
         let ingest = lock(&self.golive().ingest).clone();
         let obs = self.golive_obs_view(ingest.as_deref()).await;
         self.view_with(ingest, obs)
@@ -881,9 +985,14 @@ impl Engine {
         let cfg = self.golive_config();
         let running = lock(&g.running);
         let paused = lock(&g.paused);
+        // Before `blocked` is held: the limit reads it too.
+        let eff_limit = self.studio_limit();
         let blocked = lock(&g.blocked);
         let st = self.state();
         let failing = lock(&g.backup).failing.clone();
+        let studio_cfg = *lock(&g.studio_video);
+        let studio_streaming = live && g.studio_live.load(std::sync::atomic::Ordering::Acquire);
+        let cap_held = !g.cap_failed.load(std::sync::atomic::Ordering::Acquire);
         let destinations = cfg
             .destinations
             .iter()
@@ -901,6 +1010,32 @@ impl Engine {
                         }),
                     ),
                 };
+                let dest_stats = self.hub_of(d).stats();
+                let mut issues =
+                    if d.enabled { probe::rules_structured(&dest_stats, d.kind, d.enhanced) } else { Vec::new() };
+                let capped = if d.enabled
+                    && d.canvas == Canvas::Main
+                    && d.url.as_deref().and_then(direct_kind).is_none()
+                    && !d.enhanced
+                    && !d.wants_light()
+                    && cap_held
+                    && (!live || studio_streaming)
+                    && let Some(limit) = eff_limit
+                    && probe::ceiling(d.kind, d.enhanced).is_some()
+                    && let Some(sv) = studio_cfg
+                {
+                    probe::capped_info(limit, sv.video_kbps, sv.is_hevc, sv.keyframe_s, sv.vbr)
+                } else {
+                    None
+                };
+                if capped.is_some() && studio_streaming && !self.on_light(d) {
+                    // Studio is holding the shared encode at the platform ceiling with 1x VBV /
+                    // DataRateLimits; hold back the bitrate warning (the measured rate counts the
+                    // audio and the container). The codec and keyframe rules still speak: an
+                    // encoder that isn't H.264 (AV1) must not be hidden by the badge.
+                    issues.retain(|i| i.code != probe::RuleCode::Bitrate);
+                }
+                let rules = issues.iter().map(|i| i.detail.clone()).collect();
                 DestinationView {
                     id: d.id.clone(),
                     kind: d.kind,
@@ -914,11 +1049,9 @@ impl Engine {
                         .map(|r| r.health.borrow().clone())
                         .or_else(|| paused.get(&d.id).cloned()),
                     blocked: blocked.get(&d.id).cloned(),
-                    rules: match (d.enabled, d.canvas) {
-                        (false, _) => Vec::new(),
-                        (true, Canvas::Main) => probe::rules(&stats, d.kind),
-                        (true, Canvas::Vertical) => probe::rules(&vertical_stats, d.kind),
-                    },
+                    rules,
+                    issues,
+                    capped,
                     direct: d.url.as_deref().and_then(direct_kind),
                     light: d.wants_light(),
                     enhanced: d.enhanced,
@@ -1316,6 +1449,7 @@ impl Engine {
             d.enhanced = on;
             self.save_golive(cfg.clone()).await?;
         }
+        self.sync_stream_cap().await;
         Ok(cfg)
     }
 
@@ -1408,22 +1542,10 @@ impl Engine {
                 self.inner.secrets.get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id)).ok().flatten().unwrap_or_default();
             return Ok(ferrocast_golive::reach::reach(&url, &key).await);
         }
-        // YouTube's vertical stream is made when it's first needed, not for a test (it costs
-        // quota): its server is YouTube's own.
-        if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
-            if self.connector(Platform::Youtube).is_none() {
-                return Ok(ferrocast_golive::reach::Reach {
-                    ok: false,
-                    rtt_ms: None,
-                    message: "Connect YouTube in Settings, Accounts first.".into(),
-                    srt_latency_ms: None,
-                });
-            }
-            return Ok(ferrocast_golive::reach::reach(YOUTUBE_INGEST, "").await);
-        }
-        match self.resolve(&d).await {
-            Ok(dest) => {
-                let t = &dest.target;
+        // Read-only server peek: never creates, binds or mutates broadcasts/keys during a test or
+        // pre-flight (especially YouTube, where resolve() prepares a live broadcast).
+        match self.peek_target(&d).await {
+            Ok(t) => {
                 let url = format!("{}://{}:{}/{}", if t.tls { "rtmps" } else { "rtmp" }, t.host, t.port, t.app);
                 Ok(ferrocast_golive::reach::reach(&url, "").await)
             }
@@ -1660,33 +1782,25 @@ impl Engine {
                 rows.push(row);
                 continue;
             }
-            // YouTube's vertical stream is made when it's first needed, not for a check.
-            let resolved = if d.canvas == Canvas::Vertical && d.kind == Service::Youtube {
-                match self.connector(Platform::Youtube) {
-                    Some(_) => Target::parse(YOUTUBE_INGEST)
-                        .map(|target| Destination {
-                            id: d.id.clone(),
-                            target,
-                            key: String::new(),
-                            retry: Default::default(),
-                            extra_audio: false,
-                            extra_video: false,
-                        })
-                        .map_err(|e| e.to_string()),
-                    None => Err("Connect YouTube in Settings, Accounts first.".to_string()),
-                }
-            } else {
-                self.resolve(d).await
+            // Read-only peek for platforms that don't run bandwidth-test (YouTube, Kick) so an
+            // upload check never creates or mutates YouTube broadcasts; Twitch needs its key for
+            // `?bandwidthtest=true` (read-only on Twitch).
+            let resolved: Result<(Target, Option<String>), String> = match d.kind {
+                Service::Twitch | Service::Custom => self.resolve(d).await.map(|dest| (dest.target, Some(dest.key))),
+                Service::Youtube | Service::Kick => self.peek_target(d).await.map(|t| (t, None)),
             };
             match resolved {
-                Ok(dest) => {
-                    row.server = Some(dest.target.host.clone());
-                    match probe::delay(&dest.target).await {
+                Ok((target, key)) => {
+                    row.server = Some(target.host.clone());
+                    match probe::delay(&target).await {
                         Ok(t) => row.delay_ms = Some(t.as_millis() as u32),
                         Err(e) => row.problem = Some(e.to_string()),
                     }
-                    if d.kind == Service::Twitch && twitch.is_none() {
-                        twitch = Some((dest.target.clone(), dest.key.clone()));
+                    if d.kind == Service::Twitch
+                        && twitch.is_none()
+                        && let Some(k) = key
+                    {
+                        twitch = Some((target, k));
                     }
                 }
                 Err(reason) => row.problem = Some(reason),
@@ -1737,8 +1851,29 @@ impl Engine {
         Ok(check)
     }
 
-    /// A destination's server and key: fetched from its platform, or the saved custom one.
-    /// The error is a sentence for the streamer.
+    /// Read-only ingest server lookup for Test connection, Pre-flight and Upload check.
+    /// Never creates, binds or mutates broadcasts or stream keys on any platform.
+    async fn peek_target(&self, d: &DestinationConfig) -> Result<Target, String> {
+        let url = match platform_of(d.kind) {
+            Some(p) => {
+                let c = self.connector(p).ok_or_else(|| format!("Connect {p} in Settings, Accounts first."))?;
+                let got = match d.canvas {
+                    Canvas::Main => c.peek_ingest().await,
+                    Canvas::Vertical => c.peek_vertical_ingest().await,
+                };
+                let own_server = self.golive_config().advanced.per.get(&d.id).and_then(|a| a.server.clone());
+                match got {
+                    Ok(u) => own_server.unwrap_or(u),
+                    Err(e) => return Err(format_platform_error(p, e, false)),
+                }
+            }
+            None => d.url.clone().ok_or_else(|| "This server has no address.".to_string())?,
+        };
+        Target::parse(&url).map_err(|e| e.to_string())
+    }
+
+    /// A destination's server and key: fetched from its platform (write path, only when actually
+    /// going live), or the saved custom one. The error is a clear one-line reason for the streamer.
     async fn resolve(&self, d: &DestinationConfig) -> Result<Destination, String> {
         let (url, key) = match platform_of(d.kind) {
             Some(p) => {
@@ -1750,10 +1885,7 @@ impl Engine {
                 let own_server = self.golive_config().advanced.per.get(&d.id).and_then(|a| a.server.clone());
                 match got {
                     Ok(i) => (own_server.unwrap_or(i.url), i.key),
-                    Err(ferrocast_connector::ConnectorError::MissingScope { .. }) => {
-                        return Err(format!("{p} needs one more permission: reconnect it in Settings, Accounts."));
-                    }
-                    Err(e) => return Err(format!("Couldn't get {p}'s stream key: {e}")),
+                    Err(e) => return Err(format_platform_error(p, e, true)),
                 }
             }
             None => {
@@ -1836,6 +1968,7 @@ impl Engine {
         // The Studio's vertical and lighter streams follow the ticked platforms and the source.
         self.studio_sync_vertical().await;
         self.studio_sync_light().await;
+        self.sync_stream_cap().await;
         self.send_golive();
     }
 
@@ -1915,6 +2048,7 @@ impl Engine {
         if rules_changed {
             lock(&self.golive().protector).set_rules(cfg.advanced.rules.clone());
         }
+        self.sync_stream_cap().await;
         Ok(cfg)
     }
 
@@ -2318,6 +2452,27 @@ async fn http_upload_kbps() -> Result<u32, String> {
     Ok(send(size).await? as u32)
 }
 
+/// One-line error message when checking or preparing a platform destination.
+fn format_platform_error(p: Platform, err: ferrocast_connector::ConnectorError, write: bool) -> String {
+    match err {
+        ferrocast_connector::ConnectorError::MissingScope { .. } => {
+            format!("{p} needs one more permission: reconnect it in Settings, Accounts.")
+        }
+        ferrocast_connector::ConnectorError::SignInNeeded(_) => {
+            format!("{p} needs you to sign in again in Settings, Accounts.")
+        }
+        ferrocast_connector::ConnectorError::RateLimited { .. } => {
+            format!("{p} is temporarily rate-limited; try again shortly.")
+        }
+        ferrocast_connector::ConnectorError::Refused { message, .. } if write => {
+            format!("{p} refused to start the stream: {message}")
+        }
+        ferrocast_connector::ConnectorError::Refused { message, .. } => format!("{p}: {message}"),
+        e if write => format!("Couldn't prepare {p}: {e}"),
+        e => format!("Couldn't check {p}: {e}"),
+    }
+}
+
 /// "Twitch", "a custom server": what OBS's earlier setting was, without its key.
 fn describe_service(s: &StreamService) -> String {
     match s.settings.get("service").and_then(|v| v.as_str()) {
@@ -2345,6 +2500,9 @@ pub(crate) async fn run(engine: Engine) {
             let now = (main.borrow_and_update().on, vertical.borrow_and_update().on);
             if now.0 != was.0 {
                 tracing::info!(live = now.0, "Go live: the stream changed");
+                if !now.0 {
+                    g.studio_live.store(false, std::sync::atomic::Ordering::Release);
+                }
             }
             if now.1 != was.1 {
                 tracing::info!(live = now.1, "Go live: the vertical stream changed");

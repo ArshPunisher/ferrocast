@@ -17,6 +17,10 @@ pub use apple::media;
 pub use apple::screen;
 #[cfg(target_os = "windows")]
 mod win;
+// Built for its tests elsewhere too (format picking, pacing, monitor matching).
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod win_logic;
 /// Cameras and microphones (Windows: DirectShow through FFmpeg, WASAPI).
 #[cfg(target_os = "windows")]
 pub use win::camera;

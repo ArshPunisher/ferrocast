@@ -355,10 +355,17 @@ fn open_cpal(device: Option<&str>, stats: &Arc<Stats>) -> Result<Opened, AvError
     let ring = Arc::new(Ring::new(rate, channels, stats.clone()));
     let r = ring.clone();
     let err_stats = stats.clone();
+    let mut ftz = false;
     let stream = dev
         .build_output_stream(
             cfg.config(),
-            move |out: &mut [f32], _| r.pull(out),
+            move |out: &mut [f32], _| {
+                if !ftz {
+                    crate::afx::enable_ftz_daz();
+                    ftz = true;
+                }
+                r.pull(out);
+            },
             move |e| match e.kind() {
                 cpal::ErrorKind::Xrun => {
                     err_stats.short.fetch_add(1, Ordering::Relaxed);

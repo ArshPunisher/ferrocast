@@ -133,16 +133,22 @@ impl Engine {
                     Ok(Poll::SlowDown) => interval += Duration::from_secs(5),
                     Ok(Poll::Done(tokens)) => {
                         if let Err(e) = engine.finish_twitch(tokens).await {
-                            engine.notice(
+                            engine.notice_detail(
                                 "account:twitch",
                                 NoticeLevel::Error,
-                                &format!("Twitch sign-in didn't finish: {e}"),
+                                "Twitch sign-in didn't finish",
+                                &e.to_string(),
                             );
                         }
                         return;
                     }
                     Err(e) => {
-                        engine.notice("account:twitch", NoticeLevel::Warn, &e.to_string());
+                        engine.notice_detail(
+                            "account:twitch",
+                            NoticeLevel::Warn,
+                            "Twitch sign-in failed",
+                            &e.to_string(),
+                        );
                         return;
                     }
                 }
@@ -320,14 +326,17 @@ impl Engine {
             match ferrocast_youtube::oauth::finish(&http, &ep, &app, pending, YOUTUBE_SIGN_IN).await {
                 Ok(tokens) => {
                     if let Err(e) = engine.finish_youtube(tokens).await {
-                        engine.notice(
+                        engine.notice_detail(
                             "account:youtube",
                             NoticeLevel::Error,
-                            &format!("YouTube sign-in didn't finish: {e}"),
+                            "YouTube sign-in didn't finish",
+                            &e.to_string(),
                         );
                     }
                 }
-                Err(e) => engine.notice("account:youtube", NoticeLevel::Warn, &e.to_string()),
+                Err(e) => {
+                    engine.notice_detail("account:youtube", NoticeLevel::Warn, "YouTube sign-in failed", &e.to_string())
+                }
             }
         });
         Ok(ConnectFlow::Browser { url })
@@ -349,10 +358,11 @@ impl Engine {
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
         self.start_youtube(api, account);
-        self.notice(
+        self.notice_detail(
             "account:youtube",
             NoticeLevel::Info,
-            "YouTube is connected. Chat shows up whenever you're live there.",
+            "YouTube is connected",
+            "Chat shows up whenever you're live there.",
         );
         Ok(())
     }
@@ -362,20 +372,38 @@ impl Engine {
         self.inner.secrets.set(key, &json).map_err(|e| EngineError::Unavailable(e.to_string()))
     }
 
-    fn youtube_api(&self, tokens: ferrocast_youtube::Tokens) -> Result<Arc<ferrocast_youtube::Api>, EngineError> {
+    pub(crate) fn youtube_api(
+        &self,
+        tokens: ferrocast_youtube::Tokens,
+    ) -> Result<Arc<ferrocast_youtube::Api>, EngineError> {
         let app = self.apps().youtube.clone().ok_or_else(|| EngineError::Unavailable("no YouTube app".into()))?;
         let secrets = self.inner.secrets.clone();
         let persist = Arc::new(move |t: &ferrocast_youtube::Tokens| {
             let json = serde_json::to_string(t).map_err(|e| e.to_string())?;
             secrets.set(YOUTUBE_TOKENS, &json).map_err(|e| e.to_string())
         });
-        Ok(Arc::new(ferrocast_youtube::Api::new(
-            ferrocast_youtube::http_client(),
-            self.apps().youtube_endpoints.clone(),
-            app,
-            tokens,
-            persist,
-        )))
+        // The privacy of the broadcasts it makes is read from the settings each time, so a change
+        // applies to the next one. A weak link: the Api lives inside the engine's connectors.
+        let engine = Arc::downgrade(&self.inner);
+        let privacy: ferrocast_youtube::PrivacySource = Arc::new(move || {
+            // A value that isn't one of the three (a hand-edited file) must not publish: unlisted.
+            engine
+                .upgrade()
+                .map(|inner| Engine { inner }.settings().youtube_privacy)
+                .map_or(ferrocast_youtube::Privacy::Unlisted, |v| {
+                    ferrocast_youtube::Privacy::parse(&v).unwrap_or(ferrocast_youtube::Privacy::Unlisted)
+                })
+        });
+        Ok(Arc::new(
+            ferrocast_youtube::Api::new(
+                ferrocast_youtube::http_client(),
+                self.apps().youtube_endpoints.clone(),
+                app,
+                tokens,
+                persist,
+            )
+            .with_privacy(privacy),
+        ))
     }
 
     fn start_youtube(&self, api: Arc<ferrocast_youtube::Api>, account: repo::settings::Account) {
@@ -413,18 +441,21 @@ impl Engine {
     /// browser. Every screen shows it; the connect dialog also offers its link to copy, so
     /// the person isn't left waiting for a browser that never opens.
     pub fn browser_didnt_open(&self) {
-        self.notice(
+        self.notice_detail(
             BROWSER_NOTICE,
             NoticeLevel::Warn,
-            "Ferrocast couldn't open your browser. Try again in a moment, or open your browser first.",
+            "Ferrocast couldn't open your browser",
+            "Try again in a moment, or open your browser first.",
         );
     }
 
     /// One line on the dashboard. Notices with the same `key` replace each other there.
     pub(crate) fn notice(&self, key: &str, level: NoticeLevel, message: &str) {
-        self.send_live(LiveFrame::new(
-            "notice",
-            &Notice { key: Some(key.to_string()), level, message: message.to_string(), action: None },
-        ));
+        self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key)));
+    }
+
+    /// The same with what the line leaves out (the engine's own words), behind an (i) on the page.
+    pub(crate) fn notice_detail(&self, key: &str, level: NoticeLevel, message: &str, detail: &str) {
+        self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key).detail(detail)));
     }
 }

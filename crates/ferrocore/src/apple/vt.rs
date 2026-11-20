@@ -187,8 +187,10 @@ fn set_rate(session: &Owned, kbps: u32, rate: RateControl) -> Result<(), AvError
     };
     match rate {
         RateControl::Cbr => {
-            // Apple silicon (macOS 13+) keeps a true constant rate; elsewhere the average,
-            // held under the rate each second.
+            // Apple Silicon (macOS 13+) ConstantBitRate pads still frames, though M4-04 measured
+            // transitions peaking above target (~7.3–9.0 Mbps over 2 s on a 6 Mbps target).
+            // Elsewhere (or when CappedCbr asks for a strict cap) use AverageBitRate + 1 s
+            // DataRateLimits.
             if set(cbr, bits.0) != 0 {
                 let s = set(avg, bits.0);
                 if s != 0 {
@@ -196,6 +198,16 @@ fn set_rate(session: &Owned, kbps: u32, rate: RateControl) -> Result<(), AvError
                 }
                 limit();
             }
+        }
+        RateControl::CappedCbr => {
+            // Setting DataRateLimits alongside ConstantBitRate disables filler padding anyway on
+            // Apple Silicon, so strict platform caps use AverageBitRate + a 1 s byte ceiling
+            // (measured <= 5,930 kbps 2 s peak on 6,000 kbps target across hard noise cuts).
+            let s = set(avg, bits.0);
+            if s != 0 {
+                return Err(fail("set the bitrate", s));
+            }
+            limit();
         }
         // x264's rate factor never reaches here (VideoEncoder refuses it); an average if it did.
         RateControl::Average | RateControl::Crf(_) => {
@@ -291,8 +303,12 @@ impl Encoder {
         }
         set_rate(&session, cfg.bitrate_kbps, cfg.rate)?;
         // Hints and colour tags: the encoder may ignore them.
+        let key_frames = int(i32::try_from(cfg.keyframe_secs.max(1) * fps.round().max(1.0) as u32).unwrap_or(i32::MAX));
         // SAFETY: as above, constants only.
         unsafe {
+            if let (Some(k), Some(kf)) = (string(c"MaxKeyFrameInterval"), key_frames) {
+                set(k.0.cast(), kf.0);
+            }
             set(kVTCompressionPropertyKey_ExpectedFrameRate, rate.0);
             set(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
             set(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);

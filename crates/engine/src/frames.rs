@@ -70,9 +70,40 @@ pub struct Notice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     pub level: NoticeLevel,
+    /// One short line (about 60 characters): what happened and, where it fits, the fix.
     pub message: String,
+    /// The rest: the engine's own words, a cause, what else was done. The dashboard shows it behind
+    /// an (i) beside the line; an older dashboard ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<NoticeAction>,
+}
+
+impl Notice {
+    /// A notice of `level` with its one line; chain [`Self::key`], [`Self::detail`] and
+    /// [`Self::action`] for the rest.
+    pub fn new(level: NoticeLevel, message: impl Into<String>) -> Self {
+        Self { key: None, level, message: message.into(), detail: None, action: None }
+    }
+
+    #[must_use]
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    #[must_use]
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    #[must_use]
+    pub fn action(mut self, label: impl Into<String>, href: impl Into<String>) -> Self {
+        self.action = Some(NoticeAction { label: label.into(), href: href.into() });
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -92,6 +123,26 @@ pub struct NoticeAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_notice_is_one_line_and_its_detail_is_only_sent_when_there_is_one() {
+        let plain = serde_json::to_value(Notice::new(NoticeLevel::Warn, "Discord post failed").key("discord")).unwrap();
+        assert_eq!(plain, json!({ "key": "discord", "level": "warn", "message": "Discord post failed" }));
+        let full = Notice::new(NoticeLevel::Error, "Kick sign-in failed")
+            .key("account:kick")
+            .detail("Kick answered 401: the code expired.")
+            .action("Reconnect", "#/settings/accounts");
+        assert_eq!(
+            serde_json::to_value(full).unwrap(),
+            json!({
+                "key": "account:kick",
+                "level": "error",
+                "message": "Kick sign-in failed",
+                "detail": "Kick answered 401: the code expired.",
+                "action": { "label": "Reconnect", "href": "#/settings/accounts" }
+            })
+        );
+    }
 
     #[test]
     fn envelope_shape() {

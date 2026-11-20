@@ -217,8 +217,11 @@ async fn a_refusal_falls_back_to_the_system_voice_with_one_notice() {
     let n = notices(&mut live);
     assert_eq!(n.len(), 1, "one notice, not one per line: {n:?}");
     assert_eq!(n[0]["level"], "warn");
-    assert!(n[0]["message"].as_str().unwrap().contains("can't answer right now"), "{n:?}");
-    assert!(n[0]["message"].as_str().unwrap().contains("Reading with this PC"), "{n:?}");
+    // One short line, and the reason behind its (i).
+    let line = n[0]["message"].as_str().unwrap();
+    assert!(line.len() <= 60 && line.contains("this PC's voice"), "{n:?}");
+    assert!(n[0]["detail"].as_str().unwrap().contains("can't answer right now"), "{n:?}");
+    assert!(n[0]["detail"].as_str().unwrap().contains("Reading with this PC"), "{n:?}");
     assert_eq!(n[0]["action"]["href"], "#/settings/tts");
     assert!(w.e.tts_cloud().await.fallback.unwrap().contains("can't answer"));
     if cfg!(target_os = "macos") {
@@ -242,7 +245,7 @@ async fn a_lapsed_pro_or_a_long_line_never_reaches_the_relay() {
     let mut live = w.e.subscribe_live();
     w.e.speak_line(&"a".repeat(CLOUD_MAX_CHARS + 1), None).await;
     let n = notices(&mut live);
-    assert!(n[0]["message"].as_str().unwrap().contains("300 characters"), "{n:?}");
+    assert!(n[0]["detail"].as_str().unwrap().contains("300 characters"), "{n:?}");
     remember(&w.e, false, true).await;
     w.e.speak_line("hello", None).await;
     assert!(w.fake.calls().is_empty());
@@ -258,7 +261,7 @@ async fn the_month_used_up_falls_back_with_the_relays_reason() {
     w.e.speak_line("hello", None).await;
     assert!(w.fake.calls().is_empty(), "the relay refused before the provider");
     let n = notices(&mut live);
-    assert!(n[0]["message"].as_str().unwrap().contains("this month's Ferrocast voice characters"), "{n:?}");
+    assert!(n[0]["detail"].as_str().unwrap().contains("this month's Ferrocast voice characters"), "{n:?}");
 }
 
 #[tokio::test]
@@ -287,7 +290,7 @@ async fn a_slow_voice_never_holds_a_line_past_eight_seconds() {
     // The relay gives up on the provider at 7 s (and says so); the PC at 8 s whatever happens.
     assert!(took >= Duration::from_secs(6) && took < CLOUD_TIMEOUT + Duration::from_millis(1500), "{took:?}");
     tokio::time::timeout(Duration::from_secs(30), speak).await.expect("the line ends").unwrap();
-    let m = notice["message"].as_str().unwrap();
+    let m = notice["detail"].as_str().unwrap();
     assert!(m.contains("can't answer right now") || m.contains("didn't answer in time"), "{notice:?}");
     let used = w.relay_db.quota_used("sub_1", "tts_chars", ferrocast_relay::quota::Period::Month).unwrap();
     assert_eq!(used, 0, "the characters came back");

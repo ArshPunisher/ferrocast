@@ -10,6 +10,14 @@ use serde_json::Value;
 
 use crate::{Engine, EngineError};
 
+/// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch or Kick is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCap {
+    pub max_kbps: u32,
+    pub h264_only: bool,
+    pub keyframe_secs: u32,
+}
+
 /// What `GET /studio/engine` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StudioStatus {
@@ -203,6 +211,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn stats(&self) -> Result<Value, String>;
     /// Starts or stops recording → the recording's stats (null when stopped) and its file.
     async fn record(&self, on: bool) -> Result<Value, String>;
+    /// The recording's stats now (`active`, `bytes`, `seconds`, `file`, `error`, `error_detail`,
+    /// `disk_free_mb`), or null without one. Looked at every couple of seconds.
+    async fn record_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
     async fn record_pause(&self, on: bool) -> Result<(), String>;
     /// Starts or stops the replay buffer → `{ active }`.
     async fn replay(&self, _on: bool) -> Result<Value, String> {
@@ -257,6 +270,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// fills enough of it, else what stands out; None where nothing is found.
     async fn focus(&self, _pictures: Vec<Vec<u8>>, _w: u32, _h: u32) -> Result<Vec<Option<f32>>, String> {
         Err(NOT_HERE.into())
+    }
+    /// Tells the Studio the active shared-stream ceiling imposed by enabled main destinations
+    /// (e.g. Twitch 6,000 kbps H.264 / 2 s keyframes) without altering saved user settings.
+    async fn set_stream_cap(&self, _cap: Option<StreamCap>) -> Result<(), String> {
+        Ok(())
     }
     /// Auto quality: the stream on air (and the vertical one) at `pct` percent of the bitrate
     /// set, from now on; what's saved doesn't change.
@@ -2096,7 +2114,16 @@ impl Engine {
         }
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
-        Ok(serde_json::json!({ "settings": host.settings().await, "restart": restart }))
+        let saved = host.settings().await;
+        self.note_studio_settings(&saved);
+        self.send_golive_pub();
+        // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).
+        let (restart, detail) = one_line(restart, "Some changes apply after a restart");
+        let mut out = serde_json::json!({ "settings": saved, "restart": restart });
+        if let (Some(d), Some(o)) = (detail, out.as_object_mut()) {
+            o.insert("restart_detail".into(), Value::String(d));
+        }
+        Ok(out)
     }
 
     /// The Studio's stats, with the stream's health while it's live.
@@ -2294,18 +2321,22 @@ impl Engine {
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let s = host.settings().await;
+        self.note_studio_settings(&s);
         if on {
             self.ffmpeg_first(s.stream_needs_ffmpeg()).await?;
         }
         if !on {
+            self.set_studio_live(false);
             // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
             *crate::golive::lock_enhanced(self) = None;
             host.stream_stop().await.map_err(failed)?;
+            self.send_golive_pub();
             // The stream has ended either way; what didn't stop with it comes back in words.
             return Ok(follow_stream(host.as_ref(), false, &s)
                 .await
                 .map_or(Value::Null, |also| serde_json::json!({ "also": also })));
         }
+        self.sync_stream_cap().await;
         let (server, key) = self.golive_ingest().await?;
         // Twitch Enhanced Broadcasting: its other qualities, when Twitch's destination wants it.
         // Not while one already runs: its plan stays with it (Start then only says how it is).
@@ -2318,10 +2349,13 @@ impl Engine {
             Err(e) => {
                 if !running {
                     *crate::golive::lock_enhanced(self) = None;
+                    self.set_studio_live(false);
                 }
                 return Err(failed(e));
             }
         };
+        self.set_studio_live(true);
+        self.send_golive_pub();
         let mut also = follow_stream(host.as_ref(), true, &s).await;
         if let Some(note) = eb_note {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
@@ -2332,8 +2366,13 @@ impl Engine {
         if let Some(note) = self.studio_sync_light().await {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         }
+        // One short line (`also`), the full words behind the page's (i) (`also_detail`).
+        let (also, detail) = one_line(also, "Part of what goes with the stream didn't start");
         if let (Some(also), Some(o)) = (also, v.as_object_mut()) {
             o.insert("also".into(), Value::String(also));
+            if let Some(d) = detail {
+                o.insert("also_detail".into(), Value::String(d));
+            }
         }
         Ok(v)
     }
@@ -2741,6 +2780,16 @@ fn web_window_check(name: &str, url: &str) -> Result<(String, String), EngineErr
 
 /// What starts and stops with the stream (OBS's "Automatically record when streaming" and its
 /// friends). The stream starts or ends either way, so what didn't follow comes back in words.
+/// A hint as one short line plus the rest: a note already short enough stays as it is; a longer
+/// one (or several joined) becomes `short`, and its full words are the detail. (The page shows
+/// the line and puts the detail behind an (i); an older page shows the line.)
+pub(crate) fn one_line(full: Option<String>, short: &str) -> (Option<String>, Option<String>) {
+    match full {
+        Some(f) if f.chars().count() > 60 => (Some(short.to_string()), Some(f)),
+        other => (other, None),
+    }
+}
+
 async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> Option<String> {
     let mut failed = Vec::new();
     if on {
@@ -2774,6 +2823,18 @@ async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hint_is_one_short_line_with_the_rest_kept_as_its_detail() {
+        assert_eq!(one_line(None, "x"), (None, None));
+        let short = "Applies after a restart.".to_string();
+        assert_eq!(one_line(Some(short.clone()), "x"), (Some(short), None));
+        let long = "The replay buffer didn't start: No disk space. The recording didn't start: busy.";
+        assert_eq!(
+            one_line(Some(long.into()), "Part didn't start"),
+            (Some("Part didn't start".into()), Some(long.into()))
+        );
+    }
 
     #[derive(Debug, Default)]
     struct Fake {
