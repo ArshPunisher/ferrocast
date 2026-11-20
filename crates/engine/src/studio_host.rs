@@ -1542,6 +1542,14 @@ pub enum StudioAct {
         window: bool,
         width: u32,
     },
+    /// A still of a display, window, camera, or capture card for Add-source picker cards, at most
+    /// `width` wide -> `{ image: data URL | null }`.
+    SourceStill {
+        kind: String,
+        key: String,
+        value: Value,
+        width: u32,
+    },
     /// The VST plugins on this computer → `{ available, why, plugins: [{ path, cid, name,
     /// vendor, kinds }] }` (looked for once; `rescan` looks again).
     VstPlugins {
@@ -1813,6 +1821,21 @@ impl StudioAct {
                 Err(EngineError::Invalid("width: 64 to 1280.".into()))
             }
             A::ScreenStill { .. } => Ok(()),
+            A::SourceStill { kind, key, value, width } => {
+                if kind.trim().is_empty() || kind.len() > 64 {
+                    return Err(EngineError::Invalid("kind: a source kind id.".into()));
+                }
+                if key.trim().is_empty() || key.len() > 64 {
+                    return Err(EngineError::Invalid("key: a source setting key.".into()));
+                }
+                if value.is_null() || matches!(value, Value::String(s) if s.trim().is_empty()) {
+                    return Err(EngineError::Invalid("value: a device, screen, or window id.".into()));
+                }
+                if !(64..=640).contains(width) {
+                    return Err(EngineError::Invalid("width: 64 to 640.".into()));
+                }
+                Ok(())
+            }
             A::VstPlugins { .. } => Ok(()),
             A::Vst { name, filter, what } => {
                 check_source_name(name)?;
@@ -1931,6 +1954,7 @@ impl StudioAct {
                 | A::SourcePicture { .. }
                 | A::SourceStatus { .. }
                 | A::ScreenStill { .. }
+                | A::SourceStill { .. }
                 | A::VstPlugins { .. }
                 | A::Vst { .. }
                 | A::Items { .. }

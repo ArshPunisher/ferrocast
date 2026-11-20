@@ -2053,6 +2053,54 @@ impl Stage {
         }))
     }
 
+    /// Reuses an already-open capture source matching `(kind, key, value)` for a picker
+    /// thumbnail so the picker never opens a second camera session or grabs hardware unnecessarily.
+    #[allow(clippy::type_complexity)]
+    pub fn matching_device_picture_job(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &Value,
+        width: u32,
+    ) -> Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32)> + Send + 'static + use<>> {
+        let want_camera = PICTURE_ONLY_DEVICES.contains(&kind);
+        let want_screen = matches!(
+            kind,
+            "screen_capture" | "display_capture" | "window_capture" | "monitor_capture" | "xshm_input" | "game_capture"
+        );
+        if !want_camera && !want_screen {
+            return None;
+        }
+        let matched = self.sources_list().into_iter().find(|s| {
+            let sk = kind_of(s);
+            let kind_matches = if want_camera {
+                PICTURE_ONLY_DEVICES.contains(&sk)
+            } else {
+                sk == kind
+                    || (matches!(sk, "screen_capture" | "display_capture" | "monitor_capture")
+                        && matches!(kind, "screen_capture" | "display_capture" | "monitor_capture"))
+            };
+            if !kind_matches {
+                return false;
+            }
+            let set = s.get("settings").and_then(Value::as_object);
+            let Some(set) = set else { return false };
+            if let Some(v) = set.get(key) {
+                return v == value;
+            }
+            if want_camera {
+                return ["device", "uid", "video_device_id"].iter().any(|k| set.get(*k).is_some_and(|v| v == value));
+            }
+            false
+        })?;
+        let name = name_of(&matched).to_string();
+        let job = self.source_picture_job(&name, width.clamp(64, 320), false).ok().flatten()?;
+        Some(move || {
+            let (px, pw, ph, _) = job()?;
+            Some((px, pw, ph))
+        })
+    }
+
     /// A scene's picture `width` wide as RGBA pixels (with its height).
     pub fn thumbnail_pixels(&self, scene: &str, width: u32) -> Result<(Vec<u8>, u32, u32), StudioError> {
         self.thumbnail_job(scene, width)?()

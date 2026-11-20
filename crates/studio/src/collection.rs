@@ -337,6 +337,14 @@ pub fn png_data_url(px: &[u8], w: u32, h: u32, scene: &str) -> Result<String, St
     }
 }
 
+/// RGBA pixels as a compact JPEG `data:` URL (source picker thumbnails).
+pub fn jpeg_data_url(px: &[u8], w: u32, h: u32, premultiplied: bool, label: &str) -> Result<String, StudioError> {
+    use base64::Engine as _;
+    let bytes = ferrocore::Picture::encode_jpeg_rgba(px, w, h, premultiplied, 78)
+        .map_err(|e| StudioError::Failed(format!("\"{label}\"'s picture couldn't be made ({e})")))?;
+    Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)))
+}
+
 /// Live captions running on one sound; dropping it stops them.
 #[derive(Debug)]
 pub struct Captions {

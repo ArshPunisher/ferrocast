@@ -1153,9 +1153,11 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::AddGroup { scene, name } => v(to_json!(c.add_group(&scene, &name)?)),
         A::Ungroup { scene, id } => done(c.ungroup(&scene, id)),
         A::Thumbnail { scene, width } => Ok(json!({ "image": c.thumbnail(&scene, width)? })),
-        A::SourceStatus { .. } | A::ScreenStill { .. } | A::VstPlugins { .. } | A::Vst { .. } => {
-            Err(ferrocast_studio::StudioError::Failed("read off the main thread".into()))
-        }
+        A::SourceStatus { .. }
+        | A::ScreenStill { .. }
+        | A::SourceStill { .. }
+        | A::VstPlugins { .. }
+        | A::Vst { .. } => Err(ferrocast_studio::StudioError::Failed("read off the main thread".into())),
         A::SourcePicture { name, width, filters } => Ok(match c.source_picture_pixels(&name, width, filters)? {
             Some((px, w, h, (sw, sh))) => {
                 json!({ "image": ferrocast_studio::png_data_url(&px, w, h, &name)?, "width": sw, "height": sh })
@@ -1921,57 +1923,196 @@ impl StudioHost for DesktopStudio {
                 .await??;
             return serde_json::to_value(opts).map_err(|e| e.to_string());
         }
-        // A screen's or window's still for the picker's cards: a short capture off the main
-        // thread (Mac; elsewhere none yet, and the card keeps its icon).
-        if let StudioAct::ScreenStill { id, window, width } = &act {
-            let (id, window, width) = (*id, *window, *width);
-            #[cfg(target_os = "macos")]
-            {
-                use ferrocore::screen::{Target, still};
-                type Kept = std::collections::HashMap<(bool, u32, u32), (std::time::Instant, Option<String>)>;
-                // Each still starts a ScreenCaptureKit stream: two at a time (a window list of
-                // 30 asked at once ran over their time and kept their icons), and one taken
-                // in the last seconds is given again (the dialog opened again).
-                static TURNS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-                static KEPT: std::sync::Mutex<Option<Kept>> = std::sync::Mutex::new(None);
-                const KEEP: std::time::Duration = std::time::Duration::from_secs(5);
-                let key = (window, id, width);
-                let kept = |k| {
-                    KEPT.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get_or_insert_default()
-                        .get(&k)
-                        .filter(|(at, _)| at.elapsed() < KEEP)
-                        .map(|(_, i)| i.clone())
-                };
-                if let Some(image) = kept(key) {
-                    return Ok(json!({ "image": image }));
+        // Unified picker still (screen, window, camera, capture card) on every platform:
+        // 1) reuses an already-open stage source (zero hardware contention / camera LED flash);
+        // 2) serves 15s cached JPEG stills and deduplicates concurrent asks;
+        // 3) cancels queued/in-flight captures via Drop guard when the dialog closes.
+        if matches!(&act, StudioAct::ScreenStill { .. } | StudioAct::SourceStill { .. }) {
+            use std::collections::HashMap;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Mutex, OnceLock};
+            use std::time::{Duration, Instant};
+            use tokio::sync::{Notify, Semaphore};
+
+            struct CancelOnDrop(Arc<AtomicBool>);
+            impl Drop for CancelOnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
                 }
-                let _turn =
-                    TURNS.get_or_init(|| tokio::sync::Semaphore::new(2)).acquire().await.map_err(|e| e.to_string())?;
-                // Taken by another ask while this one waited its turn.
-                if let Some(image) = kept(key) {
-                    return Ok(json!({ "image": image }));
+            }
+
+            #[derive(Clone, Hash, PartialEq, Eq)]
+            enum StillTarget {
+                Display(u32, u32),
+                Window(u32, u32),
+                Camera(String, u32),
+            }
+
+            type Kept = HashMap<StillTarget, (Instant, String)>;
+            type FlightMap = HashMap<StillTarget, Arc<(Notify, Mutex<Option<Option<String>>>)>>;
+            static TURNS: OnceLock<Semaphore> = OnceLock::new();
+            static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
+            static IN_FLIGHT: Mutex<Option<FlightMap>> = Mutex::new(None);
+            const KEEP: Duration = Duration::from_secs(15);
+            const MAX_KEPT: usize = 128;
+
+            let (target_kind, key_name, val_json, target, width) = match &act {
+                StudioAct::ScreenStill { id, window, width } => {
+                    let w = (*width).clamp(64, 320);
+                    let tk = if *window { "window_capture" } else { "screen_capture" }.to_string();
+                    let kn = if *window { "window" } else { "display" }.to_string();
+                    let tgt = if *window { StillTarget::Window(*id, w) } else { StillTarget::Display(*id, w) };
+                    (tk, kn, json!(*id), tgt, w)
                 }
-                let target = if window { Target::Window(id) } else { Target::Display(id) };
+                StudioAct::SourceStill { kind, key, value, width } => {
+                    let w = (*width).clamp(64, 320);
+                    let tgt = if matches!(key.as_str(), "window") || kind.contains("window") {
+                        let Some(id) = value.as_u64().and_then(|n| u32::try_from(n).ok()) else {
+                            return Ok(json!({ "image": null }));
+                        };
+                        StillTarget::Window(id, w)
+                    } else if matches!(key.as_str(), "display" | "monitor_id")
+                        || kind.contains("screen")
+                        || kind.contains("monitor")
+                        || kind == "xshm_input"
+                    {
+                        let Some(id) = value.as_u64().and_then(|n| u32::try_from(n).ok()) else {
+                            return Ok(json!({ "image": null }));
+                        };
+                        StillTarget::Display(id, w)
+                    } else {
+                        let Some(id) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                            return Ok(json!({ "image": null }));
+                        };
+                        StillTarget::Camera(id.to_string(), w)
+                    };
+                    (kind.clone(), key.clone(), value.clone(), tgt, w)
+                }
+                _ => unreachable!(),
+            };
+
+            let read_kept = |k: &StillTarget| {
+                KEPT.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get_or_insert_default()
+                    .get(k)
+                    .filter(|(at, _)| at.elapsed() < KEEP)
+                    .map(|(_, img)| img.clone())
+            };
+            if let Some(image) = read_kept(&target) {
+                return Ok(json!({ "image": image }));
+            }
+
+            // Fast path: reuse an already-open stage source on the GPU (zero hardware contend).
+            let reuse_job = self
+                .on_main(move |h| {
+                    h.collection
+                        .as_ref()
+                        .and_then(|c| c.matching_device_picture_job(&target_kind, &key_name, &val_json, width))
+                })
+                .await
+                .ok()
+                .flatten();
+            if let Some(job) = reuse_job {
                 let image = tokio::task::spawn_blocking(move || {
-                    still(target, width)
-                        .ok()
-                        .and_then(|p| ferrocast_studio::png_data_url(&p.rgba, p.width, p.height, "screen").ok())
+                    job().and_then(|(px, pw, ph)| ferrocast_studio::jpeg_data_url(&px, pw, ph, true, "picker").ok())
                 })
                 .await
                 .map_err(|e| e.to_string())?;
-                let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let all = all.get_or_insert_default();
-                all.retain(|_, (at, _)| at.elapsed() < KEEP);
-                all.insert(key, (std::time::Instant::now(), image.clone()));
+                if let Some(img) = &image {
+                    let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let map = all.get_or_insert_default();
+                    map.retain(|_, (at, _)| at.elapsed() < KEEP);
+                    if map.len() >= MAX_KEPT {
+                        map.clear();
+                    }
+                    map.insert(target, (Instant::now(), img.clone()));
+                    return Ok(json!({ "image": image }));
+                }
+            }
+
+            // Single-flight deduplication + early cancellation if caller disconnects.
+            let (flight, is_leader) = {
+                let mut map_guard = IN_FLIGHT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let map = map_guard.get_or_insert_default();
+                if let Some(existing) = map.get(&target) {
+                    (existing.clone(), false)
+                } else {
+                    let created = Arc::new((Notify::new(), Mutex::new(None)));
+                    map.insert(target.clone(), created.clone());
+                    (created, true)
+                }
+            };
+            if !is_leader {
+                let notified = flight.0.notified();
+                let cached_before = flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                if let Some(res) = cached_before {
+                    return Ok(json!({ "image": res }));
+                }
+                notified.await;
+                let res = flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().flatten();
+                return Ok(json!({ "image": res }));
+            }
+
+            struct FlightCleanup {
+                target: StillTarget,
+                flight: Arc<(Notify, Mutex<Option<Option<String>>>)>,
+            }
+            impl Drop for FlightCleanup {
+                fn drop(&mut self) {
+                    let mut done = self.flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if done.is_none() {
+                        *done = Some(None);
+                    }
+                    drop(done);
+                    if let Ok(mut map) = IN_FLIGHT.lock()
+                        && let Some(m) = map.as_mut()
+                    {
+                        m.remove(&self.target);
+                    }
+                    self.flight.0.notify_waiters();
+                }
+            }
+            let _flight_cleanup = FlightCleanup { target: target.clone(), flight: flight.clone() };
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let _cancel_guard = CancelOnDrop(cancel_flag.clone());
+
+            let _turn = TURNS.get_or_init(|| Semaphore::new(2)).acquire().await.map_err(|e| e.to_string())?;
+            if let Some(image) = read_kept(&target) {
+                *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Some(image.clone()));
                 return Ok(json!({ "image": image }));
             }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = (id, window, width);
-                return Ok(json!({ "image": null }));
+
+            let capture_target = target.clone();
+            let flag = cancel_flag.clone();
+            let image = tokio::task::spawn_blocking(move || {
+                let pic = match capture_target {
+                    StillTarget::Display(id, w) => {
+                        ferrocore::screen_still_cancel(ferrocore::screen::Target::Display(id), w, &flag).ok()
+                    }
+                    StillTarget::Window(id, w) => {
+                        ferrocore::screen_still_cancel(ferrocore::screen::Target::Window(id), w, &flag).ok()
+                    }
+                    StillTarget::Camera(id, w) => ferrocore::camera_still_cancel(&id, w, &flag).ok(),
+                };
+                pic.and_then(|p| {
+                    ferrocast_studio::jpeg_data_url(&p.rgba, p.width, p.height, p.premultiplied, "picker").ok()
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+            if let Some(img) = &image {
+                let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let map = all.get_or_insert_default();
+                map.retain(|_, (at, _)| at.elapsed() < KEEP);
+                if map.len() >= MAX_KEPT {
+                    map.clear();
+                }
+                map.insert(target, (Instant::now(), img.clone()));
             }
+            *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(image.clone());
+            return Ok(json!({ "image": image }));
         }
         // How a source is doing: its settings read on the main thread, a Browser source's
         // address tried off it (the app's web client, its time limit).
