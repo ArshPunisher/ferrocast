@@ -2290,6 +2290,13 @@ impl Engine {
         let health = self.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()).1.clone();
         if let (Some(o), Some(h)) = (v.as_object_mut(), health) {
             o.insert("health".into(), serde_json::json!(h));
+            // Some platforms down while the others are fine: the score says so too, not 100.
+            if let Some(cap) = crate::golive::partial_failure_cap(&self.golive_main_states())
+                && let Some(score) = o.get_mut("health").and_then(|h| h.get_mut("score"))
+                && let Some(now) = score.as_u64()
+            {
+                *score = Value::from(now.min(cap));
+            }
         }
         // The upload itself struggling (most platforms behind at once): the status bar says
         // so, and not when only the drawing is slow or one platform has trouble of its own.
