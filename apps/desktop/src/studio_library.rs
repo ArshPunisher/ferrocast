@@ -192,7 +192,8 @@ pub fn load(data: &Path) -> Library {
 
 /// Writes the library, whole or not at all.
 pub fn save(data: &Path, lib: &Library) {
-    if let Err(e) = ferrocast_store::durable::save_json_pretty(&index(data), lib) {
+    // Queued: this runs on the async runtime and the main thread; reads see the queued bytes.
+    if let Err(e) = ferrocast_store::durable::queue_json_pretty(&index(data), lib) {
         tracing::warn!(error = %e, "the Studio's library couldn't be saved");
     }
 }
@@ -210,6 +211,11 @@ pub fn check_name(name: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// Saves are queued; tests that then touch the file by hand let them land first.
+    fn settle() {
+        assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)));
+    }
+
     #[test]
     fn earlier_files_become_the_first_of_each() {
         let dir = tempfile::tempdir().unwrap();
@@ -218,6 +224,7 @@ mod tests {
         std::fs::write(studio.join("scenes.json"), b"{\"sources\":[]}").unwrap();
         std::fs::write(studio.join("settings.json"), b"{}").unwrap();
         let lib = load(dir.path());
+        settle();
         assert_eq!(lib.collections.get(&lib.collections.current).unwrap().name, "Untitled");
         assert!(!studio.join("scenes.json").exists(), "moved, not copied");
         assert_eq!(std::fs::read(lib.current_file(dir.path(), Kind::Collections)).unwrap(), b"{\"sources\":[]}");
@@ -253,6 +260,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("studio")).unwrap();
         std::fs::write(index(dir.path()), b"{oops").unwrap();
         let lib = load(dir.path());
+        settle();
         assert_eq!(lib.collections.list.len(), 1);
         assert_eq!(lib.profiles.current, "untitled");
     }
@@ -261,14 +269,17 @@ mod tests {
     fn truncated_library_falls_back_to_bak() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut lib = load(dir.path());
+        settle();
         lib.collections.list.push(Entry { id: "gaming".into(), name: "Gaming".into() });
         lib.collections.current = "gaming".into();
         save(dir.path(), &lib);
+        settle();
 
         let bytes = std::fs::read(index(dir.path())).unwrap_or_else(|e| panic!("{e}"));
         std::fs::write(index(dir.path()), &bytes[..bytes.len() / 3]).unwrap_or_else(|e| panic!("{e}"));
 
         let recovered = load(dir.path());
+        settle();
         assert_eq!(recovered.collections.list.len(), 1, "last good library before truncation was .bak");
         assert!(ferrocast_store::durable::backup_path(&index(dir.path())).exists());
 
@@ -277,13 +288,16 @@ mod tests {
         lib2.collections.list.push(Entry { id: "gaming".into(), name: "Gaming".into() });
         lib2.collections.current = "gaming".into();
         save(dir.path(), &lib2);
+        settle();
         let mut lib3 = lib2.clone();
         lib3.profiles.list.push(Entry { id: "podcast".into(), name: "Podcast".into() });
         save(dir.path(), &lib3);
+        settle();
 
         let full = std::fs::read(index(dir.path())).unwrap_or_else(|e| panic!("{e}"));
         std::fs::write(index(dir.path()), &full[..full.len() / 2]).unwrap_or_else(|e| panic!("{e}"));
         let loaded = load(dir.path());
+        settle();
         assert_eq!(loaded.collections.current, "gaming");
     }
 }

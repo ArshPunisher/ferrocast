@@ -744,7 +744,9 @@ fn load_settings(data: &std::path::Path) -> StudioSettings {
 }
 
 fn save_json(file: &std::path::Path, v: &Value) {
-    if let Err(e) = ferrocast_store::durable::save_json_pretty(file, v) {
+    // Queued: callers run on the main thread or the async runtime, which a locked file must not
+    // stall. Later reads see the queued bytes.
+    if let Err(e) = ferrocast_store::durable::queue_json_pretty(file, v) {
         tracing::warn!(error = %e, file = %file.display(), "the Studio couldn't save");
     }
 }
@@ -830,7 +832,7 @@ fn write_session(now: Option<&ferrocast_engine::studio_host::Recovered>) {
     }
     match now {
         Some(s) => save_json(file, &serde_json::to_value(s).unwrap_or(Value::Null)),
-        None => ferrocast_store::durable::remove_with_backup(file),
+        None => ferrocast_store::durable::queue_remove_with_backup(file),
     }
 }
 
@@ -3489,16 +3491,20 @@ impl StudioHost for DesktopStudio {
                     return Err(format!("\"{}\" is in use now.", entry.name));
                 }
                 shelf.list.retain(|e| e.id != id);
-                // Kept aside, dated, not deleted.
+                // Kept aside, dated, not deleted. The renames wait out Windows file locks, so they
+                // run off the async runtime; the answer still waits for them (it says "kept").
                 let file = library::file(&data, kind, &id);
-                if file.exists() {
-                    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                    let _ = ferrocast_store::durable::rename_patiently(
-                        &file,
-                        &file.with_extension(format!("json.removed-{stamp}")),
-                    );
-                }
-                let _ = ferrocast_store::durable::remove_patiently(&ferrocast_store::durable::backup_path(&file));
+                let _ = tokio::task::spawn_blocking(move || {
+                    if file.exists() {
+                        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                        let _ = ferrocast_store::durable::rename_patiently(
+                            &file,
+                            &file.with_extension(format!("json.removed-{stamp}")),
+                        );
+                    }
+                    let _ = ferrocast_store::durable::remove_patiently(&ferrocast_store::durable::backup_path(&file));
+                })
+                .await;
                 library::save(&data, &lib);
                 Ok(Value::Null)
             }
@@ -3553,7 +3559,12 @@ impl StudioHost for DesktopStudio {
                     let to = library::file(&data, kind, &id);
                     if let Some(loaded) = ferrocast_store::durable::load_json_with_backup::<Value>(&from, |_| true) {
                         let bytes = serde_json::to_vec_pretty(&loaded.value).map_err(|e| e.to_string())?;
-                        ferrocast_store::durable::write_json_bytes(&to, &bytes)
+                        // Off the async runtime (a locked file is waited out), and still
+                        // synchronous: the copy is switched to right after, and a failure is
+                        // this request's answer.
+                        tokio::task::spawn_blocking(move || ferrocast_store::durable::write_json_bytes(&to, &bytes))
+                            .await
+                            .map_err(|e| e.to_string())?
                             .map_err(|e| format!("The copy couldn't be made: {e}"))?;
                     }
                 }
@@ -4204,7 +4215,9 @@ mod budget_tests {
         let second = StudioSettings { width: 2560, height: 1440, fps: 60, ..StudioSettings::default() };
 
         save_json(&settings_path, &serde_json::to_value(&first).unwrap_or_else(|e| panic!("{e}")));
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
         save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
         assert!(ferrocast_store::durable::backup_path(&settings_path).exists());
 
         let bytes = std::fs::read(&settings_path).unwrap_or_else(|e| panic!("{e}"));
@@ -4215,6 +4228,7 @@ mod budget_tests {
 
         // Corrupt existing settings must not clobber `.bak` on a save_json overwrite.
         save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
         assert_eq!((load_settings(dir.path()).width, load_settings(dir.path()).fps), (2560, 60));
     }
 
@@ -4227,6 +4241,7 @@ mod budget_tests {
             "scene_order": [{ "name": "Main Show" }]
         });
         save_json(&scenes_path, &saved_doc);
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
 
         if let Ok(temp_blank) = Collection::new(Canvas { width: 640, height: 360, fps: 30 }, FIRST_SCENE) {
             // While `collection_deferred` is true (Safe Mode before user confirm), save_confirmed is a no-op.
