@@ -1140,14 +1140,22 @@ async fn start_scripted(st: ScriptedYoutube) -> (Endpoints, Arc<Mutex<Vec<String
         )
         .route(
             "/api/videos",
-            axum::routing::get(|Query(q): Query<HashMap<String, String>>| async move {
+            axum::routing::get(|State(st): State<ScriptedYoutube>, Query(q): Query<HashMap<String, String>>| async move {
                 let id = q.get("id").cloned().unwrap_or_else(|| "v1".into());
+                st.calls.lock().unwrap().push(format!("GET /videos {id}"));
                 axum::Json(json!({ "items": [{ "id": id, "snippet": { "title": "Old", "description": "", "categoryId": "20" } }] }))
             })
             .put(|State(st): State<ScriptedYoutube>, axum::Json(b): axum::Json<serde_json::Value>| async move {
                 let id = b["id"].as_str().unwrap_or("").to_string();
                 st.calls.lock().unwrap().push(format!("PUT /videos {id}"));
                 axum::Json(b)
+            }),
+        )
+        .route(
+            "/api/upload/thumbnails/set",
+            axum::routing::post(|State(st): State<ScriptedYoutube>, Query(q): Query<HashMap<String, String>>| async move {
+                st.calls.lock().unwrap().push(format!("POST thumbnails.set {}", q.get("videoId").cloned().unwrap_or_default()));
+                axum::Json(json!({ "items": [] }))
             }),
         )
         .with_state(st);
@@ -1645,4 +1653,115 @@ fn a_burst_backs_off_from_five_seconds_to_a_minute() {
     assert_eq!(stream::rate_backoff(9, s(0)), s(60));
     assert_eq!(stream::rate_backoff(1, s(30)), s(30), "never less than YouTube asked");
     assert_eq!(stream::rate_backoff(1, s(300)), s(60));
+}
+
+// --- quota units (M10-06) -----------------------------------------------------------
+
+/// YouTube's units for each call in a fake's log: a read is 1, every write 50.
+fn units(calls: &[String]) -> u32 {
+    calls.iter().map(|c| if c.starts_with("GET ") { 1 } else { 50 }).sum()
+}
+
+fn reads(calls: &[String], what: &str) -> usize {
+    calls.iter().filter(|c| c.starts_with(&format!("GET {what}"))).count()
+}
+
+/// A channel with its default key and a Ferrocast broadcast waiting on it, as after a first stream.
+fn a_channel_with_a_broadcast() -> ScriptedYoutube {
+    ScriptedYoutube {
+        stream_pages: Arc::new(Mutex::new(vec![vec![stream_item(
+            "s1", "Default", true, "variable", "variable", "rtmp", "k-main",
+        )]])),
+        broadcast_pages: Arc::new(Mutex::new(vec![vec![json!({
+            "id": "b1",
+            "snippet": { "title": "Live now" },
+            "status": { "lifeCycleStatus": "ready" },
+            "contentDetails": { "boundStreamId": "s1", "enableAutoStart": true }
+        })]])),
+        ..Default::default()
+    }
+}
+
+/// A title and then a thumbnail, set one after the other as Go live does, listed the channel's
+/// streams and broadcasts twice (3 units a time, each time); the lookup is kept for a minute and
+/// forgotten at any write, and going live reads the channel as it is.
+#[tokio::test]
+async fn a_title_and_a_thumbnail_are_one_lookup_not_two() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let info = StreamInfo { title: Some("Ranked all night".into()), ..Default::default() };
+
+    // As before (nothing kept): two lookups.
+    let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+    let old = video_api(ep).with_read_cache(Duration::ZERO);
+    old.update_broadcast_info(&info).await.unwrap();
+    old.set_thumbnail(b"x", "image/png").await.unwrap();
+    let before = calls.lock().unwrap().clone();
+    assert_eq!((reads(&before, "/liveStreams"), reads(&before, "/liveBroadcasts")), (2, 4), "{before:?}");
+
+    // Now: one.
+    let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+    let api = video_api(ep);
+    api.update_broadcast_info(&info).await.unwrap();
+    api.set_thumbnail(b"x", "image/png").await.unwrap();
+    let after = calls.lock().unwrap().clone();
+    assert_eq!((reads(&after, "/liveStreams"), reads(&after, "/liveBroadcasts")), (1, 2), "{after:?}");
+    eprintln!("units for a title and a thumbnail: {} before, {} after", units(&before), units(&after));
+    assert!(units(&after) < units(&before));
+
+    // Going live reads the channel as it is now, never what was kept; and writes it makes empty it.
+    let n = reads(&after, "/liveStreams");
+    api.ingest().await.unwrap();
+    let live = calls.lock().unwrap().clone();
+    assert_eq!(reads(&live, "/liveStreams"), n + 1, "going live listed the streams again: {live:?}");
+}
+
+/// A write forgets what was kept: the lookup after it reads again.
+#[tokio::test]
+async fn a_write_forgets_the_kept_lookup() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let info = StreamInfo { title: Some("A".into()), ..Default::default() };
+    let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+    let api = video_api(ep);
+    api.update_broadcast_info(&info).await.unwrap();
+    // A broadcast is made on the vertical stream: lists change.
+    api.vertical_ingest().await.unwrap();
+    let before = reads(&calls.lock().unwrap(), "/liveStreams");
+    api.set_thumbnail(b"x", "image/png").await.unwrap();
+    let after = reads(&calls.lock().unwrap(), "/liveStreams");
+    assert_eq!(after, before + 1, "the thumbnail's lookup read again after the writes: {:?}", calls.lock().unwrap());
+}
+
+/// The bot's polling for a live chat is never answered from what was kept.
+#[tokio::test]
+async fn looking_for_the_live_chat_is_never_answered_from_the_kept_lists() {
+    let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+    let api = video_api(ep);
+    api.active_live_chat().await.unwrap();
+    api.active_live_chat().await.unwrap();
+    assert_eq!(reads(&calls.lock().unwrap(), "/liveBroadcasts"), 2);
+}
+
+/// A whole Go live with a title, a thumbnail and the vertical stream, as the engine does it:
+/// what it costs in YouTube's units with nothing kept, and now.
+#[tokio::test]
+async fn units_for_a_whole_go_live() {
+    use ferrocast_core::stream_info::StreamInfo;
+    let info = StreamInfo { title: Some("Ranked all night".into()), ..Default::default() };
+    let go_live = |keep: Duration| {
+        let info = info.clone();
+        async move {
+            let (ep, calls) = start_scripted(a_channel_with_a_broadcast()).await;
+            let api = video_api(ep).with_read_cache(keep);
+            api.update_broadcast_info(&info).await.unwrap();
+            api.set_thumbnail(b"x", "image/png").await.unwrap();
+            api.ingest().await.unwrap();
+            api.vertical_ingest().await.unwrap();
+            let log = calls.lock().unwrap().clone();
+            (units(&log), log)
+        }
+    };
+    let (before, _) = go_live(Duration::ZERO).await;
+    let (after, log) = go_live(Duration::from_secs(60)).await;
+    eprintln!("units for a whole Go live (title, thumbnail, normal and vertical): {before} before, {after} after");
+    assert!(after < before, "{log:?}");
 }

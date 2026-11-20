@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use reqwest::Method;
@@ -100,7 +101,17 @@ pub struct Api {
     made: Mutex<MadeSlot>,
     /// Same serialization and short-term cache for Ferrocast's vertical stream and broadcast.
     made_vertical: Mutex<MadeSlot>,
+    /// The stream and broadcast lists read for stream info, kept briefly (key: the request): a title
+    /// and a thumbnail set one after the other listed everything twice. Cleared by any write.
+    reads: StdMutex<HashMap<String, (i64, Value)>>,
+    /// Counts writes: a list read before one isn't kept after it.
+    writes: AtomicU64,
+    /// How long a read is kept (ms; 0: never, as before).
+    read_ttl_ms: i64,
 }
+
+/// How long a list of streams or broadcasts is kept for the next lookup.
+const READ_TTL_MS: i64 = 60_000;
 
 /// How long a broadcast or stream just made is trusted while YouTube's list doesn't show it yet.
 const MADE_FRESH_MS: i64 = 10 * 60_000;
@@ -144,7 +155,18 @@ impl Api {
             bans: StdMutex::new(HashMap::new()),
             made: Mutex::new(MadeSlot::default()),
             made_vertical: Mutex::new(MadeSlot::default()),
+            reads: StdMutex::new(HashMap::new()),
+            writes: AtomicU64::new(0),
+            read_ttl_ms: READ_TTL_MS,
         }
+    }
+
+    /// How long a list of streams or broadcasts is kept for stream info's lookups (the default is
+    /// a minute; zero reads every time).
+    #[must_use]
+    pub fn with_read_cache(mut self, keep: std::time::Duration) -> Self {
+        self.read_ttl_ms = i64::try_from(keep.as_millis()).unwrap_or(i64::MAX);
+        self
     }
 
     /// Makes every broadcast this Api creates with the privacy `source` says at that moment.
@@ -186,6 +208,12 @@ impl Api {
         body: Option<Value>,
     ) -> Result<Value, YoutubeError> {
         let mut token = self.access().await?;
+        if method != Method::GET && (path.starts_with("/liveBroadcasts") || path.starts_with("/liveStreams")) {
+            // Making, binding or changing a stream or broadcast: the lists read before it may be
+            // wrong now. (A video's title or a thumbnail changes neither list's ids or bindings.)
+            self.writes.fetch_add(1, Ordering::AcqRel);
+            self.reads.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
         for attempt in 0..2 {
             let mut req =
                 self.http.request(method.clone(), format!("{}{path}", self.ep.api)).query(query).bearer_auth(&token);
@@ -228,7 +256,17 @@ impl Api {
         path: &str,
         base_query: &[(&str, &str)],
         max_pages: usize,
+        fresh: bool,
     ) -> Result<Value, YoutubeError> {
+        let key = format!("{path}?{base_query:?}&{max_pages}");
+        let now = now_ms();
+        if !fresh
+            && let Some((at, v)) = self.reads.lock().unwrap_or_else(|p| p.into_inner()).get(&key)
+            && now - at < self.read_ttl_ms
+        {
+            return Ok(v.clone());
+        }
+        let writes_before = self.writes.load(Ordering::Acquire);
         let mut items: Vec<Value> = Vec::new();
         let mut page_token: Option<String> = None;
         let mut seen_tokens: HashSet<String> = HashSet::new();
@@ -252,30 +290,44 @@ impl Api {
                 _ => break,
             }
         }
-        Ok(json!({ "items": items }))
+        let list = json!({ "items": items });
+        // Kept for the next lookup (a fresh read leaves one too), unless a write went by meanwhile.
+        if self.read_ttl_ms > 0 && self.writes.load(Ordering::Acquire) == writes_before {
+            self.reads.lock().unwrap_or_else(|p| p.into_inner()).insert(key, (now_ms(), list.clone()));
+        }
+        Ok(list)
     }
 
-    async fn list_streams(&self) -> Result<Value, YoutubeError> {
+    /// The channel's streams (1 unit a page). `fresh`: read now, not what stream info kept.
+    async fn list_streams(&self, fresh: bool) -> Result<Value, YoutubeError> {
         self.list_paginated(
             "/liveStreams",
             &[("part", "id,snippet,cdn"), ("mine", "true"), ("maxResults", "50")],
             MAX_LIST_PAGES,
+            fresh,
         )
         .await
     }
 
-    async fn list_broadcasts(&self, part: &str, status: &str, max_pages: usize) -> Result<Value, YoutubeError> {
+    async fn list_broadcasts(
+        &self,
+        part: &str,
+        status: &str,
+        max_pages: usize,
+        fresh: bool,
+    ) -> Result<Value, YoutubeError> {
         self.list_paginated(
             "/liveBroadcasts",
             &[("part", part), ("broadcastStatus", status), ("broadcastType", "all"), ("maxResults", "50")],
             max_pages,
+            fresh,
         )
         .await
     }
 
     /// The live chat of the channel's active broadcast, if it's live now (1 unit/page).
     pub async fn active_live_chat(&self) -> Result<Option<String>, YoutubeError> {
-        let v = self.list_broadcasts("snippet", "active", MAX_LIST_PAGES).await?;
+        let v = self.list_broadcasts("snippet", "active", MAX_LIST_PAGES, true).await?;
         Ok(v.get("items")
             .and_then(Value::as_array)
             .into_iter()
@@ -344,10 +396,12 @@ impl Api {
         &self,
         vertical_streams: &HashSet<String>,
         selected_main: Option<&str>,
+        fresh: bool,
     ) -> Result<(Option<Value>, Option<Value>), YoutubeError> {
         let now = now_ms();
-        let active = self.list_broadcasts("id,snippet,status,contentDetails", "active", MAX_LIST_PAGES).await?;
-        let upcoming = self.list_broadcasts("id,snippet,status,contentDetails", "upcoming", MAX_LIST_PAGES).await?;
+        let active = self.list_broadcasts("id,snippet,status,contentDetails", "active", MAX_LIST_PAGES, fresh).await?;
+        let upcoming =
+            self.list_broadcasts("id,snippet,status,contentDetails", "upcoming", MAX_LIST_PAGES, fresh).await?;
         let active_items = active.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
         let upcoming_items = upcoming.get("items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
         let is_vertical = |b: &Value| {
@@ -386,9 +440,9 @@ impl Api {
     }
 
     pub async fn current_broadcast(&self) -> Result<Option<String>, YoutubeError> {
-        let streams = self.list_streams().await?;
+        let streams = self.list_streams(true).await?;
         let vertical = vertical_ids(&streams);
-        let (main, _) = self.broadcasts(&vertical, None).await?;
+        let (main, _) = self.broadcasts(&vertical, None, true).await?;
         Ok(main.and_then(|b| b.get("id").and_then(Value::as_str).map(String::from)))
     }
 
@@ -398,10 +452,12 @@ impl Api {
     async fn info_targets(&self) -> Result<Vec<String>, YoutubeError> {
         let mut made = self.made.lock().await;
         let now = now_ms();
-        let mut streams = self.list_streams().await?;
+        // From what the last lookup kept: the title and then the thumbnail set one after the other
+        // are one lookup, not two.
+        let mut streams = self.list_streams(false).await?;
         made.merge_fresh_stream(&mut streams, now);
         let vertical = vertical_ids(&streams);
-        let (main, vert) = self.broadcasts(&vertical, None).await?;
+        let (main, vert) = self.broadcasts(&vertical, None, false).await?;
         let listed = main
             .as_ref()
             .and_then(|b| b.get("id").and_then(Value::as_str))
@@ -523,7 +579,7 @@ impl Api {
     pub async fn last_broadcast(&self, since_ms: i64) -> Result<Option<(String, i64)>, YoutubeError> {
         let mut best: Option<(String, i64)> = None;
         for (status, max_pages) in [("completed", 4), ("active", MAX_LIST_PAGES)] {
-            let v = self.list_broadcasts("id,snippet", status, max_pages).await?;
+            let v = self.list_broadcasts("id,snippet", status, max_pages, true).await?;
             for b in v.get("items").and_then(Value::as_array).into_iter().flatten() {
                 let (Some(id), Some(start)) = (
                     b.get("id").and_then(Value::as_str),
@@ -750,7 +806,7 @@ impl Api {
     /// Read-only ingest server lookup for Test connection, Pre-flight and Upload check.
     /// Strictly GET-only: never creates, binds or mutates broadcasts or stream keys on YouTube.
     pub async fn peek_ingest(&self) -> Result<String, YoutubeError> {
-        let streams = self.list_streams().await?;
+        let streams = self.list_streams(false).await?;
         let vertical = vertical_ids(&streams);
         let candidate = main_stream_id(&streams, &vertical, None).ok_or_else(|| {
             YoutubeError::Refused(
@@ -768,7 +824,7 @@ impl Api {
 
     /// Read-only vertical ingest server lookup (GET only, zero writes on YouTube).
     pub async fn peek_vertical_ingest(&self) -> Result<String, YoutubeError> {
-        let streams = self.list_streams().await?;
+        let streams = self.list_streams(false).await?;
         let url = find_good_vertical_stream(&streams)
             .map(|(_, i)| i.url)
             .or_else(|| {
@@ -796,11 +852,12 @@ impl Api {
     ) -> Result<ferrocast_connector::Ingest, YoutubeError> {
         let mut made = self.made.lock().await;
         let now = now_ms();
-        let mut streams = self.list_streams().await?;
+        // Going live reads the channel as it is now.
+        let mut streams = self.list_streams(true).await?;
         made.merge_fresh_stream(&mut streams, now);
         let vertical = vertical_ids(&streams);
         // Ferrocast's own vertical streams (and their broadcasts) are never the normal one.
-        let (main, _) = self.broadcasts(&vertical, selected_broadcast).await?;
+        let (main, _) = self.broadcasts(&vertical, selected_broadcast, true).await?;
         let fresh_made = if selected_broadcast.is_none() { made.fresh_broadcast(now).cloned() } else { None };
         let live_now = main.as_ref().is_some_and(is_live);
 
@@ -945,7 +1002,7 @@ impl Api {
     pub async fn vertical_ingest(&self) -> Result<ferrocast_connector::Ingest, YoutubeError> {
         let mut made = self.made_vertical.lock().await;
         let now = now_ms();
-        let mut streams = self.list_streams().await?;
+        let mut streams = self.list_streams(true).await?;
         made.merge_fresh_stream(&mut streams, now);
         let mut all_vertical = vertical_ids(&streams);
 
@@ -974,7 +1031,7 @@ impl Api {
         };
         all_vertical.insert(id.clone());
 
-        let (normal, vert) = self.broadcasts(&all_vertical, None).await?;
+        let (normal, vert) = self.broadcasts(&all_vertical, None, true).await?;
         match vert {
             Some(vb) => {
                 let live_now = is_live(&vb);
