@@ -515,8 +515,14 @@ fn the_first_use_of_each_transition_costs_no_more_than_the_next() {
         later.sort();
         let median = later[later.len() / 2];
         eprintln!("{name}: first {first:?}, later median {median:?}");
-        // No frame over two frame periods (33 ms at 60 fps) and not slower than twice the next ones.
-        assert!(first < std::time::Duration::from_millis(33), "{name}: the first use took {first:?}");
-        assert!(first < median * 2 + std::time::Duration::from_millis(5), "{name}: first {first:?} against {median:?}");
+        // No frame over two frame periods (33 ms at 60 fps) and not slower than twice the next ones;
+        // on CI (a virtual graphics card) only a gross stall fails.
+        let ci = std::env::var("CI").is_ok_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
+        let (most, slack) = if ci { (250, 200) } else { (33, 5) };
+        assert!(first < std::time::Duration::from_millis(most), "{name}: the first use took {first:?}");
+        assert!(
+            first < median * 2 + std::time::Duration::from_millis(slack),
+            "{name}: first {first:?} against {median:?}"
+        );
     }
 }

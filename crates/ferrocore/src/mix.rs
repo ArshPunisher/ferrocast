@@ -866,7 +866,7 @@ struct Scratch {
 }
 
 /// How many given-back blocks are kept (the most a mix ahead of its reader needs, a second's).
-const MAX_POOL: usize = 64;
+const MAX_POOL: usize = 128;
 
 /// Source entries kept made ahead, and removed ones kept for dropping elsewhere.
 const SPARES: usize = 4;
@@ -904,7 +904,9 @@ impl std::fmt::Debug for SpareSource {
 }
 
 /// Blocks made when the mixer is (a mix in steady state needs a dozen or so in flight).
-const PREFILL_POOL: usize = 32;
+// Made ahead and kept: a stall's catch-up (a busy computer, a virtual one) mixes many blocks at
+// once, and each one taken past these is made on the audio thread (~57 KB a block).
+const PREFILL_POOL: usize = 96;
 
 /// Low latency sound: where the wait starts, and the most it waits beyond a filter's delay.
 const LOW_FLOOR_NS: u64 = 20_000_000;
