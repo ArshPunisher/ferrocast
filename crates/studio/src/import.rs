@@ -78,10 +78,9 @@ pub fn list(dir: &Path) -> Vec<ObsCollection> {
             if !valid_id(&id) {
                 return None;
             }
-            if std::fs::metadata(&path).ok().is_some_and(|m| m.len() > crate::import_preview::MAX_COLLECTION_BYTES) {
-                return None;
-            }
-            let doc: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let bytes =
+                crate::import_preview::read_plain_file(&path, crate::import_preview::MAX_COLLECTION_BYTES).ok()?;
+            let doc: Value = serde_json::from_slice(&bytes).ok()?;
             let obj = doc.as_object()?;
             if !obj.get("sources").is_none_or(Value::is_array) {
                 return None;
@@ -101,10 +100,22 @@ pub fn read(dir: &Path, id: &str) -> Result<Value, StudioError> {
         return Err(StudioError::Failed("That isn't one of OBS's scene collections.".into()));
     }
     let path = dir.join(format!("{id}.json"));
-    let bytes = std::fs::read(&path)
-        .map_err(|_| StudioError::Failed(format!("OBS's scene collection \"{id}\" isn't there any more.")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| StudioError::Failed(format!("OBS's scene collection \"{id}\" didn't read ({e}).")))
+    let bytes =
+        crate::import_preview::read_plain_file(&path, crate::import_preview::MAX_COLLECTION_BYTES).map_err(|e| {
+            StudioError::Failed(match e {
+                crate::import_preview::ReadFail::TooBig => {
+                    format!("OBS's scene collection \"{id}\" is too large to import.")
+                }
+                crate::import_preview::ReadFail::Missing => {
+                    format!("OBS's scene collection \"{id}\" isn't there any more.")
+                }
+            })
+        })?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        StudioError::Failed(format!(
+            "OBS's scene collection \"{id}\" is damaged and can't be read. Open it in OBS to check it, or start fresh."
+        ))
+    })
 }
 
 /// A file path as a `file://` address (spaces and the few characters that would end or

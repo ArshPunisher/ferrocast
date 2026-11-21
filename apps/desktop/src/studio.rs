@@ -3836,7 +3836,12 @@ impl StudioHost for DesktopStudio {
     async fn import_obs(&self, id: String) -> Result<Value, String> {
         let dir =
             ferrocast_studio::import_preview::obs_dir().ok_or("OBS's scene collections aren't on this computer.")?;
-        let doc = ferrocast_studio::import::read(&dir, &id).map_err(|e| e.to_string())?;
+        // A file of up to 64 MB is read and parsed off the async worker.
+        let read_id = id.clone();
+        let doc = tauri::async_runtime::spawn_blocking(move || ferrocast_studio::import::read(&dir, &read_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
         // A new scene collection of the same name (the Studio's own stay as they are).
         let name = doc.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
         self.shelf("collections".into(), ShelfAct::Import { name, doc }).await
@@ -3867,7 +3872,11 @@ impl StudioHost for DesktopStudio {
     async fn import_streamlabs(&self, id: String) -> Result<Value, String> {
         let dir = ferrocast_studio::import_preview::streamlabs_dir()
             .ok_or("Streamlabs' scene collections aren't on this computer.")?;
-        let doc = ferrocast_studio::streamlabs::read(&dir, &id).map_err(|e| e.to_string())?;
+        let read_id = id.clone();
+        let doc = tauri::async_runtime::spawn_blocking(move || ferrocast_studio::streamlabs::read(&dir, &read_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
         let name = doc.get("name").and_then(Value::as_str).unwrap_or("Streamlabs scenes").to_string();
         // From here on it's an OBS collection: the same import, web pages and missing kinds.
         self.shelf("collections".into(), ShelfAct::Import { name, doc }).await

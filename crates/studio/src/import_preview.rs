@@ -12,6 +12,54 @@ use crate::StudioError;
 
 /// Upper bound on scene-collection JSON files read during preview to avoid excessive allocations.
 pub const MAX_COLLECTION_BYTES: u64 = 64 * 1024 * 1024;
+/// A manifest of names is small; anything bigger isn't one.
+pub const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Why a file wasn't read.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadFail {
+    /// Not there, not a plain file (a link, a pipe, a folder) or unreadable.
+    Missing,
+    /// Bigger than the cap.
+    TooBig,
+}
+
+/// Reads a plain file of at most `cap` bytes from a folder somebody else controls: a link (to a
+/// pipe, `/dev/zero` or another file) is refused, the kind is checked on the open file (not on
+/// the name, which can change between a check and the read) and no more than `cap` bytes are
+/// ever read.
+pub(crate) fn read_plain_file(path: &Path, cap: u64) -> Result<Vec<u8>, ReadFail> {
+    use std::io::Read;
+    let named = std::fs::symlink_metadata(path).map_err(|_| ReadFail::Missing)?;
+    if !named.file_type().is_file() {
+        return Err(ReadFail::Missing);
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW (Linux 0x20000, macOS 0x100) and O_NONBLOCK so a pipe swapped in can't hang.
+        #[cfg(target_os = "macos")]
+        options.custom_flags(0x0100 | 0x0004);
+        #[cfg(not(target_os = "macos"))]
+        options.custom_flags(0x2_0000 | 0o4000);
+    }
+    let file = options.open(path).map_err(|_| ReadFail::Missing)?;
+    let meta = file.metadata().map_err(|_| ReadFail::Missing)?;
+    if !meta.is_file() {
+        return Err(ReadFail::Missing);
+    }
+    if meta.len() > cap {
+        return Err(ReadFail::TooBig);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(cap + 1).read_to_end(&mut bytes).map_err(|_| ReadFail::Missing)?;
+    if bytes.len() as u64 > cap {
+        return Err(ReadFail::TooBig);
+    }
+    Ok(bytes)
+}
 const MAX_SCENE_NAMES: usize = 12;
 const MAX_SKIP_ITEMS: usize = 50;
 
@@ -96,20 +144,13 @@ pub fn supported_kinds() -> (BTreeSet<String>, BTreeSet<String>) {
 }
 
 fn read_json_limited(path: &Path, missing_msg: &str, damaged_msg: &str) -> Result<Value, StudioError> {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(StudioError::Failed(missing_msg.to_string()));
+    let bytes = match read_plain_file(path, MAX_COLLECTION_BYTES) {
+        Ok(b) => b,
+        Err(ReadFail::TooBig) => {
+            return Err(StudioError::Failed("The collection file is too large to preview.".into()));
         }
-        Err(_) => return Err(StudioError::Failed(missing_msg.to_string())),
+        Err(ReadFail::Missing) => return Err(StudioError::Failed(missing_msg.to_string())),
     };
-    if !meta.is_file() {
-        return Err(StudioError::Failed(missing_msg.to_string()));
-    }
-    if meta.len() > MAX_COLLECTION_BYTES {
-        return Err(StudioError::Failed("The collection file is too large to preview.".into()));
-    }
-    let bytes = std::fs::read(path).map_err(|_| StudioError::Failed(missing_msg.to_string()))?;
     if bytes.is_empty() {
         return Err(StudioError::Failed(damaged_msg.to_string()));
     }
@@ -332,7 +373,7 @@ pub fn preview_obs(
 
 fn streamlabs_collection_name(dir: &Path, id: &str) -> String {
     let manifest = dir.join("manifest.json");
-    let Ok(bytes) = std::fs::read(manifest) else {
+    let Ok(bytes) = read_plain_file(&manifest, MAX_MANIFEST_BYTES) else {
         return "Streamlabs scenes".into();
     };
     let Ok(val) = serde_json::from_slice::<Value>(&bytes) else {
@@ -444,6 +485,43 @@ pub fn preview_streamlabs(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plain_file_is_read_and_a_link_a_folder_or_a_big_file_is_not() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.json");
+        std::fs::write(&f, b"{}").unwrap();
+        assert_eq!(read_plain_file(&f, 10).unwrap(), b"{}");
+        assert_eq!(read_plain_file(&f, 1), Err(ReadFail::TooBig));
+        assert_eq!(read_plain_file(&d.path().join("none.json"), 10), Err(ReadFail::Missing));
+        assert_eq!(read_plain_file(d.path(), 10), Err(ReadFail::Missing), "a folder");
+        #[cfg(unix)]
+        {
+            let link = d.path().join("link.json");
+            std::os::unix::fs::symlink(&f, &link).unwrap();
+            assert_eq!(read_plain_file(&link, 10), Err(ReadFail::Missing), "a link is refused, even to a good file");
+            let dangling = d.path().join("dangling.json");
+            std::os::unix::fs::symlink("/dev/zero", &dangling).unwrap();
+            assert_eq!(read_plain_file(&dangling, 1 << 20), Err(ReadFail::Missing));
+        }
+    }
+
+    #[test]
+    fn the_preview_refuses_a_linked_collection_and_a_huge_manifest() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real.json");
+        std::fs::write(&real, br#"{"sources":[]}"#).unwrap();
+        #[cfg(unix)]
+        {
+            let link = d.path().join("c.json");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(read_json_limited(&link, "gone", "damaged").is_err());
+        }
+        assert!(read_json_limited(&real, "gone", "damaged").is_ok());
+        let m = d.path().join("manifest.json");
+        std::fs::write(&m, vec![b' '; (MAX_MANIFEST_BYTES + 1) as usize]).unwrap();
+        assert_eq!(streamlabs_collection_name(d.path(), "x"), "Streamlabs scenes");
+    }
+
     use super::*;
     use serde_json::json;
 
