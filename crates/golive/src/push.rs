@@ -691,6 +691,19 @@ pub(crate) mod fault {
     pub(crate) fn no_name(port: u16) -> bool {
         NO_NAME.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
     }
+    static REFUSED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    /// Nothing listens there: the connect is refused at once. (A real refusal takes about 2 s on
+    /// Windows, which tries the SYN again before saying so; macOS and Linux answer at once.)
+    pub(crate) fn set_refused(port: u16, on: bool) {
+        let mut d = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if on {
+            d.push(port);
+        }
+    }
+    pub(crate) fn refused(port: u16) -> bool {
+        REFUSED.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
 }
 
 fn family_name(f: IpFamily) -> &'static str {
@@ -732,6 +745,10 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
     #[cfg(test)]
     if fault::no_name(t.port) {
         return Err(connect_error(&std::io::Error::other("failed to lookup address information"), &host));
+    }
+    #[cfg(test)]
+    if fault::refused(t.port) {
+        return Err(connect_error(&std::io::ErrorKind::ConnectionRefused.into(), &host));
     }
     // A connection the streamer chose is the only way out: it is looked up at every try (a
     // replugged cable has a new address), and one that isn't there says so by name.
