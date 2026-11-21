@@ -48,6 +48,8 @@ struct ToneState {
 pub enum AudioCmd {
     /// A source entry made ahead (see `AfxJob::MakeSpare`).
     Spare(crate::mix::SpareSource),
+    /// Sound at this input rate is coming: have a resampler made.
+    WantResampler(u32),
     /// A resampler made ahead (see `AfxJob::MakeResampler`).
     SpareResampler(crate::mix::SpareResampler),
     EnsureSource {
@@ -120,6 +122,7 @@ impl std::fmt::Debug for AudioCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spare(_) => f.write_str("Spare"),
+            Self::WantResampler(r) => f.debug_tuple("WantResampler").field(r).finish(),
             Self::SpareResampler(_) => f.write_str("SpareResampler"),
             Self::EnsureSource { id, .. } => f.debug_struct("EnsureSource").field("id", id).finish(),
             Self::RemoveSource(id) => f.debug_tuple("RemoveSource").field(id).finish(),
@@ -181,10 +184,11 @@ pub(crate) enum AfxJob {
     DropRing(AudioConsumer),
     /// A resampler a source stopped using.
     DropResampler(crate::mix::SpareResampler),
-    /// Make `n` resamplers ahead (same rate in and out, what following drift needs).
+    /// Make a resampler from `in_rate` to `out_rate` ahead (same rate: what following drift
+    /// needs; another: a source at that rate has appeared).
     MakeResampler {
-        rate: u32,
-        n: usize,
+        in_rate: u32,
+        out_rate: u32,
     },
     /// Make `n` source entries ahead for sources that appear.
     MakeSpare {
@@ -223,9 +227,9 @@ fn run_afx_bg(rx: mpsc::Receiver<AfxJob>, cmd_tx: mpsc::Sender<AudioCmd>, builde
             AfxJob::DropRing(ring) => drop(ring),
             AfxJob::DropLevels(l) => drop(l),
             AfxJob::DropResampler(r) => drop(r),
-            AfxJob::MakeResampler { rate, n } => {
-                for _ in 0..n {
-                    let _ = cmd_tx.send(AudioCmd::SpareResampler(Mixer::make_spare_resampler(rate)));
+            AfxJob::MakeResampler { in_rate, out_rate } => {
+                if let Some(r) = Mixer::make_spare_resampler(in_rate, out_rate) {
+                    let _ = cmd_tx.send(AudioCmd::SpareResampler(r));
                 }
             }
             AfxJob::MakeSpare { rate, n } => {
@@ -362,7 +366,12 @@ impl<C: AudioClock> AudioRunner<C> {
             rate,
             step_ns,
             next_tick_ns,
-            mixer: Mixer::new(rate, latency_ns),
+            mixer: {
+                let mut m = Mixer::new(rate, latency_ns);
+                // The background thread makes the resamplers other rates need.
+                m.set_background_resamplers(afx_tx.is_some());
+                m
+            },
             tones: crate::rt::PreMap::new(),
             rings: crate::rt::PreMap::new(),
             levels: crate::rt::PreMap::new(),
@@ -495,6 +504,7 @@ impl<C: AudioClock> AudioRunner<C> {
     fn handle_cmd(&mut self, cmd: AudioCmd) {
         match cmd {
             AudioCmd::Spare(s) => self.mixer.add_spare(s),
+            AudioCmd::WantResampler(r) => self.mixer.want_resampler(r),
             AudioCmd::SpareResampler(r) => self.mixer.add_spare_resampler(r),
             AudioCmd::EnsureSource { id, levels } => {
                 self.pending_removals.remove(&id);
@@ -664,9 +674,10 @@ impl<C: AudioClock> AudioRunner<C> {
         while let Some(rs) = self.mixer.pop_retired_resampler() {
             self.drop_elsewhere(AfxJob::DropResampler(rs));
         }
-        let n = self.mixer.take_resampler_request();
-        if n > 0 {
-            self.drop_elsewhere(AfxJob::MakeResampler { rate: self.rate, n });
+        self.mixer.release_held();
+        let out_rate = self.mixer.resampler_out_rate();
+        while let Some(in_rate) = self.mixer.pop_resampler_request() {
+            self.drop_elsewhere(AfxJob::MakeResampler { in_rate, out_rate });
         }
         let n = self.mixer.take_spare_request();
         if n > 0 {
