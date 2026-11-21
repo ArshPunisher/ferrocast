@@ -343,15 +343,19 @@ mod tts_cleanup_tests {
         let engine = Engine::start_with_secrets(dir.path(), secrets).await.unwrap();
         let now = crate::now().0;
         let mut quiet = sample_alert("m1", None);
-        quiet.tts_text = Some("back to the brb scene".into());
+        quiet.tts_text = Some("switch to zetamute".into());
         engine.queue_set_muted(true).await;
         engine.enqueue_alert(quiet, 0, false).await;
-        assert!(!from_a_viewer(&Command::Brb, &[], now), "muted: the message was never read, so it holds nothing");
+        let scenes = vec!["Zetamute".to_string(), "Zetaloud".to_string()];
+        assert!(
+            !from_a_viewer(&Command::Scene("Zetamute".into()), &scenes, now),
+            "muted: the message was never read, so it holds nothing"
+        );
         // Not muted: the line is read, so a command inside it must not be taken as the streamer's.
         engine.queue_set_muted(false).await;
         let mut loud = sample_alert("m2", None);
-        loud.tts_text = Some("stop recording please".into());
+        loud.tts_text = Some("switch to zetaloud".into());
         engine.enqueue_alert(loud, 0, false).await;
-        assert!(from_a_viewer(&Command::RecordOff, &[], now));
+        assert!(from_a_viewer(&Command::Scene("Zetaloud".into()), &scenes, now));
     }
 }
