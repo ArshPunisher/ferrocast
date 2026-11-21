@@ -1295,6 +1295,7 @@ async fn light_hub_destination_checks_light_hub_rules_and_eb_is_exempt() {
     };
     push_stream(&g.hub, 150_000); // ~12,000 kbps
     push_stream(&g.lhub, 37_500); // ~3,000 kbps
+    let feeds = [keep_streaming(g.hub.clone(), 150_000, 4_000), keep_streaming(g.lhub.clone(), 37_500, 4_000)];
 
     let v = e.golive_view().await;
     let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
@@ -1317,6 +1318,7 @@ async fn light_hub_destination_checks_light_hub_rules_and_eb_is_exempt() {
     assert_eq!(twitch.issues[0].code, ferrocast_golive::probe::RuleCode::Bitrate);
     assert_eq!(twitch.issues[0].fix_kbps, Some(5_500));
     assert!(!twitch.rules.is_empty());
+    feeds.iter().for_each(tokio::task::JoinHandle::abort);
 }
 
 #[tokio::test]
@@ -1454,6 +1456,23 @@ fn twitch_studio_settings() -> crate::studio_host::StudioSettings {
     crate::studio_host::StudioSettings { video_kbps: 14_000, vbr: true, keyframe_s: 4, ..Default::default() }
 }
 
+/// After a burst (frames every 100 ms of stream, a keyframe every 2 s, up to `ts`), the same
+/// stream keeps arriving on `hub` at its own pace, as a real one does, until aborted. The
+/// measured rate reads 0 three seconds after the last packet, and on Windows each view takes
+/// about 2 s (it dials OBS, and a refused connect takes that long there): a burst pushed once had
+/// gone stale by the second view, and the rules it was meant to trip said nothing.
+fn keep_streaming(hub: Arc<ferrocast_golive::Hub>, frame_bytes: usize, mut ts: u32) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            ts += 100;
+            let mut d = vec![if (ts / 100).is_multiple_of(20) { 0x17 } else { 0x27 }, 0x01];
+            d.resize(frame_bytes, 0);
+            hub.video(ts, d.into());
+        }
+    })
+}
+
 /// A stream of `kbps` on the main hub, as the Studio's would arrive.
 fn push_main(e: &crate::Engine, frame_bytes: usize) {
     let hub = &e.golive().hub;
@@ -1507,8 +1526,9 @@ async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
     };
     e.set_golive_destinations(only_twitch()).await.unwrap();
     e.studio_stream(true).await.unwrap();
-    // 7,011 kbps arrives.
+    // 7,011 kbps arrives, and goes on arriving.
     push_main(&e, 90_000);
+    let feed = keep_streaming(e.golive().hub.clone(), 90_000, 4_000);
     let twitch = |v: &crate::golive::GoLiveView| v.destinations.iter().find(|d| d.id == "twitch").cloned().unwrap();
     let v = e.golive_view().await;
     assert!(twitch(&v).capped.is_some(), "held: the badge says so");
@@ -1526,6 +1546,7 @@ async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
     e.sync_stream_cap().await;
     let v = e.golive_view().await;
     assert!(twitch(&v).capped.is_some() && twitch(&v).issues.is_empty());
+    feed.abort();
     e.studio_stream(false).await.unwrap();
 }
 

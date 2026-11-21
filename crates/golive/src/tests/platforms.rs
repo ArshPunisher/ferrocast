@@ -28,6 +28,7 @@ fn destination_with(port: u16, id: &str, first_ms: u64, max_ms: u64) -> Destinat
 /// open, its buffers fill, and the sender's writes block (a platform stuck behind its own load
 /// balancer).
 async fn platform_that_stalls(listener: TcpListener, key: &'static str) -> mpsc::UnboundedReceiver<Got> {
+    push::fault::set_send_buffer(listener.local_addr().unwrap().port(), SLOW_LINK_SEND_BUFFER);
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
@@ -66,6 +67,7 @@ async fn platform_that_is_slow(
     bytes: usize,
     every: Duration,
 ) -> mpsc::UnboundedReceiver<Got> {
+    push::fault::set_send_buffer(listener.local_addr().unwrap().port(), SLOW_LINK_SEND_BUFFER);
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
@@ -249,10 +251,17 @@ async fn a_platform_that_stops_reading_is_called_stalled_backs_off_and_spares_th
     // While it's stuck the good one keeps its pace: compare 3 s of frames inside the stall.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let before = tally(&mut good_got).1;
+    let sent_before = sent.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_secs(3)).await;
     let during = tally(&mut good_got).1;
-    // 100 a second were sent; the stuck destination mustn't have slowed the other.
-    assert!(during >= 200, "the good destination got {during} frames in 3 s, 300 were sent (before: {before})");
+    let sent_during = sent.load(Ordering::Relaxed) - sent_before;
+    // Against what was really sent (a 10 ms sleep is 15.6 ms on Windows: about 190 frames in 3 s,
+    // not 300): the stuck destination mustn't have slowed the other.
+    assert!(sent_during >= 100, "the stream kept going: {sent_during} frames in 3 s");
+    assert!(
+        u64::from(during) * 3 >= sent_during * 2,
+        "the good destination got {during} frames in 3 s, {sent_during} were sent (before: {before})"
+    );
     assert_eq!(good.borrow().state, PushState::Live);
     assert_eq!(good.borrow().since_ms, good_since, "the good one was never reconnected");
     assert_eq!(good.borrow().dropped, 0, "nothing of the good one was skipped");
@@ -482,9 +491,12 @@ async fn a_destination_without_a_backup_keeps_trying_its_own_server() {
     let primary = dead_port().await;
     let mut health = start(&w, destination_with(primary, "twitch", 20, 100));
     let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
-    for _ in 0..2 * push::BACKUP_AFTER {
+    // Try by try, past the point where one with a backup switches (a fixed time saw one try on
+    // Windows, where a refused connect takes 2 s).
+    for want in 1..=push::BACKUP_AFTER + 1 {
         match state_within(&mut health, LONG, |s| {
-            matches!(s, PushState::Reconnecting { .. } | PushState::Failed { .. })
+            matches!(s, PushState::Reconnecting { attempt, .. } if *attempt >= want)
+                || matches!(s, PushState::Failed { .. })
         })
         .await
         .state
@@ -497,7 +509,6 @@ async fn a_destination_without_a_backup_keeps_trying_its_own_server() {
             }
             s => panic!("{s:?}"),
         }
-        tokio::time::sleep(Duration::from_millis(60)).await;
     }
     let attempt = match &health.borrow().state {
         PushState::Reconnecting { attempt, .. } | PushState::Failed { attempts: attempt, .. } => *attempt,

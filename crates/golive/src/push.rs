@@ -691,6 +691,34 @@ pub(crate) mod fault {
     pub(crate) fn no_name(port: u16) -> bool {
         NO_NAME.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
     }
+    static REFUSED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    /// Nothing listens there: the connect is refused at once. (A real refusal takes about 2 s on
+    /// Windows, which tries the SYN again before saying so; macOS and Linux answer at once.)
+    pub(crate) fn set_refused(port: u16, on: bool) {
+        let mut d = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|p| *p != port);
+        if on {
+            d.push(port);
+        }
+    }
+    pub(crate) fn refused(port: u16) -> bool {
+        REFUSED.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
+    }
+    static SEND_BUFFER: Mutex<Vec<(u16, usize)>> = Mutex::new(Vec::new());
+    /// Connections to this port get a send buffer of this size, as on a real link. Over loopback
+    /// Linux sizes it from the 64 KB loopback segment (about 2.5 MB at connect), so a platform
+    /// that reads slowly or not at all takes seconds of stream before its writes block; macOS
+    /// starts at about 144 KB. Pinned, a slow test platform pushes back the same on every OS.
+    pub(crate) fn set_send_buffer(port: u16, bytes: usize) {
+        let mut d = SEND_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|(p, _)| *p != port);
+        if bytes > 0 {
+            d.push((port, bytes));
+        }
+    }
+    pub(crate) fn send_buffer(port: u16) -> Option<usize> {
+        SEND_BUFFER.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map(|(_, b)| *b)
+    }
 }
 
 fn family_name(f: IpFamily) -> &'static str {
@@ -733,6 +761,10 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
     if fault::no_name(t.port) {
         return Err(connect_error(&std::io::Error::other("failed to lookup address information"), &host));
     }
+    #[cfg(test)]
+    if fault::refused(t.port) {
+        return Err(connect_error(&std::io::ErrorKind::ConnectionRefused.into(), &host));
+    }
     // A connection the streamer chose is the only way out: it is looked up at every try (a
     // replugged cable has a new address), and one that isn't there says so by name.
     let chosen = match &t.bind {
@@ -754,6 +786,10 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
     .map_err(|_| PushError::Slow(host.clone()))?
     .map_err(|e| connect_error(&e, &host))?;
     let _ = tcp.set_nodelay(true);
+    #[cfg(test)]
+    if let Some(bytes) = fault::send_buffer(t.port) {
+        socket2::SockRef::from(&tcp).set_send_buffer_size(bytes).expect("test send buffer");
+    }
     if !t.tls {
         return Ok(Box::pin(tcp));
     }
