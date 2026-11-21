@@ -429,6 +429,9 @@ struct Also {
     light: bool,
     /// The replay buffer runs, or starts with the stream.
     replay: bool,
+    /// Some source is shown only on the stream or only in the recording, so the recording can't
+    /// share the stream's encode.
+    selective: bool,
 }
 
 /// What streaming and recording at once ask of the Mac's video encoder (its engines × about one
@@ -470,14 +473,17 @@ fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32
         encode: record_encode_capped(s, cap),
         ..Default::default()
     };
-    let shares = ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps)
-        .map_err(|why| {
-            if stream.vod_track.is_some() {
-                format!("{why} (turn the VOD track off when you're not on Twitch)")
-            } else {
-                why
-            }
-        });
+    let shares =
+        ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps, also.selective)
+            .map_err(|why| {
+                // The hint belongs to the VOD track's own reason: turning it off brings nothing
+                // back when something else is why.
+                if stream.vod_track.is_some() && why.contains("VOD track") {
+                    format!("{why} (turn the VOD track off when you're not on Twitch)")
+                } else {
+                    why
+                }
+            });
     let record_hw = hardware(&plan.encode.video_encoder);
     let mut record_mpx = if shares.is_ok() || !record_hw { 0.0 } else { canvas };
     // The replay buffer is always an encode of its own (the recording's settings).
@@ -1305,6 +1311,21 @@ fn web_act(w: ferrocast_engine::studio_host::WebAct) -> ferrocast_studio::WebAct
     }
 }
 
+/// A recording sharing the stream's encode carries the stream's picture, so choosing something
+/// to show only on the stream or only in the recording can't work while they do: it says so
+/// rather than quietly leaving the recording with the stream's picture.
+fn refuses_while_shared(act: &StudioAct, shared: bool) -> Option<&'static str> {
+    let flags = matches!(act, StudioAct::EditItem { edit: Edit::StreamOnly | Edit::RecordingOnly, .. });
+    (flags && shared).then_some(
+        "The recording shares the stream's encoder (Same as stream), so it can't show something different from the stream. Stop the recording, then choose where this shows.",
+    )
+}
+
+/// Whether the running stream and recording share one encode.
+fn shares_encoder(h: &Held) -> bool {
+    h.stream.as_ref().is_some_and(|s| s.shares_encoder()) || h.record.as_ref().is_some_and(|(r, ..)| r.shares_encoder())
+}
+
 fn item_edit(e: Edit) -> ItemEdit {
     match e {
         Edit::Show => ItemEdit::Show,
@@ -1341,6 +1362,9 @@ fn item_edit(e: Edit) -> ItemEdit {
         Edit::ScaleBilinear => ItemEdit::ScaleBilinear,
         Edit::ScaleLanczos => ItemEdit::ScaleLanczos,
         Edit::ScaleArea => ItemEdit::ScaleArea,
+        Edit::StreamAndRecording => ItemEdit::StreamAndRecording,
+        Edit::StreamOnly => ItemEdit::StreamOnly,
+        Edit::RecordingOnly => ItemEdit::RecordingOnly,
     }
 }
 
@@ -2834,6 +2858,9 @@ impl StudioHost for DesktopStudio {
                 let (undo, redo) = h.history.labels();
                 return Ok(json!({ "done": done, "undo": undo, "redo": redo }));
             }
+            if let Some(why) = refuses_while_shared(&act, shares_encoder(h)) {
+                return Err(why.into());
+            }
             let before = h.history.before(c, &act);
             let turns_vertical = matches!(act, StudioAct::StartVertical { .. } | StudioAct::StopVertical);
             if turns_vertical {
@@ -3205,7 +3232,14 @@ impl StudioHost for DesktopStudio {
             let live = h.stream.as_ref().filter(|st| st.stats().active).zip(h.stream_with.as_ref());
             let rec = match live.map(|(st, with)| {
                 let can = if c.started(st) {
-                    ferrocast_studio::stage::can_share(with, &plan, s.record_quality == "stream", c.canvas().fps, s.fps)
+                    ferrocast_studio::stage::can_share(
+                        with,
+                        &plan,
+                        s.record_quality == "stream",
+                        c.canvas().fps,
+                        s.fps,
+                        c.has_selective_items(),
+                    )
                 } else {
                     Err("the stream runs in another collection".to_string())
                 };
@@ -4083,17 +4117,18 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         // The saved profile (loaded if nothing asked for it yet), and a replay buffer that runs
         // (one that failed isn't an encode; CodeRabbit).
-        let (saved, replay, cap) = self
+        let (saved, replay, cap, selective) = self
             .on_main(move |h| {
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
-                (s, h.replay.as_ref().is_some_and(|r| r.active()), h.stream_cap)
+                let selective = h.collection.as_ref().is_some_and(|c| c.has_selective_items());
+                (s, h.replay.as_ref().is_some_and(|r| r.active()), h.stream_cap, selective)
             })
             .await?;
         let s = match draft {
             Some(d) => serde_json::from_value::<StudioSettings>(d).map_err(|e| format!("settings: {e}"))?,
             None => saved,
         };
-        let also = Also { enhanced, light, replay: replay || s.replay_when_streaming };
+        let also = Also { enhanced, light, replay: replay || s.replay_when_streaming, selective };
         Ok(encode_budget(&s, cap, ferrocast_studio::system::video_engines(), also))
     }
 
@@ -4206,7 +4241,7 @@ impl StudioHost for DesktopStudio {
                 } else if !c.started(r) {
                     Err("the recording runs in another collection".to_string())
                 } else {
-                    ferrocast_studio::stage::can_share(&settings, plan, *same, c.canvas().fps, s.fps)
+                    ferrocast_studio::stage::can_share(&settings, plan, *same, c.canvas().fps, s.fps, c.has_selective_items())
                 };
                 (r, can)
             });
@@ -4754,19 +4789,55 @@ mod budget_tests {
         let capped = record_encode_capped(&s, Some(twitch));
         assert!(capped.strict_cbr && capped.scale.is_none());
         let plan = ferrocast_studio::RecordPlan { tracks: vec![1], encode: capped, ..Default::default() };
-        assert_eq!(ferrocast_studio::stage::can_share(&stream, &plan, true, 60, 60), Ok(()));
+        assert_eq!(ferrocast_studio::stage::can_share(&stream, &plan, true, 60, 60, false), Ok(()));
         // Without a cap, nothing changes: the plain stream and the plain recording share.
         let plain = ferrocast_studio::RecordPlan {
             tracks: vec![1],
             encode: record_encode_capped(&s, None),
             ..Default::default()
         };
-        assert_eq!(ferrocast_studio::stage::can_share(&stream_settings(&s, None), &plain, true, 60, 60), Ok(()));
+        assert_eq!(ferrocast_studio::stage::can_share(&stream_settings(&s, None), &plain, true, 60, 60, false), Ok(()));
         // A recording that began plain can't be joined by a strict stream: it gets its own encoder.
-        assert!(ferrocast_studio::stage::can_share(&stream, &plain, true, 60, 60).is_err());
+        assert!(ferrocast_studio::stage::can_share(&stream, &plain, true, 60, 60, false).is_err());
+        // Sources shown only on the stream or only in the recording make two pictures: no sharing.
+        let why = ferrocast_studio::stage::can_share(&stream_settings(&s, None), &plain, true, 60, 60, true);
+        assert!(why.unwrap_err().contains("only on the stream or only in the recording"));
         // The other qualities are as chosen, cap or not.
         let high = StudioSettings { record_quality: "high".into(), ..s.clone() };
         assert_eq!(record_encode_capped(&high, Some(twitch)), record_encode(&high));
+    }
+
+    /// The encoder budget says why a recording can't share: for sources shown on one side only,
+    /// that and nothing about a Twitch VOD track (turning it off wouldn't bring sharing back).
+    #[test]
+    fn the_reason_for_not_sharing_is_the_real_one() {
+        let s = StudioSettings { record_quality: "stream".into(), twitch_vod_track: 2, ..StudioSettings::default() };
+        let why = |selective| {
+            let b = encode_budget(&s, None, Some(1), Also { selective, ..Also::default() });
+            b["why_not_shared"].as_str().map(String::from)
+        };
+        let selective = why(true).unwrap_or_else(|| panic!("not shared"));
+        assert!(selective.contains("only on the stream or only in the recording"), "{selective}");
+        assert!(!selective.contains("VOD"), "no unrelated advice: {selective}");
+        // Without them the VOD track is the reason, and the hint to turn it off is right.
+        let vod = why(false).unwrap_or_else(|| panic!("not shared"));
+        assert!(vod.contains("VOD") && vod.contains("turn the VOD track off"), "{vod}");
+    }
+
+    /// While a recording shares the stream's encode, choosing where an item shows is refused with
+    /// a plain reason; anything else, and any edit when they don't share, goes ahead.
+    #[test]
+    fn a_flag_is_refused_while_the_recording_shares_the_streams_encoder() {
+        let edit = |edit| StudioAct::EditItem { scene: "Main".into(), id: 3, edit };
+        for flag in [Edit::StreamOnly, Edit::RecordingOnly] {
+            let why = refuses_while_shared(&edit(flag), true).unwrap_or_else(|| panic!("{flag:?} is refused"));
+            assert!(why.contains("Stop the recording"), "says what to do: {why}");
+            assert!(refuses_while_shared(&edit(flag), false).is_none(), "{flag:?} alone is fine");
+        }
+        // Back to both is always fine: it can't make the pictures differ.
+        assert!(refuses_while_shared(&edit(Edit::StreamAndRecording), true).is_none());
+        assert!(refuses_while_shared(&edit(Edit::Hide), true).is_none());
+        assert!(refuses_while_shared(&StudioAct::Scenes, true).is_none());
     }
 
     #[test]

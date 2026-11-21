@@ -147,6 +147,14 @@ fn with_defaults(it: &Value) -> Value {
     out
 }
 
+/// Where an item is saved as shown: its `ferrocast_show` ("stream" or "recording"; missing,
+/// or anything else, is both, as every collection from before this had it).
+const SHOW_KEY: &str = "ferrocast_show";
+
+fn shown_of(item: &Value) -> ferrocore::engine::Show {
+    ferrocore::engine::Show::from_name(item.get(SHOW_KEY).and_then(Value::as_str).unwrap_or(""))
+}
+
 fn kind_of(s: &Value) -> &str {
     s.get("versioned_id").or_else(|| s.get("id")).and_then(Value::as_str).unwrap_or_default()
 }
@@ -1240,6 +1248,7 @@ impl Stage {
             id: it.get("id").and_then(Value::as_i64).unwrap_or(0),
             name,
             visible: it.get("visible").and_then(Value::as_bool).unwrap_or(true),
+            show: shown_of(it).name().to_string(),
             locked: it.get("locked").and_then(Value::as_bool).unwrap_or(false),
             audio,
             group: kind == "group",
@@ -1264,6 +1273,44 @@ impl Stage {
     /// A scene's items, top first (as OBS's Sources list shows them).
     pub fn items(&self, scene: &str) -> Result<Vec<ItemInfo>, StudioError> {
         Ok(self.scene_items(scene)?.iter().rev().map(|i| self.info_of(i)).collect())
+    }
+
+    /// Whether any item the engine could draw on the wide picture is shown only on the stream or
+    /// only in the recording: then the two pictures differ, so a recording can't share the stream's
+    /// encode ("Same as stream"), which carries the stream's picture. It reads the collection as
+    /// the engine does (Studio Mode's copy on air included) and counts what shows: not a hidden
+    /// source or group, not the vertical picture's scenes (it has no recording), and not the copies
+    /// OBS keeps of a group's items (`group_item_backup`).
+    pub fn has_selective_items(&self) -> bool {
+        let doc = self.doc.borrow();
+        let doc = own::engine_doc(&doc);
+        let vertical = self.vertical_order();
+        let sources: &[Value] = doc["sources"].as_array().map_or(&[], Vec::as_slice);
+        fn walk(sources: &[Value], scene: &Value, depth: u32) -> bool {
+            let items = scene.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten();
+            for it in items {
+                if it.get("group_item_backup").and_then(Value::as_bool) == Some(true)
+                    || it.get("visible").and_then(Value::as_bool) == Some(false)
+                {
+                    continue;
+                }
+                if shown_of(it) != ferrocore::engine::Show::Both {
+                    return true;
+                }
+                // A nested scene or a group shown here: what is in it is shown with it.
+                if depth < 8
+                    && let Some(inner) = sources.iter().find(|s| name_of(s) == name_of(it) && is_scene(s))
+                    && walk(sources, inner, depth + 1)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        sources
+            .iter()
+            .filter(|s| kind_of(s) == "scene" && !vertical.iter().any(|v| v == name_of(s)))
+            .any(|s| walk(sources, s, 0))
     }
 
     pub fn item_ids(&self, scene: &str) -> Result<Vec<i64>, StudioError> {
@@ -1713,6 +1760,10 @@ impl Stage {
             E::Hide => set("visible", json!(false)),
             E::Lock => set("locked", json!(true)),
             E::Unlock => set("locked", json!(false)),
+            // Both is the default and isn't kept: the file stays what it was before this.
+            E::StreamAndRecording => self.with_item(scene, id, |i| drop(i.as_object_mut().map(|o| o.remove(SHOW_KEY)))),
+            E::StreamOnly => set(SHOW_KEY, json!("stream")),
+            E::RecordingOnly => set(SHOW_KEY, json!("recording")),
             E::Remove => {
                 self.item(scene, id)?;
                 let home = self.home(scene, id);
@@ -1868,6 +1919,7 @@ impl Stage {
                         "scale_filter",
                         "blend_type",
                         "blend_method",
+                        SHOW_KEY,
                     ] {
                         if let Some(v) = it.get(k) {
                             i[k] = v.clone();
@@ -3393,6 +3445,27 @@ impl Stage {
                 );
                 c["bounds"] = json!({ "x": bw * scale.0.abs(), "y": bh * scale.1.abs() });
                 c["rot"] = json!((c.get("rot").and_then(Value::as_f64).unwrap_or(0.0) as f32 + turn).rem_euclid(360.0));
+                // Where it is shown: the group's choice covered it, and goes on covering it. One
+                // for the stream only in a group for the recording only was shown nowhere, so it
+                // stays out of sight rather than suddenly appearing.
+                use ferrocore::engine::Show;
+                let (group_show, own) = (shown_of(&g), shown_of(&c));
+                let (now, nowhere) = match (group_show, own) {
+                    (Show::Both, own) => (own, false),
+                    (g, Show::Both) => (g, false),
+                    (g, own) if g == own => (own, false),
+                    (_, own) => (own, true),
+                };
+                if let Some(o) = c.as_object_mut() {
+                    if now == Show::Both {
+                        o.remove(SHOW_KEY);
+                    } else {
+                        o.insert(SHOW_KEY.into(), json!(now.name()));
+                    }
+                    if nowhere {
+                        o.insert("visible".into(), json!(false));
+                    }
+                }
                 next += 1;
                 c["id"] = json!(next);
                 l.insert((at_bottom + k).min(l.len()), c);
@@ -4689,6 +4762,12 @@ impl StageOutput {
         self.own.stats()
     }
 
+    /// A stream and a recording share this output's encode (Same as stream): they carry one
+    /// picture, so something shown on only one of them can't be.
+    pub fn shares_encoder(&self) -> bool {
+        self.own.shares_encoder()
+    }
+
     pub fn record_stats(&self) -> RecordStats {
         self.own.record_stats()
     }
@@ -5485,16 +5564,21 @@ fn path_for(canvas: Canvas, plan: &RecordPlan) -> PathBuf {
 /// one video encoder can't do two at 4K60): Ok, or why not, in words for the person (the
 /// encoder-budget warning names the same reason; projects-60's review). `same_as_stream`: the
 /// recording's quality is "Same as stream"; `canvas_fps` the picture's rate now, `fps` the
-/// rate chosen.
+/// rate chosen; `selective`: some item that shows is for the stream only or the recording only
+/// (`Stage::has_selective_items`), so the two pictures differ.
 pub fn can_share(
     s: &StreamSettings,
     plan: &RecordPlan,
     same_as_stream: bool,
     canvas_fps: u32,
     fps: u32,
+    selective: bool,
 ) -> Result<(), String> {
     if !same_as_stream {
         return Err("the recording's quality isn't Same as stream".into());
+    }
+    if selective {
+        return Err("some sources are shown only on the stream or only in the recording".into());
     }
     if let Some((w, h)) = s.encode.scale {
         return Err(format!("the stream goes out at {w}×{h}, the recording at the full picture"));
@@ -5630,11 +5714,12 @@ mod tests {
             video_tracks: Vec::new(),
         };
         let plan = RecordPlan { tracks: vec![1], encode: enc.clone(), ..RecordPlan::default() };
-        assert_eq!(can_share(&s, &plan, true, 60, 60), Ok(()));
+        assert_eq!(can_share(&s, &plan, true, 60, 60, false), Ok(()));
         // Another bitrate still shares: the shared encode takes the stream's, live.
         let faster = StreamSettings { encode: crate::EncodeSettings { video_kbps: 9000, ..enc.clone() }, ..s.clone() };
-        assert_eq!(can_share(&faster, &plan, true, 60, 60), Ok(()));
-        let why = |s: &StreamSettings, p: &RecordPlan, same: bool, c: u32| can_share(s, p, same, c, 60).unwrap_err();
+        assert_eq!(can_share(&faster, &plan, true, 60, 60, false), Ok(()));
+        let why =
+            |s: &StreamSettings, p: &RecordPlan, same: bool, c: u32| can_share(s, p, same, c, 60, false).unwrap_err();
         assert!(why(&s, &plan, false, 60).contains("Same as stream"));
         let scaled =
             StreamSettings { encode: crate::EncodeSettings { scale: Some((1920, 1080)), ..enc.clone() }, ..s.clone() };
@@ -5655,7 +5740,7 @@ mod tests {
         let strict_stream = StreamSettings { encode: strict.clone(), ..s.clone() };
         assert!(why(&strict_stream, &plan, true, 60).contains("another way"));
         let strict_plan = RecordPlan { encode: strict, ..plan };
-        assert_eq!(can_share(&strict_stream, &strict_plan, true, 60, 60), Ok(()));
+        assert_eq!(can_share(&strict_stream, &strict_plan, true, 60, 60, false), Ok(()));
         assert!(why(&s, &strict_plan, true, 60).contains("another way"));
     }
 
@@ -5932,6 +6017,165 @@ mod tests {
         ok(s.set_transform("Main", wide.id, &t));
         ok(s.set_item_box("Main", wide.id, 0.0, 0.0, 800.0, 225.0));
         assert_eq!(ok(s.transform("Main", wide.id)).bounds, "fit");
+    }
+
+    /// Each item is shown on the stream, in the recording or both; both is the default, nothing
+    /// is saved for it, and a collection from before this has every item shown everywhere.
+    #[test]
+    fn an_item_is_shown_on_the_stream_in_the_recording_or_both() {
+        let s = stage();
+        let red = ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "width": 200, "height": 100 }), false));
+        let blue = ok(s.add_source("Main", "color_source_v3", "Blue", &json!({ "width": 50, "height": 50 }), false));
+        let show = |s: &Stage, id: i64| ok(s.items("Main")).into_iter().find(|i| i.id == id).map(|i| i.show);
+        assert_eq!(show(&s, red.id).as_deref(), Some("both"));
+        assert!(!s.has_selective_items());
+        ok(s.edit_item("Main", red.id, ItemEdit::RecordingOnly));
+        assert_eq!(show(&s, red.id).as_deref(), Some("recording"));
+        assert_eq!(show(&s, blue.id).as_deref(), Some("both"), "only that item");
+        assert!(s.has_selective_items());
+        // It is saved with the collection, and comes back.
+        let saved = s.save("Test");
+        let back = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &saved, "Main"));
+        assert_eq!(show(&back, red.id).as_deref(), Some("recording"));
+        ok(s.edit_item("Main", red.id, ItemEdit::StreamOnly));
+        assert_eq!(show(&s, red.id).as_deref(), Some("stream"));
+        // Both again: nothing stays in the file, so it is the collection it was.
+        ok(s.edit_item("Main", red.id, ItemEdit::StreamAndRecording));
+        assert_eq!(show(&s, red.id).as_deref(), Some("both"));
+        assert!(!s.save("Test").to_string().contains("ferrocast_show"), "no trace of it");
+        assert!(!s.has_selective_items());
+        // A hidden item isn't on either picture, so it differs on neither.
+        ok(s.edit_item("Main", red.id, ItemEdit::RecordingOnly));
+        ok(s.edit_item("Main", red.id, ItemEdit::Hide));
+        assert!(!s.has_selective_items());
+        ok(s.edit_item("Main", red.id, ItemEdit::Show));
+        assert!(s.has_selective_items());
+        assert!(s.edit_item("Main", 999, ItemEdit::StreamOnly).is_err(), "no such item");
+    }
+
+    /// Taking a group apart, or copying an item, never changes where something is shown: ungrouped
+    /// sources keep what the group had (a recording-only group's sources must not appear on the
+    /// stream), and a copy shows where its original does.
+    #[test]
+    fn ungrouping_and_duplicating_keep_where_things_are_shown() {
+        let s = stage();
+        let show = |s: &Stage, name: &str| -> Option<(String, bool)> {
+            ok(s.items("Main")).into_iter().find(|i| i.name == name).map(|i| (i.show, i.visible))
+        };
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 50, "height": 50 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 50, "height": 50 }), false));
+        ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 50, "height": 50 }), false));
+        // A recording-only group: both of its sources go on being recording-only.
+        let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        ok(s.edit_item("Main", g.id, ItemEdit::RecordingOnly));
+        ok(s.ungroup("Main", g.id));
+        assert_eq!(show(&s, "A"), Some(("recording".into(), true)));
+        assert_eq!(show(&s, "B"), Some(("recording".into(), true)));
+        // A source with its own flag keeps it when the group was for both; two that conflict
+        // (stream-only in a recording-only group) were shown nowhere, and stay out of sight.
+        // (Ungrouping gives its sources new ids: they are looked up by name from here.)
+        let id_of = |s: &Stage, name: &str| ok(s.items("Main")).into_iter().find(|i| i.name == name).map(|i| i.id);
+        let (a_id, c_id) = (id_of(&s, "A").unwrap_or(0), id_of(&s, "C").unwrap_or(0));
+        let g2 = ok(s.group_together("Main", &[a_id, c_id], "Other"));
+        let c_inside =
+            ok(s.items("Main")).into_iter().flat_map(|i| i.children).find(|i| i.name == "C").map_or(0, |i| i.id);
+        ok(s.edit_item("Main", c_inside, ItemEdit::StreamOnly));
+        ok(s.edit_item("Main", g2.id, ItemEdit::RecordingOnly));
+        ok(s.ungroup("Main", g2.id));
+        assert_eq!(show(&s, "A"), Some(("recording".into(), true)), "the group's flag is the same as its own");
+        assert_eq!(show(&s, "C"), Some(("stream".into(), false)), "shown in neither before: hidden now");
+        // A copy of a flagged item shows where the original does.
+        let b_id = id_of(&s, "B").unwrap_or(0);
+        ok(s.edit_item("Main", b_id, ItemEdit::StreamOnly));
+        ok(s.edit_item("Main", b_id, ItemEdit::Duplicate));
+        assert_eq!(show(&s, "B 2"), Some(("stream".into(), true)));
+    }
+
+    /// `has_selective_items` (it decides whether a recording can share the stream's encode) says
+    /// what the engine draws: what is on air in Studio Mode, but not a hidden group, not the
+    /// vertical picture's scenes, and not the copies OBS keeps of a group's items.
+    #[test]
+    fn selective_items_are_counted_as_the_engine_draws_them() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 50, "height": 50 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 50, "height": 50 }), false));
+        let group = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        ok(s.edit_item("Main", a.id, ItemEdit::StreamOnly));
+        assert!(s.has_selective_items(), "a flagged source in a shown group");
+        // A hidden group shows nothing, whatever is flagged in it.
+        ok(s.edit_item("Main", group.id, ItemEdit::Hide));
+        assert!(!s.has_selective_items(), "a hidden group");
+        ok(s.edit_item("Main", group.id, ItemEdit::Show));
+        assert!(s.has_selective_items());
+        ok(s.edit_item("Main", a.id, ItemEdit::StreamAndRecording));
+        assert!(!s.has_selective_items());
+
+        // The vertical picture has no recording of its own: its flags are not the wide one's.
+        ok(s.start_vertical("Vertical"));
+        let v = ok(s.add_source("Vertical", "color_source_v3", "V", &json!({ "width": 50, "height": 50 }), false));
+        ok(s.edit_item("Vertical", v.id, ItemEdit::RecordingOnly));
+        assert!(!s.has_selective_items(), "a flag on the vertical picture's scene");
+        ok(s.edit_item("Main", b.id, ItemEdit::RecordingOnly));
+        assert!(s.has_selective_items(), "the wide picture's own");
+        ok(s.edit_item("Main", b.id, ItemEdit::StreamAndRecording));
+        assert!(!s.has_selective_items());
+
+        // Studio Mode: what is on air is a copy of the scene's items; resetting the preview's
+        // item to both doesn't change the copy, which still carries the flag.
+        let c = ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 50, "height": 50 }), false)).id;
+        ok(s.edit_item("Main", c, ItemEdit::RecordingOnly));
+        s.set_studio_mode(true);
+        ok(s.edit_item("Main", c, ItemEdit::StreamAndRecording));
+        assert!(s.has_selective_items(), "the copy on air still has a recording-only source");
+        s.set_studio_mode(false);
+        assert!(!s.has_selective_items(), "and with Studio Mode off, it's gone");
+    }
+
+    /// The copies OBS keeps of a group's items in the scene (for versions before groups) are not
+    /// drawn, so a flag on one is no flag.
+    #[test]
+    fn a_groups_backup_copies_are_not_counted() {
+        let doc = json!({
+            "sources": [
+                { "id": "scene", "name": "Main", "settings": { "items": [
+                    { "name": "Cam", "id": 1, "group_item_backup": true, "ferrocast_show": "stream", "visible": true },
+                    { "name": "Cam", "id": 2, "visible": true },
+                ] } },
+                { "id": "color_source_v3", "name": "Cam", "settings": {} },
+            ],
+            "current_scene": "Main", "current_program_scene": "Main",
+        });
+        let s = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &doc, "Main"));
+        assert!(!s.has_selective_items());
+        let flagged = json!({ "sources": [
+            { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Cam", "id": 2, "ferrocast_show": "stream" }] } },
+            { "id": "color_source_v3", "name": "Cam", "settings": {} },
+        ], "current_scene": "Main", "current_program_scene": "Main" });
+        assert!(ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &flagged, "Main")).has_selective_items());
+    }
+
+    /// A flag on a group is the group's own (it covers the children when drawn); a child of a
+    /// group keeps its own, and either makes the picture selective.
+    #[test]
+    fn a_group_and_its_children_each_keep_where_they_are_shown() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 50, "height": 50 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 50, "height": 50 }), false));
+        let group = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        assert_eq!(group.show, "both");
+        assert!(!s.has_selective_items());
+        // A child, reached through the scene as OBS's items are.
+        ok(s.edit_item("Main", a.id, ItemEdit::StreamOnly));
+        let kids = ok(s.items("Main"))[0].children.clone();
+        assert_eq!(kids.iter().find(|k| k.id == a.id).map(|k| k.show.as_str()), Some("stream"));
+        assert_eq!(kids.iter().find(|k| k.id == b.id).map(|k| k.show.as_str()), Some("both"));
+        assert!(s.has_selective_items(), "a flagged child is enough");
+        ok(s.edit_item("Main", a.id, ItemEdit::StreamAndRecording));
+        assert!(!s.has_selective_items());
+        // The group itself.
+        ok(s.edit_item("Main", group.id, ItemEdit::RecordingOnly));
+        assert_eq!(ok(s.items("Main"))[0].show, "recording");
+        assert!(s.has_selective_items());
     }
 
     #[test]

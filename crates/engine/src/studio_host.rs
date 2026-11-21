@@ -1307,6 +1307,10 @@ pub enum ItemEdit {
     ScaleBilinear,
     ScaleLanczos,
     ScaleArea,
+    /// Where an item is shown: both (the default), only on the stream, or only in the recording.
+    StreamAndRecording,
+    StreamOnly,
+    RecordingOnly,
 }
 
 /// A change to a filter (`POST …/filters/{filter}/edit` `{ "do": "disable" }`).

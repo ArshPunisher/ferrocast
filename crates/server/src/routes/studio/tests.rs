@@ -638,6 +638,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         .await,
         r.put("/studio/engine/scenes/Gameplay/transition", json!({ "transition": null })).await,
         r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "scale_lanczos" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "stream_only" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "recording_only" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "stream_and_recording" })).await,
         r.post("/studio/engine/obs-collections/import", json!({ "id": "Untitled" })).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 10, "y": 20, "w": 640, "h": 360 })).await,
         r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3 })).await,
@@ -797,6 +800,10 @@ async fn the_studio_engine_needs_the_desktop_app() {
             "unknown scene transition",
         ),
         (r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "blend_glow" })).await, "unknown blend"),
+        (
+            r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "both" })).await,
+            "a word for where an item shows that isn't one",
+        ),
     ] {
         assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST, "{what}");
     }
