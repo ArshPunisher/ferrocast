@@ -102,13 +102,13 @@ impl AlertQueue {
             && !self.paused
             && let Some(p) = &self.playing
         {
-            let id = alert.alert_id.clone();
             let mut actions = vec![Action::Hide { alert_id: p.alert.alert_id.clone() }];
             self.finish(now);
             self.next_at = now;
             self.waiting.push_front(Waiting { alert, priority, enqueued_at: now });
-            actions.extend(self.enforce_cap(Some(&id)));
             actions.extend(self.tick(now));
+            // The new alert is already playing, so the cap only folds waiting ones.
+            actions.extend(self.enforce_cap(None));
             return actions;
         }
         let pos = self.waiting.iter().position(|w| w.priority < priority).unwrap_or(self.waiting.len());
