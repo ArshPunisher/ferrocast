@@ -182,6 +182,10 @@ fn is_audio_kind(kind: &str) -> bool {
     ) && !PICTURE_ONLY_DEVICES.contains(&kind)
 }
 
+fn source_has_audio(src: &Value) -> bool {
+    src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0) && is_audio_kind(kind_of(src))
+}
+
 /// Updates any compressor filter on `source` whose `sidechain_source` names `from` to `to`.
 fn rename_sidechain_refs(source: &mut Value, from: &str, to: &str) {
     for flt in source.get_mut("filters").and_then(Value::as_array_mut).into_iter().flatten() {
@@ -1123,23 +1127,7 @@ impl Stage {
         let kind = kind_of(&src).to_string();
         let media =
             matches!(kind.as_str(), "ffmpeg_source" | "vlc_source" | "slideshow" | "slideshow_v2" | "ferrocast_replay");
-        let audio = src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0)
-            && !matches!(
-                kind.as_str(),
-                "scene"
-                    | "group"
-                    | "image_source"
-                    | "color_source_v3"
-                    | "text_ft2_source_v2"
-                    // A copy has no sound of its own: its source's is heard once.
-                    | "ferrocast_clone"
-                    | "source-clone"
-                    | "ferrocast_countdown"
-                    | "ferrocast_visualizer"
-                    | "ferrocast_web_text"
-                    | "ferrocast_inputs"
-            )
-            && !PICTURE_ONLY_DEVICES.contains(&kind.as_str());
+        let audio = source_has_audio(&src);
         // A group's sources, top first, each framed on the canvas through the group.
         let children = if kind == "group" && expand {
             self.scene_items(&name)
@@ -2025,6 +2013,21 @@ impl Stage {
             .enumerate()
             .filter_map(|(i, k)| d.get(*k).map(|s| self.audio_info(s, Some(i as u32 + 1))))
             .collect()
+    }
+
+    /// Global channels plus every audio source in the collection (including off-scene sources),
+    /// without rendering or saving anything.
+    pub fn all_audio(&self) -> Vec<AudioInfo> {
+        let mut out = self.channels();
+        for s in self.sources_list() {
+            if source_has_audio(&s) {
+                let name = name_of(&s);
+                if !out.iter().any(|a| a.name == name) {
+                    out.push(self.audio_info(&s, None));
+                }
+            }
+        }
+        out
     }
 
     pub fn set_volume(&self, name: &str, volume_db: f32) -> Result<(), StudioError> {
