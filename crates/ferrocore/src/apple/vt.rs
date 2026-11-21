@@ -784,6 +784,7 @@ impl Encoder {
         }
         let copy = |dst: *mut u8, dst_stride: usize, rows: usize, src: &[u8], src_stride: usize| {
             let n = dst_stride.min(src_stride);
+            crate::video::note_fill_bytes((rows * n) as u64);
             for r in 0..rows {
                 let Some(line) = src.get(r * src_stride..r * src_stride + n) else { break };
                 // SAFETY: the locked buffer has `rows` rows of `dst_stride` bytes at `dst`; `n` is

@@ -2194,6 +2194,7 @@ impl Compositor {
             }
             drop(data);
             buf.unmap();
+            crate::video::note_readback_bytes(px.len() as u64);
             planes.push(px);
         }
         let uv = planes.pop().unwrap_or_default();
