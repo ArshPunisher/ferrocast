@@ -547,8 +547,10 @@ async fn a_server_that_was_live_and_refuses_connections_for_a_while_is_waited_fo
     state_is(&mut health, |s| *s == PushState::Live).await;
     assert_eq!(next(&mut got).await, Got::Publish("k".into()));
     // It has been live a while (not a moment), then the server goes: its listener and connections
-    // close; nothing listens for a while.
+    // close; nothing listens for a while (refused at once on every OS: a real refusal takes 2 s
+    // a try on Windows, and eight of them don't fit the wait).
     tokio::time::sleep(Duration::from_millis(1_200)).await;
+    push::fault::set_refused(dport, true);
     server.abort();
     let _ = server.await;
     let state = state_is(&mut health, |s| {
@@ -558,6 +560,7 @@ async fn a_server_that_was_live_and_refuses_connections_for_a_while_is_waited_fo
     assert!(matches!(state, PushState::Reconnecting { .. }), "gave up on a server that had been live: {state:?}");
     // It comes back.
     let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    push::fault::set_refused(dport, false);
     state_is(&mut health, |s| *s == PushState::Live).await;
     assert_eq!(next(&mut got).await, Got::Publish("k".into()));
     obs.video(10, KEY).await;
@@ -601,12 +604,15 @@ async fn a_destination_that_gave_up_tries_again_slowly_and_comes_back() {
     let l = free_listener().await;
     let dport = l.local_addr().unwrap().port();
     drop(l);
+    // Refused at once on every OS (Windows takes 2 s a real refusal: three don't fit the wait).
+    push::fault::set_refused(dport, true);
     let mut d = destination(dport, "k");
     d.retry = push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(60), max_attempts: 3 };
     let mut health = start(&w, d);
     let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
     state_is(&mut health, |s| matches!(s, PushState::Failed { refused: false, .. })).await;
     let mut got = platform(TcpListener::bind(("127.0.0.1", dport)).await.unwrap(), "k").await;
+    push::fault::set_refused(dport, false);
     state_is(&mut health, |s| *s == PushState::Live).await;
     assert_eq!(next(&mut got).await, Got::Publish("k".into()));
     obs.video(10, KEY).await;

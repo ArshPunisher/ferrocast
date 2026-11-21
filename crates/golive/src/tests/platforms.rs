@@ -482,9 +482,12 @@ async fn a_destination_without_a_backup_keeps_trying_its_own_server() {
     let primary = dead_port().await;
     let mut health = start(&w, destination_with(primary, "twitch", 20, 100));
     let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
-    for _ in 0..2 * push::BACKUP_AFTER {
+    // Try by try, past the point where one with a backup switches (a fixed time saw one try on
+    // Windows, where a refused connect takes 2 s).
+    for want in 1..=push::BACKUP_AFTER + 1 {
         match state_within(&mut health, LONG, |s| {
-            matches!(s, PushState::Reconnecting { .. } | PushState::Failed { .. })
+            matches!(s, PushState::Reconnecting { attempt, .. } if *attempt >= want)
+                || matches!(s, PushState::Failed { .. })
         })
         .await
         .state
@@ -497,7 +500,6 @@ async fn a_destination_without_a_backup_keeps_trying_its_own_server() {
             }
             s => panic!("{s:?}"),
         }
-        tokio::time::sleep(Duration::from_millis(60)).await;
     }
     let attempt = match &health.borrow().state {
         PushState::Reconnecting { attempt, .. } | PushState::Failed { attempts: attempt, .. } => *attempt,
