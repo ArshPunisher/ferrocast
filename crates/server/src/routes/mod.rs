@@ -11,6 +11,7 @@ mod designs;
 mod discord;
 mod giveaways;
 mod golive;
+mod highlight;
 mod history;
 mod import;
 mod loyalty;
@@ -151,6 +152,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/themes", get(app::themes))
         .route("/stats/session", get(app::session_stats))
         .route("/recap", get(recap::recap))
+        .route("/credits", get(recap::credits))
+        .route("/chat/highlight", get(highlight::current).post(highlight::pin).delete(highlight::clear))
         .route("/recap/summary", get(smart::recap_saved).post(smart::recap))
         .route("/insights/supporters", get(smart::supporters))
         .route("/updates", get(app::updates))

@@ -84,7 +84,8 @@ impl Engine {
         Ok(self.overlay_view(&saved))
     }
 
-    /// Sends an overlay's new layout to its open pages.
+    /// Sends an overlay's new layout (and initial widget state for newly added interactive
+    /// widgets) to its open pages.
     pub(crate) fn push_config(&self, o: &Overlay) {
         self.cloud_changed();
         let view = self.overlay_view(o);
@@ -94,6 +95,21 @@ impl Engine {
             "config",
             &view_public(&view),
         ));
+        let mut patch = serde_json::Map::new();
+        if o.widgets.iter().any(|w| w.kind == WidgetKind::EndCredits) {
+            patch.insert("credits".into(), json!(self.state().session.credits));
+        }
+        if o.widgets.iter().any(|w| w.kind == WidgetKind::ChatHighlight) {
+            patch.insert("chat_highlight".into(), json!(self.chat_highlight()));
+        }
+        if !patch.is_empty() {
+            self.send_overlay(OverlayFrame::new(
+                Audience::Overlay(o.id.clone()),
+                self.next_seq(),
+                "state",
+                &Value::Object(patch),
+            ));
+        }
     }
 
     pub async fn regenerate_overlay_url(&self, id: &str) -> Result<OverlayView, EngineError> {
@@ -180,11 +196,15 @@ impl Engine {
                 .collect();
             (st.goals.iter().map(ferrocast_core::goal::Goal::view).collect::<Vec<_>>(), viewers, labels)
         };
+        let has = |k: WidgetKind| o.widgets.iter().any(|w| w.kind == k);
+        let credits = if has(WidgetKind::EndCredits) { Some(self.credits().await?) } else { None };
+        let chat_highlight = if has(WidgetKind::ChatHighlight) { self.chat_highlight() } else { None };
         let view = self.overlay_view(o);
         Ok(json!({
             "overlay": view_public(&view),
             "state": { "goals": goals, "labels": labels, "viewers": viewers, "events": events, "chat": chat,
                        "poll": self.poll(), "giveaway": self.giveaway_card().await,
+                       "credits": credits, "chat_highlight": chat_highlight,
                        "show": self.show_overlay_state(), "music": self.music_now() },
         }))
     }

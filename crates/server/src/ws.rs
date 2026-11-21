@@ -251,7 +251,7 @@ enum Inbound {
 fn wants(o: &Overlay, a: &Audience) -> bool {
     match a {
         Audience::All => true,
-        Audience::Chat => o.wants_chat(),
+        Audience::Chat => o.wants_chat_events(),
         Audience::Alerts => o.widgets.iter().any(|w| matches!(w.kind, WidgetKind::Alerts | WidgetKind::Events)),
         Audience::Overlay(id) => *id == o.id,
         Audience::Widget(kind) => o.widgets.iter().any(|w| w.kind == *kind),

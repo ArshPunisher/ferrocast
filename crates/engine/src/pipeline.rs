@@ -195,6 +195,7 @@ impl Engine {
                 if let Some(uid) = &target.id {
                     self.hide_user(e.platform, uid);
                 }
+                self.clear_highlight_if_user(e.platform, target);
                 self.send_overlay(OverlayFrame::new(
                     Audience::Chat,
                     e.seq,
@@ -213,8 +214,14 @@ impl Engine {
                 let anyone_live = st.live.values().any(|l| *l);
                 st.live.insert(e.platform, true);
                 if !anyone_live {
-                    st.session = crate::state::Session { started_at: Some(at), ..Default::default() };
+                    st.session = crate::state::Session {
+                        started_at: Some(at),
+                        credits: ferrocast_core::credits::Credits::new(Some(at)),
+                        ..Default::default()
+                    };
                     drop(st);
+                    self.clear_chat_highlight();
+                    self.push_credits();
                     // A new stream: chat overlays empty out and the dashboard loads this
                     // stream's chat again, so the last stream's messages don't show.
                     self.send_overlay(crate::frames::OverlayFrame::new(
@@ -300,8 +307,8 @@ impl Engine {
         let touched = self.db(move |s| repo::viewers::touch_chat(s, &a)).await.ok().flatten();
         let person = touched.map(|t| t.viewer_id);
         *chatter = self.chatter_mark(e, touched);
-        if e.origin == Origin::Live {
-            self.state_mut().session.record(e);
+        if e.origin == Origin::Live && self.state_mut().session.record(e) {
+            self.push_credits();
         }
         let message_id = e.source_id.clone().unwrap_or_default();
 
@@ -453,7 +460,9 @@ impl Engine {
     async fn support_event(&self, e: &Event) {
         let mut reasons = Vec::new();
         if e.origin == Origin::Live {
-            self.state_mut().session.record(e);
+            if self.state_mut().session.record(e) {
+                self.push_credits();
+            }
             self.count_goals(e).await;
             self.loyalty_bonus(e).await;
         }

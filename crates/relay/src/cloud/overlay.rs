@@ -391,7 +391,7 @@ fn shows_alerts(o: &Overlay) -> bool {
 fn wants(o: &Overlay, a: &Audience) -> bool {
     match a {
         Audience::All => true,
-        Audience::Chat => o.wants_chat(),
+        Audience::Chat => o.wants_chat_events(),
         Audience::Alerts => shows_alerts(o),
         Audience::Overlay(id) => *id == o.id,
         Audience::Labels => o.widgets.iter().any(|w| w.kind == WidgetKind::Label),

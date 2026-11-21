@@ -487,6 +487,9 @@ impl WidgetKey for ferrocast_core::design::WidgetContent {
             K::Viewers => "viewers",
             K::Poll => "poll",
             K::Giveaway => "giveaway",
+            K::EndCredits => "end_credits",
+            K::EmoteWall => "emote_wall",
+            K::ChatHighlight => "chat_highlight",
             K::Layer => "layer",
         }
     }
