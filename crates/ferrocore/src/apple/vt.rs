@@ -683,60 +683,70 @@ impl Encoder {
                 )));
             }
         }
-        // SAFETY: the session is live; the pool belongs to it (not retained: "Get").
-        let pool = unsafe { VTCompressionSessionGetPixelBufferPool(self.session.0) };
-        if pool.is_null() {
-            self.lost = true;
-            return Err(AvError::Encoder("the Mac's video encoder lost its frame pool".into()));
-        }
-        let mut buf: CFTypeRef = ptr::null();
-        // SAFETY: the pool is live; the new buffer is +1.
-        let s = unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &raw mut buf) };
-        let Some(buf) = Owned::new(buf) else {
-            // No frame left in the session's pool: it isn't getting them back (a session that
-            // stopped answering). A few misses are a busy moment; many in a row is a wedge.
-            match pool_miss(&mut self.pool_misses) {
-                // A busy moment: this frame is left out and counted, the output goes on (before,
-                // one miss tore the output down for a second and made its encoders again).
-                PoolMiss::Drop => {
-                    crate::video::note_dropped(1);
-                    return Ok(Vec::new());
-                }
-                PoolMiss::Wedged => {
+        // A frame the card drew into a pooled surface goes in as it is (its colour tags were set
+        // when it was taken); any other is copied into a buffer of the session's own pool.
+        let owned;
+        let buf: CFTypeRef = match frame {
+            Frame::Surface(px) if self.input == PixelFormat::Nv12 => px.raw(),
+            _ => {
+                // SAFETY: the session is live; the pool belongs to it (not retained: "Get").
+                let pool = unsafe { VTCompressionSessionGetPixelBufferPool(self.session.0) };
+                if pool.is_null() {
                     self.lost = true;
-                    return Err(fail("make a frame", s));
+                    return Err(AvError::Encoder("the Mac's video encoder lost its frame pool".into()));
                 }
+                let mut buf: CFTypeRef = ptr::null();
+                // SAFETY: the pool is live; the new buffer is +1.
+                let s = unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), pool, &raw mut buf) };
+                let Some(b) = Owned::new(buf) else {
+                    // No frame left in the session's pool: it isn't getting them back (a session that
+                    // stopped answering). A few misses are a busy moment; many in a row is a wedge.
+                    match pool_miss(&mut self.pool_misses) {
+                        // A busy moment: this frame is left out and counted, the output goes on (before,
+                        // one miss tore the output down for a second and made its encoders again).
+                        PoolMiss::Drop => {
+                            crate::video::note_dropped(1);
+                            return Ok(Vec::new());
+                        }
+                        PoolMiss::Wedged => {
+                            self.lost = true;
+                            return Err(fail("make a frame", s));
+                        }
+                    }
+                };
+                self.pool_misses = 0;
+                // SAFETY: the buffer is live; the surface is only read for its id ("Get": not retained).
+                let surface = unsafe { CVPixelBufferGetIOSurface(b.0) };
+                // SAFETY: a live IOSurface, or null (then 0).
+                self.cost.buffer(if surface.is_null() { 0 } else { unsafe { IOSurfaceGetID(surface) as usize } });
+                let (faults0, t_fill) = (super::vt_cost::process_faults(), std::time::Instant::now());
+                self.fill(b.0, frame)?;
+                self.cost.fill(t_fill.elapsed(), super::vt_cost::process_faults().saturating_sub(faults0));
+                // SAFETY: CoreVideo's constant keys and values; the buffer is live and ours alone.
+                unsafe {
+                    CVBufferSetAttachment(
+                        b.0,
+                        kCVImageBufferColorPrimariesKey,
+                        kCVImageBufferColorPrimaries_ITU_R_709_2,
+                        PROPAGATE,
+                    );
+                    CVBufferSetAttachment(
+                        b.0,
+                        kCVImageBufferTransferFunctionKey,
+                        kCVImageBufferTransferFunction_ITU_R_709_2,
+                        PROPAGATE,
+                    );
+                    CVBufferSetAttachment(
+                        b.0,
+                        kCVImageBufferYCbCrMatrixKey,
+                        kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                        PROPAGATE,
+                    );
+                }
+                owned = b;
+                owned.0
             }
         };
-        self.pool_misses = 0;
-        // SAFETY: the buffer is live; the surface is only read for its id ("Get": not retained).
-        let surface = unsafe { CVPixelBufferGetIOSurface(buf.0) };
-        // SAFETY: a live IOSurface, or null (then 0).
-        self.cost.buffer(if surface.is_null() { 0 } else { unsafe { IOSurfaceGetID(surface) as usize } });
-        let (faults0, t_fill) = (super::vt_cost::process_faults(), std::time::Instant::now());
-        self.fill(buf.0, frame)?;
-        self.cost.fill(t_fill.elapsed(), super::vt_cost::process_faults().saturating_sub(faults0));
-        // SAFETY: CoreVideo's constant keys and values; the buffer is live.
-        unsafe {
-            CVBufferSetAttachment(
-                buf.0,
-                kCVImageBufferColorPrimariesKey,
-                kCVImageBufferColorPrimaries_ITU_R_709_2,
-                PROPAGATE,
-            );
-            CVBufferSetAttachment(
-                buf.0,
-                kCVImageBufferTransferFunctionKey,
-                kCVImageBufferTransferFunction_ITU_R_709_2,
-                PROPAGATE,
-            );
-            CVBufferSetAttachment(
-                buf.0,
-                kCVImageBufferYCbCrMatrixKey,
-                kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                PROPAGATE,
-            );
-        }
         let props = if key {
             let d = Dict::new().ok_or_else(|| AvError::Encoder("out of memory".into()))?;
             // SAFETY: VideoToolbox's constant key and CF's constant true.
@@ -756,7 +766,7 @@ impl Encoder {
         let s = unsafe {
             VTCompressionSessionEncodeFrame(
                 self.session.0,
-                buf.0,
+                buf,
                 CMTime::us(pts_us),
                 CMTime::us(self.frame_us),
                 props.as_ref().map_or(ptr::null(), |d| d.0.0),
@@ -784,6 +794,7 @@ impl Encoder {
         }
         let copy = |dst: *mut u8, dst_stride: usize, rows: usize, src: &[u8], src_stride: usize| {
             let n = dst_stride.min(src_stride);
+            crate::video::note_fill_bytes((rows * n) as u64);
             for r in 0..rows {
                 let Some(line) = src.get(r * src_stride..r * src_stride + n) else { break };
                 // SAFETY: the locked buffer has `rows` rows of `dst_stride` bytes at `dst`; `n` is
@@ -800,6 +811,26 @@ impl Encoder {
                 if !dst.is_null() {
                     copy(dst, ds, rows.min(self.height), data, stride);
                 }
+            }
+            #[cfg(target_os = "macos")]
+            (Frame::Surface(px), PixelFormat::Nv12) => {
+                // Not reached by `encode_once_inner` (it takes a surface as it is); kept so a
+                // surface can still be copied into a session buffer.
+                let _ = px.with_planes(|y, ys, uv, uvs| {
+                    for (plane, src, stride) in [(0, y, ys), (1, uv, uvs)] {
+                        // SAFETY: the buffer is locked; NV12 has planes 0 (Y) and 1 (CbCr).
+                        let (dst, ds, rows) = unsafe {
+                            (
+                                CVPixelBufferGetBaseAddressOfPlane(buf, plane),
+                                CVPixelBufferGetBytesPerRowOfPlane(buf, plane),
+                                CVPixelBufferGetHeightOfPlane(buf, plane),
+                            )
+                        };
+                        if !dst.is_null() {
+                            copy(dst, ds, rows, src, stride);
+                        }
+                    }
+                });
             }
             (Frame::Nv12 { y, y_stride, uv, uv_stride }, PixelFormat::Nv12) => {
                 for (plane, src, stride) in [(0, y, y_stride), (1, uv, uv_stride)] {

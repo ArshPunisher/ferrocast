@@ -221,6 +221,42 @@ pub struct PendingNv12 {
     state: Arc<Readback>,
     /// Its own work on the card: waiting for it doesn't wait for frames drawn after it.
     done_at: wgpu::SubmissionIndex,
+    /// Drawn straight into this pooled surface (no readback buffers): `state` then turns ready when
+    /// the card's work is done.
+    #[cfg(target_os = "macos")]
+    surface: Option<crate::apple::surface::PixelFrame>,
+}
+
+/// A frame the card finished: host planes, or (Mac) a pooled surface shared by reference.
+#[derive(Debug)]
+pub enum Drawn {
+    Host(Nv12),
+    #[cfg(target_os = "macos")]
+    Surface {
+        px: crate::apple::surface::PixelFrame,
+        /// Host planes, made once if a consumer needs them.
+        host: std::sync::OnceLock<Option<Nv12>>,
+    },
+}
+
+impl Drawn {
+    /// What an encoder takes: the surface itself, or the host planes (`stride` is the row width).
+    pub fn as_frame(&self, stride: usize) -> crate::video::Frame<'_> {
+        match self {
+            Self::Host(f) => crate::video::Frame::Nv12 { y: &f.y, y_stride: stride, uv: &f.uv, uv_stride: stride },
+            #[cfg(target_os = "macos")]
+            Self::Surface { px, .. } => crate::video::Frame::Surface(px),
+        }
+    }
+
+    /// Host planes for a consumer that needs the bytes (a tap): made once, counted.
+    pub fn host(&self) -> Option<&Nv12> {
+        match self {
+            Self::Host(f) => Some(f),
+            #[cfg(target_os = "macos")]
+            Self::Surface { px, host } => host.get_or_init(|| px.to_host()).as_ref(),
+        }
+    }
 }
 
 impl PendingNv12 {
@@ -245,6 +281,14 @@ impl std::fmt::Debug for Rig {
 /// Enhanced Broadcasting qualities and a vertical or virtual-camera canvas) without remaking
 /// textures every frame.
 const RIGS: usize = 4 * (crate::engine::IN_FLIGHT + 1) + 2;
+
+/// Whether frames are drawn into pooled surfaces (Mac) from the start: on unless
+/// FERROCORE_COPY_FRAMES is set (to compare against the copying path).
+#[cfg(target_os = "macos")]
+fn surfaces_default() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FERROCORE_COPY_FRAMES").is_none())
+}
 
 /// An uploaded source texture kept on the card between frames.
 #[derive(Debug)]
@@ -303,6 +347,12 @@ pub struct Compositor {
     staging: Mutex<HashMap<u64, Staging>>,
     /// NV12 frames' resources, kept between frames (see `Rig`).
     rigs: Mutex<Vec<Rig>>,
+    /// Pooled IOSurface frames the card draws into, one pool per size (the newest few).
+    #[cfg(target_os = "macos")]
+    surfaces: Mutex<Vec<crate::apple::surface::SurfacePool>>,
+    /// Whether frames go into those (see `surfaces_default`).
+    #[cfg(target_os = "macos")]
+    surfaces_on: AtomicBool,
     /// NV12 out: the Y and UV pipelines.
     nv12: (wgpu::RenderPipeline, wgpu::RenderPipeline),
     /// NV12 in (a file's pictures, `upload_nv12`): the pipeline and its layout, made when first
@@ -690,6 +740,10 @@ impl Compositor {
             uploads: Mutex::new(HashMap::new()),
             staging: Mutex::new(HashMap::new()),
             rigs: Mutex::new(Vec::new()),
+            #[cfg(target_os = "macos")]
+            surfaces: Mutex::new(Vec::new()),
+            #[cfg(target_os = "macos")]
+            surfaces_on: AtomicBool::new(surfaces_default()),
             nv12,
             yuv_in: std::sync::OnceLock::new(),
             planes: Mutex::new(HashMap::new()),
@@ -2119,7 +2173,16 @@ impl Compositor {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.bilinear) },
             ],
         });
-        for (tex, pipeline) in [(&rig.y, &self.nv12.0), (&rig.uv, &self.nv12.1)] {
+        #[cfg(target_os = "macos")]
+        let (surface, planes) = match self.surface_frame(w, h) {
+            Some((px, y, uv)) => (Some(px), Some((y, uv))),
+            None => (None, None),
+        };
+        #[cfg(target_os = "macos")]
+        let (tex_y, tex_uv) = planes.as_ref().map_or((&rig.y, &rig.uv), |(y, uv)| (y, uv));
+        #[cfg(not(target_os = "macos"))]
+        let (tex_y, tex_uv) = (&rig.y, &rig.uv);
+        for (tex, pipeline) in [(tex_y, &self.nv12.0), (tex_uv, &self.nv12.1)] {
             let v = tex.create_view(&Default::default());
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("nv12"),
@@ -2138,8 +2201,12 @@ impl Compositor {
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
+        #[cfg(target_os = "macos")]
+        let direct = surface.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let direct = false;
         for ((buf, padded), (plane, pw, ph, bpp)) in
-            rig.read.iter().zip([(&rig.y, w, h, 1u32), (&rig.uv, w / 2, h / 2, 2)])
+            rig.read.iter().zip([(&rig.y, w, h, 1u32), (&rig.uv, w / 2, h / 2, 2)]).filter(|_| !direct)
         {
             debug_assert!(*padded >= pw * bpp);
             enc.copy_texture_to_buffer(
@@ -2157,21 +2224,102 @@ impl Compositor {
         }
         let done_at = self.submit([enc.finish()]);
         let state = Arc::new(Readback::default());
-        for (buf, _) in &rig.read {
+        if direct {
+            // No buffers to map: the surface is ready when the card says its work is done.
             let state = state.clone();
-            buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-                if r.is_err() {
-                    state.failed.store(true, Ordering::Release);
-                }
-                state.mapped.fetch_add(1, Ordering::AcqRel);
-            });
+            self.queue.on_submitted_work_done(move || state.mapped.store(2, Ordering::Release));
+        } else {
+            for (buf, _) in &rig.read {
+                let state = state.clone();
+                buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                    if r.is_err() {
+                        state.failed.store(true, Ordering::Release);
+                    }
+                    state.mapped.fetch_add(1, Ordering::AcqRel);
+                });
+            }
         }
-        PendingNv12 { rig, state, done_at }
+        PendingNv12 {
+            rig,
+            state,
+            done_at,
+            #[cfg(target_os = "macos")]
+            surface,
+        }
+    }
+
+    /// Mac: a pooled surface for a `w`x`h` frame and its two planes as render targets, or None
+    /// (switched off, pool at its cap, no Metal: the frame is read back the copying way, and
+    /// counted). Never waits for a free buffer.
+    #[cfg(target_os = "macos")]
+    fn surface_frame(
+        &self,
+        w: u32,
+        h: u32,
+    ) -> Option<(crate::apple::surface::PixelFrame, wgpu::Texture, wgpu::Texture)> {
+        use crate::apple::surface::{Empty, SurfacePool};
+        /// Buffers a size's pool may hold: the frames on the card plus what the encoders keep
+        /// (VideoToolbox's reorder window and queue), shared by every output of the canvas.
+        const MAX_BUFFERS: u32 = 16;
+        /// Sizes kept (main, two Twitch qualities, a vertical canvas).
+        const SIZES: usize = 4;
+        if !self.surfaces_on.load(Ordering::Relaxed) {
+            return None;
+        }
+        let taken = {
+            let mut pools = self.surfaces.lock().unwrap_or_else(|e| e.into_inner());
+            let at = match pools.iter().position(|p| p.size() == (w, h)) {
+                Some(at) => at,
+                None => {
+                    let Some(p) = SurfacePool::new(w, h, MAX_BUFFERS) else {
+                        crate::video::note_fallback_frame();
+                        return None;
+                    };
+                    if pools.len() >= SIZES {
+                        pools.remove(0);
+                    }
+                    pools.push(p);
+                    pools.len() - 1
+                }
+            };
+            pools[at].take()
+        };
+        match taken {
+            Ok(px) => match px.textures(&self.device) {
+                Some((y, uv)) => {
+                    crate::video::note_zero_copy_frame();
+                    Some((px, y, uv))
+                }
+                None => {
+                    crate::video::note_fallback_frame();
+                    None
+                }
+            },
+            Err(Empty::Full | Empty::Failed) => {
+                crate::video::note_fallback_frame();
+                None
+            }
+        }
     }
 
     /// The NV12 frame `p` read back: at once when [`PendingNv12::ready`], else after waiting for
-    /// the card. Its rig goes back for the next frames.
+    /// the card. Its rig goes back for the next frames. A frame drawn into a pooled surface is
+    /// read out of it (a copy, counted).
     fn nv12_finish(&self, p: PendingNv12) -> Result<Nv12, AvError> {
+        match self.nv12_drawn(p)? {
+            Drawn::Host(f) => Ok(f),
+            #[cfg(target_os = "macos")]
+            Drawn::Surface { px, .. } => {
+                px.to_host().ok_or_else(|| AvError::Readback("the frame couldn't be read".into()))
+            }
+        }
+    }
+
+    /// The frame `p` as the card made it: host planes, or a pooled surface with no copy.
+    fn nv12_drawn(&self, p: PendingNv12) -> Result<Drawn, AvError> {
+        #[cfg(target_os = "macos")]
+        let PendingNv12 { rig, state, done_at, surface } = p;
+        #[cfg(not(target_os = "macos"))]
         let PendingNv12 { rig, state, done_at } = p;
         if !(state.failed.load(Ordering::Acquire) || state.mapped.load(Ordering::Acquire) >= 2) {
             self.device
@@ -2182,6 +2330,11 @@ impl Compositor {
             // Mapped halfway or not at all: this rig is let go (a new one is made).
             drop(rig);
             return Err(AvError::Readback("the card couldn't hand the frame back".into()));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(px) = surface {
+            self.rig_back(rig);
+            return Ok(Drawn::Surface { px, host: std::sync::OnceLock::new() });
         }
         let (w, h) = (rig.canvas.width, rig.canvas.height);
         let mut planes = Vec::with_capacity(2);
@@ -2194,17 +2347,22 @@ impl Compositor {
             }
             drop(data);
             buf.unmap();
+            crate::video::note_readback_bytes(px.len() as u64);
             planes.push(px);
         }
         let uv = planes.pop().unwrap_or_default();
         let y = planes.pop().unwrap_or_default();
+        self.rig_back(rig);
+        Ok(Drawn::Host(Nv12 { width: w, height: h, y, uv }))
+    }
+
+    fn rig_back(&self, rig: Rig) {
         let mut rigs = self.rigs.lock().unwrap_or_else(|e| e.into_inner());
         // The oldest goes when full: sizes no longer drawn mustn't keep the one in use out.
         if rigs.len() >= RIGS {
             rigs.remove(0);
         }
         rigs.push(rig);
-        Ok(Nv12 { width: w, height: h, y, uv })
     }
 
     /// Draws a scene and starts reading it back as NV12, without waiting for the card.
@@ -2241,6 +2399,25 @@ impl Compositor {
     /// A frame begun with [`Self::begin_nv12`], read back (waiting for the card if it isn't done).
     pub fn finish_nv12(&self, p: PendingNv12) -> Result<Nv12, AvError> {
         self.nv12_finish(p)
+    }
+
+    /// Mac: draws frames into pooled surfaces (no copy) or reads them back the copying way. Tests
+    /// and A/B runs; FERROCORE_COPY_FRAMES sets the start.
+    #[cfg(target_os = "macos")]
+    pub fn set_zero_copy(&self, on: bool) {
+        self.surfaces_on.store(on, Ordering::Relaxed);
+    }
+
+    /// Lets the card's finished work call back (what makes a begun frame [`PendingNv12::ready`]),
+    /// without waiting.
+    pub fn poll(&self) {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+    }
+
+    /// The same, without copying a surface-backed frame to host planes: what the engine hands its
+    /// encoders.
+    pub fn finish_drawn(&self, p: PendingNv12) -> Result<Drawn, AvError> {
+        self.nv12_drawn(p)
     }
 
     /// Sends a picture to its texture through a buffer of ours that stays mapped between frames.

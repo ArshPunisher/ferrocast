@@ -18,7 +18,7 @@ use crate::pipeline::{Pipeline, Tag};
 use crate::rt::{AtomicLevels, AudioProducer, SpscAudioRing};
 use crate::source::image::ImageSource;
 use crate::source::text::{TextRenderer, TextStyle};
-use crate::video::{Frame, VideoConfig};
+use crate::video::VideoConfig;
 use crate::{
     AvError, Blend, Compositor, Content, Effect, Filter, Item, Nv12, PendingNv12, Picture, Placement, Scene,
     Transition, TransitionKind,
@@ -2581,6 +2581,12 @@ impl Engine {
         let more = canvas.more_tracks.len();
         let mut pipe = Pipeline::with_tracks(video, audio, record.as_deref(), more)?;
         pipe.set_track_names(canvas.track_names.clone());
+        // The AAC work off the render thread (FERROCORE_AAC_ON_RENDER_THREAD keeps it there, to compare).
+        if std::env::var_os("FERROCORE_AAC_ON_RENDER_THREAD").is_none()
+            && let Err(e) = pipe.audio_off_thread()
+        {
+            tracing::warn!(error = %e, "the sound encoder stays on the render thread");
+        }
         if matches!(kind, OutputKind::Stream(_)) {
             pipe.stream_extra_tracks();
             // Twitch Enhanced Broadcasting's other qualities: H.264, even sides, a few at most.
@@ -4925,9 +4931,11 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
         }
         let Some(e) = st.in_flight.pop_front() else { break };
         let InFlight { ts, blocks, outputs, taps, drawn } = e;
-        let drawn: Vec<(Canvas, Result<Nv12, String>)> = drawn
+        // A frame the card drew into a pooled surface stays one (no copy): the encoders share it,
+        // and a tap that needs host bytes makes them once.
+        let drawn: Vec<(Canvas, Result<crate::Drawn, String>)> = drawn
             .into_iter()
-            .map(|(c, f)| (c, f.and_then(|p| gpu.finish_nv12(p).map_err(|e| e.to_string()))))
+            .map(|(c, f)| (c, f.and_then(|p| gpu.finish_drawn(p).map_err(|e| e.to_string()))))
             .collect();
         let mut failures: Vec<(u64, String)> = Vec::new();
         // Given up on (an error stays) or waiting to be made again: not fed meanwhile.
@@ -4960,7 +4968,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                     Ok(f) => {
                         let w = canvas.width as usize;
                         let t0 = Instant::now();
-                        match pipe.video(Frame::Nv12 { y: &f.y, y_stride: w, uv: &f.uv, uv_stride: w }, ts) {
+                        match pipe.video(f.as_frame(w), ts) {
                             Ok(t) => tags = t,
                             Err(e) => failed = Some(e.to_string()),
                         }
@@ -4973,7 +4981,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                     if let Some((_, Ok(f))) = drawn.iter().find(|(d, _)| *d == c) {
                         let s = w as usize;
                         let t0 = Instant::now();
-                        match pipe.video_track(i, Frame::Nv12 { y: &f.y, y_stride: s, uv: &f.uv, uv_stride: s }, ts) {
+                        match pipe.video_track(i, f.as_frame(s), ts) {
                             Ok(t) => tags.extend(t),
                             Err(e) => failed = Some(e.to_string()),
                         }
@@ -5020,8 +5028,10 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             if !taps.contains(id) {
                 continue;
             }
-            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| c == canvas) {
-                sink(f, ts);
+            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| c == canvas)
+                && let Some(host) = f.host()
+            {
+                sink(host, ts);
             }
         }
         for b in blocks {

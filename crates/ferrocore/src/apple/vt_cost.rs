@@ -106,6 +106,9 @@ impl Cost {
             return;
         }
         let secs = now.duration_since(self.since).as_secs_f64();
+        // The whole process's, since it started: which path the frames took (zero-copy surfaces
+        // from the compositor, or the copying readback) and what the CPU still copied.
+        let copies = crate::video::copy_stats();
         tracing::info!(
             target: "vt_cost",
             output = self.id,
@@ -118,6 +121,11 @@ impl Cost {
             buffers_created = self.created,
             buffers_reused = self.reused,
             fill_faults_per_frame = format!("{:.1}", self.faults as f64 / self.frames as f64),
+            zero_copy_frames_total = copies.zero_copy_frames,
+            fallback_frames_total = copies.fallback_frames,
+            readback_mb_total = copies.readback_bytes / 1_000_000,
+            fill_mb_total = copies.fill_bytes / 1_000_000,
+            materialised_mb_total = copies.materialised_bytes / 1_000_000,
             "VideoToolbox cost per frame"
         );
         *self = Self { id: self.id, seen: self.seen, seen_next: self.seen_next, ..Self::new() };

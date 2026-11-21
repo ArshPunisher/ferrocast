@@ -107,13 +107,70 @@ impl H264Profile {
     }
 }
 
-static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+use std::sync::atomic::AtomicU64;
+
+static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Frames the encoders left out since the program started: one that was behind (FFmpeg's queue
 /// full) or that VideoToolbox dropped. OBS's "skipped frames due to encoding lag". The engine's
 /// own frames that weren't drawn in time are counted apart (`Stats::skipped`).
 pub fn dropped_frames() -> u64 {
     DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What the frame path copied on the CPU, and how many frames took the zero-copy route: counters
+/// for tests and the once-a-minute `vt_cost` line. Bytes are what `memcpy` moved of pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CopyStats {
+    /// The card's readback copied into host planes (`Nv12`).
+    pub readback_bytes: u64,
+    /// A host frame copied into the encoder's pixel buffer.
+    pub fill_bytes: u64,
+    /// A pooled surface read back out for a consumer that needs host bytes (a tap, FFmpeg).
+    pub materialised_bytes: u64,
+    /// Frames the card drew straight into a pooled surface (no pixel copy).
+    pub zero_copy_frames: u64,
+    /// Frames that wanted that but took the copying path (pool full, no Metal, a size the pool
+    /// wasn't made for).
+    pub fallback_frames: u64,
+}
+
+static COPY_READBACK: AtomicU64 = AtomicU64::new(0);
+static COPY_FILL: AtomicU64 = AtomicU64::new(0);
+static COPY_MATERIAL: AtomicU64 = AtomicU64::new(0);
+static ZERO_FRAMES: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// The copy counters since the program started.
+pub fn copy_stats() -> CopyStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    CopyStats {
+        readback_bytes: COPY_READBACK.load(Relaxed),
+        fill_bytes: COPY_FILL.load(Relaxed),
+        materialised_bytes: COPY_MATERIAL.load(Relaxed),
+        zero_copy_frames: ZERO_FRAMES.load(Relaxed),
+        fallback_frames: FALLBACK_FRAMES.load(Relaxed),
+    }
+}
+
+pub(crate) fn note_readback_bytes(n: u64) {
+    COPY_READBACK.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn note_fill_bytes(n: u64) {
+    COPY_FILL.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+#[allow(dead_code)]
+pub(crate) fn note_materialised_bytes(n: u64) {
+    COPY_MATERIAL.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+#[allow(dead_code)]
+pub(crate) fn note_zero_copy_frame() {
+    ZERO_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+#[allow(dead_code)]
+pub(crate) fn note_fallback_frame() {
+    FALLBACK_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// An encoder left `n` frames out.
@@ -124,8 +181,20 @@ pub(crate) fn note_dropped(n: u64) {
 /// One frame's pixels, borrowed. Strides are bytes per row.
 #[derive(Debug, Clone, Copy)]
 pub enum Frame<'a> {
-    Bgra { data: &'a [u8], stride: usize },
-    Nv12 { y: &'a [u8], y_stride: usize, uv: &'a [u8], uv_stride: usize },
+    Bgra {
+        data: &'a [u8],
+        stride: usize,
+    },
+    Nv12 {
+        y: &'a [u8],
+        y_stride: usize,
+        uv: &'a [u8],
+        uv_stride: usize,
+    },
+    /// An NV12 frame in a pooled IOSurface (Mac): the Mac's encoder takes it as it is; anything
+    /// else reads it where it sits.
+    #[cfg(target_os = "macos")]
+    Surface(&'a crate::apple::surface::PixelFrame),
 }
 
 /// One encoded frame: NAL units, each with a 4-byte big-endian length before it (AVCC / HVCC,
@@ -283,6 +352,8 @@ impl VideoEncoder {
                     && y.len() >= y_stride * h
                     && uv.len() >= uv_stride * h / 2
             }
+            #[cfg(target_os = "macos")]
+            (Frame::Surface(px), PixelFormat::Nv12) => px.size() == (self.config.width, self.config.height),
             _ => false,
         };
         if !ok {

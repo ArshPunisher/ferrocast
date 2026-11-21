@@ -797,6 +797,19 @@ impl Video {
                     raw.extend_from_slice(&data[r * stride..r * stride + w * 4]);
                 }
             }
+            // A pooled surface (Mac): read where it sits, packed into FFmpeg's frame as above.
+            #[cfg(target_os = "macos")]
+            Frame::Surface(px) => {
+                px.with_planes(|y, y_stride, uv, uv_stride| {
+                    for r in 0..h {
+                        raw.extend_from_slice(&y[r * y_stride..r * y_stride + w]);
+                    }
+                    for r in 0..h / 2 {
+                        raw.extend_from_slice(&uv[r * uv_stride..r * uv_stride + w]);
+                    }
+                })
+                .ok_or_else(|| AvError::Encoder("a frame couldn't be read".into()))?;
+            }
         }
         self.encode_raw(raw, pts_us)
     }
