@@ -34,6 +34,22 @@ const SILENT_PEAK: f32 = 3.16e-5;
 /// three it is within a dB or two.
 const SILENT_SECS: usize = 3;
 
+/// Where the knee starts (-1.9 dBFS: speech under it is untouched) and the ceiling it reaches
+/// (-0.09 dBFS, under the 0.9999 the model complains at).
+const KNEE: f32 = 0.8;
+const CEILING: f32 = 0.99;
+
+/// What goes into the model: the sample itself up to the knee, a smooth tanh knee from there that
+/// tops out at the ceiling however far over full scale it was (a gain before the noise removal on
+/// a loud source). No state, no allocation, no delay; a NaN stays a NaN as it was.
+fn soft_limit(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= KNEE {
+        return x;
+    }
+    (KNEE + (CEILING - KNEE) * ((a - KNEE) / (CEILING - KNEE)).tanh()).copysign(x)
+}
+
 /// DeepFilterNet over a stream of planar samples: blocks in, cleaned blocks out, one block late.
 pub(crate) struct Denoiser {
     df: DfTract,
@@ -123,7 +139,7 @@ impl Denoiser {
         while self.inp[0].len() >= self.hop {
             for c in 0..self.channels() {
                 for (i, s) in self.inp[c].drain(..self.hop).enumerate() {
-                    self.noisy[[c, i]] = s;
+                    self.noisy[[c, i]] = soft_limit(s);
                 }
             }
             // Digital silence (a muted or switched-off device) is given back as silence once the
@@ -1018,6 +1034,51 @@ mod tests {
             db(&all),
             db(&skipping)
         );
+    }
+
+    /// DeepFilterNet logs "possible clipping" at 0.9999 and is made for sound inside full scale:
+    /// what goes into the model is held under it by a smooth knee, so a +3 dBFS input (a gain
+    /// before the noise removal on a loud source) never reaches it, and anything under the knee
+    /// goes in bit for bit as it was.
+    #[test]
+    fn over_range_input_never_reaches_the_model_and_normal_input_is_untouched() {
+        let sine = |amp: f32, n: usize| -> Vec<f32> {
+            (0..n).map(|i| amp * (std::f32::consts::TAU * 220.0 * i as f32 / 48_000.0).sin()).collect()
+        };
+        for amp in [db_to_mul(3.0), db_to_mul(12.0), 100.0] {
+            let mut d = Denoiser::new(1, 40).expect("the built-in model starts");
+            let input = sine(amp, 48_000);
+            let mut seen = 0.0f32;
+            for chunk in input.chunks(480) {
+                let mut b = chunk.to_vec();
+                d.run(&mut [&mut b]);
+                seen = seen.max(d.noisy.iter().fold(0.0f32, |m, v| m.max(v.abs())));
+            }
+            assert!(seen > 0.5 && seen < 0.9999, "a {amp:.2} sine reaches the model at {seen}");
+        }
+        // -20 dBFS and speech peaks to -2 dBFS: not a bit different.
+        for amp in [db_to_mul(-20.0), db_to_mul(-6.0), db_to_mul(-2.0)] {
+            let mut d = Denoiser::new(1, 40).expect("the built-in model starts");
+            let input = sine(amp, 4_800);
+            for chunk in input.chunks(480) {
+                let mut b = chunk.to_vec();
+                d.run(&mut [&mut b]);
+                assert!(
+                    d.noisy.iter().zip(chunk).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "a {amp:.3} sine goes in unchanged"
+                );
+            }
+        }
+        // The knee is smooth: no step, and it only ever goes up as the input does.
+        let mut last = (0.0f32, 0.0f32);
+        for i in 0..=4000 {
+            let x = i as f32 / 1000.0;
+            let y = soft_limit(x);
+            assert!(y >= last.1 && y - last.1 < 0.003, "smooth and rising at {x}: {} -> {y}", last.1);
+            assert_eq!(soft_limit(-x), -y, "odd");
+            last = (x, y);
+        }
+        assert!(soft_limit(f32::INFINITY) < 0.9999 && soft_limit(f32::NAN).is_nan());
     }
 
     #[test]
