@@ -798,10 +798,10 @@ impl FilePick {
     }
 }
 
-/// Shortcut actions with no name in them (OBS's hotkeys). Others: scene:, mute:,
-/// push_to_talk:, push_to_mute:, screenshot:, media_*: <name>; show:, hide: <scene>\n<source>;
-/// filter: <source>\n<filter>; quick: <1 to 10>.
-pub const HOTKEY_ACTIONS: [&str; 23] = [
+/// Shortcut actions with no name in them (OBS's hotkeys and Ferrocast's vertical canvas). Others:
+/// scene:, mute:, push_to_talk:, push_to_mute:, screenshot:, media_*: <name>; show:, hide:
+/// <scene>\n<source>; filter: <source>\n<filter>; quick: <1 to 10>.
+pub const HOTKEY_ACTIONS: [&str; 27] = [
     "go_live",
     "end_stream",
     "record",
@@ -823,6 +823,10 @@ pub const HOTKEY_ACTIONS: [&str; 23] = [
     "swap_scenes",
     "fade_to_black",
     "screenshot",
+    "vertical:show_preview",
+    "vertical:hide_preview",
+    "vertical:toggle_preview",
+    "vertical:screenshot",
     "undo",
     "redo",
 ];
@@ -4033,11 +4037,32 @@ mod tests {
             ("record", "Alt+R|F9|Cmd+Shift+KeyR"),
             ("stop_record", "F10"),
             ("start_replay", "F11"),
+            // Vertical canvas preview & screenshot, plus per-scene hotkeys targeting vertical scenes.
+            ("vertical:show_preview", "Alt+1"),
+            ("vertical:hide_preview", "Alt+4"),
+            ("vertical:toggle_preview", "Alt+V"),
+            ("vertical:screenshot", "Alt+P"),
+            ("scene:Tall", "Alt+5"),
+            ("screenshot:Tall", "Alt+6"),
+            ("show:Tall\nCam", "Alt+7"),
+            ("hide:Tall\nCam", "Alt+8"),
         ] {
             hk.hotkeys.insert(action.into(), keys.into());
         }
         assert!(hk.check().is_ok(), "{:?}", hk.check());
-        for action in ["quick:11", "quick:0", "show:only one name", "media_explode:Intro", "filter:\nGate"] {
+        for action in [
+            "quick:11",
+            "quick:0",
+            "show:only one name",
+            "media_explode:Intro",
+            "filter:\nGate",
+            // Unwired Aitum Vertical outputs must stay rejected until standalone engine support exists.
+            "vertical:record",
+            "vertical:stream",
+            "vertical:clip",
+            "vertical:virtualcam",
+            "vertical:unknown",
+        ] {
             let mut bad = d.clone();
             bad.hotkeys.insert(action.into(), "F8".into());
             assert!(bad.check().is_err(), "{action} is refused");

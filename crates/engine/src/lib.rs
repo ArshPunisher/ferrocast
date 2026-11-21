@@ -258,6 +258,12 @@ impl Engine {
         Self::start_with(data_dir, secrets, PlatformApps::default()).await
     }
 
+    /// Like [`Engine::start_with_secrets`] with an in-memory secret store (for tests outside
+    /// `ferrocast-engine` that shouldn't touch the OS keychain or start background watchers).
+    pub async fn start_with_memory_secrets(data_dir: &Path) -> Result<Engine, EngineError> {
+        Self::start_with_secrets(data_dir, Arc::new(ferrocast_secrets::MemorySecrets::default())).await
+    }
+
     /// Full control over secrets and platform apps (tests point the apps at fakes).
     pub async fn start_with(
         data_dir: &Path,

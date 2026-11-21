@@ -296,6 +296,25 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
         "screenshot" => {
             engine.studio_act(StudioAct::ScreenshotProgram).await?;
         }
+        "vertical:show_preview" | "vertical:hide_preview" | "vertical:toggle_preview" => {
+            let on = !engine.studio_act(StudioAct::Scenes).await?["vertical"].is_null();
+            let want = match action {
+                "vertical:show_preview" => true,
+                "vertical:hide_preview" => false,
+                _ => !on,
+            };
+            if want && !on {
+                start_vertical_with_fallback(engine).await?;
+            } else if !want && on {
+                engine.studio_act(StudioAct::StopVertical).await?;
+            }
+        }
+        "vertical:screenshot" => {
+            let scenes = engine.studio_act(StudioAct::Scenes).await?;
+            if let Some(name) = scenes["vertical"]["current"].as_str().filter(|s| !s.is_empty()) {
+                engine.studio_act(StudioAct::Screenshot { name: name.to_string() }).await?;
+            }
+        }
         "undo" => {
             engine.studio_act(StudioAct::Undo).await?;
         }
@@ -384,6 +403,21 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
     Ok(())
 }
 
+/// Enables the vertical canvas, picking a free default scene name if `"Vertical"` is already
+/// used by a main scene or source (`studio_name_taken`). If vertical scenes already exist from
+/// before, the engine ignores `scene` and restores them.
+async fn start_vertical_with_fallback(engine: &Engine) -> Result<(), EngineError> {
+    for n in 1..=10 {
+        let scene = if n == 1 { "Vertical".to_string() } else { format!("Vertical {n}") };
+        match engine.studio_act(StudioAct::StartVertical { scene }).await {
+            Ok(_) => return Ok(()),
+            Err(EngineError::Refused { code: "studio_name_taken", .. }) if n < 10 => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Whether a sound in the scene on air (or a global device) is muted now.
 async fn muted(engine: &Engine, name: &str) -> Result<bool, EngineError> {
     let scenes = engine.studio_act(StudioAct::Scenes).await?;
@@ -466,5 +500,201 @@ mod tests {
         let (planned, _) = plan(&wanted(&[("record", "F9|F9")]));
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].1.len(), 1);
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeHost {
+        vertical_on: std::sync::atomic::AtomicBool,
+        vertical_current: Mutex<Option<String>>,
+        taken_names: Mutex<Vec<String>>,
+        acts: Mutex<Vec<StudioAct>>,
+    }
+
+    impl FakeHost {
+        fn take_acts(&self) -> Vec<StudioAct> {
+            std::mem::take(&mut *self.acts.lock().unwrap_or_else(|p| p.into_inner()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrocast_engine::studio_host::StudioHost for FakeHost {
+        async fn status(&self) -> ferrocast_engine::studio_host::StudioStatus {
+            ferrocast_engine::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn options(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn act(&self, act: StudioAct) -> Result<Value, String> {
+            self.acts.lock().unwrap_or_else(|p| p.into_inner()).push(act.clone());
+            match act {
+                StudioAct::Scenes => {
+                    let on = self.vertical_on.load(std::sync::atomic::Ordering::SeqCst);
+                    let cur = self.vertical_current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    Ok(serde_json::json!({
+                        "scenes": [],
+                        "current": "Scene",
+                        "vertical": if on {
+                            serde_json::json!({
+                                "width": 1080,
+                                "height": 1920,
+                                "scenes": [],
+                                "current": cur.unwrap_or_default()
+                            })
+                        } else {
+                            Value::Null
+                        }
+                    }))
+                }
+                StudioAct::StartVertical { scene } => {
+                    if self.taken_names.lock().unwrap_or_else(|p| p.into_inner()).contains(&scene) {
+                        return Err(format!("name: \"{scene}\" is taken: pick another name."));
+                    }
+                    self.vertical_on.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut cur = self.vertical_current.lock().unwrap_or_else(|p| p.into_inner());
+                    if cur.is_none() {
+                        *cur = Some(scene);
+                    }
+                    Ok(Value::Null)
+                }
+                StudioAct::StopVertical => {
+                    self.vertical_on.store(false, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Value::Null)
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
+            Default::default()
+        }
+        async fn set_settings(
+            &self,
+            _s: ferrocast_engine::studio_host::StudioSettings,
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record(&self, _on: bool) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({ "devices": [] }))
+        }
+        async fn stream_start(
+            &self,
+            _server: String,
+            _key: String,
+            _tracks: Vec<(u32, u32, u32)>,
+        ) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn import_obs(&self, _id: String) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+    }
+
+    async fn test_engine(host: std::sync::Arc<FakeHost>) -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap_or_else(|e| panic!("engine: {e}"));
+        engine.set_studio_host(host);
+        (engine, dir)
+    }
+
+    #[tokio::test]
+    async fn vertical_preview_actions_toggle_start_and_stop_through_the_engine() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run(&engine, "vertical:hide_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes]);
+
+        run(&engine, "vertical:show_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StartVertical { scene: "Vertical".into() }]);
+
+        run(&engine, "vertical:show_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes]);
+
+        run(&engine, "vertical:toggle_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StopVertical]);
+
+        run(&engine, "vertical:toggle_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StartVertical { scene: "Vertical".into() }]);
+
+        run(&engine, "vertical:hide_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StopVertical]);
+
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn vertical_show_preview_picks_a_free_scene_name_if_vertical_is_taken() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        host.taken_names.lock().unwrap_or_else(|p| p.into_inner()).push("Vertical".into());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run(&engine, "vertical:show_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            host.take_acts(),
+            vec![
+                StudioAct::Scenes,
+                StudioAct::StartVertical { scene: "Vertical".into() },
+                StudioAct::StartVertical { scene: "Vertical 2".into() },
+            ]
+        );
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn vertical_screenshot_captures_the_active_vertical_scene_when_on() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run(&engine, "vertical:screenshot", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes]);
+
+        host.vertical_on.store(true, std::sync::atomic::Ordering::SeqCst);
+        *host.vertical_current.lock().unwrap_or_else(|p| p.into_inner()) = Some("Tall".into());
+
+        run(&engine, "vertical:screenshot", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::Screenshot { name: "Tall".into() }]);
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn scene_hotkey_forwards_vertical_scene_to_set_current() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run(&engine, "scene:Tall", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::SetCurrent { scene: "Tall".into() }]);
+        engine.shutdown();
     }
 }
