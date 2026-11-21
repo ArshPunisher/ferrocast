@@ -496,6 +496,8 @@ impl Pipeline {
 
     /// Ends this output's recording (its file finished); its encoders and stream go on.
     pub fn end_recording(&mut self) -> Result<(), AvError> {
+        // The sound still being encoded goes into the file first.
+        self.settle_logged();
         self.drop_pending_file();
         match self.recording.take() {
             Some(Recording::On(w)) => {
@@ -739,6 +741,9 @@ impl Pipeline {
         }
         self.video = video;
         self.audio = audio;
+        // The new encoder counts its sound from 0: its start on the output's clock is found again
+        // at the next sound (before, the old one's stayed and sound went out at time 0 again).
+        self.audio_offset_us = None;
         self.sent_video_header = false;
         self.sent_audio_header = false;
         self.key_next = true;
@@ -775,13 +780,11 @@ impl Pipeline {
     /// Has the sound encode on threads of its own (the render thread then only queues it). Call
     /// before the first sample.
     pub fn audio_off_thread(&mut self) -> Result<(), AvError> {
-        let audio = AudioEncoder::new(*self.audio.config())?.off_thread()?;
-        let mut extra = Vec::with_capacity(self.extra.len());
-        for (e, offset) in std::mem::take(&mut self.extra) {
-            extra.push((AudioEncoder::new(*e.config())?.off_thread()?, offset));
+        // The encoders already made move over as they are (a failure leaves each where it was).
+        self.audio.move_off_thread()?;
+        for (e, _) in &mut self.extra {
+            e.move_off_thread()?;
         }
-        self.audio = audio;
-        self.extra = extra;
         Ok(())
     }
 
@@ -810,6 +813,11 @@ impl Pipeline {
     }
 
     fn main_audio_out(&mut self, packets: Vec<AudioPacket>, offset: i64) {
+        if !packets.is_empty() && !self.sent_audio_header && !self.stream_waits_key {
+            // The codec header goes before the first sound, whichever call brings it.
+            self.sent_audio_header = true;
+            self.carry.push(Tag::Audio { ms: 0, body: flv::audio_header(&self.audio.header()) });
+        }
         for mut p in packets {
             p.pts_us += offset;
             if !self.stream_waits_key && p.pts_us >= self.stream_from_us {
@@ -1073,11 +1081,19 @@ impl Pipeline {
 
     /// The encoders' last packets, sent and written.
     fn flush_all(&mut self) -> Result<Vec<Tag>, AvError> {
+        // The sound given so far first: the video's last packets may start a file or a stream
+        // (as `video` settles before a frame that could).
+        self.settle_audio()?;
         let packets = self.video.flush()?;
         let mut tags = std::mem::take(&mut self.carry);
         tags.extend(self.video_out(packets)?);
         let offset = self.audio_offset_us.unwrap_or(0);
-        for mut p in self.audio.flush()? {
+        let last = self.audio.flush()?;
+        if !last.is_empty() && !self.sent_audio_header && !self.stream_waits_key {
+            self.sent_audio_header = true;
+            tags.push(Tag::Audio { ms: 0, body: flv::audio_header(&self.audio.header()) });
+        }
+        for mut p in last {
             p.pts_us += offset;
             if !self.stream_waits_key && p.pts_us >= self.stream_from_us {
                 tags.push(Tag::Audio { ms: self.stream_ms(p.pts_us), body: flv::audio_tag(&p.data) });
@@ -2263,6 +2279,99 @@ mod bframe_tests {
             assert!(!a.is_empty(), "file {i} has sound");
             assert_eq!(a, b, "file {i}: sound packet times identical");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Raw AAC tags' times (the sequence headers left out) from a stream with a `heal` in it.
+    fn heal_run(off_thread: bool) -> Option<Vec<u32>> {
+        let mut pipe =
+            Pipeline::new(video(false), AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None)
+                .ok()?;
+        if off_thread {
+            pipe.audio_off_thread().ok()?;
+        }
+        let pcm = vec![0.05f32; 1600 * 2];
+        let mut tags = Vec::new();
+        for i in 0..90u64 {
+            let ts = i * 33_333_333;
+            if i == 45 {
+                pipe.heal().ok()?;
+            }
+            let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+            let uv = vec![128u8; 320 * 90];
+            tags.extend(pipe.video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts).ok()?);
+            tags.extend(pipe.audio(&pcm, ts).ok()?);
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        tags.extend(pipe.finish().ok()?);
+        Some(
+            tags.iter()
+                .filter_map(|t| match t {
+                    Tag::Audio { ms, body } if body.len() > 2 && body[1] == 1 => Some(*ms),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
+    /// After a rebuilt encoder the sound goes on at the output's own time: the new encoder counts
+    /// from 0, so its start has to be found again (before, sound went out at time 0 again).
+    #[test]
+    fn healing_keeps_the_sound_on_the_outputs_clock() {
+        for off_thread in [false, true] {
+            let Some(ms) = heal_run(off_thread) else { return };
+            assert!(ms.len() > 100, "{} sound tags", ms.len());
+            assert!(ms.windows(2).all(|w| w[1] >= w[0]), "off_thread={off_thread}: sound times never go back");
+            assert!(ms.last().is_some_and(|m| *m > 2500), "off_thread={off_thread}: sound runs to the end of the clip");
+        }
+    }
+
+    /// A recording ended while sound is still being encoded has all of it: the same file as when
+    /// the encoding is done in place.
+    fn tail_run(off_thread: bool, dir: &std::path::Path) -> Option<Vec<(f64, f64)>> {
+        let file = dir.join(format!("t{off_thread}.mp4"));
+        let mut pipe = Pipeline::new(
+            video(false),
+            AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 },
+            Some(&file),
+        )
+        .ok()?;
+        if off_thread {
+            pipe.audio_off_thread().ok()?;
+        }
+        let tone = |len: usize, seed: usize| -> Vec<f32> {
+            (0..len)
+                .flat_map(|n| {
+                    let v = (((seed + n) as f32) * 0.05).sin() * 0.3;
+                    [v, -v]
+                })
+                .collect()
+        };
+        for i in 0..40u64 {
+            let ts = i * 33_333_333;
+            let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+            let uv = vec![128u8; 320 * 90];
+            pipe.video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts).ok()?;
+            pipe.audio(&tone(1600, i as usize * 1600), ts).ok()?;
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        // Two seconds of sound in one go, then the recording ends at once.
+        pipe.audio(&tone(96_000, 99_999), 40 * 33_333_333).ok()?;
+        pipe.end_recording().ok()?;
+        pipe.finish().ok()?;
+        Some(packets(&file, "a:0"))
+    }
+
+    #[test]
+    fn ending_a_recording_keeps_the_sound_still_being_encoded() {
+        if !have("ffprobe") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ferrocore-aactail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let (Some(here), Some(there)) = (tail_run(false, &dir), tail_run(true, &dir)) else { return };
+        assert!(here.len() > 100, "{} sound packets", here.len());
+        assert_eq!(here, there, "the same sound packets, tail included");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

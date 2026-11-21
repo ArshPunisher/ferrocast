@@ -358,6 +358,12 @@ thread_local! {
     static FINISH_BY: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
+/// When the stop under way on this thread must be done by, if one is (for work handed to another
+/// thread that finishes an FFmpeg: the deadline lives here).
+pub(crate) fn finish_deadline() -> Option<std::time::Instant> {
+    FINISH_BY.with(std::cell::Cell::get)
+}
+
 /// Runs `f` (an output's whole finish) with every FFmpeg it finishes sharing one deadline, so
 /// several FFmpegs (video, sound, extra tracks) never wait 45 s each.
 pub(crate) fn finishing_by<T>(by: std::time::Instant, f: impl FnOnce() -> T) -> T {
@@ -800,6 +806,7 @@ impl Video {
             // A pooled surface (Mac): read where it sits, packed into FFmpeg's frame as above.
             #[cfg(target_os = "macos")]
             Frame::Surface(px) => {
+                crate::video::note_materialised_bytes((w * h * 3 / 2) as u64);
                 px.with_planes(|y, y_stride, uv, uv_stride| {
                     for r in 0..h {
                         raw.extend_from_slice(&y[r * y_stride..r * y_stride + w]);

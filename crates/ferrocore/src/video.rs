@@ -133,6 +133,8 @@ pub struct CopyStats {
     /// Frames that wanted that but took the copying path (pool full, no Metal, a size the pool
     /// wasn't made for).
     pub fallback_frames: u64,
+    /// Surface pools made (one per size, again after one was let go).
+    pub pools_made: u64,
 }
 
 static COPY_READBACK: AtomicU64 = AtomicU64::new(0);
@@ -140,6 +142,7 @@ static COPY_FILL: AtomicU64 = AtomicU64::new(0);
 static COPY_MATERIAL: AtomicU64 = AtomicU64::new(0);
 static ZERO_FRAMES: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_FRAMES: AtomicU64 = AtomicU64::new(0);
+static POOLS_MADE: AtomicU64 = AtomicU64::new(0);
 
 /// The copy counters since the program started.
 pub fn copy_stats() -> CopyStats {
@@ -150,6 +153,7 @@ pub fn copy_stats() -> CopyStats {
         materialised_bytes: COPY_MATERIAL.load(Relaxed),
         zero_copy_frames: ZERO_FRAMES.load(Relaxed),
         fallback_frames: FALLBACK_FRAMES.load(Relaxed),
+        pools_made: POOLS_MADE.load(Relaxed),
     }
 }
 
@@ -160,13 +164,17 @@ pub(crate) fn note_readback_bytes(n: u64) {
 pub(crate) fn note_fill_bytes(n: u64) {
     COPY_FILL.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn note_materialised_bytes(n: u64) {
     COPY_MATERIAL.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 #[allow(dead_code)]
 pub(crate) fn note_zero_copy_frame() {
     ZERO_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn note_pool_made() {
+    POOLS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 #[allow(dead_code)]
 pub(crate) fn note_fallback_frame() {

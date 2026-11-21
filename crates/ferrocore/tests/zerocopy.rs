@@ -63,6 +63,7 @@ fn delta(a: CopyStats, b: CopyStats) -> CopyStats {
         materialised_bytes: b.materialised_bytes - a.materialised_bytes,
         zero_copy_frames: b.zero_copy_frames - a.zero_copy_frames,
         fallback_frames: b.fallback_frames - a.fallback_frames,
+        pools_made: b.pools_made - a.pools_made,
     }
 }
 
@@ -217,4 +218,24 @@ fn a_full_pool_falls_back_to_the_copy() {
     // Back to normal once they're let go.
     let after = c.finish_drawn(c.begin_nv12(&scene(640, 360, 1)).unwrap()).unwrap();
     assert!(matches!(after, ferrocore::Drawn::Surface { .. }));
+}
+
+/// More sizes in use than a cache of four: each size's pool is made once, not again every frame
+/// (a FIFO of four through a cycle of six evicted the size needed next, every time).
+#[test]
+fn six_canvas_sizes_each_keep_their_pool() {
+    let _one = serial();
+    let Some(c) = gpu() else { return };
+    c.set_zero_copy(true);
+    let sizes = [(640u32, 360u32), (480, 270), (320, 180), (256, 144), (192, 108), (128, 72)];
+    let before = ferrocore::video::copy_stats();
+    for round in 0..10 {
+        for &(w, h) in &sizes {
+            let d = c.finish_drawn(c.begin_nv12(&scene(w, h, round)).unwrap()).unwrap();
+            assert!(matches!(d, ferrocore::Drawn::Surface { .. }));
+        }
+    }
+    let d = delta(before, ferrocore::video::copy_stats());
+    assert_eq!(d.pools_made, 6, "one pool per size, kept");
+    assert_eq!(d.fallback_frames, 0);
 }

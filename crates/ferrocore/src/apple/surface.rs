@@ -98,10 +98,18 @@ impl PixelFrame {
     /// The planes as they sit in memory, read-only: `f` gets Y, its stride, CbCr, its stride.
     /// None when the system won't let the buffer be read.
     pub fn with_planes<R>(&self, f: impl FnOnce(&[u8], usize, &[u8], usize) -> R) -> Option<R> {
-        // SAFETY: the buffer is live; locked read-only until the unlock below.
+        // SAFETY: the buffer is live; locked read-only until the guard's drop (a panic in `f` too).
         if unsafe { CVPixelBufferLockBaseAddress(self.buf.0, READ_ONLY) } != 0 {
             return None;
         }
+        struct Unlock(CFTypeRef);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                // SAFETY: locked with the same flags by `with_planes`; the buffer outlives the guard.
+                unsafe { CVPixelBufferUnlockBaseAddress(self.0, READ_ONLY) };
+            }
+        }
+        let _unlock = Unlock(self.buf.0);
         // SAFETY: locked; NV12 has planes 0 (Y) and 1 (CbCr), each `stride * rows` bytes.
         let planes = unsafe {
             let plane = |i: usize| {
@@ -112,10 +120,7 @@ impl PixelFrame {
             };
             plane(0).zip(plane(1))
         };
-        let out = planes.map(|((y, ys), (uv, uvs))| f(y, ys, uv, uvs));
-        // SAFETY: locked above with the same flags.
-        unsafe { CVPixelBufferUnlockBaseAddress(self.buf.0, READ_ONLY) };
-        out
+        planes.map(|((y, ys), (uv, uvs))| f(y, ys, uv, uvs))
     }
 
     /// Packed host planes (`width` bytes a row), for a consumer that needs them (a tap, FFmpeg).
