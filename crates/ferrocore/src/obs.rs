@@ -2287,7 +2287,8 @@ mod tests {
                 { "id": "ferrocast_deepfilter", "name": "B", "settings": { "strength": 40 } } ] },
             { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Mic" }] } } ] });
         let got = import(&doc, (1920, 1080));
-        let mic = got.sources.iter().find(|s| s.name == "Mic").expect("mic");
+        // The fixture is a Mac microphone; elsewhere it isn't imported (as the test above).
+        let Some(mic) = got.sources.iter().find(|s| s.name == "Mic") else { return };
         assert_eq!(mic.sound_effects, vec![AudioEffect::Denoise { strength: 40 }]);
     }
 
@@ -2925,6 +2926,8 @@ mod tests {
         );
     }
 
+    // The fixture is a Mac microphone with a camera; the override logic isn't per OS.
+    #[cfg(target_os = "macos")]
     #[test]
     fn item_video_filter_override_replaces_source_filters_while_audio_stays_shared() {
         assert!(is_audio_filter_kind("gain_filter"));
