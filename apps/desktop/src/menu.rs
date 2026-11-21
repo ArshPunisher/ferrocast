@@ -5,6 +5,7 @@
 //! full screen, quit). Nothing here is new behaviour; the table below is the whole menu, and its
 //! tests keep it honest. Windows and Linux keep their windows without a menu bar (a menu would
 //! change the window's frame there), so this is macOS only.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 /// What choosing an item does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,7 +34,6 @@ pub(crate) enum Native {
 
 pub(crate) struct Item {
     pub id: &'static str,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub label: &'static str,
     /// Tauri's accelerator syntax ("CmdOrCtrl+,").
     pub accel: Option<&'static str>,
