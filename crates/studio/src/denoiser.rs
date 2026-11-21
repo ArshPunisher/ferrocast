@@ -264,6 +264,10 @@ struct Queue {
     ready: bool,
     dead: bool,
     closed: bool,
+    /// The worker is waiting for a block (the lock is free until one is sent): tests wait for
+    /// this before the next block, so the mixer's `try_lock` never meets the worker's.
+    #[cfg(test)]
+    idle: bool,
 }
 
 impl Queue {
@@ -280,6 +284,8 @@ impl Queue {
             ready: false,
             dead: false,
             closed: false,
+            #[cfg(test)]
+            idle: false,
         }
     }
 
@@ -405,7 +411,15 @@ impl Plugin {
                     let (new_strength, blk) = {
                         let mut q = worker_shared.q.lock().unwrap_or_else(|e| e.into_inner());
                         while !q.closed && q.inbox.is_empty() && q.pending_strength.is_none() {
+                            #[cfg(test)]
+                            {
+                                q.idle = true;
+                            }
                             q = worker_shared.wake.wait(q).unwrap_or_else(|e| e.into_inner());
+                            #[cfg(test)]
+                            {
+                                q.idle = false;
+                            }
                         }
                         if q.closed {
                             return;
@@ -1494,7 +1508,8 @@ mod tests {
         let d2 = done.clone();
         let Ok(mut p) = Plugin::start_with(65, READY_WITHIN, move |_| {
             let permits = std::sync::Arc::new(AtomicUsize::new(usize::MAX));
-            Ok(Gated { inner: MockEngine::new(0.25, None), permits, done: d2 })
+            let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            Ok(Gated { inner: MockEngine::new(0.25, None), permits, done: d2, parked })
         }) else {
             panic!("worker spawns");
         };
@@ -1509,9 +1524,12 @@ mod tests {
         for b in 0..20 {
             let (mut l, mut r) = (block(b), block(b));
             assert!(p.process([&mut l, &mut r]));
-            // Answered and handed back before the next block.
+            // Answered, handed back, and the worker waiting again (its lock free) before the next.
             let t = std::time::Instant::now();
-            while done.load(SeqCst) <= b || shared.q.lock().unwrap_or_else(|e| e.into_inner()).outbox.is_empty() {
+            while done.load(SeqCst) <= b || {
+                let q = shared.q.lock().unwrap_or_else(|e| e.into_inner());
+                q.outbox.is_empty() || !q.idle
+            } {
                 assert!(t.elapsed() < std::time::Duration::from_secs(5), "the worker answers block {b}");
                 std::thread::sleep(std::time::Duration::from_micros(50));
             }
@@ -1553,6 +1571,8 @@ mod tests {
         inner: MockEngine,
         permits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Waiting for its permit (holding no lock).
+        parked: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl WorkerEngine for Gated {
@@ -1564,8 +1584,10 @@ mod tests {
             use std::sync::atomic::Ordering::SeqCst;
             let t = std::time::Instant::now();
             while self.inner.calls >= self.permits.load(SeqCst) && t.elapsed() < std::time::Duration::from_secs(5) {
+                self.parked.store(true, SeqCst);
                 std::thread::sleep(std::time::Duration::from_micros(50));
             }
+            self.parked.store(false, SeqCst);
             self.inner.run(planes);
             self.done.fetch_add(1, SeqCst);
         }
@@ -1577,9 +1599,10 @@ mod tests {
         use ferrocore::afx::SoundPlugin as _;
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
         let (permits, done) = (std::sync::Arc::new(AtomicUsize::new(0)), std::sync::Arc::new(AtomicUsize::new(0)));
-        let (p2, d2) = (permits.clone(), done.clone());
+        let parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (p2, d2, k2) = (permits.clone(), done.clone(), parked.clone());
         let Ok(mut p) = Plugin::start_with(65, READY_WITHIN, move |_| {
-            Ok(Gated { inner: MockEngine::new(0.25, None), permits: p2, done: d2 })
+            Ok(Gated { inner: MockEngine::new(0.25, None), permits: p2, done: d2, parked: k2 })
         }) else {
             panic!("worker spawns");
         };
@@ -1600,7 +1623,11 @@ mod tests {
             let upto = held.unwrap_or(b + 1);
             permits.store(upto, SeqCst);
             let t = std::time::Instant::now();
-            while done.load(SeqCst) < upto {
+            // Answered up to there, and the worker holding no lock: waiting for a block, or for
+            // the permit of one held back (the mixer's `try_lock` then never meets it).
+            while done.load(SeqCst) < upto
+                || !(parked.load(SeqCst) || p.shared.q.lock().unwrap_or_else(|e| e.into_inner()).idle)
+            {
                 assert!(t.elapsed() < std::time::Duration::from_secs(5), "the worker answers block {b}");
                 std::thread::sleep(std::time::Duration::from_micros(50));
             }
