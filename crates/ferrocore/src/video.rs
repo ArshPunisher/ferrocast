@@ -156,6 +156,7 @@ pub fn copy_stats() -> CopyStats {
 pub(crate) fn note_readback_bytes(n: u64) {
     COPY_READBACK.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn note_fill_bytes(n: u64) {
     COPY_FILL.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
@@ -180,8 +181,20 @@ pub(crate) fn note_dropped(n: u64) {
 /// One frame's pixels, borrowed. Strides are bytes per row.
 #[derive(Debug, Clone, Copy)]
 pub enum Frame<'a> {
-    Bgra { data: &'a [u8], stride: usize },
-    Nv12 { y: &'a [u8], y_stride: usize, uv: &'a [u8], uv_stride: usize },
+    Bgra {
+        data: &'a [u8],
+        stride: usize,
+    },
+    Nv12 {
+        y: &'a [u8],
+        y_stride: usize,
+        uv: &'a [u8],
+        uv_stride: usize,
+    },
+    /// An NV12 frame in a pooled IOSurface (Mac): the Mac's encoder takes it as it is; anything
+    /// else reads it where it sits.
+    #[cfg(target_os = "macos")]
+    Surface(&'a crate::apple::surface::PixelFrame),
 }
 
 /// One encoded frame: NAL units, each with a 4-byte big-endian length before it (AVCC / HVCC,
@@ -339,6 +352,8 @@ impl VideoEncoder {
                     && y.len() >= y_stride * h
                     && uv.len() >= uv_stride * h / 2
             }
+            #[cfg(target_os = "macos")]
+            (Frame::Surface(px), PixelFormat::Nv12) => px.size() == (self.config.width, self.config.height),
             _ => false,
         };
         if !ok {

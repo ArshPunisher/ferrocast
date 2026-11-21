@@ -7,6 +7,7 @@ pub mod camera;
 pub mod media;
 pub(crate) mod power;
 pub mod screen;
+pub mod surface;
 pub(crate) mod vt;
 pub(crate) mod vt_cost;
 pub mod zerocopy;
