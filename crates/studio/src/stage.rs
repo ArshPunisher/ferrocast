@@ -292,6 +292,14 @@ fn drop_unused(d: &mut Value) {
     list.retain(|s| scene(s) || used.contains(name_of(s)));
 }
 
+/// `old` with " k" on the end, the name cut so the whole fits the 100 letters a name may have.
+fn numbered(old: &str, k: u32) -> String {
+    let suffix = format!(" {k}");
+    let room = 100usize.saturating_sub(suffix.chars().count());
+    let stem: String = old.chars().take(room).collect();
+    format!("{}{suffix}", stem.trim_end())
+}
+
 /// An item with its source (a group: every source in it), copied out of a collection.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceClip {
@@ -2475,6 +2483,13 @@ impl Stage {
     /// source was added to another scene) have a filter of the same name and kind: they follow,
     /// so a hotkey, a Stream Deck button or obs-websocket reaches every scene the source is in.
     /// An item's own filter of that name that is a different kind is left alone.
+    /// Switches a source's own filter on or off and nothing else: a picture's own copy of it (an
+    /// item with its own filters) keeps its state. A held key uses this, so letting it go can't
+    /// change what another picture had.
+    pub fn set_source_filter_enabled(&self, name: &str, filter: &str, on: bool) -> Result<(), StudioError> {
+        self.set_target_filter_enabled(FilterTarget::Source(name), filter, on)
+    }
+
     pub fn set_filter_enabled(&self, name: &str, filter: &str, on: bool) -> Result<(), StudioError> {
         let kind = self.filter_list(name)?.iter().find(|f| name_of(f) == filter).map(|f| kind_of(f).to_string());
         self.set_target_filter_enabled(FilterTarget::Source(name), filter, on)?;
@@ -2863,7 +2878,8 @@ impl Stage {
         let can = crate::kinds::kinds().inputs;
         for src in &clip.sources {
             let kind = kind_of(src);
-            if kind != "group" && !can.iter().any(|k| k.id == kind) {
+            let here = self.sources_list().iter().any(|o| kind_of(o) == kind);
+            if kind != "group" && !can.iter().any(|k| k.id == kind) && !here {
                 return Err(fail(format!(
                     "\"{}\" is a {kind} source, which this computer can't run (it was copied on another system).",
                     name_of(src)
@@ -2876,8 +2892,32 @@ impl Stage {
             .sources
             .iter()
             .flat_map(|s| s.get("filters").and_then(Value::as_array).into_iter().flatten())
-            .chain(clip.item.get("ferrocast_filters").and_then(Value::as_array).into_iter().flatten());
-        if let Some(f) = attached.into_iter().find(|f| !can_filter.iter().any(|k| k.id == kind_of(f))) {
+            .chain(clip.item.get("ferrocast_filters").and_then(Value::as_array).into_iter().flatten())
+            .chain(
+                clip.sources
+                    .iter()
+                    .filter(|s| kind_of(s) == "group")
+                    .flat_map(|g| g.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten())
+                    .flat_map(|it| it.get("ferrocast_filters").and_then(Value::as_array).into_iter().flatten()),
+            );
+        let have_filter = |k: &str| {
+            self.sources_list().iter().any(|o| {
+                let own = |l: &Value| {
+                    l.get("filters").and_then(Value::as_array).is_some_and(|f| f.iter().any(|x| kind_of(x) == k))
+                };
+                own(o)
+                    || o.pointer("/settings/items").and_then(Value::as_array).is_some_and(|items| {
+                        items.iter().any(|it| {
+                            it.get("ferrocast_filters")
+                                .and_then(Value::as_array)
+                                .is_some_and(|f| f.iter().any(|x| kind_of(x) == k))
+                        })
+                    })
+            })
+        };
+        if let Some(f) =
+            attached.into_iter().find(|f| !can_filter.iter().any(|k| k.id == kind_of(f)) && !have_filter(kind_of(f)))
+        {
             return Err(fail(format!(
                 "The filter \"{}\" is a {} filter, which this computer can't run (it was copied on another system).",
                 name_of(f),
@@ -2891,13 +2931,23 @@ impl Stage {
             let mut n = old.clone();
             let mut k = 2;
             while self.name_free(&n).is_err() || map.iter().any(|(_, new)| *new == n) {
-                n = format!("{old} {k}");
+                n = numbered(&old, k);
                 k += 1;
+                if k > 10_000 {
+                    return Err(fail(format!("Couldn't find a free name for \"{old}\": rename it first.")));
+                }
             }
             map.push((old, n));
         }
-        let new_uuids: Vec<(String, String)> =
-            clip.sources.iter().map(|c| (c["uuid"].as_str().unwrap_or("").to_string(), uuid())).collect();
+        // One fresh uuid for each source by its place in the copy: two with no uuid of their own
+        // must not share one.
+        let fresh_ids: Vec<String> = clip.sources.iter().map(|_| uuid()).collect();
+        let new_uuids: Vec<(String, String)> = clip
+            .sources
+            .iter()
+            .zip(&fresh_ids)
+            .map(|(c, n)| (c["uuid"].as_str().unwrap_or("").to_string(), n.clone()))
+            .collect();
         // What a name (or a uuid) pointed at before points at after: a source pasted with this
         // one by its new name or its new uuid, else nothing (it may still be here).
         let renamed = |old: &str| {
@@ -2908,17 +2958,12 @@ impl Stage {
         };
         let mut notes = Vec::new();
         let mut fresh: Vec<Value> = Vec::new();
-        for src in &clip.sources {
+        for (si, src) in clip.sources.iter().enumerate() {
             let mut c = src.clone();
             let old = name_of(src).to_string();
             let new = renamed(&old).unwrap_or_else(|| old.clone());
             c["name"] = json!(new);
-            c["uuid"] = json!(
-                new_uuids
-                    .iter()
-                    .find(|(u, _)| *u == src["uuid"].as_str().unwrap_or(""))
-                    .map_or_else(uuid, |(_, n)| n.clone())
-            );
+            c["uuid"] = json!(fresh_ids[si]);
             if kind_of(&c) == "ferrocast_clone" {
                 let target = c.pointer("/settings/clone").and_then(Value::as_str).unwrap_or("").to_string();
                 if let Some(n) = renamed(&target) {
@@ -2940,6 +2985,10 @@ impl Stage {
         for c in fresh.iter_mut().filter(|c| kind_of(c) == "group") {
             if let Some(items) = c.pointer_mut("/settings/items").and_then(Value::as_array_mut) {
                 for it in items {
+                    let owner = name_of(it).to_string();
+                    if let Some(own) = it.get_mut("ferrocast_filters").and_then(Value::as_array_mut) {
+                        self.fix_pasted_filters(own, &owner, &renamed, &mut notes);
+                    }
                     if let Some(n) = renamed(name_of(it)) {
                         it["source_uuid"] = json!(uuids.iter().find(|(x, _)| *x == n).map(|(_, u)| u.clone()));
                         it["name"] = json!(n);
@@ -6436,6 +6485,93 @@ mod tests {
         other.filters[0]["settings"]["sidechain_source"] = json!("00000000-dead-beef");
         let notes = ok(b.paste_filter_values("Voice", None, &other));
         assert_eq!(notes.len(), 1, "a uuid that isn't here is cleared with a note: {notes:?}");
+    }
+
+    #[test]
+    fn a_name_at_the_length_limit_still_gets_a_free_copy_name() {
+        let a = stage();
+        let long = "n".repeat(100);
+        let red = ok(a.add_source("Main", "color_source_v3", &long, &json!({}), false));
+        let clip = ok(a.copy_source("Main", red.id));
+        // Used to loop forever: "<100 letters> 2" is longer than a name may be.
+        let (info, _) = ok(a.paste_source("Main", &clip));
+        assert!(info.name.chars().count() <= 100 && info.name != long, "{}", info.name);
+        let (second, _) = ok(a.paste_source("Main", &clip));
+        assert_ne!(second.name, info.name);
+        assert_eq!(numbered("abc", 2), "abc 2");
+        assert_eq!(numbered(&"x".repeat(99), 12).chars().count(), 100);
+    }
+
+    #[test]
+    fn sources_without_uuids_get_uuids_of_their_own() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        let blue = color(&a, "Blue");
+        let g = ok(a.group_together("Main", &[red.id, blue.id], "Pair"));
+        let mut clip = ok(a.copy_source("Main", g.id));
+        for src in clip.sources.iter_mut() {
+            src.as_object_mut().map(|o| o.remove("uuid"));
+        }
+        ok(b.paste_source("Main", &clip));
+        let ids: Vec<String> = b.sources_list().iter().map(|s| s["uuid"].as_str().unwrap_or("").to_string()).collect();
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "no two sources share a uuid: {ids:?}");
+        assert!(ids.iter().all(|u| !u.is_empty()));
+    }
+
+    #[test]
+    fn a_kind_the_collection_already_runs_is_not_refused_as_foreign() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        let mut clip = ok(a.copy_source("Main", red.id));
+        clip.sources[0]["versioned_id"] = json!("legacy_source_kind");
+        clip.sources[0]["filters"] =
+            json!([{ "name": "Old", "versioned_id": "legacy_filter_kind", "uuid": "f1", "settings": {} }]);
+        assert!(b.paste_source("Main", &clip).is_err(), "unknown here: refused");
+        b.edit(|d| {
+            d["sources"].as_array_mut().map(|l| {
+                l.push(json!({ "id": "legacy_source_kind", "versioned_id": "legacy_source_kind", "name": "Have", "uuid": "u9",
+                    "settings": {}, "filters": [{ "name": "X", "versioned_id": "legacy_filter_kind", "uuid": "f9", "settings": {} }] }))
+            });
+        });
+        ok(b.paste_source("Main", &clip));
+    }
+
+    #[test]
+    fn a_pasted_groups_children_filters_are_checked_and_get_new_ids() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        let blue = color(&a, "Blue");
+        let g = ok(a.group_together("Main", &[red.id, blue.id], "Pair"));
+        let mut clip = ok(a.copy_source("Main", g.id));
+        let kid = |c: &mut SourceClip| {
+            c.sources[0]["settings"]["items"][0]["ferrocast_filters"] = json!([{ "name": "Own", "versioned_id": "gain_filter", "id": "gain_filter", "uuid": "same-uuid", "settings": {} }]);
+        };
+        kid(&mut clip);
+        ok(b.paste_source("Main", &clip));
+        let items = b.sources_list().into_iter().find(|s| name_of(s) == "Pair").unwrap_or_default();
+        let own = &items["settings"]["items"][0]["ferrocast_filters"][0];
+        assert_ne!(own["uuid"], json!("same-uuid"), "a new id");
+        let mut bad = ok(a.copy_source("Main", g.id));
+        kid(&mut bad);
+        bad.sources[0]["settings"]["items"][0]["ferrocast_filters"][0]["versioned_id"] = json!("alien_filter");
+        assert!(b.paste_source("Main", &bad).is_err(), "a child's own filter of a kind this computer lacks");
+    }
+
+    #[test]
+    fn a_held_filter_key_changes_the_sources_filter_not_a_pictures_own_copy() {
+        let a = stage();
+        ok(a.add_source("Main", "color_source_v3", "Cam", &json!({}), false));
+        ok(a.add_filter("Cam", "color_filter", "Boost", &json!({})));
+        ok(a.add_source("Main", "color_source_v3", "Other", &json!({}), false));
+        let it = ok(a.add_existing("Main", "Cam"));
+        ok(a.set_item_filter_scope("Main", it.id, true));
+        ok(a.set_source_filter_enabled("Cam", "Boost", false));
+        let own = ok(a.item_filters("Main", it.id));
+        assert!(own.iter().any(|f| f.name == "Boost" && f.enabled), "the picture's own copy is as it was");
+        assert!(ok(a.filters("Cam")).iter().any(|f| f.name == "Boost" && !f.enabled));
     }
 
     #[test]

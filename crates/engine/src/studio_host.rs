@@ -2375,6 +2375,7 @@ impl Engine {
         let (load_collection, allow_auto_start, _enabled_normal) = self.apply_start_options(&opts)?;
         let mut status = if was_running {
             if confirming && load_collection {
+                self.studio_release_holds().await;
                 host.confirm_collection().await.map_err(failed)?
             } else {
                 host.status().await
@@ -2638,6 +2639,8 @@ impl Engine {
             return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
         }
         self.ensure_idle_for_switch("scene collections").await?;
+        // Keys held now belong to the collection being left.
+        self.studio_release_holds().await;
         let host = self.studio_host()?;
         let list = host.streamlabs_collections().await.map_err(failed)?;
         if !list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id)) {
@@ -2658,6 +2661,7 @@ impl Engine {
             return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
         }
         self.ensure_idle_for_switch("scene collections").await?;
+        self.studio_release_holds().await;
         let host = self.studio_host()?;
         let list = host.obs_collections().await.map_err(failed)?;
         let known = list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id));
@@ -2693,6 +2697,11 @@ impl Engine {
     /// Does one thing to the scene collection, after checking it.
     pub async fn studio_act(&self, mut act: StudioAct) -> Result<Value, EngineError> {
         act.check()?;
+        // Undo and redo go back through snapshots: a key held now would be in them, and its
+        // release would then undo the undo. Held keys are let go first.
+        if matches!(act, StudioAct::Undo | StudioAct::Redo) {
+            self.studio_release_holds().await;
+        }
         let turns_vertical = matches!(act, StudioAct::StartVertical { .. } | StudioAct::StopVertical);
         let out = self.studio_host()?.act(act).await.map_err(failed)?;
         if turns_vertical {
@@ -3108,7 +3117,7 @@ fn captions_failed(message: String) -> EngineError {
     EngineError::Refused { status: 422, code: "captions_unavailable", message, hint: hint.into(), retry_after: None }
 }
 
-fn failed(message: String) -> EngineError {
+pub(crate) fn failed(message: String) -> EngineError {
     let refused = |status, code, message: String, hint: &str| EngineError::Refused {
         status,
         code,

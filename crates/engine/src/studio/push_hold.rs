@@ -87,6 +87,11 @@ pub(crate) struct Holds {
     by_action: HashMap<String, Target>,
     /// Each held target: its state before the first hold, and the actions holding it.
     by_target: HashMap<Target, (bool, Vec<String>)>,
+    /// Bumped whenever every hold is let go (a collection switch): a press that began before
+    /// it, and was still looking its item up, must not register afterwards.
+    epoch: u64,
+    /// Restores that failed for a reason that may pass (the window was busy): tried again.
+    pending: Vec<(Target, bool)>,
 }
 
 impl Holds {
@@ -102,7 +107,17 @@ impl Holds {
     /// The key for `action` went down on `target`, which is `now` shown or on. False when this
     /// action already holds (a repeat: nothing is recorded again).
     pub(crate) fn press(&mut self, action: &str, target: Target, now: bool) -> bool {
-        if self.holding(action) {
+        self.press_at(self.epoch, action, target, now)
+    }
+
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// [`press`](Self::press) for a press that began at `epoch`: false when every hold was let
+    /// go since (the target it found belongs to the collection that was left).
+    pub(crate) fn press_at(&mut self, epoch: u64, action: &str, target: Target, now: bool) -> bool {
+        if epoch != self.epoch || self.holding(action) {
             return false;
         }
         let entry = self.by_target.entry(target.clone()).or_insert_with(|| (now, Vec::new()));
@@ -134,12 +149,33 @@ impl Holds {
         }
     }
 
+    /// A restore that failed for a passing reason, to try again.
+    pub(crate) fn keep_pending(&mut self, target: Target, was: bool) {
+        self.pending.retain(|(t, _)| *t != target);
+        self.pending.push((target, was));
+    }
+
+    pub(crate) fn take_pending_is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    pub(crate) fn take_pending(&mut self) -> Vec<(Target, bool)> {
+        std::mem::take(&mut self.pending)
+    }
+
     /// Every hold let go → what to put back.
     pub(crate) fn release_all(&mut self) -> Vec<(Target, bool)> {
         let out = self.by_target.drain().map(|(t, (was, _))| (t, was)).collect();
         self.by_action.clear();
+        self.epoch += 1;
         out
     }
+}
+
+/// Whether a failed restore is for good: the item, filter, scene or source isn't there.
+fn gone(e: &EngineError) -> bool {
+    let m = e.to_string().to_lowercase();
+    ["no such", "has no", "no scene", "no source", "doesn't exist", "not found"].iter().any(|p| m.contains(p))
 }
 
 impl Engine {
@@ -153,17 +189,16 @@ impl Engine {
         };
         if !pressed {
             let back = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).release(action);
-            if let Some((target, was)) = back
-                && let Err(e) = self.apply_hold(&target, was).await
-            {
-                // Deleted or renamed while held: nothing to put back.
-                tracing::debug!(action, error = %e, "a held item or filter couldn't be put back");
+            if let Some((target, was)) = back {
+                self.restore(target, was).await;
             }
             return Ok(());
         }
+        self.retry_pending().await;
         if self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).holding(action) {
             return Ok(());
         }
+        let epoch = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).epoch();
         let (target, now) = match kind {
             Kind::Show | Kind::Hide => {
                 let items = self.studio_act(StudioAct::Items { scene: a.to_string() }).await?;
@@ -184,7 +219,8 @@ impl Engine {
                 (Target::Filter { source: a.to_string(), filter: b.to_string() }, on)
             }
         };
-        let first = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).press(action, target.clone(), now);
+        let first =
+            self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).press_at(epoch, action, target.clone(), now);
         if first && let Err(e) = self.apply_hold(&target, kind.held_state()).await {
             self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).forget(action);
             return Err(e);
@@ -197,8 +233,41 @@ impl Engine {
     pub async fn studio_release_holds(&self) {
         let back = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).release_all();
         for (target, was) in back {
-            if let Err(e) = self.apply_hold(&target, was).await {
-                tracing::debug!(error = %e, "a held item or filter couldn't be put back");
+            self.restore(target, was).await;
+        }
+        self.retry_pending().await;
+    }
+
+    /// Puts a target back. A target that is gone (deleted, renamed, another collection) is
+    /// nothing to put back; a failure that may pass (the Studio was busy) is kept and tried
+    /// again, now and a few times in the next seconds.
+    async fn restore(&self, target: Target, was: bool) {
+        let Err(e) = self.apply_hold(&target, was).await else { return };
+        if gone(&e) {
+            tracing::debug!(error = %e, "a held item or filter is gone: nothing to put back");
+            return;
+        }
+        tracing::warn!(error = %e, "a held item or filter couldn't be put back yet; trying again");
+        self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).keep_pending(target, was);
+        let engine = self.clone();
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                if engine.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).take_pending_is_empty() {
+                    return;
+                }
+                engine.retry_pending().await;
+            }
+        });
+    }
+
+    async fn retry_pending(&self) {
+        let todo = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).take_pending();
+        for (target, was) in todo {
+            match self.apply_hold(&target, was).await {
+                Ok(()) => {}
+                Err(e) if gone(&e) => {}
+                Err(_) => self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).keep_pending(target, was),
             }
         }
     }
@@ -210,7 +279,11 @@ impl Engine {
                 StudioAct::PushFilter { name: source.clone(), filter: filter.clone(), enabled: on }
             }
         };
-        self.studio_act(act).await.map(|_| ())
+        // Straight to the host: this runs inside the release that Undo and collection switches
+        // start, so it must not come back through `studio_act`.
+        let mut act = act;
+        act.check()?;
+        self.studio_host()?.act(act).await.map(|_| ()).map_err(crate::studio_host::failed)
     }
 }
 
@@ -656,6 +729,69 @@ mod tests {
         assert_eq!(host.enabled("Cam", "Glow"), Some(false));
         e.studio_push_hold("push_filter_off:Cam\nGlow", false).await.unwrap();
         assert_eq!(host.enabled("Cam", "Glow"), Some(true));
+    }
+
+    #[test]
+    fn a_press_that_began_before_a_collection_switch_does_not_register_after_it() {
+        let mut h = Holds::default();
+        let began = h.epoch();
+        assert_eq!(h.release_all(), vec![]);
+        assert!(
+            !h.press_at(began, "push_show:Main\nCam", item("Main", 1), false),
+            "stale: the item is the old collection's"
+        );
+        assert!(h.is_empty());
+        assert!(h.press_at(h.epoch(), "push_show:Main\nCam", item("Main", 1), false));
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_fails_because_the_studio_was_busy_is_tried_again() {
+        let host = world();
+        let (e, _d) = engine_with(host.clone()).await;
+        e.studio_push_hold("push_show:Main\nCam", true).await.unwrap();
+        assert_eq!(host.shown("Main", "Cam"), Some(true));
+        host.fail_pushes.store(true, std::sync::atomic::Ordering::SeqCst);
+        e.studio_push_hold("push_show:Main\nCam", false).await.unwrap();
+        assert_eq!(host.shown("Main", "Cam"), Some(true), "the restore failed: still held");
+        host.fail_pushes.store(false, std::sync::atomic::Ordering::SeqCst);
+        // By itself within a moment...
+        for _ in 0..40 {
+            if host.shown("Main", "Cam") == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(host.shown("Main", "Cam"), Some(false), "put back by the retry");
+    }
+
+    #[tokio::test]
+    async fn a_restore_of_an_item_that_is_gone_is_not_retried_for_ever() {
+        let host = world();
+        let (e, _d) = engine_with(host.clone()).await;
+        e.studio_push_hold("push_show:Main\nCam", true).await.unwrap();
+        host.remove_item("Main", "Cam");
+        let before = host.pushes();
+        e.studio_push_hold("push_show:Main\nCam", false).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(host.pushes(), before + 1, "one try, no retries for something that is gone");
+    }
+
+    #[tokio::test]
+    async fn undo_redo_and_collection_imports_let_every_hold_go_first() {
+        for what in ["undo", "redo", "import_obs", "import_streamlabs"] {
+            let host = world();
+            let (e, _d) = engine_with(host.clone()).await;
+            e.studio_push_hold("push_show:Main\nCam", true).await.unwrap();
+            assert_eq!(host.shown("Main", "Cam"), Some(true), "{what}");
+            match what {
+                "undo" => drop(e.studio_act(StudioAct::Undo).await),
+                "redo" => drop(e.studio_act(StudioAct::Redo).await),
+                "import_obs" => drop(e.studio_import_obs("Untitled").await),
+                _ => drop(e.studio_import_streamlabs("Untitled").await),
+            }
+            assert_eq!(host.shown("Main", "Cam"), Some(false), "{what}: put back before the switch");
+            assert!(e.studio().holds.lock().unwrap().is_empty(), "{what}");
+        }
     }
 
     #[tokio::test]

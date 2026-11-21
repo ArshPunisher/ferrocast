@@ -1543,7 +1543,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::PushItem { scene, id, visible } => {
             done(c.edit_item(&scene, id, if visible { ItemEdit::Show } else { ItemEdit::Hide }))
         }
-        A::PushFilter { name, filter, enabled } => done(c.set_filter_enabled(&name, &filter, enabled)),
+        A::PushFilter { name, filter, enabled } => done(c.set_source_filter_enabled(&name, &filter, enabled)),
         A::Sources => v(to_json!(c.sources())),
         A::Rename { name, new_name } => done(c.rename(&name, &new_name)),
         A::Settings { name } => c.settings(&name),
