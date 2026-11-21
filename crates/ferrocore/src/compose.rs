@@ -276,11 +276,22 @@ impl std::fmt::Debug for Rig {
     }
 }
 
+/// Tests: a closure run by the compositor (it has no `Debug`).
+#[cfg(test)]
+pub(crate) struct TestHook(pub(crate) Box<dyn Fn(&Compositor) + Send>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook")
+    }
+}
+
 /// Rigs kept at most. Each size an output draws at needs one per frame on the card plus the one
-/// being drawn ([`crate::engine::IN_FLIGHT`] + 1); this covers four sizes (main, two Twitch
-/// Enhanced Broadcasting qualities and a vertical or virtual-camera canvas) without remaking
-/// textures every frame.
-const RIGS: usize = 4 * (crate::engine::IN_FLIGHT + 1) + 2;
+/// being drawn ([`crate::engine::IN_FLIGHT`] + 1); this covers eight sizes (main, up to four
+/// Twitch Enhanced Broadcasting qualities, a vertical and a virtual-camera canvas) without
+/// remaking textures every frame.
+const RIGS: usize = 8 * (crate::engine::IN_FLIGHT + 1) + 2;
 
 /// Whether frames are drawn into pooled surfaces (Mac) from the start: on unless
 /// FERROCORE_COPY_FRAMES is set (to compare against the copying path).
@@ -350,6 +361,10 @@ pub struct Compositor {
     /// Pooled IOSurface frames the card draws into, one pool per size (the newest few).
     #[cfg(target_os = "macos")]
     surfaces: Mutex<Vec<crate::apple::surface::SurfacePool>>,
+    /// Tests: run between a frame's submit and its completion callback (other threads submit
+    /// there too).
+    #[cfg(test)]
+    after_submit: Mutex<Option<TestHook>>,
     /// Whether frames go into those (see `surfaces_default`).
     #[cfg(target_os = "macos")]
     surfaces_on: AtomicBool,
@@ -744,6 +759,8 @@ impl Compositor {
             surfaces: Mutex::new(Vec::new()),
             #[cfg(target_os = "macos")]
             surfaces_on: AtomicBool::new(surfaces_default()),
+            #[cfg(test)]
+            after_submit: Mutex::new(None),
             nv12,
             yuv_in: std::sync::OnceLock::new(),
             planes: Mutex::new(HashMap::new()),
@@ -2223,6 +2240,10 @@ impl Compositor {
             );
         }
         let done_at = self.submit([enc.finish()]);
+        #[cfg(test)]
+        if let Some(hook) = self.after_submit.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            (hook.0)(self);
+        }
         let state = Arc::new(Readback::default());
         if direct {
             // No buffers to map: the surface is ready when the card says its work is done.
@@ -2261,15 +2282,20 @@ impl Compositor {
         /// Buffers a size's pool may hold: the frames on the card plus what the encoders keep
         /// (VideoToolbox's reorder window and queue), shared by every output of the canvas.
         const MAX_BUFFERS: u32 = 16;
-        /// Sizes kept (main, two Twitch qualities, a vertical canvas).
-        const SIZES: usize = 4;
+        /// Sizes kept (main, up to four Twitch qualities, a vertical canvas, a camera): the least
+        /// recently used goes, so a cycle through them all never evicts the one needed next.
+        const SIZES: usize = 8;
         if !self.surfaces_on.load(Ordering::Relaxed) {
             return None;
         }
         let taken = {
             let mut pools = self.surfaces.lock().unwrap_or_else(|e| e.into_inner());
             let at = match pools.iter().position(|p| p.size() == (w, h)) {
-                Some(at) => at,
+                Some(at) => {
+                    let used = pools.remove(at);
+                    pools.push(used);
+                    pools.len() - 1
+                }
                 None => {
                     let Some(p) = SurfacePool::new(w, h, MAX_BUFFERS) else {
                         crate::video::note_fallback_frame();
@@ -2278,6 +2304,7 @@ impl Compositor {
                     if pools.len() >= SIZES {
                         pools.remove(0);
                     }
+                    crate::video::note_pool_made();
                     pools.push(p);
                     pools.len() - 1
                 }
@@ -2321,12 +2348,26 @@ impl Compositor {
         let PendingNv12 { rig, state, done_at, surface } = p;
         #[cfg(not(target_os = "macos"))]
         let PendingNv12 { rig, state, done_at } = p;
+        let mut waited = false;
         if !(state.failed.load(Ordering::Acquire) || state.mapped.load(Ordering::Acquire) >= 2) {
             self.device
                 .poll(wgpu::PollType::Wait { submission_index: Some(done_at), timeout: None })
                 .map_err(|e| AvError::Readback(e.to_string()))?;
+            waited = true;
         }
-        if state.failed.load(Ordering::Acquire) || state.mapped.load(Ordering::Acquire) < 2 {
+        // A surface frame has no buffers to map: its work being done (the wait above came back) is
+        // all it needs. The completion callback may hang on a later submission (another thread
+        // submitted between ours and the callback's registering), so it is not waited for.
+        #[cfg(target_os = "macos")]
+        let finished_without_callback = waited && surface.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let finished_without_callback = {
+            let _ = waited;
+            false
+        };
+        if state.failed.load(Ordering::Acquire)
+            || (state.mapped.load(Ordering::Acquire) < 2 && !finished_without_callback)
+        {
             // Mapped halfway or not at all: this rig is let go (a new one is made).
             drop(rig);
             return Err(AvError::Readback("the card couldn't hand the frame back".into()));
@@ -3014,5 +3055,33 @@ mod mask_tests {
         // Oldest keys were evicted; newest are retained.
         assert!(cache.get(0).is_none());
         assert!(cache.get(9_999).is_some());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod surface_tests {
+    use super::TestHook;
+    use super::*;
+
+    /// Other threads submit to the same queue (previews, NDI, uploads): work submitted between a
+    /// frame's submit and its completion callback must not make the frame look unfinished when
+    /// it is waited for (that failed the readback and tore down every output on the canvas).
+    #[test]
+    fn a_surface_frame_waited_for_is_whole_whatever_else_submits() {
+        let Ok(c) = Compositor::new() else { return };
+        c.set_zero_copy(true);
+        *c.after_submit.lock().unwrap_or_else(|e| e.into_inner()) = Some(TestHook(Box::new(|c: &Compositor| {
+            for _ in 0..4 {
+                let e = c.device.create_command_encoder(&Default::default());
+                c.submit([e.finish()]);
+            }
+        })));
+        let scene = Scene { width: 640, height: 360, items: vec![] };
+        for _ in 0..20 {
+            let p = c.begin_nv12(&scene).unwrap_or_else(|e| panic!("{e}"));
+            // Waited for at once, as `deliver` does past its in-flight limit or when flushing.
+            let d = c.finish_drawn(p).unwrap_or_else(|e| panic!("{e}"));
+            assert!(matches!(d, Drawn::Surface { .. }));
+        }
     }
 }
