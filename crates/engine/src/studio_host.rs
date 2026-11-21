@@ -74,6 +74,10 @@ pub struct PreviewRect {
     /// missing: dark.
     #[serde(default)]
     pub bg: Option<u32>,
+    /// The second colour of the diagonal stripes drawn over the part of a source that runs past
+    /// the canvas (0xRRGGBB); `bg` is the first. Missing: no stripes, the surround stays plain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stripe: Option<u32>,
     /// Where the page's menus and panels lie over the box (points from its top left): the
     /// picture isn't drawn there, so they show through instead of the whole preview hiding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -94,7 +98,16 @@ pub const PREVIEW_HOLES: usize = 16;
 impl PreviewRect {
     /// `bg` as libobs wants a display's colour (0xAABBGGRR).
     pub fn bg_abgr(&self) -> Option<u32> {
-        let rgb = self.bg.filter(|c| *c <= 0xff_ffff)?;
+        Self::abgr(self.bg)
+    }
+
+    /// `stripe` the same way.
+    pub fn stripe_abgr(&self) -> Option<u32> {
+        Self::abgr(self.stripe)
+    }
+
+    fn abgr(rgb: Option<u32>) -> Option<u32> {
+        let rgb = rgb.filter(|c| *c <= 0xff_ffff)?;
         let (r, g, b) = (rgb >> 16 & 0xff, rgb >> 8 & 0xff, rgb & 0xff);
         Some(0xff00_0000 | b << 16 | g << 8 | r)
     }
@@ -142,6 +155,9 @@ impl PreviewRect {
         }
         if self.bg.is_some() && self.bg_abgr().is_none() {
             return Err("bg: a colour, 0 to 0xFFFFFF.".into());
+        }
+        if self.stripe.is_some() && self.stripe_abgr().is_none() {
+            return Err("stripe: a colour, 0 to 0xFFFFFF.".into());
         }
         if self.opacity.is_some_and(|o| !(0.0..=1.0).contains(&o)) {
             return Err("opacity: 0 to 1.".into());
@@ -3926,6 +3942,7 @@ mod tests {
             holes: vec![],
             opacity: None,
             shade: None,
+            stripe: None,
         };
         e.studio_preview(Some(r.clone()), Some(r.clone()), Some(r.clone())).await.unwrap();
         e.studio_preview(None, None, None).await.unwrap();
@@ -3938,6 +3955,11 @@ mod tests {
         assert!(holed.validate().is_ok());
         let light = PreviewRect { bg: Some(0xe7e9ee), ..r.clone() };
         assert_eq!(light.bg_abgr(), Some(0xffee_e9e7));
+        // The second colour of the stripes over what runs past the canvas, as 0xRRGGBB.
+        let striped = PreviewRect { bg: Some(0xe6e8ed), stripe: Some(0xdcdfe6), ..r.clone() };
+        assert!(striped.validate().is_ok());
+        assert_eq!(striped.stripe_abgr(), Some(0xffe6_dfdc));
+        assert_eq!(r.stripe_abgr(), None, "none unless the page says");
         let canvas = |w: f64, h: f64| PreviewRect { canvas: Some(CanvasBox { x: 0.0, y: 0.0, w, h }), ..r.clone() };
         for bad in [
             PreviewRect { w: 0.0, ..r.clone() },
@@ -3948,6 +3970,7 @@ mod tests {
             canvas(0.0, 270.0),
             canvas(480.0, f64::NAN),
             PreviewRect { bg: Some(0x0100_0000), ..r.clone() },
+            PreviewRect { stripe: Some(0x0100_0000), ..r.clone() },
             PreviewRect { holes: vec![PreviewHole { x: 0.0, y: 0.0, w: f64::NAN, h: 1.0, r: 0.0 }], ..r.clone() },
             PreviewRect { holes: vec![PreviewHole { x: 0.0, y: 0.0, w: 1.0, h: 1.0, r: 500.0 }], ..r.clone() },
             PreviewRect {
