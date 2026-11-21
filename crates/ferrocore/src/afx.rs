@@ -69,6 +69,10 @@ pub trait SoundPlugin: Send + std::fmt::Debug {
         0
     }
 
+    /// The filter was bypassed (it saw no sound meanwhile) and is switched on again: drop what
+    /// it held from before, so old sound isn't played out of order.
+    fn reset(&mut self) {}
+
     /// Takes new settings for the same filter (a strength) and keeps running: true. False: it
     /// can't, and a new one is made.
     fn retune(&mut self, _effect: &AudioEffect) -> bool {
@@ -231,6 +235,10 @@ pub enum AudioEffect {
     /// Strong noise removal (DeepFilterNet, 48 kHz): "strength" 1 to 100 (100).
     Denoise {
         strength: u32,
+    },
+    /// "Remove background noise" (RNNoise, 48 kHz): "amount" 0 to 100 (100), the wet share.
+    Rnnoise {
+        amount: u32,
     },
     /// A VST plugin (`ferrocast_vst`), in the slot `plugin_slot` gave it.
     Plugin {
@@ -496,6 +504,13 @@ impl AudioFilter {
     /// Enables or bypasses this filter with a smooth 8 ms dry↔wet crossfade (zero clicks).
     pub fn set_enabled(&mut self, enabled: bool) {
         if self.enabled != enabled {
+            if enabled
+                && self.bypass_mix.rem == 0
+                && self.bypass_mix.cur <= 0.0
+                && let Some(p) = self.plugin.as_mut()
+            {
+                p.reset();
+            }
             self.enabled = enabled;
             self.bypass_mix.set_target(if enabled { 1.0 } else { 0.0 }, self.smooth_samples());
         }
@@ -512,6 +527,7 @@ impl AudioFilter {
     pub fn effect_needs_plugin(effect: AudioEffect, rate: u32) -> bool {
         match effect {
             AudioEffect::Denoise { .. } => rate == 48_000 && denoiser_available(),
+            AudioEffect::Rnnoise { .. } => rate == 48_000,
             AudioEffect::Plugin { .. } => plugins_available(),
             _ => false,
         }
@@ -525,6 +541,7 @@ impl AudioFilter {
             AudioEffect::Denoise { strength } if rate == 48_000 => {
                 DENOISER.get().and_then(|make| make(strength.clamp(1, 100)))
             }
+            AudioEffect::Rnnoise { amount } if rate == 48_000 => Some(Box::new(crate::rnnoise::Rnnoise::new(amount))),
             AudioEffect::Plugin { slot } => {
                 (!plugins_disabled()).then(|| PLUGIN_MAKER.get().and_then(|make| make(slot, rate))).flatten()
             }
@@ -714,7 +731,8 @@ impl AudioFilter {
         self.sync_smooth_targets();
         match self.effect {
             // No VST host in this app, or not running yet: the sound passes as it is.
-            AudioEffect::Plugin { .. } => {}
+            // Likewise RNNoise: its model is built off the audio thread (48 kHz only).
+            AudioEffect::Plugin { .. } | AudioEffect::Rnnoise { .. } => {}
             AudioEffect::Gain { .. } => {
                 for i in 0..n {
                     let m = self.smooth_gain.next();
@@ -2788,5 +2806,101 @@ mod tests {
             f.process([&mut l, &mut r]);
         }
         assert!(f.held <= 1.25, "held accumulator stayed bounded: {}", f.held);
+    }
+
+    fn noisy_speechlike(n: usize) -> Vec<f32> {
+        // A 150 Hz voiced "vowel" (harmonics, 4 Hz syllables) over steady broadband noise.
+        let mut seed = 12345u32;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let env = 0.5 + 0.5 * (2.0 * std::f32::consts::PI * 4.0 * t).sin().max(0.0);
+                let voice: f32 =
+                    (1..=8).map(|h| (2.0 * std::f32::consts::PI * 150.0 * h as f32 * t).sin() / h as f32).sum::<f32>()
+                        * 0.12
+                        * env;
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let noise = ((seed >> 8) as f32 / 8_388_608.0 - 1.0) * 0.05;
+                voice + noise
+            })
+            .collect()
+    }
+
+    fn rnn_filter(amount: u32) -> AudioFilter {
+        let mut f = AudioFilter::new_without_plugin(AudioEffect::Rnnoise { amount }, RATE);
+        f.install_plugin(AudioFilter::build_plugin(AudioEffect::Rnnoise { amount }, RATE).expect("built at 48 kHz"));
+        f
+    }
+
+    /// Band energy (dB) of a signal: Goertzel at 6 kHz, where the voice has nothing.
+    fn band_db(x: &[f32]) -> f32 {
+        let w = 2.0 * std::f32::consts::PI * 6000.0 / RATE as f32;
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for v in x {
+            let s = v + 2.0 * w.cos() * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        10.0 * ((s1 * s1 + s2 * s2 - 2.0 * w.cos() * s1 * s2) / x.len() as f32).max(1e-20).log10()
+    }
+
+    #[test]
+    fn rnnoise_quiets_the_noise_and_keeps_the_voice() {
+        let input = noisy_speechlike(RATE as usize * 3);
+        let mut out = input.clone();
+        let mut r = input.clone();
+        let mut f = rnn_filter(100);
+        for (cl, cr) in out.chunks_mut(480 * 2 + 7).zip(r.chunks_mut(480 * 2 + 7)) {
+            f.process([cl, cr]);
+        }
+        let tail = RATE as usize..RATE as usize * 3;
+        let drop = band_db(&input[tail.clone()]) - band_db(&out[tail.clone()]);
+        assert!(drop > 6.0, "noise band dropped only {drop:.1} dB");
+        assert!(rms(&out[tail.clone()]) > 0.3 * rms(&input[tail]), "the voice was kept");
+    }
+
+    #[test]
+    fn rnnoise_reports_its_latency_and_amount_zero_is_dry() {
+        let f = rnn_filter(100);
+        assert_eq!(f.latency_frames(), 480);
+        let input = noisy_speechlike(4800);
+        let (mut l, mut r) = (input.clone(), input.clone());
+        let mut f = rnn_filter(0);
+        f.process([&mut l, &mut r]);
+        for i in 480..4800 {
+            assert!((l[i] - input[i - 480]).abs() < 1e-5, "amount 0 is the input, 480 frames late (at {i})");
+        }
+    }
+
+    #[test]
+    fn rnnoise_toggle_steps_stay_small() {
+        let mut f = rnn_filter(100);
+        let sine = |i: usize| (i as f32 * 0.05).sin() * 0.3;
+        let mut prev = 0.0f32;
+        let mut worst = 0.0f32;
+        let mut pos = 0;
+        for blk in 0..60 {
+            let mut l: Vec<f32> = (0..480).map(|k| sine(pos + k)).collect();
+            let mut r = l.clone();
+            pos += 480;
+            if blk == 20 {
+                f.set_enabled(false);
+            }
+            if blk == 40 {
+                f.set_enabled(true);
+            }
+            f.process([&mut l, &mut r]);
+            if blk >= 10 {
+                for v in &l {
+                    worst = worst.max((v - prev).abs());
+                    prev = *v;
+                }
+            } else {
+                prev = *l.last().unwrap();
+            }
+        }
+        // Dry and wet are 480 frames apart, so the crossfade moves between two points of the
+        // same tone: the step per sample stays near the tone's own slope, never a click.
+        assert!(worst < 0.1, "worst step {worst}");
     }
 }

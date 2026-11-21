@@ -77,6 +77,7 @@ fn a_steady_mix_allocates_nothing() {
                 output_db: 0.0,
                 sidechain: Some(1),
             },
+            AudioEffect::Rnnoise { amount: 100 },
             AudioEffect::Limiter { threshold_db: -1.0, release_ms: 60.0 },
             AudioEffect::Expander {
                 ratio: 2.0,

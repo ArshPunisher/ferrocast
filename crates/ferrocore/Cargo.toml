@@ -24,6 +24,8 @@ half = "2"
 naga = { version = "30", features = ["wgsl-in"] }
 # A VST plugin's saved state in a collection (obs.rs `vst_effect`).
 base64 = "0.22"
+# RNNoise in pure Rust (BSD-3-Clause, no unsafe without `capi`): "Remove background noise".
+nnnoiseless = { version = "0.5.2", default-features = false }
 
 
 [dev-dependencies]
