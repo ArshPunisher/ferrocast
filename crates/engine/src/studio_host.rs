@@ -3078,6 +3078,7 @@ fn failed(message: String) -> EngineError {
         return refused(404, "studio_no_obs_collection", message, "Pick one from the list.");
     }
     if message.contains("JSON is damaged")
+        || message.contains("is damaged and can't be read")
         || message.contains("didn't read")
         || message.contains("isn't an OBS")
         || message.contains("isn't a Streamlabs")
@@ -3696,6 +3697,29 @@ mod tests {
         let v = e.studio_levels(vec!["Mic".into()], false).await.unwrap();
         assert!(v.get("Mic").is_none(), "the fast path answered with no engine: {v}");
         held.await.unwrap().unwrap();
+    }
+
+    /// The readers' words for a file that went bad after it was listed map to the same plain error.
+    #[test]
+    fn a_damaged_or_big_import_file_has_its_own_error() {
+        for (m, status, code) in [
+            (
+                "OBS's scene collection \"x\" is damaged and can't be read. Open it in OBS to check it, or start fresh.",
+                422,
+                "studio_collection_broken",
+            ),
+            (
+                "That Streamlabs scene collection is damaged and can't be read. Open it in Streamlabs to check it, or start fresh.",
+                422,
+                "studio_collection_broken",
+            ),
+            ("OBS's scene collection \"x\" is too large to import.", 413, "studio_collection_too_large"),
+        ] {
+            assert!(
+                matches!(failed(m.into()), EngineError::Refused { status: s, code: c, .. } if s == status && c == code),
+                "{m}"
+            );
+        }
     }
 
     #[test]
