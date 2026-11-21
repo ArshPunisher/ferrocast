@@ -106,6 +106,7 @@ impl Holds {
 
     /// The key for `action` went down on `target`, which is `now` shown or on. False when this
     /// action already holds (a repeat: nothing is recorded again).
+    #[cfg(test)]
     pub(crate) fn press(&mut self, action: &str, target: Target, now: bool) -> bool {
         self.press_at(self.epoch, action, target, now)
     }

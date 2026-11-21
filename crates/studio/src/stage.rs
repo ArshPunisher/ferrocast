@@ -6531,10 +6531,10 @@ mod tests {
             json!([{ "name": "Old", "versioned_id": "legacy_filter_kind", "uuid": "f1", "settings": {} }]);
         assert!(b.paste_source("Main", &clip).is_err(), "unknown here: refused");
         b.edit(|d| {
-            d["sources"].as_array_mut().map(|l| {
+            if let Some(l) = d["sources"].as_array_mut() {
                 l.push(json!({ "id": "legacy_source_kind", "versioned_id": "legacy_source_kind", "name": "Have", "uuid": "u9",
-                    "settings": {}, "filters": [{ "name": "X", "versioned_id": "legacy_filter_kind", "uuid": "f9", "settings": {} }] }))
-            });
+                    "settings": {}, "filters": [{ "name": "X", "versioned_id": "legacy_filter_kind", "uuid": "f9", "settings": {} }] }));
+            }
         });
         ok(b.paste_source("Main", &clip));
     }
