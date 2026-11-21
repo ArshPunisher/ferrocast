@@ -4880,6 +4880,9 @@ struct ViewLook {
     ppp: f32,
     /// Distance guides for the picked source (while it's dragged).
     guides: bool,
+    /// The second colour (0xAABBGGRR) of the stripes over what runs past the canvas; the first is
+    /// `background`. None draws no stripes.
+    stripe: Option<u32>,
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -5050,6 +5053,14 @@ impl StageView {
         self.push();
     }
 
+    /// The second colour of the stripes drawn over the part of a source that runs past the
+    /// canvas (0xAABBGGRR; the first is `background`), or none for a plain surround.
+    pub fn overflow_stripes(&self, abgr: Option<u32>) {
+        if std::mem::replace(&mut self.look.borrow_mut().stripe, abgr) != abgr {
+            self.push();
+        }
+    }
+
     /// A dark layer over the view, 0 to 1 (a dialog's backdrop).
     pub fn set_shade(&self, shade: f64) {
         self.look.borrow_mut().shade = shade.clamp(0.0, 1.0) as f32;
@@ -5114,6 +5125,15 @@ impl StageView {
                 }),
                 shade: l.shade,
                 guides: l.guides.then_some(l.ppp),
+                overflow: l.stripe.map(|abgr| {
+                    let c = |shift: u32| ((abgr >> shift) & 0xff) as f32 / 255.0;
+                    ferrocore::preview::Overflow {
+                        a: l.background,
+                        b: [c(0), c(8), c(16), 1.0],
+                        // 18 points across, as the page's own stripes would be.
+                        period: 18.0 * l.ppp,
+                    }
+                }),
             },
         );
     }
@@ -5403,6 +5423,7 @@ impl StageView {
     pub fn frames(&self, _scene: Option<&str>) {}
     pub fn guides(&self, _on: bool) {}
     pub fn background(&self, _abgr: u32) {}
+    pub fn overflow_stripes(&self, _abgr: Option<u32>) {}
     pub fn set_shade(&self, _shade: f64) {}
     pub fn set_holes(&self, _holes: &[(f64, f64, f64, f64, f64)]) {}
     pub fn set_opacity(&self, _opacity: f64) {}
