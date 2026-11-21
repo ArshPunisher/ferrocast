@@ -1842,24 +1842,51 @@ mod tests {
         Tag::Video { ms, body }
     }
 
+    /// Each packet goes when it is the delay old, never sooner: while the stream runs, and after it
+    /// ends (no burst of what was held). Checked as "not before" from when each was sent, so a
+    /// slow computer (a CI runner oversleeping) can't fail it: one that slept past 300 ms let the
+    /// first go before the end, as it should, and the old "nothing sent at the end" check failed.
     #[test]
     fn a_delayed_stream_holds_back_then_sends_the_rest_after_it_ends_at_its_own_pace() {
+        let delay = Duration::from_millis(300);
         let (mut out, counts) = delayed(300);
         let gate = out.gate.clone();
         let sent = || counts.bytes.load(Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
         out.send(video(0, true, 10));
-        assert_eq!(sent(), 0, "held back");
+        assert!(sent() == 0 || t0.elapsed() >= delay, "held back");
         std::thread::sleep(Duration::from_millis(100));
+        let t1 = std::time::Instant::now();
         out.send(video(100, false, 5));
         std::thread::sleep(Duration::from_millis(100));
+        let t2 = std::time::Instant::now();
         out.send(video(200, false, 7));
-        // Ending: no burst. The first goes at 300 ms, the others after it, as they would have.
+        // Ending: no burst. Each goes when it is 300 ms old, as it would have.
         drop(out);
-        assert!(gate.is_running());
-        assert_eq!(sent(), 0, "ending doesn't dump what's held");
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(sent(), 10, "the first when it is 300 ms old");
+        // (Unless this thread was held up past the last one's time: then it has gone.)
+        assert!(gate.is_running() || t2.elapsed() >= delay, "the last is still held");
+        // When each amount was first seen sent (stamped after it was read, so never before it went).
+        let mut seen: Vec<(u64, std::time::Instant)> = Vec::new();
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        while gate.is_running() && std::time::Instant::now() < end {
+            let n = sent();
+            if seen.last().is_none_or(|(m, _)| *m != n) {
+                seen.push((n, std::time::Instant::now()));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         gate.wait_done();
+        seen.push((sent(), std::time::Instant::now()));
+        // Every amount was seen at some point (the last one at least after the end), and never
+        // sooner than the delay after its packet was sent.
+        let not_before = |bytes: u64, at: std::time::Instant| {
+            seen.iter().any(|(n, _)| *n >= bytes)
+                && seen.iter().filter(|(n, _)| *n >= bytes).all(|(_, when)| *when >= at + delay)
+        };
+        assert!(not_before(10, t0), "the first not before it is 300 ms old: {seen:?}");
+        assert!(not_before(15, t1), "the second not before it is: {seen:?}");
+        assert!(not_before(22, t2), "the last not before it is: {seen:?}");
+        assert!(t0.elapsed() >= delay + Duration::from_millis(200), "the end waited for the last");
         assert_eq!(sent(), 22, "all of it, after the delay");
     }
 
