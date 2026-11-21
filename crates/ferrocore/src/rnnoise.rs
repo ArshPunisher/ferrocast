@@ -59,8 +59,10 @@ pub struct Rnnoise {
     /// Wet share now and wanted (0 to 1); moves over one frame so a slider doesn't click.
     amount: f32,
     target: f32,
-    /// Frames still to come after a reset: the first is let go (the model's old history makes it
-    /// unlike the next), the second faded in, so the sound never steps up from silence.
+    /// Frames still to play after a reset (3, 2, 1): the sound as it comes in (as it was while
+    /// bypassed, with nothing cleaned yet), then from it to the same sound a frame late, then from
+    /// that to the cleaned one (the model's first frame back is let go: its old history makes it
+    /// unlike the next). Never a gap and never a step.
     fresh: u8,
 }
 
@@ -93,7 +95,18 @@ impl SoundPlugin for Rnnoise {
         for i in 0..n {
             let p = self.pos;
             // What goes out is the previous frame's result at this place: a fixed 480 delay.
-            let (yl, yr) = (self.ch[0].out[p], self.ch[1].out[p]);
+            let (mut yl, mut yr) = (self.ch[0].out[p], self.ch[1].out[p]);
+            match self.fresh {
+                // Back from a bypass with nothing collected: the sound goes on as it comes.
+                3 => (yl, yr) = (l[i], r[i]),
+                // Then over one frame into the same sound a frame late.
+                2 => {
+                    let a = (p + 1) as f32 / FRAME_SIZE as f32;
+                    yl = l[i] + (yl - l[i]) * a;
+                    yr = r[i] + (yr - r[i]) * a;
+                }
+                _ => {}
+            }
             self.ch[0].collect[p] = l[i];
             self.ch[1].collect[p] = r[i];
             l[i] = yl;
@@ -104,14 +117,18 @@ impl SoundPlugin for Rnnoise {
                 let (a0, a1) = (self.amount, self.target);
                 self.ch[0].run_frame(a0, a1);
                 self.ch[1].run_frame(a0, a1);
-                if self.fresh > 0 {
+                // The first frame back plays dry (a frame late); the next goes from dry to
+                // cleaned over the frame.
+                if self.fresh > 1 {
                     for c in &mut self.ch {
-                        for (k, v) in c.out.iter_mut().enumerate() {
-                            *v *= if self.fresh == 2 { 0.0 } else { k as f32 / FRAME_SIZE as f32 };
+                        for (k, (v, d)) in c.out.iter_mut().zip(&c.collect).enumerate() {
+                            let dry = if d.is_finite() { *d } else { 0.0 };
+                            let a = if self.fresh == 3 { 0.0 } else { (k + 1) as f32 / FRAME_SIZE as f32 };
+                            *v = dry + (*v - dry) * a;
                         }
                     }
-                    self.fresh -= 1;
                 }
+                self.fresh = self.fresh.saturating_sub(1);
                 self.amount = a1;
             }
         }
@@ -122,15 +139,15 @@ impl SoundPlugin for Rnnoise {
         LATENCY_FRAMES
     }
 
-    /// Back from a bypass: forget the stale frame (it would play out of order); the filter's
-    /// own 8 ms crossfade hides the 10 ms of silence while the first frame fills.
+    /// Back from a bypass: forget the stale frame (it would play out of order) and come back in
+    /// three frames (see `fresh`), so the sound has no gap while the first frame fills.
     fn reset(&mut self) {
         for c in &mut self.ch {
             c.collect = [0.0; FRAME_SIZE];
             c.out = [0.0; FRAME_SIZE];
         }
         self.pos = 0;
-        self.fresh = 2;
+        self.fresh = 3;
     }
 
     fn retune(&mut self, effect: &AudioEffect) -> bool {
@@ -153,5 +170,59 @@ impl SoundPlugin for Rnnoise {
             v
         };
         Some([held(&self.ch[0]), held(&self.ch[1])])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::afx::{AudioEffect, AudioFilter};
+
+    /// The longest run of samples quieter than `floor`.
+    fn longest_quiet(x: &[f32], floor: f32) -> usize {
+        let (mut run, mut most) = (0usize, 0usize);
+        for v in x {
+            run = if v.abs() < floor { run + 1 } else { 0 };
+            most = most.max(run);
+        }
+        most
+    }
+
+    /// Back from a full bypass on a steady tone: no dropout while the model fills again (it
+    /// used to give about 20 ms of silence: the emptied frame, then the first one ×0).
+    #[test]
+    fn re_enabling_after_a_full_bypass_has_no_dropout() {
+        for amount in [100u32, 0] {
+            let effect = AudioEffect::Rnnoise { amount };
+            let mut f = AudioFilter::new(effect, 48_000);
+            assert!(f.latency_frames() > 0, "the model is built at 48 kHz");
+            // 440 Hz at -10 dBFS, in blocks that aren't a frame long.
+            let tone = |i: usize| (i as f32 * 2.0 * std::f32::consts::PI * 440.0 / 48_000.0).sin() * 0.3;
+            let mut pos = 0usize;
+            let mut block = |f: &mut AudioFilter| {
+                let mut l: Vec<f32> = (0..333).map(|k| tone(pos + k)).collect();
+                let mut r = l.clone();
+                pos += 333;
+                f.process([&mut l, &mut r]);
+                l
+            };
+            let mut before = Vec::new();
+            for _ in 0..150 {
+                before.extend(block(&mut f));
+            }
+            // What it gives on the tone once settled: "near silent" is 30 dB under that.
+            let settled = before[before.len() - 4800..].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(settled > 0.01, "amount {amount}: the tone went (peak {settled})");
+            f.set_enabled(false);
+            for _ in 0..30 {
+                block(&mut f);
+            }
+            f.set_enabled(true);
+            let mut after = Vec::new();
+            for _ in 0..60 {
+                after.extend(block(&mut f));
+            }
+            let quiet = longest_quiet(&after, settled * 0.03);
+            assert!(quiet <= 96, "amount {amount}: {quiet} near-silent samples in a row after re-enabling");
+        }
     }
 }
