@@ -537,6 +537,15 @@ struct Source {
     hold_ch: usize,
 }
 
+impl Source {
+    fn clear_hold(&mut self) {
+        self.hold.clear();
+        self.hold_ts = 0;
+        self.hold_rate = 0;
+        self.hold_ch = 0;
+    }
+}
+
 /// The longest filter delay a dry bypass covers (frames); the strong noise removal holds 3968.
 const MAX_BYPASS_FRAMES: usize = 8192;
 /// The ease from dry to the filter's own sound, in seconds.
@@ -602,15 +611,16 @@ pub struct Mixer {
     worst_late_ns: u64,
     window_ns: Option<u64>,
     sources: crate::rt::PreMap<Box<Source>>,
-    /// Entries made ahead for sources that appear.
+    /// Entries made ahead for sources that appear, and requests used/in-flight.
     spares: Vec<SpareSource>,
-    /// Spares used since asked for.
     spares_wanted: usize,
+    spares_pending: usize,
     /// Resamplers made ahead for a source that starts following drift, and how many to make.
     rs_spares: Vec<SpareResampler>,
-    /// Input rates to make a resampler for, and the ones asked for and not here yet.
+    /// Input rates to make a resampler for, the ones asked for and not here yet, and failed rates.
     rs_wanted: Vec<u32>,
     rs_pending: Vec<u32>,
+    rs_failed: Vec<u32>,
     /// Another rate's resampler comes from a background thread (the audio thread's mixer); else
     /// it is made on the spot (a mixer with no one to ask).
     async_resamplers: bool,
@@ -646,10 +656,24 @@ pub struct Mixer {
     broken_cycles: Vec<(u64, u64)>,
     /// Reusable topology planner scratch buffers (zero steady-state allocs).
     plan_scratch: PlanScratch,
+    /// Reusable effect-diff scratch buffers (zero steady-state allocs).
+    effect_scratch: EffectScratch,
     /// Blocks given back by [`Mixer::recycle`], made again instead of allocated.
     pool: Vec<Block>,
     /// Blocks allocated new (not found in the pool) so far.
     allocated: usize,
+}
+
+#[derive(Debug, Default)]
+struct EffectScratch {
+    old: Vec<(usize, Option<AudioFilter>)>,
+    made: Vec<Option<(usize, AudioFilter)>>,
+}
+
+impl EffectScratch {
+    fn with_room() -> Self {
+        Self { old: Vec::with_capacity(16), made: Vec::with_capacity(16) }
+    }
 }
 
 /// Silence key fed to a sidechained compressor whose key source is missing, muted, or cycle-broken.
@@ -842,7 +866,7 @@ const MAX_POOL: usize = 64;
 
 /// Source entries kept made ahead, and removed ones kept for dropping elsewhere.
 const SPARES: usize = 4;
-const RETIRED_ROOM: usize = 16;
+const RETIRED_ROOM: usize = 64;
 
 /// Key buffers made ahead for sidechained compressors (more are made when needed).
 const KEY_BUFS_AHEAD: usize = 4;
@@ -855,7 +879,7 @@ const HOLD_ROOM: usize = 48_000;
 const RS_SPARES: usize = 2;
 /// Room for resamplers made ahead (same rate and others a source asked for).
 const RS_SPARES_ROOM: usize = 8;
-const RS_RETIRED_ROOM: usize = 8;
+const RS_RETIRED_ROOM: usize = 32;
 
 /// A resampler made ahead (its filter tables are built when it is made: not on the audio thread).
 pub struct SpareResampler(SourceResampler);
@@ -1000,6 +1024,7 @@ impl Mixer {
             sources: crate::rt::PreMap::new(),
             spares: (0..SPARES).map(|_| SpareSource(Self::fresh_source(rate))).collect(),
             spares_wanted: 0,
+            spares_pending: 0,
             rs_spares: {
                 let mut v = Vec::with_capacity(RS_SPARES_ROOM);
                 v.extend((0..RS_SPARES).map(|_| SpareResampler(Self::cold_rs(rate))));
@@ -1007,6 +1032,7 @@ impl Mixer {
             },
             rs_wanted: Vec::with_capacity(RS_SPARES_ROOM),
             rs_pending: Vec::with_capacity(RS_SPARES_ROOM),
+            rs_failed: Vec::with_capacity(RS_SPARES_ROOM),
             async_resamplers: false,
             rs_retired: Vec::with_capacity(RS_RETIRED_ROOM),
             retired: Vec::with_capacity(RETIRED_ROOM),
@@ -1036,6 +1062,7 @@ impl Mixer {
             },
             broken_cycles: Vec::new(),
             plan_scratch: PlanScratch::with_room(),
+            effect_scratch: EffectScratch::with_room(),
             // Made now, not on the first blocks: a block the pool lacks is allocated mid-mix.
             pool: Self::prefilled_pool(),
             allocated: 0,
@@ -1177,11 +1204,23 @@ impl Mixer {
         self.monitor_device = device;
     }
 
+    /// Replaces the monitoring device id, returning any old string to drop off the audio thread.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(crate) fn replace_monitor_device(&mut self, device: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.monitor_device, device)
+    }
+
     /// Marks source `id` as an audio output capture (or clears it with `None`).
     pub fn set_output_capture(&mut self, id: u64, capture: Option<OutputCapture>) {
         if let Some(s) = self.sources.get_mut(&id) {
             s.output_capture = capture;
         }
+    }
+
+    /// Replaces source `id`'s output-capture metadata, returning any old entry to drop off-thread.
+    pub(crate) fn replace_output_capture(&mut self, id: u64, capture: Option<OutputCapture>) -> Option<OutputCapture> {
+        let s = self.sources.get_mut(&id)?;
+        std::mem::replace(&mut s.output_capture, capture)
     }
 
     /// Updates whether source `id` is currently active/on air (`obs_source_active` parity for
@@ -1301,7 +1340,7 @@ impl Mixer {
             queue: VecDeque::with_capacity(rate as usize * 2),
             start_ns: None,
             resampler: None,
-            filters: Vec::new(),
+            filters: Vec::with_capacity(16),
             key_routes: Vec::new(),
             key_slot: None,
             last_post_filter: [0.0; 2],
@@ -1352,9 +1391,29 @@ impl Mixer {
         if let Some(i) = self.rs_pending.iter().position(|p| *p == r.0.in_rate) {
             self.rs_pending.swap_remove(i);
         }
-        if self.rs_spares.len() < RS_SPARES_ROOM {
-            self.rs_spares.push(r);
+        if self.rs_spares.len() >= RS_SPARES_ROOM {
+            // Evict an older unused spare off-thread instead of dropping the arrival on the RT
+            // thread and causing an infinite request/build/drop loop.
+            let same_rate_full = r.0.in_rate == self.rate
+                && self.rs_spares.iter().filter(|s| s.0.in_rate == self.rate).count() >= RS_SPARES;
+            let evict_idx = if same_rate_full {
+                self.rs_spares.iter().position(|s| s.0.in_rate == self.rate).unwrap_or(0)
+            } else {
+                self.rs_spares
+                    .iter()
+                    .position(|s| {
+                        s.0.in_rate != self.rate
+                            && !self.sources.values().any(|src| !src.hold.is_empty() && src.hold_rate == s.0.in_rate)
+                    })
+                    .or_else(|| self.rs_spares.iter().position(|s| s.0.in_rate != self.rate))
+                    .unwrap_or(0)
+            };
+            let evicted = self.rs_spares.remove(evict_idx);
+            if self.rs_retired.len() < RS_RETIRED_ROOM {
+                self.rs_retired.push(evicted);
+            }
         }
+        self.rs_spares.push(r);
     }
 
     /// The next input rate a resampler is asked for (the audio thread sends it to be made).
@@ -1368,6 +1427,30 @@ impl Mixer {
         self.rs_wanted.pop()
     }
 
+    /// Puts an unsent request back when the background queue is full so `rs_pending` never wedges.
+    pub(crate) fn requeue_resampler_request(&mut self, in_rate: u32) {
+        if self.rs_wanted.len() < RS_SPARES_ROOM {
+            self.rs_wanted.push(in_rate);
+        } else if let Some(i) = self.rs_pending.iter().position(|p| *p == in_rate) {
+            self.rs_pending.swap_remove(i);
+        }
+    }
+
+    /// Marks `in_rate` as unbuildable when `make_spare_resampler` returned `None`, clearing
+    /// pending requests and held audio for that rate so it neither wedges nor loops.
+    pub(crate) fn fail_resampler(&mut self, in_rate: u32) {
+        self.rs_pending.retain(|&r| r != in_rate);
+        self.rs_wanted.retain(|&r| r != in_rate);
+        if !self.rs_failed.contains(&in_rate) && self.rs_failed.len() < RS_SPARES_ROOM {
+            self.rs_failed.push(in_rate);
+        }
+        for s in self.sources.values_mut() {
+            if s.hold_rate == in_rate {
+                s.clear_hold();
+            }
+        }
+    }
+
     pub fn resampler_out_rate(&self) -> u32 {
         self.rate
     }
@@ -1379,45 +1462,109 @@ impl Mixer {
             || self.rs_spares.iter().any(|s| s.0.in_rate == rate && s.0.out_rate == self.rate)
     }
 
-    /// Asks (once) for a resampler for sound at `in_rate`.
-    pub fn want_resampler(&mut self, in_rate: u32) {
-        if self.async_resamplers
-            && in_rate != self.rate
-            && in_rate != 0
-            && !self.rs_spares.iter().any(|s| s.0.in_rate == in_rate && s.0.out_rate == self.rate)
-            && !self.rs_pending.contains(&in_rate)
-            && self.rs_wanted.len() < RS_SPARES_ROOM
-        {
+    /// Ensures enough spares are in flight or queued for `in_rate` to cover all sources currently
+    /// holding `in_rate` (or at least 1 for a `WantResampler` pre-hint).
+    fn request_resampler_for(&mut self, in_rate: u32, min_needed: usize) {
+        if !self.async_resamplers || in_rate == self.rate || in_rate == 0 || self.rs_failed.contains(&in_rate) {
+            return;
+        }
+        let holding = self
+            .sources
+            .values()
+            .filter(|s| {
+                !s.hold.is_empty()
+                    && s.hold_rate == in_rate
+                    && s.resampler.as_ref().is_none_or(|r| r.in_rate != in_rate)
+            })
+            .count();
+        let needed = holding.max(min_needed);
+        let mut have = self.rs_spares.iter().filter(|s| s.0.in_rate == in_rate && s.0.out_rate == self.rate).count()
+            + self.rs_pending.iter().filter(|&&r| r == in_rate).count();
+        while have < needed && self.rs_pending.len() < RS_SPARES_ROOM && self.rs_wanted.len() < RS_SPARES_ROOM {
             self.rs_pending.push(in_rate);
             self.rs_wanted.push(in_rate);
+            have += 1;
         }
+    }
+
+    /// Asks (once) for a resampler for sound at `in_rate`.
+    pub fn want_resampler(&mut self, in_rate: u32) {
+        self.request_resampler_for(in_rate, 1);
     }
 
     /// True when `pcm` was held (not pushed now): it's another rate and no resampler for it is
     /// ready, or earlier sound of the source is still held (order is kept).
     fn hold_for_resampler(&mut self, id: u64, pcm: &[f32], channels: usize, rate: u32, ts_ns: u64) -> bool {
+        if channels == 0 || rate == 0 {
+            return false;
+        }
+        if self.rs_failed.contains(&rate) {
+            if let Some(src) = self.sources.get_mut(&id) {
+                src.clear_hold();
+            }
+            return true;
+        }
         let out_rate = self.rate;
-        let still = self.sources.get(&id).is_some_and(|s| !s.hold.is_empty());
+        let next_ns = self.next_ns;
+        let mixed_with_ns = self.mixed_with_ns;
+        let Some(src) = self.sources.get_mut(&id) else { return false };
+        if !src.hold.is_empty() {
+            // Format changed or timeline jumped: drop stale hold so returning to `out_rate` or
+            // switching rates/channels never drops new audio.
+            let format_changed = src.hold_rate != rate || src.hold_ch != channels;
+            let gap_jumped = ts_ns.saturating_sub(src.hold_ts) > MAX_GAP_NS;
+            let stale_reanchored = next_ns.is_some_and(|next| {
+                let due = next + mixed_with_ns;
+                due.saturating_sub(src.hold_ts.saturating_add(src.adjust_ns)) > RETIME_NS
+                    && due.saturating_sub(ts_ns.saturating_add(src.adjust_ns)) <= RETIME_NS
+            });
+            if format_changed || gap_jumped || stale_reanchored {
+                src.clear_hold();
+            }
+        }
+        let still = !src.hold.is_empty();
         if !still && (rate == out_rate || self.resampler_ready(id, rate)) {
             return false;
         }
-        if rate != out_rate && !still {
-            self.want_resampler(rate);
-        }
         let Some(src) = self.sources.get_mut(&id) else { return false };
+        let frames = pcm.len() / channels;
+        let usable = frames * channels;
+        let max_frames = TAIL_ROOM.min(HOLD_ROOM / channels);
+        let max_samples = max_frames * channels;
         if src.hold.is_empty() {
             (src.hold_ts, src.hold_rate, src.hold_ch) = (ts_ns, rate, channels);
         }
-        // Same format as what is held and room for it (else it is lost: never grown).
-        if src.hold_rate == rate && src.hold_ch == channels && src.hold.len() + pcm.len() <= HOLD_ROOM {
-            src.hold.extend_from_slice(pcm);
+        // Same format as what is held and room inside both `HOLD_ROOM` and `TAIL_ROOM`.
+        if src.hold_rate == rate && src.hold_ch == channels && src.hold.len() + usable <= max_samples {
+            src.hold.extend_from_slice(&pcm[..usable]);
+        } else if src.hold.is_empty() && usable > max_samples && max_samples > 0 {
+            let skip_frames = frames - max_frames;
+            src.hold_ts = ts_ns.saturating_add((skip_frames as u64 * 1_000_000_000) / u64::from(rate));
+            src.hold.extend_from_slice(&pcm[skip_frames * channels..usable]);
+        }
+        if rate != out_rate && !self.resampler_ready(id, rate) {
+            self.request_resampler_for(rate, 1);
         }
         true
     }
 
     fn release_held_one(&mut self, id: u64) {
         let Some(src) = self.sources.get_mut(&id) else { return };
+        if src.hold.is_empty() {
+            return;
+        }
+        let stale = self.next_ns.is_some_and(|next| {
+            let due = next + self.mixed_with_ns;
+            due.saturating_sub(src.hold_ts.saturating_add(src.adjust_ns)) > RETIME_NS
+        });
+        if stale {
+            src.clear_hold();
+            return;
+        }
         let (held, ts, rate, ch) = (std::mem::take(&mut src.hold), src.hold_ts, src.hold_rate, src.hold_ch);
+        src.hold_ts = 0;
+        src.hold_rate = 0;
+        src.hold_ch = 0;
         self.push(id, &held, ch, rate, ts);
         // Kept for next time (with its room), unless the push held it again (then it is the
         // source's own and this one is dropped).
@@ -1429,15 +1576,31 @@ impl Mixer {
         }
     }
 
-    /// Runs held sound through the resamplers that have arrived (after commands are handled).
+    /// Runs held sound through the resamplers that have arrived (after commands are handled), and
+    /// ensures any remaining held sources still have a resampler request in flight.
     pub fn release_held(&mut self) {
         loop {
-            let due = self
-                .sources
-                .iter()
-                .find_map(|(&id, s)| (!s.hold.is_empty() && self.resampler_ready(id, s.hold_rate)).then_some(id));
+            let due = self.sources.iter().find_map(|(&id, s)| {
+                (!s.hold.is_empty() && (s.hold_rate == self.rate || self.resampler_ready(id, s.hold_rate)))
+                    .then_some(id)
+            });
             let Some(id) = due else { break };
             self.release_held_one(id);
+        }
+        let mut rem_rates = [0u32; RS_SPARES_ROOM];
+        let mut n = 0usize;
+        for s in self.sources.values() {
+            if !s.hold.is_empty()
+                && s.hold_rate != self.rate
+                && !rem_rates[..n].contains(&s.hold_rate)
+                && n < RS_SPARES_ROOM
+            {
+                rem_rates[n] = s.hold_rate;
+                n += 1;
+            }
+        }
+        for &rate in &rem_rates[..n] {
+            self.request_resampler_for(rate, 1);
         }
     }
 
@@ -1448,14 +1611,26 @@ impl Mixer {
 
     /// Keeps a spare entry for the next source that appears.
     pub fn add_spare(&mut self, s: SpareSource) {
+        self.spares_pending = self.spares_pending.saturating_sub(1);
         if self.spares.len() < SPARES {
             self.spares.push(s);
+        } else if self.retired.len() < RETIRED_ROOM {
+            self.retired.push(s.0);
         }
     }
 
     /// How many spares to make to replace the ones used since the last call.
     pub fn take_spare_request(&mut self) -> usize {
-        std::mem::take(&mut self.spares_wanted)
+        let n = std::mem::take(&mut self.spares_wanted);
+        self.spares_pending += n;
+        n
+    }
+
+    /// Restores an unsent spare request if the background queue was full.
+    pub(crate) fn restore_spare_request(&mut self, n: usize) {
+        self.spares_pending = self.spares_pending.saturating_sub(n);
+        let room = SPARES.saturating_sub(self.spares.len() + self.spares_pending);
+        self.spares_wanted = (self.spares_wanted + n).min(room);
     }
 
     /// An entry a removed source left, to be dropped off the audio thread (its buffers free
@@ -1473,7 +1648,9 @@ impl Mixer {
                 let mut src = self.spares.pop().map_or_else(|| Self::fresh_source(self.rate), |s| s.0);
                 src.settings = settings;
                 self.sources.insert(id, src);
-                self.spares_wanted += 1;
+                if self.spares.len() + self.spares_wanted + self.spares_pending < SPARES {
+                    self.spares_wanted += 1;
+                }
                 self.rebuild_mix_plan();
             }
         }
@@ -1549,23 +1726,27 @@ impl Mixer {
         let held = |fs: &[AudioFilter]| fs.iter().map(AudioFilter::latency_frames).sum::<usize>();
         let before = held(&s.filters);
         let old_len = s.filters.len();
-        let mut old: Vec<(usize, Option<AudioFilter>)> =
-            std::mem::take(&mut s.filters).into_iter().enumerate().map(|(i, f)| (i, Some(f))).collect();
+        let mut scratch = std::mem::take(&mut self.effect_scratch);
+        scratch.old.clear();
+        for (i, f) in s.filters.drain(..).enumerate() {
+            scratch.old.push((i, Some(f)));
+        }
         // The same settings first, so a moved filter is found as it was…
-        let mut made: Vec<Option<(usize, AudioFilter)>> = effects
-            .iter()
-            .map(|e| {
-                old.iter_mut()
-                    .find(|(_, o)| o.as_ref().is_some_and(|f| f.effect == *e))
-                    .and_then(|(idx, o)| o.take().map(|f| (*idx, f)))
-            })
-            .collect();
+        scratch.made.clear();
+        for e in effects {
+            let found = scratch
+                .old
+                .iter_mut()
+                .find(|(_, o)| o.as_ref().is_some_and(|f| f.effect == *e))
+                .and_then(|(idx, o)| o.take().map(|f| (*idx, f)));
+            scratch.made.push(found);
+        }
         // …then one of the same kind takes the new settings…
-        for (slot, e) in made.iter_mut().zip(effects) {
+        for (slot, e) in scratch.made.iter_mut().zip(effects) {
             if slot.is_some() {
                 continue;
             }
-            for (idx, o) in old.iter_mut() {
+            for (idx, o) in scratch.old.iter_mut() {
                 if let Some(f) = o.as_mut()
                     && f.retune(*e)
                 {
@@ -1575,13 +1756,21 @@ impl Mixer {
             }
         }
         let pure_in_place = effects.len() == old_len
-            && made.iter().enumerate().all(|(i, slot)| matches!(slot, Some((idx, _)) if *idx == i));
+            && scratch.made.iter().enumerate().all(|(i, slot)| matches!(slot, Some((idx, _)) if *idx == i));
         // …and the rest are made.
-        s.filters = made.into_iter().zip(effects).map(|(f, e)| f.map_or_else(|| make_new(e), |(_, f)| f)).collect();
+        for (slot, e) in scratch.made.drain(..).zip(effects) {
+            s.filters.push(slot.map_or_else(|| make_new(e), |(_, f)| f));
+        }
         if !pure_in_place {
             s.filter_declick = true;
         }
-        let mut evicted: Vec<AudioFilter> = old.into_iter().filter_map(|(_, o)| o).collect();
+        let mut evicted = Vec::new();
+        for (_, o) in scratch.old.drain(..) {
+            if let Some(f) = o {
+                evicted.push(f);
+            }
+        }
+        self.effect_scratch = scratch;
         // A filter that held sound back and is taken out: what it still held plays first. Its
         // sound is filed that much later from now on, so without this the source goes quiet for
         // the filter's delay (82.7 ms of silence, then a step) every time it is switched off.
@@ -1740,6 +1929,7 @@ impl Mixer {
     pub fn flush_source(&mut self, id: u64) {
         let Some(s) = self.sources.get_mut(&id) else { return };
         s.queue.clear();
+        s.clear_hold();
         s.start_ns = None;
         s.adjust_ns = 0;
         s.drift.reset_segment();
@@ -1753,7 +1943,7 @@ impl Mixer {
     pub fn remove(&mut self, id: u64) -> Option<Vec<AudioFilter>> {
         self.taps.retain(|(tid, t)| *tid != id && t.strong_count() > 0);
         let removed = self.sources.remove(&id).map(|mut s| {
-            let filters = std::mem::take(&mut s.filters);
+            let filters = if s.filters.is_empty() { Vec::new() } else { std::mem::take(&mut s.filters) };
             // Kept (room is made ahead) for the caller to drop elsewhere; if full, dropped here.
             if self.retired.len() < RETIRED_ROOM {
                 self.retired.push(s);
@@ -2099,7 +2289,12 @@ impl Mixer {
                     match self.rs_spares.iter().position(|s| s.0.in_rate == rate && s.0.out_rate == out) {
                         Some(i) => {
                             let got = self.rs_spares.swap_remove(i).0;
-                            if rate == out && self.rs_wanted.len() < RS_SPARES_ROOM {
+                            if rate == out
+                                && self.rs_spares.iter().filter(|s| s.0.in_rate == out).count()
+                                    + self.rs_wanted.iter().filter(|&&r| r == out).count()
+                                    < RS_SPARES
+                                && self.rs_wanted.len() < RS_SPARES_ROOM
+                            {
                                 self.rs_wanted.push(rate);
                             }
                             Some(got)
@@ -2118,7 +2313,11 @@ impl Mixer {
                     }
                     // Same rate with none ready (rare): made here, and more asked for.
                     None if rate == out_rate => {
-                        if self.rs_wanted.len() < RS_SPARES_ROOM {
+                        if self.rs_spares.iter().filter(|s| s.0.in_rate == out_rate).count()
+                            + self.rs_wanted.iter().filter(|&&r| r == out_rate).count()
+                            < RS_SPARES
+                            && self.rs_wanted.len() < RS_SPARES_ROOM
+                        {
                             self.rs_wanted.push(rate);
                         }
                         let rs = if warm {
@@ -2136,10 +2335,7 @@ impl Mixer {
                     // is here the sound waits (it is never played at the wrong rate).
                     None if !self.async_resamplers => SourceResampler::new_cold(rate, out_rate),
                     None => {
-                        if !self.rs_pending.contains(&rate) && self.rs_wanted.len() < RS_SPARES_ROOM {
-                            self.rs_pending.push(rate);
-                            self.rs_wanted.push(rate);
-                        }
+                        self.request_resampler_for(rate, 1);
                         return;
                     }
                 };
@@ -2185,6 +2381,7 @@ impl Mixer {
             tracing::warn!(gap_ms = (until - next) / 1_000_000, "the clock jumped: the mix starts again from now");
             for src in self.sources.values_mut() {
                 src.queue.clear();
+                src.clear_hold();
                 src.start_ns = None;
                 src.drift.reset_segment();
             }
@@ -3831,6 +4028,267 @@ mod tests {
             m.mix_until(t);
         }
         assert!(m.latency_ns() < floor + held, "latency shrinks once filter is removed: {}", m.latency_ns());
+    }
+
+    #[test]
+    fn rev22_m1_two_sources_same_non_mix_rate_starting_together_both_get_resamplers() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set_background_resamplers(true);
+        m.set(1, SourceSettings { tracks: 0b01, ..SourceSettings::default() });
+        m.set(2, SourceSettings { tracks: 0b10, ..SourceSettings::default() });
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let piece = vec![0.35f32; 441 * 2];
+        // Both start at 44.1 kHz before the background thread delivers any resampler.
+        m.push(1, &piece, 2, 44_100, t0);
+        m.push(2, &piece, 2, 44_100, t0);
+        let mut track1_energy = 0.0f32;
+        let mut track2_energy = 0.0f32;
+        let mut pending: Option<SpareResampler> = None;
+        for k in 1..=25u64 {
+            if let Some(r) = pending.take() {
+                m.add_spare_resampler(r);
+                m.release_held();
+            }
+            if let Some(rate) = m.pop_resampler_request() {
+                pending = Mixer::make_spare_resampler(rate, 48_000);
+            }
+            let ts = t0 + k * 10_000_000;
+            m.push(1, &piece, 2, 44_100, ts);
+            m.push(2, &piece, 2, 44_100, ts);
+            for b in m.mix_until(ts + 10_000_000) {
+                track1_energy += b.tracks[0].iter().map(|v| v * v).sum::<f32>();
+                track2_energy += b.tracks[1].iter().map(|v| v * v).sum::<f32>();
+            }
+        }
+        assert!(track1_energy > 1.0, "source 1 should be heard: {track1_energy}");
+        assert!(track2_energy > 1.0, "source 2 must not be permanently muted: {track2_energy}");
+
+        // Short-alert case: both push 60 ms at start and stop pushing while resamplers arrive later.
+        let mut m2 = Mixer::new(48_000, 40_000_000);
+        m2.set_background_resamplers(true);
+        m2.set(1, SourceSettings { tracks: 0b01, ..SourceSettings::default() });
+        m2.set(2, SourceSettings { tracks: 0b10, ..SourceSettings::default() });
+        let _ = m2.mix_until(t0);
+        for k in 0..6u64 {
+            let ts = t0 + k * 10_000_000;
+            m2.push(1, &piece, 2, 44_100, ts);
+            m2.push(2, &piece, 2, 44_100, ts);
+        }
+        let mut short2_energy = 0.0f32;
+        let mut pending2: Option<SpareResampler> = None;
+        for k in 6..=20u64 {
+            if let Some(r) = pending2.take() {
+                m2.add_spare_resampler(r);
+                m2.release_held();
+            }
+            if let Some(rate) = m2.pop_resampler_request() {
+                pending2 = Mixer::make_spare_resampler(rate, 48_000);
+            }
+            for b in m2.mix_until(t0 + k * 10_000_000) {
+                short2_energy += b.tracks[1].iter().map(|v| v * v).sum::<f32>();
+            }
+        }
+        assert!(short2_energy > 0.5, "short alert source 2 must still play out: {short2_energy}");
+    }
+
+    #[test]
+    fn rev22_m3_full_rs_spares_evicts_and_burst_spares_do_not_over_request() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set_background_resamplers(true);
+        // Fill rs_spares to RS_SPARES_ROOM (2 same-rate + 6 other rates).
+        for rate in [8_000u32, 11_025, 16_000, 22_050, 32_000, 96_000] {
+            m.add_spare_resampler(Mixer::make_spare_resampler(rate, 48_000).unwrap());
+        }
+        assert_eq!(m.rs_spares.len(), RS_SPARES_ROOM);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let piece = vec![0.4f32; 441 * 2];
+        m.push(1, &piece, 2, 44_100, t0);
+        let req = m.pop_resampler_request();
+        assert_eq!(req, Some(44_100));
+        m.add_spare_resampler(Mixer::make_spare_resampler(44_100, 48_000).unwrap());
+        assert!(m.pop_retired_resampler().is_some(), "evicted spare should retire off-thread");
+        m.release_held();
+        assert!(m.pop_resampler_request().is_none(), "must not spin requesting 44.1k forever");
+        let mut energy = 0.0f32;
+        for k in 1..=10u64 {
+            let ts = t0 + k * 10_000_000;
+            m.push(1, &piece, 2, 44_100, ts);
+            for b in m.mix_until(ts + 10_000_000) {
+                energy += b.tracks[0].iter().map(|v| v * v).sum::<f32>();
+            }
+        }
+        assert!(energy > 1.0, "44.1k source must be heard when rs_spares started full: {energy}");
+
+        // Adding > SPARES sources in a single burst must not request more than SPARES.
+        for id in 10..18u64 {
+            m.set(id, SourceSettings::default());
+        }
+        assert!(m.take_spare_request() <= SPARES, "burst source adds must not over-request spares");
+    }
+
+    #[test]
+    fn rev22_m4_hold_clears_on_flush_source_and_clock_jump() {
+        let t0 = 10_000_000_000u64;
+        let stale = vec![0.9f32; 441 * 2];
+        let fresh = vec![0.2f32; 441 * 2];
+
+        // 1. flush_source (seek/pause) clears hold.
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set_background_resamplers(true);
+        m.set(1, SourceSettings::default());
+        let _ = m.mix_until(t0);
+        m.push(1, &stale, 2, 44_100, t0);
+        m.push(1, &stale, 2, 44_100, t0 + 10_000_000);
+        m.flush_source(1);
+        let _ = m.pop_resampler_request();
+        m.add_spare_resampler(Mixer::make_spare_resampler(44_100, 48_000).unwrap());
+        m.release_held();
+        let mut peak = 0.0f32;
+        for k in 2..12u64 {
+            let ts = t0 + k * 10_000_000;
+            m.push(1, &fresh, 2, 44_100, ts);
+            for b in m.mix_until(ts + 10_000_000) {
+                peak = b.tracks[0].iter().fold(peak, |a, v| a.max(v.abs()));
+            }
+        }
+        assert!(peak < 0.35, "pre-flush held audio leaked after flush_source: peak={peak}");
+
+        // 2. MAX_CATCH_UP_NS clock jump (sleep/wake) clears hold.
+        let mut m2 = Mixer::new(48_000, 40_000_000);
+        m2.set_background_resamplers(true);
+        m2.set(1, SourceSettings::default());
+        let _ = m2.mix_until(t0);
+        m2.push(1, &stale, 2, 44_100, t0);
+        let wake = t0 + 3_600_000_000_000;
+        let _ = m2.mix_until(wake);
+        let _ = m2.pop_resampler_request();
+        m2.add_spare_resampler(Mixer::make_spare_resampler(44_100, 48_000).unwrap());
+        m2.release_held();
+        let mut peak2 = 0.0f32;
+        for k in 0..10u64 {
+            let ts = wake + k * 10_000_000;
+            m2.push(1, &fresh, 2, 44_100, ts);
+            for b in m2.mix_until(ts + 10_000_000) {
+                peak2 = b.tracks[0].iter().fold(peak2, |a, v| a.max(v.abs()));
+            }
+        }
+        assert!(peak2 < 0.35, "pre-sleep held audio leaked after wake: peak={peak2}");
+    }
+
+    #[test]
+    fn rev22_m4_hold_return_to_mix_rate_and_format_change_never_drop() {
+        let t0 = 10_000_000_000u64;
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set_background_resamplers(true);
+        m.set(1, SourceSettings::default());
+        let _ = m.mix_until(t0);
+        // Push 44.1k while resampler hasn't arrived -> enters Source::hold.
+        m.push(1, &[0.9f32; 441 * 2], 2, 44_100, t0);
+        // Immediately switch back to 48 kHz before any 44.1k resampler arrives.
+        let mut energy = 0.0f32;
+        for k in 1..15u64 {
+            let ts = t0 + k * 10_000_000;
+            m.push(1, &[0.3f32; 480 * 2], 2, 48_000, ts);
+            for b in m.mix_until(ts + 10_000_000) {
+                energy += b.tracks[0].iter().map(|v| v * v).sum::<f32>();
+            }
+        }
+        assert!(energy > 1.0, "returning to 48 kHz while held must not drop audio: {energy}");
+
+        // Format change 44.1k -> 96k while held must request 96k and play 96k.
+        let mut m2 = Mixer::new(48_000, 40_000_000);
+        m2.set_background_resamplers(true);
+        m2.set(1, SourceSettings::default());
+        let _ = m2.mix_until(t0);
+        m2.push(1, &[0.9f32; 441 * 2], 2, 44_100, t0);
+        let _ = m2.pop_resampler_request(); // drain 44.1k
+        m2.push(1, &[0.25f32; 960 * 2], 2, 96_000, t0 + 10_000_000);
+        assert_eq!(m2.pop_resampler_request(), Some(96_000), "must request 96 kHz resampler on format change");
+        m2.add_spare_resampler(Mixer::make_spare_resampler(96_000, 48_000).unwrap());
+        m2.release_held();
+        let mut energy2 = 0.0f32;
+        for k in 2..12u64 {
+            let ts = t0 + k * 10_000_000;
+            m2.push(1, &[0.25f32; 960 * 2], 2, 96_000, ts);
+            for b in m2.mix_until(ts + 10_000_000) {
+                energy2 += b.tracks[0].iter().map(|v| v * v).sum::<f32>();
+            }
+        }
+        assert!(energy2 > 0.5, "96 kHz audio after format change must play: {energy2}");
+    }
+
+    #[test]
+    fn rev22_m4_mono_hold_never_exceeds_resampler_tail_room() {
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set_background_resamplers(true);
+        m.set(1, SourceSettings::default());
+        let t0 = 10_000_000_000u64;
+        let _ = m.mix_until(t0);
+        let mono = vec![0.2f32; 882]; // 20 ms mono at 44.1 kHz
+        for k in 0..45u64 {
+            m.push(1, &mono, 1, 44_100, t0 + k * 20_000_000);
+        }
+        assert!(
+            m.sources[&1].hold.len() <= TAIL_ROOM,
+            "mono hold {} exceeded TAIL_ROOM {}",
+            m.sources[&1].hold.len(),
+            TAIL_ROOM
+        );
+        m.add_spare_resampler(Mixer::make_spare_resampler(44_100, 48_000).unwrap());
+        m.release_held();
+        let cap = m.sources[&1].resampler.as_ref().unwrap().pending[0].capacity();
+        assert_eq!(cap, TAIL_ROOM, "mono release_held reallocated rs.pending[0] from {TAIL_ROOM} to {cap}");
+    }
+
+    #[test]
+    fn rev22_m4_stale_hold_past_retime_and_channel_change_are_clean() {
+        let t0 = 10_000_000_000u64;
+        // 1. Hold older than RETIME_NS does not poison adjust_ns or wipe live audio.
+        let mut m = Mixer::new(48_000, 40_000_000);
+        m.set_background_resamplers(true);
+        m.set(1, SourceSettings::default());
+        let _ = m.mix_until(t0);
+        // Short alert at t0, then mix advances 450 ms (> RETIME_NS = 300 ms) while afx-bg stalls.
+        m.push(1, &[0.8f32; 441 * 2], 2, 44_100, t0);
+        let _ = m.mix_until(t0 + 450_000_000);
+        let _ = m.pop_resampler_request();
+        m.add_spare_resampler(Mixer::make_spare_resampler(44_100, 48_000).unwrap());
+        m.release_held();
+        assert_eq!(m.sources[&1].adjust_ns, 0, "stale hold must not trip RETIME_NS and set adjust_ns");
+        // Live audio at t0 + 450 ms continues cleanly without adjust_ns reset wiping the queue.
+        let mut energy = 0.0f32;
+        for k in 0..10u64 {
+            let ts = t0 + 450_000_000 + k * 10_000_000;
+            m.push(1, &[0.3f32; 441 * 2], 2, 44_100, ts);
+            for b in m.mix_until(ts + 10_000_000) {
+                energy += b.tracks[0].iter().map(|v| v * v).sum::<f32>();
+            }
+        }
+        assert!(energy > 0.5, "live audio after stale hold drop must play cleanly: {energy}");
+
+        // 2. Channel change (stereo -> mono at 44.1 kHz) while held switches cleanly to mono.
+        let mut m2 = Mixer::new(48_000, 40_000_000);
+        m2.set_background_resamplers(true);
+        m2.set(1, SourceSettings::default());
+        let _ = m2.mix_until(t0);
+        m2.push(1, &[0.9f32; 441 * 2], 2, 44_100, t0);
+        m2.push(1, &[0.25f32; 441], 1, 44_100, t0 + 10_000_000);
+        assert_eq!(m2.sources[&1].hold_ch, 1);
+        let _ = m2.pop_resampler_request();
+        m2.add_spare_resampler(Mixer::make_spare_resampler(44_100, 48_000).unwrap());
+        m2.release_held();
+        let mut peak = 0.0f32;
+        for k in 2..12u64 {
+            let ts = t0 + k * 10_000_000;
+            m2.push(1, &[0.25f32; 441], 1, 44_100, ts);
+            for b in m2.mix_until(ts + 10_000_000) {
+                peak = b.tracks[0].iter().fold(peak, |a, v| a.max(v.abs()));
+            }
+        }
+        assert!(peak > 0.15 && peak < 0.4, "channel change while held must play new mono cleanly: peak={peak}");
     }
 }
 

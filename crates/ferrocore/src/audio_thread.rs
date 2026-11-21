@@ -52,6 +52,8 @@ pub enum AudioCmd {
     WantResampler(u32),
     /// A resampler made ahead (see `AfxJob::MakeResampler`).
     SpareResampler(crate::mix::SpareResampler),
+    /// Making a resampler for this rate failed on the background worker.
+    ResamplerFailed(u32),
     EnsureSource {
         id: u64,
         levels: Arc<AtomicLevels>,
@@ -124,6 +126,7 @@ impl std::fmt::Debug for AudioCmd {
             Self::Spare(_) => f.write_str("Spare"),
             Self::WantResampler(r) => f.debug_tuple("WantResampler").field(r).finish(),
             Self::SpareResampler(_) => f.write_str("SpareResampler"),
+            Self::ResamplerFailed(r) => f.debug_tuple("ResamplerFailed").field(r).finish(),
             Self::EnsureSource { id, .. } => f.debug_struct("EnsureSource").field("id", id).finish(),
             Self::RemoveSource(id) => f.debug_tuple("RemoveSource").field(id).finish(),
             Self::ScheduleRemove { id, after_ns } => {
@@ -196,14 +199,19 @@ pub(crate) enum AfxJob {
         n: usize,
     },
     DropPlugins(Vec<Box<dyn SoundPlugin>>),
+    DropEffects(Vec<AudioEffect>),
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    DropString(String),
+    DropOutputCapture(OutputCapture),
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     DropFeeder(Feeder),
 }
 
-/// Jobs that may wait for the background thread. A bounded channel, so the audio thread's `try_send`
-/// never allocates (an unbounded one allocates a block every few dozen messages); if it were ever
-/// full, the job is dropped there (its memory frees on the audio thread: a rare click, not a stall).
+/// Jobs that may wait for the background thread. A bounded channel so the audio thread's `try_send`
+/// never allocates; overflow is buffered in `AudioRunner::afx_retry` (preallocated) and retried
+/// each tick so critical work (`Build`, `MakeResampler`, `MakeSpare`, `DropFeeder`) is never lost.
 const AFX_QUEUE: usize = 256;
+const AFX_RETRY_CAP: usize = 128;
 
 type PluginBuilder = fn(AudioEffect, u32) -> Option<Box<dyn SoundPlugin>>;
 
@@ -230,6 +238,8 @@ fn run_afx_bg(rx: mpsc::Receiver<AfxJob>, cmd_tx: mpsc::Sender<AudioCmd>, builde
             AfxJob::MakeResampler { in_rate, out_rate } => {
                 if let Some(r) = Mixer::make_spare_resampler(in_rate, out_rate) {
                     let _ = cmd_tx.send(AudioCmd::SpareResampler(r));
+                } else {
+                    let _ = cmd_tx.send(AudioCmd::ResamplerFailed(in_rate));
                 }
             }
             AfxJob::MakeSpare { rate, n } => {
@@ -238,6 +248,10 @@ fn run_afx_bg(rx: mpsc::Receiver<AfxJob>, cmd_tx: mpsc::Sender<AudioCmd>, builde
                 }
             }
             AfxJob::DropPlugins(plugins) => drop(plugins),
+            AfxJob::DropEffects(effects) => drop(effects),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            AfxJob::DropString(s) => drop(s),
+            AfxJob::DropOutputCapture(oc) => drop(oc),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             AfxJob::DropFeeder(feeder) => drop(feeder),
         }
@@ -327,6 +341,7 @@ pub struct AudioRunner<C: AudioClock> {
     recycle_rx: mpsc::Receiver<Block>,
     bridge_tx: Option<mpsc::SyncSender<Block>>,
     afx_tx: Option<mpsc::SyncSender<AfxJob>>,
+    afx_retry: VecDeque<AfxJob>,
     needs_plugin: fn(AudioEffect, u32) -> bool,
     next_build_id: u64,
     ring_scratch: Vec<f32>,
@@ -385,6 +400,7 @@ impl<C: AudioClock> AudioRunner<C> {
             cmd_rx,
             recycle_rx,
             bridge_tx,
+            afx_retry: if afx_tx.is_some() { VecDeque::with_capacity(AFX_RETRY_CAP) } else { VecDeque::new() },
             afx_tx,
             needs_plugin,
             next_build_id: 1,
@@ -396,6 +412,7 @@ impl<C: AudioClock> AudioRunner<C> {
 
     /// Executes one audio cadence step without sleeping.
     pub fn step(&mut self) {
+        self.flush_afx_retry();
         while let Ok(b) = self.recycle_rx.try_recv() {
             self.mixer.recycle(b);
         }
@@ -408,6 +425,7 @@ impl<C: AudioClock> AudioRunner<C> {
         self.expire_scheduled_removals(now);
         self.push_tones(now);
         self.drain_rings();
+        self.tidy_after_commands();
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Some(f) = &self.monitor {
@@ -503,14 +521,25 @@ impl<C: AudioClock> AudioRunner<C> {
 
     fn handle_cmd(&mut self, cmd: AudioCmd) {
         match cmd {
-            AudioCmd::Spare(s) => self.mixer.add_spare(s),
+            AudioCmd::Spare(s) => {
+                self.mixer.add_spare(s);
+                while let Some(excess) = self.mixer.pop_retired() {
+                    self.send_afx(AfxJob::DropSource(excess));
+                }
+            }
             AudioCmd::WantResampler(r) => self.mixer.want_resampler(r),
-            AudioCmd::SpareResampler(r) => self.mixer.add_spare_resampler(r),
+            AudioCmd::SpareResampler(r) => {
+                self.mixer.add_spare_resampler(r);
+                while let Some(evicted) = self.mixer.pop_retired_resampler() {
+                    self.send_afx(AfxJob::DropResampler(evicted));
+                }
+            }
+            AudioCmd::ResamplerFailed(r) => self.mixer.fail_resampler(r),
             AudioCmd::EnsureSource { id, levels } => {
                 self.pending_removals.remove(&id);
                 self.mixer.ensure(id);
                 if let Some(old) = self.levels.insert(id, levels) {
-                    self.drop_elsewhere(AfxJob::DropLevels(old));
+                    self.send_afx(AfxJob::DropLevels(old));
                 }
             }
             AudioCmd::RemoveSource(id) => self.remove_source_now(id),
@@ -521,7 +550,7 @@ impl<C: AudioClock> AudioRunner<C> {
                 self.pending_removals.remove(&id);
                 self.mixer.ensure(id);
                 if let Some(old) = self.rings.insert(id, consumer) {
-                    self.drop_elsewhere(AfxJob::DropRing(old));
+                    self.send_afx(AfxJob::DropRing(old));
                 }
             }
             AudioCmd::FlushSource(id) => {
@@ -538,7 +567,7 @@ impl<C: AudioClock> AudioRunner<C> {
                         if let Some(l) = levels
                             && let Some(old) = self.levels.insert(id, l)
                         {
-                            self.drop_elsewhere(AfxJob::DropLevels(old));
+                            self.send_afx(AfxJob::DropLevels(old));
                         }
                         self.tones.insert(id, ToneState { spec, pushed_to: None });
                     }
@@ -551,19 +580,21 @@ impl<C: AudioClock> AudioRunner<C> {
                 self.pending_removals.remove(&id);
                 self.mixer.set(id, settings);
                 if let Some(old) = self.levels.insert(id, levels) {
-                    self.drop_elsewhere(AfxJob::DropLevels(old));
+                    self.send_afx(AfxJob::DropLevels(old));
                 }
             }
             AudioCmd::PushKey { id, talk, down } => self.mixer.push_key(id, talk, down),
             AudioCmd::SetOutputCapture { id, capture } => {
-                self.mixer.set_output_capture(id, capture);
+                if let Some(old) = self.mixer.replace_output_capture(id, capture) {
+                    self.send_afx(AfxJob::DropOutputCapture(old));
+                }
             }
             AudioCmd::SetEffects { id, effects, levels } => {
                 self.pending_removals.remove(&id);
                 if let Some(l) = levels
                     && let Some(old) = self.levels.insert(id, l)
                 {
-                    self.drop_elsewhere(AfxJob::DropLevels(old));
+                    self.send_afx(AfxJob::DropLevels(old));
                 }
                 let next_id = &mut self.next_build_id;
                 let mut gen_id = || {
@@ -573,32 +604,23 @@ impl<C: AudioClock> AudioRunner<C> {
                 };
                 let (evicted, missing) =
                     self.mixer.set_effects_nonblocking(id, &effects, &mut gen_id, &self.needs_plugin);
-                if !evicted.is_empty() {
-                    if let Some(afx) = &self.afx_tx {
-                        let _ = afx.try_send(AfxJob::DropFilters(evicted));
-                    } else {
-                        drop(evicted);
-                    }
+                if effects.capacity() > 0 {
+                    self.send_afx(AfxJob::DropEffects(effects));
                 }
-                if !missing.is_empty()
-                    && let Some(afx) = &self.afx_tx
-                {
-                    let _ = afx.try_send(AfxJob::Build { id, rate: self.rate, items: missing });
+                if !evicted.is_empty() {
+                    self.send_afx(AfxJob::DropFilters(evicted));
+                }
+                if !missing.is_empty() {
+                    self.send_afx(AfxJob::Build { id, rate: self.rate, items: missing });
                 }
             }
             AudioCmd::AttachPlugins { id, built } => {
                 let out = self.mixer.attach_plugins(id, built);
                 if !out.rejected.is_empty() {
-                    if let Some(afx) = &self.afx_tx {
-                        let _ = afx.try_send(AfxJob::DropPlugins(out.rejected));
-                    } else {
-                        drop(out.rejected);
-                    }
+                    self.send_afx(AfxJob::DropPlugins(out.rejected));
                 }
-                if !out.rebuild.is_empty()
-                    && let Some(afx) = &self.afx_tx
-                {
-                    let _ = afx.try_send(AfxJob::Build { id, rate: self.rate, items: out.rebuild });
+                if !out.rebuild.is_empty() {
+                    self.send_afx(AfxJob::Build { id, rate: self.rate, items: out.rebuild });
                 }
             }
             AudioCmd::SetHeard(heard) => {
@@ -606,9 +628,7 @@ impl<C: AudioClock> AudioRunner<C> {
                 // The list it had is freed on the background thread, not here (a scene switch
                 // must not free memory on the real-time thread).
                 let old = std::mem::replace(&mut self.heard, heard);
-                if let Some(afx) = &self.afx_tx {
-                    let _ = afx.try_send(AfxJob::DropHeard(old));
-                }
+                self.send_afx(AfxJob::DropHeard(old));
             }
             AudioCmd::SetLowLatency(on) => self.mixer.set_low_latency(on),
             AudioCmd::SetTruePeak(on) => self.mixer.set_true_peak(on),
@@ -622,13 +642,11 @@ impl<C: AudioClock> AudioRunner<C> {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             AudioCmd::SetMonitor { feeder, dev_id, epoch } => {
                 self.monitor_epoch = epoch;
-                self.mixer.set_monitor_device(dev_id);
+                if let Some(old_dev) = self.mixer.replace_monitor_device(dev_id) {
+                    self.send_afx(AfxJob::DropString(old_dev));
+                }
                 if let Some(old) = std::mem::replace(&mut self.monitor, feeder) {
-                    if let Some(afx) = &self.afx_tx {
-                        let _ = afx.try_send(AfxJob::DropFeeder(old));
-                    } else {
-                        drop(old);
-                    }
+                    self.send_afx(AfxJob::DropFeeder(old));
                 }
             }
             #[cfg(test)]
@@ -642,46 +660,137 @@ impl<C: AudioClock> AudioRunner<C> {
         self.pending_removals.remove(&id);
         self.tones.remove(&id);
         if let Some(ring) = self.rings.remove(&id) {
-            self.drop_elsewhere(AfxJob::DropRing(ring));
+            self.send_afx(AfxJob::DropRing(ring));
         }
         if let Some(l) = self.levels.remove(&id) {
-            self.drop_elsewhere(AfxJob::DropLevels(l));
+            self.send_afx(AfxJob::DropLevels(l));
         }
         if let Some(evicted) = self.mixer.remove(id)
-            && !evicted.is_empty()
+            && (!evicted.is_empty() || evicted.capacity() > 0)
         {
-            if let Some(afx) = &self.afx_tx {
-                let _ = afx.try_send(AfxJob::DropFilters(evicted));
-            } else {
-                drop(evicted);
+            self.send_afx(AfxJob::DropFilters(evicted));
+        }
+        while let Some(src) = self.mixer.pop_retired() {
+            self.send_afx(AfxJob::DropSource(src));
+        }
+    }
+
+    fn is_critical_afx_job(job: &AfxJob) -> bool {
+        match job {
+            AfxJob::Build { .. } | AfxJob::MakeResampler { .. } | AfxJob::MakeSpare { .. } => true,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            AfxJob::DropFeeder(_) => true,
+            _ => false,
+        }
+    }
+
+    fn flush_afx_retry(&mut self) {
+        let Some(afx) = &self.afx_tx else {
+            self.afx_retry.clear();
+            return;
+        };
+        while let Some(job) = self.afx_retry.pop_front() {
+            match afx.try_send(job) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(job)) => {
+                    self.afx_retry.push_front(job);
+                    break;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.afx_retry.clear();
+                    break;
+                }
             }
         }
     }
 
-    /// Frees what a job holds on the background thread (here only when there is none).
-    fn drop_elsewhere(&self, job: AfxJob) {
-        if let Some(afx) = &self.afx_tx {
-            let _ = afx.try_send(job);
+    fn queue_afx_retry(&mut self, job: AfxJob) {
+        if self.afx_retry.len() < AFX_RETRY_CAP {
+            self.afx_retry.push_back(job);
+            return;
+        }
+        if Self::is_critical_afx_job(&job) {
+            if let Some(idx) = self.afx_retry.iter().position(|j| !Self::is_critical_afx_job(j)) {
+                let _ = self.afx_retry.remove(idx);
+            }
+            self.afx_retry.push_back(job);
         }
     }
 
-    /// After commands: the entries of removed sources go to be dropped elsewhere, and spares
-    /// are asked for to replace the ones sources took.
+    /// Sends work/drop jobs to the background thread without blocking or losing critical work.
+    fn send_afx(&mut self, job: AfxJob) {
+        if self.afx_tx.is_none() {
+            return;
+        }
+        if !self.afx_retry.is_empty() {
+            self.flush_afx_retry();
+        }
+        if let Some(afx) = &self.afx_tx
+            && self.afx_retry.is_empty()
+        {
+            match afx.try_send(job) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(j)) => self.queue_afx_retry(j),
+                Err(mpsc::TrySendError::Disconnected(_)) => {}
+            }
+        } else {
+            self.queue_afx_retry(job);
+        }
+    }
+
+    /// After commands or ring drains: retired entries go off-thread, held sound releases, and
+    /// resampler / spare requests are sent (leaving unsent requests pending if `afx_tx` is full).
     fn tidy_after_commands(&mut self) {
+        self.flush_afx_retry();
         while let Some(src) = self.mixer.pop_retired() {
-            self.drop_elsewhere(AfxJob::DropSource(src));
+            self.send_afx(AfxJob::DropSource(src));
         }
         while let Some(rs) = self.mixer.pop_retired_resampler() {
-            self.drop_elsewhere(AfxJob::DropResampler(rs));
+            self.send_afx(AfxJob::DropResampler(rs));
         }
         self.mixer.release_held();
         let out_rate = self.mixer.resampler_out_rate();
         while let Some(in_rate) = self.mixer.pop_resampler_request() {
-            self.drop_elsewhere(AfxJob::MakeResampler { in_rate, out_rate });
+            if self.afx_tx.is_none() {
+                continue;
+            }
+            if !self.afx_retry.is_empty() {
+                self.flush_afx_retry();
+            }
+            if let Some(afx) = &self.afx_tx
+                && self.afx_retry.is_empty()
+            {
+                match afx.try_send(AfxJob::MakeResampler { in_rate, out_rate }) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        self.mixer.requeue_resampler_request(in_rate);
+                        break;
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                }
+            } else {
+                self.mixer.requeue_resampler_request(in_rate);
+                break;
+            }
         }
         let n = self.mixer.take_spare_request();
-        if n > 0 {
-            self.drop_elsewhere(AfxJob::MakeSpare { rate: self.rate, n });
+        if n > 0 && self.afx_tx.is_some() {
+            if !self.afx_retry.is_empty() {
+                self.flush_afx_retry();
+            }
+            if let Some(afx) = &self.afx_tx
+                && self.afx_retry.is_empty()
+            {
+                match afx.try_send(AfxJob::MakeSpare { rate: self.rate, n }) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        self.mixer.restore_spare_request(n);
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {}
+                }
+            } else {
+                self.mixer.restore_spare_request(n);
+            }
         }
     }
 
@@ -1363,5 +1472,186 @@ mod tests {
             (last_recovered - 0.5).abs() < 0.03,
             "music must recover to full level after key removal, got {last_recovered}"
         );
+    }
+
+    #[test]
+    fn rev22_m2_full_afx_channel_never_loses_critical_jobs() {
+        fn needs_slot_77(effect: AudioEffect, _rate: u32) -> bool {
+            matches!(effect, AudioEffect::Plugin { slot: 77 })
+        }
+
+        let t0 = 6_000_000_000u64;
+        let clock = SimClock::at(t0);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
+        let (bridge_tx, _bridge_rx) = mpsc::sync_channel(BRIDGE_CAP);
+        let (afx_tx, afx_rx) = mpsc::sync_channel(AFX_QUEUE);
+
+        let mut runner = AudioRunner::new(
+            clock,
+            RATE,
+            40_000_000,
+            cmd_rx,
+            recycle_rx,
+            Some(bridge_tx),
+            Some(afx_tx.clone()),
+            needs_slot_77,
+        );
+
+        // Fill `afx_tx` completely so `try_send` fails with `Full` for every job.
+        for _ in 0..AFX_QUEUE {
+            afx_tx.try_send(AfxJob::DropHeard(Arc::from([]))).unwrap_or_else(|e| panic!("{e:?}"));
+        }
+
+        // Trigger all 4 critical job kinds while `afx_tx` is completely full:
+        // 1. Build (SetEffects needing plugin slot 77)
+        let levels = AtomicLevels::shared();
+        cmd_tx.send(AudioCmd::EnsureSource { id: 1, levels: levels.clone() }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx
+            .send(AudioCmd::SetEffects { id: 1, effects: vec![AudioEffect::Plugin { slot: 77 }], levels: None })
+            .unwrap_or_else(|e| panic!("{e}"));
+        // 2. MakeResampler (44.1 kHz ring)
+        let (mut prod, cons) = SpscAudioRing::for_seconds(1, 44_100, 2, 441);
+        cmd_tx.send(AudioCmd::AttachRing { id: 2, consumer: cons }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::SetHeard(Arc::from([1, 2]))).unwrap_or_else(|e| panic!("{e}"));
+        prod.push(&[0.4f32; 441 * 2], 2, 44_100, t0).unwrap_or_else(|e| panic!("{e:?}"));
+        // 3. MakeSpare (consume prefilled spares)
+        for id in 10..15u64 {
+            cmd_tx.send(AudioCmd::EnsureSource { id, levels: levels.clone() }).unwrap_or_else(|e| panic!("{e}"));
+        }
+        // 4. DropFeeder (SetMonitor replacing an existing Feeder)
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let mon1 = crate::monitor::TestMonitor::new(RATE, RATE, 2);
+            let mon2 = crate::monitor::TestMonitor::new(RATE, RATE, 2);
+            cmd_tx
+                .send(AudioCmd::SetMonitor { feeder: Some(mon1.feeder), dev_id: Some("a".into()), epoch: 1 })
+                .unwrap_or_else(|e| panic!("{e}"));
+            cmd_tx
+                .send(AudioCmd::SetMonitor { feeder: Some(mon2.feeder), dev_id: Some("b".into()), epoch: 2 })
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        // Tick multiple times while `afx_tx` remains full (must not block).
+        for _ in 0..3 {
+            runner.tick();
+        }
+
+        // Drain the channel over several ticks and collect every critical job emitted.
+        let (mut saw_build, mut saw_resampler, mut saw_spare, mut saw_feeder) = (0usize, 0usize, 0usize, 0usize);
+        for _ in 0..10 {
+            while let Ok(job) = afx_rx.try_recv() {
+                match job {
+                    AfxJob::Build { id: 1, .. } => saw_build += 1,
+                    AfxJob::MakeResampler { in_rate: 44_100, out_rate: RATE } => saw_resampler += 1,
+                    AfxJob::MakeSpare { n, .. } if n > 0 => saw_spare += 1,
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    AfxJob::DropFeeder(_) => saw_feeder += 1,
+                    _ => {}
+                }
+            }
+            runner.tick();
+        }
+        assert_eq!(saw_build, 1, "Build job was lost when afx_tx was full");
+        assert_eq!(saw_resampler, 1, "MakeResampler job was lost when afx_tx was full");
+        assert!(saw_spare >= 1, "MakeSpare job was lost when afx_tx was full");
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(saw_feeder, 1, "DropFeeder job was lost/dropped on RT thread when afx_tx was full");
+    }
+
+    #[test]
+    fn rev22_m3_step_dispatches_ring_resampler_request_on_same_tick() {
+        let t0 = 1_000_000_000u64;
+        let clock = SimClock::at(t0);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
+        let (afx_tx, afx_rx) = mpsc::sync_channel(AFX_QUEUE);
+        let mut runner = AudioRunner::new(
+            clock,
+            RATE,
+            40_000_000,
+            cmd_rx,
+            recycle_rx,
+            None,
+            Some(afx_tx),
+            AudioFilter::effect_needs_plugin,
+        );
+        let (mut prod, cons) = SpscAudioRing::for_seconds(1, 44_100, 2, 441);
+        cmd_tx.send(AudioCmd::AttachRing { id: 1, consumer: cons }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::SetHeard(Arc::from([1]))).unwrap_or_else(|e| panic!("{e}"));
+        prod.push(&[0.3f32; 441 * 2], 2, 44_100, t0).unwrap_or_else(|e| panic!("{e:?}"));
+
+        runner.step();
+        let mut found = false;
+        while let Ok(job) = afx_rx.try_recv() {
+            if matches!(job, AfxJob::MakeResampler { in_rate: 44_100, out_rate: RATE }) {
+                found = true;
+            }
+        }
+        assert!(found, "MakeResampler from drain_rings should dispatch on the same step, not one tick late");
+    }
+
+    #[test]
+    fn rev22_m2_retry_overflow_evicts_droppable_jobs_not_critical_and_resampler_fail_unwedges() {
+        fn needs_slot_77(effect: AudioEffect, _rate: u32) -> bool {
+            matches!(effect, AudioEffect::Plugin { slot: 77 })
+        }
+
+        let t0 = 6_000_000_000u64;
+        let clock = SimClock::at(t0);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (_recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
+        let (afx_tx, afx_rx) = mpsc::sync_channel(AFX_QUEUE);
+        let mut runner =
+            AudioRunner::new(clock, RATE, 40_000_000, cmd_rx, recycle_rx, None, Some(afx_tx.clone()), needs_slot_77);
+
+        // Fill both afx_tx (256) and afx_retry (128) with droppable DropHeard jobs, then send Build.
+        for _ in 0..AFX_QUEUE {
+            afx_tx.try_send(AfxJob::DropHeard(Arc::from([]))).unwrap_or_else(|e| panic!("{e:?}"));
+        }
+        for _ in 0..(AFX_RETRY_CAP + 20) {
+            cmd_tx.send(AudioCmd::SetHeard(Arc::from([]))).unwrap_or_else(|e| panic!("{e}"));
+        }
+        cmd_tx.send(AudioCmd::EnsureSource { id: 1, levels: AtomicLevels::shared() }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx
+            .send(AudioCmd::SetEffects { id: 1, effects: vec![AudioEffect::Plugin { slot: 77 }], levels: None })
+            .unwrap_or_else(|e| panic!("{e}"));
+        runner.step();
+
+        let mut saw_build = 0usize;
+        for _ in 0..10 {
+            while let Ok(job) = afx_rx.try_recv() {
+                if matches!(job, AfxJob::Build { id: 1, .. }) {
+                    saw_build += 1;
+                }
+            }
+            runner.step();
+        }
+        assert_eq!(saw_build, 1, "critical Build must evict droppable DropHeard from afx_retry, never drop");
+
+        // ResamplerFailed clears rs_pending and hold without looping.
+        let (mut prod, cons) = SpscAudioRing::for_seconds(1, 44_100, 2, 441);
+        cmd_tx.send(AudioCmd::AttachRing { id: 2, consumer: cons }).unwrap_or_else(|e| panic!("{e}"));
+        cmd_tx.send(AudioCmd::SetHeard(Arc::from([2]))).unwrap_or_else(|e| panic!("{e}"));
+        prod.push(&[0.5f32; 441 * 2], 2, 44_100, t0).unwrap_or_else(|e| panic!("{e:?}"));
+        runner.step();
+        let mut asked = false;
+        while let Ok(job) = afx_rx.try_recv() {
+            if matches!(job, AfxJob::MakeResampler { in_rate: 44_100, out_rate: RATE }) {
+                asked = true;
+            }
+        }
+        assert!(asked, "heard 44.1 kHz ring must request MakeResampler");
+        cmd_tx.send(AudioCmd::ResamplerFailed(44_100)).unwrap_or_else(|e| panic!("{e}"));
+        runner.step();
+        prod.push(&[0.5f32; 441 * 2], 2, 44_100, t0 + 10_000_000).unwrap_or_else(|e| panic!("{e:?}"));
+        runner.step();
+        let mut looped = false;
+        while let Ok(job) = afx_rx.try_recv() {
+            if matches!(job, AfxJob::MakeResampler { in_rate: 44_100, .. }) {
+                looped = true;
+            }
+        }
+        assert!(!looped, "failed rate must not re-loop MakeResampler requests");
     }
 }
