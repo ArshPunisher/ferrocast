@@ -1062,12 +1062,13 @@ impl Default for StudioSettings {
             multiview_layout: "top".into(),
             multiview_labels: true,
             multiview_safe_areas: false,
-            // OBS's defaults.
+            // On, 10 pixels, and everything it can line up with (OBS's own default is the canvas's
+            // edges only): the preview draws a guide line for each thing a source snaps to.
             snapping: true,
             snap_px: 10,
             snap_screen: true,
-            snap_sources: false,
-            snap_center: false,
+            snap_sources: true,
+            snap_center: true,
             confirm_go_live: false,
             confirm_end_stream: true,
             confirm_stop_record: false,
@@ -3689,6 +3690,15 @@ mod tests {
         assert!(old.check().is_ok());
         let gl = StudioSettings { renderer: "opengl".into(), ..StudioSettings::default() };
         assert!(gl.check().is_ok());
+    }
+
+    /// A new profile snaps a moved source to the canvas's edges and middle and to other sources'
+    /// edges and middles, 10 pixels near (the guide lines in the preview show what it caught).
+    #[test]
+    fn the_preview_snaps_to_everything_by_default() {
+        let s = StudioSettings::default();
+        assert!(s.snapping && s.snap_screen && s.snap_center && s.snap_sources);
+        assert_eq!(s.snap_px, 10);
     }
 
     #[test]
