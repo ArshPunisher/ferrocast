@@ -164,6 +164,36 @@ fn parse_ffmpeg_options(opts: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Header lines that carry a credential (lower case).
+const CREDENTIAL_HEADERS: &[&str] = &["authorization", "proxy-authorization", "cookie"];
+
+/// Takes the credentials out of `parsed` (the `cookies` option, and the credential lines of
+/// `headers`) unless `input` is an https:// address: over anything else (plain http, or a
+/// protocol wrapped around it) anyone on the way could read them (CWE-319). True when something
+/// was taken out.
+fn drop_plain_credentials(input: &str, parsed: &mut Vec<(String, String)>) -> bool {
+    if input.trim_start().get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+        return false;
+    }
+    let before = parsed.clone();
+    parsed.retain_mut(|(k, v)| match k.as_str() {
+        "cookies" => false,
+        "headers" => {
+            let kept: String = v
+                .split_inclusive('\n')
+                .filter(|line| {
+                    let name = line.split(':').next().unwrap_or_default().trim();
+                    !CREDENTIAL_HEADERS.iter().any(|c| name.eq_ignore_ascii_case(c))
+                })
+                .collect();
+            *v = kept;
+            !v.trim().is_empty()
+        }
+        _ => true,
+    });
+    *parsed != before
+}
+
 /// Returns the FFmpeg protocol timeout option (`-rw_timeout` or `-timeout`) appropriate for
 /// `input` and `input_format`, or `None` for formats (like `sdp`) that reject AVIO timeouts.
 fn protocol_timeout_flag(input: &str, input_format: Option<&str>) -> Option<&'static str> {
@@ -196,7 +226,8 @@ fn args(set: &Value, sound_to: &str, parts: Parts, use_hw: bool, timeout: Durati
     }
     // OBS's "FFmpeg options": quoted `key=value` pairs filtered through the safe input allowlist.
     let opts = set.get("ffmpeg_options").and_then(Value::as_str).unwrap_or_default();
-    let parsed = parse_ffmpeg_options(opts);
+    let mut parsed = parse_ffmpeg_options(opts);
+    drop_plain_credentials(input, &mut parsed);
     let has_opt = |name: &str| parsed.iter().any(|(k, _)| k == name);
     // A live stream shows within a second, not after FFmpeg's default five of probing.
     if !has_opt("analyzeduration") {
@@ -283,6 +314,14 @@ impl NetMedia {
         let ffmpeg = ferrocore::ffenc::path()
             .ok_or("Media from a network address needs FFmpeg: pick x264 once in Settings and Ferrocast fetches it.")?;
         args(set, "", BOTH, true, timeout).ok_or("The media source has no address to read.")?;
+        // Said once a start (`args` leaves them out of every attempt), never with their values.
+        let input = set.get("input").and_then(Value::as_str).unwrap_or_default();
+        let opts = set.get("ffmpeg_options").and_then(Value::as_str).unwrap_or_default();
+        if drop_plain_credentials(input, &mut parse_ffmpeg_options(opts)) {
+            tracing::warn!(
+                "a network media source's credentials (Authorization, Cookie) are not sent: its address isn't https://"
+            );
+        }
         let set = set.clone();
         let delay = set.get("reconnect_delay_sec").and_then(Value::as_u64).unwrap_or(1).clamp(1, 60);
         let feed = Arc::new(Mutex::new(feed));
@@ -657,6 +696,36 @@ mod tests {
         let sound = Parts { picture: false, sound: true };
         let only = args(&set, "tcp://127.0.0.1:9", sound, true, DEFAULT_TIMEOUT).unwrap_or_default().join(" ");
         assert!(!only.contains("hwaccel"), "{only}");
+    }
+
+    /// Credentials (an Authorization or Cookie header, the cookies option) go only to an https://
+    /// address: over plain http anyone on the way reads them (CWE-319). Other headers still go.
+    #[test]
+    fn credentials_never_go_over_plain_http() {
+        let opts = "headers=\"X-Room: 7\r\nAuthorization: Bearer s3cret\r\nproxy-authorization: Basic s3cret\r\nCOOKIE: sid=s3cret\r\n\" cookies=sid=s3cret user_agent=Cam";
+        let run = |input: &str| {
+            args(&json!({ "input": input, "ffmpeg_options": opts }), "", BOTH, true, DEFAULT_TIMEOUT)
+                .unwrap_or_default()
+                .join(" ")
+        };
+        for plain in ["http://cam.test/live.m3u8", "HTTP://cam.test/a", "cache:http://cam.test/a", "  http://x/a"] {
+            let s = run(plain);
+            assert!(!s.contains("s3cret"), "{plain}: {s}");
+            assert!(!s.contains("-cookies"), "{plain}: {s}");
+            assert!(s.contains("X-Room: 7") && s.contains("-user_agent Cam"), "the rest still goes: {s}");
+        }
+        let tls = run("https://cam.test/live.m3u8");
+        assert!(tls.contains("Authorization: Bearer s3cret") && tls.contains("-cookies sid=s3cret"), "{tls}");
+        // Nothing left of the headers: the option isn't passed at all.
+        let only = args(
+            &json!({ "input": "http://x/a", "ffmpeg_options": "headers='Authorization: Bearer s3cret'" }),
+            "",
+            BOTH,
+            true,
+            DEFAULT_TIMEOUT,
+        )
+        .unwrap_or_default();
+        assert!(!only.iter().any(|a| a == "-headers"), "{only:?}");
     }
 
     /// A dead server or a 404 says nothing about the decoder: hardware decoding stays on and the
