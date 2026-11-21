@@ -1052,7 +1052,7 @@ impl Drop for Capture {
 /// Not when it moved to a Bluetooth input from one that isn't: putting on AirPods makes them the
 /// system's microphone, and opening it drops them to the 16 kHz call profile, which ruins the
 /// stream's voice and the streamer's own headphone sound. The mic open stays; picking the
-/// Bluetooth one by name still works (agy GAPS #7).
+/// Bluetooth one by name still works (GAPS #7).
 fn moved_on(follows: Option<&str>, now: Option<&str>, bluetooth: impl Fn(&str) -> bool) -> Option<String> {
     match (follows, now) {
         (Some(was), Some(now)) if was != now => {
@@ -1330,7 +1330,7 @@ mod tests {
         assert_eq!(pick_output_pixel_format(&[kCVPixelFormatType_422YpCbCr8]), kCVPixelFormatType_422YpCbCr8);
     }
 
-    /// agy GAPS #10 said 10-bit (HDR) frames from a card would be dropped by `copy_video_frame`.
+    /// GAPS #10 said 10-bit (HDR) frames from a card would be dropped by `copy_video_frame`.
     /// They never reach it: the output is told to deliver an 8-bit format, so AVFoundation
     /// converts, and the choice never lands on a 10-bit one even when that is all the card lists.
     #[test]

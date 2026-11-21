@@ -188,7 +188,7 @@ async fn channel(url: &str) -> Result<Channel, String> {
 async fn channel_with(url: &str, every: Duration, timeout: Duration) -> Result<Channel, String> {
     // HTTP/2 pings: a connection that died silently (Wi-Fi blip, a router dropping the idle
     // mapping) ends the stream within ~30 s and the chat reconnects; without them it hung
-    // forever, chat quietly gone for the rest of the stream (agy's M10 scan, M10-02). The
+    // forever, chat quietly gone for the rest of the stream (the M10 scan, M10-02). The
     // client pings only after `every` without anything from the server, so a chat with traffic
     // sends none.
     let mut ep = Endpoint::from_shared(url.to_string())

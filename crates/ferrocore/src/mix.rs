@@ -2242,7 +2242,7 @@ impl Mixer {
             }
         }
         // Its rate changed (a device or file at another rate now): what the old resampler still
-        // holds is played out first, not dropped (a click of ~11 ms; Sonnet's soak test, 20 Nov).
+        // holds is played out first, not dropped (a click of ~11 ms; a soak test, 20 Nov).
         let mut switched_rate = false;
         if src.resampler.as_ref().is_some_and(|rs| rs.in_rate != rate)
             && let Some(mut rs) = src.resampler.take()
@@ -2376,7 +2376,7 @@ impl Mixer {
         let mut next = *self.next_ns.get_or_insert(until.saturating_sub(step));
         // The clock jumped (the computer slept, a debugger held it): mixing every block of the
         // gap would allocate ~2.6 MB per second of it in one call (an hour: gigabytes, an
-        // out-of-memory crash on wake; agy's M11 scan). What was queued is long past: start again.
+        // out-of-memory crash on wake; the M11 scan). What was queued is long past: start again.
         if until.saturating_sub(next) > MAX_CATCH_UP_NS {
             tracing::warn!(gap_ms = (until - next) / 1_000_000, "the clock jumped: the mix starts again from now");
             for src in self.sources.values_mut() {

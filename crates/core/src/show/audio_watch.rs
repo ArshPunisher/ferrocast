@@ -488,7 +488,7 @@ mod tests {
         }
     }
 
-    // ---- S61a: agy REV21 and the review of the first version.
+    // ---- S61a: REV21 and the review of the first version.
 
     fn talk_muted(w: &mut LiveWatch, t: &mut i64, secs: i64) -> Vec<LiveAlert> {
         feed(w, t, secs, |_| vec![mic(-100.0, -22.0, true)])

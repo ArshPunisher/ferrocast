@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(unique.len(), all.len());
     }
 
-    /// A raid's worth of lines at once: one voice at a time, a long line of them let go (agy
+    /// A raid's worth of lines at once: one voice at a time, a long line of them let go (review
     /// GAPS #11).
     #[cfg(target_os = "macos")]
     #[tokio::test]

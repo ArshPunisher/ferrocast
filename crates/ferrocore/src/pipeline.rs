@@ -1864,7 +1864,7 @@ mod cut_tests {
     }
 }
 
-/// A hardware session lost and rebuilt (agy GAPS #4): viewers' decoders hold the first SPS/PPS,
+/// A hardware session lost and rebuilt (GAPS #4): viewers' decoders hold the first SPS/PPS,
 /// so a different pair needs a new sequence header before the keyframe; the same needs none.
 #[cfg(all(test, target_os = "macos"))]
 mod rebuild_tests {

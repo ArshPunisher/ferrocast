@@ -1,4 +1,4 @@
-//! Building blocks for sound that runs on a thread of its own (D1, `notes/obs-parity/agy/D1-audio-thread.md`):
+//! Building blocks for sound that runs on a thread of its own (D1, `the D1 design note`):
 //! a wait-free ring for one producer and one consumer, meters that are read without a lock, and a
 //! clock that tests can drive. Nothing here is used by the engine yet.
 //!

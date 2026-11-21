@@ -516,7 +516,7 @@ impl ScreenCapture {
             Some(Pictures::Native(w)) => w.frames(),
             Some(Pictures::Ffmpeg(l)) => l.frames(),
             // Sound alone: its pieces are its sign of life, so a source that came back resets
-            // the watchdog's waits (else they stayed at a minute; agy's review). Not steady:
+            // the watchdog's waits (else they stayed at a minute; the review). Not steady:
             // quiet speakers send nothing, which isn't a stop.
             None => self.sound.as_ref().map_or(0, Heal::received),
         }

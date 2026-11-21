@@ -316,7 +316,7 @@ impl Engine {
     /// to go live with and ends. A live show stays (its own ending, or the next Go live, takes it).
     pub(crate) fn end_show_whose_stream_stopped(&self) {
         // One look and the cancel under one lock: a show that went Live (or began again) between
-        // them must not be wiped (agy REV21 R2.6).
+        // them must not be wiped (REV21 R2.6).
         self.cancel_show_when("The stream stopped.", |m| {
             matches!(m.phase, BroadcastPhase::Countdown | BroadcastPhase::Starting)
                 && m.started_stream

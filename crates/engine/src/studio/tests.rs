@@ -2091,7 +2091,7 @@ async fn stopping_the_studio_ends_a_show_even_when_it_had_already_gone() {
     assert!(!e.is_show_active(), "a show with no Studio under it is over");
 }
 
-/// agy REV21 R2.6 (1): a show running on OBS while the Studio is off is not the Studio's: turning
+/// REV21 R2.6 (1): a show running on OBS while the Studio is off is not the Studio's: turning
 /// the (already off) Studio off must leave it. (The stale-show clearing of 1c4b9bb is for a show
 /// that had the Studio under it.)
 #[tokio::test]
@@ -2109,7 +2109,7 @@ async fn stopping_a_studio_that_is_off_leaves_a_show_running_on_obs() {
     assert!(e.is_show_active(), "the Studio was never under it");
 }
 
-/// agy REV21 R2.6 (2): the stream-stopped check and the cancel were two separate looks at the
+/// REV21 R2.6 (2): the stream-stopped check and the cancel were two separate looks at the
 /// machine; a show that had gone Live (or begun again) in between was wiped. The cancel is
 /// conditional under one lock now.
 #[tokio::test]
@@ -2137,7 +2137,7 @@ async fn a_stream_stop_never_ends_a_show_that_is_no_longer_counting_down() {
     assert!(!e.is_show_active());
 }
 
-/// agy REV21 R2.6 (3): a show whose stream is started by "at zero" (not by Start show) must count as
+/// REV21 R2.6 (3): a show whose stream is started by "at zero" (not by Start show) must count as
 /// having streamed: when that stream later stops, the next Start show must not be refused with
 /// "A show is already running".
 #[tokio::test]
@@ -2164,7 +2164,7 @@ async fn a_stream_started_at_zero_makes_the_show_stale_when_it_stops() {
     assert!(again.is_ok(), "the next show starts: {again:?}");
 }
 
-/// agy REV21 / S61a #4: a wake (or a new stream) starts the watch over; a BRB that a black camera
+/// REV21 / S61a #4: a wake (or a new stream) starts the watch over; a BRB that a black camera
 /// put on by itself must come off with it, and the page be told what was dropped.
 #[tokio::test]
 async fn a_reset_with_a_black_camera_raised_takes_brb_off_and_tells_the_page() {
@@ -2192,7 +2192,7 @@ async fn a_reset_with_a_black_camera_raised_takes_brb_off_and_tells_the_page() {
     assert!(e.reset_live_watch().await.is_empty());
 }
 
-/// agy REV21 R2.3, S61a #2: a muted mic that isn't the voice (another mic carries it) is no
+/// REV21 R2.3, S61a #2: a muted mic that isn't the voice (another mic carries it) is no
 /// warning before Go live; with no other mic it still is.
 #[tokio::test]
 async fn preflight_does_not_warn_about_a_muted_mic_while_another_carries_the_voice() {
@@ -2216,7 +2216,7 @@ async fn preflight_does_not_warn_about_a_muted_mic_while_another_carries_the_voi
     assert!(checks.iter().any(|c| c.id == "mic:Mic"), "alone it is warned about: {checks:?}");
 }
 
-/// agy REV21 R2.7: a live tick used to make a handful of separate reads on the Studio's thread
+/// REV21 R2.7: a live tick used to make a handful of separate reads on the Studio's thread
 /// (Scenes twice, Audio, Items per scene, Look); it makes two now: one snapshot (scenes, the
 /// on-air scene's sounds, the items to judge it) and the cameras' look.
 #[tokio::test]

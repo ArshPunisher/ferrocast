@@ -271,7 +271,7 @@ fn stops(kind: cpal::ErrorKind) -> bool {
 
 /// Sound that starts itself again when its device stops (speakers unplugged, the default
 /// changed), in the background, beside a picture that goes on: restarting the whole capture for
-/// its sound blinked the video (agy's review, 20 Nov). Without a picture (`heals` false) it
+/// its sound blinked the video (the review, 20 Nov). Without a picture (`heals` false) it
 /// doesn't: its stop is said by [`Heal::ended`] and the watchdog starts the source again.
 #[derive(Debug)]
 pub struct Heal {

@@ -807,7 +807,7 @@ mod tests {
 
     /// An undo storm (a key held down) saves the collection on every step: the writer coalesces
     /// them, so a hundred quick saves are a handful of disk writes, and the last one is what is
-    /// on disk (agy GAPS #22).
+    /// on disk (GAPS #22).
     #[test]
     fn a_hundred_rapid_saves_are_a_few_writes_and_the_last_one_wins() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));

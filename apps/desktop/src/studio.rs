@@ -4609,7 +4609,7 @@ mod budget_tests {
     }
 
     /// An undo or redo storm saves after every step: through the queue the file ends as the last
-    /// state, whole, and no step waits on a disk write (agy GAPS #22).
+    /// state, whole, and no step waits on a disk write (GAPS #22).
     #[test]
     fn a_storm_of_steps_leaves_the_last_state_on_disk() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));

@@ -1023,7 +1023,7 @@ mod tests {
     }
 
     /// The system takes the session away (display sleep, screen lock, the media server restarting:
-    /// agy GAPS #4): the encoder makes a new one and goes on with a keyframe, not an error that
+    /// GAPS #4): the encoder makes a new one and goes on with a keyframe, not an error that
     /// ends the stream.
     #[test]
     fn a_session_the_system_invalidated_is_made_again() {
@@ -1051,7 +1051,7 @@ mod tests {
     }
 
     /// An encoder that keeps dying isn't rebuilt every frame for ever: three restarts, then the
-    /// output stops with its own error (agy review R3).
+    /// output stops with its own error (review R3).
     #[test]
     fn an_encoder_that_keeps_dying_is_given_up_on() {
         let Ok(mut e) = Encoder::new(&config()) else { return };
@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     /// Changing the bitrate, or stopping, on a session the system took back is not an error
-    /// (agy review R4/R5).
+    /// (review R4/R5).
     #[test]
     fn a_lost_session_still_takes_a_bitrate_and_stops_cleanly() {
         let Ok(mut e) = Encoder::new(&config()) else { return };
@@ -1079,7 +1079,7 @@ mod tests {
     }
 
     /// Right after a rebuild, before the new session has made a frame, the codec header is the
-    /// lost session's, not none (a replay save at that moment would find nothing; agy review R6).
+    /// lost session's, not none (a replay save at that moment would find nothing; review R6).
     #[test]
     fn the_header_is_never_none_after_a_rebuild() {
         let Ok(mut e) = Encoder::new(&config()) else { return };
@@ -1095,7 +1095,7 @@ mod tests {
     }
 
     /// A session that accepts frames and never answers (no packet, no drop, no error) is built
-    /// again instead of silently ending the stream (the 25 min stall in Sonnet 1's soak).
+    /// again instead of silently ending the stream (the 25 min stall in a soak).
     #[test]
     fn a_session_that_goes_quiet_is_built_again_and_packets_flow() {
         let Ok(mut e) = Encoder::new(&config()) else { return };

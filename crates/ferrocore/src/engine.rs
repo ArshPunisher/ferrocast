@@ -950,7 +950,7 @@ struct Watch {
     faulted: bool,
     /// Ended because the system turned its permission off (Screen Recording): not tried again
     /// until the permission is back (`regained_access`); each try would only raise the system's
-    /// prompt again (agy GAPS #20).
+    /// prompt again (GAPS #20).
     denied: bool,
     /// The permission is back: the next look restarts it at once.
     regained: bool,
@@ -5892,7 +5892,7 @@ mod tests {
     }
 
     /// The wait for a signal needs a session open to see it come: without one (the last try failed
-    /// to open, or it ended with an error) the watchdog still tries, slowly (agy review R9).
+    /// to open, or it ended with an error) the watchdog still tries, slowly (review R9).
     #[test]
     fn a_no_signal_wait_without_a_session_is_retried_slowly() {
         let s = 1_000_000_000;
@@ -5907,7 +5907,7 @@ mod tests {
     }
 
     /// A capture card nobody has plugged anything into yet (a PS5 turned on later): once it
-    /// sends, the "no signal" wait ends by itself, with no unplugging or editing (agy GAPS #6).
+    /// sends, the "no signal" wait ends by itself, with no unplugging or editing (GAPS #6).
     #[test]
     fn a_no_signal_card_wakes_when_its_picture_comes() {
         let s = 1_000_000_000;
@@ -5924,7 +5924,7 @@ mod tests {
     }
 
     /// An HDMI link that flaps (one frame, then nothing, again and again) keeps its tries, so the
-    /// backoff grows instead of a restart every few seconds for ever (agy review R8).
+    /// backoff grows instead of a restart every few seconds for ever (review R8).
     #[test]
     fn a_flapping_link_does_not_reset_its_backoff() {
         let s = 1_000_000_000;
@@ -6020,7 +6020,7 @@ mod tests {
 
     /// Driven through the real watchdog step, not `Watch::backoff` alone: a mic that has worked
     /// and whose reopen fails is looked for again within seconds (the worker's own writes of
-    /// `next_try` used the long backoff and overwrote the short one; agy review R7).
+    /// `next_try` used the long backoff and overwrote the short one; review R7).
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     #[test]
     fn a_mic_that_worked_is_retried_within_seconds_after_a_failed_reopen_too() {
@@ -6424,7 +6424,7 @@ mod tests {
     }
 
     /// Editing a text's words or a colour while live is applied in place too: no source is opened
-    /// or closed, so no full load, no sound reset (agy GAPS #21).
+    /// or closed, so no full load, no sound reset (GAPS #21).
     #[test]
     fn a_text_or_colour_edit_applies_in_place() {
         let Some(e) = engine() else { return };
@@ -6846,7 +6846,7 @@ mod tests {
         assert_eq!(e.snapshot().unwrap_or_default()[0], 255);
     }
 
-    /// The graphics card's failure reaches every output's error (agy review R1).
+    /// The graphics card's failure reaches every output's error (review R1).
     #[test]
     #[cfg(target_os = "macos")]
     fn a_gpu_failure_is_every_outputs_error() {
@@ -6869,7 +6869,7 @@ mod tests {
         assert!(a.take_notices().is_empty(), "taken once");
     }
 
-    /// A failed output isn't fed again at 60 frames a second (agy review R2).
+    /// A failed output isn't fed again at 60 frames a second (review R2).
     #[test]
     #[cfg(target_os = "macos")]
     fn a_failed_output_is_not_fed_again() {
@@ -6892,7 +6892,7 @@ mod tests {
     }
 
     /// Stopping an output whose hardware session was just taken away, while the frame loop
-    /// rebuilds it under the engine's lock: it finishes, with no error and no deadlock (agy
+    /// rebuilds it under the engine's lock: it finishes, with no error and no deadlock (review
     /// review R5).
     #[test]
     #[cfg(target_os = "macos")]
@@ -6982,7 +6982,7 @@ mod tests {
         }
     }
 
-    /// One output's encoder fault marks that output, not the others (agy GAPS #3): the main
+    /// One output's encoder fault marks that output, not the others (GAPS #3): the main
     /// stream stays well, and a new output starts with no error.
     #[test]
     #[cfg(target_os = "macos")]
