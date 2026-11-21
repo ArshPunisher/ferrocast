@@ -1850,6 +1850,7 @@ pub(crate) mod tests {
             kinds: vec!["follow".into()],
             platforms: vec![],
             variations: vec![Variation::new("v", "{name} followed!")],
+            interrupt: false,
         };
         let a = render("a", &rule, &rule.variations[0], &e);
         assert!(a.design.is_none());

@@ -112,6 +112,10 @@ pub struct Variation {
     pub condition: Option<Condition>,
     /// Higher wins when several variations match.
     pub priority: i32,
+    /// Chance share among matching variations of the same top priority (0 = never picked
+    /// while a peer has weight; all zero = equal chances). Default 1.
+    #[serde(default = "default_weight")]
+    pub weight: u32,
     /// Headline, e.g. "{name} subscribed for {months} months!"
     pub title: String,
     /// Second line; usually "{message}".
@@ -130,6 +134,13 @@ pub struct Variation {
     pub css: String,
 }
 
+fn default_weight() -> u32 {
+    1
+}
+
+/// Largest weight the editor accepts (keeps the sum far from overflow).
+pub const MAX_WEIGHT: u32 = 1_000;
+
 impl Variation {
     pub fn new(id: &str, title: &str) -> Self {
         Variation {
@@ -137,6 +148,7 @@ impl Variation {
             name: "Default".into(),
             condition: None,
             priority: 0,
+            weight: 1,
             title: title.into(),
             body: "{message}".into(),
             image: None,
@@ -162,6 +174,41 @@ pub struct AlertRule {
     #[serde(default)]
     pub platforms: Vec<Platform>,
     pub variations: Vec<Variation>,
+    /// A new alert from this rule ends the one playing instead of waiting its turn.
+    #[serde(default)]
+    pub interrupt: bool,
+}
+
+/// A small seedable random generator (SplitMix64), so picks are repeatable in tests.
+#[derive(Debug, Clone)]
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn seeded(seed: u64) -> Self {
+        Rng(seed)
+    }
+
+    /// Seeded from the clock and a counter (each call differs, even in the same tick).
+    pub fn from_clock() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        Rng(nanos ^ COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed))
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A number in `0..n` (`n` > 0).
+    pub fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n.max(1)
+    }
 }
 
 /// Shortest and longest an alert may stay on screen.
@@ -182,6 +229,8 @@ pub enum RuleError {
     Volume(String),
     #[error("variation '{0}': duration must be 1 to 60 seconds")]
     Duration(String),
+    #[error("variation '{0}': weight must be 0 to 1000")]
+    Weight(String),
 }
 
 /// Event kinds a rule may target.
@@ -210,6 +259,9 @@ impl AlertRule {
             if !(MIN_DURATION_MS..=MAX_DURATION_MS).contains(&v.duration_ms) {
                 return Err(RuleError::Duration(v.name.clone()));
             }
+            if v.weight > MAX_WEIGHT {
+                return Err(RuleError::Weight(v.name.clone()));
+            }
         }
         Ok(())
     }
@@ -220,23 +272,57 @@ impl AlertRule {
             && (self.platforms.is_empty() || self.platforms.contains(&event.platform))
     }
 
-    /// The variation for `event`: the highest-priority matching one, else the default.
+    /// The variation for `event`: among the matching conditional ones the highest priority,
+    /// ties broken by weight with `rng`; else the default.
+    pub fn pick_with(&self, event: &Event, rng: &mut Rng) -> Option<&Variation> {
+        let matching: Vec<&Variation> =
+            self.variations.iter().filter(|v| v.condition.as_ref().is_some_and(|c| c.matches(event))).collect();
+        let top = matching.iter().map(|v| v.priority).max();
+        let tied: Vec<&Variation> = matching.into_iter().filter(|v| Some(v.priority) == top).collect();
+        pick_weighted(&tied, rng).or_else(|| self.variations.iter().find(|v| v.condition.is_none()))
+    }
+
+    /// [`pick_with`](Self::pick_with) with a clock-seeded generator.
     pub fn pick(&self, event: &Event) -> Option<&Variation> {
-        let conditional = self
-            .variations
-            .iter()
-            .filter(|v| v.condition.as_ref().is_some_and(|c| c.matches(event)))
-            .max_by_key(|v| v.priority);
-        conditional.or_else(|| self.variations.iter().find(|v| v.condition.is_none()))
+        self.pick_with(event, &mut Rng::from_clock())
+    }
+}
+
+/// One of `tied` by weight. A zero weight is never chosen while another has weight; when
+/// all are zero they are equally likely (an alert is never dropped over a weight of 0).
+fn pick_weighted<'a>(tied: &[&'a Variation], rng: &mut Rng) -> Option<&'a Variation> {
+    match tied {
+        [] => None,
+        [only] => Some(only),
+        _ => {
+            let total: u64 = tied.iter().map(|v| u64::from(v.weight)).sum();
+            if total == 0 {
+                return Some(tied[rng.below(tied.len() as u64) as usize]);
+            }
+            let mut roll = rng.below(total);
+            for v in tied {
+                let w = u64::from(v.weight);
+                if roll < w {
+                    return Some(v);
+                }
+                roll -= w;
+            }
+            tied.last().copied()
+        }
     }
 }
 
 /// Picks the first enabled rule that applies, and its variation.
 pub fn select<'a>(rules: &'a [AlertRule], event: &Event) -> Option<(&'a AlertRule, &'a Variation)> {
+    select_with(rules, event, &mut Rng::from_clock())
+}
+
+/// [`select`] with the caller's generator (seeded in tests).
+pub fn select_with<'a>(rules: &'a [AlertRule], event: &Event, rng: &mut Rng) -> Option<(&'a AlertRule, &'a Variation)> {
     if !event.may_alert() {
         return None;
     }
-    rules.iter().filter(|r| r.applies_to(event)).find_map(|r| r.pick(event).map(|v| (r, v)))
+    rules.iter().filter(|r| r.applies_to(event)).find_map(|r| r.pick_with(event, rng).map(|v| (r, v)))
 }
 
 /// What the overlay receives: text already rendered, media by id.
@@ -329,6 +415,7 @@ pub fn default_rules() -> Vec<AlertRule> {
             kinds: vec![kind.into()],
             platforms: vec![],
             variations: vec![v],
+            interrupt: false,
         }
     };
     vec![
@@ -365,6 +452,7 @@ mod tests {
             kinds: vec!["subscription".into()],
             platforms: vec![],
             variations: vec![Variation::new("default", "{name} subscribed"), silver, gold],
+            interrupt: false,
         }
     }
 
@@ -489,6 +577,7 @@ mod tests {
             kinds: vec!["tip".into()],
             platforms: vec![],
             variations: vec![v.clone()],
+            interrupt: false,
         };
         let a = render("a", &rule, &v, &e);
         assert_eq!(a.duration_ms, MAX_DURATION_MS);
@@ -513,5 +602,116 @@ mod tests {
         // And other wording is left alone.
         let own = Variation::new("own", "{months}");
         assert_eq!(render("a", sub_rule, &own, &one).title, "1");
+    }
+
+    fn weighted_rule(weights: &[u32]) -> AlertRule {
+        let mut r = sub_rule();
+        r.variations = vec![Variation::new("default", "{name} subscribed")];
+        for (i, w) in weights.iter().enumerate() {
+            let mut v = Variation::new(&format!("v{i}"), "{name}");
+            v.condition = Some(Condition::MonthsAtLeast { months: 1 });
+            v.priority = 5;
+            v.weight = *w;
+            r.variations.push(v);
+        }
+        r
+    }
+
+    fn counts(rule: &AlertRule, seed: u64, n: usize) -> std::collections::HashMap<String, usize> {
+        let mut rng = Rng::seeded(seed);
+        let e = sub_with_months(2);
+        let mut m = std::collections::HashMap::new();
+        for _ in 0..n {
+            *m.entry(rule.pick_with(&e, &mut rng).unwrap().id.clone()).or_insert(0) += 1;
+        }
+        m
+    }
+
+    #[test]
+    fn weights_shape_the_distribution() {
+        let c = counts(&weighted_rule(&[1, 3]), 7, 20_000);
+        let share = c["v1"] as f64 / 20_000.0;
+        assert!((share - 0.75).abs() < 0.02, "share {share}");
+    }
+
+    #[test]
+    fn the_same_seed_gives_the_same_picks() {
+        let r = weighted_rule(&[1, 1, 1]);
+        assert_eq!(counts(&r, 42, 500), counts(&r, 42, 500));
+        let e = sub_with_months(2);
+        let run = |seed| {
+            let mut g = Rng::seeded(seed);
+            (0..30).map(|_| r.pick_with(&e, &mut g).unwrap().id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(run(5), run(5));
+        assert_ne!(run(5), run(6));
+    }
+
+    #[test]
+    fn a_zero_weight_is_never_picked_beside_a_weighted_peer() {
+        let c = counts(&weighted_rule(&[0, 2, 0]), 1, 2_000);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c["v1"], 2_000);
+    }
+
+    #[test]
+    fn all_zero_weights_are_equally_likely_and_still_alert() {
+        let c = counts(&weighted_rule(&[0, 0]), 3, 4_000);
+        assert_eq!(c.len(), 2);
+        assert!(c.values().all(|n| (*n as f64 / 4_000.0 - 0.5).abs() < 0.05), "{c:?}");
+    }
+
+    #[test]
+    fn one_variation_is_always_picked_whatever_its_weight() {
+        for w in [0, 1, 1_000] {
+            assert_eq!(counts(&weighted_rule(&[w]), 9, 50)["v0"], 50);
+        }
+    }
+
+    #[test]
+    fn equal_weights_at_a_tie_split_evenly() {
+        let c = counts(&weighted_rule(&[1, 1]), 11, 10_000);
+        assert!((c["v0"] as f64 / 10_000.0 - 0.5).abs() < 0.03, "{c:?}");
+    }
+
+    #[test]
+    fn weight_never_beats_a_higher_priority() {
+        let mut r = weighted_rule(&[1, 1]);
+        r.variations[1].priority = 9;
+        r.variations[1].weight = 0;
+        r.variations[2].weight = 1_000;
+        assert_eq!(counts(&r, 2, 200)["v0"], 200);
+    }
+
+    #[test]
+    fn weight_is_ignored_by_the_default_look() {
+        let mut r = weighted_rule(&[5]);
+        r.variations[0].weight = 0;
+        let e = sub_with_months(0);
+        assert_eq!(r.pick_with(&e, &mut Rng::seeded(1)).unwrap().id, "default");
+    }
+
+    #[test]
+    fn weights_above_the_limit_are_refused_and_old_rules_default_to_one() {
+        let mut r = weighted_rule(&[1]);
+        r.variations[1].weight = MAX_WEIGHT + 1;
+        assert!(matches!(r.validate(), Err(RuleError::Weight(_))));
+        r.variations[1].weight = MAX_WEIGHT;
+        assert!(r.validate().is_ok());
+        let mut j = serde_json::to_value(Variation::new("x", "t")).unwrap();
+        j.as_object_mut().unwrap().remove("weight");
+        assert_eq!(serde_json::from_value::<Variation>(j).unwrap().weight, 1);
+        let mut j = serde_json::to_value(sub_rule()).unwrap();
+        j.as_object_mut().unwrap().remove("interrupt");
+        assert!(!serde_json::from_value::<AlertRule>(j).unwrap().interrupt);
+    }
+
+    #[test]
+    fn select_with_uses_the_given_generator() {
+        let rules = vec![weighted_rule(&[1, 1])];
+        let e = sub_with_months(2);
+        let a = select_with(&rules, &e, &mut Rng::seeded(4)).unwrap().1.id.clone();
+        let b = select_with(&rules, &e, &mut Rng::seeded(4)).unwrap().1.id.clone();
+        assert_eq!(a, b);
     }
 }
