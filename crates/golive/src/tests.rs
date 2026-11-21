@@ -1191,13 +1191,21 @@ async fn only_enhanced_broadcasting_gets_the_other_qualities() {
     assert_eq!(next(&mut other).await, Got::Video(40, Bytes::from_static(INTER)));
 }
 
-/// Listener with a small TCP receive buffer so pausing or throttling reads exerts real TCP
-/// backpressure on `push::session`'s writes within a few frames.
+/// The sender's send buffer toward a slow test platform: about macOS's loopback default, and what
+/// a real link starts with. Left to itself Linux makes it about 2.5 MB over loopback, so a
+/// stalled platform's writes only block seconds of stream later.
+pub(crate) const SLOW_LINK_SEND_BUFFER: usize = 128 * 1024;
+
+/// Listener with a small TCP receive buffer (and the sender's send buffer to it pinned) so
+/// pausing or throttling reads exerts real TCP backpressure on `push::session`'s writes within
+/// a few frames, on every OS.
 async fn small_buf_listener() -> TcpListener {
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     let _ = sock.set_recv_buffer_size(16 * 1024);
     sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    sock.listen(16).unwrap()
+    let l = sock.listen(16).unwrap();
+    push::fault::set_send_buffer(l.local_addr().unwrap().port(), SLOW_LINK_SEND_BUFFER);
+    l
 }
 
 /// A fake platform whose reads can be paused via `open` (true = read freely, false = stall)

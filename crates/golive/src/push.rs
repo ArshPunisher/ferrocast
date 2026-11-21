@@ -704,6 +704,21 @@ pub(crate) mod fault {
     pub(crate) fn refused(port: u16) -> bool {
         REFUSED.lock().unwrap_or_else(|e| e.into_inner()).contains(&port)
     }
+    static SEND_BUFFER: Mutex<Vec<(u16, usize)>> = Mutex::new(Vec::new());
+    /// Connections to this port get a send buffer of this size, as on a real link. Over loopback
+    /// Linux sizes it from the 64 KB loopback segment (about 2.5 MB at connect), so a platform
+    /// that reads slowly or not at all takes seconds of stream before its writes block; macOS
+    /// starts at about 144 KB. Pinned, a slow test platform pushes back the same on every OS.
+    pub(crate) fn set_send_buffer(port: u16, bytes: usize) {
+        let mut d = SEND_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+        d.retain(|(p, _)| *p != port);
+        if bytes > 0 {
+            d.push((port, bytes));
+        }
+    }
+    pub(crate) fn send_buffer(port: u16) -> Option<usize> {
+        SEND_BUFFER.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(p, _)| *p == port).map(|(_, b)| *b)
+    }
 }
 
 fn family_name(f: IpFamily) -> &'static str {
@@ -771,6 +786,10 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
     .map_err(|_| PushError::Slow(host.clone()))?
     .map_err(|e| connect_error(&e, &host))?;
     let _ = tcp.set_nodelay(true);
+    #[cfg(test)]
+    if let Some(bytes) = fault::send_buffer(t.port) {
+        socket2::SockRef::from(&tcp).set_send_buffer_size(bytes).expect("test send buffer");
+    }
     if !t.tls {
         return Ok(Box::pin(tcp));
     }

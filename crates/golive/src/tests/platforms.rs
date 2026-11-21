@@ -28,6 +28,7 @@ fn destination_with(port: u16, id: &str, first_ms: u64, max_ms: u64) -> Destinat
 /// open, its buffers fill, and the sender's writes block (a platform stuck behind its own load
 /// balancer).
 async fn platform_that_stalls(listener: TcpListener, key: &'static str) -> mpsc::UnboundedReceiver<Got> {
+    push::fault::set_send_buffer(listener.local_addr().unwrap().port(), SLOW_LINK_SEND_BUFFER);
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
@@ -66,6 +67,7 @@ async fn platform_that_is_slow(
     bytes: usize,
     every: Duration,
 ) -> mpsc::UnboundedReceiver<Got> {
+    push::fault::set_send_buffer(listener.local_addr().unwrap().port(), SLOW_LINK_SEND_BUFFER);
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
