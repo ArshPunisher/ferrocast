@@ -34,6 +34,8 @@ pub(crate) async fn run(engine: Engine) {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueView {
     pub paused: bool,
+    /// Alerts play without sound or speech.
+    pub muted: bool,
     pub playing: Option<PlayingView>,
     pub waiting: Vec<WaitingView>,
 }
@@ -54,6 +56,7 @@ pub struct WaitingView {
 fn view(q: &AlertQueue) -> QueueView {
     QueueView {
         paused: q.is_paused(),
+        muted: q.is_muted(),
         playing: q.playing().map(|p| PlayingView { alert: p.alert.clone(), started_at: p.started_at.0 }),
         waiting: q
             .waiting()
@@ -152,9 +155,9 @@ impl Engine {
         v
     }
 
-    pub(crate) async fn enqueue_alert(&self, alert: RenderedAlert, priority: i32) {
+    pub(crate) async fn enqueue_alert(&self, alert: RenderedAlert, priority: i32, interrupt: bool) {
         let speak = alert.tts_text.clone().map(|t| (alert.alert_id.clone(), t));
-        self.queue_op(move |q, t| q.enqueue(alert, priority, t)).await;
+        self.queue_op(move |q, t| q.enqueue_with(alert, priority, interrupt, t)).await;
         self.inner.queue_changed.notify_one();
         if let Some((alert_id, text)) = speak {
             // Read aloud: what it says can't be taken for the streamer's voice command.
@@ -204,6 +207,15 @@ impl Engine {
     pub async fn queue_pause(&self) -> QueueView {
         self.queue_op(|q, _| {
             q.pause();
+            vec![]
+        })
+        .await
+    }
+
+    /// Mutes or unmutes alert sound and speech (kept across restarts).
+    pub async fn queue_set_muted(&self, muted: bool) -> QueueView {
+        self.queue_op(move |q, _| {
+            q.set_muted(muted);
             vec![]
         })
         .await

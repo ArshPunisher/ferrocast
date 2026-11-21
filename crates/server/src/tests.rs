@@ -1789,3 +1789,51 @@ async fn chat_shows_this_stream_not_the_last_one() {
     let ids: Vec<&str> = chat.as_array().unwrap().iter().filter_map(|e| e["source_id"].as_str()).collect();
     assert_eq!(ids, ["just now"]);
 }
+
+#[tokio::test]
+async fn queue_controls_pause_mute_skip_and_their_state() {
+    let r = start().await;
+    let q: Value = r.get("/api/v1/queue").await.json().await.unwrap();
+    assert_eq!((q["paused"].as_bool(), q["muted"].as_bool()), (Some(false), Some(false)), "{q}");
+    for (path, key, want) in [
+        ("/api/v1/queue/pause", "paused", true),
+        ("/api/v1/queue/mute", "muted", true),
+        ("/api/v1/queue/unmute", "muted", false),
+        ("/api/v1/queue/resume", "paused", false),
+    ] {
+        let res = r.post(path, json!({})).await;
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        let q: Value = res.json().await.unwrap();
+        assert_eq!(q[key].as_bool(), Some(want), "{path}: {q}");
+    }
+    // Idempotent, and skipping with nothing playing is fine.
+    assert_eq!(r.post("/api/v1/queue/mute", json!({})).await.status(), StatusCode::OK);
+    let q: Value = r.post("/api/v1/queue/mute", json!({})).await.json().await.unwrap();
+    assert_eq!(q["muted"], true);
+    assert_eq!(r.post("/api/v1/queue/skip", json!({})).await.status(), StatusCode::OK);
+    // Without the session token every one is refused.
+    for p in ["/api/v1/queue/mute", "/api/v1/queue/unmute", "/api/v1/queue/skip"] {
+        assert_eq!(r.anonymous(reqwest::Method::POST, p).await.status(), StatusCode::UNAUTHORIZED, "{p}");
+    }
+    assert_eq!(r.get("/api/v1/queue/mute").await.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn alert_rules_take_weight_and_interrupt_and_refuse_bad_weights() {
+    let r = start().await;
+    let rules: Value = r.get("/api/v1/alert-rules").await.json().await.unwrap();
+    let mut rule = rules[0].clone();
+    assert!(rule["variations"][0]["weight"].is_number() && rule["interrupt"] == false, "{rule}");
+    rule["interrupt"] = json!(true);
+    rule["variations"][0]["weight"] = json!(7);
+    let id = rule["id"].as_str().unwrap().to_string();
+    let res = r.put(&format!("/api/v1/alert-rules/{id}"), rule.clone()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let back: Value = res.json().await.unwrap();
+    assert_eq!((back["interrupt"].as_bool(), back["variations"][0]["weight"].as_u64()), (Some(true), Some(7)));
+    rule["variations"][0]["weight"] = json!(1001);
+    let res = r.put(&format!("/api/v1/alert-rules/{id}"), rule).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let e: Value = res.json().await.unwrap();
+    assert!(e.to_string().contains("weight"), "{e}");
+}
