@@ -406,7 +406,10 @@ impl<C: AudioClock> AudioRunner<C> {
             next_build_id: 1,
             ring_scratch: Vec::with_capacity(INITIAL_RING_SCRATCH_SAMPLES),
             tone_scratch: Vec::with_capacity(BLOCK * 2),
-            blocks_scratch: Vec::with_capacity(8),
+            // Room for every block one call can catch up on (the mixer restarts past 10 s): a
+            // slow moment then mixes several blocks at once without growing this on the audio
+            // thread (a CI machine did; ~56 bytes a slot).
+            blocks_scratch: Vec::with_capacity(crate::mix::MAX_CATCH_UP_BLOCKS),
         }
     }
 

@@ -52,6 +52,10 @@ const SWITCH_FADE: usize = 96;
 /// The most the mix catches up on in one call (about 26 MB of blocks): a longer gap is a clock
 /// jump (sleep), and the mix starts again from now. A stall of a few seconds is still mixed.
 const MAX_CATCH_UP_NS: u64 = 10_000_000_000;
+/// The most blocks one [`Mixer::mix_until_into`] call can make (10 s of 1024-frame blocks at the
+/// highest mix rate, 48 kHz, plus a spare).
+pub(crate) const MAX_CATCH_UP_BLOCKS: usize = (MAX_CATCH_UP_NS * 48_000 / 1_000_000_000 / BLOCK as u64) as usize + 2;
+const _: () = assert!(MAX_CATCH_UP_BLOCKS >= 10 * 48_000 / BLOCK, "room for the whole catch-up");
 /// After this long with sound on time, the mixer waits only as long as the latest sound in it
 /// needed (a moment of trouble no longer keeps everything late for the rest of the stream).
 const SHRINK_AFTER_NS: u64 = 20_000_000_000;
@@ -2757,6 +2761,22 @@ mod tests {
 
     /// Every edit of a collection sets each source's filters again: one whose settings didn't
     /// change keeps running (a VST's helper isn't started again), a changed one is made anew.
+    #[test]
+    fn a_stall_catches_up_without_growing_the_block_list() {
+        // A slow moment (a busy machine, a CI runner) mixes many blocks in one call: the
+        // audio thread's list was made for the most a call can make, so it never grows there.
+        let mut m = Mixer::new(48_000, 0);
+        let mut out: Vec<Block> = Vec::with_capacity(MAX_CATCH_UP_BLOCKS);
+        let t0 = 10_000_000_000u64;
+        m.mix_until_into(t0, &mut out);
+        let (cap, at) = (out.capacity(), out.as_ptr());
+        out.clear();
+        // Half a second of nothing mixed, then one call: ~23 blocks at once.
+        m.mix_until_into(t0 + 500_000_000, &mut out);
+        assert!(out.len() > 8, "a stall mixes several blocks: {}", out.len());
+        assert_eq!((out.capacity(), out.as_ptr()), (cap, at), "the list didn't grow or move");
+    }
+
     #[test]
     fn unchanged_filters_keep_running() {
         use std::sync::atomic::{AtomicU32, Ordering};
