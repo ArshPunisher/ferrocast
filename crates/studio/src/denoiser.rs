@@ -28,8 +28,11 @@ fn atten_db(strength: u32) -> f32 {
 /// device that is switched off or muted in hardware, not a quiet room (that is never this low).
 const SILENT_PEAK: f32 = 3.16e-5;
 /// Seconds of digital silence the model has already worked through before it stops being run on
-/// more of it (its state, and the delay it holds, are then silence too).
-const SILENT_SECS: usize = 1;
+/// more of it. Its own state (the level it measures the sound against) adapts to silence over
+/// a few seconds: stopped after one it is still a third of what the voice before it left, and
+/// the voice after the silence is judged differently from by the model that ran all along; after
+/// three it is within a dB or two.
+const SILENT_SECS: usize = 3;
 
 /// DeepFilterNet over a stream of planar samples: blocks in, cleaned blocks out, one block late.
 pub(crate) struct Denoiser {
@@ -95,6 +98,8 @@ impl Denoiser {
         for q in &mut self.inp {
             q.clear();
         }
+        // The stretch of silence it was in is over: the sound after the hole is the model's.
+        self.quiet_blocks = 0;
     }
 
     pub(crate) fn set_strength(&mut self, strength: u32) {
@@ -121,14 +126,16 @@ impl Denoiser {
                     self.noisy[[c, i]] = s;
                 }
             }
-            // Digital silence (a muted or switched-off device) goes through as it is once the
-            // model has had a second of it: the model's state and its held delay are silence by
-            // then, so the sound that follows comes out in the same place, and the first block
-            // with anything in it goes to the model with nothing to wait for.
+            // Digital silence (a muted or switched-off device) is given back as silence once the
+            // model has had a few seconds of it: the model's state and its held delay are
+            // silence by then, so the sound that follows comes out in the same place, and the
+            // first block with anything in it goes to the model with nothing to wait for.
             let silent = self.noisy.iter().all(|s| s.abs() <= SILENT_PEAK);
             self.quiet_blocks = if silent { self.quiet_blocks + 1 } else { 0 };
             if self.skip_silence && silent && self.quiet_blocks > SILENT_SECS * 48_000 / self.hop {
-                self.clean.assign(&self.noisy);
+                // Exactly nothing: not the input's last bits of dither, which the model would have
+                // taken down and which would come in as a step here.
+                self.clean.fill(0.0);
                 self.skipped_blocks += 1;
             } else if self.df.process(self.noisy.view(), self.clean.view_mut()).is_err() {
                 // As it was rather than nothing.
@@ -847,17 +854,17 @@ mod tests {
         assert_eq!(said, MODEL_LATENCY, "40 ms with the built-in model (the plugin says it before the model is made)");
     }
 
-    /// Hiss, three seconds of digital silence, then a voice-like buzz, in libobs's 1024-frame
+    /// Hiss, six seconds of digital silence, then a voice-like buzz, in libobs's 1024-frame
     /// pieces; one run with the silence skipped and one with the model run on all of it.
     fn silence_between(skip: bool) -> (Denoiser, Vec<f32>, Vec<f32>) {
         let mut d = Denoiser::new(2, 100).expect("the built-in model starts");
         d.skip_silence = skip;
         let mut seed = 11;
         let (mut before, mut after) = (Vec::new(), Vec::new());
-        for piece in 0..(47 + 141 + 94) {
+        for piece in 0..(47 + 282 + 94) {
             let mut l: Vec<f32> = if piece < 47 {
                 hiss(1024, &mut seed)
-            } else if piece < 47 + 141 {
+            } else if piece < 47 + 282 {
                 vec![0.0; 1024]
             } else {
                 let base = before.len();
@@ -880,24 +887,32 @@ mod tests {
     /// Digital silence stops costing the model after its first second, and the sound after it
     /// comes out where and as it would have: same place, no click, nothing lost.
     #[test]
-    fn digital_silence_is_passed_through_after_a_second_and_the_voice_after_it_is_the_same() {
+    fn digital_silence_is_skipped_after_three_seconds_and_the_voice_after_it_is_the_same() {
         let (all, _, with_model) = silence_between(false);
         let (skipping, before, skipped) = silence_between(true);
         assert_eq!(all.skipped_blocks, 0, "the control never skips");
-        // 3 s of silence = 300 blocks of 10 ms; the first second goes through the model.
-        assert!((190..=200).contains(&skipping.skipped_blocks), "skipped {}", skipping.skipped_blocks);
+        // 6 s of silence = 600 blocks of 10 ms; the first 3 s go through the model.
+        assert!((295..=305).contains(&skipping.skipped_blocks), "skipped {}", skipping.skipped_blocks);
         assert_eq!(skipped.len(), before.len(), "as many samples out as in");
         // The same sound, in the same place: the first 150 ms of the voice (before the model has
         // made up its mind about a steady buzz, which depends on how long it has sat in silence)
         // come out as they do when the model has run on every block of the silence.
-        let onset = (47 + 141) * 1024;
+        let onset = (47 + 282) * 1024;
         let first = |v: &[f32]| v[onset - 4_800..onset + 7_200].to_vec();
         let worst = first(&with_model).iter().zip(first(&skipped)).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(worst < 0.03, "the voice's first 150 ms match the model run on everything: {worst}");
         // No click at the edges: no step bigger than the voice itself has.
         let step = |v: &[f32]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
         assert!(step(&skipped) <= step(&with_model) * 1.05 + 1e-4, "{} vs {}", step(&skipped), step(&with_model));
-        assert!(rms(&skipped[(47 + 141) * 1024 + 24_000..]) > 0.01, "the voice is there");
+        // And what the model makes of the buzz afterwards (it takes a steady one for noise) is
+        // what it makes of it with nothing skipped.
+        let late = |v: &[f32]| rms(&v[onset + 24_000..]);
+        assert!(
+            late(&skipped) < late(&with_model) * 2.0 && late(&skipped) > late(&with_model) * 0.5,
+            "{} vs {}",
+            late(&skipped),
+            late(&with_model)
+        );
         // A very quiet room (not digital silence) is never skipped.
         let mut d = Denoiser::new(2, 100).expect("the built-in model starts");
         let mut seed = 5;
@@ -907,6 +922,102 @@ mod tests {
             d.run(&mut [&mut l, &mut r]);
         }
         assert_eq!(d.skipped_blocks, 0, "-70 dBFS of room tone still goes through the model");
+    }
+
+    /// What a skipped block says is "nothing", exactly: no leftover dither of the input's, which
+    /// the model alone would have taken down, not passed on as a step.
+    #[test]
+    fn skipped_silence_is_exact_zeros() {
+        let mut d = Denoiser::new(1, 100).expect("the built-in model starts");
+        let mut out = Vec::new();
+        for i in 0..(6 * 48_000 / 480) {
+            let mut b: Vec<f32> = (0..480).map(|k| if (i + k) % 2 == 0 { 2e-5 } else { -2e-5 }).collect();
+            d.run(&mut [&mut b]);
+            out.extend_from_slice(&b);
+        }
+        assert!(d.skipped_blocks > 100, "skipping: {}", d.skipped_blocks);
+        assert!(out[out.len() - 48_000..].iter().all(|v| *v == 0.0), "the last second is exact zeros");
+    }
+
+    /// A hole in the samples ends the stretch of silence: the model works through the next
+    /// seconds again before anything more is skipped.
+    #[test]
+    fn a_gap_ends_the_silent_stretch() {
+        let mut d = Denoiser::new(1, 100).expect("the built-in model starts");
+        let silent = |d: &mut Denoiser, blocks: usize| {
+            for _ in 0..blocks {
+                let mut b = vec![0.0f32; 480];
+                d.run(&mut [&mut b]);
+            }
+        };
+        silent(&mut d, 600);
+        let skipped = d.skipped_blocks;
+        assert!(skipped > 200, "skipping by now: {skipped}");
+        d.gap();
+        silent(&mut d, 50);
+        assert_eq!(d.skipped_blocks, skipped, "after a gap the model runs again");
+        silent(&mut d, 400);
+        assert!(d.skipped_blocks > skipped, "and the skipping comes back after the silence has gone on");
+    }
+
+    /// The model's own state adapts to silence over a few seconds. Skipping too soon leaves it
+    /// part way, and a voice after a long silence then comes out differently from what the model
+    /// that ran all along gives: not by more than a few dB.
+    #[test]
+    fn after_a_long_silence_the_voice_is_judged_like_the_model_that_never_skipped() {
+        let r = 48_000usize;
+        let speech = |n: usize| -> Vec<f32> {
+            let mut out = Vec::with_capacity(n);
+            let mut phase = 0.0f64;
+            for i in 0..n {
+                let t = i as f64 / 48_000.0;
+                let f0 = 140.0 + 25.0 * (std::f64::consts::TAU * 0.8 * t).sin();
+                phase += std::f64::consts::TAU * f0 / 48_000.0;
+                let f1 = 520.0 + 220.0 * (std::f64::consts::TAU * 1.9 * t).sin();
+                let f2 = 1550.0 + 550.0 * (std::f64::consts::TAU * 1.4 * t).cos();
+                let mut sv = 0.0f64;
+                for k in 1..=26 {
+                    let fk = f0 * f64::from(k);
+                    let g1 = 1.0 / ((fk - f1).powi(2) + 55.0f64.powi(2)).sqrt();
+                    let g2 = 0.7 / ((fk - f2).powi(2) + 80.0f64.powi(2)).sqrt();
+                    let env = (g1 + g2) / f64::from(k).powf(0.5);
+                    sv += (phase * f64::from(k) + std::f64::consts::PI * f64::from(k * k) / 26.0).sin() * env;
+                }
+                let cyc = (t * 3.2) % 1.0;
+                let gate = if cyc < 0.78 { (std::f64::consts::PI * cyc / 0.78).sin().powf(0.6) } else { 0.0 };
+                out.push((sv * gate) as f32);
+            }
+            let cur = rms(&out).max(1e-9);
+            out.iter().map(|v| v * db_to_mul(-28.0) / cur).collect()
+        };
+        let mut seed = 42u32;
+        let mut burst = || -> Vec<f32> {
+            let noise = pink_noise(3 * r, db_to_mul(-36.0), &mut seed);
+            noise.iter().zip(speech(3 * r)).map(|(a, b)| a + b).collect()
+        };
+        let mut input = burst();
+        input.extend(std::iter::repeat_n(0.0f32, 6 * r));
+        let onset = input.len();
+        input.extend(burst());
+        let run = |skip: bool| -> Vec<f32> {
+            let mut d = Denoiser::new(1, 100).expect("the built-in model starts");
+            d.skip_silence = skip;
+            let mut out = Vec::new();
+            for chunk in input.chunks(1024) {
+                let mut b = chunk.to_vec();
+                d.run(&mut [&mut b]);
+                out.extend_from_slice(&b);
+            }
+            out
+        };
+        let (all, skipping) = (run(false), run(true));
+        let db = |v: &[f32]| 20.0 * rms(&v[onset..onset + r]).max(1e-9).log10();
+        assert!(
+            (db(&all) - db(&skipping)).abs() < 3.0,
+            "first second of the voice: {:.1} dB vs {:.1} dB",
+            db(&all),
+            db(&skipping)
+        );
     }
 
     #[test]
