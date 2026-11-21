@@ -3965,7 +3965,12 @@ fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32), 
                 .iter()
                 .filter(|i| i.visible && i.show.shown_to(aud))
                 .filter_map(|i| item_at(st, i, ms, depth + 1, canvas, aud))
-                .collect();
+                .collect::<Vec<_>>();
+            // Everything in it is for the other audience: it draws nothing (its own filters would
+            // otherwise paint an empty box into this picture).
+            if items.is_empty() && scene.iter().any(|i| i.visible && !i.show.shown_to(aud)) {
+                return None;
+            }
             match it.group {
                 // An empty group is 0×0: nothing to draw, and drawing it would fail the whole
                 // frame (owner, 11 Nov: the canvas stayed blank once a group was added).
@@ -6983,6 +6988,36 @@ mod tests {
         assert_eq!(shown(Show::Stream, Show::Both), (3, 0, 3));
         // Nothing flagged: everyone sees everything (the item beside it is still stream-only).
         assert_eq!(shown(Show::Both, Show::Both), (3, 2, 3));
+    }
+
+    /// A group none of whose sources is for this audience draws nothing (its own filters would
+    /// paint an empty box into a clean recording).
+    #[test]
+    fn a_group_with_nothing_for_an_audience_draws_nothing() {
+        let Some(e) = engine() else { return };
+        for id in [1, 2] {
+            e.set_source(id, SourceKind::Color { width: 64, height: 36, rgba: [255, 0, 0, 255] })
+                .unwrap_or_else(|x| panic!("{x}"));
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !(1..=2).all(|id| e.lock().sources.get(&id).is_some_and(|s| s.size.is_some())) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let only_stream = |id| SceneItem { show: Show::Stream, ..SceneItem::new(id, Placement::default()) };
+        e.set_scene("Inner", vec![only_stream(1), only_stream(2)]);
+        let mut group = SceneItem::new(0, Placement::default());
+        group.scene = Some("Inner".into());
+        group.group = Some((400, 600));
+        e.set_scene("Main", vec![group]);
+        let st = e.lock();
+        let count = |a| build(&st, 640, 360, Some("Main"), 0, a).items.len();
+        assert_eq!(count(Audience::Stream), 1, "the stream shows the group");
+        assert_eq!(count(Audience::Everyone), 1);
+        assert_eq!(count(Audience::Recording), 0, "the recording has nothing from it, not an empty box");
+        // A group that was empty to begin with is as it was.
+        drop(st);
+        e.set_scene("Inner", vec![]);
+        assert_eq!(build(&e.lock(), 640, 360, Some("Main"), 0, Audience::Recording).items.len(), 1);
     }
 
     /// The picture at the middle of the canvas, as the stream's, the recording's and the editor's

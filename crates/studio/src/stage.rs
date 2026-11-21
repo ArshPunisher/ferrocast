@@ -1920,6 +1920,7 @@ impl Stage {
                         "scale_filter",
                         "blend_type",
                         "blend_method",
+                        SHOW_KEY,
                     ] {
                         if let Some(v) = it.get(k) {
                             i[k] = v.clone();
@@ -3445,6 +3446,27 @@ impl Stage {
                 );
                 c["bounds"] = json!({ "x": bw * scale.0.abs(), "y": bh * scale.1.abs() });
                 c["rot"] = json!((c.get("rot").and_then(Value::as_f64).unwrap_or(0.0) as f32 + turn).rem_euclid(360.0));
+                // Where it is shown: the group's choice covered it, and goes on covering it. One
+                // for the stream only in a group for the recording only was shown nowhere, so it
+                // stays out of sight rather than suddenly appearing.
+                use ferrocore::engine::Show;
+                let (group_show, own) = (shown_of(&g), shown_of(&c));
+                let (now, nowhere) = match (group_show, own) {
+                    (Show::Both, own) => (own, false),
+                    (g, Show::Both) => (g, false),
+                    (g, own) if g == own => (own, false),
+                    (_, own) => (own, true),
+                };
+                if let Some(o) = c.as_object_mut() {
+                    if now == Show::Both {
+                        o.remove(SHOW_KEY);
+                    } else {
+                        o.insert(SHOW_KEY.into(), json!(now.name()));
+                    }
+                    if nowhere {
+                        o.insert("visible".into(), json!(false));
+                    }
+                }
                 next += 1;
                 c["id"] = json!(next);
                 l.insert((at_bottom + k).min(l.len()), c);
@@ -6030,6 +6052,44 @@ mod tests {
         ok(s.edit_item("Main", red.id, ItemEdit::Show));
         assert!(s.has_selective_items());
         assert!(s.edit_item("Main", 999, ItemEdit::StreamOnly).is_err(), "no such item");
+    }
+
+    /// Taking a group apart, or copying an item, never changes where something is shown: ungrouped
+    /// sources keep what the group had (a recording-only group's sources must not appear on the
+    /// stream), and a copy shows where its original does.
+    #[test]
+    fn ungrouping_and_duplicating_keep_where_things_are_shown() {
+        let s = stage();
+        let show = |s: &Stage, name: &str| -> Option<(String, bool)> {
+            ok(s.items("Main")).into_iter().find(|i| i.name == name).map(|i| (i.show, i.visible))
+        };
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 50, "height": 50 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 50, "height": 50 }), false));
+        let c = ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 50, "height": 50 }), false));
+        // A recording-only group: both of its sources go on being recording-only.
+        let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        ok(s.edit_item("Main", g.id, ItemEdit::RecordingOnly));
+        ok(s.ungroup("Main", g.id));
+        assert_eq!(show(&s, "A"), Some(("recording".into(), true)));
+        assert_eq!(show(&s, "B"), Some(("recording".into(), true)));
+        // A source with its own flag keeps it when the group was for both; two that conflict
+        // (stream-only in a recording-only group) were shown nowhere, and stay out of sight.
+        // (Ungrouping gives its sources new ids: they are looked up by name from here.)
+        let id_of = |s: &Stage, name: &str| ok(s.items("Main")).into_iter().find(|i| i.name == name).map(|i| i.id);
+        let (a_id, c_id) = (id_of(&s, "A").unwrap_or(0), id_of(&s, "C").unwrap_or(0));
+        let g2 = ok(s.group_together("Main", &[a_id, c_id], "Other"));
+        let c_inside =
+            ok(s.items("Main")).into_iter().flat_map(|i| i.children).find(|i| i.name == "C").map_or(0, |i| i.id);
+        ok(s.edit_item("Main", c_inside, ItemEdit::StreamOnly));
+        ok(s.edit_item("Main", g2.id, ItemEdit::RecordingOnly));
+        ok(s.ungroup("Main", g2.id));
+        assert_eq!(show(&s, "A"), Some(("recording".into(), true)), "the group's flag is the same as its own");
+        assert_eq!(show(&s, "C"), Some(("stream".into(), false)), "shown in neither before: hidden now");
+        // A copy of a flagged item shows where the original does.
+        let b_id = id_of(&s, "B").unwrap_or(0);
+        ok(s.edit_item("Main", b_id, ItemEdit::StreamOnly));
+        ok(s.edit_item("Main", b_id, ItemEdit::Duplicate));
+        assert_eq!(show(&s, "B 2"), Some(("stream".into(), true)));
     }
 
     /// `has_selective_items` (it decides whether a recording can share the stream's encode) says
