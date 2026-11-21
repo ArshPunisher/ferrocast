@@ -153,6 +153,8 @@ pub type MakePlugin = fn(u32, u32) -> Option<Box<dyn SoundPlugin>>;
 
 static PLUGIN_MAKER: std::sync::OnceLock<MakePlugin> = std::sync::OnceLock::new();
 static PLUGINS_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Said once: RNNoise had no model (a mix that isn't 48 kHz) and the light noise removal ran.
+static RNNOISE_LIGHT_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Enables or suppresses third-party VST plugin creation (Safe Mode sets `true`).
 pub fn set_plugins_disabled(disabled: bool) {
@@ -731,8 +733,20 @@ impl AudioFilter {
         self.sync_smooth_targets();
         match self.effect {
             // No VST host in this app, or not running yet: the sound passes as it is.
-            // Likewise RNNoise: its model is built off the audio thread (48 kHz only).
-            AudioEffect::Plugin { .. } | AudioEffect::Rnnoise { .. } => {}
+            AudioEffect::Plugin { .. } => {}
+            // RNNoise's model is being built off the audio thread: the sound passes as it is.
+            AudioEffect::Rnnoise { .. } if self.pending_build.is_some() => {}
+            // No model (it works at 48 kHz only): the light noise removal, at the strength
+            // OBS's RNNoise loaded as before it had its own (24 dB → 40), never the sound as it is.
+            AudioEffect::Rnnoise { .. } => {
+                if !RNNOISE_LIGHT_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        rate = self.rate,
+                        "Remove background noise needs a 48 kHz mix: the light noise removal runs instead"
+                    );
+                }
+                self.light_denoise(&mut l[..n], &mut r[..n], 40);
+            }
             AudioEffect::Gain { .. } => {
                 for i in 0..n {
                     let m = self.smooth_gain.next();
@@ -2857,6 +2871,31 @@ mod tests {
         let drop = band_db(&input[tail.clone()]) - band_db(&out[tail.clone()]);
         assert!(drop > 6.0, "noise band dropped only {drop:.1} dB");
         assert!(rms(&out[tail.clone()]) > 0.3 * rms(&input[tail]), "the voice was kept");
+    }
+
+    /// At a 44.1 kHz mix there is no RNNoise model (48 kHz only): the light noise removal runs
+    /// instead, at the strength OBS's RNNoise used to load as (40), never the sound untouched.
+    #[test]
+    fn rnnoise_at_44_1_khz_falls_back_to_the_light_noise_removal() {
+        const R44: u32 = 44_100;
+        let r = R44 as usize;
+        let mut seed = 5u32;
+        // 6 s of a room's noise (-45 dBFS pink): the last second is measured.
+        let input = pink_noise(6 * r, db_to_mul(-45.0), &mut seed);
+        let run = |effect: AudioEffect| {
+            let mut f = AudioFilter::new(effect, R44);
+            assert!(f.plugin.is_none() && f.latency_frames() == 0, "no model at 44.1 kHz");
+            let (mut l, mut rr) = (input.clone(), input.clone());
+            for (a, b) in l.chunks_mut(441).zip(rr.chunks_mut(441)) {
+                f.process([a, b]);
+            }
+            l
+        };
+        let out = run(AudioEffect::Rnnoise { amount: 100 });
+        let tail = 5 * r..6 * r;
+        let drop = mul_to_db(rms(&input[tail.clone()])) - mul_to_db(rms(&out[tail.clone()]));
+        assert!(drop > 4.0, "the noise went down only {drop:.1} dB");
+        assert_eq!(out, run(AudioEffect::Denoise { strength: 40 }), "the light noise removal at 40");
     }
 
     #[test]
