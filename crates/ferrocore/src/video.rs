@@ -232,6 +232,22 @@ impl VideoEncoder {
         }
     }
 
+    pub(crate) fn dts_shift(&self) -> i64 {
+        match &self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => e.dts_shift(),
+            Inner::Ffmpeg(_) => 0,
+        }
+    }
+
+    pub(crate) fn set_min_dts(&mut self, #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] last_dts: i64) {
+        match &mut self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => e.set_min_dts(last_dts),
+            Inner::Ffmpeg(_) => {}
+        }
+    }
+
     /// True once when a rebuilt hardware session made a codec header unlike the lost one's:
     /// a stream sends the new sequence header before the next keyframe.
     pub fn header_changed(&mut self) -> bool {

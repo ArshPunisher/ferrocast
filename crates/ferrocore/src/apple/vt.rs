@@ -164,6 +164,25 @@ struct Sink {
     mute: bool,
 }
 
+impl Sink {
+    /// Shifts decode time by `dts_shift`, forces strict monotonicity against `last_dts`, and keeps
+    /// `pts >= dts` so RTMP composition times are never negative.
+    fn normalize(&mut self, mut pts: i64, raw_dts: i64) -> (i64, i64) {
+        let mut dts = if self.dts_shift > 0 { (raw_dts - self.dts_shift).min(pts) } else { raw_dts.min(pts) };
+        if let Some(last) = self.last_dts
+            && dts <= last
+        {
+            let step = if pts > last { ((pts - last) / 4).clamp(1, 1_000) } else { 1 };
+            dts = last + step;
+        }
+        if pts < dts {
+            pts = dts;
+        }
+        self.last_dts = Some(dts);
+        (pts, dts)
+    }
+}
+
 /// Whether the session reorders frames: asked for, and the profile has B-frames (Baseline hasn't).
 fn reorder_on(cfg: &VideoConfig) -> bool {
     cfg.bframes && !(cfg.codec == VideoCodec::H264 && cfg.profile == crate::video::H264Profile::Baseline)
@@ -467,6 +486,16 @@ impl Encoder {
         self.sink.lock().ok().and_then(|s| s.header.clone()).or_else(|| self.prior_header.clone())
     }
 
+    pub(crate) fn dts_shift(&self) -> i64 {
+        self.sink.lock().map_or(0, |s| s.dts_shift)
+    }
+
+    pub(crate) fn set_min_dts(&mut self, last_dts: i64) {
+        if let Ok(mut s) = self.sink.lock() {
+            s.last_dts = Some(s.last_dts.map_or(last_dts, |prev| prev.max(last_dts)));
+        }
+    }
+
     pub(crate) fn encode(&mut self, frame: Frame<'_>, pts_us: i64, key: bool) -> Result<Vec<VideoPacket>, AvError> {
         self.lost = false;
         match self.encode_once(frame, pts_us, key) {
@@ -764,18 +793,9 @@ extern "C" fn output(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus,
             sink.error = Some("an encoded frame couldn't be read".into());
             return;
         }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sbuf).to_us().unwrap_or(0);
-        let mut dts = CMSampleBufferGetDecodeTimeStamp(sbuf).to_us().unwrap_or(pts);
-        if sink.dts_shift > 0 {
-            // Decode times move back so none is after its picture's time, and still rise.
-            dts = (dts - sink.dts_shift).min(pts);
-            if let Some(last) = sink.last_dts
-                && dts <= last
-            {
-                dts = last + 1;
-            }
-            sink.last_dts = Some(dts);
-        }
+        let raw_pts = CMSampleBufferGetPresentationTimeStamp(sbuf).to_us().unwrap_or(0);
+        let raw_dts = CMSampleBufferGetDecodeTimeStamp(sbuf).to_us().unwrap_or(raw_pts);
+        let (pts, dts) = sink.normalize(raw_pts, raw_dts);
         let mut key = true;
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sbuf, 0);
         if !attachments.is_null() && CFArrayGetCount(attachments) > 0 {
@@ -987,5 +1007,26 @@ mod tests {
             pts.sort_unstable();
             assert_eq!(pts, (0..90).map(|i| i * 33_333).collect::<Vec<i64>>());
         }
+    }
+
+    #[test]
+    fn vt_bframes_dts_validity_and_monotonic_cts_non_negative() {
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            let Ok(mut e) = Encoder::new(&VideoConfig { bframes: true, codec, ..config() }) else { continue };
+            let mut out = Vec::new();
+            for i in 0..45i64 {
+                let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+                let pix = (y, vec![128u8; 320 * 90]);
+                out.extend(e.encode(frame(&pix), i * 33_333, i == 0).unwrap_or_else(|er| panic!("{er}")));
+            }
+            out.extend(e.flush().unwrap_or_else(|er| panic!("{er}")));
+            assert!(out.windows(2).all(|w| w[1].dts_us > w[0].dts_us), "dts must strictly increase");
+            assert!(out.iter().all(|p| p.dts_us <= p.pts_us), "never emit negative cts");
+        }
+        // Even if last_dts pushes past an incoming frame's pts - dts_shift (or kCMTimeInvalid hits),
+        // normalize keeps dts strictly rising and pts >= dts (cts >= 0).
+        let mut sink = Sink { dts_shift: 100_000, last_dts: Some(110_000), ..Default::default() };
+        let (pts, dts) = sink.normalize(100_000, 100_000);
+        assert!(dts > 110_000 && pts >= dts, "pts={pts} dts={dts}");
     }
 }

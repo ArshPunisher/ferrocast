@@ -51,7 +51,9 @@ const FAIL_DELAY: Duration = Duration::from_secs(1);
 const MAX_MESSAGE: usize = 256 * 1024;
 const IDENTIFY_WITHIN: Duration = Duration::from_secs(10);
 const SEND_WITHIN: Duration = Duration::from_secs(5);
-const POLL: Duration = Duration::from_millis(250);
+const POLL: Duration = Duration::from_secs(1);
+/// Maximum failed LAN IPs tracked so spoofed floods cannot grow memory without bound.
+const MAX_FAIL_IPS: usize = 1024;
 /// Failed passwords from one address before it's shut out, and for how long.
 const MAX_FAILS: u32 = 5;
 const FAIL_WINDOW: Duration = Duration::from_secs(60);
@@ -149,8 +151,16 @@ struct Fails {
 }
 
 #[derive(Debug)]
+struct ListenerTask {
+    stop: watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
 pub(crate) struct Runtime {
-    task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task: tokio::sync::Mutex<Option<ListenerTask>>,
+    apply_lock: tokio::sync::Mutex<()>,
+    listening_tasks: AtomicUsize,
     /// Bumped on every change: connections made before it close.
     generation: watch::Sender<u64>,
     clients: AtomicUsize,
@@ -166,7 +176,9 @@ pub(crate) struct Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self {
-            task: std::sync::Mutex::new(None),
+            task: tokio::sync::Mutex::new(None),
+            apply_lock: tokio::sync::Mutex::new(()),
+            listening_tasks: AtomicUsize::new(0),
             generation: watch::channel(0).0,
             clients: AtomicUsize::new(0),
             events: broadcast::channel(256).0,
@@ -396,7 +408,7 @@ impl Engine {
             }
         }
         self.ows_save(s).await?;
-        self.obsws_apply();
+        self.obsws_apply().await;
         self.obsws_settle().await;
         Ok((self.obsws_view().await, made))
     }
@@ -408,14 +420,15 @@ impl Engine {
         let (pw, salt, secret) = new_secret()?;
         (s.salt, s.secret) = (salt, secret);
         self.ows_save(s).await?;
-        self.obsws_apply();
+        self.obsws_apply().await;
         self.obsws_settle().await;
         Ok(pw)
     }
 
     /// Starts what the saved settings ask for (the server calls this once it's up).
     pub fn start_obsws(&self) {
-        self.obsws_apply();
+        let engine = self.clone();
+        tokio::spawn(async move { engine.obsws_apply().await });
         let mut slot = self.inner.obsws.poller.lock().unwrap_or_else(|p| p.into_inner());
         if slot.as_ref().is_none_or(tokio::task::JoinHandle::is_finished) {
             let engine = self.clone();
@@ -423,17 +436,25 @@ impl Engine {
         }
     }
 
-    /// Looks at the saved settings again: closes everyone, and listens afresh when on.
-    fn obsws_apply(&self) {
+    /// Looks at the saved settings again: closes everyone, awaits the old listener's socket drop,
+    /// and listens afresh when on.
+    async fn obsws_apply(&self) {
         let rt = &self.inner.obsws;
+        let _apply = rt.apply_lock.lock().await;
         rt.generation.send_modify(|g| *g += 1);
-        let mut slot = rt.task.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(old) = slot.take() {
-            old.abort();
+        let prev = rt.task.lock().await.take();
+        if let Some(ListenerTask { stop, mut handle }) = prev {
+            let _ = stop.send(true);
+            if tokio::time::timeout(Duration::from_secs(2), &mut handle).await.is_err() {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
         *rt.status.lock().unwrap_or_else(|p| p.into_inner()) = (false, None);
+        let (stop, stop_rx) = watch::channel(false);
         let engine = self.clone();
-        *slot = Some(tokio::spawn(async move { engine.ows_listen().await }));
+        let handle = tokio::spawn(async move { engine.ows_listen(stop_rx).await });
+        *rt.task.lock().await = Some(ListenerTask { stop, handle });
     }
 
     /// Waits (a second at most) for the listener to bind or say why it couldn't.
@@ -449,12 +470,18 @@ impl Engine {
         }
     }
 
-    async fn ows_listen(&self) {
+    async fn ows_listen(&self, mut stop_rx: watch::Receiver<bool>) {
+        struct CountGuard<'a>(&'a AtomicUsize);
+        impl Drop for CountGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
         let saved = self.ows_saved().await;
         let set_status = |listening: bool, error: Option<String>| {
             *self.inner.obsws.status.lock().unwrap_or_else(|p| p.into_inner()) = (listening, error);
         };
-        if !saved.enabled {
+        if !saved.enabled || *stop_rx.borrow() {
             return;
         }
         if saved.secret.is_empty() {
@@ -470,13 +497,23 @@ impl Engine {
                 return;
             }
         };
+        self.inner.obsws.listening_tasks.fetch_add(1, Ordering::SeqCst);
+        let _guard = CountGuard(&self.inner.obsws.listening_tasks);
         tracing::info!(port = saved.port, lan = saved.lan, "obs-websocket is listening");
         set_status(true, None);
         let generation = *self.inner.obsws.generation.borrow();
         loop {
-            let Ok((stream, peer)) = listener.accept().await else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+            let accepted = tokio::select! {
+                biased;
+                _ = stop_rx.changed() => break,
+                res = listener.accept() => res,
+            };
+            let Ok((stream, peer)) = accepted else {
+                tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => break,
+                    () = tokio::time::sleep(Duration::from_millis(100)) => continue,
+                }
             };
             // A device that failed the password too often waits.
             if self.ows_shut_out(peer.ip()) {
@@ -516,13 +553,21 @@ impl Engine {
             return;
         }
         let mut map = self.inner.obsws.fails.lock().unwrap_or_else(|p| p.into_inner());
-        let f = map.entry(ip).or_insert(Fails { count: 0, since: Instant::now(), shut_until: None });
-        if f.since.elapsed() > FAIL_WINDOW {
-            *f = Fails { count: 0, since: Instant::now(), shut_until: None };
+        let now = Instant::now();
+        map.retain(|_, v| v.shut_until.is_some_and(|t| t > now) || now.duration_since(v.since) < FAIL_WINDOW);
+        if map.len() >= MAX_FAIL_IPS
+            && !map.contains_key(&ip)
+            && let Some(oldest) = map.iter().min_by_key(|(_, v)| v.since).map(|(k, _)| *k)
+        {
+            map.remove(&oldest);
+        }
+        let f = map.entry(ip).or_insert(Fails { count: 0, since: now, shut_until: None });
+        if now.duration_since(f.since) > FAIL_WINDOW {
+            *f = Fails { count: 0, since: now, shut_until: None };
         }
         f.count += 1;
         if f.count >= MAX_FAILS {
-            f.shut_until = Some(Instant::now() + SHUT_OUT);
+            f.shut_until = Some(now + SHUT_OUT);
             tracing::warn!(%ip, "obs-websocket: too many wrong passwords, this device waits a minute");
         }
     }
@@ -654,8 +699,8 @@ impl Engine {
                                         self.inner.obsws.poll_now.notify_one();
                                     }
                                     subs = Some(mask);
-                                    // Identified is op 2; Reidentified is op 3.
-                                    let reply = json!({ "op": if op == 1 { 2 } else { 3 },
+                                    // obs-websocket v5 has only Identified (op 2), even in response to Reidentify (op 3).
+                                    let reply = json!({ "op": 2,
                                         "d": { "negotiatedRpcVersion": RPC_VERSION } });
                                     if send(&mut ws, &reply).await.is_err() {
                                         break;
@@ -681,7 +726,10 @@ impl Engine {
                             }
                         }
                         8 => {
-                            let reply = self.ows_batch(d).await;
+                            let Some(reply) = self.ows_batch(d, generation, &mut gen_rx).await else {
+                                close(&mut ws, CLOSE_INVALIDATED, "The settings changed.").await;
+                                break;
+                            };
                             if send(&mut ws, &json!({ "op": 9, "d": reply })).await.is_err() {
                                 break;
                             }
@@ -722,19 +770,31 @@ impl Engine {
         }
     }
 
-    async fn ows_batch(&self, d: &Value) -> Value {
+    async fn ows_batch(&self, d: &Value, generation: u64, gen_rx: &mut watch::Receiver<u64>) -> Option<Value> {
         let id = d.get("requestId").cloned().unwrap_or(Value::Null);
         let halt = d.get("haltOnFailure").and_then(Value::as_bool).unwrap_or(false);
         let mut results = Vec::new();
         for r in d.get("requests").and_then(Value::as_array).into_iter().flatten().take(MAX_BATCH) {
-            let out = self.ows_one(r).await;
+            if *gen_rx.borrow() != generation {
+                return None;
+            }
+            let out = tokio::select! {
+                biased;
+                changed = gen_rx.changed() => {
+                    if changed.is_err() || *gen_rx.borrow() != generation {
+                        return None;
+                    }
+                    continue;
+                }
+                out = self.ows_one(r) => out,
+            };
             let ok = out["requestStatus"]["result"] == Value::Bool(true);
             results.push(out);
             if halt && !ok {
                 break;
             }
         }
-        json!({ "requestId": id, "results": results })
+        Some(json!({ "requestId": id, "results": results }))
     }
 
     /// One request → the RequestResponse's data.
@@ -758,8 +818,10 @@ impl Engine {
                 if !body.is_null() {
                     r["responseData"] = body;
                 }
-                // A change made here shows in the events at once, not a quarter second on.
-                self.inner.obsws.poll_now.notify_one();
+                if ows_mutates(kind) {
+                    // A change made here shows in the events at once, without polling on read-only Get* calls.
+                    self.inner.obsws.poll_now.notify_one();
+                }
                 r
             }
             Err((code, comment)) => json!({ "requestType": kind, "requestId": id,
@@ -798,31 +860,61 @@ impl Engine {
         Err(fail(ST_MISSING_FIELD, "Your request needs `sceneName` or `sceneUuid`."))
     }
 
-    fn ows_input_name(d: &Value) -> Result<String, Fail> {
+    async fn ows_resolve_source_uuid(&self, u: &str, missing: &'static str) -> Result<String, Fail> {
+        let v = self.studio_act(StudioAct::Sources).await.map_err(obs_error)?;
+        if let Some(n) = v.as_array().into_iter().flatten().filter_map(|s| s["name"].as_str()).find(|n| uuid_of(n) == u)
+        {
+            return Ok(n.to_string());
+        }
+        // Global channels live outside `Sources`; check cached snapshot inputs when available.
+        if let Ok(host) = self.studio_host()
+            && let Some(Ok(snap)) = host.obsws_snapshot().await
+            && let Some(n) = snap["inputs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a["name"].as_str())
+                .find(|n| uuid_of(n) == u)
+        {
+            return Ok(n.to_string());
+        }
+        Err(fail(ST_NOT_FOUND, missing))
+    }
+
+    async fn ows_input_name(&self, d: &Value) -> Result<String, Fail> {
         if let Some(n) = d.get("inputName").and_then(Value::as_str) {
             return Ok(n.to_string());
         }
-        Err(fail(ST_MISSING_FIELD, "Your request needs `inputName`."))
+        if let Some(u) = d.get("inputUuid").and_then(Value::as_str) {
+            return self.ows_resolve_source_uuid(u, "No input was found by that uuid.").await;
+        }
+        Err(fail(ST_MISSING_FIELD, "Your request needs `inputName` or `inputUuid`."))
     }
 
-    /// A sound's mixer row, wherever it is (the scene on air first, then the others).
-    async fn ows_audio(&self, name: &str) -> Result<Value, Fail> {
-        let scenes = self.ows_scenes().await?;
-        let mut order: Vec<String> = vec![scenes["current"].as_str().unwrap_or_default().to_string()];
-        order.extend(
-            scenes["scenes"].as_array().into_iter().flatten().filter_map(|s| s["name"].as_str()).map(String::from),
-        );
-        let mut seen = std::collections::HashSet::new();
-        for scene in order.into_iter().filter(|s| !s.is_empty()).take(64) {
-            if !seen.insert(scene.clone()) {
-                continue;
-            }
-            let list = self.studio_act(StudioAct::Audio { scene }).await.map_err(obs_error)?;
-            if let Some(row) = list.as_array().and_then(|l| l.iter().find(|a| a["name"].as_str() == Some(name))) {
-                return Ok(row.clone());
+    async fn ows_source_name(&self, d: &Value) -> Result<String, Fail> {
+        for key in ["sourceName", "inputName"] {
+            if let Some(n) = d.get(key).and_then(Value::as_str) {
+                return Ok(n.to_string());
             }
         }
-        Err(fail(ST_NOT_FOUND, "No input was found by that name."))
+        for key in ["sourceUuid", "inputUuid"] {
+            if let Some(u) = d.get(key).and_then(Value::as_str) {
+                return self.ows_resolve_source_uuid(u, "No source was found by that uuid.").await;
+            }
+        }
+        Err(fail(ST_MISSING_FIELD, "Your request needs `sourceName` or `sourceUuid`."))
+    }
+
+    /// A sound's mixer row in O(1), without scanning every scene.
+    async fn ows_audio(&self, name: &str) -> Result<Value, Fail> {
+        match self.studio_act(StudioAct::AudioByName { name: name.to_string() }).await {
+            Ok(v) if !v.is_null() => Ok(v),
+            Ok(_) => Err(fail(ST_NOT_FOUND, "No input was found by that name.")),
+            Err(e) if e.to_string().contains("no source") => {
+                Err(fail(ST_NOT_FOUND, "No input was found by that name."))
+            }
+            Err(e) => Err(obs_error(e)),
+        }
     }
 
     async fn ows_items(&self, scene: &str) -> Result<Vec<Value>, Fail> {
@@ -844,7 +936,52 @@ impl Engine {
             .ok_or_else(|| fail(ST_NOT_FOUND, "No scene item was found by that id."))
     }
 
+    async fn ows_stream_stoppable(&self) -> Result<bool, Fail> {
+        let stats = self.ows_stats().await?;
+        if stats["stream"]["active"].as_bool() == Some(true) {
+            return Ok(true);
+        }
+        if let Ok(host) = self.studio_host() {
+            if host.delay_drain().is_some() {
+                return Ok(true);
+            }
+            if host.stream_stats().await.ok().is_some_and(|v| !v.is_null()) {
+                return Ok(true);
+            }
+        }
+        let show_active = {
+            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            matches!(
+                m.phase,
+                crate::studio::show::BroadcastPhase::Preparing
+                    | crate::studio::show::BroadcastPhase::Starting
+                    | crate::studio::show::BroadcastPhase::Countdown
+                    | crate::studio::show::BroadcastPhase::Live
+            ) || (m.phase == crate::studio::show::BroadcastPhase::Ending && m.stop_waiting)
+        };
+        Ok(show_active)
+    }
+
     async fn ows_set_output(&self, which: &str, on: bool) -> Result<Value, Fail> {
+        if which == "stream" {
+            if on {
+                let stats = self.ows_stats().await?;
+                if stats["stream"]["active"].as_bool() == Some(true) {
+                    return Err(fail(ST_RUNNING, "The output is already running."));
+                }
+                self.go_live().await.map_err(obs_error)?;
+            } else {
+                if !self.ows_stream_stoppable().await? {
+                    return Err(fail(ST_NOT_RUNNING, "The output is not running."));
+                }
+                let had_drain = self.studio_host().ok().is_some_and(|h| h.delay_drain().is_some());
+                self.end_live().await.map_err(obs_error)?;
+                if had_drain && let Ok(host) = self.studio_host() {
+                    host.discard_delay().await;
+                }
+            }
+            return Ok(Value::Null);
+        }
         let stats = self.ows_stats().await?;
         let now = stats[which]["active"].as_bool().unwrap_or(false);
         if on == now {
@@ -854,7 +991,6 @@ impl Engine {
             ));
         }
         match which {
-            "stream" => self.studio_stream(on).await.map(drop),
             "record" => self.studio_record(on).await.map(drop),
             "replay" => self.studio_replay(on).await.map(drop),
             _ => self.studio_virtual_camera(on, None).await.map(drop),
@@ -864,8 +1000,11 @@ impl Engine {
     }
 
     async fn ows_toggle_output(&self, which: &str) -> Result<Value, Fail> {
-        let stats = self.ows_stats().await?;
-        let now = stats[which]["active"].as_bool().unwrap_or(false);
+        let now = if which == "stream" {
+            self.ows_stream_stoppable().await?
+        } else {
+            self.ows_stats().await?[which]["active"].as_bool().unwrap_or(false)
+        };
         self.ows_set_output(which, !now).await?;
         Ok(json!({ "outputActive": !now }))
     }
@@ -982,11 +1121,11 @@ impl Engine {
                 Ok(json!({ "inputs": list }))
             }
             "GetInputMute" => {
-                let row = self.ows_audio(&Self::ows_input_name(d)?).await?;
+                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
                 Ok(json!({ "inputMuted": row["muted"].as_bool().unwrap_or(false) }))
             }
             "SetInputMute" | "ToggleInputMute" => {
-                let name = Self::ows_input_name(d)?;
+                let name = self.ows_input_name(d).await?;
                 let row = self.ows_audio(&name).await?;
                 let now = row["muted"].as_bool().unwrap_or(false);
                 let muted = if kind == "SetInputMute" { bool_field(d, "inputMuted")? } else { !now };
@@ -995,12 +1134,12 @@ impl Engine {
                 Ok(if kind == "ToggleInputMute" { json!({ "inputMuted": muted }) } else { Value::Null })
             }
             "GetInputVolume" => {
-                let row = self.ows_audio(&Self::ows_input_name(d)?).await?;
+                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
                 let db = row["volume_db"].as_f64().unwrap_or(0.0);
                 Ok(json!({ "inputVolumeMul": mul_of(db), "inputVolumeDb": db }))
             }
             "SetInputVolume" => {
-                let name = Self::ows_input_name(d)?;
+                let name = self.ows_input_name(d).await?;
                 let db = if d.get("inputVolumeDb").is_some_and(|v| !v.is_null()) {
                     let db = num_field(d, "inputVolumeDb")?;
                     if !(-100.0..=26.0).contains(&db) {
@@ -1043,12 +1182,12 @@ impl Engine {
             }
             "GetSceneItemId" => {
                 let scene = self.ows_scene_name(d).await?;
-                let source = str_field(d, "sourceName")?;
+                let source = self.ows_source_name(d).await?;
                 let items = self.ows_items(&scene).await?;
                 items
                     .iter()
                     .flat_map(|i| std::iter::once(i).chain(i["children"].as_array().into_iter().flatten()))
-                    .find(|i| i["name"].as_str() == Some(source))
+                    .find(|i| i["name"].as_str() == Some(source.as_str()))
                     .map(|i| json!({ "sceneItemId": i["id"] }))
                     .ok_or_else(|| fail(ST_NOT_FOUND, "No scene items were found in the specified scene by that name."))
             }
@@ -1070,10 +1209,12 @@ impl Engine {
             "GetStreamStatus" => {
                 let s = self.ows_stats().await?;
                 let st = &s["stream"];
+                let secs = st["seconds"].as_f64().unwrap_or(0.0);
                 Ok(json!({
                     "outputActive": st["active"].as_bool().unwrap_or(false),
                     "outputReconnecting": st["reconnecting"].as_bool().unwrap_or(false),
-                    "outputTimecode": timecode(0.0), "outputDuration": 0, "outputCongestion": 0.0,
+                    "outputTimecode": timecode(secs), "outputDuration": (secs * 1000.0) as u64,
+                    "outputCongestion": 0.0,
                     "outputBytes": st["bytes"].as_u64().unwrap_or(0),
                     "outputSkippedFrames": st["dropped"].as_u64().unwrap_or(0),
                     "outputTotalFrames": st["frames"].as_u64().unwrap_or(0),
@@ -1153,7 +1294,7 @@ impl Engine {
             "ToggleVirtualCam" => self.ows_toggle_output("virtualcam").await,
             // ---- filters ----
             "GetSourceFilterList" => {
-                let name = str_field(d, "sourceName").or_else(|_| str_field(d, "inputName"))?.to_string();
+                let name = self.ows_source_name(d).await?;
                 let v = self.studio_act(StudioAct::Filters { name, item: None }).await.map_err(obs_error)?;
                 let list: Vec<Value> = v
                     .as_array()
@@ -1168,7 +1309,7 @@ impl Engine {
                 Ok(json!({ "filters": list }))
             }
             "SetSourceFilterEnabled" => {
-                let name = str_field(d, "sourceName")?.to_string();
+                let name = self.ows_source_name(d).await?;
                 let filter = str_field(d, "filterName")?.to_string();
                 let on = bool_field(d, "filterEnabled")?;
                 let list =
@@ -1212,15 +1353,58 @@ impl Engine {
     }
 
     async fn ows_snap(&self) -> Option<Snap> {
+        let host = self.studio_host().ok()?;
+        if let Some(res) = host.obsws_snapshot().await {
+            let raw = res.ok()?;
+            let program = raw["program"].as_str().unwrap_or_default().to_string();
+            let preview = raw["preview"].as_str().map(String::from);
+            let mut snap = Snap {
+                program,
+                studio_mode: preview.is_some(),
+                preview,
+                stream: raw["stream"].as_bool().unwrap_or(false) && self.golive_main_failed().is_none(),
+                record: raw["record"]["active"].as_bool().unwrap_or(false),
+                record_paused: raw["record"]["paused"].as_bool().unwrap_or(false),
+                record_file: raw["record"]["file"].as_str().unwrap_or_default().to_string(),
+                replay: raw["replay"]["active"].as_bool().unwrap_or(false),
+                replay_last: raw["replay"]["last"].as_str().map(String::from),
+                vcam: raw["vcam"].as_bool().unwrap_or(false),
+                ..Default::default()
+            };
+            for a in raw["inputs"].as_array().into_iter().flatten() {
+                if let Some(n) = a["name"].as_str() {
+                    snap.inputs.insert(
+                        n.to_string(),
+                        (a["muted"].as_bool().unwrap_or(false), a["volume_db"].as_f64().unwrap_or(0.0)),
+                    );
+                }
+            }
+            for sc in raw["scene_items"].as_array().into_iter().flatten() {
+                let Some(scene) = sc["scene"].as_str() else { continue };
+                for i in sc["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|i| std::iter::once(i).chain(i["children"].as_array().into_iter().flatten()))
+                {
+                    if let Some(id) = i["id"].as_i64() {
+                        snap.items.insert((scene.to_string(), id), i["visible"].as_bool().unwrap_or(true));
+                    }
+                }
+            }
+            return Some(snap);
+        }
         let scenes = self.studio_act(StudioAct::Scenes).await.ok()?;
         let stats = self.studio_stats().await.ok()?;
         let program = scenes["current"].as_str().unwrap_or_default().to_string();
+        let preview = scenes["preview"].as_str().map(String::from);
         let mut snap = Snap {
             program: program.clone(),
-            preview: scenes["preview"].as_str().map(String::from),
-            studio_mode: !scenes["preview"].is_null(),
+            studio_mode: preview.is_some(),
+            preview: preview.clone(),
             stream: stats["stream"]["active"].as_bool().unwrap_or(false),
             record: stats["record"]["active"].as_bool().unwrap_or(false),
+            record_paused: stats["record"]["paused"].as_bool().unwrap_or(false),
             record_file: stats["record"]["file"].as_str().unwrap_or_default().to_string(),
             replay: stats["replay"]["active"].as_bool().unwrap_or(false),
             replay_last: stats["replay"]["last"].as_str().map(String::from),
@@ -1243,13 +1427,44 @@ impl Engine {
                     items.iter().flat_map(|i| std::iter::once(i).chain(i["children"].as_array().into_iter().flatten()))
                 {
                     if let Some(id) = i["id"].as_i64() {
-                        snap.items.insert(id, i["visible"].as_bool().unwrap_or(true));
+                        snap.items.insert((program.clone(), id), i["visible"].as_bool().unwrap_or(true));
                     }
                 }
             }
         }
         Some(snap)
     }
+}
+
+fn ows_mutates(kind: &str) -> bool {
+    matches!(
+        kind,
+        "SetCurrentProgramScene"
+            | "SetCurrentPreviewScene"
+            | "SetStudioModeEnabled"
+            | "TriggerStudioModeTransition"
+            | "SetInputMute"
+            | "ToggleInputMute"
+            | "SetInputVolume"
+            | "SetSceneItemEnabled"
+            | "StartStream"
+            | "StopStream"
+            | "ToggleStream"
+            | "StartRecord"
+            | "StopRecord"
+            | "ToggleRecord"
+            | "PauseRecord"
+            | "ResumeRecord"
+            | "ToggleRecordPause"
+            | "StartReplayBuffer"
+            | "StopReplayBuffer"
+            | "ToggleReplayBuffer"
+            | "SaveReplayBuffer"
+            | "StartVirtualCam"
+            | "StopVirtualCam"
+            | "ToggleVirtualCam"
+            | "SetSourceFilterEnabled"
+    )
 }
 
 /// What the Studio looked like at one look.
@@ -1260,14 +1475,15 @@ struct Snap {
     studio_mode: bool,
     stream: bool,
     record: bool,
+    record_paused: bool,
     record_file: String,
     replay: bool,
     replay_last: Option<String>,
     vcam: bool,
-    /// name → (muted, dB), for the sounds in the scene on air.
+    /// name → (muted, dB), across all audio inputs.
     inputs: BTreeMap<String, (bool, f64)>,
-    /// item id → shown, in the scene on air.
-    items: BTreeMap<i64, bool>,
+    /// (scene, item id) → shown, for program and Studio Mode preview scenes.
+    items: BTreeMap<(String, i64), bool>,
 }
 
 fn event(bit: u64, kind: &str, data: Value) -> (u64, String) {
@@ -1275,12 +1491,7 @@ fn event(bit: u64, kind: &str, data: Value) -> (u64, String) {
 }
 
 fn output_event(kind: &str, active: bool, mut extra: Value) -> (u64, String) {
-    let state = match (kind, active) {
-        ("StreamStateChanged", true) => "OBS_WEBSOCKET_OUTPUT_STARTED",
-        ("RecordStateChanged", true) => "OBS_WEBSOCKET_OUTPUT_STARTED",
-        (_, true) => "OBS_WEBSOCKET_OUTPUT_STARTED",
-        (_, false) => "OBS_WEBSOCKET_OUTPUT_STOPPED",
-    };
+    let state = if active { "OBS_WEBSOCKET_OUTPUT_STARTED" } else { "OBS_WEBSOCKET_OUTPUT_STOPPED" };
     extra["outputActive"] = json!(active);
     extra["outputState"] = json!(state);
     event(SUB_OUTPUTS, kind, extra)
@@ -1321,15 +1532,13 @@ fn diff(was: &Snap, is: &Snap) -> Vec<(u64, String)> {
             ));
         }
     }
-    if was.program == is.program {
-        for (id, on) in &is.items {
-            if was.items.get(id).is_some_and(|w| w != on) {
-                out.push(event(
-                    SUB_SCENE_ITEMS,
-                    "SceneItemEnableStateChanged",
-                    json!({ "sceneName": is.program, "sceneUuid": uuid_of(&is.program), "sceneItemId": id, "sceneItemEnabled": on }),
-                ));
-            }
+    for ((scene, id), on) in &is.items {
+        if was.items.get(&(scene.clone(), *id)).is_some_and(|w| w != on) {
+            out.push(event(
+                SUB_SCENE_ITEMS,
+                "SceneItemEnableStateChanged",
+                json!({ "sceneName": scene, "sceneUuid": uuid_of(scene), "sceneItemId": id, "sceneItemEnabled": on }),
+            ));
         }
     }
     if was.stream != is.stream {
@@ -1341,6 +1550,13 @@ fn diff(was: &Snap, is: &Snap) -> Vec<(u64, String)> {
             "RecordStateChanged",
             is.record,
             json!({ "outputPath": if is.record { Value::Null } else { json!(path) } }),
+        ));
+    } else if is.record && was.record_paused != is.record_paused {
+        let state = if is.record_paused { "OBS_WEBSOCKET_OUTPUT_PAUSED" } else { "OBS_WEBSOCKET_OUTPUT_RESUMED" };
+        out.push(event(
+            SUB_OUTPUTS,
+            "RecordStateChanged",
+            json!({ "outputActive": true, "outputState": state, "outputPath": Value::Null }),
         ));
     }
     if was.replay != is.replay {
@@ -1418,7 +1634,7 @@ mod tests {
         let a = Snap {
             program: "One".into(),
             inputs: BTreeMap::from([("Mic".into(), (false, 0.0))]),
-            items: BTreeMap::from([(3, true)]),
+            items: BTreeMap::from([(("One".into(), 3), true)]),
             ..Default::default()
         };
         let mut b = a.clone();
@@ -1433,13 +1649,13 @@ mod tests {
             names,
             ["CurrentProgramSceneChanged", "InputMuteStateChanged", "InputVolumeChanged", "StreamStateChanged"]
         );
-        // An item changing in the same scene is told; a scene change doesn't tell every item.
+        // An item changing in the same scene is told; switching program scene without that item does not emit.
         let mut c = a.clone();
-        c.items.insert(3, false);
+        c.items.insert(("One".into(), 3), false);
         assert_eq!(diff(&a, &c).len(), 1);
         let mut d = a.clone();
         d.program = "Two".into();
-        d.items = BTreeMap::from([(3, false)]);
+        d.items = BTreeMap::from([(("Two".into(), 3), false)]);
         assert_eq!(diff(&a, &d).len(), 1);
         assert!(diff(&a, &a).is_empty());
     }
@@ -1456,14 +1672,23 @@ mod tests {
         current: String,
         preview: Option<String>,
         mic: (bool, f64),
+        aux: (bool, f64),
         cam_visible: bool,
+        preview_cam_visible: bool,
         filter_on: bool,
         stream: bool,
+        stream_secs: f64,
         record: bool,
         paused: bool,
         replay: bool,
         replay_last: Option<String>,
         vcam: bool,
+        extra_scenes: Vec<String>,
+        stats_calls: usize,
+        acts: Vec<&'static str>,
+        drain: Option<(f64, f64)>,
+        discarded: bool,
+        slow_act_once: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[derive(Debug)]
@@ -1475,14 +1700,23 @@ mod tests {
                 current: "Game".into(),
                 preview: None,
                 mic: (false, 0.0),
+                aux: (false, -3.0),
                 cam_visible: true,
+                preview_cam_visible: true,
                 filter_on: true,
                 stream: false,
+                stream_secs: 0.0,
                 record: false,
                 paused: false,
                 replay: false,
                 replay_last: None,
                 vcam: false,
+                extra_scenes: Vec::new(),
+                stats_calls: 0,
+                acts: Vec::new(),
+                drain: None,
+                discarded: false,
+                slow_act_once: None,
             })))
         }
         fn with<R>(&self, f: impl FnOnce(&mut Studio) -> R) -> R {
@@ -1492,8 +1726,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl StudioHost for Fake {
+        fn delay_drain(&self) -> Option<(f64, f64)> {
+            self.with(|s| s.drain)
+        }
+        async fn discard_delay(&self) {
+            self.with(|s| {
+                s.drain = None;
+                s.discarded = true;
+            });
+        }
         async fn status(&self) -> StudioStatus {
-            StudioStatus { available: true, ..Default::default() }
+            StudioStatus { available: true, running: true, ..Default::default() }
         }
         async fn start(&self) -> Result<StudioStatus, String> {
             Ok(StudioStatus { available: true, running: true, ..Default::default() })
@@ -1523,13 +1766,17 @@ mod tests {
             Ok(json!({}))
         }
         async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
-            Ok(json!({}))
+            self.with(|s| s.stream = true);
+            Ok(json!({ "active": true }))
         }
         async fn stream_stop(&self) -> Result<(), String> {
+            self.with(|s| s.stream = false);
             Ok(())
         }
         async fn stream_stats(&self) -> Result<Value, String> {
-            Ok(Value::Null)
+            Ok(self.with(|s| {
+                if s.stream { json!({ "active": true, "seconds": s.stream_secs, "error": null }) } else { Value::Null }
+            }))
         }
         async fn obs_collections(&self) -> Result<Value, String> {
             Ok(json!([]))
@@ -1537,11 +1784,55 @@ mod tests {
         async fn import_obs(&self, _i: String) -> Result<Value, String> {
             Ok(json!({}))
         }
+        async fn obsws_snapshot(&self) -> Option<Result<Value, String>> {
+            Some(Ok(self.with(|s| {
+                let mut scene_items = Vec::new();
+                let program_items = if s.current == "BRB" {
+                    json!([
+                        { "id": 7, "name": "Cam", "visible": s.cam_visible, "children": [] },
+                        { "id": 19, "name": "CamPreview", "visible": s.preview_cam_visible, "children": [] },
+                    ])
+                } else {
+                    json!([
+                        { "id": 7, "name": "Cam", "visible": s.cam_visible, "children": [] },
+                        { "id": 8, "name": "Logo", "visible": true, "children": [] },
+                    ])
+                };
+                scene_items.push(json!({ "scene": s.current, "items": program_items }));
+                if let Some(p) = &s.preview
+                    && p != &s.current
+                {
+                    let prev_items = if p == "BRB" {
+                        json!([
+                            { "id": 7, "name": "Cam", "visible": s.cam_visible, "children": [] },
+                            { "id": 19, "name": "CamPreview", "visible": s.preview_cam_visible, "children": [] },
+                        ])
+                    } else {
+                        json!([{ "id": 7, "name": "Cam", "visible": s.cam_visible, "children": [] }])
+                    };
+                    scene_items.push(json!({ "scene": p, "items": prev_items }));
+                }
+                json!({
+                    "program": s.current,
+                    "preview": s.preview,
+                    "stream": s.stream,
+                    "record": { "active": s.record, "paused": s.paused, "file": "/r/a.mkv" },
+                    "replay": { "active": s.replay, "last": s.replay_last },
+                    "vcam": s.vcam,
+                    "inputs": [
+                        { "name": "Mic", "muted": s.mic.0, "volume_db": s.mic.1 },
+                        { "name": "Aux", "muted": s.aux.0, "volume_db": s.aux.1 },
+                    ],
+                    "scene_items": scene_items,
+                })
+            })))
+        }
         async fn stats(&self) -> Result<Value, String> {
             Ok(self.with(|s| {
+                s.stats_calls += 1;
                 json!({
                     "engine": { "cpu": 3.5, "fps": 30.0, "frame_ms": 4.0, "lagged": 0, "frames": 100, "memory_mb": 200.0 },
-                    "stream": { "active": s.stream, "frames": 5, "bytes": 9, "dropped": 0 },
+                    "stream": { "active": s.stream, "seconds": s.stream_secs, "frames": 5, "bytes": 9, "dropped": 0 },
                     "record": { "active": s.record, "paused": s.paused, "seconds": 61.5, "bytes": 1, "file": "/r/a.mkv" },
                     "replay": { "active": s.replay, "last": s.replay_last },
                     "virtualcam": { "active": s.vcam },
@@ -1572,55 +1863,104 @@ mod tests {
             Ok(json!({}))
         }
         async fn act(&self, act: StudioAct) -> Result<Value, String> {
-            Ok(self.with(|s| match act {
-                StudioAct::Scenes => json!({
-                    "scenes": [{ "name": "Game" }, { "name": "BRB" }], "current": s.current,
-                    "preview": s.preview,
-                }),
-                StudioAct::SetCurrent { scene } => {
-                    s.current = scene;
-                    Value::Null
-                }
-                StudioAct::StudioMode { on } => {
-                    s.preview = on.then(|| s.current.clone());
-                    Value::Null
-                }
-                StudioAct::SetPreview { scene } => {
-                    s.preview = Some(scene);
-                    Value::Null
-                }
-                StudioAct::TransitionNow { .. } => {
-                    if let Some(p) = s.preview.clone() {
-                        s.current = p;
+            let slow = self.with(|s| s.slow_act_once.take());
+            if let Some(n) = slow {
+                n.notify_one();
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+            self.with(|s| {
+                let tag = match &act {
+                    StudioAct::Scenes => "Scenes",
+                    StudioAct::Audio { .. } => "Audio",
+                    StudioAct::AudioByName { .. } => "AudioByName",
+                    StudioAct::Items { .. } => "Items",
+                    StudioAct::Sources => "Sources",
+                    StudioAct::SetAudio { .. } => "SetAudio",
+                    _ => "Other",
+                };
+                s.acts.push(tag);
+                Ok(match act {
+                    StudioAct::Scenes => {
+                        let mut scenes = vec![json!({ "name": "Game" }), json!({ "name": "BRB" })];
+                        for name in &s.extra_scenes {
+                            scenes.push(json!({ "name": name }));
+                        }
+                        json!({
+                            "scenes": scenes, "current": s.current,
+                            "preview": s.preview,
+                        })
                     }
-                    Value::Null
-                }
-                StudioAct::Items { .. } => json!([
-                    { "id": 7, "name": "Cam", "kind": "av_capture_input", "visible": s.cam_visible, "locked": false, "group": false, "children": [] },
-                    { "id": 8, "name": "Logo", "kind": "image_source", "visible": true, "locked": false, "group": false, "children": [] },
-                ]),
-                StudioAct::EditItem { id: 7, edit, .. } => {
-                    s.cam_visible = matches!(edit, ItemEdit::Show);
-                    Value::Null
-                }
-                StudioAct::Audio { .. } => json!([{ "name": "Mic", "muted": s.mic.0, "volume_db": s.mic.1 }]),
-                StudioAct::SetAudio { change, .. } => {
-                    if let Some(m) = change.muted {
-                        s.mic.0 = m;
+                    StudioAct::SetCurrent { scene } => {
+                        s.current = scene;
+                        Value::Null
                     }
-                    if let Some(v) = change.volume_db {
-                        s.mic.1 = f64::from(v);
+                    StudioAct::StudioMode { on } => {
+                        s.preview = on.then(|| s.current.clone());
+                        Value::Null
                     }
-                    Value::Null
-                }
-                StudioAct::Sources => json!([{ "name": "Mic", "kind": "coreaudio_input_capture", "scenes": [] }]),
-                StudioAct::Filters { .. } => json!([{ "name": "Blur", "kind": "blur", "enabled": s.filter_on }]),
-                StudioAct::EditFilter { edit, .. } => {
-                    s.filter_on = matches!(edit, FilterEdit::Enable);
-                    Value::Null
-                }
-                _ => Value::Null,
-            }))
+                    StudioAct::SetPreview { scene } => {
+                        s.preview = Some(scene);
+                        Value::Null
+                    }
+                    StudioAct::TransitionNow { .. } => {
+                        if let Some(p) = s.preview.clone() {
+                            s.current = p;
+                        }
+                        Value::Null
+                    }
+                    StudioAct::Items { scene } => {
+                        if scene == "BRB" {
+                            json!([{ "id": 19, "name": "CamPreview", "kind": "av_capture_input", "visible": s.preview_cam_visible, "locked": false, "group": false, "children": [] }])
+                        } else {
+                            json!([
+                                { "id": 7, "name": "Cam", "kind": "av_capture_input", "visible": s.cam_visible, "locked": false, "group": false, "children": [] },
+                                { "id": 8, "name": "Logo", "kind": "image_source", "visible": true, "locked": false, "group": false, "children": [] },
+                            ])
+                        }
+                    }
+                    StudioAct::EditItem { id, edit, .. } => {
+                        if id == 19 {
+                            s.preview_cam_visible = matches!(edit, ItemEdit::Show);
+                        } else {
+                            s.cam_visible = matches!(edit, ItemEdit::Show);
+                        }
+                        Value::Null
+                    }
+                    StudioAct::Audio { scene } => {
+                        if s.extra_scenes.last().is_some_and(|last| last == &scene) {
+                            json!([{ "name": "Aux", "muted": s.aux.0, "volume_db": s.aux.1 }])
+                        } else {
+                            json!([{ "name": "Mic", "muted": s.mic.0, "volume_db": s.mic.1 }])
+                        }
+                    }
+                    StudioAct::AudioByName { name } => match name.as_str() {
+                        "Mic" => json!({ "name": "Mic", "muted": s.mic.0, "volume_db": s.mic.1 }),
+                        "Aux" => json!({ "name": "Aux", "muted": s.aux.0, "volume_db": s.aux.1 }),
+                        other => return Err(format!("There's no source called \"{other}\".")),
+                    },
+                    StudioAct::SetAudio { name, change } => {
+                        let target = if name == "Aux" { &mut s.aux } else { &mut s.mic };
+                        if let Some(m) = change.muted {
+                            target.0 = m;
+                        }
+                        if let Some(v) = change.volume_db {
+                            target.1 = f64::from(v);
+                        }
+                        Value::Null
+                    }
+                    StudioAct::Sources => json!([
+                        { "name": "Mic", "kind": "coreaudio_input_capture", "scenes": ["Game"] },
+                        { "name": "Cam", "kind": "av_capture_input", "scenes": ["Game"] },
+                        { "name": "Aux", "kind": "coreaudio_input_capture", "scenes": [] },
+                    ]),
+                    StudioAct::Filters { .. } => json!([{ "name": "Blur", "kind": "blur", "enabled": s.filter_on }]),
+                    StudioAct::EditFilter { edit, .. } => {
+                        s.filter_on = matches!(edit, FilterEdit::Enable);
+                        Value::Null
+                    }
+                    _ => Value::Null,
+                })
+            })
         }
     }
 
@@ -2076,5 +2416,195 @@ mod tests {
         assert_eq!(old.closed_with().await, Some(CLOSE_AUTH));
         let mut new = Client::open(port).await.unwrap();
         assert_eq!(new.identify(&fresh, None).await["op"], 2);
+    }
+
+    #[tokio::test]
+    async fn r1_1_poller_avoids_heavy_stats_and_readonly_requests_do_not_wake_poller() {
+        let (_e, fake, port, pw, _dir) = on().await;
+        let mut c = Client::open(port).await.unwrap();
+        c.identify(&pw, None).await;
+        // Let poller run for a couple of intervals without calling GetStats.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            fake.with(|s| s.stats_calls),
+            0,
+            "poller must use lightweight snapshot, never heavy StudioHost::stats"
+        );
+
+        // Mutate external state, then send read-only GetVersion: because POLL >= 1s and
+        // GetVersion is read-only, poll_now must NOT be notified by GetVersion.
+        fake.with(|s| s.current = "BRB".into());
+        c.req("GetVersion", json!({})).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), c.ws.next()).await.is_err(),
+            "read-only request must not wake the event poller early"
+        );
+    }
+
+    #[tokio::test]
+    async fn r1_2_stream_follows_show_path_stops_draining_and_reports_uptime() {
+        let (e, fake, port, pw, _dir) = on().await;
+        e.start_golive(0).await;
+        // Point ingest to Fake and configure a Show (countdown_s = 15) + live_scene = Game.
+        e.patch_show_config(
+            json!({
+                "starting_scene": "Game",
+                "live_scene": "Game",
+                "ending_scene": "BRB",
+                "countdown_s": 15,
+                "start_stream": false
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut c = Client::open(port).await.unwrap();
+        c.identify(&pw, None).await;
+
+        let start = c.req("StartStream", json!({})).await;
+        assert_eq!(start["requestStatus"]["result"], true, "{start:?}");
+        assert!(
+            e.show_run().is_some(),
+            "StartStream must route through Show / go_live path when Show style is configured"
+        );
+
+        // Stream uptime is non-zero when live.
+        fake.with(|s| {
+            s.stream = true;
+            s.stream_secs = 42.5;
+        });
+        let st = c.req("GetStreamStatus", json!({})).await;
+        assert_eq!(st["responseData"]["outputDuration"], 42_500);
+        assert_eq!(st["responseData"]["outputTimecode"], "00:00:42.500");
+
+        let stop = c.req("StopStream", json!({})).await;
+        assert_eq!(stop["requestStatus"]["result"], true, "{stop:?}");
+
+        // Draining stream delay with `active == false` must still be stoppable by StopStream.
+        fake.with(|s| {
+            s.stream = false;
+            s.drain = Some((8.0, 2.5));
+            s.discarded = false;
+        });
+        let stop_drain = c.req("StopStream", json!({})).await;
+        assert_eq!(
+            stop_drain["requestStatus"]["result"], true,
+            "StopStream must stop a draining delay tail: {stop_drain:?}"
+        );
+        assert!(fake.with(|s| s.discarded), "draining delay tail must be discarded");
+    }
+
+    #[tokio::test]
+    async fn r1_3_listener_awaits_old_bind_before_rebind() {
+        let (e, _fake, _port, _pw, _dir) = on().await;
+        for i in 0..12 {
+            let new_pw = e.obsws_regenerate().await.unwrap();
+            assert_eq!(new_pw.len(), 24);
+            let view = e.obsws_view().await;
+            assert!(view.listening, "rebind iteration {i} lost listener: {view:?}");
+            assert!(view.error.is_none(), "rebind iteration {i} failed: {view:?}");
+            assert_eq!(e.inner.obsws.listening_tasks.load(Ordering::SeqCst), 1, "only one listener alive");
+        }
+    }
+
+    #[tokio::test]
+    async fn r1_4_reidentify_replies_op_2_identified() {
+        let (_e, _fake, port, pw, _dir) = on().await;
+        let mut c = Client::open(port).await.unwrap();
+        assert_eq!(c.identify(&pw, Some(SUB_ALL)).await["op"], 2);
+        c.send_raw(json!({ "op": 3, "d": { "eventSubscriptions": SUB_SCENES } })).await;
+        let reply = c.json().await;
+        assert_eq!(reply["op"], 2, "obs-websocket v5 has no op 3 reply; server must reply op 2 Identified: {reply}");
+    }
+
+    #[tokio::test]
+    async fn r1_5_audio_lookup_is_single_act_and_batch_stops_on_generation_change() {
+        let (e, fake, port, pw, _dir) = on().await;
+        fake.with(|s| {
+            s.extra_scenes = vec!["S1".into(), "S2".into(), "S3".into(), "S4".into()];
+            s.acts.clear();
+        });
+        let mut c = Client::open(port).await.unwrap();
+        c.identify(&pw, None).await;
+        let mute = c.req("GetInputMute", json!({ "inputName": "Aux" })).await;
+        assert_eq!(mute["requestStatus"]["result"], true, "{mute:?}");
+        let audio_scans = fake.with(|s| s.acts.iter().filter(|&&t| t == "Scenes" || t == "Audio").count());
+        assert!(audio_scans <= 1, "GetInputMute must look up audio in O(1), saw {audio_scans} scene/audio scans");
+
+        // Start a batch whose first item pauses briefly while we regenerate password.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let g = gate.clone();
+        fake.with(|s| {
+            s.acts.clear();
+            s.slow_act_once = Some(g);
+        });
+        let mut requests = Vec::new();
+        for i in 0..20 {
+            requests.push(json!({ "requestType": "GetSceneList", "requestId": format!("b{i}") }));
+        }
+        c.send_raw(json!({ "op": 8, "d": { "requestId": "batch1", "requests": requests } })).await;
+        gate.notified().await;
+        let _ = e.obsws_regenerate().await.unwrap();
+        assert_eq!(c.closed_with().await, Some(CLOSE_INVALIDATED));
+        let done = fake.with(|s| s.acts.len());
+        assert!(done < 10, "batch must stop when generation bumps, ran {done} acts");
+    }
+
+    #[tokio::test]
+    async fn r1_6_uuids_record_pause_event_preview_offscene_and_bounded_fails() {
+        let (e, fake, port, pw, _dir) = on().await;
+        let mut c = Client::open(port).await.unwrap();
+        c.identify(&pw, None).await;
+
+        // 1. inputUuid & sourceUuid resolution
+        assert_eq!(
+            c.req("GetInputMute", json!({ "inputUuid": uuid_of("Mic") })).await["requestStatus"]["result"],
+            true
+        );
+        assert_eq!(
+            c.req("GetSourceFilterList", json!({ "sourceUuid": uuid_of("Cam") })).await["requestStatus"]["result"],
+            true
+        );
+        assert_eq!(
+            c.req(
+                "SetSourceFilterEnabled",
+                json!({
+                    "sourceUuid": uuid_of("Cam"),
+                    "filterName": "Blur",
+                    "filterEnabled": false
+                })
+            )
+            .await["requestStatus"]["result"],
+            true
+        );
+
+        // 2. RecordStateChanged emitted for PAUSED and RESUMED.
+        c.req("StartRecord", json!({})).await;
+        assert_eq!(c.event("RecordStateChanged").await["outputState"], "OBS_WEBSOCKET_OUTPUT_STARTED");
+        c.req("PauseRecord", json!({})).await;
+        assert_eq!(c.event("RecordStateChanged").await["outputState"], "OBS_WEBSOCKET_OUTPUT_PAUSED");
+        c.req("ResumeRecord", json!({})).await;
+        assert_eq!(c.event("RecordStateChanged").await["outputState"], "OBS_WEBSOCKET_OUTPUT_RESUMED");
+
+        // 3. Off-scene input volume/mute & Studio Mode preview item visibility changes emit events.
+        c.req("SetStudioModeEnabled", json!({ "studioModeEnabled": true })).await;
+        c.req("SetCurrentPreviewScene", json!({ "sceneName": "BRB" })).await;
+        assert_eq!(c.event("CurrentPreviewSceneChanged").await["sceneName"], "BRB");
+        fake.with(|s| {
+            s.aux.0 = true;
+            s.preview_cam_visible = false;
+        });
+        assert_eq!(c.event("InputMuteStateChanged").await["inputName"], "Aux");
+        let item_ev = c.event("SceneItemEnableStateChanged").await;
+        assert_eq!((item_ev["sceneName"].clone(), item_ev["sceneItemId"].clone()), (json!("BRB"), json!(19)));
+
+        // 4. fails map capped against spoofed LAN floods.
+        for i in 0..1500u32 {
+            let ip = IpAddr::V4(Ipv4Addr::new(10, 0, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8));
+            e.ows_note_fail(ip);
+        }
+        let map_len = e.inner.obsws.fails.lock().unwrap().len();
+        assert!(map_len <= 1024, "fails IP table must be capped, got {map_len}");
     }
 }

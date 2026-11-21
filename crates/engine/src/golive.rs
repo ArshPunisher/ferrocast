@@ -572,6 +572,7 @@ struct StudioCapConfig {
     is_hevc: bool,
     keyframe_s: u32,
     vbr: bool,
+    bframes: bool,
 }
 
 impl From<&crate::studio_host::StudioSettings> for StudioCapConfig {
@@ -581,6 +582,7 @@ impl From<&crate::studio_host::StudioSettings> for StudioCapConfig {
             is_hevc: s.video_encoder.as_deref().is_some_and(|e| e.to_ascii_lowercase().contains("hevc")),
             keyframe_s: s.keyframe_s,
             vbr: s.vbr,
+            bframes: s.bframes,
         }
     }
 }
@@ -971,12 +973,28 @@ impl Engine {
         )
     }
 
+    /// Whether any enabled (or standby-backup for an enabled) main WebRTC (WHIP) destination
+    /// needs B-frames disabled (WebRTC cannot carry B-frames regardless of `ignore_service_limits`).
+    pub(crate) fn studio_no_bframes(&self) -> bool {
+        let cfg = self.golive_config();
+        let blocked = lock(&self.golive().blocked);
+        cfg.destinations.iter().any(|d| {
+            d.canvas == Canvas::Main
+                && d.url.as_deref().and_then(direct_kind) == Some("whip")
+                && !blocked.contains_key(&d.id)
+                && (d.enabled || backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
+        })
+    }
+
     pub(crate) async fn sync_stream_cap(&self) {
         let Ok(host) = self.studio_host() else { return };
-        let cap = self.studio_limit().map(|l| crate::studio_host::StreamCap {
-            max_kbps: l.max_kbps,
-            h264_only: l.h264_only,
-            keyframe_secs: l.keyframe_secs,
+        let limit = self.studio_limit();
+        let no_bframes = self.studio_no_bframes();
+        let cap = (limit.is_some() || no_bframes).then(|| crate::studio_host::StreamCap {
+            max_kbps: limit.map(|l| l.max_kbps),
+            h264_only: limit.is_some_and(|l| l.h264_only),
+            keyframe_secs: limit.map_or(0, |l| l.keyframe_secs),
+            no_bframes,
         });
         let failed = &self.golive().cap_failed;
         match host.set_stream_cap(cap).await {
@@ -986,7 +1004,11 @@ impl Engine {
                 // The stream on air isn't held to the platform's limit: said, and the view stops
                 // claiming it is (the badge, the held-back bitrate warning).
                 failed.store(true, std::sync::atomic::Ordering::Release);
-                let what = cap.map_or("the platform".to_string(), |c| format!("{} kbps", c.max_kbps));
+                let what = match cap {
+                    Some(c) if c.max_kbps.is_some() => format!("{} kbps", c.max_kbps.unwrap_or_default()),
+                    Some(c) if c.no_bframes => "no B-frames for WebRTC".to_string(),
+                    _ => "the platform".to_string(),
+                };
                 self.notice_detail(
                     "stream-cap",
                     crate::frames::NoticeLevel::Warn,
@@ -1048,7 +1070,25 @@ impl Engine {
                 let dest_stats = self.hub_of(d).stats();
                 let mut issues =
                     if d.enabled { probe::rules_structured(&dest_stats, d.kind, d.enhanced) } else { Vec::new() };
-                let capped = if d.enabled
+                let is_whip = d.url.as_deref().and_then(direct_kind) == Some("whip");
+                let capped = if is_whip
+                    && d.enabled
+                    && d.canvas == Canvas::Main
+                    && cap_held
+                    && (!live || studio_streaming)
+                    && let Some(sv) = studio_cfg
+                    && sv.bframes
+                {
+                    let kbps = eff_limit.map_or(sv.video_kbps, |l| sv.video_kbps.min(l.max_kbps));
+                    Some(probe::CappedInfo {
+                        kbps,
+                        resolution: None,
+                        separate_encode: false,
+                        summary: "B-frames off for WebRTC".into(),
+                        detail: "B-frames are turned off for this stream because WebRTC (WHIP) can't carry them."
+                            .into(),
+                    })
+                } else if d.enabled
                     && d.canvas == Canvas::Main
                     && d.url.as_deref().and_then(direct_kind).is_none()
                     && !d.enhanced
@@ -2053,6 +2093,11 @@ impl Engine {
             // The next stream starts with every destination given its own chance again.
             *lock(&g.backup) = BackupState::default();
             lock(&g.quality).reset();
+        }
+        // Apply stream caps (e.g. WebRTC no-B-frames) BEFORE launching new direct destinations so
+        // an already-live Studio stream reshapes before WHIP subscribes to it.
+        if !want.is_empty() {
+            self.sync_stream_cap().await;
         }
         for d in want {
             if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {

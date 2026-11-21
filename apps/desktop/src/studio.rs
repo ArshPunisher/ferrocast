@@ -42,6 +42,8 @@ struct Held {
     /// Where the preview is, to make it again when the canvas changes.
     preview_at: Option<(Rect, f64)>,
     stream: Option<Streaming>,
+    /// Monotonic start time of the current main stream (for obs-websocket `GetStreamStatus`).
+    stream_started: Option<std::time::Instant>,
     /// What the main stream was started with (a recording "Same as stream" may share its
     /// encoder: `can_share`).
     stream_with: Option<ferrocast_studio::StreamSettings>,
@@ -52,6 +54,8 @@ struct Held {
     vstream: Option<Streaming>,
     /// The lighter copy of what's on air, for platforms that take it (720p).
     lstream: Option<Streaming>,
+    /// Whether `lstream` was started/reshaped with `no_bframes` (WHIP simulcast).
+    lstream_no_bframes: bool,
     record: Option<(Recording, PathBuf, std::time::Instant)>,
     /// Sources recorded on their own (Source Record): name, recording, file.
     source_records: Vec<(String, Recording, PathBuf)>,
@@ -512,19 +516,35 @@ fn h264_encoder_for(id: &str) -> String {
 fn effective_stream_encode(s: &StudioSettings, cap: Option<StreamCap>, live_pct: Option<u8>) -> EncodeSettings {
     let mut e = encode_of(s);
     if let Some(cap) = cap {
-        e.video_kbps = e.video_kbps.min(cap.max_kbps);
+        if let Some(max_kbps) = cap.max_kbps {
+            e.video_kbps = e.video_kbps.min(max_kbps);
+            // Strict CBR with 1x VBV (FFmpeg) / DataRateLimits (VideoToolbox) prevents platform peaks.
+            e.vbr = false;
+            e.strict_cbr = true;
+        }
         if cap.h264_only {
             e.video_encoder = h264_encoder_for(&e.video_encoder);
         }
         if cap.keyframe_secs > 0 {
             e.keyframe_s = cap.keyframe_secs;
         }
-        // Strict CBR with 1x VBV (FFmpeg) / DataRateLimits (VideoToolbox) prevents platform peaks.
-        e.vbr = false;
-        e.strict_cbr = true;
+        if cap.no_bframes {
+            e.bframes = false;
+        }
     }
     e.video_kbps = at_pct(e.video_kbps, live_pct);
     e
+}
+
+fn light_stream_settings(s: &StudioSettings, canvas: Canvas, no_bframes: bool) -> StreamSettings {
+    let mut settings = stream_settings(s, None);
+    settings.encode.scale = light_size(canvas.width, canvas.height);
+    settings.encode.video_kbps = settings.encode.video_kbps.min(3000);
+    if no_bframes {
+        settings.encode.bframes = false;
+    }
+    settings.vod_track = None;
+    settings
 }
 
 fn shape_differs(a: &EncodeSettings, b: &EncodeSettings) -> bool {
@@ -1254,9 +1274,12 @@ fn record_stats(r: &(Recording, PathBuf, std::time::Instant)) -> Value {
     v
 }
 
-fn stats_of(s: &Streaming) -> Value {
+fn stats_of(s: &Streaming, started: Option<std::time::Instant>) -> Value {
     let mut v = serde_json::to_value(s.stats()).unwrap_or(Value::Null);
     if let Some(o) = v.as_object_mut() {
+        if let Some(st) = started {
+            o.insert("seconds".into(), json!(st.elapsed().as_secs_f64()));
+        }
         o.insert("error".into(), s.last_error().map_or(Value::Null, Value::String));
         o.insert("encoder".into(), s.encoder().map_or(Value::Null, Value::String));
     }
@@ -1511,6 +1534,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::Options { name } => v(to_json!(c.options(&name)?)),
         A::Update { name, settings } => done(c.update(&name, &settings)),
         A::Audio { scene } => v(to_json!(c.audio(&scene)?)),
+        A::AudioByName { name } => v(to_json!(c.audio_of(&name)?)),
         A::SetAudio { name, change } => {
             if let Some(d) = change.volume_db {
                 c.set_volume(&name, d)?;
@@ -2977,7 +3001,7 @@ impl StudioHost for DesktopStudio {
                 // What Undo and Redo would do (labels for the buttons).
                 "history": { "undo": h.history.labels().0, "redo": h.history.labels().1 },
                 "canvas": studio.canvas(),
-                "stream": h.stream.as_ref().map(stats_of),
+                "stream": h.stream.as_ref().map(|s| stats_of(s, h.stream_started)),
                 "record": h.record.as_ref().map(record_stats),
                 // Sources recorded on their own.
                 "source_records": h.source_records.iter().map(|(n, _, f)| json!({
@@ -3024,6 +3048,50 @@ impl StudioHost for DesktopStudio {
             Ok(out)
         })
         .await?
+    }
+
+    async fn obsws_snapshot(&self) -> Option<Result<Value, String>> {
+        Some(
+            self.on_main(|h| {
+                let c = h.collection.as_ref().ok_or(STOPPED)?;
+                let program = c.current();
+                let preview = c.preview_scene();
+                let mut scene_items = Vec::new();
+                if !program.is_empty()
+                    && let Ok(items) = c.items(&program)
+                {
+                    scene_items.push(json!({ "scene": program, "items": items }));
+                }
+                if let Some(p) = &preview
+                    && p != &program
+                    && let Ok(items) = c.items(p)
+                {
+                    scene_items.push(json!({ "scene": p, "items": items }));
+                }
+                Ok(json!({
+                    "program": program,
+                    "preview": preview,
+                    "stream": h.stream.as_ref().is_some_and(|s| s.stats().active),
+                    "record": h.record.as_ref().map(|r| {
+                        let st = r.0.record_stats();
+                        json!({
+                            "active": st.active,
+                            "paused": st.paused,
+                            "file": r.1.display().to_string(),
+                        })
+                    }),
+                    "replay": h.replay.as_ref().map(|r| json!({
+                        "active": r.active(),
+                        "last": r.last_replay().map(|p| p.display().to_string()),
+                    })),
+                    "vcam": h.virtualcam.as_ref().is_some_and(|vc| vc.active()),
+                    "inputs": c.all_audio(),
+                    "scene_items": scene_items,
+                }))
+            })
+            .await
+            .and_then(|r| r),
+        )
     }
 
     async fn stalled_sources(&self) -> Vec<(String, bool)> {
@@ -3612,6 +3680,19 @@ impl StudioHost for DesktopStudio {
                     w.encode.video_kbps = target.video_kbps;
                 }
             }
+            let no_bframes = cap.is_some_and(|c| c.no_bframes);
+            if s.bframes && no_bframes {
+                tracing::info!("B-frames turned off for this stream: a WebRTC (WHIP) destination can't carry them");
+            }
+            if h.lstream.as_ref().is_some_and(|l| l.stats().active)
+                && h.lstream_no_bframes != no_bframes
+                && let Some(canvas) = h.collection.as_ref().map(|c| c.canvas())
+                && let Some(ls) = h.lstream.as_ref()
+            {
+                let l_encode = light_stream_settings(&s, canvas, no_bframes).encode;
+                ls.reshape(&l_encode, s.fps).map_err(|e| e.to_string())?;
+                h.lstream_no_bframes = no_bframes;
+            }
             Ok(())
         })
         .await?
@@ -3620,7 +3701,7 @@ impl StudioHost for DesktopStudio {
     async fn set_live_quality(&self, pct: u8) -> Result<(), String> {
         self.on_main(move |h| {
             let set = h.settings.as_ref().map_or(6000, |s| s.video_kbps);
-            let capped = h.stream_cap.map_or(set, |c| set.min(c.max_kbps));
+            let capped = h.stream_cap.and_then(|c| c.max_kbps).map_or(set, |max| set.min(max));
             h.live_pct = (pct < 100).then_some(pct);
             let kbps = at_pct(capped, h.live_pct);
             if let Some(st) = h.stream.as_mut() {
@@ -4075,14 +4156,18 @@ impl StudioHost for DesktopStudio {
         self.on_main(move |h| {
             h.collection.as_ref().ok_or(STOPPED)?;
             if let Some(s) = h.stream.as_ref().filter(|s| s.stats().active) {
-                return Ok(stats_of(s));
+                return Ok(stats_of(s, h.stream_started));
             }
             // A stopped or failed one goes first: one output at a time.
             h.stream = None;
+            h.stream_started = None;
             h.live_pct = None;
             // A frame rate chosen during the last stream, still waiting.
             apply_waiting_canvas(&app, h);
             let s = h.settings.clone().unwrap_or_default();
+            if s.bframes && h.stream_cap.is_some_and(|c| c.no_bframes) {
+                tracing::info!("B-frames turned off for this stream: a WebRTC (WHIP) destination can't carry them");
+            }
             let mut settings = stream_settings(&s, h.stream_cap);
             settings.video_tracks = tracks;
             tracing::info!(encoder = %settings.encode.video_encoder, kbps = settings.encode.video_kbps, qualities = settings.video_tracks.len() + 1, "the Studio starts streaming into Go live");
@@ -4120,8 +4205,10 @@ impl StudioHost for DesktopStudio {
             {
                 tracing::warn!(error = %e, fps = s.fps, "the stream went out at the canvas's frame rate");
             }
-            let v = stats_of(&stream);
+            let now = std::time::Instant::now();
+            let v = stats_of(&stream, Some(now));
             h.stream = Some(stream);
+            h.stream_started = Some(now);
             h.stream_with = Some(settings);
             Ok(v)
         })
@@ -4141,7 +4228,9 @@ impl StudioHost for DesktopStudio {
         self.on_main(move |h| {
             h.vstream = None;
             h.lstream = None;
+            h.lstream_no_bframes = false;
             h.stream = None;
+            h.stream_started = None;
             apply_waiting_canvas(&app, h);
         })
         .await
@@ -4154,16 +4243,19 @@ impl StudioHost for DesktopStudio {
                 return Ok(());
             }
             h.lstream = None;
+            h.lstream_no_bframes = false;
             let s = h.settings.clone().unwrap_or_default();
-            let mut settings = stream_settings(&s, None);
-            // 720 high at the canvas's shape (even sizes), 3,000 kbps at most; one sound.
-            let canvas = studio.canvas();
-            settings.encode.scale = light_size(canvas.width, canvas.height);
-            settings.encode.video_kbps = settings.encode.video_kbps.min(3000);
-            settings.vod_track = None;
+            let no_bframes = h.stream_cap.is_some_and(|c| c.no_bframes);
+            if s.bframes && no_bframes {
+                tracing::info!(
+                    "B-frames turned off for the lighter stream: a WebRTC (WHIP) destination can't carry them"
+                );
+            }
+            let settings = light_stream_settings(&s, studio.canvas(), no_bframes);
             tracing::info!(kbps = settings.encode.video_kbps, "the Studio's lighter stream starts into Go live");
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             h.lstream = Some(c.stream_drawn(&server, &key, &settings).map_err(|e| e.to_string())?);
+            h.lstream_no_bframes = no_bframes;
             Ok(())
         })
         .await?
@@ -4172,6 +4264,7 @@ impl StudioHost for DesktopStudio {
     async fn light_stream_stop(&self) -> Result<(), String> {
         self.on_main(|h| {
             h.lstream = None;
+            h.lstream_no_bframes = false;
         })
         .await
     }
@@ -4206,7 +4299,7 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn stream_stats(&self) -> Result<Value, String> {
-        self.on_main(|h| h.stream.as_ref().map_or(Value::Null, stats_of)).await
+        self.on_main(|h| h.stream.as_ref().map_or(Value::Null, |s| stats_of(s, h.stream_started))).await
     }
 
     async fn direct_start(&self, id: String, url: String, key: String, simulcast: bool) -> Result<(), String> {
@@ -4635,7 +4728,7 @@ mod budget_tests {
             record_quality: "stream".into(),
             ..StudioSettings::default()
         };
-        let twitch = StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 };
+        let twitch = StreamCap { max_kbps: Some(6_000), h264_only: true, keyframe_secs: 2, no_bframes: false };
         let stream = stream_settings(&s, Some(twitch));
         let capped = record_encode_capped(&s, Some(twitch));
         assert!(capped.strict_cbr && capped.scale.is_none());
@@ -4664,7 +4757,7 @@ mod budget_tests {
             video_encoder: Some("com.apple.videotoolbox.videoencoder.ave.hevc".into()),
             ..StudioSettings::default()
         };
-        let twitch = StreamCap { max_kbps: 6_000, h264_only: true, keyframe_secs: 2 };
+        let twitch = StreamCap { max_kbps: Some(6_000), h264_only: true, keyframe_secs: 2, no_bframes: false };
         let capped = effective_stream_encode(&s, Some(twitch), None);
         assert_eq!(capped.video_kbps, 6_000);
         assert!(!capped.vbr, "CBR forced when capped");
@@ -4680,6 +4773,15 @@ mod budget_tests {
         s.video_kbps = 4_500;
         assert_eq!(effective_stream_encode(&s, Some(twitch), Some(50)).video_kbps, 2_250);
         assert_eq!(effective_stream_encode(&s, None, None).video_kbps, 4_500);
+
+        // WebRTC (WHIP) turns off B-frames on both main and light streams without forcing CBR.
+        s.bframes = true;
+        s.vbr = true;
+        let whip = StreamCap { max_kbps: None, h264_only: false, keyframe_secs: 0, no_bframes: true };
+        let whip_main = effective_stream_encode(&s, Some(whip), None);
+        assert!(!whip_main.bframes && whip_main.vbr && !whip_main.strict_cbr);
+        let whip_light = light_stream_settings(&s, Canvas { width: 1920, height: 1080, fps: 60 }, true);
+        assert!(!whip_light.encode.bframes);
     }
 }
 

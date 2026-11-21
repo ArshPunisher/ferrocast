@@ -10,12 +10,13 @@ use serde_json::Value;
 
 use crate::{Engine, EngineError};
 
-/// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch or Kick is enabled.
+/// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch, Kick, or WebRTC (WHIP) is enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamCap {
-    pub max_kbps: u32,
+    pub max_kbps: Option<u32>,
     pub h264_only: bool,
     pub keyframe_secs: u32,
+    pub no_bframes: bool,
 }
 
 /// What `GET /studio/engine` shows.
@@ -220,6 +221,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String>;
     /// `{ engine: { cpu, fps, frame_ms, lagged, frames, memory_mb }, canvas, stream, record }`.
     async fn stats(&self) -> Result<Value, String>;
+    /// Cheap, read-only Studio snapshot for obs-websocket event polling: never saves to disk or
+    /// gathers CPU/disk stats. Returning None falls back to individual `act` calls for test fakes.
+    async fn obsws_snapshot(&self) -> Option<Result<Value, String>> {
+        None
+    }
     /// Starts or stops recording → the recording's stats (null when stopped) and its file.
     async fn record(&self, on: bool) -> Result<Value, String>;
     /// The recording's stats now (`active`, `bytes`, `seconds`, `file`, `error`, `error_detail`,
@@ -1477,6 +1483,10 @@ pub enum StudioAct {
     Audio {
         scene: String,
     },
+    /// One audio source or global channel by name -> `AudioInfo`.
+    AudioByName {
+        name: String,
+    },
     SetAudio {
         name: String,
         change: AudioChange,
@@ -1847,7 +1857,8 @@ impl StudioAct {
             | A::MoveScene { scene, .. }
             | A::SetCurrent { scene }
             | A::Items { scene }
-            | A::Audio { scene } => check_source_name(scene),
+            | A::Audio { scene }
+            | A::AudioByName { name: scene } => check_source_name(scene),
             A::DuplicateScene { scene, name } | A::AddExisting { scene, name } => {
                 check_source_name(scene)?;
                 check_source_name(name)
@@ -2134,6 +2145,7 @@ impl StudioAct {
                 | A::Settings { .. }
                 | A::Options { .. }
                 | A::Audio { .. }
+                | A::AudioByName { .. }
                 | A::Levels { .. }
                 | A::PushKey { .. }
                 | A::WatchSnapshot

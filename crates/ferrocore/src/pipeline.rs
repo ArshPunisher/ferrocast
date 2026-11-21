@@ -86,16 +86,26 @@ pub struct Pipeline {
     stream_from_us: i64,
     stream_waits_key: bool,
     /// The recording alone paused, its stream going on (they share the encode): each pause
-    /// cuts [from, to) out of the file, on the output's clock (µs; `to` None: still paused).
+    /// cuts [from, to) out of the file on the raw clock and shifts later media by `cut`, leaving
+    /// one frame interval after the last pre-cut frame so resuming never collides with it in MP4.
     /// Picture and sound are cut by their time, not by when the encoder hands them back (it
     /// does so a frame or two late; cut that way, the sound fell 0.35 s behind in 4 pauses).
-    rec_cuts: Vec<(i64, Option<i64>)>,
+    rec_cuts: Vec<RecCut>,
     /// Resumed, from this time on (µs): the cut ends at the first keyframe out of the encoder
     /// drawn from then (VideoToolbox makes one when asked; FFmpeg's encoders keep their own
     /// interval, so it may be seconds later: a frame before it needs frames from inside the
     /// cut; and a keyframe drawn while paused, still in the encoder, is paused picture;
     /// projects-60).
     rec_resume: Option<i64>,
+    /// True once the active open recording cut has started dropping packets (`pts >= from`), so
+    /// reordered B-frames with `pts < from` whose reference was already dropped are not orphaned.
+    rec_cut_entered: bool,
+    /// Highest raw presentation timestamp written to the recording so far, to place resume cuts cleanly.
+    rec_last_raw_pts_us: Option<i64>,
+    /// Last decode timestamp written to the recording, to keep recording DTS monotonic across cuts.
+    rec_last_dts_us: Option<i64>,
+    /// Last decode timestamp produced by `self.video`, carried across `set_video` and `heal`.
+    last_video_dts_us: Option<i64>,
     /// Sound that came while the cut's end wasn't known yet (resumed, no keyframe since).
     rec_held: VecDeque<(usize, AudioPacket)>,
     /// The newest frame given to the encoder (µs).
@@ -409,8 +419,10 @@ impl Pipeline {
             }
             None => None,
         };
+        let video = VideoEncoder::new(video)?;
+        let stream_from_us = -video.dts_shift();
         Ok(Self {
-            video: VideoEncoder::new(video)?,
+            video,
             audio: AudioEncoder::new(audio)?,
             start_ns: None,
             audio_offset_us: None,
@@ -436,10 +448,14 @@ impl Pipeline {
             track_names: Vec::new(),
             sent_extra_headers: Vec::new(),
             video_tracks: Vec::new(),
-            stream_from_us: 0,
+            stream_from_us,
             stream_waits_key: false,
             rec_cuts: Vec::new(),
             rec_resume: None,
+            rec_cut_entered: false,
+            rec_last_raw_pts_us: None,
+            rec_last_dts_us: None,
+            last_video_dts_us: None,
             rec_held: VecDeque::new(),
             last_in_us: 0,
         })
@@ -464,6 +480,9 @@ impl Pipeline {
         // A recording before it on this output may have stopped paused: this one starts afresh.
         self.rec_cuts.clear();
         self.rec_resume = None;
+        self.rec_cut_entered = false;
+        self.rec_last_raw_pts_us = None;
+        self.rec_last_dts_us = None;
         self.rec_held.clear();
         Ok(())
     }
@@ -498,12 +517,13 @@ impl Pipeline {
     /// Pauses (`on`) or resumes the recording alone, its stream going on: the encode is shared,
     /// so pausing it all would pause the stream too. The file goes on with no gap.
     pub fn pause_recording(&mut self, on: bool) {
-        let open = self.rec_cuts.last().is_some_and(|c| c.1.is_none());
+        let open = self.rec_cuts.last().is_some_and(|c| c.to.is_none());
         if on && !open {
             // From the next frame on (every frame drawn before went in already): any time after
             // the newest one, whatever the frame rate (60000/1001 too; projects-60).
-            self.rec_cuts.push((self.last_in_us + 1, None));
+            self.rec_cuts.push(RecCut { from: self.last_in_us + 1, to: None, cut: 0 });
             self.rec_resume = None;
+            self.rec_cut_entered = false;
         } else if on {
             // Paused again before it went on: nothing held is needed.
             self.rec_resume = None;
@@ -516,16 +536,16 @@ impl Pipeline {
 
     /// Whether the recording alone is paused (or waits to go on).
     pub fn recording_paused(&self) -> bool {
-        self.rec_cuts.last().is_some_and(|c| c.1.is_none())
+        self.rec_cuts.last().is_some_and(|c| c.to.is_none())
     }
 
     /// Where time `us` lands in the file: None inside a cut, else moved back by the cuts before.
     fn rec_time(&self, us: i64) -> Option<i64> {
         let mut cut = 0;
-        for &(from, to) in &self.rec_cuts {
-            match to {
-                Some(to) if us >= to => cut += to - from,
-                _ if us >= from => return None,
+        for c in &self.rec_cuts {
+            match c.to {
+                Some(to) if us >= to => cut += c.cut,
+                _ if us >= c.from => return None,
                 _ => {}
             }
         }
@@ -678,12 +698,15 @@ impl Pipeline {
     /// changed (Optimize while live; owner, 15 Nov: "I have to end and stream again"). Streams
     /// only: a file can't change its picture halfway. `next` is opened by the caller (opening a
     /// hardware encoder can take a few hundred ms; nothing else should wait on it).
-    pub fn set_video(&mut self, next: VideoEncoder) -> Result<Vec<Tag>, AvError> {
+    pub fn set_video(&mut self, mut next: VideoEncoder) -> Result<Vec<Tag>, AvError> {
         if self.recording.is_some() || self.replay.is_some() {
             return Err(AvError::Encoder("a recording's picture can't change while it records".into()));
         }
         let packets = self.video.flush()?;
         let tags = self.video_out(packets)?;
+        if let Some(last) = self.last_video_dts_us {
+            next.set_min_dts(last);
+        }
         self.video = next;
         self.sent_video_header = false;
         self.key_next = true;
@@ -696,7 +719,10 @@ impl Pipeline {
     /// config halfway. The old encoders are dropped as they are: they failed, nothing is
     /// flushed out of them.
     pub fn heal(&mut self) -> Result<(), AvError> {
-        let video = VideoEncoder::new(*self.video.config())?;
+        let mut video = VideoEncoder::new(*self.video.config())?;
+        if let Some(last) = self.last_video_dts_us {
+            video.set_min_dts(last);
+        }
         let audio = AudioEncoder::new(*self.audio.config())?;
         self.video = video;
         self.audio = audio;
@@ -756,7 +782,12 @@ impl Pipeline {
     pub fn add_video_tracks(&mut self, configs: &[VideoConfig]) -> usize {
         for c in configs {
             match VideoEncoder::new(*c) {
-                Ok(e) => self.video_tracks.push((e, false)),
+                Ok(e) => {
+                    if !self.sent_video_header && !self.stream_waits_key {
+                        self.stream_from_us = self.stream_from_us.min(-e.dts_shift());
+                    }
+                    self.video_tracks.push((e, false));
+                }
                 Err(e) => {
                     tracing::warn!(width = c.width, height = c.height, error = %e, "a quality left out of the stream")
                 }
@@ -778,6 +809,7 @@ impl Pipeline {
             return Ok(Vec::new());
         }
         let pts = (ts_ns.saturating_sub(start).saturating_sub(self.paused_ns) / 1000) as i64;
+        let start_us = self.stream_from_us;
         let (enc, sent) = &mut self.video_tracks[i];
         let first = !*sent && enc.header().is_none();
         let packets = enc.encode(frame, pts, first)?;
@@ -786,19 +818,20 @@ impl Pipeline {
         if enc.header_changed() {
             *sent = false;
         }
-        Ok(Self::track_tags(i, enc, sent, packets))
+        Ok(Self::track_tags(i, enc, sent, packets, start_us))
     }
 
-    fn track_tags(i: usize, enc: &VideoEncoder, sent: &mut bool, packets: Vec<VideoPacket>) -> Vec<Tag> {
+    fn track_tags(i: usize, enc: &VideoEncoder, sent: &mut bool, packets: Vec<VideoPacket>, start_us: i64) -> Vec<Tag> {
         let track = u8::try_from(i + 1).unwrap_or(u8::MAX);
         let mut tags = Vec::new();
         for p in packets {
             if !*sent {
                 let Some(h) = enc.header() else { continue };
                 *sent = true;
-                tags.push(Tag::Video { ms: 0, body: flv::video_track_header(track, &h) });
+                let ms = ((p.dts_us - start_us).max(0) / 1000) as u32;
+                tags.push(Tag::Video { ms, body: flv::video_track_header(track, &h) });
             }
-            let (ms, body) = flv::video_track_tag(track, &p, 0);
+            let (ms, body) = flv::video_track_tag(track, &p, start_us);
             tags.push(Tag::Video { ms, body });
         }
         tags
@@ -905,7 +938,7 @@ impl Pipeline {
             let header = self.extra[i].0.header();
             tags.push(Tag::Audio { ms: 0, body: flv::audio_track_tag(track, true, &header) });
         }
-        let ms = (p.pts_us.max(0) / 1000) as u32;
+        let ms = self.stream_ms(p.pts_us);
         tags.push(Tag::Audio { ms, body: flv::audio_track_tag(track, false, &p.data) });
         tags
     }
@@ -953,10 +986,11 @@ impl Pipeline {
                 self.record_audio(i + 1, p);
             }
         }
+        let start_us = self.stream_from_us;
         for i in 0..self.video_tracks.len() {
             let (enc, sent) = &mut self.video_tracks[i];
             let packets = enc.flush()?;
-            tags.extend(Self::track_tags(i, enc, sent, packets));
+            tags.extend(Self::track_tags(i, enc, sent, packets, start_us));
         }
         Ok(tags)
     }
@@ -1001,7 +1035,17 @@ impl Pipeline {
     fn video_out(&mut self, packets: Vec<VideoPacket>) -> Result<Vec<Tag>, AvError> {
         let codec = self.video.config().codec;
         let mut tags = Vec::new();
-        for p in packets {
+        for mut p in packets {
+            if let Some(last) = self.last_video_dts_us
+                && p.dts_us <= last
+            {
+                let step = if p.pts_us > last { ((p.pts_us - last) / 4).clamp(1, 1_000) } else { 1 };
+                p.dts_us = last + step;
+                if p.pts_us < p.dts_us {
+                    p.pts_us = p.dts_us;
+                }
+            }
+            self.last_video_dts_us = Some(p.dts_us);
             // A stream that joined goes out from its first keyframe, timed from its decode time
             // (the encoder's frames still under way come out as P-frames first: left out).
             if self.stream_waits_key {
@@ -1033,15 +1077,24 @@ impl Pipeline {
         // Resumed after a recording-only pause: the cut ends at the first keyframe out; frames
         // before it aren't written (they lean on frames inside the cut).
         let mut resumed = false;
+        let vcfg = *self.video.config();
+        let frame_us = (1_000_000 * i64::from(vcfg.fps_den.max(1)) / i64::from(vcfg.fps_num.max(1))).max(1);
         if let Some(c) = self.rec_cuts.last_mut()
-            && c.1.is_none()
+            && c.to.is_none()
         {
-            match cut_step(c.0, self.rec_resume, p.key, p.pts_us) {
+            match cut_step(c.from, self.rec_resume, p.key, p.pts_us, self.rec_cut_entered) {
                 CutStep::Write => {}
-                CutStep::Leave => return,
+                CutStep::Leave => {
+                    self.rec_cut_entered = true;
+                    return;
+                }
                 CutStep::End => {
-                    c.1 = Some(p.pts_us);
+                    let resume_at =
+                        self.rec_last_raw_pts_us.map_or(c.from, |lp| (lp + frame_us).max(c.from)).min(p.pts_us);
+                    c.to = Some(p.pts_us);
+                    c.cut = p.pts_us - resume_at;
                     self.rec_resume = None;
+                    self.rec_cut_entered = false;
                     resumed = true;
                 }
             }
@@ -1078,16 +1131,28 @@ impl Pipeline {
                 }
             }
         }
+        let raw_pts = p.pts_us;
+        self.rec_last_raw_pts_us = Some(self.rec_last_raw_pts_us.map_or(raw_pts, |prev| prev.max(raw_pts)));
         // The recording alone paused: frames in a cut aren't written, later ones move back.
-        let shifted;
+        let mut shifted;
         let p = if self.rec_cuts.is_empty() {
             p
         } else {
             let Some(at) = self.rec_time(p.pts_us) else { return };
             let by = p.pts_us - at;
             shifted = VideoPacket { pts_us: at, dts_us: p.dts_us - by, ..p.clone() };
+            if let Some(last) = self.rec_last_dts_us
+                && shifted.dts_us <= last
+            {
+                let step = if shifted.pts_us > last { ((shifted.pts_us - last) / 4).clamp(1, 1_000) } else { 1 };
+                shifted.dts_us = last + step;
+                if shifted.pts_us < shifted.dts_us {
+                    shifted.pts_us = shifted.dts_us;
+                }
+            }
             &shifted
         };
+        self.rec_last_dts_us = Some(p.dts_us);
         let header = self.video.header();
         let cfg = *self.video.config();
         let acfg = *self.audio.config();
@@ -1166,7 +1231,7 @@ impl Pipeline {
         }
         if !self.rec_cuts.is_empty() {
             // Resumed, the cut's end not known yet: held until the next frame says it.
-            if self.rec_resume.is_some() && self.rec_cuts.last().is_some_and(|c| c.1.is_none() && p.pts_us >= c.0) {
+            if self.rec_resume.is_some() && self.rec_cuts.last().is_some_and(|c| c.to.is_none() && p.pts_us >= c.from) {
                 push_held_audio(&mut self.rec_held, (track, p));
                 return;
             }
@@ -1187,6 +1252,14 @@ impl Pipeline {
     }
 }
 
+/// One paused interval excluded from a recording sharing its encoder with a stream.
+#[derive(Debug, Clone, Copy)]
+struct RecCut {
+    from: i64,
+    to: Option<i64>,
+    cut: i64,
+}
+
 /// What a frame out of the encoder does while a recording-only pause's cut is open (from
 /// `from`; resumed from `resume`, if it was).
 #[derive(Debug, PartialEq, Eq)]
@@ -1202,9 +1275,9 @@ enum CutStep {
 /// The most video packets held while a recording waits to be told its next file.
 const SPLIT_HELD_MAX: usize = 600;
 
-fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64) -> CutStep {
+fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64, entered: bool) -> CutStep {
     match resume {
-        _ if pts < from => CutStep::Write,
+        _ if !entered && pts < from => CutStep::Write,
         Some(at) if key && pts >= at => CutStep::End,
         _ => CutStep::Leave,
     }
@@ -1476,13 +1549,14 @@ mod cut_tests {
     #[test]
     fn the_cut_ends_only_at_a_keyframe_drawn_after_the_resume() {
         let (from, at) = (3_000_000, 3_900_000);
-        assert_eq!(cut_step(from, None, false, 2_966_667), CutStep::Write);
-        assert_eq!(cut_step(from, Some(at), false, 2_966_667), CutStep::Write);
-        assert_eq!(cut_step(from, None, true, 3_500_000), CutStep::Leave, "still paused");
-        assert_eq!(cut_step(from, Some(at), true, 3_800_000), CutStep::Leave, "a keyframe drawn while paused");
-        assert_eq!(cut_step(from, Some(at), false, 3_933_333), CutStep::Leave, "not a keyframe");
-        assert_eq!(cut_step(from, Some(at), true, 3_900_000), CutStep::End);
-        assert_eq!(cut_step(from, Some(at), true, 4_000_000), CutStep::End);
+        assert_eq!(cut_step(from, None, false, 2_966_667, false), CutStep::Write);
+        assert_eq!(cut_step(from, Some(at), false, 2_966_667, false), CutStep::Write);
+        assert_eq!(cut_step(from, None, false, 2_966_667, true), CutStep::Leave, "reordered B-frame after dropped P");
+        assert_eq!(cut_step(from, None, true, 3_500_000, false), CutStep::Leave, "still paused");
+        assert_eq!(cut_step(from, Some(at), true, 3_800_000, false), CutStep::Leave, "a keyframe drawn while paused");
+        assert_eq!(cut_step(from, Some(at), false, 3_933_333, true), CutStep::Leave, "not a keyframe");
+        assert_eq!(cut_step(from, Some(at), true, 3_900_000, true), CutStep::End);
+        assert_eq!(cut_step(from, Some(at), true, 4_000_000, true), CutStep::End);
     }
 
     #[test]
@@ -1524,6 +1598,94 @@ mod cut_tests {
         }
         assert_eq!(held.len(), super::MAX_HELD_AUDIO);
         assert_eq!(held.back().unwrap().1.pts_us, 9_999 * 21_333);
+    }
+
+    #[test]
+    fn recording_pause_with_bframes_never_orphans_bframes_or_moves_dts_backwards() {
+        // Mini-GOP (P=3.067s, B=3.000s, B=3.033s) straddling a pause cut at from=3.033s+1,
+        // followed by a resume keyframe at pts=5.000s, dts=4.900s.
+        let pipe = super::Pipeline::new(
+            crate::video::VideoConfig {
+                codec: crate::video::VideoCodec::H264,
+                input: crate::video::PixelFormat::Nv12,
+                width: 64,
+                height: 64,
+                fps_num: 30,
+                fps_den: 1,
+                bitrate_kbps: 1500,
+                rate: crate::video::RateControl::Cbr,
+                keyframe_secs: 1,
+                software: false,
+                profile: crate::video::H264Profile::High,
+                bframes: true,
+                preset: None,
+                tune: None,
+            },
+            crate::audio::AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 },
+            None,
+        );
+        let Ok(mut pipe) = pipe else { return };
+        let dir = std::env::temp_dir().join(format!("ferrocore-rec-cut-bf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("cut.mp4");
+        pipe.start_recording(&path).unwrap_or_else(|e| panic!("{e}"));
+        // Satisfy video/audio headers cleanly using a dummy avcC via feed? Easier: run real VT
+        // or inspect written packets directly via cut_step + rec_last_dts_us!
+        // First write pre-pause frames (up to pts=2.967s) via real VT or direct record_video if header exists:
+        let (y, uv) = (vec![90u8; 64 * 64], vec![128u8; 64 * 32]);
+        for i in 0..89u64 {
+            let ts = i * 33_333_333;
+            let _ = pipe.video(crate::video::Frame::Nv12 { y: &y, y_stride: 64, uv: &uv, uv_stride: 64 }, ts);
+        }
+        // Force header presence and pause at last_in_us=3_033_333 -> from=3_033_334.
+        pipe.last_in_us = 3_033_333;
+        pipe.pause_recording(true);
+        // Simulate decode-order packets arriving from the encoder across the pause cut:
+        // P(pts=3_066_667, dts=2_966_667) arrives FIRST, followed by B(3_000_000) and B(3_033_333).
+        // Marker byte in data[4] identifies each frame.
+        let pkt = |pts: i64, dts: i64, key: bool, tag: u8| super::VideoPacket {
+            pts_us: pts,
+            dts_us: dts,
+            key,
+            data: vec![0, 0, 0, 1, tag, 0, 0, 0],
+        };
+        // Wait: instead of hitting real VT header check, inspect recording via a second test with
+        // real VT + ffprobe, AND here test `record_video` on `pipe` (which has a real VT header!).
+        if pipe.video.header().is_none() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let Some(dts_before_pause) = pipe.rec_last_dts_us else {
+            panic!("wrote frames before pause");
+        };
+        pipe.record_video(&pkt(3_066_667, 2_966_667, false, 0xAA));
+        pipe.record_video(&pkt(3_000_000, 3_000_000, false, 0xBB));
+        pipe.record_video(&pkt(3_033_333, 3_033_333, false, 0xCC));
+        pipe.pause_recording(false); // rec_resume = Some(3_033_334)
+        pipe.record_video(&pkt(5_000_000, 4_900_000, true, 0xDD));
+        let Some(dts_after_resume) = pipe.rec_last_dts_us else {
+            panic!("wrote resume keyframe");
+        };
+        assert!(
+            dts_after_resume > dts_before_pause,
+            "recording dts must not move backwards across resume: before={dts_before_pause} after={dts_after_resume}"
+        );
+        pipe.record_video(&pkt(5_100_000, 4_933_333, false, 0xEE));
+        let Some(dts_next) = pipe.rec_last_dts_us else {
+            panic!("wrote post-resume frame");
+        };
+        assert!(dts_next > dts_after_resume, "dts continues rising: {dts_after_resume} -> {dts_next}");
+        pipe.end_recording().unwrap_or_else(|e| panic!("{e}"));
+        let bytes = std::fs::read(&path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let has_p = bytes.windows(4).any(|w| w == [0xAA, 0, 0, 0]);
+        let has_b1 = bytes.windows(4).any(|w| w == [0xBB, 0, 0, 0]);
+        let has_b2 = bytes.windows(4).any(|w| w == [0xCC, 0, 0, 0]);
+        assert!(
+            !(!has_p && (has_b1 || has_b2)),
+            "orphaned B-frames written without their reference P-frame! (p={has_p}, b1={has_b1}, b2={has_b2})"
+        );
+        assert!(bytes.windows(4).any(|w| w == [0xDD, 0, 0, 0]), "resumed keyframe was written");
     }
 }
 
@@ -1865,6 +2027,192 @@ mod bframe_tests {
         if let Some(tags) = run(false, &f) {
             assert!(tags.iter().all(|t| t.2 == 0), "no composition times without B-frames");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bframe_stream_start_has_strictly_increasing_dts_and_non_negative_cts() {
+        let mut pipe = match Pipeline::new(
+            video(true),
+            AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 },
+            None,
+        ) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        pipe.add_video_tracks(&[VideoConfig { width: 320, height: 180, bitrate_kbps: 800, ..video(true) }]);
+        let pcm = vec![0.05f32; 1600 * 2];
+        let mut main_times = Vec::new();
+        let mut track_times = Vec::new();
+        let mut cts_list = Vec::new();
+        for i in 0..45u64 {
+            let ts = i * 33_333_333;
+            let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+            let uv = vec![128u8; 320 * 90];
+            let mut tags = pipe
+                .video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts)
+                .unwrap_or_else(|e| panic!("{e}"));
+            tags.extend(
+                pipe.video_track(0, Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts)
+                    .unwrap_or_else(|e| panic!("{e}")),
+            );
+            let _ = pipe.audio(&pcm, ts);
+            for t in tags {
+                if let Tag::Video { ms, body } = t {
+                    if body[0] & 0x80 != 0 && body[0] & 0x0F == 6 {
+                        if body[1] & 0x0F != 0 {
+                            track_times.push(ms);
+                        }
+                    } else if body[1] == 1 {
+                        main_times.push(ms);
+                        let cts = ((body[2] as i32) << 16 | (body[3] as i32) << 8 | (body[4] as i32)) << 8 >> 8;
+                        cts_list.push(cts);
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        let end_tags = pipe.finish().unwrap_or_else(|e| panic!("{e}"));
+        for t in end_tags {
+            if let Tag::Video { ms, body } = t {
+                if body[0] & 0x80 != 0 && body[0] & 0x0F == 6 {
+                    if body[1] & 0x0F != 0 {
+                        track_times.push(ms);
+                    }
+                } else if body[1] == 1 {
+                    main_times.push(ms);
+                    let cts = ((body[2] as i32) << 16 | (body[3] as i32) << 8 | (body[4] as i32)) << 8 >> 8;
+                    cts_list.push(cts);
+                }
+            }
+        }
+        assert!(main_times.len() >= 30, "got {}", main_times.len());
+        assert!(
+            main_times.windows(2).all(|w| w[1] > w[0]),
+            "main stream dts must strictly increase from frame 1: {:?}",
+            &main_times[..10.min(main_times.len())]
+        );
+        assert!(cts_list.iter().all(|c| *c >= 0), "cts must never be negative: {cts_list:?}");
+        if !track_times.is_empty() {
+            assert!(
+                track_times.windows(2).all(|w| w[1] > w[0]),
+                "extra track dts must strictly increase: {:?}",
+                &track_times[..10.min(track_times.len())]
+            );
+        }
+    }
+
+    #[test]
+    fn reshape_and_heal_never_move_dts_backwards() {
+        // Test 1: set_video toggling bframes false -> true (and 60fps -> 30fps with bframes=true).
+        let cfg60 = VideoConfig { fps_num: 60, ..video(true) };
+        let Ok(mut pipe) =
+            Pipeline::new(cfg60, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None)
+        else {
+            return;
+        };
+        let mut all_ms = Vec::new();
+        for i in 0..30u64 {
+            let ts = i * 16_666_667;
+            let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+            let uv = vec![128u8; 320 * 90];
+            for t in pipe
+                .video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts)
+                .unwrap_or_else(|e| panic!("{e}"))
+            {
+                if let Tag::Video { ms, .. } = t {
+                    all_ms.push(ms);
+                }
+            }
+        }
+        // Reshape to 30fps bframes=true (dts_shift jumps from 50ms to 100ms).
+        let next = VideoEncoder::new(video(true)).unwrap_or_else(|e| panic!("{e}"));
+        for t in pipe.set_video(next).unwrap_or_else(|e| panic!("{e}")) {
+            if let Tag::Video { ms, .. } = t {
+                all_ms.push(ms);
+            }
+        }
+        for i in 15..30u64 {
+            let ts = i * 33_333_333;
+            let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+            let uv = vec![128u8; 320 * 90];
+            for t in pipe
+                .video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts)
+                .unwrap_or_else(|e| panic!("{e}"))
+            {
+                if let Tag::Video { ms, .. } = t {
+                    all_ms.push(ms);
+                }
+            }
+        }
+        // Also test heal() mid-stream:
+        pipe.heal().unwrap_or_else(|e| panic!("{e}"));
+        for i in 30..45u64 {
+            let ts = i * 33_333_333;
+            let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+            let uv = vec![128u8; 320 * 90];
+            for t in pipe
+                .video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts)
+                .unwrap_or_else(|e| panic!("{e}"))
+            {
+                if let Tag::Video { ms, .. } = t {
+                    all_ms.push(ms);
+                }
+            }
+        }
+        for t in pipe.finish().unwrap_or_else(|e| panic!("{e}")) {
+            if let Tag::Video { ms, .. } = t {
+                all_ms.push(ms);
+            }
+        }
+        assert!(all_ms.windows(2).all(|w| w[1] >= w[0]), "dts jumped backwards across reshape/heal: {all_ms:?}");
+    }
+
+    #[test]
+    fn real_vt_bframes_recording_pause_resume_decodes_cleanly_in_ffmpeg() {
+        if !have("ffmpeg") || !have("ffprobe") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ferrocore-bframe-pause-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("paused.mp4");
+        let Ok(mut pipe) =
+            Pipeline::new(video(true), AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, Some(&f))
+        else {
+            return;
+        };
+        let pcm = vec![0.05f32; 1600 * 2];
+        for i in 0..180u64 {
+            if i == 60 {
+                pipe.pause_recording(true);
+            }
+            if i == 110 {
+                pipe.pause_recording(false);
+            }
+            let ts = i * 33_333_333;
+            let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
+            let uv = vec![128u8; 320 * 90];
+            pipe.video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts)
+                .unwrap_or_else(|e| panic!("{e}"));
+            pipe.audio(&pcm, ts).unwrap_or_else(|e| panic!("{e}"));
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        pipe.finish().unwrap_or_else(|e| panic!("{e}"));
+        let dec = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&f)
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            dec.stderr.is_empty(),
+            "ffmpeg decode errors after pause/resume: {}",
+            String::from_utf8_lossy(&dec.stderr)
+        );
+        let v = packets(&f, "v:0");
+        assert!(v.len() >= 100 && v.len() <= 140, "paused segment cut cleanly: {} frames", v.len());
+        assert!(v.windows(2).all(|w| w[1].1 > w[0].1), "mp4 decode times strictly rise across pause/resume");
+        assert!(v.iter().all(|p| p.1 <= p.0 + 1e-6), "never displayed before decoded");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
