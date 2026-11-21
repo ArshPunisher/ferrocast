@@ -244,6 +244,7 @@ fn run(secs: u64) {
     let mut worst = 0.0f32;
     let mut idle_from: Option<(Instant, usize)> = None;
     let (mut warm_allocs, mut warm_frees) = (0usize, 0usize);
+    let mut guest: Option<(u64, ferrocore::engine::Feed)> = None;
     let mut tick = 0u64;
     let mut base = None;
     while started.elapsed() < churn_end + Duration::from_secs(4) {
@@ -259,6 +260,21 @@ fn run(secs: u64) {
             // 500 ms: the talk key; 1 s: hide/show + the filter by name; 3 s: scene switch.
             if tick.is_multiple_of(25) {
                 e.push_key(MIC, true, (tick / 25).is_multiple_of(2));
+            }
+            // A source appears every 2 s (a guest, a browser source...) and goes 1 s later, its
+            // sound flowing: registering it and dropping it mustn't allocate or free there.
+            if tick % 100 == 10 {
+                let id = 100 + tick / 100;
+                e.set_source(id, SourceKind::Fed { width: 16, height: 16 }).unwrap();
+                guest = Some((id, e.fed(id).unwrap()));
+            }
+            if let Some((_, f)) = &guest {
+                f.sound(tone.clone(), 48_000, now_ns());
+            }
+            if tick % 100 == 60
+                && let Some((id, _)) = guest.take()
+            {
+                e.remove_source(id);
             }
             if tick.is_multiple_of(50) {
                 set_scenes(&e, tick / 50);

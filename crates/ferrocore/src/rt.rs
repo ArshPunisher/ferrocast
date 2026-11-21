@@ -689,3 +689,140 @@ mod tests {
         );
     }
 }
+
+/// A map from source id to `V` that adding or removing an entry doesn't allocate in, up to the
+/// room made when it was created: two sorted vectors, not tree nodes (a `BTreeMap` insert
+/// allocates a node). The audio thread keeps its sources, rings and levels in these, so a source
+/// added while live costs no allocation there. Past its room it grows like a `Vec` (rare: the
+/// room is [`PreMap::ROOM`] entries).
+pub struct PreMap<V> {
+    keys: Vec<u64>,
+    vals: Vec<V>,
+}
+
+/// Shown as a map (`{1: .., 2: ..}`), as the `BTreeMap` it replaces was (tests read it).
+impl<V: std::fmt::Debug> std::fmt::Debug for PreMap<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl<V> Default for PreMap<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<V> PreMap<V> {
+    /// Entries there is room for without growing.
+    pub const ROOM: usize = 256;
+
+    pub fn new() -> Self {
+        Self { keys: Vec::with_capacity(Self::ROOM), vals: Vec::with_capacity(Self::ROOM) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn contains_key(&self, k: &u64) -> bool {
+        self.keys.binary_search(k).is_ok()
+    }
+
+    pub fn get(&self, k: &u64) -> Option<&V> {
+        self.keys.binary_search(k).ok().map(|i| &self.vals[i])
+    }
+
+    pub fn get_mut(&mut self, k: &u64) -> Option<&mut V> {
+        self.keys.binary_search(k).ok().map(|i| &mut self.vals[i])
+    }
+
+    /// Puts `v` at `k`; what was there is handed back (drop it off the audio thread).
+    pub fn insert(&mut self, k: u64, v: V) -> Option<V> {
+        match self.keys.binary_search(&k) {
+            Ok(i) => Some(std::mem::replace(&mut self.vals[i], v)),
+            Err(i) => {
+                self.keys.insert(i, k);
+                self.vals.insert(i, v);
+                None
+            }
+        }
+    }
+
+    pub fn remove(&mut self, k: &u64) -> Option<V> {
+        let i = self.keys.binary_search(k).ok()?;
+        self.keys.remove(i);
+        Some(self.vals.remove(i))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &V)> {
+        self.keys.iter().zip(self.vals.iter())
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (&u64, &mut V)> {
+        self.keys.iter().zip(self.vals.iter_mut())
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.vals.iter()
+    }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.vals.iter_mut()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &u64> {
+        self.keys.iter()
+    }
+}
+
+impl<'a, V> IntoIterator for &'a PreMap<V> {
+    type Item = (&'a u64, &'a V);
+    type IntoIter = std::iter::Zip<std::slice::Iter<'a, u64>, std::slice::Iter<'a, V>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.keys.iter().zip(self.vals.iter())
+    }
+}
+
+impl<'a, V> IntoIterator for &'a mut PreMap<V> {
+    type Item = (&'a u64, &'a mut V);
+    type IntoIter = std::iter::Zip<std::slice::Iter<'a, u64>, std::slice::IterMut<'a, V>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.keys.iter().zip(self.vals.iter_mut())
+    }
+}
+
+impl<V> std::ops::Index<&u64> for PreMap<V> {
+    type Output = V;
+    fn index(&self, k: &u64) -> &V {
+        &self.vals[self.keys.binary_search(k).unwrap_or_else(|_| panic!("no entry for source {k}"))]
+    }
+}
+
+#[cfg(test)]
+mod premap_tests {
+    use super::PreMap;
+
+    #[test]
+    fn behaves_like_a_sorted_map_and_adds_without_growing() {
+        let mut m = PreMap::<u32>::new();
+        let (kc, vc) = (m.keys.capacity(), m.vals.capacity());
+        for k in [5u64, 1, 9, 3] {
+            assert!(m.insert(k, k as u32).is_none());
+        }
+        assert_eq!(m.insert(3, 33), Some(3));
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), vec![1, 3, 5, 9]);
+        assert_eq!(m[&3], 33);
+        assert_eq!(m.remove(&5), Some(5));
+        assert!(!m.contains_key(&5) && m.len() == 3);
+        for (_, v) in &mut m {
+            *v += 1;
+        }
+        assert_eq!(m.get(&9), Some(&10));
+        assert_eq!((m.keys.capacity(), m.vals.capacity()), (kc, vc), "no growth");
+    }
+}

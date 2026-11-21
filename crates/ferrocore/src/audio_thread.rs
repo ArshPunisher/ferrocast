@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread::JoinHandle;
@@ -45,6 +45,8 @@ struct ToneState {
 
 /// Commands sent from `Engine` / control threads / `ferrocast-afx-bg` to `ferrocast-audio`.
 pub enum AudioCmd {
+    /// A source entry made ahead (see `AfxJob::MakeSpare`).
+    Spare(crate::mix::SpareSource),
     EnsureSource {
         id: u64,
         levels: Arc<AtomicLevels>,
@@ -114,6 +116,7 @@ pub enum AudioCmd {
 impl std::fmt::Debug for AudioCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Spare(_) => f.write_str("Spare"),
             Self::EnsureSource { id, .. } => f.debug_struct("EnsureSource").field("id", id).finish(),
             Self::RemoveSource(id) => f.debug_tuple("RemoveSource").field(id).finish(),
             Self::ScheduleRemove { id, after_ns } => {
@@ -165,10 +168,26 @@ pub(crate) enum AfxJob {
     DropFilters(Vec<AudioFilter>),
     /// The list of heard sources a newer one replaced.
     DropHeard(Arc<[u64]>),
+    /// A removed source's mixer entry (its buffers free here, not on the audio thread).
+    DropSource(crate::mix::SpareSource),
+    /// A source's level meter, when the audio thread held its last reference.
+    DropLevels(Arc<AtomicLevels>),
+    /// A ring a source left or replaced.
+    DropRing(AudioConsumer),
+    /// Make `n` source entries ahead for sources that appear.
+    MakeSpare {
+        rate: u32,
+        n: usize,
+    },
     DropPlugins(Vec<Box<dyn SoundPlugin>>),
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     DropFeeder(Feeder),
 }
+
+/// Jobs that may wait for the background thread. A bounded channel, so the audio thread's `try_send`
+/// never allocates (an unbounded one allocates a block every few dozen messages); if it were ever
+/// full, the job is dropped there (its memory frees on the audio thread: a rare click, not a stall).
+const AFX_QUEUE: usize = 256;
 
 type PluginBuilder = fn(AudioEffect, u32) -> Option<Box<dyn SoundPlugin>>;
 
@@ -188,6 +207,14 @@ fn run_afx_bg(rx: mpsc::Receiver<AfxJob>, cmd_tx: mpsc::Sender<AudioCmd>, builde
             }
             AfxJob::DropFilters(filters) => drop(filters),
             AfxJob::DropHeard(old) => drop(old),
+            AfxJob::DropSource(src) => drop(src),
+            AfxJob::DropRing(ring) => drop(ring),
+            AfxJob::DropLevels(l) => drop(l),
+            AfxJob::MakeSpare { rate, n } => {
+                for _ in 0..n {
+                    let _ = cmd_tx.send(AudioCmd::Spare(Mixer::make_spare(rate)));
+                }
+            }
             AfxJob::DropPlugins(plugins) => drop(plugins),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             AfxJob::DropFeeder(feeder) => drop(feeder),
@@ -264,10 +291,10 @@ pub struct AudioRunner<C: AudioClock> {
     step_ns: u64,
     next_tick_ns: u64,
     mixer: Mixer,
-    tones: BTreeMap<u64, ToneState>,
-    rings: BTreeMap<u64, AudioConsumer>,
-    levels: HashMap<u64, Arc<AtomicLevels>>,
-    pending_removals: BTreeMap<u64, u64>,
+    tones: crate::rt::PreMap<ToneState>,
+    rings: crate::rt::PreMap<AudioConsumer>,
+    levels: crate::rt::PreMap<Arc<AtomicLevels>>,
+    pending_removals: crate::rt::PreMap<u64>,
     heard: Arc<[u64]>,
     master_taps: Vec<Weak<Mutex<VecDeque<f32>>>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -277,7 +304,7 @@ pub struct AudioRunner<C: AudioClock> {
     cmd_rx: mpsc::Receiver<AudioCmd>,
     recycle_rx: mpsc::Receiver<Block>,
     bridge_tx: Option<mpsc::SyncSender<Block>>,
-    afx_tx: Option<mpsc::Sender<AfxJob>>,
+    afx_tx: Option<mpsc::SyncSender<AfxJob>>,
     needs_plugin: fn(AudioEffect, u32) -> bool,
     next_build_id: u64,
     ring_scratch: Vec<f32>,
@@ -306,7 +333,7 @@ impl<C: AudioClock> AudioRunner<C> {
         cmd_rx: mpsc::Receiver<AudioCmd>,
         recycle_rx: mpsc::Receiver<Block>,
         bridge_tx: Option<mpsc::SyncSender<Block>>,
-        afx_tx: Option<mpsc::Sender<AfxJob>>,
+        afx_tx: Option<mpsc::SyncSender<AfxJob>>,
         needs_plugin: fn(AudioEffect, u32) -> bool,
     ) -> Self {
         let rate = rate.max(1);
@@ -318,10 +345,10 @@ impl<C: AudioClock> AudioRunner<C> {
             step_ns,
             next_tick_ns,
             mixer: Mixer::new(rate, latency_ns),
-            tones: BTreeMap::new(),
-            rings: BTreeMap::new(),
-            levels: HashMap::new(),
-            pending_removals: BTreeMap::new(),
+            tones: crate::rt::PreMap::new(),
+            rings: crate::rt::PreMap::new(),
+            levels: crate::rt::PreMap::new(),
+            pending_removals: crate::rt::PreMap::new(),
             heard: Arc::from([]),
             master_taps: Vec::new(),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -348,6 +375,7 @@ impl<C: AudioClock> AudioRunner<C> {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             self.handle_cmd(cmd);
         }
+        self.tidy_after_commands();
 
         let now = self.clock.now_ns();
         self.expire_scheduled_removals(now);
@@ -448,10 +476,13 @@ impl<C: AudioClock> AudioRunner<C> {
 
     fn handle_cmd(&mut self, cmd: AudioCmd) {
         match cmd {
+            AudioCmd::Spare(s) => self.mixer.add_spare(s),
             AudioCmd::EnsureSource { id, levels } => {
                 self.pending_removals.remove(&id);
                 self.mixer.ensure(id);
-                self.levels.insert(id, levels);
+                if let Some(old) = self.levels.insert(id, levels) {
+                    self.drop_elsewhere(AfxJob::DropLevels(old));
+                }
             }
             AudioCmd::RemoveSource(id) => self.remove_source_now(id),
             AudioCmd::ScheduleRemove { id, after_ns } => {
@@ -460,7 +491,9 @@ impl<C: AudioClock> AudioRunner<C> {
             AudioCmd::AttachRing { id, consumer } => {
                 self.pending_removals.remove(&id);
                 self.mixer.ensure(id);
-                self.rings.insert(id, consumer);
+                if let Some(old) = self.rings.insert(id, consumer) {
+                    self.drop_elsewhere(AfxJob::DropRing(old));
+                }
             }
             AudioCmd::FlushSource(id) => {
                 if let Some(c) = self.rings.get_mut(&id) {
@@ -473,8 +506,10 @@ impl<C: AudioClock> AudioRunner<C> {
                 match tone {
                     Some(spec) => {
                         self.mixer.ensure(id);
-                        if let Some(l) = levels {
-                            self.levels.insert(id, l);
+                        if let Some(l) = levels
+                            && let Some(old) = self.levels.insert(id, l)
+                        {
+                            self.drop_elsewhere(AfxJob::DropLevels(old));
                         }
                         self.tones.insert(id, ToneState { spec, pushed_to: None });
                     }
@@ -486,7 +521,9 @@ impl<C: AudioClock> AudioRunner<C> {
             AudioCmd::SetSettings { id, settings, levels } => {
                 self.pending_removals.remove(&id);
                 self.mixer.set(id, settings);
-                self.levels.insert(id, levels);
+                if let Some(old) = self.levels.insert(id, levels) {
+                    self.drop_elsewhere(AfxJob::DropLevels(old));
+                }
             }
             AudioCmd::PushKey { id, talk, down } => self.mixer.push_key(id, talk, down),
             AudioCmd::SetOutputCapture { id, capture } => {
@@ -494,8 +531,10 @@ impl<C: AudioClock> AudioRunner<C> {
             }
             AudioCmd::SetEffects { id, effects, levels } => {
                 self.pending_removals.remove(&id);
-                if let Some(l) = levels {
-                    self.levels.insert(id, l);
+                if let Some(l) = levels
+                    && let Some(old) = self.levels.insert(id, l)
+                {
+                    self.drop_elsewhere(AfxJob::DropLevels(old));
                 }
                 let next_id = &mut self.next_build_id;
                 let mut gen_id = || {
@@ -507,7 +546,7 @@ impl<C: AudioClock> AudioRunner<C> {
                     self.mixer.set_effects_nonblocking(id, &effects, &mut gen_id, &self.needs_plugin);
                 if !evicted.is_empty() {
                     if let Some(afx) = &self.afx_tx {
-                        let _ = afx.send(AfxJob::DropFilters(evicted));
+                        let _ = afx.try_send(AfxJob::DropFilters(evicted));
                     } else {
                         drop(evicted);
                     }
@@ -515,14 +554,14 @@ impl<C: AudioClock> AudioRunner<C> {
                 if !missing.is_empty()
                     && let Some(afx) = &self.afx_tx
                 {
-                    let _ = afx.send(AfxJob::Build { id, rate: self.rate, items: missing });
+                    let _ = afx.try_send(AfxJob::Build { id, rate: self.rate, items: missing });
                 }
             }
             AudioCmd::AttachPlugins { id, built } => {
                 let out = self.mixer.attach_plugins(id, built);
                 if !out.rejected.is_empty() {
                     if let Some(afx) = &self.afx_tx {
-                        let _ = afx.send(AfxJob::DropPlugins(out.rejected));
+                        let _ = afx.try_send(AfxJob::DropPlugins(out.rejected));
                     } else {
                         drop(out.rejected);
                     }
@@ -530,7 +569,7 @@ impl<C: AudioClock> AudioRunner<C> {
                 if !out.rebuild.is_empty()
                     && let Some(afx) = &self.afx_tx
                 {
-                    let _ = afx.send(AfxJob::Build { id, rate: self.rate, items: out.rebuild });
+                    let _ = afx.try_send(AfxJob::Build { id, rate: self.rate, items: out.rebuild });
                 }
             }
             AudioCmd::SetHeard(heard) => {
@@ -539,7 +578,7 @@ impl<C: AudioClock> AudioRunner<C> {
                 // must not free memory on the real-time thread).
                 let old = std::mem::replace(&mut self.heard, heard);
                 if let Some(afx) = &self.afx_tx {
-                    let _ = afx.send(AfxJob::DropHeard(old));
+                    let _ = afx.try_send(AfxJob::DropHeard(old));
                 }
             }
             AudioCmd::SetLowLatency(on) => self.mixer.set_low_latency(on),
@@ -557,7 +596,7 @@ impl<C: AudioClock> AudioRunner<C> {
                 self.mixer.set_monitor_device(dev_id);
                 if let Some(old) = std::mem::replace(&mut self.monitor, feeder) {
                     if let Some(afx) = &self.afx_tx {
-                        let _ = afx.send(AfxJob::DropFeeder(old));
+                        let _ = afx.try_send(AfxJob::DropFeeder(old));
                     } else {
                         drop(old);
                     }
@@ -573,16 +612,39 @@ impl<C: AudioClock> AudioRunner<C> {
     fn remove_source_now(&mut self, id: u64) {
         self.pending_removals.remove(&id);
         self.tones.remove(&id);
-        self.rings.remove(&id);
-        self.levels.remove(&id);
+        if let Some(ring) = self.rings.remove(&id) {
+            self.drop_elsewhere(AfxJob::DropRing(ring));
+        }
+        if let Some(l) = self.levels.remove(&id) {
+            self.drop_elsewhere(AfxJob::DropLevels(l));
+        }
         if let Some(evicted) = self.mixer.remove(id)
             && !evicted.is_empty()
         {
             if let Some(afx) = &self.afx_tx {
-                let _ = afx.send(AfxJob::DropFilters(evicted));
+                let _ = afx.try_send(AfxJob::DropFilters(evicted));
             } else {
                 drop(evicted);
             }
+        }
+    }
+
+    /// Frees what a job holds on the background thread (here only when there is none).
+    fn drop_elsewhere(&self, job: AfxJob) {
+        if let Some(afx) = &self.afx_tx {
+            let _ = afx.try_send(job);
+        }
+    }
+
+    /// After commands: the entries of removed sources go to be dropped elsewhere, and spares
+    /// are asked for to replace the ones sources took.
+    fn tidy_after_commands(&mut self) {
+        while let Some(src) = self.mixer.pop_retired() {
+            self.drop_elsewhere(AfxJob::DropSource(src));
+        }
+        let n = self.mixer.take_spare_request();
+        if n > 0 {
+            self.drop_elsewhere(AfxJob::MakeSpare { rate: self.rate, n });
         }
     }
 
@@ -591,12 +653,11 @@ impl<C: AudioClock> AudioRunner<C> {
             return;
         }
         let lat = self.mixer.latency_ns();
-        let ready: Vec<u64> = self
-            .pending_removals
-            .iter()
-            .filter_map(|(&id, &after)| (now >= after.saturating_add(lat)).then_some(id))
-            .collect();
-        for id in ready {
+        // One at a time (no list made here): each removal changes the map.
+        loop {
+            let due =
+                self.pending_removals.iter().find_map(|(&id, &after)| (now >= after.saturating_add(lat)).then_some(id));
+            let Some(id) = due else { break };
             self.remove_source_now(id);
         }
     }
@@ -687,7 +748,7 @@ impl AudioHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
         let (recycle_tx, recycle_rx) = mpsc::sync_channel::<Block>(RECYCLE_CAP);
         let (bridge_tx, bridge_rx) = mpsc::sync_channel::<Block>(BRIDGE_CAP);
-        let (afx_tx, afx_rx) = mpsc::channel::<AfxJob>();
+        let (afx_tx, afx_rx) = mpsc::sync_channel::<AfxJob>(AFX_QUEUE);
 
         let afx_cmd = cmd_tx.clone();
         let afx_thread = std::thread::Builder::new()
@@ -945,7 +1006,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (_recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
         let (bridge_tx, bridge_rx) = mpsc::sync_channel(BRIDGE_CAP);
-        let (afx_tx, afx_rx) = mpsc::channel();
+        let (afx_tx, afx_rx) = mpsc::sync_channel(AFX_QUEUE);
 
         let afx_cmd = cmd_tx.clone();
         let afx_thread = std::thread::Builder::new()
@@ -1058,7 +1119,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (_recycle_tx, recycle_rx) = mpsc::sync_channel(RECYCLE_CAP);
         let (bridge_tx, bridge_rx) = mpsc::sync_channel(BRIDGE_CAP);
-        let (afx_tx, afx_rx) = mpsc::channel();
+        let (afx_tx, afx_rx) = mpsc::sync_channel(AFX_QUEUE);
         let afx_cmd = cmd_tx.clone();
         let afx_thread = std::thread::Builder::new()
             .name("test-afx-retune".into())
