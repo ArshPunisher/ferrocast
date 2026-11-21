@@ -114,6 +114,14 @@ impl Denoiser {
         for q in &mut self.inp {
             q.clear();
         }
+        // What waits to go out is a block of silence again, as at the start: what it held in and
+        // what it holds out made one block of delay between them, and with the part frame let go
+        // the model's sound would come out early by that much from here on.
+        let hop = self.hop;
+        for q in &mut self.out {
+            q.clear();
+            q.extend(std::iter::repeat_n(0.0, hop));
+        }
         // The stretch of silence it was in is over: the sound after the hole is the model's.
         self.quiet_blocks = 0;
     }
@@ -868,6 +876,22 @@ mod tests {
         let said = d.latency();
         assert_eq!(delay_of(&mut d), said, "measured against reported, in samples");
         assert_eq!(said, MODEL_LATENCY, "40 ms with the built-in model (the plugin says it before the model is made)");
+    }
+
+    /// A hole in the input (the worker's inbox dropped a block) leaves the delay what it says: the
+    /// part frame it let go is made up in the output too, or the model's sound comes out early by
+    /// that much (32 samples after eight 1024-sample blocks) while the plugin takes it as in step.
+    #[test]
+    fn after_a_gap_the_delay_is_still_what_it_says() {
+        let mut d = Denoiser::new(2, 1).expect("the built-in model starts");
+        let mut seed = 9;
+        for _ in 0..8 {
+            let mut l = hiss(1024, &mut seed);
+            let mut r = l.clone();
+            d.run(&mut [&mut l, &mut r]);
+        }
+        d.gap();
+        assert_eq!(delay_of(&mut d), MODEL_LATENCY, "measured after the gap, in samples");
     }
 
     /// Hiss, six seconds of digital silence, then a voice-like buzz, in libobs's 1024-frame
