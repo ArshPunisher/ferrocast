@@ -667,11 +667,12 @@ fn read(
                     if at <= horizon && room {
                         // SAFETY: the decoded frame's pixel buffer is live with its sample buffer.
                         if let Some(img) = unsafe { s.image_buffer() }
-                            && let Some(p) = super::screen::copy_bgra(&img)
+                            && let Some(mut p) = super::screen::copy_bgra(&img)
                             && let Ok(mut q) = shared.frames.lock()
                         {
                             let pos_ns = pts.max(0) as u64;
-                            q.push_back((Picture { premultiplied: false, ..p }, at, pos_ns));
+                            p.premultiplied = false;
+                            q.push_back((p, at, pos_ns));
                         }
                         last_end = last_end.max(pts);
                         v_next = pass.video.as_ref().and_then(|o| next(o));
