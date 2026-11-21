@@ -198,6 +198,82 @@ impl Feed {
     }
 }
 
+/// Who a picture is drawn for. The stream and the recording can differ by item (`Show`); the
+/// editor's own views (the preview, snapshots, the multiview) show everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Audience {
+    /// Every item, whatever it is shown for.
+    #[default]
+    Everyone,
+    /// The stream's picture: items shown on the stream (or both).
+    Stream,
+    /// The recording's picture (and the replay buffer's clips): items shown in the recording
+    /// (or both).
+    Recording,
+}
+
+/// Where an item is shown: on the stream, in the recording, or both (the default, and what a
+/// collection from before this had).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Show {
+    #[default]
+    Both,
+    /// Only on the stream: a chat box or alerts a clean recording leaves out.
+    Stream,
+    /// Only in the recording: a camera the stream doesn't carry.
+    Recording,
+}
+
+impl Show {
+    /// Whether a picture drawn for `audience` carries the item.
+    pub fn shown_to(self, audience: Audience) -> bool {
+        matches!(
+            (self, audience),
+            (Self::Both, _)
+                | (_, Audience::Everyone)
+                | (Self::Stream, Audience::Stream)
+                | (Self::Recording, Audience::Recording)
+        )
+    }
+
+    /// "both", "stream" or "recording" (what is saved and sent); anything else is both.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "stream" => Self::Stream,
+            "recording" => Self::Recording,
+            _ => Self::Both,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Stream => "stream",
+            Self::Recording => "recording",
+        }
+    }
+}
+
+/// What an output is for: a stream's picture, or a recording's (a replay buffer's clips are
+/// recordings).
+pub fn audience_of(kind: &OutputKind) -> Audience {
+    match kind {
+        OutputKind::Stream(_) => Audience::Stream,
+        OutputKind::Record(_) | OutputKind::Replay { .. } => Audience::Recording,
+    }
+}
+
+/// The canvas as the frame loop draws it: while no visible item differs between the stream and
+/// the recording they are the same picture (the audience is dropped), so it is drawn once, as
+/// it always was; once one does, each audience is drawn on its own.
+fn view(canvas: &Canvas, selective: bool) -> Canvas {
+    let mut c = canvas.clone();
+    if !selective {
+        c.audience = Audience::Everyone;
+    }
+    c
+}
+
 /// A source in a scene: which, where, and how.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneItem {
@@ -219,6 +295,9 @@ pub struct SceneItem {
     pub item_id: i64,
     /// `effects` are this item's own list (an override), not its source's filters.
     pub own_effects: bool,
+    /// Whether the stream, the recording or both show it. On a group, that covers the group's
+    /// children as a whole (a child keeps its own flag inside a group that is shown).
+    pub show: Show,
 }
 
 impl SceneItem {
@@ -236,6 +315,7 @@ impl SceneItem {
             group: None,
             item_id: 0,
             own_effects: false,
+            show: Show::Both,
         }
     }
 }
@@ -380,6 +460,9 @@ pub struct Canvas {
     /// More video qualities a stream sends as Enhanced RTMP tracks 1… (Twitch Enhanced
     /// Broadcasting): each width, height and kbps, drawn from the same picture scaled down.
     pub video_tracks: Vec<(u32, u32, u32)>,
+    /// Whose picture it is: an output takes it from what it is (`start_output_with`). Matters
+    /// only while an item is shown just on the stream or just in the recording.
+    pub audience: Audience,
 }
 
 impl Canvas {
@@ -395,6 +478,7 @@ impl Canvas {
             more_tracks: Vec::new(),
             track_names: Vec::new(),
             video_tracks: Vec::new(),
+            audience: Audience::Everyone,
         }
     }
 
@@ -2631,6 +2715,8 @@ impl Engine {
         }
         let id = st.next_output;
         st.next_output += 1;
+        // A stream draws what the stream shows, a recording what the recording shows.
+        let canvas = Canvas { audience: audience_of(&kind), ..canvas };
         st.outputs.push((id, pipe, kind, canvas));
         sync_heard(&mut st, &self.audio.cmd_sender());
         self.show(&st);
@@ -3154,7 +3240,7 @@ impl Engine {
                 return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
             }
             send_pending(&mut st, &self.gpu);
-            build(&st, self.config.width, self.config.height, Some(name), now_ns())
+            build(&st, self.config.width, self.config.height, Some(name), now_ns(), Audience::Everyone)
         };
         self.gpu.render(&scene)
     }
@@ -3168,7 +3254,7 @@ impl Engine {
                 return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
             }
             send_pending(&mut st, &self.gpu);
-            build(&st, canvas.0.max(1), canvas.1.max(1), Some(name), now_ns())
+            build(&st, canvas.0.max(1), canvas.1.max(1), Some(name), now_ns(), Audience::Everyone)
         };
         self.gpu.render(&scaled(scene, size.0.max(1), size.1.max(1), Filter::Bicubic))
     }
@@ -3248,7 +3334,7 @@ impl Engine {
             );
             one.filter = Filter::Bilinear;
             one.effects = effects;
-            item_of(&st, &one, 0, (w, h))?
+            item_of(&st, &one, 0, (w, h), Audience::Everyone)?
         };
         self.gpu.render(&Scene { width: w, height: h, items: vec![item] }).ok()
     }
@@ -3257,7 +3343,7 @@ impl Engine {
     pub fn snapshot(&self) -> Result<Vec<u8>, AvError> {
         let frame = {
             let st = self.lock();
-            what_to_draw(&st, self.config.width, self.config.height, None, now_ns())
+            what_to_draw(&st, self.config.width, self.config.height, None, now_ns(), Audience::Everyone)
         };
         match frame {
             Draw::Scene(s) => self.gpu.render(&s),
@@ -3351,7 +3437,7 @@ fn preview_loop(
             st.previews.get(&id).map(|p| {
                 let draw = match &p.multiview {
                     Some(mv) => Draw::Scene(multiview_scene(&st, mv, now_ns())),
-                    None => what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns()),
+                    None => what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns(), Audience::Everyone),
                 };
                 // The outlines from the same items, at the same moment, as the picture: drawn
                 // together they can't drift apart while a source is dragged (as OBS draws its
@@ -3463,11 +3549,11 @@ const STINGER: u64 = u64::MAX - 1;
 
 /// A canvas's frame: its own scene, or what's on air (mid-transition, perhaps), with the top
 /// layer over it.
-fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u64) -> Draw {
+fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u64, aud: Audience) -> Draw {
     if let Some(name) = scene {
-        return Draw::Scene(build(st, width, height, Some(name), ts));
+        return Draw::Scene(build(st, width, height, Some(name), ts, aud));
     }
-    let mut draw = on_air_draw(st, width, height, ts);
+    let mut draw = on_air_draw(st, width, height, ts, aud);
     // The top layer over both sides of a transition, so it stays still through it; never
     // over itself.
     if let Some(top) = st.top.as_deref()
@@ -3475,7 +3561,7 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
     {
         let mut over = SceneItem::new(0, Placement::default());
         over.scene = Some(top.to_string());
-        let item = || item_of(st, &over, ts, (width, height));
+        let item = || item_of(st, &over, ts, (width, height), aud);
         match &mut draw {
             Draw::Scene(s) => s.items.extend(item()),
             Draw::Moving(t) => {
@@ -3487,12 +3573,35 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
     draw
 }
 
+/// Whether a visible item that goes out differs between the stream and the recording: one shown
+/// only on the stream or only in the recording, in what is on air (with a transition's other side,
+/// the top layer and a scene an output or tap shows of its own), and in scenes nested in them.
+/// While none does there is one picture for both, drawn once (`view`).
+fn selective(st: &State) -> bool {
+    fn walk(st: &State, scene: &str, depth: u32) -> bool {
+        let Some(items) = st.scenes.get(scene) else { return false };
+        items.iter().filter(|i| i.visible).any(|i| {
+            i.show != Show::Both
+                || i.scene.as_deref().is_some_and(|inner| depth < MAX_NESTING && walk(st, inner, depth + 1))
+        })
+    }
+    let mut roots: Vec<&str> = Vec::new();
+    roots.extend(st.on_air.as_deref());
+    roots.extend(st.top.as_deref());
+    roots.extend(st.moving.as_ref().map(|(from, ..)| from.as_str()));
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
+    roots.extend(st.outputs.iter().filter_map(|(.., c)| c.scene.as_deref()));
+    roots.extend(st.taps.iter().filter_map(|(_, c, _)| c.scene.as_deref()));
+    roots.into_iter().any(|r| walk(st, r, 0))
+}
+
 /// What's on air: one scene, or two mid-transition.
-fn on_air_draw(st: &State, width: u32, height: u32, ts: u64) -> Draw {
+fn on_air_draw(st: &State, width: u32, height: u32, ts: u64, aud: Audience) -> Draw {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if let Some((from, _, cut, _)) = &st.stinger {
         let under = if ts < *cut { Some(from.as_str()) } else { st.on_air.as_deref() };
-        let mut s = build(st, width, height, under, ts);
+        let mut s = build(st, width, height, under, ts, aud);
         // Over everything, stretched to the canvas.
         let over = SceneItem::new(
             STINGER,
@@ -3503,25 +3612,25 @@ fn on_air_draw(st: &State, width: u32, height: u32, ts: u64) -> Draw {
                 ..Default::default()
             },
         );
-        s.items.extend(item_of(st, &over, 0, (width, height)));
+        s.items.extend(item_of(st, &over, 0, (width, height), aud));
         return Draw::Scene(s);
     }
     match &st.moving {
         Some((from, TransitionKind::Move, start, dur)) if ts < start + dur => {
             let t = crate::cubic_ease_in_out(ts.saturating_sub(*start) as f32 / *dur as f32);
-            Draw::Scene(moved(st, width, height, from, st.on_air.as_deref().unwrap_or_default(), t, ts))
+            Draw::Scene(moved(st, (width, height), from, st.on_air.as_deref().unwrap_or_default(), t, ts, aud))
         }
         Some((from, kind, start, dur)) if ts < start + dur => {
             let t = ts.saturating_sub(*start) as f32 / *dur as f32;
-            let to = build(st, width, height, st.on_air.as_deref(), ts);
+            let to = build(st, width, height, st.on_air.as_deref(), ts, aud);
             Draw::Moving(Box::new(Transition {
                 kind: kind.clone(),
                 t,
-                from: build(st, width, height, Some(from), ts),
+                from: build(st, width, height, Some(from), ts, aud),
                 to,
             }))
         }
-        _ => Draw::Scene(build(st, width, height, st.on_air.as_deref(), ts)),
+        _ => Draw::Scene(build(st, width, height, st.on_air.as_deref(), ts, aud)),
     }
 }
 
@@ -3553,7 +3662,7 @@ fn multiview_scene(st: &State, mv: &Multiview, ts: u64) -> Scene {
     for (b, label) in &mv.boxes {
         let (x, y, w, h) = b.area;
         let name = b.scene.as_deref().or(st.on_air.as_deref());
-        items.push(at(Content::Scene(build(st, mv.canvas.0, mv.canvas.1, name, ts)), b.area));
+        items.push(at(Content::Scene(build(st, mv.canvas.0, mv.canvas.1, name, ts, Audience::Everyone)), b.area));
         let frame = match b.live {
             Some(live) if b.scene.is_some() && b.scene.as_deref() == st.on_air.as_deref() => live,
             _ => b.frame,
@@ -3800,21 +3909,24 @@ fn send_pending(st: &mut State, gpu: &Compositor) {
 }
 
 /// An item as the compositor takes it, `ms` into its scene; None without a picture yet.
-fn item_of(st: &State, it: &SceneItem, ms: u64, canvas: (u32, u32)) -> Option<Item> {
-    item_at(st, it, ms, 0, canvas)
+fn item_of(st: &State, it: &SceneItem, ms: u64, canvas: (u32, u32), aud: Audience) -> Option<Item> {
+    item_at(st, it, ms, 0, canvas, aud)
 }
 
 /// Scenes inside scenes go at most this deep (a scene showing itself stops there).
 const MAX_NESTING: u32 = 8;
 
-fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) -> Option<Item> {
+fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32), aud: Audience) -> Option<Item> {
     let (placement, opacity) = animated(it, ms);
     let content = match &it.scene {
         Some(name) if depth < MAX_NESTING => {
             let scene = st.scenes.get(name)?;
             // Its items keep the time of the scene showing it (as OBS: a nested scene plays along).
-            let items =
-                scene.iter().filter(|i| i.visible).filter_map(|i| item_at(st, i, ms, depth + 1, canvas)).collect();
+            let items = scene
+                .iter()
+                .filter(|i| i.visible && i.show.shown_to(aud))
+                .filter_map(|i| item_at(st, i, ms, depth + 1, canvas, aud))
+                .collect();
             match it.group {
                 // An empty group is 0×0: nothing to draw, and drawing it would fail the whole
                 // frame (owner, 11 Nov: the canvas stayed blank once a group was added).
@@ -3867,13 +3979,18 @@ fn scene_ms(st: &State, name: &str, ts: u64) -> u64 {
 }
 
 /// A scene as the compositor takes it at `ts` (sources without a picture yet are left out).
-fn build(st: &State, width: u32, height: u32, name: Option<&str>, ts: u64) -> Scene {
+fn build(st: &State, width: u32, height: u32, name: Option<&str>, ts: u64, aud: Audience) -> Scene {
     let mut items = Vec::new();
     if let Some(name) = name
         && let Some(scene) = st.scenes.get(name)
     {
         let ms = scene_ms(st, name, ts);
-        items.extend(scene.iter().filter(|i| i.visible).filter_map(|it| item_of(st, it, ms, (width, height))));
+        items.extend(
+            scene
+                .iter()
+                .filter(|i| i.visible && i.show.shown_to(aud))
+                .filter_map(|it| item_of(st, it, ms, (width, height), aud)),
+        );
     }
     Scene { width, height, items }
 }
@@ -3881,25 +3998,26 @@ fn build(st: &State, width: u32, height: u32, name: Option<&str>, ts: u64) -> Sc
 /// The Move transition `t` of the way (eased): a source in both scenes glides from its old
 /// place to its new one; one only in the old scene fades out underneath, one only in the new
 /// fades in.
-fn moved(st: &State, width: u32, height: u32, from: &str, to: &str, t: f32, ts: u64) -> Scene {
+fn moved(st: &State, canvas: (u32, u32), from: &str, to: &str, t: f32, ts: u64, aud: Audience) -> Scene {
     let (empty, empty2) = (Vec::new(), Vec::new());
     let a = st.scenes.get(from).unwrap_or(&empty);
     let b = st.scenes.get(to).unwrap_or(&empty2);
     let (ma, mb) = (scene_ms(st, from, ts), scene_ms(st, to, ts));
     let lerp = |x: f32, y: f32| x + (y - x) * t;
-    let canvas = (width, height);
+    let (width, height) = canvas;
     // The same thing in both scenes: one source, or one nested scene.
     let same = |x: &SceneItem, y: &SceneItem| x.source == y.source && x.scene == y.scene;
     let mut items = Vec::new();
-    for old in a.iter().filter(|i| i.visible && !b.iter().any(|n| n.visible && same(n, i))) {
-        if let Some(mut it) = item_of(st, old, ma, canvas) {
+    let shows = |i: &SceneItem| i.visible && i.show.shown_to(aud);
+    for old in a.iter().filter(|i| shows(i) && !b.iter().any(|n| shows(n) && same(n, i))) {
+        if let Some(mut it) = item_of(st, old, ma, canvas, aud) {
             it.opacity *= 1.0 - t;
             items.push(it);
         }
     }
-    for new in b.iter().filter(|i| i.visible) {
-        let Some(mut it) = item_of(st, new, mb, canvas) else { continue };
-        match a.iter().find(|o| o.visible && same(o, new)).and_then(|o| item_of(st, o, ma, canvas)) {
+    for new in b.iter().filter(|i| shows(i)) {
+        let Some(mut it) = item_of(st, new, mb, canvas, aud) else { continue };
+        match a.iter().find(|o| shows(o) && same(o, new)).and_then(|o| item_of(st, o, ma, canvas, aud)) {
             Some(o) => {
                 let (p, q) = (o.placement, it.placement);
                 it.placement.x = lerp(p.x, q.x);
@@ -4851,6 +4969,8 @@ struct InFlight {
     outputs: Vec<u64>,
     taps: Vec<u64>,
     drawn: Vec<(Canvas, Result<PendingNv12, String>)>,
+    /// Whether the stream and the recording were drawn apart this frame (`view`).
+    selective: bool,
 }
 
 /// Hands the frames that came back to their outputs and taps, oldest first: those ready, and
@@ -4933,7 +5053,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             break;
         }
         let Some(e) = st.in_flight.pop_front() else { break };
-        let InFlight { ts, blocks, outputs, taps, drawn } = e;
+        let InFlight { ts, blocks, outputs, taps, drawn, selective } = e;
         // A frame the card drew into a pooled surface stays one (no copy): the encoders share it,
         // and a tap that needs host bytes makes them once.
         let drawn: Vec<(Canvas, Result<crate::Drawn, String>)> = drawn
@@ -4966,7 +5086,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                 continue;
             }
             let mut tags = Vec::new();
-            if let Some((_, frame)) = drawn.iter().find(|(c, _)| c == canvas) {
+            if let Some((_, frame)) = drawn.iter().find(|(c, _)| *c == view(canvas, selective)) {
                 match frame {
                     Ok(f) => {
                         let w = canvas.width as usize;
@@ -4980,7 +5100,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                     Err(e) => failed = Some(e.clone()),
                 }
                 for (i, &(w, h, _)) in canvas.video_tracks.iter().enumerate() {
-                    let c = canvas.track(w, h);
+                    let c = view(&canvas.track(w, h), selective);
                     if let Some((_, Ok(f))) = drawn.iter().find(|(d, _)| *d == c) {
                         let s = w as usize;
                         let t0 = Instant::now();
@@ -5031,7 +5151,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             if !taps.contains(id) {
                 continue;
             }
-            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| c == canvas)
+            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| *c == view(canvas, selective))
                 && let Some(host) = f.host()
             {
                 sink(host, ts);
@@ -5430,13 +5550,18 @@ fn frame(
         // back while the next frames are drawn (`deliver`): waiting for it here stalled the loop
         // whenever a game kept the card busy (owner, 15 Nov: 35 of 60 fps, 46% skipped).
         let index = st.stats.frames;
+        // The stream and the recording are one picture, drawn once, unless an item that shows
+        // differs between them; then each is drawn for its own audience.
+        let selective = selective(&st);
         let mut drawn: Vec<(Canvas, Result<PendingNv12, String>)> = Vec::new();
         for canvas in st.outputs.iter().map(|(.., c)| c).chain(st.taps.iter().map(|(_, c, _)| c)) {
+            let canvas = &view(canvas, selective);
             if !index.is_multiple_of(u64::from(canvas.every)) || drawn.iter().any(|(c, _)| c == canvas) {
                 continue;
             }
             let (w, h) = canvas.scaled_from.map_or((canvas.width, canvas.height), |(w, h, _)| (w, h));
-            let draw = match (what_to_draw(&st, w, h, canvas.scene.as_deref(), ts), canvas.scaled_from) {
+            let draw = match (what_to_draw(&st, w, h, canvas.scene.as_deref(), ts, canvas.audience), canvas.scaled_from)
+            {
                 (d, None) => d,
                 (Draw::Scene(s), Some((.., f))) => Draw::Scene(scaled(s, canvas.width, canvas.height, f)),
                 (Draw::Moving(mut t), Some((.., f))) => {
@@ -5458,13 +5583,13 @@ fn frame(
                 continue;
             }
             for &(w, h, _) in &canvas.video_tracks {
-                let c = canvas.track(w, h);
+                let c = view(&canvas.track(w, h), selective);
                 if drawn.iter().chain(extra.iter()).any(|(d, _)| *d == c) {
                     continue;
                 }
                 let (bw, bh) = c.scaled_from.map_or((w, h), |(bw, bh, _)| (bw, bh));
                 let f = c.scaled_from.map_or(Filter::Bicubic, |(.., f)| f);
-                let frame = match what_to_draw(&st, bw, bh, c.scene.as_deref(), ts) {
+                let frame = match what_to_draw(&st, bw, bh, c.scene.as_deref(), ts, c.audience) {
                     Draw::Scene(s) => gpu.begin_nv12(&scaled(s, w, h, f)),
                     Draw::Moving(mut t) => {
                         t.from = scaled(t.from, w, h, f);
@@ -5490,6 +5615,7 @@ fn frame(
             outputs: st.outputs.iter().map(|(id, ..)| *id).collect(),
             taps: st.taps.iter().map(|(id, ..)| *id).collect(),
             drawn,
+            selective,
         };
         st.in_flight.push_back(entry);
     } else {
@@ -6641,6 +6767,180 @@ mod tests {
         assert!(e.tap_frames(Canvas::scaled(e.config, 321, 180), sink(&got)).is_err());
         assert!(e.tap_frames(Canvas { every: 0, ..Canvas::main(e.config) }, sink(&got)).is_err());
         assert!(e.tap_frames(Canvas { scene: Some("Nope".into()), ..Canvas::main(e.config) }, sink(&got)).is_err());
+    }
+
+    /// Each item is for the stream, the recording or both; the editing views show everything.
+    #[test]
+    fn show_decides_who_sees_an_item() {
+        for (show, stream, recording) in
+            [(Show::Both, true, true), (Show::Stream, true, false), (Show::Recording, false, true)]
+        {
+            assert_eq!(show.shown_to(Audience::Stream), stream, "{show:?} on the stream");
+            assert_eq!(show.shown_to(Audience::Recording), recording, "{show:?} in the recording");
+            assert!(show.shown_to(Audience::Everyone), "{show:?} in the editor's views");
+        }
+        for (name, show) in [("both", Show::Both), ("stream", Show::Stream), ("recording", Show::Recording)] {
+            assert_eq!(Show::from_name(name), show);
+            assert_eq!(show.name(), name);
+        }
+        // Anything else is both: a collection from before this, or a typo, shows as it always did.
+        assert_eq!(Show::from_name(""), Show::Both);
+        assert_eq!(Show::from_name("Stream "), Show::Both);
+        assert_eq!(Show::default(), Show::Both);
+    }
+
+    /// What an output is for follows what it is: the stream's picture, or the recording's (the
+    /// replay buffer's clips are recordings).
+    #[test]
+    fn an_output_is_for_the_stream_or_the_recording() {
+        assert_eq!(audience_of(&OutputKind::Stream(Box::new(|_| {}))), Audience::Stream);
+        assert_eq!(audience_of(&OutputKind::Record(PathBuf::new())), Audience::Recording);
+        assert_eq!(audience_of(&OutputKind::Replay { seconds: 30, mb: 0 }), Audience::Recording);
+    }
+
+    /// While no item differs the stream and the recording are one picture, drawn once; once one
+    /// does they are two.
+    #[test]
+    fn nothing_is_drawn_twice_while_no_item_differs() {
+        let main = Canvas::main(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() });
+        let for_ = |audience| Canvas { audience, ..main.clone() };
+        let (stream, recording, everyone) =
+            (for_(Audience::Stream), for_(Audience::Recording), for_(Audience::Everyone));
+        assert_eq!(view(&stream, false), view(&recording, false));
+        assert_eq!(view(&stream, false), view(&everyone, false));
+        assert_ne!(view(&stream, true), view(&recording, true));
+        assert_ne!(view(&stream, true), view(&everyone, true), "the editor's views keep every item");
+        // Nothing else of a canvas is touched.
+        let sized = Canvas { width: 320, height: 180, every: 2, ..stream.clone() };
+        let v = view(&sized, false);
+        assert_eq!((v.width, v.height, v.every), (320, 180, 2));
+    }
+
+    /// The leaf pictures a built scene draws (a group's, inside it).
+    fn leaves(items: &[Item]) -> usize {
+        items
+            .iter()
+            .map(|i| match &i.content {
+                Content::Group { items, .. } => leaves(items),
+                Content::Scene(s) => leaves(&s.items),
+                _ => 1,
+            })
+            .sum()
+    }
+
+    /// A flag on a group covers the group as a whole, and a child keeps its own inside it.
+    #[test]
+    fn a_flag_on_a_group_covers_its_children() {
+        let Some(e) = engine() else { return };
+        for id in [1, 2, 3] {
+            e.set_source(id, SourceKind::Color { width: 160, height: 90, rgba: [255, 0, 0, 255] })
+                .unwrap_or_else(|x| panic!("{x}"));
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !(1..=3).all(|id| e.lock().sources.get(&id).is_some_and(|s| s.size.is_some())) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let shown = |show: Show, child: Show| {
+            let mut a = SceneItem::new(1, Placement::default());
+            let mut b = SceneItem::new(2, Placement::default());
+            b.show = child;
+            a.show = Show::Both;
+            e.set_scene("Inner", vec![a, b]);
+            let mut group = SceneItem::new(0, Placement::default());
+            group.scene = Some("Inner".into());
+            group.group = Some((640, 360));
+            group.show = show;
+            let mut other = SceneItem::new(3, Placement::default());
+            other.show = Show::Stream;
+            e.set_scene("Main", vec![group, other]);
+            let st = e.lock();
+            let n = |audience| leaves(&build(&st, 640, 360, Some("Main"), 0, audience).items);
+            (n(Audience::Stream), n(Audience::Recording), n(Audience::Everyone))
+        };
+        // A plain group: its children as they are (the second only in the recording), and the
+        // stream-only item beside it.
+        assert_eq!(shown(Show::Both, Show::Recording), (2, 2, 3));
+        // A recording-only group is gone from the stream whole, children and all.
+        assert_eq!(shown(Show::Recording, Show::Both), (1, 2, 3));
+        // A stream-only group is gone from the recording whole; the stream-only item with it.
+        assert_eq!(shown(Show::Stream, Show::Both), (3, 0, 3));
+        // Nothing flagged: everyone sees everything (the item beside it is still stream-only).
+        assert_eq!(shown(Show::Both, Show::Both), (3, 2, 3));
+    }
+
+    /// The picture at the middle of the canvas, as the stream's, the recording's and the editor's
+    /// views draw it: the luma of a white backdrop (high) or a black box over it (low).
+    fn middle_luma(e: &Engine, audience: Audience) -> u8 {
+        let got = Arc::new(Mutex::new(None::<u8>));
+        let sink = got.clone();
+        let (w, h) = (e.config.width as usize, e.config.height as usize);
+        let tap = e
+            .tap_frames(
+                Canvas { audience, ..Canvas::main(e.config) },
+                Box::new(move |f: &Nv12, _| {
+                    sink.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(f.y[h / 2 * w + w / 2]);
+                }),
+            )
+            .unwrap_or_else(|x| panic!("{x}"));
+        let until = Instant::now() + Duration::from_secs(5);
+        while got.lock().unwrap_or_else(|p| p.into_inner()).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        e.stop_tap(tap);
+        let luma = *got.lock().unwrap_or_else(|p| p.into_inner());
+        luma.expect("a picture drew")
+    }
+
+    /// The point of it: a box shown only in the recording is in the recording's picture and not
+    /// the stream's, and the reverse.
+    #[test]
+    fn the_recording_lacks_a_stream_only_item_and_the_stream_lacks_a_recording_only_one() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 160, height: 90, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let scene = |show: Show| {
+            let mut boxed = SceneItem::new(2, Placement { x: 240.0, y: 135.0, ..Placement::default() });
+            boxed.show = show;
+            e.set_scene("Main", vec![SceneItem::new(1, Placement::default()), boxed]);
+            assert!(e.go("Main").is_ok());
+        };
+        let (white, black) = (|l: u8| l > 200, |l: u8| l < 40);
+        scene(Show::Recording);
+        assert!(white(middle_luma(&e, Audience::Stream)), "the stream has no box");
+        assert!(black(middle_luma(&e, Audience::Recording)), "the recording has it");
+        assert!(black(middle_luma(&e, Audience::Everyone)), "the editor shows it");
+        scene(Show::Stream);
+        assert!(black(middle_luma(&e, Audience::Stream)), "the stream has the box");
+        assert!(white(middle_luma(&e, Audience::Recording)), "the recording has none");
+        assert!(black(middle_luma(&e, Audience::Everyone)));
+        scene(Show::Both);
+        assert!(black(middle_luma(&e, Audience::Stream)) && black(middle_luma(&e, Audience::Recording)));
+    }
+
+    /// A stream and a recording started on the engine take their pictures by what they are.
+    #[test]
+    fn outputs_are_started_for_what_they_are() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        assert!(e.go("Main").is_ok());
+        let dir = std::env::temp_dir().join(format!("ferrocast-audience-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|x| panic!("{x}"));
+        let rec = e.start_output(OutputKind::Record(dir.join("a.mp4")));
+        let stream = e.start_output(OutputKind::Stream(Box::new(|_| {})));
+        let both = rec.is_ok() && stream.is_ok();
+        let audiences: Vec<Audience> = e.lock().outputs.iter().map(|(.., c)| c.audience).collect();
+        for id in [rec, stream].into_iter().flatten() {
+            let _ = e.stop_output(id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // Where an encoder isn't there (a CI box) nothing started: nothing to check.
+        if both {
+            assert_eq!(audiences, [Audience::Recording, Audience::Stream]);
+        }
     }
 
     /// Broadcast timing: 29.97 and 59.94 (and 23.976) as fractions, and the frame times that go with them.
