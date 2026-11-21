@@ -235,7 +235,12 @@ fn source_has_audio(src: &Value) -> bool {
 }
 
 /// Updates any compressor filter on `source` whose `sidechain_source` names `from` to `to`.
+/// OBS's "none" means no ducking (the engine never keys by a source of that name), so a source
+/// called that, renamed, leaves it alone.
 fn rename_sidechain_refs(source: &mut Value, from: &str, to: &str) {
+    if from.trim().eq_ignore_ascii_case("none") {
+        return;
+    }
     for flt in source.get_mut("filters").and_then(Value::as_array_mut).into_iter().flatten() {
         if kind_of(flt) == "compressor_filter"
             && flt.pointer("/settings/sidechain_source").and_then(Value::as_str) == Some(from)
@@ -7019,6 +7024,19 @@ mod tests {
         assert_eq!(listed(&s), vec!["None", "Voice"], "no sound track, no key");
         ok(s.set_tracks("Silent clip", &[1]));
         assert_eq!(listed(&s), vec!["None", "Voice", "Silent clip"]);
+    }
+
+    /// A source called "none" renamed leaves every compressor's "none" (no ducking, the default)
+    /// alone: it turned all of them into ducking under the renamed source.
+    #[test]
+    fn renaming_a_source_called_none_leaves_no_ducking_alone() {
+        let s = stage();
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "none", &json!({ "local_file": "/n.mp3" }), false));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/a.mp3" }), false));
+        ok(s.add_filter("Music", "compressor_filter", "Duck", &json!({})));
+        assert_eq!(ok(s.filter_settings("Music", "Duck"))["sidechain_source"], json!("none"));
+        ok(s.rename("none", "Voice"));
+        assert_eq!(ok(s.filter_settings("Music", "Duck"))["sidechain_source"], json!("none"), "still no ducking");
     }
 
     #[test]
