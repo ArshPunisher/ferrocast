@@ -156,9 +156,19 @@ impl Engine {
     }
 
     pub(crate) async fn enqueue_alert(&self, alert: RenderedAlert, priority: i32, interrupt: bool) {
-        let speak = alert.tts_text.clone().map(|t| (alert.alert_id.clone(), t));
-        self.queue_op(move |q, t| q.enqueue_with(alert, priority, interrupt, t)).await;
+        let mut speak = alert.tts_text.clone().map(|t| (alert.alert_id.clone(), t));
+        let mut muted = false;
+        self.queue_op(|q, t| {
+            muted = q.is_muted();
+            q.enqueue_with(alert, priority, interrupt, t)
+        })
+        .await;
         self.inner.queue_changed.notify_one();
+        // Muted: nothing is read aloud, so nothing is synthesised (no Pro quota, no voice) and
+        // no viewer's words are held against the streamer's voice commands.
+        if muted {
+            speak = None;
+        }
         if let Some((alert_id, text)) = speak {
             // Read aloud: what it says can't be taken for the streamer's voice command.
             crate::studio::voice_commands::reading_aloud(&text, crate::now().0);
@@ -323,5 +333,25 @@ mod tts_cleanup_tests {
         // Clear waiting -> remaining waiting alerts' TTS deleted immediately.
         engine.queue_clear().await;
         assert!(repo::media::list(&store).unwrap().is_empty(), "cleared alerts' TTS deleted");
+    }
+
+    #[tokio::test]
+    async fn a_muted_alert_reads_nothing_aloud_and_blocks_no_voice_command() {
+        use crate::studio::voice_commands::{Command, from_a_viewer};
+        let dir = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn ferrocast_secrets::Secrets> = Arc::new(ferrocast_secrets::MemorySecrets::default());
+        let engine = Engine::start_with_secrets(dir.path(), secrets).await.unwrap();
+        let now = crate::now().0;
+        let mut quiet = sample_alert("m1", None);
+        quiet.tts_text = Some("back to the brb scene".into());
+        engine.queue_set_muted(true).await;
+        engine.enqueue_alert(quiet, 0, false).await;
+        assert!(!from_a_viewer(&Command::Brb, &[], now), "muted: the message was never read, so it holds nothing");
+        // Not muted: the line is read, so a command inside it must not be taken as the streamer's.
+        engine.queue_set_muted(false).await;
+        let mut loud = sample_alert("m2", None);
+        loud.tts_text = Some("stop recording please".into());
+        engine.enqueue_alert(loud, 0, false).await;
+        assert!(from_a_viewer(&Command::RecordOff, &[], now));
     }
 }
