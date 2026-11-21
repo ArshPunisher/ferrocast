@@ -33,6 +33,7 @@ pub(crate) enum Native {
 
 pub(crate) struct Item {
     pub id: &'static str,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub label: &'static str,
     /// Tauri's accelerator syntax ("CmdOrCtrl+,").
     pub accel: Option<&'static str>,

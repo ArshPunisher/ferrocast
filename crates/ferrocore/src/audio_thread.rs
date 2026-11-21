@@ -1541,7 +1541,9 @@ mod tests {
         }
 
         // Drain the channel over several ticks and collect every critical job emitted.
-        let (mut saw_build, mut saw_resampler, mut saw_spare, mut saw_feeder) = (0usize, 0usize, 0usize, 0usize);
+        let (mut saw_build, mut saw_resampler, mut saw_spare) = (0usize, 0usize, 0usize);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let mut saw_feeder = 0usize;
         for _ in 0..10 {
             while let Ok(job) = afx_rx.try_recv() {
                 match job {

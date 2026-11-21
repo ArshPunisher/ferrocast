@@ -4129,7 +4129,10 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         self.on_main(move |h| {
             h.projectors.clear();
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             save_projectors(h, &data);
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let _ = &data;
         })
         .await
     }
