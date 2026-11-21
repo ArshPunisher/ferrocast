@@ -1789,3 +1789,89 @@ async fn chat_shows_this_stream_not_the_last_one() {
     let ids: Vec<&str> = chat.as_array().unwrap().iter().filter_map(|e| e["source_id"].as_str()).collect();
     assert_eq!(ids, ["just now"]);
 }
+
+#[tokio::test]
+async fn diagnostics_routes_export_redacted_zip_and_enforce_validation() {
+    use std::io::Read;
+
+    let r = start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let logs = r._dir.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("ferrocast.log"),
+        "2026-11-22T03:30:00Z ERROR user=route@test.example ip=198.51.100.77 token=routeSecret999\n",
+    )
+    .unwrap();
+
+    // Unauthenticated denied
+    assert_eq!(
+        r.anonymous(reqwest::Method::GET, "/api/v1/diagnostics/preview").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Preview returns structured JSON with likely_causes right on it
+    let preview = r.get("/api/v1/diagnostics/preview").await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let pv: Value = preview.json().await.unwrap();
+    assert!(pv["likely_causes"].is_array());
+    assert!(pv["app"]["version"].is_string());
+    let pv_text = pv.to_string();
+    assert!(
+        !pv_text.contains("route@test.example")
+            && !pv_text.contains("198.51.100.77")
+            && !pv_text.contains("routeSecret999")
+    );
+
+    // Missing / invalid folder returns 400
+    let bad_dir = r.post("/api/v1/diagnostics/report", json!({ "folder": "/no/such/ferrocast-folder-xyz" })).await;
+    assert_eq!(error_code(bad_dir).await.0, StatusCode::BAD_REQUEST);
+
+    // Valid folder writes real zip archive
+    let created = r.post("/api/v1/diagnostics/report", json!({ "folder": folder.path().display().to_string() })).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let body: Value = created.json().await.unwrap();
+    assert_eq!(body["cancelled"], false);
+    let out_file = std::path::PathBuf::from(body["path"].as_str().unwrap());
+    assert!(out_file.is_file());
+    let mut arc = zip::ZipArchive::new(std::fs::File::open(&out_file).unwrap()).unwrap();
+    let mut summary = String::new();
+    arc.by_name("SUMMARY.txt").unwrap().read_to_string(&mut summary).unwrap();
+    assert!(summary.contains("=== LIKELY CAUSES ==="));
+
+    // Binary .zip endpoint also works for browsers
+    let zip_res = r.post("/api/v1/diagnostics/report.zip", json!({})).await;
+    assert_eq!(zip_res.status(), StatusCode::OK);
+    assert_eq!(zip_res.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("application/zip"));
+    let bytes = zip_res.bytes().await.unwrap();
+    let arc2 = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    assert!(arc2.len() >= 2);
+}
+
+#[tokio::test]
+async fn overlays_validate_new_label_options_and_reject_bad_train_settings() {
+    let r = start().await;
+    let created: Value =
+        r.post("/api/v1/overlays", json!({ "name": "Labels", "preset": "blank" })).await.json().await.unwrap();
+    let id = created["id"].as_str().unwrap();
+
+    let mut bad = created.clone();
+    bad["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "hype_train", "template": "{value}", "theme": "molten", "train_window_s": 2 }
+    }]);
+    let res_bad = r.put(&format!("/api/v1/overlays/{id}"), bad).await;
+    assert_eq!(error_code(res_bad).await.0, StatusCode::BAD_REQUEST);
+
+    let mut ok_ov = created.clone();
+    ok_ov["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "monthly_tips", "template": "Month: {value}", "theme": "molten", "timezone_offset_min": 330 }
+    }]);
+    let res_ok = r.put(&format!("/api/v1/overlays/{id}"), ok_ov).await;
+    assert_eq!(res_ok.status(), StatusCode::OK);
+}

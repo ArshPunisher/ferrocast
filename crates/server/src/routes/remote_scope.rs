@@ -124,6 +124,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/golive/destinations/*"),
     ("*", "/golive/test"),
     ("*", "/golive/networks"),
+    // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.
+    ("*", "/diagnostics"),
+    ("*", "/diagnostics/**"),
 ];
 
 /// One plain path segment: no `.`/`..`, no encoded `/`, `\`, `.` or NUL, nothing outside

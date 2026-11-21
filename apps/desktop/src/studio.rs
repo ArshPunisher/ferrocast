@@ -4049,6 +4049,39 @@ impl StudioHost for DesktopStudio {
         self.app.opener().reveal_item_in_dir(&file).map_err(|e| format!("The log folder didn't open: {e}"))
     }
 
+    async fn diagnostics_studio(&self) -> Option<Value> {
+        let data = self.data.clone();
+        self.on_main(move |h| {
+            let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+            let stats = h.collection.as_ref().map(|c| c.stats());
+            let encoders: Vec<Value> = ferrocast_studio::kinds::kinds()
+                .encoders
+                .into_iter()
+                .filter_map(|e| {
+                    let mut v = serde_json::to_value(&e).ok()?;
+                    if let Some(obj) = v.as_object_mut() {
+                        let hw = e.id != "obs_x264";
+                        obj.insert("hardware".into(), Value::Bool(hw));
+                    }
+                    Some(v)
+                })
+                .collect();
+            json!({
+                "studio_running": h.collection.is_some(),
+                "renderer": h.renderer,
+                "encoders": encoders,
+                "video_encoder": encode_of(&s).video_encoder,
+                "sample_rate": s.sample_rate,
+                "monitoring": s.monitoring.as_ref().map(|(n, _)| n.clone()),
+                "canvas": format!("{}x{}", s.width, s.height),
+                "fps": s.fps,
+                "stats": stats,
+            })
+        })
+        .await
+        .ok()
+    }
+
     async fn web_window(&self, name: String, url: String) -> Result<(), String> {
         use std::hash::{Hash, Hasher};
         // One window per page, so it keeps its place (the window-state plugin keys on this).

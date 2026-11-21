@@ -123,6 +123,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/golive/destinations/*"),
     ("*", "/golive/test"),
     ("*", "/golive/networks"),
+    // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.
+    ("*", "/diagnostics"),
+    ("*", "/diagnostics/**"),
 ];
 
 /// The dashboard API's routes with a variable part, for the audit log's action names:
