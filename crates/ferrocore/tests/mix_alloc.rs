@@ -129,4 +129,25 @@ fn a_steady_mix_allocates_nothing() {
     }
     let after = ALLOCATIONS.load(Ordering::SeqCst);
     assert_eq!(after - before, 0, "{} allocations in 1,000 steady blocks of three sources", after - before);
+
+    // M5: dragging/reordering effects via set_effects_nonblocking allocates 0 times on the mixer.
+    let mut bid = 1u64;
+    let mut next_id = || {
+        let cur = bid;
+        bid += 1;
+        cur
+    };
+    let fx_a = [AudioEffect::Gain { db: -1.0 }, AudioEffect::Eq3 { low_db: 1.0, mid_db: 0.0, high_db: 2.0 }];
+    let fx_b = [AudioEffect::Eq3 { low_db: 1.5, mid_db: -0.5, high_db: 2.5 }, AudioEffect::Gain { db: -3.0 }];
+    m.set(4, SourceSettings::default());
+    let (evicted, missing) = m.set_effects_nonblocking(4, &fx_a, &mut next_id, &|_, _| false);
+    assert!(evicted.is_empty() && missing.is_empty());
+    let before_fx = ALLOCATIONS.load(Ordering::SeqCst);
+    for round in 0..20 {
+        let fx = if round % 2 == 0 { &fx_b } else { &fx_a };
+        let (evicted, missing) = m.set_effects_nonblocking(4, fx, &mut next_id, &|_, _| false);
+        assert!(evicted.is_empty() && missing.is_empty());
+    }
+    let after_fx = ALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(after_fx - before_fx, 0, "effect retune/reorder allocated {} times", after_fx - before_fx);
 }

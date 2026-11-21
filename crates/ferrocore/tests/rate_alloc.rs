@@ -192,3 +192,27 @@ fn a_short_44k_sound_that_beats_its_resampler_keeps_its_start() {
     let expect = energy_in * f64::from(OUT) / f64::from(IN);
     assert!(energy_out > 0.92 * expect && energy_out < 1.08 * expect, "out {energy_out:.2} vs {expect:.2} expected");
 }
+
+#[test]
+fn a_mono_44k_source_held_over_half_second_allocates_nothing_on_release() {
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut m = Mixer::new(OUT, 40_000_000);
+    m.set_background_resamplers(true);
+    m.set(1, SourceSettings::default());
+    let t0 = 10_000_000_000u64;
+    let _ = m.mix_until(t0);
+    let mono = vec![0.25f32; 882]; // 20 ms mono at 44.1 kHz
+    // Pre-build the resampler outside the measured window.
+    let rs = Mixer::make_spare_resampler(IN, OUT).unwrap();
+    let before = ALLOCATIONS.load(Ordering::SeqCst);
+    for k in 0..45u64 {
+        m.push(1, &mono, 1, IN, t0 + k * 20_000_000);
+    }
+    let after_push = ALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(after_push - before, 0, "mono hold allocated during push");
+    m.add_spare_resampler(rs);
+    let before_rel = ALLOCATIONS.load(Ordering::SeqCst);
+    m.release_held();
+    let after_rel = ALLOCATIONS.load(Ordering::SeqCst);
+    assert_eq!(after_rel - before_rel, 0, "mono release_held allocated {} times", after_rel - before_rel);
+}
