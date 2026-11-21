@@ -20,6 +20,18 @@ pub struct Outline {
     pub handles: bool,
 }
 
+/// Diagonal stripes over the part of a source's box that lies outside the canvas, the way
+/// Streamlabs shows what won't be seen: a fill in `a`, bands of `b` over it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Overflow {
+    /// The fill (straight alpha, the view's gamma): the page's colour round the canvas.
+    pub a: [f32; 4],
+    /// The bands' colour, same encoding.
+    pub b: [f32; 4],
+    /// Distance between two bands' starts across the bands, in view pixels.
+    pub period: f32,
+}
+
 /// How the preview looks round and over the picture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreviewLook {
@@ -45,6 +57,8 @@ pub struct PreviewLook {
     /// a line from each side to the canvas edge with its length in canvas pixels. The view's
     /// pixels per point, so the labels read the same size on any screen; None draws none.
     pub guides: Option<f32>,
+    /// Stripes over what runs past the canvas, for every outlined source; None draws none.
+    pub overflow: Option<Overflow>,
 }
 
 impl Default for PreviewLook {
@@ -58,6 +72,7 @@ impl Default for PreviewLook {
             marks: None,
             shade: 0.0,
             guides: None,
+            overflow: None,
         }
     }
 }
@@ -502,11 +517,13 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
     let (vw, vh) = (size.0.max(1) as f32, size.1.max(1) as f32);
     let clip = |x: f32, y: f32| [x / vw * 2.0 - 1.0, 1.0 - y / vh * 2.0];
     let mut v: Vec<Vertex> = Vec::new();
-    let mut quad = |p: [(f32, f32); 4], uv: [(f32, f32); 4], color: [f32; 4], picture: bool| {
+    // `mode`: 0 a colour, 1 the canvas picture, 2 a colour only outside the canvas, and
+    // 3 + the period: stripes of the colour only outside the canvas (see preview.wgsl).
+    let mut quad = |p: [(f32, f32); 4], uv: [(f32, f32); 4], color: [f32; 4], mode: f32| {
         for i in [0, 1, 2, 0, 2, 3] {
             let [x, y] = clip(p[i].0, p[i].1);
             let [r, g, b, a] = color;
-            v.push([x, y, uv[i].0, uv[i].1, r, g, b, a, if picture { 1.0 } else { 0.0 }]);
+            v.push([x, y, uv[i].0, uv[i].1, r, g, b, a, mode]);
         }
     };
     let none = [(0.0, 0.0); 4];
@@ -515,10 +532,25 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
         [(ax, ay), (ax + aw, ay), (ax + aw, ay + ah), (ax, ay + ah)],
         [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
         [0.0; 4],
-        true,
+        1.0,
     );
     let scale = aw / canvas.0.max(1) as f32;
     let place = |(x, y): (f32, f32)| (ax + x * scale, ay + y * scale);
+    // What runs past the canvas, under the outlines: only boxes that leave it get a layer, and
+    // the shader keeps it to the part outside (each corner says where it is on the canvas).
+    if let Some(o) = look.overflow {
+        let (cw, ch) = (canvas.0 as f32, canvas.1 as f32);
+        for out in &look.outlines {
+            let leaves = out.corners.iter().any(|&(x, y)| x < 0.0 || y < 0.0 || x > cw || y > ch);
+            if !leaves {
+                continue;
+            }
+            let c = out.corners.map(place);
+            let uv = out.corners.map(|(x, y)| (x / cw, y / ch));
+            quad(c, uv, o.a, 2.0);
+            quad(c, uv, o.b, 3.0 + o.period.max(2.0));
+        }
+    }
     // Outlines (picked ones last, so they're on top), then their handles.
     let mut order: Vec<&Outline> = look.outlines.iter().filter(|o| !o.handles).collect();
     order.extend(look.outlines.iter().filter(|o| o.handles));
@@ -541,7 +573,7 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
                 ],
                 none,
                 o.color,
-                false,
+                0.0,
             );
         }
         if o.handles {
@@ -553,7 +585,7 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
                         [(x - side, y - side), (x + side, y - side), (x + side, y + side), (x - side, y + side)],
                         none,
                         o.color,
-                        false,
+                        0.0,
                     );
                 }
             }
@@ -566,16 +598,16 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
             let (a, b) = (place(from), place(to));
             let half = ppp.max(0.5) / 2.0;
             let (x0, x1, y0, y1) = (a.0.min(b.0) - half, a.0.max(b.0) + half, a.1.min(b.1) - half, a.1.max(b.1) + half);
-            quad([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], none, GUIDE, false);
+            quad([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], none, GUIDE, 0.0);
             let mid = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
             for (r, color) in label(&format!("{n}px"), mid, ppp) {
-                quad(r, none, color, false);
+                quad(r, none, color, 0.0);
             }
         }
     }
     if look.shade > 0.0 {
         let [r, g, b] = SHADE;
-        quad([(0.0, 0.0), (vw, 0.0), (vw, vh), (0.0, vh)], none, [r, g, b, look.shade.min(1.0)], false);
+        quad([(0.0, 0.0), (vw, 0.0), (vw, vh), (0.0, vh)], none, [r, g, b, look.shade.min(1.0)], 0.0);
     }
     v
 }
@@ -699,6 +731,74 @@ mod tests {
         let lit = |c: char| glyph(c).iter().map(|b| b.count_ones() as usize).sum::<usize>();
         assert_eq!(dots, lit('1') + lit('2') + lit('p') + lit('x'));
         assert!(glyph('?').iter().all(|b| *b == 0), "a character it can't draw is a space");
+    }
+
+    fn box_at(x0: f32, x1: f32) -> Outline {
+        Outline {
+            corners: [(x0, 20.0), (x1, 20.0), (x1, 70.0), (x0, 70.0)],
+            color: [0.0, 1.0, 0.0, 1.0],
+            width: 2.0,
+            handles: false,
+        }
+    }
+
+    #[test]
+    fn stripes_are_laid_only_over_boxes_that_leave_the_canvas() {
+        let stripes = Some(Overflow { a: [0.0, 0.0, 1.0, 1.0], b: [1.0, 1.0, 0.0, 1.0], period: 18.0 });
+        let mut look = PreviewLook { margin: 10.0, overflow: stripes, ..Default::default() };
+        let picture = |l: &PreviewLook| layout((200, 100), (160, 90), l);
+        let overflow_quads = |l: &PreviewLook| picture(l).iter().filter(|v| v[8] >= 2.0).count();
+        // Inside the canvas: nothing to stripe.
+        look.outlines = vec![box_at(40.0, 120.0)];
+        assert_eq!(overflow_quads(&look), 0);
+        // Hanging off the right edge: a fill and a stripe layer, a quad (6 vertices) each.
+        look.outlines = vec![box_at(100.0, 220.0)];
+        let v = picture(&look);
+        assert_eq!(v.iter().filter(|v| v[8] == 2.0).count(), 6, "the fill under the stripes");
+        assert_eq!(v.iter().filter(|v| v[8] == 21.0).count(), 6, "the stripes, 3 + the period");
+        // The corners carry canvas positions, so the shader can tell which side of the edge.
+        assert!(v.iter().filter(|v| v[8] >= 2.0).any(|v| v[2] > 1.0), "uv past the canvas's right edge");
+        // Not asked for: as before.
+        look.overflow = None;
+        assert_eq!(overflow_quads(&look), 0);
+    }
+
+    #[test]
+    fn the_part_of_a_box_outside_the_canvas_is_striped_in_the_two_colours() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let scene = Scene {
+            width: 160,
+            height: 90,
+            items: vec![Item::picture(Picture::solid(160, 90, [255, 0, 0, 255]), Placement::default())],
+        };
+        // A box from canvas x 100 to 220: 60 of it on the canvas, the rest past its right edge.
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        let yellow = [1.0, 1.0, 0.0, 1.0];
+        let look = PreviewLook {
+            background: [0.5, 0.5, 0.5, 1.0],
+            margin: 10.0,
+            outlines: vec![box_at(100.0, 220.0)],
+            overflow: Some(Overflow { a: blue, b: yellow, period: 18.0 }),
+            ..Default::default()
+        };
+        let px = gpu.render_preview(200, 100, Shown::Scene(&scene), &look).unwrap_or_else(|e| panic!("{e}"));
+        let at = |x: usize, y: usize| [px[(y * 200 + x) * 4], px[(y * 200 + x) * 4 + 1], px[(y * 200 + x) * 4 + 2]];
+        // The canvas fills 142x80 at (29, 10): its right edge is view x 171. Inside it, under the box:
+        // still the picture.
+        assert_eq!(at(150, 50), [255, 0, 0], "the canvas shows through");
+        // Past the edge, inside the box (to view x 200, the view's edge): both stripe colours.
+        let row: Vec<[u8; 3]> = (174..200).map(|x| at(x, 50)).collect();
+        assert!(row.contains(&[0, 0, 255]), "the first colour: {row:?}");
+        assert!(row.contains(&[255, 255, 0]), "the second colour: {row:?}");
+        assert!(row.iter().all(|p| *p == [0, 0, 255] || *p == [255, 255, 0]), "nothing else: {row:?}");
+        // Past the edge but outside the box (below its bottom): the plain surround.
+        let below = at(185, 95);
+        assert!(below.iter().all(|c| (127..=128).contains(c)), "background {below:?}");
+        // Without the stripes the same place is the surround.
+        let plain = gpu
+            .render_preview(200, 100, Shown::Scene(&scene), &PreviewLook { overflow: None, ..look.clone() })
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(plain[(50 * 200 + 185) * 4..(50 * 200 + 185) * 4 + 3].iter().all(|c| (127..=128).contains(c)));
     }
 
     #[test]
