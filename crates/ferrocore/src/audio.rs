@@ -490,10 +490,23 @@ mod tests {
         AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }
     }
 
+    /// Whether an AAC encoder can open here: a Mac always; elsewhere only with FFmpeg (a CI runner
+    /// has none, and these tests are about the thread, not the encoder).
+    fn aac_here() -> bool {
+        let ok = AudioEncoder::new(cfg()).is_ok();
+        if !ok {
+            eprintln!("no AAC encoder here (no FFmpeg): skipped");
+        }
+        ok
+    }
+
     /// On a thread of its own the encoder makes the same frames with the same times: what comes
     /// back is the same list, at the end (and `settle` hands over what is owed meanwhile).
     #[test]
     fn a_thread_makes_the_same_packets_with_the_same_times() {
+        if !aac_here() {
+            return;
+        }
         let blocks = tone(400);
         let mut here = AudioEncoder::new(cfg()).unwrap_or_else(|e| panic!("{e}"));
         let mut there = AudioEncoder::new(cfg()).and_then(AudioEncoder::off_thread).unwrap_or_else(|e| panic!("{e}"));
@@ -530,6 +543,9 @@ mod tests {
             let _ = e.flush();
             (total, worst)
         };
+        if !aac_here() {
+            return;
+        }
         let here = time(AudioEncoder::new(cfg()).unwrap_or_else(|e| panic!("{e}")));
         let there = time(AudioEncoder::new(cfg()).and_then(AudioEncoder::off_thread).unwrap_or_else(|e| panic!("{e}")));
         println!(
@@ -621,6 +637,9 @@ mod tests {
     /// A queue with no room keeps the sound (nothing is dropped, so no later time moves).
     #[test]
     fn a_full_queue_keeps_the_sound() {
+        if !aac_here() {
+            return;
+        }
         let mut here = AudioEncoder::new(cfg()).unwrap_or_else(|e| panic!("{e}"));
         let mut there = AudioEncoder::new(cfg()).and_then(AudioEncoder::off_thread).unwrap_or_else(|e| panic!("{e}"));
         // Far more blocks than the queue holds, given without ever taking time to let it drain.
