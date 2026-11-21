@@ -22,6 +22,11 @@ pub const MUTED_CALM_TICKS: u32 = 5;
 pub const OTHER_MIC_LOUD_DB: f32 = -40.0;
 /// Digital silence: a working mic's own noise is always above this; a dead device reads -100.
 pub const DEAD_DB: f32 = -90.0;
+/// A device that was reading digital silence is "back" only above this (a hardware-muted device
+/// floats around `DEAD_DB` with dither, so the edge itself must not decide).
+pub const HEARS_DB: f32 = -80.0;
+/// Ticks in a row above `HEARS_DB` that count as hearing it again.
+pub const HEARS_TICKS: u32 = 3;
 /// The least a mic must send nothing at all before saying so (the Show's `watch.mic_silent_s`
 /// says how long, and is never taken under this).
 pub const DEAD_S: i64 = 30;
@@ -88,7 +93,11 @@ pub(super) struct MicTrack {
     cleared_at: Option<i64>,
     /// Ticks in a row it was held shut by a push-to-talk or push-to-mute key.
     gated_run: u32,
+    /// When it first read digital silence in this stretch (readings between `DEAD_DB` and
+    /// `HEARS_DB` neither start nor end it).
     dead_since: Option<i64>,
+    /// Ticks in a row above `HEARS_DB`.
+    heard_run: u32,
     /// `(at, post-fader peak)` while it was on, last `QUIET_WINDOW_S`.
     window: VecDeque<(i64, f32)>,
 }
@@ -197,16 +206,26 @@ impl LiveWatch {
             }
             // A mic that sends nothing at all (for as long as the Show's setting says, at least
             // 30 s), unless another mic is carrying the voice.
-            let dead_wrong = if live && cfg.mic_silent_s > 0 && !m.listed && m.input_db <= DEAD_DB && !other {
-                let since = *t.dead_since.get_or_insert(s.at);
+            let dead_wrong = if live && cfg.mic_silent_s > 0 && !m.listed && !other {
+                // Hysteresis: it starts at `DEAD_DB` or lower, and only `HEARS_TICKS` ticks in a
+                // row above `HEARS_DB` end it, so dither around -90 neither blocks nor flaps it.
+                t.heard_run = if m.input_db > HEARS_DB { t.heard_run + 1 } else { 0 };
+                if m.input_db <= DEAD_DB {
+                    t.dead_since.get_or_insert(s.at);
+                }
+                if t.heard_run >= HEARS_TICKS {
+                    t.dead_since = None;
+                }
                 let dead_s = i64::from(cfg.mic_silent_s).max(DEAD_S);
-                ((s.at - since) / 1000 >= dead_s).then(|| {
+                let raised = self.raised.contains(&id_s);
+                t.dead_since.filter(|since| raised || (s.at - since) / 1000 >= dead_s).map(|_| {
                     LiveAlert::raised(&id_s, "error", format!("No sound from {name}.")).detail(
                         "It sends nothing at all: unplugged, switched off on the device, or taken by another app?",
                     )
                 })
             } else {
                 t.dead_since = None;
+                t.heard_run = 0;
                 None
             };
             self.flip(out, &id_s, dead_wrong, &format!("{name} hears you again."));
@@ -387,6 +406,8 @@ mod tests {
         assert!(a.is_empty(), "{a:?}");
         let a = feed(&mut w, &mut t, 6, |_| vec![mic(-100.0, -100.0, false)]);
         assert_eq!(ids(&a), [("mic:silent:KREO".to_string(), false)], "{a:?}");
+        // One loud tick is not enough; three in a row are.
+        assert!(feed(&mut w, &mut t, 4, |_| vec![mic(-60.0, -60.0, false)]).is_empty());
         let a = feed(&mut w, &mut t, 2, |_| vec![mic(-60.0, -60.0, false)]);
         assert_eq!(ids(&a), [("mic:silent:KREO".to_string(), true)]);
         // A muted dead mic is not "no sound": it's muted.
@@ -412,6 +433,37 @@ mod tests {
             t += 2000;
         }
         assert!(all.is_empty(), "20 s is under the least: {all:?}");
+    }
+
+    #[test]
+    fn a_floor_of_dither_around_minus_ninety_neither_blocks_nor_flaps_the_silent_notice() {
+        // A hardware-muted device: mostly -91, now and then -88 or -85 (above DEAD_DB, under
+        // HEARS_DB). It is said once after the setting and stays up, never cleared and re-raised.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let dither = |i: i64| {
+            let v = match i % 7 {
+                0 => -88.0,
+                3 => -85.0,
+                _ => -91.0 - (i % 3) as f32,
+            };
+            vec![mic(v, v, false)]
+        };
+        let a = feed(&mut w, &mut t, 200, dither);
+        assert_eq!(ids(&a), [("mic:silent:KREO".to_string(), false)], "said once, never cleared: {a:?}");
+        // Two loud ticks, then back to the floor: still up.
+        assert!(feed(&mut w, &mut t, 4, |_| vec![mic(-60.0, -60.0, false)]).is_empty());
+        assert!(feed(&mut w, &mut t, 60, dither).is_empty());
+        // A real return (3 ticks above -80) clears it.
+        let a = feed(&mut w, &mut t, 6, |_| vec![mic(-62.0, -62.0, false)]);
+        assert_eq!(ids(&a), [("mic:silent:KREO".to_string(), true)], "{a:?}");
+        // Spikes above -80 that are not three in a row do not restart the 120 s clock either.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let spiky = |i: i64| {
+            let v = if i % 4 == 0 { -70.0 } else { -92.0 };
+            vec![mic(v, v, false)]
+        };
+        let a = feed(&mut w, &mut t, 200, spiky);
+        assert_eq!(ids(&a), [("mic:silent:KREO".to_string(), false)], "{a:?}");
     }
 
     #[test]
