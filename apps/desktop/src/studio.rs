@@ -2565,7 +2565,8 @@ impl StudioHost for DesktopStudio {
 
             let capture_target = target.clone();
             let flag = cancel_flag.clone();
-            let image = tokio::task::spawn_blocking(move || {
+            let (image, problem) = tokio::task::spawn_blocking(move || {
+                let mut problem: Option<String> = None;
                 let pic = match capture_target {
                     StillTarget::Display(id, w) => {
                         ferrocore::screen_still_cancel(ferrocore::screen::Target::Display(id), w, &flag).ok()
@@ -2573,11 +2574,21 @@ impl StudioHost for DesktopStudio {
                     StillTarget::Window(id, w) => {
                         ferrocore::screen_still_cancel(ferrocore::screen::Target::Window(id), w, &flag).ok()
                     }
-                    StillTarget::Camera(id, w) => ferrocore::camera_still_cancel(&id, w, &flag).ok(),
+                    // A camera says why it gave nothing (permission off, in use): the page shows it.
+                    StillTarget::Camera(id, w) => match ferrocore::camera_still_cancel(&id, w, &flag) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                problem = Some(e.to_string());
+                            }
+                            None
+                        }
+                    },
                 };
-                pic.and_then(|p| {
+                let image = pic.and_then(|p| {
                     ferrocast_studio::jpeg_data_url(&p.rgba, p.width, p.height, p.premultiplied, "picker").ok()
-                })
+                });
+                (image, problem)
             })
             .await
             .map_err(|e| e.to_string())?;
@@ -2592,7 +2603,7 @@ impl StudioHost for DesktopStudio {
                 map.insert(target, (Instant::now(), img.clone()));
             }
             *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(image.clone());
-            return Ok(json!({ "image": image }));
+            return Ok(json!({ "image": image, "error": problem }));
         }
         // How a source is doing: its settings read on the main thread, a Browser source's
         // address tried off it (the app's web client, its time limit).
