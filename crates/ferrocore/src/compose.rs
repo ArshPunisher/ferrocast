@@ -273,6 +273,8 @@ pub struct Compositor {
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Mutex<HashMap<(Shader, Blend, bool), wgpu::RenderPipeline>>,
+    /// Textures kept for the filter chains.
+    pool: Arc<TexPool>,
     /// Alpha blends as libobs's Metal renderer does (see `blend_state`).
     metal_alpha: bool,
     pub(crate) bilinear: wgpu::Sampler,
@@ -318,7 +320,7 @@ enum Src<'a> {
     Pic(&'a Picture),
     /// An uploaded picture: its id, and whether it's premultiplied.
     Up(u64, bool),
-    Tex(Box<Target>),
+    Tex(Arc<Target>),
     Items(&'a [Item]),
 }
 
@@ -329,6 +331,86 @@ pub(crate) struct Target {
     pub(crate) gamma: wgpu::TextureView,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// The pool it goes back to when dropped (filter intermediates), if it came from one.
+    home: Option<Arc<TexPool>>,
+}
+
+type PooledTexture = (wgpu::Texture, wgpu::TextureView, wgpu::TextureView);
+
+/// Textures the filter chains draw into, kept between frames by size so each frame reuses
+/// them (a fresh texture for every filter of every item every frame was ~hundreds of
+/// allocations a second). Only plain render targets (no readback or copy usage), which a
+/// chain always clears before drawing.
+#[derive(Default)]
+struct TexPool {
+    free: Mutex<HashMap<(u32, u32), Vec<PooledTexture>>>,
+    /// Counters for `Compositor::texture_stats`.
+    created: std::sync::atomic::AtomicU64,
+    reused: std::sync::atomic::AtomicU64,
+    shared: std::sync::atomic::AtomicU64,
+    /// Measuring switches (default on): the pool, and one chain shared by identical items.
+    pool_off: std::sync::atomic::AtomicBool,
+    share_off: std::sync::atomic::AtomicBool,
+}
+
+impl std::fmt::Debug for TexPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TexPool")
+    }
+}
+
+/// Most textures kept for one size, and in all.
+const POOL_PER_SIZE: usize = 8;
+const POOL_TOTAL: usize = 48;
+
+impl Drop for Target {
+    fn drop(&mut self) {
+        let Some(pool) = self.home.take() else { return };
+        let mut free = pool.free.lock().unwrap_or_else(|e| e.into_inner());
+        let total: usize = free.values().map(Vec::len).sum();
+        if total >= POOL_TOTAL {
+            return;
+        }
+        let list = free.entry((self.width, self.height)).or_default();
+        if list.len() < POOL_PER_SIZE {
+            list.push((self.texture.clone(), self.linear.clone(), self.gamma.clone()));
+        }
+    }
+}
+
+/// What a frame's filter chains made, by what they were made from, so an item with the same
+/// picture and the same filters as another (copy-on-add gives a camera in two scenes identical
+/// lists) draws the first one's result. Per thread, cleared at the start and end of each render.
+struct ChainKey {
+    id: u64,
+    size: (u32, u32),
+    premultiplied: bool,
+    linear: bool,
+    effects: Vec<Effect>,
+}
+
+thread_local! {
+    static CHAINS: std::cell::RefCell<Vec<(ChainKey, Arc<Target>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Renders in progress on this thread (chains are kept only inside one, or they would go stale).
+    static SCOPES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Clears the thread's chain cache when made and when dropped (a render's start and end).
+struct ChainScope;
+
+impl ChainScope {
+    fn new() -> Self {
+        CHAINS.with(|c| c.borrow_mut().clear());
+        SCOPES.with(|n| n.set(n.get() + 1));
+        Self
+    }
+}
+
+impl Drop for ChainScope {
+    fn drop(&mut self) {
+        SCOPES.with(|n| n.set(n.get().saturating_sub(1)));
+        CHAINS.with(|c| c.borrow_mut().clear());
+    }
 }
 
 /// One quad to draw: where it goes and how.
@@ -629,6 +711,7 @@ impl Compositor {
             layout,
             pipeline_layout,
             pipelines: Mutex::new(HashMap::new()),
+            pool: Arc::default(),
             metal_alpha: cfg!(target_os = "macos"),
             bilinear,
             point,
@@ -716,6 +799,7 @@ impl Compositor {
     pub fn render(&self, scene: &Scene) -> Result<Vec<u8>, AvError> {
         check_size(scene.width, scene.height)?;
         self.validate(&scene.items)?;
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let target = self.target(scene.width, scene.height, wgpu::TextureUsages::COPY_SRC);
         self.clear(&mut enc, &target);
@@ -727,6 +811,7 @@ impl Compositor {
     pub fn render_transition(&self, tr: &Transition) -> Result<Vec<u8>, AvError> {
         let (w, h) = (tr.from.width, tr.from.height);
         check_size(w, h)?;
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let canvas = self.target(w, h, wgpu::TextureUsages::COPY_SRC);
         self.transition_into(&mut enc, &canvas, tr)?;
@@ -740,6 +825,7 @@ impl Compositor {
         if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(AvError::BadSize(w, h));
         }
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let rig = self.rig(w, h);
         self.clear(&mut enc, &rig.canvas);
@@ -915,7 +1001,47 @@ impl Compositor {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | extra,
             view_formats: &[LINEAR],
         });
-        Target { linear: view(&texture, LINEAR), gamma: view(&texture, GAMMA), texture, width, height }
+        Target { linear: view(&texture, LINEAR), gamma: view(&texture, GAMMA), texture, width, height, home: None }
+    }
+
+    /// A filter chain's texture: one kept from an earlier frame when there is one (not cleared:
+    /// the chain clears it before drawing), else a new one that comes back to the pool when dropped.
+    fn pooled_target(&self, width: u32, height: u32) -> Target {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.pool.pool_off.load(Relaxed) {
+            self.pool.created.fetch_add(1, Relaxed);
+            return self.target(width, height, wgpu::TextureUsages::empty());
+        }
+        let got = self.pool.free.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&(width, height)).and_then(Vec::pop);
+        match got {
+            Some((texture, linear, gamma)) => {
+                self.pool.reused.fetch_add(1, Relaxed);
+                Target { texture, linear, gamma, width, height, home: Some(self.pool.clone()) }
+            }
+            None => {
+                self.pool.created.fetch_add(1, Relaxed);
+                let mut t = self.target(width, height, wgpu::TextureUsages::empty());
+                t.home = Some(self.pool.clone());
+                t
+            }
+        }
+    }
+
+    /// (textures made new, reused from the pool, filter chains shared between items) since the
+    /// start: what the pool saves, for measuring.
+    #[doc(hidden)]
+    pub fn texture_stats(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.pool.created.load(Relaxed), self.pool.reused.load(Relaxed), self.pool.shared.load(Relaxed))
+    }
+
+    /// Switches the texture pool and the sharing of identical chains off (`true`), as they were
+    /// before: for measuring.
+    #[doc(hidden)]
+    pub fn set_filter_savings_off(&self, off: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.pool.pool_off.store(off, Relaxed);
+        self.pool.share_off.store(off, Relaxed);
     }
 
     pub(crate) fn clear(&self, enc: &mut wgpu::CommandEncoder, t: &Target) {
@@ -967,10 +1093,10 @@ impl Compositor {
         } else {
             // Ferrocast's filters run in gamma space (they aren't sRGB-aware), OBS's own in linear
             // light: the result mixes as the last one ran.
-            let t = self.apply_effects(enc, item)?;
+            let t = self.chain_for(enc, item)?;
             let (w, h) = (t.width, t.height);
             let linear = item.effects.last().is_some_and(Effect::linear);
-            (Src::Tex(Box::new(t)), w, h, linear)
+            (Src::Tex(t), w, h, linear)
         };
         if w == 0 || h == 0 {
             return Ok(());
@@ -1085,11 +1211,54 @@ impl Compositor {
         Ok(())
     }
 
+    /// An item's filter chain's result: the one an item with the same uploaded picture and the
+    /// same filters already made this render, else made now.
+    fn chain_for(&self, enc: &mut wgpu::CommandEncoder, item: &Item) -> Result<Arc<Target>, AvError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let key = match &item.content {
+            Content::Uploaded { id, width, height, premultiplied }
+                if !self.pool.share_off.load(Relaxed) && SCOPES.with(std::cell::Cell::get) > 0 =>
+            {
+                Some(ChainKey {
+                    id: *id,
+                    size: (*width, *height),
+                    premultiplied: *premultiplied,
+                    linear: item.linear,
+                    effects: item.effects.clone(),
+                })
+            }
+            _ => None,
+        };
+        if let Some(k) = &key {
+            let hit = CHAINS.with(|c| {
+                c.borrow()
+                    .iter()
+                    .find(|(o, _)| {
+                        o.id == k.id
+                            && o.size == k.size
+                            && o.premultiplied == k.premultiplied
+                            && o.linear == k.linear
+                            && o.effects == k.effects
+                    })
+                    .map(|(_, t)| t.clone())
+            });
+            if let Some(t) = hit {
+                self.pool.shared.fetch_add(1, Relaxed);
+                return Ok(t);
+            }
+        }
+        let t = Arc::new(self.apply_effects(enc, item)?);
+        if let Some(k) = key {
+            CHAINS.with(|c| c.borrow_mut().push((k, t.clone())));
+        }
+        Ok(t)
+    }
+
     /// Runs an item's filters (libobs's filter chain): its picture drawn raw into a texture, then
     /// each filter into the next, as big as it draws.
     fn apply_effects(&self, enc: &mut wgpu::CommandEncoder, item: &Item) -> Result<Target, AvError> {
         let (w, h) = item.content.size();
-        let mut cur = self.target(w.max(1), h.max(1), wgpu::TextureUsages::empty());
+        let mut cur = self.pooled_target(w.max(1), h.max(1));
         self.clear(enc, &cur);
         // The picture goes in as the first filter reads it: linear for OBS's, raw for ours.
         // Each filter runs in linear light (OBS's v2 kinds always; Ferrocast's own when the item
@@ -1156,7 +1325,7 @@ impl Compositor {
             let pad = e.pad();
             let (ow, oh) = e.out_size(cur.width, cur.height);
             check_size(ow, oh)?;
-            let next = self.target(ow, oh, wgpu::TextureUsages::empty());
+            let next = self.pooled_target(ow, oh);
             self.clear(enc, &next);
             let lin = in_linear(e);
             // A colour picked (straight sRGB) is mixed as the picture is: in linear light there.
@@ -1796,7 +1965,7 @@ impl Compositor {
         let done_at = self.submit(std::iter::once(enc.finish()));
         let mut ups = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
         if ups.get(&id).is_some_and(|u| u.pinned && u.width == w && u.height == h) {
-            ups.insert(id, Upload { texture: dst.texture, width: w, height: h, pinned: false });
+            ups.insert(id, Upload { texture: dst.texture.clone(), width: w, height: h, pinned: false });
         }
         drop(ups);
         drop(src_tex);
@@ -1876,6 +2045,7 @@ impl Compositor {
             return Err(AvError::BadSize(w, h));
         }
         self.validate(&scene.items)?;
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let rig = self.rig(w, h);
         self.clear(&mut enc, &rig.canvas);
@@ -2045,6 +2215,7 @@ impl Compositor {
             return Err(AvError::BadSize(w, h));
         }
         self.validate(&scene.items)?;
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let rig = self.rig(w, h);
         self.clear(&mut enc, &rig.canvas);
@@ -2059,6 +2230,7 @@ impl Compositor {
         if !w.is_multiple_of(2) || !h.is_multiple_of(2) {
             return Err(AvError::BadSize(w, h));
         }
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         let rig = self.rig(w, h);
         self.clear(&mut enc, &rig.canvas);
@@ -2122,6 +2294,7 @@ impl Compositor {
         drop(view);
         ready.store(false, Ordering::Release);
         buf.unmap();
+        let _chains = ChainScope::new();
         let mut enc = self.device.create_command_encoder(&Default::default());
         enc.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
