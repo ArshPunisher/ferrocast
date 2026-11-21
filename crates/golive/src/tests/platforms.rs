@@ -251,10 +251,17 @@ async fn a_platform_that_stops_reading_is_called_stalled_backs_off_and_spares_th
     // While it's stuck the good one keeps its pace: compare 3 s of frames inside the stall.
     tokio::time::sleep(Duration::from_secs(3)).await;
     let before = tally(&mut good_got).1;
+    let sent_before = sent.load(Ordering::Relaxed);
     tokio::time::sleep(Duration::from_secs(3)).await;
     let during = tally(&mut good_got).1;
-    // 100 a second were sent; the stuck destination mustn't have slowed the other.
-    assert!(during >= 200, "the good destination got {during} frames in 3 s, 300 were sent (before: {before})");
+    let sent_during = sent.load(Ordering::Relaxed) - sent_before;
+    // Against what was really sent (a 10 ms sleep is 15.6 ms on Windows: about 190 frames in 3 s,
+    // not 300): the stuck destination mustn't have slowed the other.
+    assert!(sent_during >= 100, "the stream kept going: {sent_during} frames in 3 s");
+    assert!(
+        u64::from(during) * 3 >= sent_during * 2,
+        "the good destination got {during} frames in 3 s, {sent_during} were sent (before: {before})"
+    );
     assert_eq!(good.borrow().state, PushState::Live);
     assert_eq!(good.borrow().since_ms, good_since, "the good one was never reconnected");
     assert_eq!(good.borrow().dropped, 0, "nothing of the good one was skipped");
