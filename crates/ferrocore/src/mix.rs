@@ -7,7 +7,7 @@
 //! The caller drives the clock: `mix_until(now)` makes every block that ends `latency` before
 //! `now`, so sound that arrives a little late still makes its block.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::afx::{AudioEffect, AudioFilter};
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
@@ -59,6 +59,9 @@ const SHRINK_AFTER_NS: u64 = 20_000_000_000;
 const MAX_QUEUE_SECS: usize = 5;
 /// Input frames the resampler takes at a time.
 const RESAMPLE_CHUNK: usize = 480;
+
+/// Frames of room in a source's drift tail: half a second at 48 kHz.
+const TAIL_ROOM: usize = 24_000;
 
 /// Whether a source is heard here (OBS's Audio Monitoring).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -370,7 +373,8 @@ impl Default for DriftTrack {
             phase_err_ns: 0.0,
             ratio: 1.0,
             follows: false,
-            tail: [Vec::new(), Vec::new()],
+            // Room for a long piece after a stall (it is trimmed to RESAMPLE_CHUNK after each).
+            tail: [Vec::with_capacity(TAIL_ROOM), Vec::with_capacity(TAIL_ROOM)],
         }
     }
 }
@@ -566,7 +570,14 @@ pub struct Mixer {
     /// The latest any sound came since `window_ns` (ns after its time), and when that began.
     worst_late_ns: u64,
     window_ns: Option<u64>,
-    sources: BTreeMap<u64, Source>,
+    sources: crate::rt::PreMap<Box<Source>>,
+    /// Entries made ahead for sources that appear.
+    spares: Vec<SpareSource>,
+    /// Spares used since asked for.
+    spares_wanted: usize,
+    /// Entries of removed sources, waiting to be dropped elsewhere.
+    #[allow(clippy::vec_box)] // boxed as they were in the map: moving one out must not allocate
+    retired: Vec<Box<Source>>,
     /// The next block's start; set by the first `mix_until`.
     next_ns: Option<u64>,
     /// Listeners to one source's sound (captions), by source; gone when their tap is dropped.
@@ -632,6 +643,32 @@ struct PlanScratch {
     prev_broken: Vec<(u64, u64)>,
     slot_by_node: Vec<Option<usize>>,
     topo: TopoScratch,
+}
+
+impl PlanScratch {
+    /// Room for this many sources, so adding one doesn't allocate.
+    fn with_room() -> Self {
+        let n = crate::rt::PreMap::<Box<Source>>::ROOM;
+        Self {
+            nodes: Vec::with_capacity(n),
+            deps: Vec::with_capacity(n),
+            prev_broken: Vec::with_capacity(16),
+            slot_by_node: Vec::with_capacity(n),
+            topo: TopoScratch::with_room(n),
+        }
+    }
+}
+
+impl TopoScratch {
+    fn with_room(n: usize) -> Self {
+        Self {
+            in_deg: Vec::with_capacity(n),
+            placed: Vec::with_capacity(n),
+            edges: Vec::with_capacity(n),
+            visit_step: Vec::with_capacity(n),
+            path: Vec::with_capacity(n),
+        }
+    }
 }
 
 /// Resolves a deterministic topological processing order (dependencies before dependents) over
@@ -762,6 +799,19 @@ struct Scratch {
 /// How many given-back blocks are kept (the most a mix ahead of its reader needs, a second's).
 const MAX_POOL: usize = 64;
 
+/// Source entries kept made ahead, and removed ones kept for dropping elsewhere.
+const SPARES: usize = 4;
+const RETIRED_ROOM: usize = 16;
+
+/// A source's mixer entry made ahead of the source (see [`Mixer::make_spare`]).
+pub struct SpareSource(Box<Source>);
+
+impl std::fmt::Debug for SpareSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpareSource")
+    }
+}
+
 /// Blocks made when the mixer is (a mix in steady state needs a dozen or so in flight).
 const PREFILL_POOL: usize = 32;
 
@@ -884,7 +934,10 @@ impl Mixer {
             mixed_with_ns: latency_ns,
             worst_late_ns: 0,
             window_ns: None,
-            sources: BTreeMap::new(),
+            sources: crate::rt::PreMap::new(),
+            spares: (0..SPARES).map(|_| SpareSource(Self::fresh_source(rate))).collect(),
+            spares_wanted: 0,
+            retired: Vec::with_capacity(RETIRED_ROOM),
             next_ns: None,
             taps: Vec::new(),
             ducker: None,
@@ -895,17 +948,18 @@ impl Mixer {
             usual_floor_ns: latency_ns,
             monitor_device: None,
             scratch: Scratch {
-                l: Vec::with_capacity(RESAMPLE_CHUNK * 4),
-                r: Vec::with_capacity(RESAMPLE_CHUNK * 4),
+                // A second of frames: silence filled in after a stall mustn't grow them mid-mix.
+                l: Vec::with_capacity(rate as usize),
+                r: Vec::with_capacity(rate as usize),
                 buf: Vec::with_capacity(BLOCK * 2),
                 fl: Vec::with_capacity(BLOCK),
                 fr: Vec::with_capacity(BLOCK),
                 bbuf: Vec::with_capacity(BLOCK * 2),
             },
-            mix_order: Vec::new(),
+            mix_order: Vec::with_capacity(crate::rt::PreMap::<Box<Source>>::ROOM),
             key_bufs: Vec::new(),
             broken_cycles: Vec::new(),
-            plan_scratch: PlanScratch::default(),
+            plan_scratch: PlanScratch::with_room(),
             // Made now, not on the first blocks: a block the pool lacks is allocated mid-mix.
             pool: Self::prefilled_pool(),
             allocated: 0,
@@ -1159,46 +1213,78 @@ impl Mixer {
         }
     }
 
+    /// A source's mixer entry, new (what `set` makes when none was made ahead).
+    fn fresh_source(rate: u32) -> Box<Source> {
+        let settings = SourceSettings::default();
+        Box::new(Source {
+            settings,
+            output_capture: None,
+            active: true,
+            // Room for a second of stereo: a stall that lets sound pile up must not grow it
+            // mid-mix (the mixer's cap on waiting is a second).
+            queue: VecDeque::with_capacity(rate as usize * 2),
+            start_ns: None,
+            resampler: None,
+            filters: Vec::new(),
+            key_routes: Vec::new(),
+            key_slot: None,
+            last_post_filter: [0.0; 2],
+            filter_declick: false,
+            gain_applied: None,
+            ptt_down: false,
+            ptm_down: false,
+            ptt_hold: 0,
+            ptm_hold: 0,
+            gated: false,
+            levels: Levels::default(),
+            recent: VecDeque::with_capacity(METER_BLOCKS + 1),
+            tp: [[0.0; TP_TAPS]; 2],
+            adjust_ns: 0,
+            offset_ns: None,
+            drift: DriftTrack::default(),
+            bypass: VecDeque::new(),
+            bypass_pure: 0,
+            bypass_done: 0,
+            bypass_owed: 0,
+            ease_owed: 0,
+        })
+    }
+
+    /// A source entry made ahead, to be handed to [`Mixer::add_spare`]: building one allocates,
+    /// so the audio thread asks for it ([`Mixer::take_spare_request`]) and a background thread
+    /// makes it.
+    pub fn make_spare(rate: u32) -> SpareSource {
+        SpareSource(Self::fresh_source(rate))
+    }
+
+    /// Keeps a spare entry for the next source that appears.
+    pub fn add_spare(&mut self, s: SpareSource) {
+        if self.spares.len() < SPARES {
+            self.spares.push(s);
+        }
+    }
+
+    /// How many spares to make to replace the ones used since the last call.
+    pub fn take_spare_request(&mut self) -> usize {
+        std::mem::take(&mut self.spares_wanted)
+    }
+
+    /// An entry a removed source left, to be dropped off the audio thread (its buffers free
+    /// there otherwise).
+    pub fn pop_retired(&mut self) -> Option<SpareSource> {
+        self.retired.pop().map(SpareSource)
+    }
+
     /// Adds a source (or changes its settings).
     pub fn set(&mut self, id: u64, settings: SourceSettings) {
         match self.sources.get_mut(&id) {
             Some(s) => s.settings = settings,
             None => {
-                self.sources.insert(
-                    id,
-                    Source {
-                        settings,
-                        output_capture: None,
-                        active: true,
-                        // Room for a second of stereo: a stall that lets sound pile up must not grow it
-                        // mid-mix (the mixer's cap on waiting is a second).
-                        queue: VecDeque::with_capacity(self.rate as usize * 2),
-                        start_ns: None,
-                        resampler: None,
-                        filters: Vec::new(),
-                        key_routes: Vec::new(),
-                        key_slot: None,
-                        last_post_filter: [0.0; 2],
-                        filter_declick: false,
-                        gain_applied: None,
-                        ptt_down: false,
-                        ptm_down: false,
-                        ptt_hold: 0,
-                        ptm_hold: 0,
-                        gated: false,
-                        levels: Levels::default(),
-                        recent: VecDeque::with_capacity(METER_BLOCKS + 1),
-                        tp: [[0.0; TP_TAPS]; 2],
-                        adjust_ns: 0,
-                        offset_ns: None,
-                        drift: DriftTrack::default(),
-                        bypass: VecDeque::new(),
-                        bypass_pure: 0,
-                        bypass_done: 0,
-                        bypass_owed: 0,
-                        ease_owed: 0,
-                    },
-                );
+                // A source made ahead (off the audio thread) when there is one.
+                let mut src = self.spares.pop().map_or_else(|| Self::fresh_source(self.rate), |s| s.0);
+                src.settings = settings;
+                self.sources.insert(id, src);
+                self.spares_wanted += 1;
                 self.rebuild_mix_plan();
             }
         }
@@ -1477,7 +1563,14 @@ impl Mixer {
 
     pub fn remove(&mut self, id: u64) -> Option<Vec<AudioFilter>> {
         self.taps.retain(|(tid, t)| *tid != id && t.strong_count() > 0);
-        let removed = self.sources.remove(&id).map(|s| s.filters);
+        let removed = self.sources.remove(&id).map(|mut s| {
+            let filters = std::mem::take(&mut s.filters);
+            // Kept (room is made ahead) for the caller to drop elsewhere; if full, dropped here.
+            if self.retired.len() < RETIRED_ROOM {
+                self.retired.push(s);
+            }
+            filters
+        });
         if removed.is_some() {
             self.rebuild_mix_plan();
         }
@@ -1785,7 +1878,8 @@ impl Mixer {
             if src.resampler.as_ref().is_none_or(|rs| rs.in_rate != rate) {
                 let made = if rate == out_rate && !switched_rate && src.drift.tail[0].len() >= RESAMPLE_CHUNK {
                     let rs = SourceResampler::new_warm(rate, out_rate, &src.drift.tail, &mut src.queue);
-                    src.drift.tail = [Vec::new(), Vec::new()];
+                    src.drift.tail[0].clear();
+                    src.drift.tail[1].clear();
                     rs
                 } else {
                     SourceResampler::new_cold(rate, out_rate)
