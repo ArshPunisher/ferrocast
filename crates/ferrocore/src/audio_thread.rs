@@ -48,6 +48,8 @@ struct ToneState {
 pub enum AudioCmd {
     /// A source entry made ahead (see `AfxJob::MakeSpare`).
     Spare(crate::mix::SpareSource),
+    /// Sound at this input rate is coming: have a resampler made.
+    WantResampler(u32),
     /// A resampler made ahead (see `AfxJob::MakeResampler`).
     SpareResampler(crate::mix::SpareResampler),
     EnsureSource {
@@ -120,6 +122,7 @@ impl std::fmt::Debug for AudioCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spare(_) => f.write_str("Spare"),
+            Self::WantResampler(r) => f.debug_tuple("WantResampler").field(r).finish(),
             Self::SpareResampler(_) => f.write_str("SpareResampler"),
             Self::EnsureSource { id, .. } => f.debug_struct("EnsureSource").field("id", id).finish(),
             Self::RemoveSource(id) => f.debug_tuple("RemoveSource").field(id).finish(),
@@ -501,6 +504,7 @@ impl<C: AudioClock> AudioRunner<C> {
     fn handle_cmd(&mut self, cmd: AudioCmd) {
         match cmd {
             AudioCmd::Spare(s) => self.mixer.add_spare(s),
+            AudioCmd::WantResampler(r) => self.mixer.want_resampler(r),
             AudioCmd::SpareResampler(r) => self.mixer.add_spare_resampler(r),
             AudioCmd::EnsureSource { id, levels } => {
                 self.pending_removals.remove(&id);
@@ -670,6 +674,7 @@ impl<C: AudioClock> AudioRunner<C> {
         while let Some(rs) = self.mixer.pop_retired_resampler() {
             self.drop_elsewhere(AfxJob::DropResampler(rs));
         }
+        self.mixer.release_held();
         let out_rate = self.mixer.resampler_out_rate();
         while let Some(in_rate) = self.mixer.pop_resampler_request() {
             self.drop_elsewhere(AfxJob::MakeResampler { in_rate, out_rate });

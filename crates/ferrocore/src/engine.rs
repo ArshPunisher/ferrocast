@@ -1271,6 +1271,9 @@ fn forward_audio(
     let prod = slot.get_or_insert_with(|| {
         let (p, c) = SpscAudioRing::for_seconds(FRAME_RING_SECONDS, 48_000, 2, FRAME_RING_PIECE_FRAMES);
         let _ = audio_cmd.send(AudioCmd::AttachRing { id, consumer: c });
+        // Its rate is known now: a resampler (if it isn't the mix's rate) is made before the
+        // sound is taken in.
+        let _ = audio_cmd.send(AudioCmd::WantResampler(rate));
         p
     });
     let max_samples = MAX_RING_CHUNK_FRAMES * channels;

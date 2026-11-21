@@ -528,6 +528,13 @@ struct Source {
     /// bypass (`bypass_owed`), then a few more go to both (`ease_owed`, the overlap to ease over).
     bypass_owed: usize,
     ease_owed: usize,
+    /// Sound of another rate that came before its resampler did, as it came (interleaved, at
+    /// `hold_rate`, `hold_ch` channels, the first piece stamped `hold_ts`): run through the
+    /// resampler when it is here, so the sound starts complete.
+    hold: Vec<f32>,
+    hold_ts: u64,
+    hold_rate: u32,
+    hold_ch: usize,
 }
 
 /// The longest filter delay a dry bypass covers (frames); the strong noise removal holds 3968.
@@ -842,6 +849,9 @@ const KEY_BUFS_AHEAD: usize = 4;
 
 /// Resamplers kept made ahead (same rate in and out: what following a clock's drift uses), and
 /// used ones kept for dropping elsewhere.
+/// Samples a source can hold while its resampler is made (half a second of stereo at 48 kHz).
+const HOLD_ROOM: usize = 48_000;
+
 const RS_SPARES: usize = 2;
 /// Room for resamplers made ahead (same rate and others a source asked for).
 const RS_SPARES_ROOM: usize = 8;
@@ -1313,6 +1323,10 @@ impl Mixer {
             bypass_done: 0,
             bypass_owed: 0,
             ease_owed: 0,
+            hold: Vec::with_capacity(HOLD_ROOM),
+            hold_ts: 0,
+            hold_rate: 0,
+            hold_ch: 0,
         })
     }
 
@@ -1356,6 +1370,75 @@ impl Mixer {
 
     pub fn resampler_out_rate(&self) -> u32 {
         self.rate
+    }
+
+    /// Whether a resampler for sound at `rate` is ready for source `id` (it has one, or one
+    /// made ahead waits).
+    fn resampler_ready(&self, id: u64, rate: u32) -> bool {
+        self.sources.get(&id).is_some_and(|s| s.resampler.as_ref().is_some_and(|r| r.in_rate == rate))
+            || self.rs_spares.iter().any(|s| s.0.in_rate == rate && s.0.out_rate == self.rate)
+    }
+
+    /// Asks (once) for a resampler for sound at `in_rate`.
+    pub fn want_resampler(&mut self, in_rate: u32) {
+        if self.async_resamplers
+            && in_rate != self.rate
+            && in_rate != 0
+            && !self.rs_spares.iter().any(|s| s.0.in_rate == in_rate && s.0.out_rate == self.rate)
+            && !self.rs_pending.contains(&in_rate)
+            && self.rs_wanted.len() < RS_SPARES_ROOM
+        {
+            self.rs_pending.push(in_rate);
+            self.rs_wanted.push(in_rate);
+        }
+    }
+
+    /// True when `pcm` was held (not pushed now): it's another rate and no resampler for it is
+    /// ready, or earlier sound of the source is still held (order is kept).
+    fn hold_for_resampler(&mut self, id: u64, pcm: &[f32], channels: usize, rate: u32, ts_ns: u64) -> bool {
+        let out_rate = self.rate;
+        let still = self.sources.get(&id).is_some_and(|s| !s.hold.is_empty());
+        if !still && (rate == out_rate || self.resampler_ready(id, rate)) {
+            return false;
+        }
+        if rate != out_rate && !still {
+            self.want_resampler(rate);
+        }
+        let Some(src) = self.sources.get_mut(&id) else { return false };
+        if src.hold.is_empty() {
+            (src.hold_ts, src.hold_rate, src.hold_ch) = (ts_ns, rate, channels);
+        }
+        // Same format as what is held and room for it (else it is lost: never grown).
+        if src.hold_rate == rate && src.hold_ch == channels && src.hold.len() + pcm.len() <= HOLD_ROOM {
+            src.hold.extend_from_slice(pcm);
+        }
+        true
+    }
+
+    fn release_held_one(&mut self, id: u64) {
+        let Some(src) = self.sources.get_mut(&id) else { return };
+        let (held, ts, rate, ch) = (std::mem::take(&mut src.hold), src.hold_ts, src.hold_rate, src.hold_ch);
+        self.push(id, &held, ch, rate, ts);
+        // Kept for next time (with its room), unless the push held it again (then it is the
+        // source's own and this one is dropped).
+        if let Some(src) = self.sources.get_mut(&id)
+            && src.hold.is_empty()
+        {
+            src.hold = held;
+            src.hold.clear();
+        }
+    }
+
+    /// Runs held sound through the resamplers that have arrived (after commands are handled).
+    pub fn release_held(&mut self) {
+        loop {
+            let due = self
+                .sources
+                .iter()
+                .find_map(|(&id, s)| (!s.hold.is_empty() && self.resampler_ready(id, s.hold_rate)).then_some(id));
+            let Some(id) = due else { break };
+            self.release_held_one(id);
+        }
     }
 
     /// A resampler a source left, to be dropped off the audio thread.
@@ -1752,6 +1835,14 @@ impl Mixer {
     /// A source's sound: `channels` interleaved (1 or 2; more are folded to their first two) at
     /// `rate`, its first frame at `ts_ns`. Unknown sources are ignored.
     pub fn push(&mut self, id: u64, pcm: &[f32], channels: usize, rate: u32, ts_ns: u64) {
+        // Earlier sound held for its resampler goes first, once that is here.
+        if self.async_resamplers
+            && let Some(s) = self.sources.get(&id)
+            && !s.hold.is_empty()
+            && self.resampler_ready(id, s.hold_rate)
+        {
+            self.release_held_one(id);
+        }
         // The planar copy lives in buffers kept between pushes (taken out, so the rest of
         // `self` can be borrowed meanwhile): a steady source allocates nothing.
         let (mut l, mut r) = (std::mem::take(&mut self.scratch.l), std::mem::take(&mut self.scratch.r));
@@ -1773,6 +1864,11 @@ impl Mixer {
     ) {
         let out_rate = self.rate;
         if channels == 0 || rate == 0 || pcm.is_empty() {
+            return;
+        }
+        // Another rate with its resampler not here yet: the sound is held as it came, and run
+        // through when the resampler arrives (see `release_held`), so it starts complete.
+        if self.async_resamplers && self.hold_for_resampler(id, pcm, channels, rate, ts_ns) {
             return;
         }
         // A filter that holds sound back just went on and the queue didn't hold all of the dry
