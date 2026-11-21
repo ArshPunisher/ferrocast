@@ -186,8 +186,12 @@ fn drop_plain_credentials(input: &str, parsed: &mut Vec<(String, String)>) -> bo
                     !CREDENTIAL_HEADERS.iter().any(|c| name.eq_ignore_ascii_case(c))
                 })
                 .collect();
+            // One typed line holds several headers when they're joined by escapes (OBS's field is
+            // one line): a credential name left anywhere in it takes the whole option out.
+            let lower = kept.to_ascii_lowercase();
+            let hidden = CREDENTIAL_HEADERS.iter().any(|c| lower.contains(&format!("{c}:")));
             *v = kept;
-            !v.trim().is_empty()
+            !hidden && !v.trim().is_empty()
         }
         _ => true,
     });
@@ -731,6 +735,16 @@ mod tests {
         )
         .unwrap_or_default();
         assert!(!only.iter().any(|a| a == "-headers"), "{only:?}");
+        // Typed as one line with escapes (OBS's field is one line): no real line breaks, the
+        // credential inside another header's text. Not sent either.
+        for typed in
+            [r#"headers="X-Room: 7\r\nAuthorization: Bearer s3cret""#, r#"headers='X-Room: 7\r\nCookie: sid=s3cret'"#]
+        {
+            let a = args(&json!({ "input": "http://x/a", "ffmpeg_options": typed }), "", BOTH, true, DEFAULT_TIMEOUT)
+                .unwrap_or_default()
+                .join(" ");
+            assert!(!a.contains("s3cret"), "{typed}: {a}");
+        }
     }
 
     /// A source's own hardware decoder (`hwaccel` in its FFmpeg options) is used only when
