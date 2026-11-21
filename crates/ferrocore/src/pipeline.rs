@@ -1626,8 +1626,8 @@ mod cut_tests {
 
     #[test]
     fn recording_pause_with_bframes_never_orphans_bframes_or_moves_dts_backwards() {
-        // Mini-GOP (P=3.067s, B=3.000s, B=3.033s) straddling a pause cut at from=3.033s+1,
-        // followed by a resume keyframe at pts=5.000s, dts=4.900s.
+        // Mini-GOP (P=base+66.7ms, B=base, B=base+33.3ms) straddling a pause cut at
+        // from=base+33.3ms+1, followed by a resume keyframe at pts=base+2s, dts=base+1.9s.
         let pipe = super::Pipeline::new(
             crate::video::VideoConfig {
                 codec: crate::video::VideoCodec::H264,
@@ -1653,48 +1653,80 @@ mod cut_tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("cut.mp4");
         pipe.start_recording(&path).unwrap_or_else(|e| panic!("{e}"));
-        // Satisfy video/audio headers cleanly using a dummy avcC via feed? Easier: run real VT
-        // or inspect written packets directly via cut_step + rec_last_dts_us!
-        // First write pre-pause frames (up to pts=2.967s) via real VT or direct record_video if header exists:
+
+        // Feed frames until the async encoder has produced its codec header and written at least
+        // one keyframe into `Recording::On` (bounded condition wait; never assume a fixed count).
         let (y, uv) = (vec![90u8; 64 * 64], vec![128u8; 64 * 32]);
-        for i in 0..89u64 {
+        let frame = crate::video::Frame::Nv12 { y: &y, y_stride: 64, uv: &uv, uv_stride: 64 };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut i = 0u64;
+        loop {
             let ts = i * 33_333_333;
-            let _ = pipe.video(crate::video::Frame::Nv12 { y: &y, y_stride: 64, uv: &uv, uv_stride: 64 }, ts);
+            i += 1;
+            pipe.video(frame, ts).unwrap_or_else(|e| panic!("{e}"));
+            assert!(!pipe.recording_failed(), "recording failed during startup: {:?}", pipe.recording_problem());
+            if pipe.video.header().is_some()
+                && pipe.rec_last_dts_us.is_some()
+                && matches!(pipe.recording, Some(super::Recording::On(_)))
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!(
+                    "encoder did not start recording before pause within 5s (header={}, dts={:?})",
+                    pipe.video.header().is_some(),
+                    pipe.rec_last_dts_us,
+                );
+            }
+            let wait_ms = if i < 10 { 2 } else { 10 };
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms));
         }
-        // Force header presence and pause at last_in_us=3_033_333 -> from=3_033_334.
-        pipe.last_in_us = 3_033_333;
-        pipe.pause_recording(true);
-        // Simulate decode-order packets arriving from the encoder across the pause cut:
-        // P(pts=3_066_667, dts=2_966_667) arrives FIRST, followed by B(3_000_000) and B(3_033_333).
-        // Marker byte in data[4] identifies each frame.
-        let pkt = |pts: i64, dts: i64, key: bool, tag: u8| super::VideoPacket {
-            pts_us: pts,
-            dts_us: dts,
-            key,
-            data: vec![0, 0, 0, 1, tag, 0, 0, 0],
-        };
-        // Wait: instead of hitting real VT header check, inspect recording via a second test with
-        // real VT + ffprobe, AND here test `record_video` on `pipe` (which has a real VT header!).
-        if pipe.video.header().is_none() {
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
+
         let Some(dts_before_pause) = pipe.rec_last_dts_us else {
             panic!("wrote frames before pause");
         };
-        pipe.record_video(&pkt(3_066_667, 2_966_667, false, 0xAA));
-        pipe.record_video(&pkt(3_000_000, 3_000_000, false, 0xBB));
-        pipe.record_video(&pkt(3_033_333, 3_033_333, false, 0xCC));
-        pipe.pause_recording(false); // rec_resume = Some(3_033_334)
-        pipe.record_video(&pkt(5_000_000, 4_900_000, true, 0xDD));
+        let base = pipe.last_in_us.max(pipe.rec_last_raw_pts_us.unwrap_or(0)).max(dts_before_pause) + 100_000;
+        // Distinct 16-byte ASCII tags avoid colliding with encoded H.264 bytes or MP4 sample tables.
+        let pkt = |pts: i64, dts: i64, key: bool, tag: &[u8; 16]| {
+            let mut data = vec![0, 0, 0, 16];
+            data.extend_from_slice(tag);
+            super::VideoPacket { pts_us: pts, dts_us: dts, key, data }
+        };
+        const TAG_PRE_P: &[u8; 16] = b"FCUT_PRE_P_00001";
+        const TAG_PRE_B: &[u8; 16] = b"FCUT_PRE_B_00002";
+        const TAG_PAU_P: &[u8; 16] = b"FCUT_PAU_P_00003";
+        const TAG_PAU_B1: &[u8; 16] = b"FCUT_PAU_B_00004";
+        const TAG_PAU_B2: &[u8; 16] = b"FCUT_PAU_B_00005";
+        const TAG_RES_K: &[u8; 16] = b"FCUT_RES_K_00006";
+        const TAG_RES_P: &[u8; 16] = b"FCUT_RES_P_00007";
+
+        // Pause at from = base + 33_334. A pre-pause mini-GOP still in the encoder (pts < from)
+        // must still be written in decode order before the cut enters.
+        pipe.last_in_us = base + 33_333;
+        pipe.pause_recording(true);
+        pipe.record_video(&pkt(base - 33_333, base - 66_667, false, TAG_PRE_P));
+        pipe.record_video(&pkt(base - 66_667, base - 33_333, false, TAG_PRE_B));
+        let Some(dts_before_cut) = pipe.rec_last_dts_us else {
+            panic!("pre-pause mini-GOP wrote frames");
+        };
+
+        // Simulate decode-order packets straddling the pause cut:
+        // P(pts=base+66.7ms) arrives FIRST (dropped, enters cut), followed by B(base) and
+        // B(base+33.3ms) with pts < from (must also be dropped, never orphaned).
+        pipe.record_video(&pkt(base + 66_667, base, false, TAG_PAU_P));
+        pipe.record_video(&pkt(base, base + 33_333, false, TAG_PAU_B1));
+        pipe.record_video(&pkt(base + 33_333, base + 66_667, false, TAG_PAU_B2));
+        pipe.pause_recording(false); // rec_resume = Some(base + 33_334)
+        pipe.record_video(&pkt(base + 2_000_000, base + 1_900_000, true, TAG_RES_K));
         let Some(dts_after_resume) = pipe.rec_last_dts_us else {
             panic!("wrote resume keyframe");
         };
         assert!(
-            dts_after_resume > dts_before_pause,
-            "recording dts must not move backwards across resume: before={dts_before_pause} after={dts_after_resume}"
+            dts_after_resume > dts_before_cut,
+            "recording dts must not move backwards across resume: before={dts_before_cut} after={dts_after_resume}"
         );
-        pipe.record_video(&pkt(5_100_000, 4_933_333, false, 0xEE));
+        pipe.record_video(&pkt(base + 2_100_000, base + 1_933_333, false, TAG_RES_P));
         let Some(dts_next) = pipe.rec_last_dts_us else {
             panic!("wrote post-resume frame");
         };
@@ -1702,14 +1734,14 @@ mod cut_tests {
         pipe.end_recording().unwrap_or_else(|e| panic!("{e}"));
         let bytes = std::fs::read(&path).unwrap_or_default();
         let _ = std::fs::remove_dir_all(&dir);
-        let has_p = bytes.windows(4).any(|w| w == [0xAA, 0, 0, 0]);
-        let has_b1 = bytes.windows(4).any(|w| w == [0xBB, 0, 0, 0]);
-        let has_b2 = bytes.windows(4).any(|w| w == [0xCC, 0, 0, 0]);
+        let has = |tag: &[u8; 16]| bytes.windows(16).any(|w| w == tag);
+        assert!(has(TAG_PRE_P) && has(TAG_PRE_B), "pre-pause buffered mini-GOP was written");
+        let (has_p, has_b1, has_b2) = (has(TAG_PAU_P), has(TAG_PAU_B1), has(TAG_PAU_B2));
         assert!(
-            !(!has_p && (has_b1 || has_b2)),
-            "orphaned B-frames written without their reference P-frame! (p={has_p}, b1={has_b1}, b2={has_b2})"
+            !has_p && !has_b1 && !has_b2,
+            "straddling mini-GOP dropped without orphaning B-frames (p={has_p}, b1={has_b1}, b2={has_b2})"
         );
-        assert!(bytes.windows(4).any(|w| w == [0xDD, 0, 0, 0]), "resumed keyframe was written");
+        assert!(has(TAG_RES_K) && has(TAG_RES_P), "resumed keyframe and following frame were written");
     }
 }
 
