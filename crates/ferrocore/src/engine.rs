@@ -2970,13 +2970,16 @@ impl Engine {
         let mut st = self.lock();
         // Frames drawn before the join go to the recording alone: the stream starts after them.
         deliver(&mut st, &self.gpu, true, &self.recycle_tx);
-        let (_, pipe, kind, _) =
+        let (_, pipe, kind, canvas) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
         if !matches!(kind, OutputKind::Record(_)) {
             return Err(AvError::Source("only a recording can take a stream on".into()));
         }
         pipe.begin_stream()?;
         *kind = OutputKind::Stream(send);
+        // One picture goes to both while they share: the stream's, so an item shown only in the
+        // recording never reaches the stream (the frames drawn before are delivered above).
+        canvas.audience = Audience::Stream;
         let ticket = st.sleep_ticket();
         drop(st);
         self.sync_sleep(ticket);
@@ -2987,11 +2990,14 @@ impl Engine {
     /// kept): the stream ended while a recording sharing its encode goes on.
     pub fn stream_off(&self, id: u64) -> Result<(), AvError> {
         let mut st = self.lock();
-        let (_, pipe, kind, _) =
+        // Frames drawn for the stream's picture go out first: the recording's picture is another.
+        deliver(&mut st, &self.gpu, true, &self.recycle_tx);
+        let (_, pipe, kind, canvas) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
         // The stream always leaves (a recording that failed, say on a full disk, mustn't keep
         // it: the next Go live would find a stream there; CodeRabbit).
         *kind = OutputKind::Record(PathBuf::new());
+        canvas.audience = Audience::Recording;
         let no_rec = !pipe.recording();
         let ticket = st.sleep_ticket();
         drop(st);
@@ -7838,6 +7844,26 @@ mod tests {
         assert_ne!(left, Some(0), "an empty file was left at {}", file.display());
         let _ = std::fs::remove_file(&file);
         e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+    }
+
+    /// An output a stream is on draws what the stream shows (a recording-only item must never
+    /// reach the stream through a shared encode); when the stream leaves, the recording goes on
+    /// with what the recording shows.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_shared_output_follows_whether_a_stream_is_on_it() {
+        let Some(e) = engine() else { return };
+        shared_scene(&e);
+        let file = std::env::temp_dir().join(format!("ferrocore-audience-{}.mp4", std::process::id()));
+        let id = e.start_output(OutputKind::Record(file.clone())).unwrap_or_else(|x| panic!("{x}"));
+        let audience = |e: &Engine| e.lock().outputs.iter().find(|o| o.0 == id).map(|o| o.3.audience);
+        assert_eq!(audience(&e), Some(Audience::Recording));
+        e.stream_on(id, sink_into(&Sent::default())).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(audience(&e), Some(Audience::Stream), "a stream on it: the stream's picture");
+        e.stream_off(id).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(audience(&e), Some(Audience::Recording), "the recording goes on with its own");
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        let _ = std::fs::remove_file(file);
     }
 
     /// A stream joins a running recording's encode: it opens with the codec headers and a
