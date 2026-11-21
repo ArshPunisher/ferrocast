@@ -2581,6 +2581,12 @@ impl Engine {
         let more = canvas.more_tracks.len();
         let mut pipe = Pipeline::with_tracks(video, audio, record.as_deref(), more)?;
         pipe.set_track_names(canvas.track_names.clone());
+        // The AAC work off the render thread (FERROCORE_AAC_ON_RENDER_THREAD keeps it there, to compare).
+        if std::env::var_os("FERROCORE_AAC_ON_RENDER_THREAD").is_none()
+            && let Err(e) = pipe.audio_off_thread()
+        {
+            tracing::warn!(error = %e, "the sound encoder stays on the render thread");
+        }
         if matches!(kind, OutputKind::Stream(_)) {
             pipe.stream_extra_tracks();
             // Twitch Enhanced Broadcasting's other qualities: H.264, even sides, a few at most.
