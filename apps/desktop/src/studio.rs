@@ -92,6 +92,10 @@ struct Held {
     preview_holes: Vec<(f64, f64, f64, f64, f64)>,
     /// How much of the preview shows, 0 to 1.
     preview_opacity: Option<f64>,
+    /// Performance mode: the preview, Studio Mode's second picture and the vertical picture are
+    /// not drawn (outputs and projectors are untouched). Kept here so a picture made again
+    /// after a canvas change is paused too.
+    preview_paused: bool,
     /// The dialog backdrop's shade over the preview, 0 to 1.
     preview_shade: f64,
     /// The same for Studio Mode's picture of what's on air.
@@ -251,6 +255,7 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&v.holes);
     p.set_opacity(v.opacity.unwrap_or(1.0));
     p.set_shade(v.shade);
+    p.set_paused(h.preview_paused);
     h.vertical.view = Some(p);
     Ok(())
 }
@@ -1533,6 +1538,12 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         }
         A::AddExisting { scene, name } => v(to_json!(json!({ "item": c.add_existing(&scene, &name)? }))),
         A::EditItem { scene, id, edit } => done(c.edit_item(&scene, id, item_edit(edit))),
+        // A key held down: shown or hidden for as long as it is held, never saved (the engine
+        // puts it back on release).
+        A::PushItem { scene, id, visible } => {
+            done(c.edit_item(&scene, id, if visible { ItemEdit::Show } else { ItemEdit::Hide }))
+        }
+        A::PushFilter { name, filter, enabled } => done(c.set_filter_enabled(&name, &filter, enabled)),
         A::Sources => v(to_json!(c.sources())),
         A::Rename { name, new_name } => done(c.rename(&name, &new_name)),
         A::Settings { name } => c.settings(&name),
@@ -1715,6 +1726,7 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&h.program_holes);
     p.set_opacity(h.program_opacity.unwrap_or(1.0));
     p.set_shade(h.program_shade);
+    p.set_paused(h.preview_paused);
     h.program_view = Some(p);
     Ok(())
 }
@@ -1740,6 +1752,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&h.preview_holes);
     p.set_opacity(h.preview_opacity.unwrap_or(1.0));
     p.set_shade(h.preview_shade);
+    p.set_paused(h.preview_paused);
     h.preview = Some(p);
     sync_views(h);
     Ok(())
@@ -2241,6 +2254,21 @@ impl StudioHost for DesktopStudio {
             .await?
             .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))?;
         serde_json::to_value(opts).map_err(|e| e.to_string())
+    }
+
+    async fn set_preview_paused(&self, paused: bool) -> Result<(), String> {
+        self.on_main(move |h| {
+            h.preview_paused = paused;
+            // Only the three views over the page: projectors and every output draw on.
+            for p in [h.preview.as_ref(), h.program_view.as_ref(), h.vertical.view.as_ref()].into_iter().flatten() {
+                p.set_paused(paused);
+            }
+        })
+        .await
+    }
+
+    async fn preview_paused(&self) -> bool {
+        self.on_main(|h| h.preview_paused).await.unwrap_or(false)
     }
 
     async fn program_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {

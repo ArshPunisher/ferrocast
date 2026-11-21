@@ -53,6 +53,7 @@ pub(crate) fn routes() -> Router<AppState> {
         )
         .route("/studio/engine/preview/selection", put(engine_select))
         .route("/studio/engine/preview/cursor", put(engine_cursor))
+        .route("/studio/engine/preview/pause", get(engine_preview_paused).put(engine_set_preview_paused))
         .route("/studio/engine/studio-mode", put(engine_studio_mode))
         .route("/studio/engine/studio-mode/preview", put(engine_set_preview))
         .route("/studio/engine/studio-mode/transition", post(engine_transition_now))
@@ -450,6 +451,27 @@ struct CursorBody {
 async fn engine_cursor(State(app): State<AppState>, Body(b): Body<CursorBody>) -> ApiResult<StatusCode> {
     app.engine.studio_preview_cursor(b.cursor).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PausedBody {
+    paused: bool,
+}
+
+/// `GET /studio/engine/preview/pause` → `{ paused }`: performance mode, whether the preview is paused.
+async fn engine_preview_paused(State(app): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let paused = app.engine.studio_preview_paused().await?;
+    Ok(Json(serde_json::json!({ "paused": paused })))
+}
+
+/// `PUT /studio/engine/preview/pause` `{ paused }` → `{ paused }`: pauses or resumes drawing the
+/// preview (performance mode). The stream and recording are never touched.
+async fn engine_set_preview_paused(
+    State(app): State<AppState>,
+    Body(b): Body<PausedBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let paused = app.engine.studio_set_preview_paused(b.paused).await?;
+    Ok(Json(serde_json::json!({ "paused": paused })))
 }
 
 #[derive(Deserialize)]

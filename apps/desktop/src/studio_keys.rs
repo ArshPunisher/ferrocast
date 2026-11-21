@@ -9,11 +9,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use ferrocast_engine::studio::push_hold;
 use ferrocast_engine::studio_host::{AudioChange, FilterEdit, ItemEdit, MediaAct, StudioAct};
 use ferrocast_engine::{Engine, EngineError};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+
+/// A request (not a shortcut action: none can be set to it) for the key worker to let every key
+/// held down go and put its items back, for when the keys can't report their release any more.
+pub(crate) const RELEASE_HOLDS: &str = "release_holds";
 
 /// The Studio's shortcuts registered now and what each does, and the queue their presses go
 /// through: one worker runs them in order, so a quick push-to-talk tap never ends unmuted.
@@ -141,6 +146,8 @@ pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> 
         return Vec::new();
     }
     let mut map = state.keys.lock().unwrap_or_else(|p| p.into_inner());
+    // Shortcuts about to be replaced can't report a key let go any more: nothing stays held.
+    let _ = state.queue.send((RELEASE_HOLDS.to_string(), false));
     for (sc, _) in map.drain() {
         let _ = app.global_shortcut().unregister(sc);
     }
@@ -170,6 +177,8 @@ pub(crate) fn capture(app: &AppHandle, on: bool) {
     match change {
         Capture::Suspend => {
             tracing::info!("the shortcuts are let go while a shortcut field waits for a key");
+            // A key held now would never be seen coming up.
+            let _ = state.queue.send((RELEASE_HOLDS.to_string(), false));
             let _ = app.global_shortcut().unregister_all();
             watch_capture(app.clone());
         }
@@ -212,8 +221,7 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> boo
     let pressed = state == ShortcutState::Pressed;
     for action in actions {
         tracing::debug!(action, pressed, "a Studio shortcut");
-        // Only push to talk and push to mute act on letting go.
-        if !pressed && !action.starts_with("push_to_talk:") && !action.starts_with("push_to_mute:") {
+        if !pressed && !acts_on_release(&action) {
             continue;
         }
         let _ = keys.queue.send((action, pressed));
@@ -221,7 +229,19 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> boo
     true
 }
 
+/// Only push to talk, push to mute and the push-to-show/hide keys act on letting go.
+pub(crate) fn acts_on_release(action: &str) -> bool {
+    action.starts_with("push_to_talk:") || action.starts_with("push_to_mute:") || push_hold::is_push_hold(action)
+}
+
 async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineError> {
+    if action == RELEASE_HOLDS {
+        engine.studio_release_holds().await;
+        return Ok(());
+    }
+    if push_hold::is_push_hold(action) {
+        return engine.studio_push_hold(action, pressed).await;
+    }
     match action {
         "go_live" => {
             engine.go_live().await?;
@@ -322,6 +342,13 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                 engine.studio_act(StudioAct::Screenshot { name: name.to_string() }).await?;
             }
         }
+        "performance_mode" => {
+            let on = engine.studio_preview_paused().await?;
+            engine.studio_set_preview_paused(!on).await?;
+        }
+        "performance_mode_on" | "performance_mode_off" => {
+            engine.studio_set_preview_paused(action == "performance_mode_on").await?;
+        }
         "undo" => {
             engine.studio_act(StudioAct::Undo).await?;
         }
@@ -346,13 +373,7 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
             } else if let Some((scene, source)) = pair("show:").or_else(|| pair("hide:")) {
                 let items = engine.studio_act(StudioAct::Items { scene: scene.to_string() }).await?;
                 // Inside a group too.
-                let flat: Vec<&Value> = items
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|i| std::iter::once(i).chain(i["children"].as_array().into_iter().flatten()))
-                    .collect();
-                let id = flat.iter().find(|i| i["name"] == Value::String(source.into())).and_then(|i| i["id"].as_i64());
+                let id = push_hold::find_item(&items, source).map(|(id, _)| id);
                 if let Some(id) = id {
                     let edit = if a.starts_with("show:") { ItemEdit::Show } else { ItemEdit::Hide };
                     engine.studio_act(StudioAct::EditItem { scene: scene.to_string(), id, edit }).await?;
@@ -519,6 +540,8 @@ mod tests {
         streaming: std::sync::atomic::AtomicBool,
         /// How often the vertical stream was told to stop.
         vstream_stops: std::sync::atomic::AtomicUsize,
+        /// Performance mode: the preview is paused.
+        paused: std::sync::atomic::AtomicBool,
     }
 
     impl FakeHost {
@@ -546,6 +569,13 @@ mod tests {
         }
         async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
             Ok(())
+        }
+        async fn set_preview_paused(&self, paused: bool) -> Result<(), String> {
+            self.paused.store(paused, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn preview_paused(&self) -> bool {
+            self.paused.load(std::sync::atomic::Ordering::SeqCst)
         }
         async fn defaults(&self, _kind: String) -> Result<Value, String> {
             Ok(serde_json::json!({}))
@@ -586,6 +616,11 @@ mod tests {
                     self.vertical_on.store(false, std::sync::atomic::Ordering::SeqCst);
                     Ok(Value::Null)
                 }
+                StudioAct::Items { .. } => Ok(serde_json::json!([
+                    { "id": 4, "name": "Banner", "visible": false, "children": [
+                        { "id": 9, "name": "Deep", "visible": false, "children": [] }
+                    ] },
+                ])),
                 _ => Ok(Value::Null),
             }
         }
@@ -645,6 +680,103 @@ mod tests {
         let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap_or_else(|e| panic!("engine: {e}"));
         engine.set_studio_host(host);
         (engine, dir)
+    }
+
+    /// Performance mode's keys: one toggles, the others say on or off (so a key can never leave
+    /// it the wrong way round), and none of them touches the outputs.
+    #[tokio::test]
+    async fn performance_mode_keys_toggle_pause_and_resume_the_preview_only() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+        let paused = || host.paused.load(std::sync::atomic::Ordering::SeqCst);
+        run(&engine, "performance_mode", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(paused());
+        run(&engine, "performance_mode", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(!paused());
+        // On twice stays on; off twice stays off.
+        for _ in 0..2 {
+            run(&engine, "performance_mode_on", true).await.unwrap_or_else(|e| panic!("{e}"));
+            assert!(paused());
+        }
+        for _ in 0..2 {
+            run(&engine, "performance_mode_off", true).await.unwrap_or_else(|e| panic!("{e}"));
+            assert!(!paused());
+        }
+        // Nothing was asked of the scenes, the stream or the recording.
+        assert!(host.take_acts().is_empty());
+        assert_eq!(host.vstream_stops.load(std::sync::atomic::Ordering::SeqCst), 0);
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn performance_mode_while_streaming_leaves_the_stream_running() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+        host.streaming.store(true, SeqCst);
+        run(&engine, "performance_mode_on", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(host.paused.load(SeqCst));
+        assert!(host.streaming.load(SeqCst), "the stream is still on");
+        assert_eq!(host.vstream_stops.load(SeqCst), 0, "no stream was stopped");
+        engine.shutdown();
+    }
+
+    #[test]
+    fn only_the_held_keys_act_on_letting_go() {
+        for a in ["push_to_talk:Mic", "push_to_mute:Mic", "push_show:Main\nCam", "push_hide:Main\nCam"] {
+            assert!(acts_on_release(a), "{a}");
+        }
+        for a in ["push_filter_on:Cam\nBlur", "push_filter_off:Cam\nBlur"] {
+            assert!(acts_on_release(a), "{a}");
+        }
+        for a in ["show:Main\nCam", "hide:Main\nCam", "filter:Cam\nBlur", "mute:Mic", "go_live", "scene:Main"] {
+            assert!(!acts_on_release(a), "{a}");
+        }
+    }
+
+    /// The key worker's path: down shows (even inside a group), up puts back, and nothing the
+    /// Studio is asked is a saved edit or an undo step.
+    #[tokio::test]
+    async fn push_to_show_runs_down_and_up_through_the_engine_without_edits() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+        run(&engine, "push_show:Main\nDeep", true).await.unwrap_or_else(|e| panic!("{e}"));
+        run(&engine, "push_show:Main\nDeep", false).await.unwrap_or_else(|e| panic!("{e}"));
+        let acts = host.take_acts();
+        assert_eq!(
+            acts,
+            vec![
+                StudioAct::Items { scene: "Main".into() },
+                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: true },
+                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: false },
+            ]
+        );
+        assert!(acts.iter().all(|a| !matches!(a, StudioAct::EditItem { .. }) && !a.changes()));
+        // A key let go while the shortcuts were taken away: the worker's own request puts it back.
+        run(&engine, "push_show:Main\nBanner", true).await.unwrap_or_else(|e| panic!("{e}"));
+        host.take_acts();
+        run(&engine, RELEASE_HOLDS, false).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::PushItem { scene: "Main".into(), id: 4, visible: false }]);
+        // Nothing held: asking again does nothing.
+        run(&engine, RELEASE_HOLDS, false).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(host.take_acts().is_empty());
+        engine.shutdown();
+    }
+
+    /// The old show/hide keys (a tap) reach an item in a group too.
+    #[tokio::test]
+    async fn show_and_hide_keys_reach_items_in_groups() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+        run(&engine, "show:Main\nDeep", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            host.take_acts(),
+            vec![
+                StudioAct::Items { scene: "Main".into() },
+                StudioAct::EditItem { scene: "Main".into(), id: 9, edit: ItemEdit::Show },
+            ]
+        );
+        engine.shutdown();
     }
 
     #[tokio::test]

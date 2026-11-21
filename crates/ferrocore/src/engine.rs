@@ -1121,6 +1121,9 @@ struct Preview {
     size: (u32, u32),
     /// Every scene in boxes instead (a multiview projector).
     multiview: Option<Multiview>,
+    /// Performance mode: nothing is composed or drawn for this view until it is let go. Never
+    /// touches an output: streams and recordings draw their own frames.
+    paused: bool,
 }
 
 /// One box of a multiview: a scene (None: what's on air) stretched into `area` (the
@@ -2755,7 +2758,9 @@ impl Engine {
         // SAFETY: passed on from the caller's promise.
         let surface = unsafe { self.gpu.preview_surface(ns_view, width, height) }?;
         let id = self.next_preview.fetch_add(1, Ordering::Relaxed);
-        self.lock().previews.insert(id, Preview { look: Default::default(), scene, size, multiview: None });
+        self.lock()
+            .previews
+            .insert(id, Preview { look: Default::default(), scene, size, multiview: None, paused: false });
         let surface = Arc::new(Mutex::new(surface));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
@@ -2789,6 +2794,20 @@ impl Engine {
         if let Some(p) = self.preview_threads().get(&id) {
             self.gpu.resize_preview(&mut p.surface.lock().unwrap_or_else(|e| e.into_inner()), width, height);
         }
+    }
+
+    /// Performance mode: a paused preview composes and draws nothing (its view keeps the last
+    /// picture, or is hidden by the host) until `paused` is false again. The outputs (stream,
+    /// recording, replay, virtual camera) are never touched. An unknown id changes nothing.
+    pub fn set_preview_paused(&self, id: u64, paused: bool) {
+        if let Some(p) = self.lock().previews.get_mut(&id) {
+            p.paused = paused;
+        }
+    }
+
+    /// Whether a preview is paused (None: no such preview).
+    pub fn preview_paused(&self, id: u64) -> Option<bool> {
+        self.lock().previews.get(&id).map(|p| p.paused)
     }
 
     /// How a preview looks round and over the picture (outlines, where the canvas sits…).
@@ -3346,9 +3365,13 @@ fn preview_loop(
 ) {
     while !stop.load(Ordering::Acquire) {
         let started = Instant::now();
+        let paused;
         let next = {
             let st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.previews.get(&id).map(|p| {
+            let found = st.previews.get(&id);
+            // Paused: nothing is composed (no scene walk, no GPU pass) until it is let go.
+            paused = found.is_some_and(|p| p.paused);
+            found.filter(|p| !p.paused).map(|p| {
                 let draw = match &p.multiview {
                     Some(mv) => Draw::Scene(multiview_scene(&st, mv, now_ns())),
                     None => what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns()),
@@ -3374,9 +3397,18 @@ fn preview_loop(
                 tracing::warn!("the preview couldn't be drawn: {e}");
             }
         }
-        std::thread::sleep(every.saturating_sub(started.elapsed()));
+        std::thread::sleep(preview_wait(paused, every, started.elapsed()));
     }
 }
+
+/// How long a preview's thread waits before looking again: the rest of the frame, or (paused)
+/// a slow look for the moment it is let go, so a paused view costs next to nothing.
+fn preview_wait(paused: bool, every: Duration, spent: Duration) -> Duration {
+    if paused { PAUSED_LOOK.max(every).saturating_sub(spent) } else { every.saturating_sub(spent) }
+}
+
+/// How often a paused preview checks whether it should draw again.
+const PAUSED_LOOK: Duration = Duration::from_millis(100);
 
 /// The preview's outlines (canvas pixels) for `m`, from the engine's own items at `ts`: every
 /// shown source of `m.scene` in its colour, then the picked ones with handles on top.
@@ -5692,6 +5724,86 @@ mod tests {
         assert!(video.len() as u64 + slack >= drawn_before_stop.min(45), "{} of {drawn_before_stop}", video.len());
         assert!(video.windows(2).all(|w| w[0] <= w[1]), "in time order: {video:?}");
         assert!(audio > 20, "sound came too: {audio}");
+    }
+
+    fn some_preview() -> Preview {
+        Preview { look: Default::default(), scene: None, size: (640, 360), multiview: None, paused: false }
+    }
+
+    #[test]
+    fn a_preview_can_be_paused_and_let_go_and_an_unknown_one_changes_nothing() {
+        let Some(e) = engine() else { return };
+        e.lock().previews.insert(7, some_preview());
+        assert_eq!(e.preview_paused(7), Some(false));
+        e.set_preview_paused(7, true);
+        assert_eq!(e.preview_paused(7), Some(true));
+        // Twice is the same as once.
+        e.set_preview_paused(7, true);
+        assert_eq!(e.preview_paused(7), Some(true));
+        e.set_preview_paused(7, false);
+        assert_eq!(e.preview_paused(7), Some(false));
+        // No such preview: nothing made up, nothing panics.
+        e.set_preview_paused(99, true);
+        assert_eq!(e.preview_paused(99), None);
+        assert!(!e.lock().previews.contains_key(&99));
+    }
+
+    #[test]
+    fn pausing_one_preview_leaves_the_others_drawing() {
+        let Some(e) = engine() else { return };
+        e.lock().previews.insert(1, some_preview());
+        e.lock().previews.insert(2, some_preview());
+        e.set_preview_paused(1, true);
+        assert_eq!((e.preview_paused(1), e.preview_paused(2)), (Some(true), Some(false)));
+    }
+
+    #[test]
+    fn a_paused_preview_waits_long_and_a_drawing_one_waits_for_its_frame() {
+        let frame = Duration::from_millis(33);
+        assert_eq!(preview_wait(false, frame, Duration::from_millis(10)), Duration::from_millis(23));
+        // Late: no wait at all.
+        assert_eq!(preview_wait(false, frame, Duration::from_millis(50)), Duration::ZERO);
+        // Paused: a slow look, not the frame rate.
+        assert_eq!(preview_wait(true, frame, Duration::ZERO), PAUSED_LOOK);
+        // A slower frame rate than the look keeps its own pace.
+        assert_eq!(preview_wait(true, Duration::from_millis(500), Duration::ZERO), Duration::from_millis(500));
+    }
+
+    /// Performance mode never pauses an output: a stream keeps getting its pictures and sound
+    /// while every preview is paused, and again after they are let go.
+    #[test]
+    fn a_paused_preview_never_stops_the_stream_or_recording() {
+        if !encodes_here() {
+            return;
+        }
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [10, 200, 30, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        e.lock().previews.insert(1, some_preview());
+        let video: Arc<Mutex<u32>> = Arc::default();
+        let audio: Arc<Mutex<u32>> = Arc::default();
+        let sink = {
+            let (video, audio) = (video.clone(), audio.clone());
+            move |t: Tag| match t {
+                Tag::Video { .. } => *video.lock().unwrap_or_else(|p| p.into_inner()) += 1,
+                Tag::Audio { .. } => *audio.lock().unwrap_or_else(|p| p.into_inner()) += 1,
+            }
+        };
+        let out = e.start_output(OutputKind::Stream(Box::new(sink))).unwrap_or_else(|x| panic!("{x}"));
+        let count = |m: &Arc<Mutex<u32>>| *m.lock().unwrap_or_else(|p| p.into_inner());
+        std::thread::sleep(Duration::from_millis(600));
+        e.set_preview_paused(1, true);
+        let (v0, a0) = (count(&video), count(&audio));
+        std::thread::sleep(Duration::from_millis(1200));
+        let (v1, a1) = (count(&video), count(&audio));
+        assert!(v1 >= v0 + 10, "pictures kept going while paused: {v0} then {v1}");
+        assert!(a1 > a0, "sound kept going while paused: {a0} then {a1}");
+        e.set_preview_paused(1, false);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(count(&video) > v1, "and after");
+        e.stop_output(out).unwrap_or_else(|x| panic!("{x}"));
     }
 
     /// Optimize while live: a stream's picture goes from the canvas at full rate to a smaller

@@ -4,7 +4,7 @@
 //! running). The same calls as `Collection`, returning the same answers, so the app can move
 //! over call by call (ENGINE.md, step 3).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -4830,6 +4830,13 @@ impl StageOutput {
     }
 }
 
+/// How much of a preview's view shows: the page's opacity, but a paused (performance mode) view
+/// is clear, whatever the page asks, so its "Preview paused" card shows there.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn view_opacity(paused: bool, asked: f64) -> f64 {
+    if paused { 0.0 } else { asked }
+}
+
 /// The Studio's preview of the stage, drawn by our engine in a view over the page (macOS): the
 /// same calls as `Preview`. Its outlines and handles come from the stage's own items, taken on
 /// each `follow` (the app's tick) and kept between. Removed when dropped.
@@ -4842,6 +4849,11 @@ pub struct StageView {
     look: RefCell<ViewLook>,
     /// Shows the vertical picture (it follows that picture's scene on air).
     vertical: bool,
+    /// Performance mode: nothing is drawn and the view is clear (the page shows its
+    /// "Preview paused" card there). Outputs are never touched.
+    paused: Cell<bool>,
+    /// The opacity the page asked for (a paused view is clear whatever it is).
+    opacity: Cell<f64>,
 }
 
 /// The window the preview draws in: an NSView on a Mac, a child window on Windows.
@@ -4969,7 +4981,15 @@ impl Stage {
                 }
             }));
         }
-        let v = StageView { shared, id, view, look: RefCell::new(look), vertical };
+        let v = StageView {
+            shared,
+            id,
+            view,
+            look: RefCell::new(look),
+            vertical,
+            paused: Cell::new(false),
+            opacity: Cell::new(1.0),
+        };
         v.follow(self);
         Ok(v)
     }
@@ -5077,7 +5097,26 @@ impl StageView {
 
     /// How much of the picture shows, 0 to 1. Main thread.
     pub fn set_opacity(&self, opacity: f64) {
-        self.view.set_opacity(opacity);
+        self.opacity.set(opacity);
+        self.view.set_opacity(self.shown_opacity());
+    }
+
+    fn shown_opacity(&self) -> f64 {
+        view_opacity(self.paused.get(), self.opacity.get())
+    }
+
+    /// Performance mode: stops (or resumes) drawing this view; while paused it is clear so the
+    /// page's own placeholder shows. Only this view: no output is touched. Main thread.
+    pub fn set_paused(&self, paused: bool) {
+        if self.paused.replace(paused) == paused {
+            return;
+        }
+        self.shared.engine.set_preview_paused(self.id, paused);
+        self.view.set_opacity(self.shown_opacity());
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.get()
     }
 
     /// Mouse actions over it go to `cb` (Windows: the picture's own window takes them; on a
@@ -5427,6 +5466,10 @@ impl StageView {
     pub fn set_shade(&self, _shade: f64) {}
     pub fn set_holes(&self, _holes: &[(f64, f64, f64, f64, f64)]) {}
     pub fn set_opacity(&self, _opacity: f64) {}
+    pub fn set_paused(&self, _paused: bool) {}
+    pub fn is_paused(&self) -> bool {
+        false
+    }
     pub fn set_input(&self, _cb: Box<dyn Fn(crate::PreviewInput)>) {}
     pub fn set_cursor(&self, _css: &str) {}
     pub fn follow(&self, _stage: &Stage) {}
@@ -5689,6 +5732,15 @@ mod tests {
         let mut other = json!({ "window": 3, "owner_name": "Keep" });
         remember_capture("image_source", &mut other, true);
         assert_eq!(other["owner_name"], "Keep");
+    }
+
+    #[test]
+    fn a_paused_preview_is_clear_whatever_the_page_asks() {
+        assert_eq!(view_opacity(false, 0.6), 0.6);
+        assert_eq!(view_opacity(true, 1.0), 0.0);
+        assert_eq!(view_opacity(true, 0.0), 0.0);
+        // Let go again: what the page last asked for.
+        assert_eq!(view_opacity(false, 1.0), 1.0);
     }
 
     fn stage() -> Stage {

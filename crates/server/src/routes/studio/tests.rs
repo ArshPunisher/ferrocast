@@ -1052,3 +1052,113 @@ async fn item_filter_routes_forward_item_target_and_validate_queries() {
     assert!(matches!(&acts[3], StudioAct::EditFilter { edit: FilterEdit::Disable, item, .. } if item == &expected));
     assert!(matches!(&acts[10], StudioAct::SourcePicture { filters: true, item, .. } if item == &expected));
 }
+
+/// A Studio that keeps performance mode (the preview paused) and nothing else.
+#[derive(Debug, Default)]
+struct PausedHost {
+    paused: std::sync::atomic::AtomicBool,
+    acts: Mutex<Vec<ferrocast_engine::studio_host::StudioAct>>,
+}
+
+#[async_trait]
+impl ferrocast_engine::studio_host::StudioHost for PausedHost {
+    async fn status(&self) -> ferrocast_engine::studio_host::StudioStatus {
+        ferrocast_engine::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+    }
+    async fn start(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn kinds(&self) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn options(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn set_preview_paused(&self, paused: bool) -> Result<(), String> {
+        self.paused.store(paused, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn preview_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    async fn defaults(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn act(&self, act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
+        self.acts.lock().unwrap().push(act);
+        Ok(Value::Null)
+    }
+    async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
+        ferrocast_engine::studio_host::StudioSettings::default()
+    }
+    async fn set_settings(&self, _s: ferrocast_engine::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record(&self, _on: bool) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<Value, String> {
+        Ok(json!({ "devices": [] }))
+    }
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn obs_collections(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+}
+
+#[tokio::test]
+async fn performance_mode_pauses_the_preview_and_says_so_without_the_desktop_app() {
+    let r = start().await;
+    // No desktop app: the same plain 422 as every other Studio route.
+    for res in [
+        r.get("/studio/engine/preview/pause").await,
+        r.put("/studio/engine/preview/pause", json!({ "paused": true })).await,
+    ] {
+        assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
+    }
+    let host = Arc::new(PausedHost::default());
+    r.engine.set_studio_host(host.clone());
+    let (s, v) = body(r.get("/studio/engine/preview/pause").await).await;
+    assert_eq!((s, v["paused"].as_bool()), (StatusCode::OK, Some(false)), "{v}");
+    for (ask, now) in [(true, true), (true, true), (false, false), (false, false)] {
+        let (s, v) = body(r.put("/studio/engine/preview/pause", json!({ "paused": ask })).await).await;
+        assert_eq!((s, v["paused"].as_bool()), (StatusCode::OK, Some(now)), "{v}");
+    }
+    // A body that isn't `{ paused: bool }` is a 400 with a plain message, and changes nothing.
+    r.put("/studio/engine/preview/pause", json!({ "paused": true })).await;
+    for bad in [json!({}), json!({ "paused": "yes" }), json!({ "paused": null })] {
+        let res = r.put("/studio/engine/preview/pause", bad.clone()).await;
+        assert!(res.status().is_client_error(), "{bad}");
+    }
+    assert!(host.paused.load(std::sync::atomic::Ordering::SeqCst));
+    // It never touched the scenes, the stream or a recording.
+    assert!(host.acts.lock().unwrap().is_empty());
+}

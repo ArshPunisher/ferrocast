@@ -23,6 +23,7 @@ pub(crate) mod game_scenes;
 pub(crate) mod live_watch;
 pub mod moments;
 pub mod obs_tools;
+pub mod push_hold;
 pub(crate) mod record_watch;
 pub(crate) mod rig;
 pub(crate) mod rules;
@@ -124,6 +125,8 @@ pub(crate) struct Studio {
     pub autoreplies: autoreplies::AutoReplies,
     /// Event rules running now (by their place in the list).
     pub rules_busy: Mutex<HashSet<usize>>,
+    /// Items and filters held shown, hidden, on or off by a key held down (never saved).
+    pub holds: Mutex<push_hold::Holds>,
 }
 
 impl Default for Studio {
@@ -160,6 +163,7 @@ impl Default for Studio {
             scene_now: Mutex::default(),
             autoreplies: autoreplies::AutoReplies::default(),
             rules_busy: Mutex::default(),
+            holds: Mutex::default(),
         }
     }
 }

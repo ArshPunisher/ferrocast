@@ -201,6 +201,17 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn options(&self, kind: String) -> Result<Value, String>;
     /// Shows the preview at the box in the dashboard window, or hides it (None).
     async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String>;
+    /// Performance mode: stops (`paused`) or resumes drawing the preview, Studio Mode's second
+    /// picture and the vertical picture, to save GPU and CPU. Never touches a stream, recording,
+    /// replay buffer or virtual camera, which draw their own frames. Kept by the host while it
+    /// runs (the pictures made again after a canvas change stay as they were set).
+    async fn set_preview_paused(&self, _paused: bool) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+    /// Whether performance mode has the preview paused now.
+    async fn preview_paused(&self) -> bool {
+        false
+    }
     /// Studio Mode's second picture, what's on air, over its own box (or none).
     async fn program_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
         Ok(())
@@ -817,7 +828,7 @@ impl FilePick {
 /// Shortcut actions with no name in them (OBS's hotkeys and Ferrocast's vertical canvas). Others:
 /// scene:, mute:, push_to_talk:, push_to_mute:, screenshot:, media_*: <name>; show:, hide:
 /// <scene>\n<source>; filter: <source>\n<filter>; quick: <1 to 10>.
-pub const HOTKEY_ACTIONS: [&str; 27] = [
+pub const HOTKEY_ACTIONS: [&str; 30] = [
     "go_live",
     "end_stream",
     "record",
@@ -843,6 +854,9 @@ pub const HOTKEY_ACTIONS: [&str; 27] = [
     "vertical:hide_preview",
     "vertical:toggle_preview",
     "vertical:screenshot",
+    "performance_mode",
+    "performance_mode_on",
+    "performance_mode_off",
     "undo",
     "redo",
 ];
@@ -1245,7 +1259,7 @@ impl StudioSettings {
                     .iter()
                     .any(|p| action.strip_prefix(p).is_some_and(|n| check_source_name(n).is_ok()))
                 // A source in a scene, a filter on a source: two names, a line apart.
-                || ["show:", "hide:", "filter:"].iter().any(|p| {
+                || ["show:", "hide:", "filter:", "push_show:", "push_hide:", "push_filter_on:", "push_filter_off:"].iter().any(|p| {
                     action.strip_prefix(p).and_then(|r| r.split_once('\n')).is_some_and(|(x, y)| {
                         check_source_name(x).is_ok() && check_source_name(y).is_ok()
                     })
@@ -1532,6 +1546,19 @@ pub enum StudioAct {
     /// `Audio`, null when none) and the items of that scene and of every scene shown inside it
     /// (as `Items`, by scene name). Replaces a handful of separate reads every tick. Never saved.
     WatchSnapshot,
+    /// A push-to-show / push-to-hide key: an item shown or hidden while its key is held and put back
+    /// on release (`studio_push_hold`). Never saved and never an undo step.
+    PushItem {
+        scene: String,
+        id: i64,
+        visible: bool,
+    },
+    /// A push-to-enable / push-to-disable key on a source's own filter; as `PushItem`.
+    PushFilter {
+        name: String,
+        filter: String,
+        enabled: bool,
+    },
     /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
     /// frozen camera).
     Look {
@@ -1954,6 +1981,11 @@ impl StudioAct {
                 device.as_mut().map(new).transpose().map(|_| ())
             }
             A::PushKey { name, .. } => check_source_name(name),
+            A::PushItem { scene, .. } => check_source_name(scene),
+            A::PushFilter { name, filter, .. } => {
+                check_source_name(name)?;
+                check_source_name(filter)
+            }
             A::Levels { names } | A::Look { names } => {
                 if names.len() > 64 {
                     return Err(EngineError::Invalid("names: up to 64 sources at once.".into()));
@@ -2168,6 +2200,8 @@ impl StudioAct {
                 | A::AudioByName { .. }
                 | A::Levels { .. }
                 | A::PushKey { .. }
+                | A::PushItem { .. }
+                | A::PushFilter { .. }
                 | A::WatchSnapshot
                 | A::Look { .. }
                 | A::AudioCare
@@ -2330,6 +2364,8 @@ impl Engine {
 
     pub async fn studio_stop(&self) -> Result<StudioStatus, EngineError> {
         let host = self.studio_host()?;
+        // Keys held down put their items back before the scenes are saved and let go.
+        self.studio_release_holds().await;
         let was_running = host.status().await.running;
         // Cancel any active Show, countdown, or pending delayed stop immediately (even before
         // acquiring output_lock) so an in-flight start_show / go_live_now sees the generation
@@ -2947,6 +2983,8 @@ impl Engine {
         if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
             let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
             self.ensure_idle_for_switch(noun).await?;
+            // A held key's item is in the collection being left: put it back first.
+            self.studio_release_holds().await;
         }
         let out = self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)?;
         // Another collection may have its own vertical picture (or none): the stream follows.
@@ -2978,6 +3016,20 @@ impl Engine {
         host.preview(rect).await.map_err(failed)?;
         host.program_view(program).await.map_err(failed)?;
         host.vertical_view(vertical).await.map_err(failed)
+    }
+
+    /// Performance mode now: whether the preview is paused.
+    pub async fn studio_preview_paused(&self) -> Result<bool, EngineError> {
+        Ok(self.studio_host()?.preview_paused().await)
+    }
+
+    /// Performance mode: pauses (`paused`) or resumes drawing the preview → whether it is paused
+    /// now. The outputs are never touched, so it is allowed while streaming or recording (that
+    /// is what it is for). Said again, it changes nothing.
+    pub async fn studio_set_preview_paused(&self, paused: bool) -> Result<bool, EngineError> {
+        let host = self.studio_host()?;
+        host.set_preview_paused(paused).await.map_err(failed)?;
+        Ok(host.preview_paused().await)
     }
 
     /// The cursor over the pictures (a CSS cursor name, as the page's stage shows it there).
@@ -3265,6 +3317,8 @@ mod tests {
         direct: std::sync::atomic::AtomicBool,
         /// Each `capture_keys(on)` the page asked for.
         captured: std::sync::Mutex<Vec<bool>>,
+        /// Performance mode: the preview is paused.
+        paused: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -3304,6 +3358,13 @@ mod tests {
         async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String> {
             self.rects.lock().unwrap_or_else(|p| p.into_inner()).push(rect);
             Ok(())
+        }
+        async fn set_preview_paused(&self, paused: bool) -> Result<(), String> {
+            self.paused.store(paused, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn preview_paused(&self) -> bool {
+            self.paused.load(std::sync::atomic::Ordering::SeqCst)
         }
         async fn defaults(&self, _kind: String) -> Result<Value, String> {
             Ok(serde_json::json!({}))
@@ -3473,6 +3534,39 @@ mod tests {
         e.studio_capture_keys(true);
         e.studio_capture_keys(false);
         assert_eq!(*fake.captured.lock().unwrap_or_else(|p| p.into_inner()), vec![true, false]);
+    }
+
+    /// Performance mode: the engine asks the host to pause, answers what the host says, and
+    /// saying the same thing twice changes nothing. Without the desktop app it says so (not a
+    /// crash, not a pretend success).
+    #[tokio::test]
+    async fn performance_mode_goes_to_the_host_and_is_idempotent() {
+        let (e, _d) = engine().await;
+        assert!(matches!(
+            e.studio_set_preview_paused(true).await.unwrap_err(),
+            EngineError::Refused { code: "studio_unavailable", .. }
+        ));
+        assert!(e.studio_preview_paused().await.is_err());
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        assert!(!e.studio_preview_paused().await.unwrap());
+        assert!(e.studio_set_preview_paused(true).await.unwrap());
+        assert!(e.studio_set_preview_paused(true).await.unwrap());
+        assert!(e.studio_preview_paused().await.unwrap());
+        assert!(!e.studio_set_preview_paused(false).await.unwrap());
+        // It never asks the host to do anything to the scenes, the stream or a recording.
+        assert!(fake.acts.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+        assert!(fake.outputs.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn the_performance_mode_keys_are_known_shortcut_actions() {
+        for a in ["performance_mode", "performance_mode_on", "performance_mode_off"] {
+            assert!(HOTKEY_ACTIONS.contains(&a), "{a}");
+            let mut s = StudioSettings::default();
+            s.hotkeys.insert(a.into(), "Alt+P".into());
+            assert!(s.check().is_ok(), "{a}");
+        }
     }
 
     #[tokio::test]
