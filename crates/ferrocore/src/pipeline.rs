@@ -106,6 +106,8 @@ pub struct Pipeline {
     rec_last_dts_us: Option<i64>,
     /// Last decode timestamp produced by `self.video`, carried across `set_video` and `heal`.
     last_video_dts_us: Option<i64>,
+    /// Logged once if the last-resort DTS clamp in `video_out` ever fires.
+    dts_clamp_logged: bool,
     /// Sound that came while the cut's end wasn't known yet (resumed, no keyframe since).
     rec_held: VecDeque<(usize, AudioPacket)>,
     /// The newest frame given to the encoder (µs).
@@ -456,6 +458,7 @@ impl Pipeline {
             rec_last_raw_pts_us: None,
             rec_last_dts_us: None,
             last_video_dts_us: None,
+            dts_clamp_logged: false,
             rec_held: VecDeque::new(),
             last_in_us: 0,
         })
@@ -1032,18 +1035,33 @@ impl Pipeline {
         ((us - self.stream_from_us).max(0) / 1000) as u32
     }
 
+    /// Nominal output frame duration in microseconds (at least 1).
+    fn frame_us(&self) -> i64 {
+        let vcfg = *self.video.config();
+        (1_000_000 * i64::from(vcfg.fps_den.max(1)) / i64::from(vcfg.fps_num.max(1))).max(1)
+    }
+
     fn video_out(&mut self, packets: Vec<VideoPacket>) -> Result<Vec<Tag>, AvError> {
         let codec = self.video.config().codec;
+        let frame_us = self.frame_us();
+        let max_step = (frame_us / 4).max(1);
         let mut tags = Vec::new();
         for mut p in packets {
             if let Some(last) = self.last_video_dts_us
                 && p.dts_us <= last
             {
-                let step = if p.pts_us > last { ((p.pts_us - last) / 4).clamp(1, 1_000) } else { 1 };
-                p.dts_us = last + step;
-                if p.pts_us < p.dts_us {
-                    p.pts_us = p.dts_us;
+                let clamped = monotonic_dts_step(last, p.pts_us, max_step);
+                if !self.dts_clamp_logged {
+                    self.dts_clamp_logged = true;
+                    tracing::warn!(
+                        pts_us = p.pts_us,
+                        dts_us = p.dts_us,
+                        clamped_dts_us = clamped,
+                        last_dts_us = last,
+                        "pipeline clamped video decode timestamp to stay monotonic"
+                    );
                 }
+                p.dts_us = clamped;
             }
             self.last_video_dts_us = Some(p.dts_us);
             // A stream that joined goes out from its first keyframe, timed from its decode time
@@ -1077,8 +1095,7 @@ impl Pipeline {
         // Resumed after a recording-only pause: the cut ends at the first keyframe out; frames
         // before it aren't written (they lean on frames inside the cut).
         let mut resumed = false;
-        let vcfg = *self.video.config();
-        let frame_us = (1_000_000 * i64::from(vcfg.fps_den.max(1)) / i64::from(vcfg.fps_num.max(1))).max(1);
+        let frame_us = self.frame_us();
         if let Some(c) = self.rec_cuts.last_mut()
             && c.to.is_none()
         {
@@ -1135,6 +1152,7 @@ impl Pipeline {
         self.rec_last_raw_pts_us = Some(self.rec_last_raw_pts_us.map_or(raw_pts, |prev| prev.max(raw_pts)));
         // The recording alone paused: frames in a cut aren't written, later ones move back.
         let mut shifted;
+        let frame_us = self.frame_us();
         let p = if self.rec_cuts.is_empty() {
             p
         } else {
@@ -1144,11 +1162,7 @@ impl Pipeline {
             if let Some(last) = self.rec_last_dts_us
                 && shifted.dts_us <= last
             {
-                let step = if shifted.pts_us > last { ((shifted.pts_us - last) / 4).clamp(1, 1_000) } else { 1 };
-                shifted.dts_us = last + step;
-                if shifted.pts_us < shifted.dts_us {
-                    shifted.pts_us = shifted.dts_us;
-                }
+                shifted.dts_us = monotonic_dts_step(last, shifted.pts_us, (frame_us / 4).max(1));
             }
             &shifted
         };
@@ -1313,6 +1327,16 @@ impl Pipeline {
     fn record_into(&mut self, file: File) {
         self.recording =
             Some(Recording::Waiting { file: BufWriter::new(file), kind: Kind::Mp4, held: VecDeque::new() });
+    }
+}
+
+/// Last-resort DTS bump that rises above `last` while leaving headroom before `pts_us` for buffered B-frames.
+fn monotonic_dts_step(last: i64, pts_us: i64, max_step: i64) -> i64 {
+    if pts_us > last {
+        let headroom = pts_us - last;
+        last + (headroom / 4).clamp(1, max_step.max(1)).min(headroom)
+    } else {
+        last + 1
     }
 }
 
@@ -2214,5 +2238,75 @@ mod bframe_tests {
         assert!(v.windows(2).all(|w| w[1].1 > w[0].1), "mp4 decode times strictly rise across pause/resume");
         assert!(v.iter().all(|p| p.1 <= p.0 + 1e-6), "never displayed before decoded");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 60 fps 2+ GOP pipeline with B-frames (including simulated engine stalls): FLV tag DTS
+    /// never hits 1 ms clamp steps and every packet's display time matches its true capture time.
+    #[test]
+    fn bframes_60fps_pipeline_flv_tags_have_steady_dts_and_exact_pts() {
+        let cfg = VideoConfig {
+            fps_num: 60,
+            fps_den: 1,
+            keyframe_secs: 1,
+            width: 640,
+            height: 360,
+            bitrate_kbps: 3000,
+            ..video(true)
+        };
+        let Ok(mut pipe) = Pipeline::new(cfg, AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }, None)
+        else {
+            return;
+        };
+        let dts_shift_us = 50_000i64;
+        let frame_ns = 16_666_667u64;
+        let y_base = vec![90u8; 640 * 360];
+        let uv = vec![128u8; 640 * 180];
+        let mut tags = Vec::new();
+        let mut input_pts_ms = Vec::new();
+        let mut ts = 0u64;
+        for i in 0..160u64 {
+            if matches!(i, 14 | 31 | 63 | 80) {
+                ts += frame_ns * 3;
+            } else if i > 0 {
+                ts += frame_ns;
+            }
+            input_pts_ms.push(((ts / 1000) as i64 + dts_shift_us) / 1000);
+            let mut y = y_base.clone();
+            let stripe = ((i as usize * 37) % 360) * 640;
+            let end = (stripe + 640 * 6).min(y.len());
+            for b in &mut y[stripe..end] {
+                *b = ((i * 23) % 251) as u8;
+            }
+            tags.extend(
+                pipe.video(Frame::Nv12 { y: &y, y_stride: 640, uv: &uv, uv_stride: 640 }, ts)
+                    .unwrap_or_else(|e| panic!("{e}")),
+            );
+        }
+        tags.extend(pipe.finish().unwrap_or_else(|e| panic!("{e}")));
+
+        let mut dts_ms = Vec::new();
+        let mut pts_ms = Vec::new();
+        let mut keys = 0usize;
+        for t in tags {
+            if let Tag::Video { ms, body } = t
+                && body.len() > 5
+                && body[1] == 1
+            {
+                if body[0] >> 4 == 1 {
+                    keys += 1;
+                }
+                let cts = ((body[2] as i32) << 16 | (body[3] as i32) << 8 | (body[4] as i32)) << 8 >> 8;
+                assert!(cts >= 0, "negative cts {cts}");
+                dts_ms.push(i64::from(ms));
+                pts_ms.push(i64::from(ms) + i64::from(cts));
+            }
+        }
+        assert_eq!(dts_ms.len(), 160);
+        assert!(keys >= 2, "expected 2+ GOPs, got {keys} keyframes");
+        assert!(dts_ms.windows(2).all(|w| w[1] - w[0] >= 8), "no 1 ms DTS clamp steps: {dts_ms:?}");
+        pts_ms.sort_unstable();
+        for (got, want) in pts_ms.iter().zip(&input_pts_ms) {
+            assert!((got - want).abs() <= 1, "display time altered: got={got} ms want={want} ms");
+        }
     }
 }
