@@ -1057,8 +1057,6 @@ impl OwnStream {
             (_, Some((seconds, mb))) => OutputKind::Replay { seconds, mb },
             (Some(p), None) => OutputKind::Record(p.to_path_buf()),
             (None, None) => {
-                // A new stream ends the tail of the last one.
-                discard_delay();
                 let mut out = Delayed::new(
                     hub.clone(),
                     counts.clone(),
@@ -1118,6 +1116,7 @@ impl OwnStream {
                 hub.metadata(meta);
             }
         }
+        let replaces_tail = record.is_none() && replay.is_none();
         let output = match engine.start_output_with(kind, out, video, audio) {
             Ok(id) => id,
             Err(e) => {
@@ -1127,6 +1126,11 @@ impl OwnStream {
                 return Err(fail(e.to_string()));
             }
         };
+        // A new stream ends the tail of the last one, once it has started: one that fails to
+        // start (here or before) leaves the last stream's last seconds going (CodeRabbit).
+        if replaces_tail {
+            discard_delay();
+        }
         if vertical {
             shared.seen().vertical.push(output);
         }
@@ -1232,7 +1236,6 @@ impl OwnStream {
             hub.start();
             hub.metadata(meta);
         }
-        discard_delay();
         let mut out = Delayed::new(
             hub.clone(),
             counts.clone(),
@@ -1245,6 +1248,8 @@ impl OwnStream {
             hub.end();
             return Err(fail(err.to_string()));
         }
+        // The last stream's tail ends once this one has started (not when it fails to).
+        discard_delay();
         // The shared encode takes the stream's bitrate (what "Same as stream" means): the
         // recording's file follows it from here.
         if let Err(err) = d.shared.engine.set_output_kbps(d.output, e.video_kbps) {
@@ -1956,6 +1961,40 @@ mod tests {
         let _ = runner.join();
         let _ = changer.join();
         assert_eq!(hub.subscribe().headers.metadata.and_then(|m| m.video_width), Some(1280), "the reshape was kept");
+    }
+
+    /// A new stream that fails to start leaves the last one's delayed tail going: it was cut before
+    /// the engine took the new one, and a failed start lost the last seconds of the stream before.
+    /// (The only test that starts an output that could end every tail: `discard_delay` is global.)
+    #[test]
+    fn a_new_stream_that_fails_to_start_leaves_the_last_ones_tail() {
+        let doc = serde_json::json!({ "sources": [] });
+        let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 30 }, &doc) else {
+            eprintln!("skipped: no engine here");
+            return;
+        };
+        let (mut out, _) = delayed(5_000);
+        let gate = out.gate.clone();
+        out.send(video(0, true, 10));
+        drop(out);
+        assert!(gate.is_running());
+        let enc = EncodeSettings::with_encoder("obs_x264");
+        let how = Drawing {
+            send_to: None,
+            record: None,
+            encode: &enc,
+            tracks: &[],
+            delay_s: 0,
+            vertical: false,
+            replay: None,
+            solo: Some("Nothing called this"),
+            video_tracks: &[],
+        };
+        assert!(OwnStream::drawn(shared, &doc, how).is_err(), "it can't start");
+        let cancelled = gate.state.lock().unwrap_or_else(|p| p.into_inner()).cancel;
+        gate.cancel();
+        gate.wait_done();
+        assert!(!cancelled, "the last stream's tail goes on");
     }
 
     #[test]
