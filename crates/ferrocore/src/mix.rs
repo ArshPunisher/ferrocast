@@ -216,7 +216,8 @@ impl SourceResampler {
             out_rate,
             sinc_len,
             rs,
-            pending: [Vec::new(), Vec::new()],
+            // Room for a long piece after a stall (drained a chunk at a time).
+            pending: [Vec::with_capacity(TAIL_ROOM), Vec::with_capacity(TAIL_ROOM)],
             in_scratch: [vec![0.0; RESAMPLE_CHUNK], vec![0.0; RESAMPLE_CHUNK]],
             out_scratch: [vec![0.0; out_max], vec![0.0; out_max]],
             primed: false,
@@ -249,13 +250,18 @@ impl SourceResampler {
     /// pushed to `queue`, trimming the overlapping tail from `queue` so output is continuous.
     fn new_warm(in_rate: u32, out_rate: u32, tail: &[Vec<f32>; 2], queue: &mut VecDeque<f32>) -> Option<Self> {
         let mut s = Self::new_cold(in_rate, out_rate)?;
-        if in_rate == out_rate && tail[0].len() >= RESAMPLE_CHUNK {
-            let start = tail[0].len() - RESAMPLE_CHUNK;
-            s.in_scratch[0].copy_from_slice(&tail[0][start..]);
-            s.in_scratch[1].copy_from_slice(&tail[1][start..]);
-            s.prime_from_scratch(queue);
-        }
+        s.prime_warm(tail, queue);
         Some(s)
+    }
+
+    /// As [`Self::new_warm`] for one made already (no allocation here).
+    fn prime_warm(&mut self, tail: &[Vec<f32>; 2], queue: &mut VecDeque<f32>) {
+        if self.in_rate == self.out_rate && tail[0].len() >= RESAMPLE_CHUNK {
+            let start = tail[0].len() - RESAMPLE_CHUNK;
+            self.in_scratch[0].copy_from_slice(&tail[0][start..]);
+            self.in_scratch[1].copy_from_slice(&tail[1][start..]);
+            self.prime_from_scratch(queue);
+        }
     }
 
     fn reset(&mut self, queue: &mut VecDeque<f32>) {
@@ -575,6 +581,11 @@ pub struct Mixer {
     spares: Vec<SpareSource>,
     /// Spares used since asked for.
     spares_wanted: usize,
+    /// Resamplers made ahead for a source that starts following drift, and how many to make.
+    rs_spares: Vec<SpareResampler>,
+    rs_wanted: usize,
+    /// Resamplers a source no longer uses, to be dropped elsewhere.
+    rs_retired: Vec<SpareResampler>,
     /// Entries of removed sources, waiting to be dropped elsewhere.
     #[allow(clippy::vec_box)] // boxed as they were in the map: moving one out must not allocate
     retired: Vec<Box<Source>>,
@@ -803,6 +814,23 @@ const MAX_POOL: usize = 64;
 const SPARES: usize = 4;
 const RETIRED_ROOM: usize = 16;
 
+/// Key buffers made ahead for sidechained compressors (more are made when needed).
+const KEY_BUFS_AHEAD: usize = 4;
+
+/// Resamplers kept made ahead (same rate in and out: what following a clock's drift uses), and
+/// used ones kept for dropping elsewhere.
+const RS_SPARES: usize = 2;
+const RS_RETIRED_ROOM: usize = 8;
+
+/// A resampler made ahead (its filter tables are built when it is made: not on the audio thread).
+pub struct SpareResampler(SourceResampler);
+
+impl std::fmt::Debug for SpareResampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpareResampler")
+    }
+}
+
 /// A source's mixer entry made ahead of the source (see [`Mixer::make_spare`]).
 pub struct SpareSource(Box<Source>);
 
@@ -937,6 +965,9 @@ impl Mixer {
             sources: crate::rt::PreMap::new(),
             spares: (0..SPARES).map(|_| SpareSource(Self::fresh_source(rate))).collect(),
             spares_wanted: 0,
+            rs_spares: (0..RS_SPARES).map(|_| SpareResampler(Self::cold_rs(rate))).collect(),
+            rs_wanted: 0,
+            rs_retired: Vec::with_capacity(RS_RETIRED_ROOM),
             retired: Vec::with_capacity(RETIRED_ROOM),
             next_ns: None,
             taps: Vec::new(),
@@ -957,7 +988,11 @@ impl Mixer {
                 bbuf: Vec::with_capacity(BLOCK * 2),
             },
             mix_order: Vec::with_capacity(crate::rt::PreMap::<Box<Source>>::ROOM),
-            key_bufs: Vec::new(),
+            key_bufs: {
+                let mut v = Vec::with_capacity(crate::rt::PreMap::<Box<Source>>::ROOM);
+                v.extend((0..KEY_BUFS_AHEAD).map(|_| Box::new(([0.0; BLOCK], [0.0; BLOCK]))));
+                v
+            },
             broken_cycles: Vec::new(),
             plan_scratch: PlanScratch::with_room(),
             // Made now, not on the first blocks: a block the pool lacks is allocated mid-mix.
@@ -1255,6 +1290,32 @@ impl Mixer {
     /// makes it.
     pub fn make_spare(rate: u32) -> SpareSource {
         SpareSource(Self::fresh_source(rate))
+    }
+
+    fn cold_rs(rate: u32) -> SourceResampler {
+        // Same rate in and out: the filter the drift follower uses. (Can't fail for these rates.)
+        SourceResampler::new_cold(rate, rate).unwrap_or_else(|| panic!("a {rate} Hz resampler"))
+    }
+
+    /// A resampler made ahead, to be handed to [`Mixer::add_spare_resampler`].
+    pub fn make_spare_resampler(rate: u32) -> SpareResampler {
+        SpareResampler(Self::cold_rs(rate))
+    }
+
+    pub fn add_spare_resampler(&mut self, r: SpareResampler) {
+        if self.rs_spares.len() < RS_SPARES {
+            self.rs_spares.push(r);
+        }
+    }
+
+    /// How many resamplers to make to replace the ones taken since the last call.
+    pub fn take_resampler_request(&mut self) -> usize {
+        std::mem::take(&mut self.rs_wanted)
+    }
+
+    /// A resampler a source left, to be dropped off the audio thread.
+    pub fn pop_retired_resampler(&mut self) -> Option<SpareResampler> {
+        self.rs_retired.pop()
     }
 
     /// Keeps a spare entry for the next source that appears.
@@ -1577,6 +1638,12 @@ impl Mixer {
         removed
     }
 
+    /// Whether source `id` is following its clock's drift now (a resampler is at work).
+    #[must_use]
+    pub fn follows_drift(&self, id: u64) -> bool {
+        self.sources.get(&id).is_some_and(|s| s.drift.follows)
+    }
+
     /// Number of sources currently registered in the mixer.
     pub fn source_count(&self) -> usize {
         self.sources.len()
@@ -1868,7 +1935,12 @@ impl Mixer {
             }
         }
         if rate == out_rate && !src.drift.follows {
-            src.resampler = None;
+            // Off the audio thread when dropped (its filter tables are large).
+            if let Some(old) = src.resampler.take()
+                && self.rs_retired.len() < RS_RETIRED_ROOM
+            {
+                self.rs_retired.push(SpareResampler(old));
+            }
             src.drift.push_tail(l, r);
             for (a, b) in l.iter().zip(r.iter()) {
                 src.queue.push_back(*a);
@@ -1877,7 +1949,18 @@ impl Mixer {
         } else {
             if src.resampler.as_ref().is_none_or(|rs| rs.in_rate != rate) {
                 let made = if rate == out_rate && !switched_rate && src.drift.tail[0].len() >= RESAMPLE_CHUNK {
-                    let rs = SourceResampler::new_warm(rate, out_rate, &src.drift.tail, &mut src.queue);
+                    // One made ahead when there is one; else made here (and more asked for).
+                    let rs = match self.rs_spares.pop() {
+                        Some(mut spare) => {
+                            self.rs_wanted += 1;
+                            spare.0.prime_warm(&src.drift.tail, &mut src.queue);
+                            Some(spare.0)
+                        }
+                        None => {
+                            self.rs_wanted += 1;
+                            SourceResampler::new_warm(rate, out_rate, &src.drift.tail, &mut src.queue)
+                        }
+                    };
                     src.drift.tail[0].clear();
                     src.drift.tail[1].clear();
                     rs
@@ -4324,7 +4407,7 @@ mod steady_state_tests {
             }
         }
         assert_eq!(m.source_count(), 1);
-        assert!(m.key_bufs.len() <= 1, "key_bufs grew unexpectedly over 10k cycles: {}", m.key_bufs.len());
+        assert!(m.key_bufs.len() <= KEY_BUFS_AHEAD, "key_bufs grew unexpectedly over 10k cycles: {}", m.key_bufs.len());
         assert!(m.broken_sidechains().is_empty());
     }
 
