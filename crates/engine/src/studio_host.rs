@@ -388,11 +388,19 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     }
     /// OBS's scene collections on this computer: `{ id, name, scenes, sources }[]`.
     async fn obs_collections(&self) -> Result<Value, String>;
+    /// Previews OBS's collection `id` without changing anything in the Studio.
+    async fn preview_obs(&self, _id: String) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// Replaces the Studio's scenes with OBS's collection `id` (listed by `obs_collections`;
     /// the old scenes are kept in a file first) → what came in.
     async fn import_obs(&self, id: String) -> Result<Value, String>;
     /// Streamlabs Desktop's scene collections on this computer, like `obs_collections`.
     async fn streamlabs_collections(&self) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Previews Streamlabs' collection `id` without changing anything in the Studio.
+    async fn preview_streamlabs(&self, _id: String) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
     /// Adds Streamlabs' collection `id` as a new scene collection (turned into OBS's format,
@@ -2546,9 +2554,25 @@ impl Engine {
         self.studio_host()?.obs_collections().await.map_err(failed)
     }
 
+    /// Previews OBS's scene collection `id` without modifying Studio state.
+    pub async fn studio_preview_obs(&self, id: &str) -> Result<Value, EngineError> {
+        if !collection_id_ok(id) {
+            return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
+        }
+        self.studio_host()?.preview_obs(id.to_string()).await.map_err(failed)
+    }
+
     /// Streamlabs Desktop's scene collections, to import one.
     pub async fn studio_streamlabs_collections(&self) -> Result<Value, EngineError> {
         self.studio_host()?.streamlabs_collections().await.map_err(failed)
+    }
+
+    /// Previews Streamlabs' scene collection `id` without modifying Studio state.
+    pub async fn studio_preview_streamlabs(&self, id: &str) -> Result<Value, EngineError> {
+        if !collection_id_ok(id) {
+            return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
+        }
+        self.studio_host()?.preview_streamlabs(id.to_string()).await.map_err(failed)
     }
 
     /// Brings in Streamlabs' scene collection `id` as a new scene collection.
@@ -3048,6 +3072,31 @@ fn failed(message: String) -> EngineError {
     if message.contains("There's no scene collection") || message.contains("There's no profile") {
         return refused(404, "studio_no_such", message, "Refresh the list.");
     }
+    if (message.contains("scene collection") && message.contains("isn't there any more"))
+        || message.contains("has no such scene collection")
+    {
+        return refused(404, "studio_no_obs_collection", message, "Pick one from the list.");
+    }
+    if message.contains("JSON is damaged")
+        || message.contains("didn't read")
+        || message.contains("isn't an OBS")
+        || message.contains("isn't a Streamlabs")
+    {
+        return refused(
+            422,
+            "studio_collection_broken",
+            message,
+            "Pick another scene collection or start fresh in Ferrocast.",
+        );
+    }
+    if message.contains("too large to") {
+        return refused(
+            413,
+            "studio_collection_too_large",
+            message,
+            "Split very large collections in OBS or Streamlabs, or start fresh.",
+        );
+    }
     if message.contains("already a source") || message.contains("already a filter") {
         return refused(409, "studio_name_taken", message, "Pick another name.");
     }
@@ -3372,8 +3421,53 @@ mod tests {
         async fn obs_collections(&self) -> Result<Value, String> {
             Ok(serde_json::json!([{ "id": "Untitled", "name": "Untitled", "scenes": 2, "sources": 3 }]))
         }
+        async fn preview_obs(&self, id: String) -> Result<Value, String> {
+            match id.as_str() {
+                "Untitled" => Ok(serde_json::json!({
+                    "source": "obs",
+                    "id": "Untitled",
+                    "name": "Untitled",
+                    "scenes": 2,
+                    "sources": 3,
+                    "web_pages": 0,
+                    "scene_names": ["Main", "BRB"],
+                    "truncated_scenes": 0,
+                    "device_resets": [],
+                    "skipped": [],
+                    "skipped_total": 0,
+                    "missing": []
+                })),
+                "broken" => {
+                    Err("OBS's scene collection \"broken\" couldn't be read because the JSON is damaged.".into())
+                }
+                "huge" => Err("The collection file is too large to preview.".into()),
+                _ => Err(format!("OBS's scene collection \"{id}\" isn't there any more.")),
+            }
+        }
         async fn import_obs(&self, id: String) -> Result<Value, String> {
-            Ok(serde_json::json!({ "name": id, "scenes": 2, "sources": 3, "web_pages": 0, "missing": [] }))
+            Ok(
+                serde_json::json!({ "id": "untitled-2", "previous_id": "untitled", "name": id, "scenes": 2, "sources": 3, "web_pages": 0, "missing": [] }),
+            )
+        }
+        async fn preview_streamlabs(&self, id: String) -> Result<Value, String> {
+            if id == "sl-main" {
+                Ok(serde_json::json!({
+                    "source": "streamlabs",
+                    "id": id,
+                    "name": "SL Main",
+                    "scenes": 1,
+                    "sources": 2,
+                    "web_pages": 1,
+                    "scene_names": ["Live"],
+                    "truncated_scenes": 0,
+                    "device_resets": [],
+                    "skipped": [],
+                    "skipped_total": 0,
+                    "missing": []
+                }))
+            } else {
+                Err("That Streamlabs scene collection isn't there any more.".into())
+            }
         }
     }
 
@@ -3747,6 +3841,28 @@ mod tests {
         assert!(matches!(
             failed("Stop streaming and recording before bringing in scenes.".into()),
             EngineError::Refused { status: 409, code: "studio_busy", .. }
+        ));
+        assert_eq!(e.studio_preview_obs("Untitled").await.unwrap()["scenes"], 2);
+        assert_eq!(e.studio_preview_streamlabs("sl-main").await.unwrap()["source"], "streamlabs");
+        for bad in ["../Untitled", "", ".x", "a/b"] {
+            assert!(matches!(e.studio_preview_obs(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
+            assert!(matches!(e.studio_preview_streamlabs(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
+        }
+        assert!(matches!(
+            e.studio_preview_obs("Other").await.unwrap_err(),
+            EngineError::Refused { status: 404, code: "studio_no_obs_collection", .. }
+        ));
+        assert!(matches!(
+            e.studio_preview_obs("broken").await.unwrap_err(),
+            EngineError::Refused { status: 422, code: "studio_collection_broken", .. }
+        ));
+        assert!(matches!(
+            e.studio_preview_obs("huge").await.unwrap_err(),
+            EngineError::Refused { status: 413, code: "studio_collection_too_large", .. }
+        ));
+        assert!(matches!(
+            e.studio_preview_streamlabs("missing").await.unwrap_err(),
+            EngineError::Refused { status: 404, code: "studio_no_obs_collection", .. }
         ));
     }
 

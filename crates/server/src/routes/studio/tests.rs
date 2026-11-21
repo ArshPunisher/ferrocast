@@ -630,6 +630,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Cam" })).await,
         r.post("/studio/engine/sources/Alerts/web", json!({ "do": "interact" })).await,
         r.get("/studio/engine/obs-collections").await,
+        r.post("/studio/engine/obs-collections/preview", json!({ "id": "Untitled" })).await,
+        r.get("/studio/engine/streamlabs-collections").await,
+        r.post("/studio/engine/streamlabs-collections/preview", json!({ "id": "sl-1" })).await,
         r.post("/studio/engine/sources/Gameplay/screenshot", json!({})).await,
         r.put(
             "/studio/engine/scenes/Gameplay/transition",
@@ -755,7 +758,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.post("/studio/engine/record", json!({})).await, "record without on"),
         (r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Mic" })).await, "paste onto itself"),
         (r.post("/studio/engine/sources/Alerts/web", json!({ "do": "click" })).await, "unknown web act"),
+        (r.post("/studio/engine/obs-collections/preview", json!({ "id": "../x" })).await, "preview id with path"),
         (r.post("/studio/engine/obs-collections/import", json!({ "id": "../x" })).await, "id with a path"),
+        (r.post("/studio/engine/streamlabs-collections/preview", json!({ "id": "../x" })).await, "sl preview path"),
         (
             r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 0, "y": 0, "w": 0, "h": 360 })).await,
             "no width",
@@ -873,6 +878,45 @@ impl ferrocast_engine::studio_host::StudioHost for LevelsStudio {
     async fn import_obs(&self, _id: String) -> Result<Value, String> {
         Ok(Value::Null)
     }
+    async fn preview_obs(&self, id: String) -> Result<Value, String> {
+        match id.as_str() {
+            "Untitled" => Ok(json!({
+                "source": "obs",
+                "id": "Untitled",
+                "name": "Untitled",
+                "scenes": 2,
+                "sources": 4,
+                "web_pages": 1,
+                "scene_names": ["Main", "BRB"],
+                "truncated_scenes": 0,
+                "device_resets": [],
+                "skipped": [],
+                "skipped_total": 0,
+                "missing": []
+            })),
+            "broken" => Err("OBS's scene collection \"broken\" couldn't be read because the JSON is damaged.".into()),
+            _ => Err(format!("OBS's scene collection \"{id}\" isn't there any more.")),
+        }
+    }
+    async fn preview_streamlabs(&self, id: String) -> Result<Value, String> {
+        match id.as_str() {
+            "sl-main" => Ok(json!({
+                "source": "streamlabs",
+                "id": "sl-main",
+                "name": "SL Main",
+                "scenes": 1,
+                "sources": 2,
+                "web_pages": 1,
+                "scene_names": ["Live"],
+                "truncated_scenes": 0,
+                "device_resets": [],
+                "skipped": [],
+                "skipped_total": 0,
+                "missing": []
+            })),
+            _ => Err("That Streamlabs scene collection isn't there any more.".into()),
+        }
+    }
     fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
         Some(json!({ names[0].clone(): { "peak": [if fast { -6.0 } else { -20.0 }, -6.0] } }))
     }
@@ -970,6 +1014,45 @@ impl ferrocast_engine::studio_host::StudioHost for ItemFilterHost {
     async fn import_obs(&self, _id: String) -> Result<Value, String> {
         Ok(Value::Null)
     }
+    async fn preview_obs(&self, id: String) -> Result<Value, String> {
+        match id.as_str() {
+            "Untitled" => Ok(json!({
+                "source": "obs",
+                "id": "Untitled",
+                "name": "Untitled",
+                "scenes": 2,
+                "sources": 4,
+                "web_pages": 1,
+                "scene_names": ["Main", "BRB"],
+                "truncated_scenes": 0,
+                "device_resets": [],
+                "skipped": [],
+                "skipped_total": 0,
+                "missing": []
+            })),
+            "broken" => Err("OBS's scene collection \"broken\" couldn't be read because the JSON is damaged.".into()),
+            _ => Err(format!("OBS's scene collection \"{id}\" isn't there any more.")),
+        }
+    }
+    async fn preview_streamlabs(&self, id: String) -> Result<Value, String> {
+        match id.as_str() {
+            "sl-main" => Ok(json!({
+                "source": "streamlabs",
+                "id": "sl-main",
+                "name": "SL Main",
+                "scenes": 1,
+                "sources": 2,
+                "web_pages": 1,
+                "scene_names": ["Live"],
+                "truncated_scenes": 0,
+                "device_resets": [],
+                "skipped": [],
+                "skipped_total": 0,
+                "missing": []
+            })),
+            _ => Err("That Streamlabs scene collection isn't there any more.".into()),
+        }
+    }
     async fn act(&self, act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
         self.acts.lock().unwrap().push(act.clone());
         match act {
@@ -1051,4 +1134,39 @@ async fn item_filter_routes_forward_item_target_and_validate_queries() {
     assert!(matches!(&acts[2], StudioAct::SetItemFilterScope { scene, id: 3, own: true } if scene == "Vertical"));
     assert!(matches!(&acts[3], StudioAct::EditFilter { edit: FilterEdit::Disable, item, .. } if item == &expected));
     assert!(matches!(&acts[10], StudioAct::SourcePicture { filters: true, item, .. } if item == &expected));
+}
+
+#[tokio::test]
+async fn import_preview_routes_validate_and_forward() {
+    let r = start().await;
+    let host = Arc::new(ItemFilterHost::default());
+    r.engine.set_studio_host(host);
+
+    let obs_ok = r.post("/studio/engine/obs-collections/preview", json!({ "id": "Untitled" })).await;
+    assert_eq!(obs_ok.status(), StatusCode::OK);
+    let body: Value = obs_ok.json().await.unwrap();
+    assert_eq!(body["scenes"], 2);
+    assert_eq!(body["web_pages"], 1);
+
+    let sl_ok = r.post("/studio/engine/streamlabs-collections/preview", json!({ "id": "sl-main" })).await;
+    assert_eq!(sl_ok.status(), StatusCode::OK);
+    let sl_body: Value = sl_ok.json().await.unwrap();
+    assert_eq!(sl_body["source"], "streamlabs");
+
+    assert_eq!(
+        r.post("/studio/engine/obs-collections/preview", json!({ "id": "../bad" })).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.post("/studio/engine/obs-collections/preview", json!({ "id": "missing" })).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        r.post("/studio/engine/obs-collections/preview", json!({ "id": "broken" })).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        r.post("/studio/engine/streamlabs-collections/preview", json!({ "id": "missing" })).await.status(),
+        StatusCode::NOT_FOUND
+    );
 }
