@@ -20,6 +20,7 @@ mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod automation;
 pub mod designs;
+pub mod diagnostics;
 mod discord;
 mod dispatcher;
 mod error;
@@ -30,6 +31,7 @@ pub mod golive;
 mod guests;
 mod history;
 pub mod import;
+mod labels;
 mod loyalty;
 pub mod music;
 mod obs;
@@ -119,6 +121,7 @@ pub struct Engine {
 
 #[derive(Debug)]
 struct Inner {
+    data_dir: std::path::PathBuf,
     store: Arc<Store>,
     state: RwLock<State>,
     connectors: RwLock<HashMap<Platform, Arc<dyn Connector>>>,
@@ -209,6 +212,10 @@ struct Inner {
     plugin_logic: Mutex<plugins::Running>,
     /// Unclean-exit detection and Safe Mode state.
     safe_mode: Mutex<safe_mode::SafeModeState>,
+    /// Local session/monthly/all-time label counts and hype/combo trains.
+    labels: Mutex<labels::LabelRuntime>,
+    /// Current stream health tracker persisted to the last-5 streams store.
+    stream_health: Mutex<diagnostics::ActiveStreamHealth>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -298,6 +305,7 @@ impl Engine {
         let start_seq = u64::try_from(now().0).unwrap_or(0).saturating_mul(1000);
         let engine = Engine {
             inner: Arc::new(Inner {
+                data_dir: data_dir.to_path_buf(),
                 store,
                 state: RwLock::new(state),
                 connectors: RwLock::new(HashMap::new()),
@@ -359,6 +367,8 @@ impl Engine {
                 automations: Mutex::new(Default::default()),
                 plugin_logic: Mutex::new(Default::default()),
                 safe_mode: Mutex::new(Default::default()),
+                labels: Mutex::new(Default::default()),
+                stream_health: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -387,6 +397,9 @@ impl Engine {
         tokio::spawn(cloud_bot::run(engine.clone()));
         engine.load_smart().await;
         tokio::spawn(smart::run(engine.clone()));
+        engine.hydrate_labels().await;
+        engine.mark_unclean_stream_health().await;
+        tokio::spawn(labels::run(engine.clone()));
         tokio::spawn(ferro_account::run(engine.clone()));
         engine.guests_at_start();
         tokio::spawn(cloud_sync::run(engine.clone()));
@@ -398,6 +411,11 @@ impl Engine {
     /// Where adapters send events.
     pub fn sink(&self) -> EventSink {
         self.inner.sink.clone()
+    }
+
+    /// Data directory configured when starting this engine.
+    pub fn data_dir(&self) -> &Path {
+        &self.inner.data_dir
     }
 
     /// Submits an event (used by the API for tests and by in-process sources).

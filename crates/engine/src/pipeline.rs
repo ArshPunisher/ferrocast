@@ -209,12 +209,18 @@ impl Engine {
                 if e.origin == Origin::Live {
                     self.discord_go_live(e.platform, title.clone());
                 }
-                let mut st = self.state_mut();
-                let anyone_live = st.live.values().any(|l| *l);
-                st.live.insert(e.platform, true);
+                let anyone_live = {
+                    let mut st = self.state_mut();
+                    let was_live = st.live.values().any(|l| *l);
+                    st.live.insert(e.platform, true);
+                    if !was_live {
+                        st.session = crate::state::Session { started_at: Some(at), ..Default::default() };
+                    }
+                    was_live
+                };
                 if !anyone_live {
-                    st.session = crate::state::Session { started_at: Some(at), ..Default::default() };
-                    drop(st);
+                    self.labels_reset_session().await;
+                    self.push_all_overlay_labels().await;
                     // A new stream: chat overlays empty out and the dashboard loads this
                     // stream's chat again, so the last stream's messages don't show.
                     self.send_overlay(crate::frames::OverlayFrame::new(
@@ -225,19 +231,29 @@ impl Engine {
                     ));
                     self.send_live(crate::frames::LiveFrame::new("resync", &json!({ "missed": 0 })));
                 }
+                if e.origin == Origin::Live {
+                    self.health_stream_started(at, e.platform).await;
+                }
             }
             EventKind::StreamOffline => {
                 if e.platform == Platform::Youtube && e.origin == Origin::Live {
                     let since = self.state().session.started_at.map_or(at.0 - 43_200_000, |m| m.0);
                     self.youtube_chapters_later(since);
                 }
-                let mut st = self.state_mut();
-                st.live.insert(e.platform, false);
-                // An ended stream's last count must not keep adding to the peak.
-                st.viewers.remove(&e.platform);
+                let any_live = {
+                    let mut st = self.state_mut();
+                    st.live.insert(e.platform, false);
+                    // An ended stream's last count must not keep adding to the peak.
+                    st.viewers.remove(&e.platform);
+                    st.live.values().any(|l| *l)
+                };
+                if !any_live && e.origin == Origin::Live {
+                    self.health_stream_ended(at).await;
+                }
             }
             EventKind::Reversal { original_source_id, reason } => {
                 self.reverse(e.platform, original_source_id, *reason).await;
+                self.labels_observe_event(&e).await;
             }
             _ => {}
         }
@@ -456,6 +472,7 @@ impl Engine {
             self.state_mut().session.record(e);
             self.count_goals(e).await;
             self.loyalty_bonus(e).await;
+            self.labels_observe_event(e).await;
         }
 
         let (rules, test_alerts, tts_decision, paused_tts) = {

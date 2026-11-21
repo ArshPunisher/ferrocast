@@ -191,28 +191,20 @@ impl Engine {
         let mut vars = Vars::new();
         self.counter_vars(&mut vars);
         for o in overlays {
-            let labels: serde_json::Map<String, Value> = o
-                .widgets
-                .iter()
-                .filter(|w| w.kind == WidgetKind::Label)
-                .filter_map(|w| {
-                    let tpl = w.config.get("template").and_then(Value::as_str)?;
-                    if !chatbot::counters_in(tpl).iter().any(|c| c == name) {
-                        return None;
-                    }
-                    let source = w.config.get("source").and_then(Value::as_str).unwrap_or("");
-                    let mut v = vars.clone();
-                    v.insert("value".into(), self.state().session.label(source));
-                    let text = Template::parse(tpl).map(|t| t.render(&v)).unwrap_or_default();
-                    Some((w.id.clone(), json!(text)))
-                })
-                .collect();
-            if !labels.is_empty() {
+            let (labels, label_trains) = self.overlay_labels_and_trains(&o).await;
+            let has_counter = o.widgets.iter().any(|w| {
+                w.kind == WidgetKind::Label
+                    && w.config
+                        .get("template")
+                        .and_then(Value::as_str)
+                        .is_some_and(|tpl| chatbot::counters_in(tpl).iter().any(|c| c == name))
+            });
+            if has_counter && !labels.is_empty() {
                 self.send_overlay(OverlayFrame::new(
                     Audience::Overlay(o.id.clone()),
                     self.next_seq(),
                     "state",
-                    &json!({ "labels": labels }),
+                    &json!({ "labels": labels, "label_trains": label_trains }),
                 ));
             }
         }
