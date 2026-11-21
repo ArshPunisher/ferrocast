@@ -147,6 +147,12 @@ impl AlertQueue {
                 next.alert.sound = None;
                 next.alert.tts_text = None;
                 next.alert.tts_audio = None;
+                // A design brings its own sound and, if on, synthesised impact hits.
+                if let Some(d) = &mut next.alert.design {
+                    d.look.sound.media_ref = None;
+                    d.look.sound.volume = 0;
+                    d.look.motion.impact_sounds = false;
+                }
             }
             let deadline = Millis(now.0 + i64::from(next.alert.duration_ms) + self.tuning.ack_grace_ms);
             actions.push(Action::Show { alert: Box::new(next.alert.clone()) });
@@ -591,5 +597,35 @@ mod tests {
         q.enqueue(alert("p", 5_000), 0, Millis(0));
         let acts = q.enqueue_with(alert("i", 5_000), 0, true, Millis(10));
         assert_eq!(shown(&acts), vec!["i"]);
+    }
+
+    /// A muted alert with an alert design still carried the design's own sound and impact hits.
+    #[test]
+    fn mute_also_silences_the_designs_sound_and_impact_hits() {
+        use crate::design::{BuiltinSound, DesignContent, EventKey, Sound, pick, render_onto, tests::alert_design};
+        let e = any_sample("tip", Millis(0)).unwrap();
+        let rules = default_rules();
+        let (rule, var) = select(&rules, &e).unwrap();
+        let mut a = render("d1", rule, var, &e);
+        let mut d = alert_design("dz");
+        if let DesignContent::Alert(c) = &mut d.content {
+            let l = &mut c.events.get_mut(&EventKey::Tip).unwrap().variations[0].look;
+            l.sound = Sound { media_ref: Some("01hzsound".into()), builtin: BuiltinSound::Coin, volume: 55 };
+            l.motion.impact_sounds = true;
+        }
+        let (key, v) = pick(&d, &e).unwrap();
+        render_onto(&mut a, &d, key, v, &e);
+        assert!(a.design.as_ref().unwrap().look.motion.impact_sounds, "set up with sound");
+        let mut q = q();
+        q.set_muted(true);
+        let acts = q.enqueue(a, 0, Millis(0));
+        let Action::Show { alert } = &acts[0] else { panic!("no show") };
+        let look = &alert.design.as_ref().unwrap().look;
+        assert_eq!((look.sound.media_ref.as_deref(), look.sound.volume, look.motion.impact_sounds), (None, 0, false));
+        assert_eq!(
+            q.playing().unwrap().alert.design.as_ref().unwrap().look.sound.volume,
+            0,
+            "what is kept is silent too"
+        );
     }
 }
