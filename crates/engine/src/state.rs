@@ -25,7 +25,8 @@ pub struct EngineSettings {
     pub bot_enabled: bool,
     /// Ban accounts on the shared ban list automatically when they chat.
     pub auto_ban_on_sight: bool,
-    /// The dashboard's look: "system", "dark" or "light".
+    /// The dashboard's look: "system", one of the ten themes, or the older "dark" and "light"
+    /// (aliases of Slate and Daylight).
     pub theme: String,
     /// "system", "on" or "off".
     pub reduced_motion: String,
@@ -122,7 +123,25 @@ impl EngineSettings {
         let one_of = |field: &str, v: &str, ok: &[&str]| {
             if ok.contains(&v) { Ok(()) } else { Err(format!("{field}: use one of {}.", ok.join(", "))) }
         };
-        one_of("theme", &self.theme, &["system", "dark", "light"])?;
+        one_of(
+            "theme",
+            &self.theme,
+            &[
+                "system",
+                "dark",
+                "light",
+                "graphite",
+                "slate",
+                "moonlight",
+                "forest",
+                "ember",
+                "obsidian",
+                "daylight",
+                "mist",
+                "linen",
+                "contrast",
+            ],
+        )?;
         one_of("reduced_motion", &self.reduced_motion, &["system", "on", "off"])?;
         one_of("youtube_privacy", &self.youtube_privacy, &["public", "unlisted", "private"])?;
         if self.currency.len() != 3 || !self.currency.bytes().all(|b| b.is_ascii_uppercase()) {

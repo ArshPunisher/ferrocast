@@ -471,6 +471,36 @@ async fn settings_save_what_was_sent_and_name_bad_fields() {
     assert_eq!(r.put("/api/v1/settings", json!([1])).await.status(), StatusCode::BAD_REQUEST);
 }
 
+/// The dashboard's ten looks are a setting; `dark` and `light` stay as aliases of Slate and Daylight.
+#[tokio::test]
+async fn settings_take_each_of_the_ten_themes_and_still_the_old_three() {
+    let r = start().await;
+    for theme in [
+        "system",
+        "dark",
+        "light",
+        "graphite",
+        "slate",
+        "moonlight",
+        "forest",
+        "ember",
+        "obsidian",
+        "daylight",
+        "mist",
+        "linen",
+        "contrast",
+    ] {
+        let res = r.put("/api/v1/settings", json!({ "theme": theme })).await;
+        assert_eq!(res.status(), StatusCode::OK, "{theme}");
+        let s: Value = r.get("/api/v1/settings").await.json().await.unwrap();
+        assert_eq!(s["theme"], theme);
+    }
+    let bad = r.put("/api/v1/settings", json!({ "theme": "Slate" })).await;
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "ids are lower case");
+    let v: Value = bad.json().await.unwrap();
+    assert!(v["error"]["message"].as_str().unwrap().starts_with("theme"), "{v}");
+}
+
 #[tokio::test]
 async fn tts_goals_and_commands_speak_the_dashboards_language() {
     let r = start().await;

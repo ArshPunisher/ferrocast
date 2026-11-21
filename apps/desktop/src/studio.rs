@@ -86,6 +86,8 @@ struct Held {
     preview_canvas: Option<(f64, f64, f64, f64)>,
     /// The page's colour round the canvas (0xAABBGGRR), when it said.
     preview_bg: Option<u32>,
+    /// The second colour of the stripes over what runs past the canvas (0xAABBGGRR).
+    preview_stripe: Option<u32>,
     /// Where the page's menus and panels lie over the preview (points from its box's top left).
     preview_holes: Vec<(f64, f64, f64, f64, f64)>,
     /// How much of the preview shows, 0 to 1.
@@ -94,6 +96,7 @@ struct Held {
     preview_shade: f64,
     /// The same for Studio Mode's picture of what's on air.
     program_bg: Option<u32>,
+    program_stripe: Option<u32>,
     /// Where the page's menus and panels lie over Studio Mode's picture of what's on air.
     program_holes: Vec<(f64, f64, f64, f64, f64)>,
     program_opacity: Option<f64>,
@@ -215,6 +218,7 @@ struct VerticalView {
     at: Option<(Rect, f64)>,
     canvas: Option<(f64, f64, f64, f64)>,
     bg: Option<u32>,
+    stripe: Option<u32>,
     holes: Vec<(f64, f64, f64, f64, f64)>,
     opacity: Option<f64>,
     shade: f64,
@@ -243,6 +247,7 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     if let Some(bg) = v.bg {
         p.background(bg);
     }
+    p.overflow_stripes(v.stripe);
     p.set_holes(&v.holes);
     p.set_opacity(v.opacity.unwrap_or(1.0));
     p.set_shade(v.shade);
@@ -1706,6 +1711,7 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     if let Some(c) = h.program_bg {
         p.background(c);
     }
+    p.overflow_stripes(h.program_stripe);
     p.set_holes(&h.program_holes);
     p.set_opacity(h.program_opacity.unwrap_or(1.0));
     p.set_shade(h.program_shade);
@@ -1730,6 +1736,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     if let Some(c) = h.preview_bg {
         p.background(c);
     }
+    p.overflow_stripes(h.preview_stripe);
     p.set_holes(&h.preview_holes);
     p.set_opacity(h.preview_opacity.unwrap_or(1.0));
     p.set_shade(h.preview_shade);
@@ -2263,8 +2270,12 @@ impl StudioHost for DesktopStudio {
             }
             // The stage round it matches the page's theme.
             h.program_bg = r.bg_abgr();
+            h.program_stripe = r.stripe_abgr();
             if let (Some(p), Some(c)) = (h.program_view.as_ref(), h.program_bg) {
                 p.background(c);
+            }
+            if let Some(p) = h.program_view.as_ref() {
+                p.overflow_stripes(h.program_stripe);
             }
             Ok(())
         })
@@ -2295,6 +2306,7 @@ impl StudioHost for DesktopStudio {
             v.at = Some((rect, scale));
             v.canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
             v.bg = r.bg_abgr();
+            v.stripe = r.stripe_abgr();
             v.holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
             v.opacity = r.opacity;
             v.shade = r.shade.unwrap_or(0.0);
@@ -2302,6 +2314,7 @@ impl StudioHost for DesktopStudio {
             if let Some(bg) = v.bg {
                 p.background(bg);
             }
+            p.overflow_stripes(v.stripe);
             match v.canvas {
                 Some(c) => p.set_area(rect, c, scale),
                 None => p.set_rect(rect, scale),
@@ -2328,6 +2341,7 @@ impl StudioHost for DesktopStudio {
             h.preview_at = Some((rect, scale));
             h.preview_canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
             h.preview_bg = r.bg_abgr();
+            h.preview_stripe = r.stripe_abgr();
             h.preview_holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
             h.preview_opacity = r.opacity;
             h.preview_shade = r.shade.unwrap_or(0.0);
@@ -2335,6 +2349,7 @@ impl StudioHost for DesktopStudio {
                 if let Some(c) = h.preview_bg {
                     p.background(c);
                 }
+                p.overflow_stripes(h.preview_stripe);
                 match h.preview_canvas {
                     Some(c) => p.set_area(rect, c, scale),
                     None => p.set_rect(rect, scale),
