@@ -5,7 +5,7 @@
 //! filter on or off, media controls, screenshots, undo, mute, push to talk and push to mute
 //! (held down).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,43 @@ pub struct StudioKeys {
     wanted: Mutex<BTreeMap<String, String>>,
     /// Whether a shortcut field is waiting for a key (the global shortcuts are let go).
     gate: Mutex<CaptureGate>,
+    /// Which shortcuts are down now, per held action: an action with two keys (`F8|F9`) is let go
+    /// only when the last is.
+    down: Mutex<PressedKeys>,
+}
+
+/// The physical shortcuts down for each action that acts on letting go. Two keys bound to one
+/// action are one hold: it starts with the first down and ends with the last up.
+#[derive(Debug, Default)]
+pub(crate) struct PressedKeys(HashMap<String, HashSet<String>>);
+
+impl PressedKeys {
+    /// `key` went down for `action` → whether the action's press goes on (the first key down).
+    pub(crate) fn down(&mut self, action: &str, key: &str) -> bool {
+        let set = self.0.entry(action.to_string()).or_default();
+        let first = set.is_empty();
+        set.insert(key.to_string());
+        first
+    }
+
+    /// `key` came up → whether the action's release goes on (nothing else of it is down). A key
+    /// that was never seen going down (pressed before the shortcuts were replaced) still ends it
+    /// when nothing is down.
+    pub(crate) fn up(&mut self, action: &str, key: &str) -> bool {
+        let Some(set) = self.0.get_mut(action) else { return true };
+        set.remove(key);
+        if set.is_empty() {
+            self.0.remove(action);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The shortcuts were replaced or let go: nothing is down any more.
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 /// How long a shortcut field's "waiting for a key" holds the global shortcuts without being
@@ -108,6 +145,7 @@ impl StudioKeys {
             queue,
             wanted: Mutex::new(BTreeMap::new()),
             gate: Mutex::new(CaptureGate::default()),
+            down: Mutex::new(PressedKeys::default()),
         }
     }
 }
@@ -148,6 +186,7 @@ pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> 
     let mut map = state.keys.lock().unwrap_or_else(|p| p.into_inner());
     // Shortcuts about to be replaced can't report a key let go any more: nothing stays held.
     let _ = state.queue.send((RELEASE_HOLDS.to_string(), false));
+    state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
     for (sc, _) in map.drain() {
         let _ = app.global_shortcut().unregister(sc);
     }
@@ -179,6 +218,7 @@ pub(crate) fn capture(app: &AppHandle, on: bool) {
             tracing::info!("the shortcuts are let go while a shortcut field waits for a key");
             // A key held now would never be seen coming up.
             let _ = state.queue.send((RELEASE_HOLDS.to_string(), false));
+            state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
             let _ = app.global_shortcut().unregister_all();
             watch_capture(app.clone());
         }
@@ -219,10 +259,18 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> boo
         return false;
     };
     let pressed = state == ShortcutState::Pressed;
+    let key = shortcut.to_string();
     for action in actions {
         tracing::debug!(action, pressed, "a Studio shortcut");
         if !pressed && !acts_on_release(&action) {
             continue;
+        }
+        if acts_on_release(&action) {
+            let mut down = keys.down.lock().unwrap_or_else(|p| p.into_inner());
+            let go = if pressed { down.down(&action, &key) } else { down.up(&action, &key) };
+            if !go {
+                continue;
+            }
         }
         let _ = keys.queue.send((action, pressed));
     }
@@ -460,6 +508,31 @@ async fn muted(engine: &Engine, name: &str) -> Result<bool, EngineError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn two_keys_on_one_action_are_one_hold() {
+        let mut k = PressedKeys::default();
+        let a = "push_show:Main\nCam";
+        assert!(k.down(a, "F8"), "the first key starts the hold");
+        assert!(!k.down(a, "F9"), "the second is part of it");
+        assert!(!k.down(a, "F9"), "a repeat changes nothing");
+        assert!(!k.up(a, "F8"), "F9 is still down: not let go");
+        assert!(k.up(a, "F9"), "the last key ends it");
+        // Starts fresh afterwards, and each action counts on its own.
+        assert!(k.down(a, "F8"));
+        assert!(k.down("push_hide:Main\nLogo", "F8"), "another action on the same key holds on its own");
+        assert!(k.up(a, "F8"));
+    }
+
+    #[test]
+    fn a_release_of_a_key_never_seen_down_ends_the_hold_and_clear_forgets_all() {
+        let mut k = PressedKeys::default();
+        let a = "push_show:Main\nCam";
+        assert!(k.up(a, "F8"), "nothing down: it ends");
+        assert!(k.down(a, "F8"));
+        k.clear();
+        assert!(k.down(a, "F9"), "after the shortcuts were replaced it starts again");
+    }
+
     use super::{CAPTURE_HOLD, Capture, CaptureGate};
     use std::time::{Duration, Instant};
 
