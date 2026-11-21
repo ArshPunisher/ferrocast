@@ -44,9 +44,12 @@ struct ToneState {
 }
 
 /// Commands sent from `Engine` / control threads / `ferrocast-afx-bg` to `ferrocast-audio`.
+#[allow(clippy::large_enum_variant)] // rare messages; boxing would free on the audio thread
 pub enum AudioCmd {
     /// A source entry made ahead (see `AfxJob::MakeSpare`).
     Spare(crate::mix::SpareSource),
+    /// A resampler made ahead (see `AfxJob::MakeResampler`).
+    SpareResampler(crate::mix::SpareResampler),
     EnsureSource {
         id: u64,
         levels: Arc<AtomicLevels>,
@@ -117,6 +120,7 @@ impl std::fmt::Debug for AudioCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Spare(_) => f.write_str("Spare"),
+            Self::SpareResampler(_) => f.write_str("SpareResampler"),
             Self::EnsureSource { id, .. } => f.debug_struct("EnsureSource").field("id", id).finish(),
             Self::RemoveSource(id) => f.debug_tuple("RemoveSource").field(id).finish(),
             Self::ScheduleRemove { id, after_ns } => {
@@ -159,6 +163,7 @@ impl std::fmt::Debug for AudioCmd {
 
 /// Jobs dispatched from `ferrocast-audio` to `ferrocast-afx-bg` so heavy plugin setup and teardown
 /// never happen on the real-time audio thread.
+#[allow(clippy::large_enum_variant)] // as AudioCmd
 pub(crate) enum AfxJob {
     Build {
         id: u64,
@@ -174,6 +179,13 @@ pub(crate) enum AfxJob {
     DropLevels(Arc<AtomicLevels>),
     /// A ring a source left or replaced.
     DropRing(AudioConsumer),
+    /// A resampler a source stopped using.
+    DropResampler(crate::mix::SpareResampler),
+    /// Make `n` resamplers ahead (same rate in and out, what following drift needs).
+    MakeResampler {
+        rate: u32,
+        n: usize,
+    },
     /// Make `n` source entries ahead for sources that appear.
     MakeSpare {
         rate: u32,
@@ -210,6 +222,12 @@ fn run_afx_bg(rx: mpsc::Receiver<AfxJob>, cmd_tx: mpsc::Sender<AudioCmd>, builde
             AfxJob::DropSource(src) => drop(src),
             AfxJob::DropRing(ring) => drop(ring),
             AfxJob::DropLevels(l) => drop(l),
+            AfxJob::DropResampler(r) => drop(r),
+            AfxJob::MakeResampler { rate, n } => {
+                for _ in 0..n {
+                    let _ = cmd_tx.send(AudioCmd::SpareResampler(Mixer::make_spare_resampler(rate)));
+                }
+            }
             AfxJob::MakeSpare { rate, n } => {
                 for _ in 0..n {
                     let _ = cmd_tx.send(AudioCmd::Spare(Mixer::make_spare(rate)));
@@ -477,6 +495,7 @@ impl<C: AudioClock> AudioRunner<C> {
     fn handle_cmd(&mut self, cmd: AudioCmd) {
         match cmd {
             AudioCmd::Spare(s) => self.mixer.add_spare(s),
+            AudioCmd::SpareResampler(r) => self.mixer.add_spare_resampler(r),
             AudioCmd::EnsureSource { id, levels } => {
                 self.pending_removals.remove(&id);
                 self.mixer.ensure(id);
@@ -641,6 +660,13 @@ impl<C: AudioClock> AudioRunner<C> {
     fn tidy_after_commands(&mut self) {
         while let Some(src) = self.mixer.pop_retired() {
             self.drop_elsewhere(AfxJob::DropSource(src));
+        }
+        while let Some(rs) = self.mixer.pop_retired_resampler() {
+            self.drop_elsewhere(AfxJob::DropResampler(rs));
+        }
+        let n = self.mixer.take_resampler_request();
+        if n > 0 {
+            self.drop_elsewhere(AfxJob::MakeResampler { rate: self.rate, n });
         }
         let n = self.mixer.take_spare_request();
         if n > 0 {
