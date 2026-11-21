@@ -240,8 +240,8 @@ const DRY_HOLD: usize = 6144;
 /// The longest the model may take to get ready before the light noise removal is used instead.
 const READY_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long a stretch is judged over, and the share of it that may pass dry (the model's answer
-/// late) before the light noise removal takes over: a computer just too slow for it flips
+/// How long a stretch is judged over, and the share of it whose answers may be late (the dry
+/// held after one isn't counted) before the light noise removal takes over: a computer just too slow for it flips
 /// between the two every few blocks, and the noise pumped all stream long.
 const JUDGE_SECS: usize = 10;
 const MOST_DRY: f32 = 0.2;
@@ -336,7 +336,8 @@ struct Plugin {
     was_wet: bool,
     /// Samples left to stay dry after a late answer (see `DRY_HOLD`).
     dry_hold: usize,
-    /// Samples judged in this stretch, and how many of them passed dry, since the first wet block.
+    /// Samples judged in this stretch, and how many of them had no answer in time, since the
+    /// first wet block.
     judged: usize,
     dry_run: usize,
     /// Too slow for this computer or failed init: the next block isn't taken.
@@ -575,7 +576,9 @@ impl ferrocore::afx::SoundPlugin for Plugin {
         // starts from there with no step.
         if self.ever_wet {
             self.judged += n;
-            if !wet {
+            // The answers that were late, not the blocks held dry after one by choice
+            // (`DRY_HOLD`): one late in 30 held seven dry and read as a computer too slow.
+            if !have {
                 self.dry_run += n;
             }
             if self.judged >= JUDGE_SECS * 48_000 {
@@ -1467,6 +1470,78 @@ mod tests {
         }
         // (The first frames after the model is ready may start mid-ramp: that is a start, not a join.)
         assert_eq!(joined.load(std::sync::atomic::Ordering::SeqCst), 0, "frames made of two stretches");
+    }
+
+    /// A model whose answer for a block is held back until the test lets it go (`permits`): an
+    /// answer is late exactly when the test says, however fast or slow the computer is.
+    struct Gated {
+        inner: MockEngine,
+        permits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl WorkerEngine for Gated {
+        fn latency(&self) -> usize {
+            MODEL_LATENCY
+        }
+        fn set_strength(&mut self, _: u32) {}
+        fn run(&mut self, planes: &mut [&mut [f32]]) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let t = std::time::Instant::now();
+            while self.inner.calls >= self.permits.load(SeqCst) && t.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            self.inner.run(planes);
+            self.done.fetch_add(1, SeqCst);
+        }
+    }
+
+    /// Runs `blocks` blocks through a plugin whose answer for every `every`th block (from block 40)
+    /// is late for the one block that needs it, then on time again: whether it gave up.
+    fn gives_up_when_late_every(every: usize, blocks: usize) -> bool {
+        use ferrocore::afx::SoundPlugin as _;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (permits, done) = (std::sync::Arc::new(AtomicUsize::new(0)), std::sync::Arc::new(AtomicUsize::new(0)));
+        let (p2, d2) = (permits.clone(), done.clone());
+        let Ok(mut p) = Plugin::start_with(65, READY_WITHIN, move |_| {
+            Ok(Gated { inner: MockEngine::new(0.25, None), permits: p2, done: d2 })
+        }) else {
+            panic!("worker spawns");
+        };
+        let t = std::time::Instant::now();
+        while !p.shared.q.lock().unwrap_or_else(|e| e.into_inner()).ready {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "the model gets ready");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The answer for block `k` is needed two blocks later (`PIPE`): it is held from `k` until
+        // block `k + 2` has been played without it.
+        let late = |b: usize| b >= 40 && (b - 40).is_multiple_of(every);
+        for b in 0..blocks {
+            let (mut l, mut r) = (vec![0.4f32; 1024], vec![0.4f32; 1024]);
+            if !p.process([&mut l, &mut r]) {
+                return true;
+            }
+            let held = (b.saturating_sub(1)..=b).find(|k| late(*k));
+            let upto = held.unwrap_or(b + 1);
+            permits.store(upto, SeqCst);
+            let t = std::time::Instant::now();
+            while done.load(SeqCst) < upto {
+                assert!(t.elapsed() < std::time::Duration::from_secs(5), "the worker answers block {b}");
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        }
+        assert!(p.ever_wet, "the model's sound played");
+        p.gave_up
+    }
+
+    /// An answer late one block in 30 holds the sound dry for the seven blocks after it (by
+    /// design, `DRY_HOLD`), but only one answer in 30 was late: the computer is fast enough and
+    /// the strong removal stays. (It counted the held blocks: 23% "dry", over the 20%, and gave up.)
+    /// One late in three is a computer too slow for it, and that still gives up.
+    #[test]
+    fn the_dry_hold_after_a_late_answer_is_not_counted_as_too_slow() {
+        assert!(!gives_up_when_late_every(30, 40 + JUDGE_SECS * 48_000 / 1024 + 40), "one late in 30");
+        assert!(gives_up_when_late_every(3, 40 + JUDGE_SECS * 48_000 / 1024 + 40), "one late in 3");
     }
 
     /// The output of a plugin whose answers are late now and then must not flip between the model's
