@@ -685,11 +685,15 @@ impl Begin {
     }
 
     fn run(&self, hub: &Hub) {
+        // One lock (taken first, as `change` takes it) over taking the start, starting and the
+        // changes queued before: a change made meanwhile waits for all of it. It went to the hub
+        // directly once the start was taken, and the start's own metadata (or an older queued
+        // change) then overwrote it (CodeRabbit).
+        let mut patches = self.patches.lock().unwrap_or_else(|p| p.into_inner());
         let f = self.start.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(f) = f {
             f(hub);
-            let patches = std::mem::take(&mut *self.patches.lock().unwrap_or_else(|p| p.into_inner()));
-            for p in patches {
+            for p in std::mem::take(&mut *patches) {
                 hub.metadata_changed(p);
             }
             self.started.store(true, Ordering::Release);
@@ -1918,6 +1922,40 @@ mod tests {
         assert!(!hub.live().borrow().on);
         gate.wait_done();
         assert!(hub.live().borrow().on, "the tail started it");
+    }
+
+    /// A reshape made while the hub is being started (its start taken, its metadata not set yet)
+    /// waits for it and lands after it: it went to the hub directly and the start's own metadata
+    /// then overwrote it (or, made before metadata existed, was lost).
+    #[test]
+    fn a_reshape_while_the_hub_starts_lands_after_it() {
+        let hub = Hub::new();
+        let begin = Arc::new(Begin::default());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        begin.set(move |hub| {
+            hub.start();
+            let _ = started_tx.send(());
+            let _ = go_rx.recv_timeout(Duration::from_millis(500));
+            let mut m = ferrocast_golive::hub::StreamMetadata::new();
+            m.video_width = Some(640);
+            hub.metadata(m);
+        });
+        let runner = {
+            let (b, h) = (begin.clone(), hub.clone());
+            std::thread::spawn(move || b.run(&h))
+        };
+        assert!(started_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "the start runs");
+        let changer = {
+            let (b, h) = (begin.clone(), hub.clone());
+            std::thread::spawn(move || b.change(&h, |m| m.video_width = Some(1280)))
+        };
+        // Time for the change to land while the start is still under way (it waits now).
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = go_tx.send(());
+        let _ = runner.join();
+        let _ = changer.join();
+        assert_eq!(hub.subscribe().headers.metadata.and_then(|m| m.video_width), Some(1280), "the reshape was kept");
     }
 
     #[test]
