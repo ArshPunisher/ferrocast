@@ -1275,16 +1275,43 @@ impl Stage {
         Ok(self.scene_items(scene)?.iter().rev().map(|i| self.info_of(i)).collect())
     }
 
-    /// Whether any item that shows (in any scene or group) is shown only on the stream or only in
-    /// the recording: then the two pictures differ, so a recording can't share the stream's
-    /// encode ("Same as stream"), which carries the stream's picture.
+    /// Whether any item the engine could draw on the wide picture is shown only on the stream or
+    /// only in the recording: then the two pictures differ, so a recording can't share the stream's
+    /// encode ("Same as stream"), which carries the stream's picture. It reads the collection as
+    /// the engine does (Studio Mode's copy on air included) and counts what shows: not a hidden
+    /// source or group, not the vertical picture's scenes (it has no recording), and not the copies
+    /// OBS keeps of a group's items (`group_item_backup`).
     pub fn has_selective_items(&self) -> bool {
         let doc = self.doc.borrow();
-        doc["sources"].as_array().into_iter().flatten().filter(|s| is_scene(s)).any(|s| {
-            s.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten().any(|i| {
-                i.get("visible").and_then(Value::as_bool) != Some(false) && shown_of(i) != ferrocore::engine::Show::Both
-            })
-        })
+        let doc = own::engine_doc(&doc);
+        let vertical = self.vertical_order();
+        let sources: &[Value] = doc["sources"].as_array().map_or(&[], Vec::as_slice);
+        let scene = |name: &str| sources.iter().find(|s| name_of(s) == name && is_scene(s));
+        fn walk(sources: &[Value], scene: &Value, depth: u32) -> bool {
+            let items = scene.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten();
+            for it in items {
+                if it.get("group_item_backup").and_then(Value::as_bool) == Some(true)
+                    || it.get("visible").and_then(Value::as_bool) == Some(false)
+                {
+                    continue;
+                }
+                if shown_of(it) != ferrocore::engine::Show::Both {
+                    return true;
+                }
+                // A nested scene or a group shown here: what is in it is shown with it.
+                if depth < 8
+                    && let Some(inner) = sources.iter().find(|s| name_of(s) == name_of(it) && is_scene(s))
+                    && walk(sources, inner, depth + 1)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        sources
+            .iter()
+            .filter(|s| kind_of(s) == "scene" && !vertical.iter().any(|v| v == name_of(s)))
+            .any(|s| walk(sources, s, 0))
     }
 
     pub fn item_ids(&self, scene: &str) -> Result<Vec<i64>, StudioError> {
@@ -5997,6 +6024,69 @@ mod tests {
         ok(s.edit_item("Main", red.id, ItemEdit::Show));
         assert!(s.has_selective_items());
         assert!(s.edit_item("Main", 999, ItemEdit::StreamOnly).is_err(), "no such item");
+    }
+
+    /// `has_selective_items` (it decides whether a recording can share the stream's encode) says
+    /// what the engine draws: what is on air in Studio Mode, but not a hidden group, not the
+    /// vertical picture's scenes, and not the copies OBS keeps of a group's items.
+    #[test]
+    fn selective_items_are_counted_as_the_engine_draws_them() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 50, "height": 50 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 50, "height": 50 }), false));
+        let group = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        ok(s.edit_item("Main", a.id, ItemEdit::StreamOnly));
+        assert!(s.has_selective_items(), "a flagged source in a shown group");
+        // A hidden group shows nothing, whatever is flagged in it.
+        ok(s.edit_item("Main", group.id, ItemEdit::Hide));
+        assert!(!s.has_selective_items(), "a hidden group");
+        ok(s.edit_item("Main", group.id, ItemEdit::Show));
+        assert!(s.has_selective_items());
+        ok(s.edit_item("Main", a.id, ItemEdit::StreamAndRecording));
+        assert!(!s.has_selective_items());
+
+        // The vertical picture has no recording of its own: its flags are not the wide one's.
+        ok(s.start_vertical("Vertical"));
+        let v = ok(s.add_source("Vertical", "color_source_v3", "V", &json!({ "width": 50, "height": 50 }), false));
+        ok(s.edit_item("Vertical", v.id, ItemEdit::RecordingOnly));
+        assert!(!s.has_selective_items(), "a flag on the vertical picture's scene");
+        ok(s.edit_item("Main", b.id, ItemEdit::RecordingOnly));
+        assert!(s.has_selective_items(), "the wide picture's own");
+        ok(s.edit_item("Main", b.id, ItemEdit::StreamAndRecording));
+        assert!(!s.has_selective_items());
+
+        // Studio Mode: what is on air is a copy of the scene's items; resetting the preview's
+        // item to both doesn't change the copy, which still carries the flag.
+        let c = ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 50, "height": 50 }), false));
+        ok(s.edit_item("Main", c.id, ItemEdit::RecordingOnly));
+        s.set_studio_mode(true);
+        ok(s.edit_item("Main", c.id, ItemEdit::StreamAndRecording));
+        assert!(s.has_selective_items(), "the copy on air still has a recording-only source");
+        s.set_studio_mode(false);
+        assert!(!s.has_selective_items(), "and with Studio Mode off, it's gone");
+    }
+
+    /// The copies OBS keeps of a group's items in the scene (for versions before groups) are not
+    /// drawn, so a flag on one is no flag.
+    #[test]
+    fn a_groups_backup_copies_are_not_counted() {
+        let doc = json!({
+            "sources": [
+                { "id": "scene", "name": "Main", "settings": { "items": [
+                    { "name": "Cam", "id": 1, "group_item_backup": true, "ferrocast_show": "stream", "visible": true },
+                    { "name": "Cam", "id": 2, "visible": true },
+                ] } },
+                { "id": "color_source_v3", "name": "Cam", "settings": {} },
+            ],
+            "current_scene": "Main", "current_program_scene": "Main",
+        });
+        let s = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &doc, "Main"));
+        assert!(!s.has_selective_items());
+        let flagged = json!({ "sources": [
+            { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Cam", "id": 2, "ferrocast_show": "stream" }] } },
+            { "id": "color_source_v3", "name": "Cam", "settings": {} },
+        ], "current_scene": "Main", "current_program_scene": "Main" });
+        assert!(ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &flagged, "Main")).has_selective_items());
     }
 
     /// A flag on a group is the group's own (it covers the children when drawn); a child of a
