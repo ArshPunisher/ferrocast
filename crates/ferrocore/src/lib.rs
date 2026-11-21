@@ -209,7 +209,8 @@ const POOL_MAX: usize = 4;
 const POOL_BYTES: usize = 96 << 20;
 
 /// A pixel buffer of exactly `len` bytes whose contents are not defined (the caller writes every
-/// byte): a kept one when it fits, else a new zeroed one.
+/// byte): a kept one when it fits, else a new zeroed one. Only the Mac's capture copies use it.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn pixel_buffer(len: usize) -> Vec<u8> {
     if len >= POOL_MIN
         && let Ok(mut pool) = PIXELS.lock()
