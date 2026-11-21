@@ -78,7 +78,14 @@ pub fn list(dir: &Path) -> Vec<ObsCollection> {
             if !valid_id(&id) {
                 return None;
             }
+            if std::fs::metadata(&path).ok().is_some_and(|m| m.len() > crate::import_preview::MAX_COLLECTION_BYTES) {
+                return None;
+            }
             let doc: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let obj = doc.as_object()?;
+            if !obj.get("sources").is_none_or(Value::is_array) {
+                return None;
+            }
             let (scenes, sources) = counts(&doc);
             let name = doc.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
             Some(ObsCollection { id, name, scenes, sources })
