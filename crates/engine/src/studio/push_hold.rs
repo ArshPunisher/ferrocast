@@ -116,8 +116,8 @@ impl Holds {
         let _ = self.release(action);
     }
 
-    /// The key for `action` came up → the target and the state to put it back in, when no other
-    /// key still holds it.
+    /// The key for `action` came up → the target and the state to put it in: as it was before
+    /// the first hold when no other key holds it, else what the key still held asks for.
     pub(crate) fn release(&mut self, action: &str) -> Option<(Target, bool)> {
         let target = self.by_action.remove(action)?;
         let (was, holders) = self.by_target.get_mut(&target)?;
@@ -127,7 +127,10 @@ impl Holds {
             self.by_target.remove(&target);
             Some((target, was))
         } else {
-            None
+            // Another key still holds it, and its state counts again (show held, hide let go:
+            // shown). The most recent holder left decides.
+            let state = holders.last().and_then(|h| parse(h)).map(|(k, _, _)| k.held_state())?;
+            Some((target, state))
         }
     }
 
@@ -291,16 +294,17 @@ mod tests {
     #[test]
     fn two_keys_on_one_target_put_it_back_only_when_the_last_is_let_go() {
         let mut h = Holds::default();
-        assert!(h.press("show", item("Main", 1), false));
+        let (show, hide) = ("push_show:Main\nCam", "push_hide:Main\nCam");
+        assert!(h.press(show, item("Main", 1), false));
         // The second key sees it shown (by the first) but the original was hidden.
-        assert!(h.press("hide", item("Main", 1), true));
-        assert_eq!(h.release("show"), None, "still held by the other");
-        assert_eq!(h.release("hide"), Some((item("Main", 1), false)));
-        // In the other order too.
-        assert!(h.press("show", item("Main", 1), true));
-        assert!(h.press("hide", item("Main", 1), true));
-        assert_eq!(h.release("hide"), None);
-        assert_eq!(h.release("show"), Some((item("Main", 1), true)));
+        assert!(h.press(hide, item("Main", 1), true));
+        assert_eq!(h.release(show), Some((item("Main", 1), false)), "the key still held (hide) decides");
+        assert_eq!(h.release(hide), Some((item("Main", 1), false)), "the original");
+        // In the other order too: letting go of hide leaves show held, so it shows again.
+        assert!(h.press(show, item("Main", 1), true));
+        assert!(h.press(hide, item("Main", 1), true));
+        assert_eq!(h.release(hide), Some((item("Main", 1), true)));
+        assert_eq!(h.release(show), Some((item("Main", 1), true)));
     }
 
     #[test]
@@ -662,7 +666,7 @@ mod tests {
         e.studio_push_hold("push_hide:Main\nCam", true).await.unwrap();
         assert_eq!(host.shown("Main", "Cam"), Some(false), "the later key wins while both are held");
         e.studio_push_hold("push_hide:Main\nCam", false).await.unwrap();
-        assert_eq!(host.shown("Main", "Cam"), Some(false), "still held by the first, which says shown...");
+        assert_eq!(host.shown("Main", "Cam"), Some(true), "hide let go while show is still held: shown again");
         e.studio_push_hold("push_show:Main\nCam", false).await.unwrap();
         assert_eq!(host.shown("Main", "Cam"), Some(false), "...and at the end, as it began");
     }
