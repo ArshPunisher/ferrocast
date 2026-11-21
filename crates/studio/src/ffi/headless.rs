@@ -445,19 +445,9 @@ impl Session {
             }
             if shot_id.is_some() && v.get("id").and_then(Value::as_u64) == shot_id {
                 shot_id = None;
-                dog.alive(Instant::now());
-                stalled.store(false, Ordering::Relaxed);
-                if let Some(data) = v["result"].get("data").and_then(Value::as_str) {
-                    let print = {
-                        use std::hash::{Hash, Hasher};
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        data.hash(&mut h);
-                        h.finish()
-                    };
-                    let new = last_print != Some(print);
-                    last_print = Some(print);
-                    dog.picture_was_new(new);
-                    if new && let Some(pic) = decode(data) {
+                if let Some(pic) = shot_answer(&v, &mut dog, &mut last_print, Instant::now()) {
+                    stalled.store(false, Ordering::Relaxed);
+                    if let Some(pic) = pic {
                         feed.lock().unwrap_or_else(|e| e.into_inner()).clone().picture(pic);
                     }
                 }
@@ -484,6 +474,31 @@ impl Session {
             feed.lock().unwrap_or_else(|e| e.into_inner()).clone().picture(pic);
         }
     }
+}
+
+/// What the answer `v` to a screenshot says: `None` when it is no sign of life (an error answer
+/// or a picture that can't be read: the page stays on the watchdog's reload path); else the page
+/// is alive (the watchdog is told) and its picture is given when it differs from the last one
+/// (`last_print`; a still page's is the same, read before, and makes no new frame).
+fn shot_answer(
+    v: &Value,
+    dog: &mut Watchdog,
+    last_print: &mut Option<u64>,
+    now: Instant,
+) -> Option<Option<ferrocore::Picture>> {
+    let data = v["result"].get("data").and_then(Value::as_str)?;
+    let print = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        data.hash(&mut h);
+        h.finish()
+    };
+    let new = *last_print != Some(print);
+    let pic = if new { Some(decode(data)?) } else { None };
+    *last_print = Some(print);
+    dog.alive(now);
+    dog.picture_was_new(new);
+    Some(pic)
 }
 
 /// Whether the page is still on the browser's blank starting page when it should be showing
@@ -779,6 +794,40 @@ mod tests {
 
     /// A page that sends no frames because it is still isn't reloaded: it is asked for a picture,
     /// answers, and is asked less and less often, for ten minutes, with no reload.
+    /// A screenshot the browser couldn't take (an error answer, no picture) is no sign of life:
+    /// the page stays on the reload path (it cleared it, and a page whose screencast sent nothing
+    /// and whose every screenshot failed stayed frozen, with no reload and no notice). A picture
+    /// is one, even the same as the last.
+    #[test]
+    fn a_failed_screenshot_is_no_sign_of_life() {
+        use base64::Engine as _;
+        let t0 = Instant::now();
+        let mut dog = Watchdog::new(t0);
+        let mut last = None;
+        let asked = t0 + Watchdog::QUIET;
+        assert_eq!(dog.step(asked), Step::AskPicture);
+        let failed = json!({ "id": 7, "error": { "code": -32000, "message": "Unable to capture screenshot" } });
+        assert!(shot_answer(&failed, &mut dog, &mut last, asked).is_none(), "not alive");
+        assert_eq!(dog.step(asked + Watchdog::ANSWER_WITHIN), Step::Reload(1), "still on the retry path");
+        // A real picture (1×1).
+        let mut png_bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut png_bytes, 1, 1);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap_or_else(|e| panic!("png header: {e}"));
+            w.write_image_data(&[10, 20, 30, 255]).unwrap_or_else(|e| panic!("png data: {e}"));
+        }
+        let good =
+            json!({ "id": 8, "result": { "data": base64::engine::general_purpose::STANDARD.encode(&png_bytes) } });
+        let now = asked + Watchdog::ANSWER_WITHIN;
+        assert!(matches!(shot_answer(&good, &mut dog, &mut last, now), Some(Some(_))), "alive, with its picture");
+        assert_eq!(dog.step(now + Duration::from_millis(10)), Step::Wait, "off the retry path");
+        assert!(matches!(shot_answer(&good, &mut dog, &mut last, now), Some(None)), "the same picture: alive");
+        let garbled = json!({ "id": 9, "result": { "data": "bm90IGEgcG5n" } });
+        assert!(shot_answer(&garbled, &mut dog, &mut last, now).is_none(), "a picture that can't be read: not alive");
+    }
+
     #[test]
     fn a_still_page_is_never_reloaded() {
         let t0 = Instant::now();
