@@ -3955,6 +3955,31 @@ fn item_of(st: &State, it: &SceneItem, ms: u64, canvas: (u32, u32), aud: Audienc
 /// Scenes inside scenes go at most this deep (a scene showing itself stops there).
 const MAX_NESTING: u32 = 8;
 
+/// Whether scene `name` holds something that `aud` doesn't see: a visible item for the other
+/// side, or a visible container (that this audience does see) whose own contents are all for the
+/// other side. It tells a container emptied by the audience from one that was empty to begin with.
+fn emptied_by(st: &State, name: &str, depth: u32, aud: Audience) -> bool {
+    let Some(items) = st.scenes.get(name) else { return false };
+    items.iter().filter(|i| i.visible).any(|i| {
+        !i.show.shown_to(aud)
+            || i.scene.as_deref().is_some_and(|inner| {
+                depth < MAX_NESTING
+                    && emptied_by(st, inner, depth + 1, aud)
+                    && !holds_anything_for(st, inner, depth + 1, aud)
+            })
+    })
+}
+
+/// Whether scene `name` has any visible item that `aud` sees (and, in a container, anything in it).
+fn holds_anything_for(st: &State, name: &str, depth: u32, aud: Audience) -> bool {
+    let Some(items) = st.scenes.get(name) else { return false };
+    items.iter().filter(|i| i.visible && i.show.shown_to(aud)).any(|i| match i.scene.as_deref() {
+        Some(inner) if depth < MAX_NESTING => holds_anything_for(st, inner, depth + 1, aud),
+        Some(_) => false,
+        None => true,
+    })
+}
+
 fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32), aud: Audience) -> Option<Item> {
     let (placement, opacity) = animated(it, ms);
     let content = match &it.scene {
@@ -3967,8 +3992,8 @@ fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32), 
                 .filter_map(|i| item_at(st, i, ms, depth + 1, canvas, aud))
                 .collect::<Vec<_>>();
             // Everything in it is for the other audience: it draws nothing (its own filters would
-            // otherwise paint an empty box into this picture).
-            if items.is_empty() && scene.iter().any(|i| i.visible && !i.show.shown_to(aud)) {
+            // otherwise paint an empty box into this picture), however many containers deep.
+            if items.is_empty() && emptied_by(st, name, depth, aud) {
                 return None;
             }
             match it.group {
@@ -7014,8 +7039,34 @@ mod tests {
         assert_eq!(count(Audience::Stream), 1, "the stream shows the group");
         assert_eq!(count(Audience::Everyone), 1);
         assert_eq!(count(Audience::Recording), 0, "the recording has nothing from it, not an empty box");
-        // A group that was empty to begin with is as it was.
+        // Several containers deep: Main > Outer > Inner > a source for the stream only. The recording
+        // sees none of the three, not an empty Outer.
         drop(st);
+        let mut inner = SceneItem::new(0, Placement::default());
+        inner.scene = Some("Leaf".into());
+        inner.group = Some((200, 200));
+        e.set_scene("Leaf", vec![only_stream(1)]);
+        e.set_scene("Middle", vec![inner]);
+        let mut outer = SceneItem::new(0, Placement::default());
+        outer.scene = Some("Middle".into());
+        outer.group = Some((300, 300));
+        e.set_scene("Main", vec![outer]);
+        {
+            let st = e.lock();
+            let count = |a| build(&st, 640, 360, Some("Main"), 0, a).items.len();
+            assert_eq!(count(Audience::Stream), 1);
+            assert_eq!(count(Audience::Recording), 0, "no empty box left by the outer group");
+        }
+        // A group that was empty to begin with is as it was.
+        e.set_scene(
+            "Main",
+            vec![{
+                let mut g = SceneItem::new(0, Placement::default());
+                g.scene = Some("Inner".into());
+                g.group = Some((400, 600));
+                g
+            }],
+        );
         e.set_scene("Inner", vec![]);
         assert_eq!(build(&e.lock(), 640, 360, Some("Main"), 0, Audience::Recording).items.len(), 1);
     }
