@@ -1686,6 +1686,9 @@ fn sync_views(h: &Held) {
     {
         p.show_scene(want.as_deref());
     }
+    if let (Some(c), Some(v)) = (&h.collection, &h.vertical.view) {
+        v.follow(c);
+    }
     // A multiview's preview box and scene list too.
     refresh_projectors(h);
 }

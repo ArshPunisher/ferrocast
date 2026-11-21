@@ -973,7 +973,11 @@ impl Stage {
     }
 
     /// Puts a scene on air, through the Studio's transition (the engine plays it).
+    /// When the vertical canvas is enabled, its own scenes switch there instead.
     pub fn set_current(&self, name: &str) -> Result<(), StudioError> {
+        if self.vertical().is_some() && self.vertical_order().iter().any(|n| n == name) {
+            return self.set_vertical_current(name);
+        }
         self.scene_index(name)?;
         // The scene's own way in (its Transition Override), else the Studio's.
         let t = self.scene_transition_of(name)?.unwrap_or_else(|| self.transition());
@@ -6679,6 +6683,21 @@ mod tests {
         assert!(s.vertical().is_none());
         ok(s.start_vertical("Other"));
         assert_eq!(s.vertical().map(|v| v.scenes.len()), Some(2), "back as it was");
+    }
+
+    #[test]
+    fn set_current_switches_an_active_vertical_scene_leaving_main_alone() {
+        let s = stage();
+        let main_before = s.current();
+        ok(s.add_scene("Main 2"));
+        ok(s.start_vertical("Tall"));
+        ok(s.add_vertical_scene("Tall 2"));
+        ok(s.set_current("Tall 2"));
+        assert_eq!(s.current(), main_before);
+        let v = s.vertical().unwrap_or_else(|| panic!("vertical should be on"));
+        assert_eq!(v.current, "Tall 2");
+        s.stop_vertical();
+        assert!(s.set_current("Tall").is_err(), "turned off vertical doesn't switch via set_current");
     }
 
     #[test]
