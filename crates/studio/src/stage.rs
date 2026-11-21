@@ -2815,7 +2815,15 @@ impl Stage {
     /// Copies an item with its source (a group with every source inside it) out of this
     /// collection, as plain data the Studio keeps while another collection is open.
     pub fn copy_source(&self, scene: &str, id: i64) -> Result<SourceClip, StudioError> {
-        let item = self.item(scene, id)?;
+        let mut item = self.item(scene, id)?;
+        // A source inside a group keeps its place on the canvas: its stored position is the
+        // group's local one (scale and turn of the group are not carried).
+        if let Some(g) = self.group_of(scene, id) {
+            let x = item.pointer("/pos/x").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let y = item.pointer("/pos/y").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let (cx, cy) = self.group_map(&g).apply(x, y);
+            item["pos"] = json!({ "x": cx, "y": cy });
+        }
         let root = self.source(name_of(&item))?;
         let mut sources = Vec::new();
         self.collect_clip(&root, &mut sources, 0)?;
@@ -2862,6 +2870,20 @@ impl Stage {
                 )));
             }
         }
+        // Every filter on it, too, must be one this computer has: nothing is added otherwise.
+        let can_filter = crate::kinds::kinds().filters;
+        let attached = clip
+            .sources
+            .iter()
+            .flat_map(|s| s.get("filters").and_then(Value::as_array).into_iter().flatten())
+            .chain(clip.item.get("ferrocast_filters").and_then(Value::as_array).into_iter().flatten());
+        if let Some(f) = attached.into_iter().find(|f| !can_filter.iter().any(|k| k.id == kind_of(f))) {
+            return Err(fail(format!(
+                "The filter \"{}\" is a {} filter, which this computer can't run (it was copied on another system).",
+                name_of(f),
+                kind_of(f)
+            )));
+        }
         // New names, in order, each free here and unlike the others pasted with it.
         let mut map: Vec<(String, String)> = Vec::new();
         for src in &clip.sources {
@@ -2874,7 +2896,16 @@ impl Stage {
             }
             map.push((old, n));
         }
-        let renamed = |old: &str| map.iter().find(|(o, _)| o == old).map(|(_, n)| n.clone());
+        let new_uuids: Vec<(String, String)> =
+            clip.sources.iter().map(|c| (c["uuid"].as_str().unwrap_or("").to_string(), uuid())).collect();
+        // What a name (or a uuid) pointed at before points at after: a source pasted with this
+        // one by its new name or its new uuid, else nothing (it may still be here).
+        let renamed = |old: &str| {
+            map.iter()
+                .find(|(o, _)| o == old)
+                .map(|(_, n)| n.clone())
+                .or_else(|| new_uuids.iter().find(|(u, _)| !u.is_empty() && u == old).map(|(_, n)| n.clone()))
+        };
         let mut notes = Vec::new();
         let mut fresh: Vec<Value> = Vec::new();
         for src in &clip.sources {
@@ -2882,7 +2913,12 @@ impl Stage {
             let old = name_of(src).to_string();
             let new = renamed(&old).unwrap_or_else(|| old.clone());
             c["name"] = json!(new);
-            c["uuid"] = json!(uuid());
+            c["uuid"] = json!(
+                new_uuids
+                    .iter()
+                    .find(|(u, _)| *u == src["uuid"].as_str().unwrap_or(""))
+                    .map_or_else(uuid, |(_, n)| n.clone())
+            );
             if kind_of(&c) == "ferrocast_clone" {
                 let target = c.pointer("/settings/clone").and_then(Value::as_str).unwrap_or("").to_string();
                 if let Some(n) = renamed(&target) {
@@ -2924,6 +2960,19 @@ impl Stage {
             }
         });
         let placed = self.place(scene, &root)?;
+        // A group's children get ids above everything in this scene, so none repeats one here.
+        let mut next = self.top_id(scene).max(placed.id) + 1;
+        for g in fresh.iter().filter(|c| kind_of(c) == "group") {
+            self.with_source(name_of(g), |s| {
+                if let Some(items) = s.pointer_mut("/settings/items").and_then(Value::as_array_mut) {
+                    for it in items {
+                        it["id"] = json!(next);
+                        next += 1;
+                    }
+                }
+                s["settings"]["id_counter"] = json!(next - 1);
+            })?;
+        }
         item["id"] = json!(placed.id);
         item["name"] = root["name"].clone();
         item["source_uuid"] = root["uuid"].clone();
@@ -2953,7 +3002,9 @@ impl Stage {
             }
             if let Some(n) = renamed(&side) {
                 f["settings"]["sidechain_source"] = json!(n);
-            } else if self.source(&side).is_err() {
+            } else if self.source(&side).is_err()
+                && !self.sources_list().iter().any(|s| s["uuid"].as_str() == Some(&side))
+            {
                 f["settings"]["sidechain_source"] = json!("none");
                 notes.push(format!(
                     "The compressor \"{}\" on \"{owner}\" listened to \"{side}\", which isn't in this collection: its sidechain is set to None.",
@@ -6300,6 +6351,91 @@ mod tests {
         let parts = ok(b.group_parts("Main", info.id));
         assert_eq!(parts.0, "Pair");
         assert!(parts.1.iter().any(|n| n == "Blue 2") && parts.1.iter().any(|n| n == "Red"), "{parts:?}");
+    }
+
+    #[test]
+    fn a_pasted_group_children_never_share_an_id_with_the_scene() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        let blue = color(&a, "Blue");
+        let g = ok(a.group_together("Main", &[red.id, blue.id], "Pair"));
+        let clip = ok(a.copy_source("Main", g.id));
+        // The destination already uses ids 1 and 2 (the children's ids in the copy).
+        color(&b, "One");
+        color(&b, "Two");
+        let (info, _) = ok(b.paste_source("Main", &clip));
+        let mut ids: Vec<i64> = Vec::new();
+        for it in ok(b.items("Main")) {
+            ids.push(it.id);
+            ids.extend(it.children.iter().map(|c| c.id));
+        }
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "every id in the scene is its own: {ids:?}");
+        assert_eq!(ok(b.items("Main")).iter().find(|i| i.id == info.id).map(|i| i.children.len()), Some(2));
+        // Editing a child touches that child alone.
+        let kid =
+            ok(b.items("Main")).into_iter().find(|i| i.id == info.id).and_then(|i| i.children.first().map(|c| c.id));
+        ok(b.edit_item("Main", kid.unwrap_or(0), ItemEdit::Hide));
+        let after = ok(b.items("Main"));
+        assert!(after.iter().filter(|i| !i.group).all(|i| i.visible), "the others still show");
+        assert!(after.iter().find(|i| i.group).is_some_and(|g| g.children.iter().filter(|c| !c.visible).count() == 1));
+    }
+
+    #[test]
+    fn a_source_copied_out_of_a_group_keeps_its_place_on_the_canvas() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        ok(a.set_item_box("Main", red.id, 300.0, 120.0, 200.0, 100.0));
+        let blue = color(&a, "Blue");
+        let g = ok(a.group_together("Main", &[red.id, blue.id], "Pair"));
+        let kids = ok(a.items("Main")).into_iter().find(|i| i.id == g.id).map(|i| i.children).unwrap_or_default();
+        let red_id = kids.iter().find(|c| c.name == "Red").map(|c| c.id).unwrap_or(0);
+        let clip = ok(a.copy_source("Main", red_id));
+        let (info, _) = ok(b.paste_source("Main", &clip));
+        let t = ok(b.transform("Main", info.id));
+        assert!((t.x - 300.0).abs() < 0.5 && (t.y - 120.0).abs() < 0.5, "on the canvas where it was: {} {}", t.x, t.y);
+    }
+
+    #[test]
+    fn a_filter_this_computer_lacks_stops_a_source_paste_before_anything_is_added() {
+        let (a, b) = (stage(), stage());
+        color(&a, "Red");
+        ok(a.add_filter("Red", "gain_filter", "Boost", &json!({})));
+        let id = ok(a.items("Main"))[0].id;
+        let mut clip = ok(a.copy_source("Main", id));
+        clip.sources[0]["filters"][0]["versioned_id"] = json!("alien_filter_from_another_os");
+        let e = b.paste_source("Main", &clip).unwrap_err().to_string();
+        assert!(e.contains("can't run") && e.contains("Boost"), "{e}");
+        assert!(b.sources().iter().all(|u| u.name != "Red"), "nothing was added");
+        let mut over = ok(a.copy_source("Main", id));
+        over.item["ferrocast_filters"] =
+            json!([{ "name": "Odd", "versioned_id": "alien", "id": "alien", "settings": {} }]);
+        assert!(b.paste_source("Main", &over).is_err(), "an item's own filters are checked too");
+    }
+
+    #[test]
+    fn a_sidechain_named_by_uuid_is_kept_when_that_source_is_here() {
+        let (a, b) = (stage(), stage());
+        ok(a.add_source("Main", "color_source_v3", "Mic", &json!({}), false));
+        let music_uuid = ok(b.add_source("Main", "color_source_v3", "Music", &json!({}), false));
+        let _ = music_uuid;
+        let uuid_of_music = b
+            .sources_list()
+            .iter()
+            .find(|s| name_of(s) == "Music")
+            .map(|s| s["uuid"].as_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        ok(a.add_filter("Mic", "compressor_filter", "Duck", &json!({ "sidechain_source": uuid_of_music })));
+        let clip = ok(a.copy_filters("Mic", None));
+        ok(b.add_source("Main", "color_source_v3", "Voice", &json!({}), false));
+        assert!(ok(b.paste_filter_values("Voice", None, &clip)).is_empty(), "a uuid that is here stays");
+        let gone = ok(a.copy_filters("Mic", None));
+        let mut other = gone.clone();
+        other.filters[0]["settings"]["sidechain_source"] = json!("00000000-dead-beef");
+        let notes = ok(b.paste_filter_values("Voice", None, &other));
+        assert_eq!(notes.len(), 1, "a uuid that isn't here is cleared with a note: {notes:?}");
     }
 
     #[test]
