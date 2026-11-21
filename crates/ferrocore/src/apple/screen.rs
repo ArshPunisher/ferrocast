@@ -796,7 +796,9 @@ pub(crate) fn copy_bgra(image: &objc2_core_video::CVPixelBuffer) -> Option<Pictu
     // Each pixel is turned as one 32-bit word (blue and red swapped) so the loop compiles to
     // wide vector moves; a byte-by-byte `extend_from_slice` per pixel was the biggest CPU
     // cost in a 1080p recording.
-    let mut rgba = vec![0u8; w * h * 4];
+    // A kept buffer when there is one (every byte is written below): a fresh one each frame was
+    // page faults and zero-filling on the thread that decodes the clip.
+    let mut rgba = crate::pixel_buffer(w * h * 4);
     for (y, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
         // SAFETY: the locked buffer holds `h` rows of `stride` bytes at `base`.
         let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) };

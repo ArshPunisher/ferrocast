@@ -29,8 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cap = ScreenCapture::start_with(Target::Display(main.id), 320, 180, 10, false, false, hide)?;
             let t = std::time::Instant::now();
             while t.elapsed().as_secs() < 5 {
-                if let Some(p) = cap.take() {
-                    return Ok(p.rgba);
+                if let Some(mut p) = cap.take() {
+                    return Ok(std::mem::take(&mut p.rgba));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }

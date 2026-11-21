@@ -200,6 +200,44 @@ pub struct Picture {
     pub premultiplied: bool,
 }
 
+/// Big pictures' pixel buffers kept for the next one (a 1440p clip frame is 15 MB, a fresh buffer
+/// a frame was page faults and zero-filling every frame).
+static PIXELS: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+/// Smallest buffer worth keeping, most kept, and most bytes kept.
+const POOL_MIN: usize = 1 << 20;
+const POOL_MAX: usize = 4;
+const POOL_BYTES: usize = 96 << 20;
+
+/// A pixel buffer of exactly `len` bytes whose contents are not defined (the caller writes every
+/// byte): a kept one when it fits, else a new zeroed one.
+pub(crate) fn pixel_buffer(len: usize) -> Vec<u8> {
+    if len >= POOL_MIN
+        && let Ok(mut pool) = PIXELS.lock()
+        && let Some(i) = pool.iter().position(|b| b.capacity() >= len && b.capacity() <= len + len / 4)
+    {
+        let mut b = pool.swap_remove(i);
+        // Cut to size or grown within what it has: bytes the caller overwrites anyway.
+        b.resize(len, 0);
+        return b;
+    }
+    vec![0u8; len]
+}
+
+impl Drop for Picture {
+    fn drop(&mut self) {
+        if self.rgba.capacity() < POOL_MIN {
+            return;
+        }
+        let buf = std::mem::take(&mut self.rgba);
+        if let Ok(mut pool) = PIXELS.lock() {
+            let kept: usize = pool.iter().map(Vec::capacity).sum();
+            if pool.len() < POOL_MAX && kept + buf.capacity() <= POOL_BYTES {
+                pool.push(buf);
+            }
+        }
+    }
+}
+
 impl Picture {
     /// One colour, `width`×`height` (OBS's Color source).
     pub fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Self {
@@ -765,5 +803,41 @@ mod placed {
         assert_eq!(Effect::placed_size(&[shadow(true), crop(4)], 100, 100), (100, 100));
         // A crop into the picture after the shadow: all of the shadow goes, the box shrinks.
         assert_eq!(Effect::placed_size(&[shadow(true), crop(20)], 100, 100), (80, 80));
+    }
+}
+
+#[cfg(test)]
+mod pixel_pool {
+    use super::{Picture, pixel_buffer};
+
+    /// A dropped big picture's buffer is the next one's, with no new allocation or zero-fill; a
+    /// small one is never kept; a buffer too big for the size asked for is left in the pool.
+    #[test]
+    fn a_dropped_big_picture_gives_its_buffer_to_the_next() {
+        const LEN: usize = 7_654_320; // a size no other test uses
+        let mut buf = pixel_buffer(LEN);
+        assert_eq!(buf.len(), LEN);
+        buf.fill(0xAB);
+        let at = buf.as_ptr();
+        drop(Picture { width: 1912, height: 1002, rgba: buf, premultiplied: false });
+        let again = pixel_buffer(LEN);
+        assert_eq!(again.as_ptr(), at, "the same memory came back");
+        assert_eq!(again.len(), LEN);
+        assert!(again.iter().all(|b| *b == 0xAB), "kept as it was: the caller overwrites every byte");
+        // A little under: cut to size, same memory.
+        drop(Picture { width: 1, height: 1, rgba: again, premultiplied: false });
+        let smaller = pixel_buffer(LEN - 4);
+        assert_eq!(smaller.as_ptr(), at);
+        assert_eq!(smaller.len(), LEN - 4);
+        drop(Picture { width: 1, height: 1, rgba: smaller, premultiplied: false });
+        // Much smaller wanted: a new one, the big one stays for its own size.
+        let other = pixel_buffer(LEN / 2);
+        assert_ne!(other.as_ptr(), at);
+        assert!(other.iter().all(|b| *b == 0), "a new one is zeroed");
+        // Small pictures are not kept.
+        let small = Picture::solid(8, 8, [1, 2, 3, 4]);
+        assert!(small.rgba.capacity() < super::POOL_MIN);
+        let again = pixel_buffer(LEN);
+        assert_eq!(again.as_ptr(), at, "still the big one");
     }
 }
