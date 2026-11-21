@@ -179,6 +179,7 @@ impl Camera {
             track: 0,
             scaled_from: ((cw, ch) != size).then_some((size.0, size.1, Filter::Bicubic)),
             more_tracks: Vec::new(),
+            track_names: Vec::new(),
             video_tracks: Vec::new(),
         };
         let writers = Arc::new(Mutex::new(Writers {
