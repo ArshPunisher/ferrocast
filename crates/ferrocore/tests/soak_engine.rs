@@ -180,13 +180,17 @@ fn cam_item(effects: Vec<Effect>, visible: bool) -> SceneItem {
 }
 
 /// The scenes, as the soak edits them: `round` flips what is hidden and which filter is on.
-fn set_scenes(e: &Engine, round: u64) {
+fn set_scenes(e: &Engine, round: u64, guest: Option<u64>) {
     let on = round.is_multiple_of(2);
     let round_fx = |radius: f32| if on { vec![Effect::RoundedCorners { radius }] } else { Vec::new() };
     // A: the camera with a Video Delay (sound too) and its own filters.
     let mut a = round_fx(12.0);
     a.push(Effect::Delay { ms: 300, audio: true });
-    e.set_scene("A", vec![cam_item(a, true), SceneItem::new(MIC, Placement::default())]);
+    let mut a_items = vec![cam_item(a, true), SceneItem::new(MIC, Placement::default())];
+    // The guest source (when there is one) is in every scene, so its sound is heard.
+    let guest_item = |id: u64| SceneItem::new(id, Placement { x: 400.0, ..Placement::default() });
+    a_items.extend(guest.map(guest_item));
+    e.set_scene("A", a_items);
     // B: the same camera with another list of its own, hidden every third round.
     e.set_scene(
         "B",
@@ -195,7 +199,9 @@ fn set_scenes(e: &Engine, round: u64) {
     // C: the camera plain, over a card that is hidden and shown.
     let mut card = SceneItem::new(CARD, Placement { x: 200.0, ..Placement::default() });
     card.visible = on;
-    e.set_scene("C", vec![cam_item(Vec::new(), true), card]);
+    let mut c_items = vec![cam_item(Vec::new(), true), card];
+    c_items.extend(guest.map(guest_item));
+    e.set_scene("C", c_items);
 }
 
 fn run(secs: u64) {
@@ -213,7 +219,7 @@ fn run(secs: u64) {
     e.set_source(CARD, SourceKind::Color { width: 100, height: 100, rgba: [200, 30, 30, 255] }).unwrap();
     e.set_sound(MIC, SourceSettings { push_to_talk: Some(150), ..Default::default() });
     e.set_sound(CAM, SourceSettings::default());
-    set_scenes(&e, 0);
+    set_scenes(&e, 0, None);
     e.go("A").unwrap();
     let (cam, mic) = (e.fed(CAM).unwrap(), e.fed(MIC).unwrap());
 
@@ -244,6 +250,13 @@ fn run(secs: u64) {
     let mut worst = 0.0f32;
     let mut idle_from: Option<(Instant, usize)> = None;
     let (mut warm_allocs, mut warm_frees) = (0usize, 0usize);
+    let mut guest_44k = false;
+    let tone_44k: Vec<f32> = (0..882)
+        .flat_map(|i| {
+            let s = 0.2 * (std::f32::consts::TAU * 220.0 * i as f32 / 44_100.0).sin();
+            [s, s]
+        })
+        .collect();
     let mut guest: Option<(u64, ferrocore::engine::Feed)> = None;
     let mut tick = 0u64;
     let mut base = None;
@@ -266,18 +279,26 @@ fn run(secs: u64) {
             if tick % 100 == 10 {
                 let id = 100 + tick / 100;
                 e.set_source(id, SourceKind::Fed { width: 16, height: 16 }).unwrap();
+                guest_44k = id % 2 == 1;
                 guest = Some((id, e.fed(id).unwrap()));
+                set_scenes(&e, tick / 50, Some(id));
             }
             if let Some((_, f)) = &guest {
-                f.sound(tone.clone(), 48_000, now_ns());
+                // Every other guest is at 44.1 kHz (a music file, a USB device).
+                if guest_44k {
+                    f.sound(tone_44k.clone(), 44_100, now_ns());
+                } else {
+                    f.sound(tone.clone(), 48_000, now_ns());
+                }
             }
             if tick % 100 == 60
                 && let Some((id, _)) = guest.take()
             {
+                set_scenes(&e, tick / 50, None);
                 e.remove_source(id);
             }
             if tick.is_multiple_of(50) {
-                set_scenes(&e, tick / 50);
+                set_scenes(&e, tick / 50, guest.as_ref().map(|g| g.0));
             }
             if tick % 150 == 75 {
                 e.go(scenes[((tick / 150) % 3) as usize]).unwrap();

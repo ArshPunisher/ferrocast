@@ -184,6 +184,8 @@ struct SourceResampler {
     out_scratch: [Vec<f32>; 2],
     primed: bool,
     skip_out: usize,
+    /// Room for what `flush_into` collects (so it makes nothing).
+    flush_buf: [Vec<f32>; 2],
 }
 
 impl SourceResampler {
@@ -222,6 +224,7 @@ impl SourceResampler {
             out_scratch: [vec![0.0; out_max], vec![0.0; out_max]],
             primed: false,
             skip_out: 0,
+            flush_buf: [Vec::with_capacity(out_max * 4), Vec::with_capacity(out_max * 4)],
         })
     }
 
@@ -324,29 +327,44 @@ impl SourceResampler {
         }
     }
 
-    fn flush_into(mut self, queue: &mut VecDeque<f32>, drift_ratio: f64) {
+    /// Plays out what it still holds into `queue` (the resampler is kept, to be dropped
+    /// elsewhere). Nothing is allocated: input is zero-padded in `in_scratch` and the output
+    /// lands in `out_scratch` and `flush_buf`.
+    fn flush_into(&mut self, queue: &mut VecDeque<f32>, drift_ratio: f64) {
         let r = self.effective_ratio(drift_ratio);
         let owed = (self.held_in_frames(r) * r).round() as usize;
-        let mut out: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
-        if !self.pending[0].is_empty()
-            && let Ok(o) = self.rs.process_partial(Some(&self.pending), None)
-        {
-            out[0].extend_from_slice(&o[0]);
-            out[1].extend_from_slice(&o[1]);
-        }
-        while out[0].len() < owed + self.skip_out {
-            let Ok(o) = self.rs.process_partial(None::<&[Vec<f32>]>, None) else { break };
-            if o[0].is_empty() {
+        let mut out = std::mem::take(&mut self.flush_buf);
+        out[0].clear();
+        out[1].clear();
+        let mut first = !self.pending[0].is_empty();
+        for _ in 0..16 {
+            if !first && out[0].len() >= owed + self.skip_out {
                 break;
             }
-            out[0].extend_from_slice(&o[0]);
-            out[1].extend_from_slice(&o[1]);
+            for ch in 0..2 {
+                let n = if first { self.pending[ch].len().min(RESAMPLE_CHUNK) } else { 0 };
+                self.in_scratch[ch][..n].copy_from_slice(&self.pending[ch][..n]);
+                self.in_scratch[ch][n..].fill(0.0);
+            }
+            let n_out = match self.rs.process_into_buffer(&self.in_scratch, &mut self.out_scratch, None) {
+                Ok((_, n)) => n,
+                Err(_) => 0,
+            };
+            if n_out == 0 && !first {
+                break;
+            }
+            out[0].extend_from_slice(&self.out_scratch[0][..n_out]);
+            out[1].extend_from_slice(&self.out_scratch[1][..n_out]);
+            first = false;
         }
         let skip = self.skip_out.min(out[0].len());
         for (a, b) in out[0][skip..].iter().zip(&out[1][skip..]).take(owed) {
             queue.push_back(*a);
             queue.push_back(*b);
         }
+        self.pending[0].clear();
+        self.pending[1].clear();
+        self.flush_buf = out;
     }
 }
 
@@ -583,7 +601,12 @@ pub struct Mixer {
     spares_wanted: usize,
     /// Resamplers made ahead for a source that starts following drift, and how many to make.
     rs_spares: Vec<SpareResampler>,
-    rs_wanted: usize,
+    /// Input rates to make a resampler for, and the ones asked for and not here yet.
+    rs_wanted: Vec<u32>,
+    rs_pending: Vec<u32>,
+    /// Another rate's resampler comes from a background thread (the audio thread's mixer); else
+    /// it is made on the spot (a mixer with no one to ask).
+    async_resamplers: bool,
     /// Resamplers a source no longer uses, to be dropped elsewhere.
     rs_retired: Vec<SpareResampler>,
     /// Entries of removed sources, waiting to be dropped elsewhere.
@@ -820,6 +843,8 @@ const KEY_BUFS_AHEAD: usize = 4;
 /// Resamplers kept made ahead (same rate in and out: what following a clock's drift uses), and
 /// used ones kept for dropping elsewhere.
 const RS_SPARES: usize = 2;
+/// Room for resamplers made ahead (same rate and others a source asked for).
+const RS_SPARES_ROOM: usize = 8;
 const RS_RETIRED_ROOM: usize = 8;
 
 /// A resampler made ahead (its filter tables are built when it is made: not on the audio thread).
@@ -965,8 +990,14 @@ impl Mixer {
             sources: crate::rt::PreMap::new(),
             spares: (0..SPARES).map(|_| SpareSource(Self::fresh_source(rate))).collect(),
             spares_wanted: 0,
-            rs_spares: (0..RS_SPARES).map(|_| SpareResampler(Self::cold_rs(rate))).collect(),
-            rs_wanted: 0,
+            rs_spares: {
+                let mut v = Vec::with_capacity(RS_SPARES_ROOM);
+                v.extend((0..RS_SPARES).map(|_| SpareResampler(Self::cold_rs(rate))));
+                v
+            },
+            rs_wanted: Vec::with_capacity(RS_SPARES_ROOM),
+            rs_pending: Vec::with_capacity(RS_SPARES_ROOM),
+            async_resamplers: false,
             rs_retired: Vec::with_capacity(RS_RETIRED_ROOM),
             retired: Vec::with_capacity(RETIRED_ROOM),
             next_ns: None,
@@ -1297,20 +1328,34 @@ impl Mixer {
         SourceResampler::new_cold(rate, rate).unwrap_or_else(|| panic!("a {rate} Hz resampler"))
     }
 
-    /// A resampler made ahead, to be handed to [`Mixer::add_spare_resampler`].
-    pub fn make_spare_resampler(rate: u32) -> SpareResampler {
-        SpareResampler(Self::cold_rs(rate))
+    /// A resampler made ahead for `in_rate` to `out_rate` (None for rates it can't do), to be
+    /// handed to [`Mixer::add_spare_resampler`].
+    pub fn make_spare_resampler(in_rate: u32, out_rate: u32) -> Option<SpareResampler> {
+        SourceResampler::new_cold(in_rate, out_rate).map(SpareResampler)
     }
 
     pub fn add_spare_resampler(&mut self, r: SpareResampler) {
-        if self.rs_spares.len() < RS_SPARES {
+        if let Some(i) = self.rs_pending.iter().position(|p| *p == r.0.in_rate) {
+            self.rs_pending.swap_remove(i);
+        }
+        if self.rs_spares.len() < RS_SPARES_ROOM {
             self.rs_spares.push(r);
         }
     }
 
-    /// How many resamplers to make to replace the ones taken since the last call.
-    pub fn take_resampler_request(&mut self) -> usize {
-        std::mem::take(&mut self.rs_wanted)
+    /// The next input rate a resampler is asked for (the audio thread sends it to be made).
+    /// Resamplers for other rates are asked for ([`Mixer::pop_resampler_request`]) and waited
+    /// for, not made here (set where something answers the requests).
+    pub fn set_background_resamplers(&mut self, on: bool) {
+        self.async_resamplers = on;
+    }
+
+    pub fn pop_resampler_request(&mut self) -> Option<u32> {
+        self.rs_wanted.pop()
+    }
+
+    pub fn resampler_out_rate(&self) -> u32 {
+        self.rate
     }
 
     /// A resampler a source left, to be dropped off the audio thread.
@@ -1914,10 +1959,13 @@ impl Mixer {
         // holds is played out first, not dropped (a click of ~11 ms; Sonnet's soak test, 20 Nov).
         let mut switched_rate = false;
         if src.resampler.as_ref().is_some_and(|rs| rs.in_rate != rate)
-            && let Some(rs) = src.resampler.take()
+            && let Some(mut rs) = src.resampler.take()
         {
             switched_rate = true;
             rs.flush_into(&mut src.queue, src.drift.ratio);
+            if self.rs_retired.len() < RS_RETIRED_ROOM {
+                self.rs_retired.push(SpareResampler(rs));
+            }
             // The tail's last frames were filtered with silence for the input that never came at
             // the old rate: no exact join exists, so the old sound fades out and the new fades in
             // over 2 ms (a dip, not a click).
@@ -1948,24 +1996,56 @@ impl Mixer {
             }
         } else {
             if src.resampler.as_ref().is_none_or(|rs| rs.in_rate != rate) {
-                let made = if rate == out_rate && !switched_rate && src.drift.tail[0].len() >= RESAMPLE_CHUNK {
-                    // One made ahead when there is one; else made here (and more asked for).
-                    let rs = match self.rs_spares.pop() {
-                        Some(mut spare) => {
-                            self.rs_wanted += 1;
-                            spare.0.prime_warm(&src.drift.tail, &mut src.queue);
-                            Some(spare.0)
+                let warm = rate == out_rate && !switched_rate && src.drift.tail[0].len() >= RESAMPLE_CHUNK;
+                // One made ahead (off the audio thread) when there is one.
+                let spare = {
+                    let out = self.rate;
+                    match self.rs_spares.iter().position(|s| s.0.in_rate == rate && s.0.out_rate == out) {
+                        Some(i) => {
+                            let got = self.rs_spares.swap_remove(i).0;
+                            if rate == out && self.rs_wanted.len() < RS_SPARES_ROOM {
+                                self.rs_wanted.push(rate);
+                            }
+                            Some(got)
                         }
-                        None => {
-                            self.rs_wanted += 1;
+                        None => None,
+                    }
+                };
+                let made = match spare {
+                    Some(mut rs) => {
+                        if warm {
+                            rs.prime_warm(&src.drift.tail, &mut src.queue);
+                            src.drift.tail[0].clear();
+                            src.drift.tail[1].clear();
+                        }
+                        Some(rs)
+                    }
+                    // Same rate with none ready (rare): made here, and more asked for.
+                    None if rate == out_rate => {
+                        if self.rs_wanted.len() < RS_SPARES_ROOM {
+                            self.rs_wanted.push(rate);
+                        }
+                        let rs = if warm {
                             SourceResampler::new_warm(rate, out_rate, &src.drift.tail, &mut src.queue)
+                        } else {
+                            SourceResampler::new_cold(rate, out_rate)
+                        };
+                        if warm {
+                            src.drift.tail[0].clear();
+                            src.drift.tail[1].clear();
                         }
-                    };
-                    src.drift.tail[0].clear();
-                    src.drift.tail[1].clear();
-                    rs
-                } else {
-                    SourceResampler::new_cold(rate, out_rate)
+                        rs
+                    }
+                    // Another rate: asked for (once) and made on the background thread; until it
+                    // is here the sound waits (it is never played at the wrong rate).
+                    None if !self.async_resamplers => SourceResampler::new_cold(rate, out_rate),
+                    None => {
+                        if !self.rs_pending.contains(&rate) && self.rs_wanted.len() < RS_SPARES_ROOM {
+                            self.rs_pending.push(rate);
+                            self.rs_wanted.push(rate);
+                        }
+                        return;
+                    }
                 };
                 match made {
                     Some(rs) => src.resampler = Some(rs),
