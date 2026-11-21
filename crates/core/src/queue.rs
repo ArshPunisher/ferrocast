@@ -93,27 +93,28 @@ impl AlertQueue {
 
     /// Like [`enqueue`](Self::enqueue). With `interrupt`, an alert that is playing ends now
     /// (a `Hide`, no gap) and this one goes to the front and shows at once. While paused it
-    /// just waits, and with nothing playing it is an ordinary enqueue.
+    /// just waits, and in the gap between two alerts it still goes first.
     pub fn enqueue_with(&mut self, alert: RenderedAlert, priority: i32, interrupt: bool, now: Millis) -> Vec<Action> {
         if self.contains(&alert.alert_id) {
             return Vec::new();
         }
-        if interrupt
-            && !self.paused
-            && let Some(p) = &self.playing
-        {
-            let mut actions = vec![Action::Hide { alert_id: p.alert.alert_id.clone() }];
-            self.finish(now);
+        if interrupt && !self.paused {
+            let mut actions = Vec::new();
+            if let Some(p) = &self.playing {
+                actions.push(Action::Hide { alert_id: p.alert.alert_id.clone() });
+                self.finish(now);
+            }
+            // Playing or between two alerts, it goes first and skips the gap.
             self.next_at = now;
             self.waiting.push_front(Waiting { alert, priority, enqueued_at: now });
             actions.extend(self.tick(now));
             // The new alert is already playing, so the cap only folds waiting ones.
-            actions.extend(self.enforce_cap(None));
+            actions.extend(self.enforce_cap());
             return actions;
         }
         let pos = self.waiting.iter().position(|w| w.priority < priority).unwrap_or(self.waiting.len());
         self.waiting.insert(pos, Waiting { alert, priority, enqueued_at: now });
-        let mut actions = self.enforce_cap(None);
+        let mut actions = self.enforce_cap();
         actions.extend(self.tick(now));
         actions
     }
@@ -290,15 +291,12 @@ impl AlertQueue {
         self.next_at = Millis(now.0 + self.tuning.gap_ms);
     }
 
-    /// Folds the oldest lowest-priority alerts past the cap; never `keep` (an interrupting alert).
-    fn enforce_cap(&mut self, keep: Option<&str>) -> Vec<Action> {
+    /// Folds the oldest alerts of the lowest priority past the cap.
+    fn enforce_cap(&mut self) -> Vec<Action> {
         let mut folded = Vec::new();
         while self.waiting.len() > self.tuning.max_waiting.max(1) {
-            // Fold the oldest of the lowest priority, never `keep`.
-            let candidates =
-                || self.waiting.iter().enumerate().filter(|(_, w)| Some(w.alert.alert_id.as_str()) != keep);
-            let Some(lowest) = candidates().map(|(_, w)| w.priority).min() else { break };
-            let Some(idx) = candidates().find(|(_, w)| w.priority == lowest).map(|(i, _)| i) else { break };
+            let lowest = self.waiting.iter().map(|w| w.priority).min().unwrap_or(0);
+            let Some(idx) = self.waiting.iter().position(|w| w.priority == lowest) else { break };
             if let Some(w) = self.waiting.remove(idx) {
                 folded.push(w.alert.alert_id);
             }
@@ -627,5 +625,30 @@ mod tests {
             0,
             "what is kept is silent too"
         );
+    }
+
+    /// Between two alerts (the gap) nothing plays, but an interrupting alert still goes first.
+    #[test]
+    fn interrupt_jumps_ahead_during_the_gap() {
+        let mut q = q();
+        q.enqueue(alert("a", 1_000), 0, Millis(0));
+        q.enqueue(alert("w", 1_000), 0, Millis(1));
+        q.ack("a", AckPhase::Finished, Millis(1_000));
+        assert!(q.playing().is_none(), "in the gap");
+        let acts = q.enqueue_with(alert("i", 1_000), 0, true, Millis(1_010));
+        assert_eq!(shown(&acts), vec!["i"], "no waiting for the gap, no queueing behind w");
+        assert!(hidden(&acts).is_empty(), "nothing was playing to hide");
+        let order: Vec<_> = q.waiting().map(|w| w.alert.alert_id.clone()).collect();
+        assert_eq!(order, vec!["w"]);
+    }
+
+    #[test]
+    fn interrupt_while_paused_in_the_gap_still_just_waits() {
+        let mut q = q();
+        q.enqueue(alert("a", 1_000), 0, Millis(0));
+        q.ack("a", AckPhase::Finished, Millis(1_000));
+        q.pause();
+        assert!(q.enqueue_with(alert("i", 1_000), 0, true, Millis(1_010)).is_empty());
+        assert_eq!(q.waiting().count(), 1);
     }
 }
