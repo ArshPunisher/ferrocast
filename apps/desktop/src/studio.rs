@@ -476,7 +476,9 @@ fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32
     let shares =
         ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps, also.selective)
             .map_err(|why| {
-                if stream.vod_track.is_some() {
+                // The hint belongs to the VOD track's own reason: turning it off brings nothing
+                // back when something else is why.
+                if stream.vod_track.is_some() && why.contains("VOD track") {
                     format!("{why} (turn the VOD track off when you're not on Twitch)")
                 } else {
                     why
@@ -1307,6 +1309,21 @@ fn web_act(w: ferrocast_engine::studio_host::WebAct) -> ferrocast_studio::WebAct
         W::Stop => ferrocast_studio::WebAct::Stop,
         W::Reload => ferrocast_studio::WebAct::Reload,
     }
+}
+
+/// A recording sharing the stream's encode carries the stream's picture, so choosing something
+/// to show only on the stream or only in the recording can't work while they do: it says so
+/// rather than quietly leaving the recording with the stream's picture.
+fn refuses_while_shared(act: &StudioAct, shared: bool) -> Option<&'static str> {
+    let flags = matches!(act, StudioAct::EditItem { edit: Edit::StreamOnly | Edit::RecordingOnly, .. });
+    (flags && shared).then_some(
+        "The recording shares the stream's encoder (Same as stream), so it can't show something different from the stream. Stop the recording, then choose where this shows.",
+    )
+}
+
+/// Whether the running stream and recording share one encode.
+fn shares_encoder(h: &Held) -> bool {
+    h.stream.as_ref().is_some_and(|s| s.shares_encoder()) || h.record.as_ref().is_some_and(|(r, ..)| r.shares_encoder())
 }
 
 fn item_edit(e: Edit) -> ItemEdit {
@@ -2840,6 +2857,9 @@ impl StudioHost for DesktopStudio {
                 refresh_projectors(h);
                 let (undo, redo) = h.history.labels();
                 return Ok(json!({ "done": done, "undo": undo, "redo": redo }));
+            }
+            if let Some(why) = refuses_while_shared(&act, shares_encoder(h)) {
+                return Err(why.into());
             }
             let before = h.history.before(c, &act);
             let turns_vertical = matches!(act, StudioAct::StartVertical { .. } | StudioAct::StopVertical);
@@ -4785,6 +4805,39 @@ mod budget_tests {
         // The other qualities are as chosen, cap or not.
         let high = StudioSettings { record_quality: "high".into(), ..s.clone() };
         assert_eq!(record_encode_capped(&high, Some(twitch)), record_encode(&high));
+    }
+
+    /// The encoder budget says why a recording can't share: for sources shown on one side only,
+    /// that and nothing about a Twitch VOD track (turning it off wouldn't bring sharing back).
+    #[test]
+    fn the_reason_for_not_sharing_is_the_real_one() {
+        let s = StudioSettings { record_quality: "stream".into(), twitch_vod_track: 2, ..StudioSettings::default() };
+        let why = |selective| {
+            let b = encode_budget(&s, None, Some(1), Also { selective, ..Also::default() });
+            b["why_not_shared"].as_str().map(String::from)
+        };
+        let selective = why(true).unwrap_or_else(|| panic!("not shared"));
+        assert!(selective.contains("only on the stream or only in the recording"), "{selective}");
+        assert!(!selective.contains("VOD"), "no unrelated advice: {selective}");
+        // Without them the VOD track is the reason, and the hint to turn it off is right.
+        let vod = why(false).unwrap_or_else(|| panic!("not shared"));
+        assert!(vod.contains("VOD") && vod.contains("turn the VOD track off"), "{vod}");
+    }
+
+    /// While a recording shares the stream's encode, choosing where an item shows is refused with
+    /// a plain reason; anything else, and any edit when they don't share, goes ahead.
+    #[test]
+    fn a_flag_is_refused_while_the_recording_shares_the_streams_encoder() {
+        let edit = |edit| StudioAct::EditItem { scene: "Main".into(), id: 3, edit };
+        for flag in [Edit::StreamOnly, Edit::RecordingOnly] {
+            let why = refuses_while_shared(&edit(flag), true).unwrap_or_else(|| panic!("{flag:?} is refused"));
+            assert!(why.contains("Stop the recording"), "says what to do: {why}");
+            assert!(refuses_while_shared(&edit(flag), false).is_none(), "{flag:?} alone is fine");
+        }
+        // Back to both is always fine: it can't make the pictures differ.
+        assert!(refuses_while_shared(&edit(Edit::StreamAndRecording), true).is_none());
+        assert!(refuses_while_shared(&edit(Edit::Hide), true).is_none());
+        assert!(refuses_while_shared(&StudioAct::Scenes, true).is_none());
     }
 
     #[test]

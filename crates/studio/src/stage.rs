@@ -4741,6 +4741,12 @@ impl StageOutput {
         self.own.stats()
     }
 
+    /// A stream and a recording share this output's encode (Same as stream): they carry one
+    /// picture, so something shown on only one of them can't be.
+    pub fn shares_encoder(&self) -> bool {
+        self.own.shares_encoder()
+    }
+
     pub fn record_stats(&self) -> RecordStats {
         self.own.record_stats()
     }
