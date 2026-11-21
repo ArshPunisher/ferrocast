@@ -4362,10 +4362,15 @@ impl Stage {
                     let _ = self.collect_audio(name, on, out, path);
                     path.pop();
                 }
-            } else if self.info_of(it).audio && !out.iter().any(|a| a.name == name) {
-                let mut info = self.audio_info(&src, None);
-                info.shown = on;
-                out.push(info);
+            } else if self.info_of(it).audio {
+                // Listed where it's first seen, on air when any placement of it is.
+                if let Some(a) = out.iter_mut().find(|a| a.name == name) {
+                    a.shown |= on;
+                } else {
+                    let mut info = self.audio_info(&src, None);
+                    info.shown = on;
+                    out.push(info);
+                }
             }
         }
         Ok(())
@@ -6795,6 +6800,22 @@ mod tests {
         // A scene inside itself doesn't loop.
         ok(s.add_existing("Audio", "Main"));
         assert!(!ok(s.audio("Main")).is_empty());
+    }
+
+    /// A sound placed twice is on air when any of its placements is: a hidden scene above that
+    /// holds the mic too doesn't make the visible one read as hidden (the first one seen won).
+    #[test]
+    fn a_sound_is_shown_when_any_of_its_placements_is() {
+        let s = stage();
+        ok(s.add_source("Main", "coreaudio_input_capture", "Mic", &json!({}), false));
+        ok(s.add_scene("Audio"));
+        ok(s.add_existing("Audio", "Mic"));
+        let nested = ok(s.add_existing("Main", "Audio"));
+        ok(s.edit_item("Main", nested.id, ItemEdit::Hide));
+        let rows = ok(s.audio("Main"));
+        let mics: Vec<_> = rows.iter().filter(|a| a.name == "Mic").collect();
+        assert_eq!(mics.len(), 1, "listed once");
+        assert!(mics[0].shown, "on air through its own visible item");
     }
 
     /// Push-to-talk and push-to-mute are kept in the sound's own settings (OBS's keys), clamped to
