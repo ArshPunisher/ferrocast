@@ -5558,6 +5558,7 @@ fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
     }
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn remember_display_id(set: &mut Value, index_key: &str, id_key: &str, lookup: impl FnOnce(u32) -> Option<String>) {
     if let Some(d) = set.get(index_key).and_then(Value::as_u64) {
         match lookup(d as u32) {

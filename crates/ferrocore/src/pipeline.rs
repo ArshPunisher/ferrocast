@@ -1419,6 +1419,7 @@ fn cut_step(from: i64, resume: Option<i64>, key: bool, pts: i64, entered: bool) 
 impl Pipeline {
     /// Tests: how many frames the encoder has been handed.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn video_calls_for_test(&self) -> u64 {
         self.video_calls
     }
@@ -1431,18 +1432,21 @@ impl Pipeline {
 
     /// Tests: the next video frame fails, once.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn fail_video_once_for_test(&mut self) {
         self.fail_video_once = true;
     }
 
     /// Tests: this output's encoder faults on every frame from now on.
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn fail_video_for_test(&mut self) {
         self.fail_video = true;
     }
 
     /// Records into `file` (tests: a file that fails when it is told to).
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn record_into(&mut self, file: File) {
         self.recording =
             Some(Recording::Waiting { file: BufWriter::new(file), kind: Kind::Mp4, held: VecDeque::new() });
@@ -1463,10 +1467,12 @@ fn monotonic_dts_step(last: i64, pts_us: i64, max_step: i64) -> i64 {
 /// and nothing is retried.
 #[cfg(test)]
 mod full_disk_tests {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
     use std::io::{self, Read, Write};
 
     use super::*;
     use crate::mp4::{AudioTrack, Mp4Writer, VideoTrack};
+    #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
     use crate::video::{PixelFormat, RateControl, VideoCodec};
 
     /// A sink that takes `room` bytes and then says the disk is full (a short write first, as a
@@ -1603,6 +1609,7 @@ mod full_disk_tests {
     }
 
     /// Whether this computer encodes (the Mac always; elsewhere with FFmpeg's H.264).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn encodes() -> bool {
         (cfg!(target_os = "macos") && std::env::var("FERROCAST_AV_ENCODER").as_deref() != Ok("ffmpeg"))
             || crate::ffenc::h264_encoder().is_some()
