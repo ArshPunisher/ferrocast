@@ -3022,6 +3022,12 @@ impl Stage {
                 s["settings"]["id_counter"] = json!(next - 1);
             })?;
         }
+        // The scene's counter goes past the children too, so the next item added gets a new id.
+        let high = next - 1;
+        self.with_items(scene, |_, set| {
+            let have = set.get("id_counter").and_then(Value::as_i64).unwrap_or(0);
+            set.insert("id_counter".into(), json!(have.max(high)));
+        })?;
         item["id"] = json!(placed.id);
         item["name"] = root["name"].clone();
         item["source_uuid"] = root["uuid"].clone();
@@ -6572,6 +6578,28 @@ mod tests {
         let own = ok(a.item_filters("Main", it.id));
         assert!(own.iter().any(|f| f.name == "Boost" && f.enabled), "the picture's own copy is as it was");
         assert!(ok(a.filters("Cam")).iter().any(|f| f.name == "Boost" && !f.enabled));
+    }
+
+    #[test]
+    fn a_source_added_after_a_group_paste_gets_an_id_no_child_has() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        let blue = color(&a, "Blue");
+        let g = ok(a.group_together("Main", &[red.id, blue.id], "Pair"));
+        let clip = ok(a.copy_source("Main", g.id));
+        ok(b.paste_source("Main", &clip));
+        let later = color(&b, "Later");
+        let mut ids = vec![later.id];
+        for it in ok(b.items("Main")) {
+            if it.id != later.id {
+                ids.push(it.id);
+            }
+            ids.extend(it.children.iter().map(|c| c.id));
+        }
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "no id repeats: {ids:?}");
     }
 
     #[test]
