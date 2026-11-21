@@ -1392,6 +1392,11 @@ impl Engine {
         self.sleep.is_inhibited()
     }
 
+    /// Reloads Ferrocast's local font directory (`<data>/fonts/`) into the text renderer.
+    pub fn reload_fonts(&self) {
+        self.text.lock().unwrap_or_else(|p| p.into_inner()).reload_extra_fonts();
+    }
+
     fn sync_sleep(&self, ticket: Option<(u64, bool)>) {
         if let Some((epoch, want)) = ticket {
             self.sleep.apply(epoch, want);

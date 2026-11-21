@@ -52,6 +52,7 @@ pub mod engine;
 pub mod ffenc;
 pub mod ffsrc;
 pub mod flv;
+pub mod fonts;
 pub mod level;
 pub mod lut;
 pub mod mix;

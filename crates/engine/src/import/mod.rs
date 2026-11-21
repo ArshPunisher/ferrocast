@@ -8,6 +8,8 @@
 //! 2. **Apply**: a backup, then one transaction (`ferrocast_store::import`), then the
 //!    engine reloads its commands, timers and points settings.
 
+pub mod overlay;
+pub mod overlay_parse;
 pub mod streamelements;
 pub mod streamlabs;
 mod text;
