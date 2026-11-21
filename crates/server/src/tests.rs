@@ -1837,3 +1837,31 @@ async fn alert_rules_take_weight_and_interrupt_and_refuse_bad_weights() {
     let e: Value = res.json().await.unwrap();
     assert!(e.to_string().contains("weight"), "{e}");
 }
+
+#[tokio::test]
+async fn creating_a_rule_checks_weight_and_interrupt_too() {
+    let r = start().await;
+    let rules: Value = r.get("/api/v1/alert-rules").await.json().await.unwrap();
+    let mut base = rules[0].clone();
+    base["id"] = json!("mine");
+    base["name"] = json!("Mine");
+    for (what, edit) in
+        [("over the limit", json!(1001)), ("negative", json!(-1)), ("fractional", json!(1.5)), ("text", json!("heavy"))]
+    {
+        let mut rule = base.clone();
+        rule["variations"][0]["weight"] = edit;
+        let res = r.post("/api/v1/alert-rules", rule).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{what}");
+    }
+    let mut rule = base.clone();
+    rule["interrupt"] = json!("yes");
+    assert_eq!(
+        r.post("/api/v1/alert-rules", rule).await.status(),
+        StatusCode::BAD_REQUEST,
+        "interrupt must be a boolean"
+    );
+    let mut ok = base.clone();
+    ok["variations"][0]["weight"] = json!(1000);
+    ok["interrupt"] = json!(true);
+    assert_eq!(r.post("/api/v1/alert-rules", ok).await.status(), StatusCode::CREATED);
+}
