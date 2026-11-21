@@ -194,7 +194,7 @@ pub fn install(data: &Path) {
         return;
     };
     // SAFETY: valid null args create unnamed auto-reset/manual-reset events.
-    let (Ok(fault_ev), Ok(done_ev)) = (unsafe {
+    let Ok((fault_ev, done_ev)) = (unsafe {
         CreateEventW(None, false, false, PCWSTR::null())
             .and_then(|f| CreateEventW(None, true, false, PCWSTR::null()).map(|d| (f, d)))
     }) else {
