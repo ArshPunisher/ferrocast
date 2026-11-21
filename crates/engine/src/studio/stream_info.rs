@@ -72,7 +72,7 @@ impl Engine {
                     Some(format!("Connect {} in Settings, Accounts.", p.label()))
                 } else if !has_scope {
                     Some(format!(
-                        "Reconnect {} in Settings, Accounts to let Ferrocast change your stream info (it needs the \"{scope}\" permission).",
+                        "Reconnect {} in Settings, Accounts to allow stream info changes (\"{scope}\").",
                         p.label()
                     ))
                 } else {
@@ -490,7 +490,7 @@ async fn push_one(
             };
             let message = match &e {
                 ConnectorError::MissingScope { scope, .. } => {
-                    format!("{} needs a permission it didn't get when you connected (\"{scope}\").", p.label())
+                    format!("{} needs more permission (\"{scope}\"): reconnect it in Settings, Accounts.", p.label())
                 }
                 other => sentence(&other.to_string()),
             };

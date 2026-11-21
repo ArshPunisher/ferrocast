@@ -10,6 +10,15 @@ use serde_json::Value;
 
 use crate::{Engine, EngineError};
 
+/// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch, Kick, or WebRTC (WHIP) is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCap {
+    pub max_kbps: Option<u32>,
+    pub h264_only: bool,
+    pub keyframe_secs: u32,
+    pub no_bframes: bool,
+}
+
 /// What `GET /studio/engine` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StudioStatus {
@@ -26,6 +35,9 @@ pub struct StudioStatus {
     /// what came back on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovered: Option<Recovered>,
+    /// Present when an unclean exit was detected or Safe Mode is active / awaiting confirmation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_mode: Option<crate::safe_mode::SafeModeStatus>,
 }
 
 /// What the Studio was doing when Ferrocast last closed without quitting.
@@ -158,6 +170,14 @@ impl PreviewRect {
 pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn status(&self) -> StudioStatus;
     async fn start(&self) -> Result<StudioStatus, String>;
+    /// Starts the Studio, deferring saved collection load when `load_collection` is `false` (Safe Mode).
+    async fn start_with_mode(&self, _load_collection: bool) -> Result<StudioStatus, String> {
+        self.start().await
+    }
+    /// Confirms loading the saved scene collection while running in Safe Mode or switching to Normal Mode.
+    async fn confirm_collection(&self) -> Result<StudioStatus, String> {
+        Ok(self.status().await)
+    }
     async fn stop(&self) -> Result<StudioStatus, String>;
     /// Every kind of source, filter, transition, encoder and output (`ferrocast_studio::Kinds`).
     async fn kinds(&self) -> Result<Value, String>;
@@ -183,6 +203,17 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Does one thing to the scene collection (checked before it gets here) and answers what
     /// it shows; changes are saved by the host.
     async fn act(&self, act: StudioAct) -> Result<Value, String>;
+    /// The meters' levels (the 300 ms window, or `fast`: a few blocks), read without waiting for the Studio's queue
+    /// (`act` runs one thing at a time, in order). None: this host can't (or no engine runs),
+    /// ask `act` with `StudioAct::Levels` instead.
+    fn levels_now(&self, _names: &[String], _fast: bool) -> Option<Value> {
+        None
+    }
+    /// A shortcut field is waiting for a key (`on`) or stopped waiting: the host's global
+    /// shortcuts are let go for the wait, so the page gets every key (those already in use too)
+    /// and no action runs from it. Asked again within seconds, it keeps them off; it puts them
+    /// back by itself if the page goes away without saying so. Not queued behind other work.
+    fn capture_keys(&self, _on: bool) {}
     /// The Studio's settings (saved by the host; defaults the first time).
     async fn settings(&self) -> StudioSettings;
     /// Saves and applies them (checked before they get here) → what applies only after
@@ -190,8 +221,26 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String>;
     /// `{ engine: { cpu, fps, frame_ms, lagged, frames, memory_mb }, canvas, stream, record }`.
     async fn stats(&self) -> Result<Value, String>;
+    /// Cheap, read-only Studio snapshot for obs-websocket event polling: never saves to disk or
+    /// gathers CPU/disk stats. Returning None falls back to individual `act` calls for test fakes.
+    async fn obsws_snapshot(&self) -> Option<Result<Value, String>> {
+        None
+    }
     /// Starts or stops recording → the recording's stats (null when stopped) and its file.
     async fn record(&self, on: bool) -> Result<Value, String>;
+    /// The recording's stats now (`active`, `bytes`, `seconds`, `file`, `error`, `error_detail`,
+    /// `disk_free_mb`), or null without one. Looked at every couple of seconds.
+    async fn record_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    /// Web page sources and whether each stopped drawing (its browser gave up being brought back).
+    async fn stalled_sources(&self) -> Vec<(String, bool)> {
+        Vec::new()
+    }
+    /// One-line things the Studio's captures want said (key, line, detail), since the last call.
+    async fn take_notices(&self) -> Vec<(String, String, String)> {
+        Vec::new()
+    }
     async fn record_pause(&self, on: bool) -> Result<(), String>;
     /// Starts or stops the replay buffer → `{ active }`.
     async fn replay(&self, _on: bool) -> Result<Value, String> {
@@ -247,6 +296,11 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn focus(&self, _pictures: Vec<Vec<u8>>, _w: u32, _h: u32) -> Result<Vec<Option<f32>>, String> {
         Err(NOT_HERE.into())
     }
+    /// Tells the Studio the active shared-stream ceiling imposed by enabled main destinations
+    /// (e.g. Twitch 6,000 kbps H.264 / 2 s keyframes) without altering saved user settings.
+    async fn set_stream_cap(&self, _cap: Option<StreamCap>) -> Result<(), String> {
+        Ok(())
+    }
     /// Auto quality: the stream on air (and the vertical one) at `pct` percent of the bitrate
     /// set, from now on; what's saved doesn't change.
     async fn set_live_quality(&self, _pct: u8) -> Result<(), String> {
@@ -277,6 +331,12 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn stream_start(&self, server: String, key: String, tracks: Vec<(u32, u32, u32)>) -> Result<Value, String>;
     /// Stops the stream (and the vertical picture's with it).
     async fn stream_stop(&self) -> Result<(), String>;
+    /// A delayed stream's tail still being sent after Stop: seconds to go and megabytes left.
+    fn delay_drain(&self) -> Option<(f64, f64)> {
+        None
+    }
+    /// Ends the delayed tail at once (what is left of the delay is dropped).
+    async fn discard_delay(&self) {}
     /// Also streams the vertical picture, while it's on, over RTMP to `key` → whether it
     /// started (false: there's no vertical picture).
     async fn vertical_stream_start(&self, _server: String, _key: String) -> Result<bool, String> {
@@ -738,27 +798,41 @@ impl FilePick {
     }
 }
 
-/// Shortcut actions with no name in them (OBS's hotkeys). Others: scene:, mute:,
-/// push_to_talk:, push_to_mute:, screenshot:, media_*: <name>; show:, hide: <scene>\n<source>;
-/// filter: <source>\n<filter>; quick: <1 to 10>.
-pub const HOTKEY_ACTIONS: [&str; 16] = [
+/// Shortcut actions with no name in them (OBS's hotkeys and Ferrocast's vertical canvas). Others:
+/// scene:, mute:, push_to_talk:, push_to_mute:, screenshot:, media_*: <name>; show:, hide:
+/// <scene>\n<source>; filter: <source>\n<filter>; quick: <1 to 10>.
+pub const HOTKEY_ACTIONS: [&str; 27] = [
     "go_live",
     "end_stream",
     "record",
+    "start_record",
+    "stop_record",
     "pause_record",
+    "unpause_record",
     "split_record",
     "chapter",
     "replay",
+    "start_replay",
+    "stop_replay",
     "save_replay",
     "virtualcam",
+    "start_virtualcam",
+    "stop_virtualcam",
     "studio_mode",
     "transition",
     "swap_scenes",
     "fade_to_black",
     "screenshot",
+    "vertical:show_preview",
+    "vertical:hide_preview",
+    "vertical:toggle_preview",
+    "vertical:screenshot",
     "undo",
     "redo",
 ];
+
+/// How many keys one hotkey action takes (OBS's "+" on a hotkey row).
+pub const MAX_KEYS_PER_ACTION: usize = 4;
 
 /// Recording formats: crash-safe MP4 and MOV, fragmented ones, and MKV, FLV and TS.
 pub const RECORD_FORMATS: [&str; 8] = ["mp4", "mov", "fmp4", "fmov", "mkv", "flv", "ts", "hls"];
@@ -777,14 +851,22 @@ pub struct StudioSettings {
     pub keyframe_s: u32,
     /// "high", "main" or "baseline".
     pub profile: String,
+    /// B-frames in the Mac's encoder. Its own key: the old `bframes` (always saved as true, and
+    /// ignored) must not switch them on.
+    #[serde(rename = "b_frames")]
     pub bframes: bool,
     /// Send at this size instead of the canvas's.
     pub scale: Option<[u32; 2]>,
+    /// How a stream sent at another size is scaled: "bilinear", "bicubic" (default), "lanczos" or
+    /// "area".
+    pub scale_filter: String,
     pub audio_kbps: u32,
     /// The canvas: what's composed.
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    /// Broadcast timing: 24 → 23.976, 30 → 29.97, 60 → 59.94 (from the next start).
+    pub fps_ntsc: bool,
     /// Where recordings go (absolute); None is the Movies folder's Ferrocast folder.
     pub record_folder: Option<String>,
     /// That Movies (Videos) folder's Ferrocast folder on this computer, so Settings can show
@@ -793,18 +875,25 @@ pub struct StudioSettings {
     pub record_folder_default: String,
     /// "mp4" or "mov" (both crash-safe).
     pub record_format: String,
-    /// "stream" (same as the stream), "high" (near-lossless, the default), "lossless".
+    /// "stream" (same as the stream), "high" (near-lossless, the default), "balanced" (about half
+    /// its size), "lossless", "custom".
     pub record_quality: String,
     pub reconnect: bool,
     pub reconnect_every_s: u32,
     pub reconnect_tries: u32,
     /// Viewers see everything this many seconds later (0: off).
     pub delay_s: u32,
+    /// The most memory the delay holds, in megabytes: past it the oldest seconds are dropped
+    /// (16 to 4096; 256).
+    pub delay_max_mb: u32,
     /// Twitch's VOD track: this audio track (2 to 6) also goes to Twitch for the VOD (leave
     /// music off it); 0: off.
     pub twitch_vod_track: u8,
     /// 44100 or 48000 (applies after a restart).
     pub sample_rate: u32,
+    /// The names of the recording's six audio tracks in its file (MP4 and MKV), each up to 40
+    /// characters; fewer than six leave the rest unnamed.
+    pub audio_track_names: Vec<String>,
     pub stereo: bool,
     /// The device "Hear it" plays on: (name, id); None is the system's.
     pub monitoring: Option<(String, String)>,
@@ -836,7 +925,7 @@ pub struct StudioSettings {
     /// ffmpeg muxer settings of the streamer's own for recordings (OBS's Custom Muxer Settings).
     pub record_muxer: String,
     /// The replay buffer keeps the last this many seconds (5 to 21600), at most this many
-    /// megabytes (0: no limit), saved as `replay_format` ("mp4", "mkv", "mov", "flv", "ts").
+    /// megabytes (0: the default cap, 512; 1000000 is as good as none), saved as `replay_format` ("mp4", "mkv", "mov", "flv", "ts").
     pub replay_seconds: u32,
     pub replay_mb: u32,
     pub replay_format: String,
@@ -877,6 +966,26 @@ pub struct StudioSettings {
     pub keep_recording: bool,
     pub replay_when_streaming: bool,
     pub keep_replay: bool,
+    /// OBS's General › Projectors: new projector windows stay above other apps' windows.
+    pub projector_on_top: bool,
+    /// Opening a full-screen projector on a display closes the one already there.
+    pub projector_one_per_screen: bool,
+    /// The projectors open when Ferrocast quits come back at the next Start.
+    pub projector_restore: bool,
+    /// OBS's "Hide cursor over projectors": the pointer is hidden while it is over a projector
+    /// window and comes back when it leaves.
+    pub projector_hide_cursor: bool,
+}
+
+/// The replay buffer's memory cap when none is set: it kept encoded video in RAM without a limit.
+pub const DEFAULT_REPLAY_MB: u32 = 512;
+
+impl StudioSettings {
+    /// The megabytes the replay buffer may hold: `replay_mb`, or the default cap for 0 (profiles
+    /// saved before the cap existed carry 0).
+    pub fn replay_cap_mb(&self) -> u32 {
+        if self.replay_mb == 0 { DEFAULT_REPLAY_MB } else { self.replay_mb }
+    }
 }
 
 impl Default for StudioSettings {
@@ -887,12 +996,14 @@ impl Default for StudioSettings {
             vbr: false,
             keyframe_s: 2,
             profile: "high".into(),
-            bframes: true,
+            bframes: false,
             scale: None,
+            scale_filter: "bicubic".into(),
             audio_kbps: 160,
             width: 1920,
             height: 1080,
             fps: 30,
+            fps_ntsc: false,
             record_folder: None,
             record_folder_default: String::new(),
             record_format: "mp4".into(),
@@ -904,8 +1015,10 @@ impl Default for StudioSettings {
             reconnect_every_s: 2,
             reconnect_tries: 25,
             delay_s: 0,
+            delay_max_mb: 256,
             twitch_vod_track: 0,
             sample_rate: 48000,
+            audio_track_names: Vec::new(),
             stereo: true,
             monitoring: None,
             hotkeys: Default::default(),
@@ -922,7 +1035,7 @@ impl Default for StudioSettings {
             record_remux: true,
             record_muxer: String::new(),
             replay_seconds: 30,
-            replay_mb: 0,
+            replay_mb: DEFAULT_REPLAY_MB,
             replay_format: "mp4".into(),
             speakers: None,
             true_peak: false,
@@ -946,6 +1059,10 @@ impl Default for StudioSettings {
             keep_recording: false,
             replay_when_streaming: false,
             keep_replay: false,
+            projector_on_top: false,
+            projector_one_per_screen: false,
+            projector_restore: false,
+            projector_hide_cursor: false,
         }
     }
 }
@@ -995,6 +1112,9 @@ impl StudioSettings {
         if !["high", "main", "baseline"].contains(&self.profile.as_str()) {
             return bad("profile: high, main or baseline.");
         }
+        if ferrocore::Filter::downscale_named(&self.scale_filter).is_none() {
+            return bad("scale_filter: bilinear, bicubic, lanczos or area.");
+        }
         if let Some([w, h]) = self.scale
             && !((128..=7680).contains(&w) && (72..=4320).contains(&h) && w.is_multiple_of(2) && h.is_multiple_of(2))
         {
@@ -1012,6 +1132,9 @@ impl StudioSettings {
         if ![24, 25, 30, 48, 50, 60, 120].contains(&self.fps) {
             return bad("fps: 24, 25, 30, 48, 50, 60 or 120.");
         }
+        if self.fps_ntsc && ![24, 30, 60].contains(&self.fps) {
+            return bad("fps_ntsc: only for 24 (23.976), 30 (29.97) or 60 (59.94).");
+        }
         if let Some(f) = &self.record_folder
             && (f.len() > 1024 || !std::path::Path::new(f).is_absolute())
         {
@@ -1020,8 +1143,8 @@ impl StudioSettings {
         if !RECORD_FORMATS.contains(&self.record_format.as_str()) {
             return bad("record_format: mp4, mov, fmp4, fmov, mkv, flv, ts or hls.");
         }
-        if !["stream", "high", "lossless", "custom"].contains(&self.record_quality.as_str()) {
-            return bad("record_quality: stream, high, lossless or custom.");
+        if !["stream", "high", "balanced", "lossless", "custom"].contains(&self.record_quality.as_str()) {
+            return bad("record_quality: stream, high, balanced, lossless or custom.");
         }
         for (field, id) in [("video_encoder", &self.video_encoder), ("record_encoder", &self.record_encoder)] {
             if let Some(id) = id
@@ -1050,7 +1173,7 @@ impl StudioSettings {
             return bad("record_split: up to 1440 minutes or 1000000 MB (0: never).");
         }
         if !(5..=21_600).contains(&self.replay_seconds) || self.replay_mb > 1_000_000 {
-            return bad("replay_seconds: 5 to 21600 (replay_mb: 0 to 1000000).");
+            return bad("replay_seconds: 5 to 21600 (replay_mb: 0 to 1000000, 0 is 512).");
         }
         if !["metal", "opengl"].contains(&self.renderer.as_str()) {
             return bad("renderer: metal or opengl.");
@@ -1081,6 +1204,14 @@ impl StudioSettings {
         if self.delay_s > 1800 {
             return bad("delay_s: 0 to 1800.");
         }
+        if !(16..=4096).contains(&self.delay_max_mb) {
+            return bad("delay_max_mb: 16 to 4096 megabytes.");
+        }
+        if self.audio_track_names.len() > 6
+            || self.audio_track_names.iter().any(|n| n.chars().count() > 40 || n.chars().any(char::is_control))
+        {
+            return bad("audio_track_names: up to 6 names of up to 40 characters.");
+        }
         if ![44_100, 48_000].contains(&self.sample_rate) {
             return bad("sample_rate: 44100 or 48000.");
         }
@@ -1092,7 +1223,7 @@ impl StudioSettings {
         if self.hotkeys.len() > 200 {
             return bad("hotkeys: up to 200.");
         }
-        for (action, keys) in &self.hotkeys {
+        for (action, value) in &self.hotkeys {
             let known = HOTKEY_ACTIONS.contains(&action.as_str())
                 || ["scene:", "mute:", "push_to_talk:", "push_to_mute:", "media_play_pause:", "media_restart:", "media_stop:", "media_next:", "media_previous:", "screenshot:"]
                     .iter()
@@ -1107,12 +1238,15 @@ impl StudioSettings {
             if !known {
                 return bad("hotkeys: one of the Studio's shortcut actions (see API.md).");
             }
-            if keys.is_empty()
-                || keys.len() > 64
-                // Named keys (Space, Comma, F9…) joined with +: nothing else.
-                || !keys.chars().all(|c| c.is_ascii_alphanumeric() || c == '+')
+            // One or more keys (up to 4), each named keys (Space, Comma, F9…) joined with +,
+            // the keys of one action joined with |: nothing else.
+            let all: Vec<&str> = value.split('|').collect();
+            if all.len() > MAX_KEYS_PER_ACTION
+                || all.iter().any(|keys| {
+                    keys.is_empty() || keys.len() > 64 || !keys.chars().all(|c| c.is_ascii_alphanumeric() || c == '+')
+                })
             {
-                return bad("hotkeys: keys like CmdOrCtrl+Shift+L.");
+                return bad("hotkeys: keys like CmdOrCtrl+Shift+L, up to 4 for one action, joined with |.");
             }
         }
         Ok(())
@@ -1228,6 +1362,13 @@ pub struct AudioChange {
     /// Heard this much later (negative: earlier), -950 to 20000 ms.
     pub sync_ms: Option<i64>,
     pub mono: Option<bool>,
+    /// Push-to-talk / push-to-mute on or off, and their release delays (0 to 5000 ms).
+    pub push_to_talk: Option<bool>,
+    pub push_to_talk_ms: Option<u32>,
+    pub push_to_mute: Option<bool>,
+    pub push_to_mute_ms: Option<u32>,
+    /// "This is a mic": whether the live watch judges it as a microphone.
+    pub mic: Option<bool>,
     /// The audio tracks (1 to 6) it's mixed into.
     pub tracks: Option<Vec<u8>>,
     /// Sent by a shortcut (mute, push-to-talk): not an undo step, as in OBS. Never from the API.
@@ -1251,6 +1392,13 @@ pub struct NewSource {
     pub name: String,
     #[serde(default)]
     pub settings: Value,
+}
+
+/// Optional scene-item target for item-scoped video filter operations (`{ scene, id }`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ItemTarget {
+    pub scene: String,
+    pub id: i64,
 }
 
 /// One thing to do to the scene collection. The routes build these; [`StudioAct::check`]
@@ -1339,6 +1487,10 @@ pub enum StudioAct {
     Audio {
         scene: String,
     },
+    /// One audio source or global channel by name -> `AudioInfo`.
+    AudioByName {
+        name: String,
+    },
     SetAudio {
         name: String,
         change: AudioChange,
@@ -1352,6 +1504,18 @@ pub enum StudioAct {
     Levels {
         names: Vec<String>,
     },
+    /// A push-to-talk (`talk`) or push-to-mute key went down or up for a sound → whether the sound
+    /// has that switched on (false: the key then toggles its mute as before). Never saved.
+    PushKey {
+        name: String,
+        talk: bool,
+        down: bool,
+    },
+    /// One look for the live watch's two-second tick, taken together on the Studio's thread:
+    /// `{ scenes, audio, items }`: the scenes (as `Scenes`), the sounds of the scene on air (as
+    /// `Audio`, null when none) and the items of that scene and of every scene shown inside it
+    /// (as `Items`, by scene name). Replaces a handful of separate reads every tick. Never saved.
+    WatchSnapshot,
     /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
     /// frozen camera).
     Look {
@@ -1371,32 +1535,53 @@ pub enum StudioAct {
     },
     Filters {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     AddFilter {
         name: String,
         filter: NewSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     RemoveFilter {
         name: String,
         filter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     EditFilter {
         name: String,
         filter: String,
         edit: FilterEdit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     FilterSettings {
         name: String,
         filter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     FilterOptions {
         name: String,
         filter: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     UpdateFilter {
         name: String,
         filter: String,
         settings: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
+    },
+    /// Switches one scene item between `"This picture only"` (`own: true`, copies source video
+    /// filters to an item override) and `"Everywhere this source is used"` (`own: false`).
+    SetItemFilterScope {
+        scene: String,
+        id: i64,
+        own: bool,
     },
     /// A PNG of a scene or source, saved where recordings go → `{ file }`.
     Screenshot {
@@ -1411,10 +1596,14 @@ pub enum StudioAct {
         name: String,
         what: WebAct,
     },
-    /// Copies every filter of `from` onto `name` (OBS's Copy / Paste Filters).
+    /// Copies every filter of `from` (or `from_item`) onto `name` or `item` (OBS's Copy / Paste Filters).
     PasteFilters {
         name: String,
         from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_item: Option<ItemTarget>,
     },
     /// Moves and sizes an item from the preview: its box's first corner to (`x`, `y`), its
     /// sides `w` and `h` long, in canvas pixels → the item. `save` at the end of a drag.
@@ -1508,6 +1697,8 @@ pub enum StudioAct {
         /// With its filters on (the drawer's result), as it shows in a scene.
         #[serde(default)]
         filters: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     /// How a source is doing, for its drawer → `{ web_text?: { at_ms, value, error } | null }`
     /// for a Web text (its last read), `{ page?: { ok, error } }` for a Browser source on the
@@ -1522,6 +1713,14 @@ pub enum StudioAct {
         id: u32,
         #[serde(default)]
         window: bool,
+        width: u32,
+    },
+    /// A still of a display, window, camera, or capture card for Add-source picker cards, at most
+    /// `width` wide -> `{ image: data URL | null }`.
+    SourceStill {
+        kind: String,
+        key: String,
+        value: Value,
         width: u32,
     },
     /// The VST plugins on this computer → `{ available, why, plugins: [{ path, cid, name,
@@ -1643,7 +1842,7 @@ impl StudioAct {
             check_settings(v)
         };
         match self {
-            A::Scenes | A::Sources | A::StopVertical | A::AudioCare | A::Privacy => Ok(()),
+            A::Scenes | A::Sources | A::StopVertical | A::AudioCare | A::Privacy | A::WatchSnapshot => Ok(()),
             A::SetPrivacy { privacy } => {
                 if !privacy.is_object() || privacy.to_string().len() > 8_000 {
                     return Err(EngineError::Invalid("privacy: { hide_notifications, hide_apps }.".into()));
@@ -1662,7 +1861,8 @@ impl StudioAct {
             | A::MoveScene { scene, .. }
             | A::SetCurrent { scene }
             | A::Items { scene }
-            | A::Audio { scene } => check_source_name(scene),
+            | A::Audio { scene }
+            | A::AudioByName { name: scene } => check_source_name(scene),
             A::DuplicateScene { scene, name } | A::AddExisting { scene, name } => {
                 check_source_name(scene)?;
                 check_source_name(name)
@@ -1698,7 +1898,8 @@ impl StudioAct {
                 check_source_name(name)?;
                 check_source_name(new_name)
             }
-            A::Settings { name } | A::Options { name } | A::Filters { name } => check_source_name(name),
+            A::Settings { name } | A::Options { name } => check_source_name(name),
+            A::Filters { name, item } => check_filter_target(name, item.as_ref()),
             A::Update { name, settings } => {
                 check_source_name(name)?;
                 object(settings)
@@ -1725,6 +1926,9 @@ impl StudioAct {
                 {
                     return Err(EngineError::Invalid("tracks: numbers 1 to 6.".into()));
                 }
+                if c.push_to_talk_ms.is_some_and(|ms| ms > 5_000) || c.push_to_mute_ms.is_some_and(|ms| ms > 5_000) {
+                    return Err(EngineError::Invalid("push_to_talk_ms, push_to_mute_ms: 0 to 5000 ms.".into()));
+                }
                 Ok(())
             }
             A::SetChannel { channel, device } => {
@@ -1733,33 +1937,35 @@ impl StudioAct {
                 }
                 device.as_mut().map(new).transpose().map(|_| ())
             }
+            A::PushKey { name, .. } => check_source_name(name),
             A::Levels { names } | A::Look { names } => {
                 if names.len() > 64 {
                     return Err(EngineError::Invalid("names: up to 64 sources at once.".into()));
                 }
                 names.iter().try_for_each(|n| check_source_name(n))
             }
-            A::AddFilter { name, filter } => {
-                check_source_name(name)?;
+            A::AddFilter { name, filter, item } => {
+                check_filter_target(name, item.as_ref())?;
                 new(filter)
             }
-            A::RemoveFilter { name, filter }
-            | A::EditFilter { name, filter, .. }
-            | A::FilterSettings { name, filter }
-            | A::FilterOptions { name, filter } => {
-                check_source_name(name)?;
+            A::RemoveFilter { name, filter, item }
+            | A::EditFilter { name, filter, item, .. }
+            | A::FilterSettings { name, filter, item }
+            | A::FilterOptions { name, filter, item } => {
+                check_filter_target(name, item.as_ref())?;
                 check_source_name(filter)
             }
-            A::UpdateFilter { name, filter, settings } => {
-                check_source_name(name)?;
+            A::UpdateFilter { name, filter, settings, item } => {
+                check_filter_target(name, item.as_ref())?;
                 check_source_name(filter)?;
                 object(settings)
             }
+            A::SetItemFilterScope { scene, .. } => check_source_name(scene),
             A::Web { name, .. } | A::Screenshot { name } => check_source_name(name),
-            A::PasteFilters { name, from } => {
-                check_source_name(name)?;
-                check_source_name(from)?;
-                if name == from {
+            A::PasteFilters { name, from, item, from_item } => {
+                check_filter_target(name, item.as_ref())?;
+                check_filter_target(from, from_item.as_ref())?;
+                if item.is_none() && from_item.is_none() && name == from {
                     return Err(EngineError::Invalid("from: another source than the one pasted onto.".into()));
                 }
                 Ok(())
@@ -1795,6 +2001,21 @@ impl StudioAct {
                 Err(EngineError::Invalid("width: 64 to 1280.".into()))
             }
             A::ScreenStill { .. } => Ok(()),
+            A::SourceStill { kind, key, value, width } => {
+                if kind.trim().is_empty() || kind.len() > 64 {
+                    return Err(EngineError::Invalid("kind: a source kind id.".into()));
+                }
+                if key.trim().is_empty() || key.len() > 64 {
+                    return Err(EngineError::Invalid("key: a source setting key.".into()));
+                }
+                if value.is_null() || matches!(value, Value::String(s) if s.trim().is_empty()) {
+                    return Err(EngineError::Invalid("value: a device, screen, or window id.".into()));
+                }
+                if !(64..=640).contains(width) {
+                    return Err(EngineError::Invalid("width: 64 to 640.".into()));
+                }
+                Ok(())
+            }
             A::VstPlugins { .. } => Ok(()),
             A::Vst { name, filter, what } => {
                 check_source_name(name)?;
@@ -1804,8 +2025,15 @@ impl StudioAct {
                 }
                 Ok(())
             }
-            A::Thumbnail { scene: name, width } | A::SourcePicture { name, width, .. } => {
+            A::Thumbnail { scene: name, width } => {
                 check_source_name(name)?;
+                if !(64..=640).contains(width) {
+                    return Err(EngineError::Invalid("w: 64 to 640 pixels.".into()));
+                }
+                Ok(())
+            }
+            A::SourcePicture { name, width, item, .. } => {
+                check_filter_target(name, item.as_ref())?;
                 if !(64..=640).contains(width) {
                     return Err(EngineError::Invalid("w: 64 to 640 pixels.".into()));
                 }
@@ -1913,6 +2141,7 @@ impl StudioAct {
                 | A::SourcePicture { .. }
                 | A::SourceStatus { .. }
                 | A::ScreenStill { .. }
+                | A::SourceStill { .. }
                 | A::VstPlugins { .. }
                 | A::Vst { .. }
                 | A::Items { .. }
@@ -1920,7 +2149,10 @@ impl StudioAct {
                 | A::Settings { .. }
                 | A::Options { .. }
                 | A::Audio { .. }
+                | A::AudioByName { .. }
                 | A::Levels { .. }
+                | A::PushKey { .. }
+                | A::WatchSnapshot
                 | A::Look { .. }
                 | A::AudioCare
                 | A::Privacy
@@ -1952,6 +2184,18 @@ fn check_transition(t: &SceneTransition) -> Result<(), EngineError> {
 }
 
 /// A source or filter kind id from OBS (`color_source`, `com.example.thing`).
+fn check_filter_target(name: &str, item: Option<&ItemTarget>) -> Result<(), EngineError> {
+    match item {
+        Some(it) => {
+            if !name.is_empty() {
+                check_source_name(name)?;
+            }
+            check_source_name(&it.scene)
+        }
+        None => check_source_name(name),
+    }
+}
+
 fn check_kind(kind: &str) -> Result<(), EngineError> {
     if kind.is_empty() || kind.len() > 128 || !kind.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
         return Err(EngineError::Invalid("kind: an OBS source or filter id, like color_source.".into()));
@@ -2002,41 +2246,89 @@ impl Engine {
     }
 
     pub async fn studio_status(&self) -> StudioStatus {
-        match self.studio_host() {
+        let mut status = match self.studio_host() {
             Ok(h) => h.status().await,
             Err(_) => StudioStatus { detail: Some(NONE.into()), ..Default::default() },
-        }
+        };
+        status.safe_mode = self.safe_mode_option();
+        status
     }
 
     pub async fn studio_start(&self) -> Result<StudioStatus, EngineError> {
+        self.studio_start_with(crate::safe_mode::StartOptions::default()).await
+    }
+
+    pub async fn studio_start_with(&self, opts: crate::safe_mode::StartOptions) -> Result<StudioStatus, EngineError> {
         // Off a Mac, cameras, video files and some screen capture go through FFmpeg: fetched
         // now, in the background, so a new streamer never installs anything or waits later.
         if !cfg!(target_os = "macos") && self.ffmpeg_path().is_none() {
             let _ = self.get_ffmpeg().await;
         }
-        let mut status = self.studio_host()?.start().await.map_err(failed)?;
-        // After a crash: the replay buffer and the recording come back on as they were (a new
-        // file); the stream waits for the streamer.
-        if let Some(r) = status.recovered.as_mut() {
-            if r.replay {
-                match self.studio_replay(true).await {
-                    Ok(_) => r.again.push("replay buffer".into()),
-                    Err(e) => r.failed.push(format!("The replay buffer didn't start: {e}")),
-                }
-            }
-            if r.record {
-                match self.studio_record(true).await {
-                    Ok(_) => r.again.push("recording".into()),
-                    Err(e) => r.failed.push(format!("Recording didn't start: {e}")),
-                }
-            }
-            tracing::info!(?r, "the Studio came back after Ferrocast closed unexpectedly");
+        let host = self.studio_host()?;
+        let was_running = host.status().await.running;
+        // A running Studio reloads its scene collection only to put the held-back saved scenes in
+        // place of the temporary ones. That is a collection switch, refused while a show or any
+        // output is on (it used to run on every Start, wiping the undo history and stopping NDI,
+        // the virtual camera and the vertical picture), and it is asked before any choice is made,
+        // so a refused one leaves Safe Mode as it was.
+        let confirming = was_running
+            && self.safe_mode_status().collection_pending
+            && (opts.confirm_collection || opts.safe_mode == Some(false));
+        if confirming {
+            self.ensure_idle_for_switch("scene collections").await?;
         }
+        let (load_collection, allow_auto_start, _enabled_normal) = self.apply_start_options(&opts)?;
+        let mut status = if was_running {
+            if confirming && load_collection {
+                host.confirm_collection().await.map_err(failed)?
+            } else {
+                host.status().await
+            }
+        } else {
+            host.start_with_mode(load_collection).await.map_err(failed)?
+        };
+        // After a crash: the replay buffer and the recording come back on as they were (a new
+        // file) unless Safe Mode has auto-start disabled; the stream always waits for the streamer.
+        if let Some(r) = status.recovered.as_mut() {
+            if allow_auto_start {
+                if r.replay {
+                    match self.studio_replay(true).await {
+                        Ok(_) => r.again.push("replay buffer".into()),
+                        Err(e) => r.failed.push(format!("The replay buffer didn't start: {e}")),
+                    }
+                }
+                if r.record {
+                    match self.studio_record(true).await {
+                        Ok(_) => r.again.push("recording".into()),
+                        Err(e) => r.failed.push(format!("Recording didn't start: {e}")),
+                    }
+                }
+                tracing::info!(?r, "the Studio came back after Ferrocast closed unexpectedly");
+            } else {
+                tracing::info!(?r, "Safe Mode kept recording and replay buffer off after crash");
+            }
+        }
+        status.safe_mode = self.safe_mode_option();
         Ok(status)
     }
 
     pub async fn studio_stop(&self) -> Result<StudioStatus, EngineError> {
-        self.studio_host()?.stop().await.map_err(failed)
+        let host = self.studio_host()?;
+        let was_running = host.status().await.running;
+        // Cancel any active Show, countdown, or pending delayed stop immediately (even before
+        // acquiring output_lock) so an in-flight start_show / go_live_now sees the generation
+        // bump at once and never posts Discord/chat or resurrects Live after Studio stops.
+        // Even when it had already gone (a crash): a show with no Studio under it is over. Not
+        // when OBS is there to run a show of its own with the Studio off: that one is not ours.
+        if was_running || !matches!(self.rig().await, Ok(crate::studio::rig::Rig::Obs(_))) {
+            self.cancel_show_on_studio_stop("Studio stopped.");
+        }
+        let _out = self.studio().output_lock.lock().await;
+        if was_running {
+            *crate::golive::lock_enhanced(self) = None;
+            self.set_studio_live(false);
+        }
+        host.stop().await.map_err(failed)
     }
 
     pub async fn studio_kinds(&self) -> Result<Value, EngineError> {
@@ -2067,22 +2359,60 @@ impl Engine {
         }
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
-        Ok(serde_json::json!({ "settings": host.settings().await, "restart": restart }))
+        let saved = host.settings().await;
+        self.note_studio_settings(&saved);
+        self.send_golive_pub();
+        // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).
+        let (restart, detail) = one_line(restart, "Some changes apply after a restart");
+        let mut out = serde_json::json!({ "settings": saved, "restart": restart });
+        if let (Some(d), Some(o)) = (detail, out.as_object_mut()) {
+            o.insert("restart_detail".into(), Value::String(d));
+        }
+        Ok(out)
     }
 
     /// The Studio's stats, with the stream's health while it's live.
     pub async fn studio_stats(&self) -> Result<Value, EngineError> {
         let mut v = self.studio_host()?.stats().await.map_err(failed)?;
+        self.observe_sidechain_cycles(&v);
         let health = self.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()).1.clone();
         if let (Some(o), Some(h)) = (v.as_object_mut(), health) {
             o.insert("health".into(), serde_json::json!(h));
+            // Some platforms down while the others are fine: the score says so too, not 100.
+            if let Some(cap) = crate::golive::partial_failure_cap(&self.golive_main_states())
+                && let Some(score) = o.get_mut("health").and_then(|h| h.get_mut("score"))
+                && let Some(now) = score.as_u64()
+            {
+                *score = Value::from(now.min(cap));
+            }
         }
         // The upload itself struggling (most platforms behind at once): the status bar says
         // so, and not when only the drawing is slow or one platform has trouble of its own.
         let struggling =
             self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).struggling(crate::now().0);
+        // The stream delay: what it holds while live, or how long its tail still has to go after Stop.
+        let drain = self.studio_host().ok().and_then(|h| h.delay_drain());
+        let held_mb = v.pointer("/stream/delay_mb").and_then(Value::as_f64).unwrap_or(0.0);
+        if let Some(o) = v.as_object_mut()
+            && (drain.is_some() || held_mb > 0.0)
+        {
+            let (draining, remaining_s, mb) = drain.map_or((false, 0.0, held_mb), |(r, mb)| (true, r, mb));
+            o.insert(
+                "delay".into(),
+                serde_json::json!({ "draining": draining, "remaining_s": remaining_s.round(), "mb": (mb * 10.0).round() / 10.0 }),
+            );
+        }
         if let Some(s) = v.get_mut("stream").and_then(Value::as_object_mut) {
             s.insert("upload_struggling".into(), Value::Bool(struggling));
+            if let Some(reason) = self.golive_main_failed() {
+                s.insert("active".into(), Value::Bool(false));
+                s.insert("reconnecting".into(), Value::Bool(false));
+                s.insert("error".into(), Value::String(reason));
+            } else if let Some(reason) = self.golive_main_reconnecting() {
+                // Still running, and honest: nothing is reaching any platform.
+                s.insert("reconnecting".into(), Value::Bool(true));
+                s.insert("reconnecting_reason".into(), Value::String(reason));
+            }
         }
         Ok(v)
     }
@@ -2104,8 +2434,8 @@ impl Engine {
         self.get_ffmpeg().await?;
         Err(crate::golive::refused_pub(
             "ffmpeg_downloading",
-            "Ferrocast is downloading FFmpeg for the software encoder (x264) and Lossless (about 30 MB).",
-            "Try again in a minute, or pick the Mac's hardware encoder.",
+            "Downloading FFmpeg for x264 and Lossless (about 30 MB).",
+            "Try again in a minute, or pick the hardware encoder.",
         ))
     }
 
@@ -2210,6 +2540,7 @@ impl Engine {
         if !collection_id_ok(id) {
             return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
         }
+        self.ensure_idle_for_switch("scene collections").await?;
         let host = self.studio_host()?;
         let list = host.streamlabs_collections().await.map_err(failed)?;
         if !list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id)) {
@@ -2229,6 +2560,7 @@ impl Engine {
         if !collection_id_ok(id) {
             return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
         }
+        self.ensure_idle_for_switch("scene collections").await?;
         let host = self.studio_host()?;
         let list = host.obs_collections().await.map_err(failed)?;
         let known = list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id));
@@ -2248,6 +2580,19 @@ impl Engine {
         self.studio_host()?.monitoring().await.map_err(failed)
     }
 
+    /// The meters' levels (`POST /studio/engine/levels`): read straight from the engine's
+    /// wait-free meters over a short window, so thirty polls a second never queue behind (or in
+    /// front of) the user's edits; the Studio's own queue answers when no engine runs.
+    pub async fn studio_levels(&self, names: Vec<String>, fast: bool) -> Result<Value, EngineError> {
+        let mut act = StudioAct::Levels { names };
+        act.check()?;
+        let StudioAct::Levels { names } = &act else { unreachable!() };
+        if let Some(v) = self.studio_host()?.levels_now(names, fast) {
+            return Ok(v);
+        }
+        self.studio_act(act).await
+    }
+
     /// Does one thing to the scene collection, after checking it.
     pub async fn studio_act(&self, mut act: StudioAct) -> Result<Value, EngineError> {
         act.check()?;
@@ -2260,27 +2605,62 @@ impl Engine {
         Ok(out)
     }
 
+    /// A shortcut field of the dashboard is waiting for a key (`on`) or has stopped: the desktop
+    /// lets its global shortcuts go meanwhile (see [`StudioHost::capture_keys`]). Without a
+    /// desktop (the server, a browser) there is nothing to let go: fine.
+    pub fn studio_capture_keys(&self, on: bool) {
+        if let Ok(h) = self.studio_host() {
+            h.capture_keys(on);
+        }
+    }
+
     /// Starts or stops streaming the Studio into this PC's Go live ingest, which sends it on
     /// to every destination switched on, as a stream from OBS would.
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
+        let _out = self.studio().output_lock.lock().await;
+        self.studio_stream_locked(on).await
+    }
+
+    /// Stops the stream; with `discard_delay` the delay's tail (what the stream delay still holds)
+    /// isn't sent either, at once. Without, it goes on being sent for the delay (`stats.delay`).
+    pub async fn studio_stream_stop(&self, discard_delay: bool) -> Result<Value, EngineError> {
+        let out = self.studio_stream(false).await?;
+        if discard_delay {
+            self.studio_host()?.discard_delay().await;
+        }
+        Ok(out)
+    }
+
+    /// Runs `studio_stream` while the caller already holds `studio().output_lock`.
+    pub(crate) async fn studio_stream_locked(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let s = host.settings().await;
+        self.note_studio_settings(&s);
         if on {
             self.ffmpeg_first(s.stream_needs_ffmpeg()).await?;
         }
         if !on {
+            self.set_studio_live(false);
             // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
             *crate::golive::lock_enhanced(self) = None;
             host.stream_stop().await.map_err(failed)?;
+            // A countdown (or a show waiting for its live scene) with no stream is over: Go
+            // live again must start a new show, not say one is running.
+            self.end_show_whose_stream_stopped();
+            self.send_golive_pub();
             // The stream has ended either way; what didn't stop with it comes back in words.
             return Ok(follow_stream(host.as_ref(), false, &s)
                 .await
                 .map_or(Value::Null, |also| serde_json::json!({ "also": also })));
         }
+        self.sync_stream_cap().await;
         let (server, key) = self.golive_ingest().await?;
         // Twitch Enhanced Broadcasting: its other qualities, when Twitch's destination wants it.
         // Not while one already runs: its plan stays with it (Start then only says how it is).
         let running = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
+        if !running {
+            self.clear_golive_failures(crate::golive::Canvas::Main);
+        }
         let out = s.scale.map_or((s.width, s.height), |[w, h]| (w, h));
         let (tracks, eb_note) =
             if running { (Vec::new(), None) } else { self.enhanced_tracks(out, s.fps, s.twitch_vod_track > 0).await };
@@ -2289,11 +2669,17 @@ impl Engine {
             Err(e) => {
                 if !running {
                     *crate::golive::lock_enhanced(self) = None;
+                    self.set_studio_live(false);
                 }
                 return Err(failed(e));
             }
         };
-        let mut also = follow_stream(host.as_ref(), true, &s).await;
+        // Mark a new stream session (even when `running` was still true during a prior Show's
+        // stop delay) so no earlier Show's delayed stop can kill this stream.
+        self.on_stream_started();
+        self.set_studio_live(true);
+        self.send_golive_pub();
+        let mut also = if running { None } else { follow_stream(host.as_ref(), true, &s).await };
         if let Some(note) = eb_note {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         }
@@ -2303,8 +2689,13 @@ impl Engine {
         if let Some(note) = self.studio_sync_light().await {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         }
+        // One short line (`also`), the full words behind the page's (i) (`also_detail`).
+        let (also, detail) = one_line(also, "Part of what goes with the stream didn't start");
         if let (Some(also), Some(o)) = (also, v.as_object_mut()) {
             o.insert("also".into(), Value::String(also));
+            if let Some(d) = detail {
+                o.insert("also_detail".into(), Value::String(d));
+            }
         }
         Ok(v)
     }
@@ -2330,9 +2721,7 @@ impl Engine {
         };
         match started {
             Ok(true) => None,
-            Ok(false) => {
-                Some("A vertical platform is on, but there's no vertical picture: add one in Studio, Go live.".into())
-            }
+            Ok(false) => Some("A vertical platform is on, but there's no vertical picture: add one in Go live.".into()),
             Err(e) => {
                 tracing::warn!(error = %e, "the Studio's vertical picture didn't start streaming");
                 Some("The vertical stream didn't start; the wide one did.".into())
@@ -2377,7 +2766,20 @@ impl Engine {
     }
 
     pub async fn studio_stream_stats(&self) -> Result<Value, EngineError> {
-        self.studio_host()?.stream_stats().await.map_err(failed)
+        let mut v = self.studio_host()?.stream_stats().await.map_err(failed)?;
+        if let Some(s) = v.as_object_mut()
+            && let Some(reason) = self.golive_main_failed()
+        {
+            s.insert("active".into(), Value::Bool(false));
+            s.insert("reconnecting".into(), Value::Bool(false));
+            s.insert("error".into(), Value::String(reason));
+        } else if let Some(s) = v.as_object_mut()
+            && let Some(reason) = self.golive_main_reconnecting()
+        {
+            s.insert("reconnecting".into(), Value::Bool(true));
+            s.insert("reconnecting_reason".into(), Value::String(reason));
+        }
+        Ok(v)
     }
 
     /// A file dialog on the computer Ferrocast runs on → the path picked, or null.
@@ -2477,9 +2879,59 @@ impl Engine {
         self.studio_host()?.close_projectors().await.map_err(failed)
     }
 
+    /// Refuses scene-collection or profile switches (and imports/new) while a Show or any
+    /// live Studio output (stream, recording, source record, replay, virtual camera, NDI) is
+    /// active, so outputs can never be orphaned or blacked out mid-broadcast (M9-01).
+    async fn ensure_idle_for_switch(&self, noun: &str) -> Result<(), EngineError> {
+        if self.is_show_active() {
+            return Err(EngineError::Refused {
+                status: 409,
+                code: "studio_busy",
+                message: format!("Stop the show before changing {noun}."),
+                hint: "End the show or cancel the countdown first.".into(),
+                retry_after: None,
+            });
+        }
+        let Ok(host) = self.studio_host() else { return Ok(()) };
+        if !host.status().await.running {
+            return Ok(());
+        }
+        let streaming = host
+            .stream_stats()
+            .await
+            .ok()
+            .is_some_and(|v| v["active"].as_bool() == Some(true) || v["reconnecting"].as_bool() == Some(true));
+        let stats_busy = host.stats().await.ok().is_some_and(|v| {
+            let active = |k: &str| v[k]["active"].as_bool() == Some(true);
+            active("stream")
+                || v["stream"]["reconnecting"].as_bool() == Some(true)
+                || active("vertical_stream")
+                || active("light_stream")
+                || active("record")
+                || active("replay")
+                || active("virtualcam")
+                || active("ndi")
+                || v["source_records"].as_array().is_some_and(|a| !a.is_empty())
+        });
+        if streaming || stats_busy {
+            return Err(EngineError::Refused {
+                status: 409,
+                code: "studio_busy",
+                message: format!("Stop streaming and recording before changing {noun}."),
+                hint: "Stop every active output first.".into(),
+                retry_after: None,
+            });
+        }
+        Ok(())
+    }
+
     /// Scene collections or profiles: one act on that list.
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
+        if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
+            let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
+            self.ensure_idle_for_switch(noun).await?;
+        }
         let out = self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)?;
         // Another collection may have its own vertical picture (or none): the stream follows.
         self.studio_sync_vertical().await;
@@ -2594,7 +3046,7 @@ fn failed(message: String) -> EngineError {
         return refused(409, "studio_already_here", message, "Pick it in the Sources list instead.");
     }
     if message.contains("isn't here yet") {
-        return refused(422, "studio_not_supported", message, "Use Reload, or OBS for now.");
+        return refused(422, "studio_not_supported", message, "Use Reload for now.");
     }
     if message.starts_with("The replay buffer is off") {
         return refused(
@@ -2714,6 +3166,16 @@ fn web_window_check(name: &str, url: &str) -> Result<(String, String), EngineErr
 
 /// What starts and stops with the stream (OBS's "Automatically record when streaming" and its
 /// friends). The stream starts or ends either way, so what didn't follow comes back in words.
+/// A hint as one short line plus the rest: a note already short enough stays as it is; a longer
+/// one (or several joined) becomes `short`, and its full words are the detail. (The page shows
+/// the line and puts the detail behind an (i); an older page shows the line.)
+pub(crate) fn one_line(full: Option<String>, short: &str) -> (Option<String>, Option<String>) {
+    match full {
+        Some(f) if f.chars().count() > 60 => (Some(short.to_string()), Some(f)),
+        other => (other, None),
+    }
+}
+
 async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> Option<String> {
     let mut failed = Vec::new();
     if on {
@@ -2746,7 +3208,29 @@ async fn follow_stream(host: &dyn StudioHost, on: bool, s: &StudioSettings) -> O
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_replay_buffer_has_a_memory_cap_unless_one_is_set() {
+        let mut s = StudioSettings::default();
+        assert_eq!(s.replay_cap_mb(), 512, "the default is capped");
+        s.replay_mb = 0;
+        assert_eq!(s.replay_cap_mb(), 512, "an older profile's 0 is capped too");
+        s.replay_mb = 2048;
+        assert_eq!(s.replay_cap_mb(), 2048);
+    }
+
     use super::*;
+
+    #[test]
+    fn a_hint_is_one_short_line_with_the_rest_kept_as_its_detail() {
+        assert_eq!(one_line(None, "x"), (None, None));
+        let short = "Applies after a restart.".to_string();
+        assert_eq!(one_line(Some(short.clone()), "x"), (Some(short), None));
+        let long = "The replay buffer didn't start: No disk space. The recording didn't start: busy.";
+        assert_eq!(
+            one_line(Some(long.into()), "Part didn't start"),
+            (Some("Part didn't start".into()), Some(long.into()))
+        );
+    }
 
     #[derive(Debug, Default)]
     struct Fake {
@@ -2754,10 +3238,38 @@ mod tests {
         acts: std::sync::Mutex<Vec<StudioAct>>,
         outputs: std::sync::Mutex<Vec<String>>,
         streaming: std::sync::atomic::AtomicBool,
+        said: std::sync::Mutex<Vec<(String, String, String)>>,
+        /// What `stats` answers (null when none), and the delay's tail being sent.
+        stats: std::sync::Mutex<Option<Value>>,
+        drain: std::sync::Mutex<Option<(f64, f64)>>,
+        discarded: std::sync::atomic::AtomicBool,
+        /// While set, `act` waits (the Studio's queue is busy with a long edit).
+        busy: std::sync::atomic::AtomicBool,
+        /// Whether `levels_now` answers (an engine is running).
+        direct: std::sync::atomic::AtomicBool,
+        /// Each `capture_keys(on)` the page asked for.
+        captured: std::sync::Mutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
     impl StudioHost for Fake {
+        fn capture_keys(&self, on: bool) {
+            self.captured.lock().unwrap_or_else(|p| p.into_inner()).push(on);
+        }
+        fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
+            self.direct
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then(|| serde_json::json!({ names[0].clone(): { "peak": [if fast { -6.0 } else { -20.0 }, -6.0] } }))
+        }
+        fn delay_drain(&self) -> Option<(f64, f64)> {
+            *self.drain.lock().unwrap()
+        }
+        async fn discard_delay(&self) {
+            self.discarded.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        async fn take_notices(&self) -> Vec<(String, String, String)> {
+            std::mem::take(&mut *self.said.lock().unwrap())
+        }
         async fn status(&self) -> StudioStatus {
             StudioStatus { available: true, ..Default::default() }
         }
@@ -2787,7 +3299,7 @@ mod tests {
             Ok(None)
         }
         async fn stats(&self) -> Result<Value, String> {
-            Ok(Value::Null)
+            Ok(self.stats.lock().unwrap().clone().unwrap_or(Value::Null))
         }
         async fn record(&self, on: bool) -> Result<Value, String> {
             self.outputs.lock().unwrap_or_else(|p| p.into_inner()).push(format!("record {on}"));
@@ -2807,6 +3319,9 @@ mod tests {
             Ok(serde_json::json!({ "devices": [] }))
         }
         async fn act(&self, act: StudioAct) -> Result<Value, String> {
+            while self.busy.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
             self.acts.lock().unwrap_or_else(|p| p.into_inner()).push(act.clone());
             Ok(serde_json::to_value(act).unwrap_or_default())
         }
@@ -2931,6 +3446,19 @@ mod tests {
         (e, dir)
     }
 
+    /// A shortcut field waiting for a key reaches the desktop's host, in order, and without a
+    /// desktop (the server, a browser) it is fine and does nothing.
+    #[tokio::test]
+    async fn a_shortcut_field_waiting_for_a_key_reaches_the_host() {
+        let (e, _d) = engine().await;
+        e.studio_capture_keys(true);
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        e.studio_capture_keys(true);
+        e.studio_capture_keys(false);
+        assert_eq!(*fake.captured.lock().unwrap_or_else(|p| p.into_inner()), vec![true, false]);
+    }
+
     #[tokio::test]
     async fn the_vertical_picture_streams_with_the_wide_one_when_a_vertical_platform_is_ticked() {
         let (e, _d) = engine().await;
@@ -2960,7 +3488,55 @@ mod tests {
         assert!(!sent(&taken()));
     }
 
+    /// The stream delay in the stats: what it holds while live, then how long its tail has to go after
+    /// Stop; Stop now (discard_delay) ends the tail, plain Stop doesn't.
+    #[tokio::test]
+    async fn the_stream_delay_shows_in_the_stats_and_stop_now_discards_the_tail() {
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        // Live with a delay holding 3.2 MB.
+        *fake.stats.lock().unwrap() = Some(serde_json::json!({ "stream": { "active": true, "delay_mb": 3.2 } }));
+        let v = e.studio_stats().await.unwrap();
+        assert_eq!(v["delay"], serde_json::json!({ "draining": false, "remaining_s": 0.0, "mb": 3.2 }));
+        // Without a delay: no "delay".
+        *fake.stats.lock().unwrap() = Some(serde_json::json!({ "stream": { "active": true } }));
+        assert!(e.studio_stats().await.unwrap().get("delay").is_none());
+        // Stopped, the tail still going: 12 s to go, 1.5 MB.
+        *fake.stats.lock().unwrap() = Some(serde_json::json!({}));
+        *fake.drain.lock().unwrap() = Some((11.6, 1.46));
+        let v = e.studio_stats().await.unwrap();
+        assert_eq!(v["delay"], serde_json::json!({ "draining": true, "remaining_s": 12.0, "mb": 1.5 }));
+        // Stop leaves the tail; Stop now ends it.
+        e.studio_stream_stop(false).await.unwrap();
+        assert!(!fake.discarded.load(std::sync::atomic::Ordering::SeqCst));
+        e.studio_stream_stop(true).await.unwrap();
+        assert!(fake.discarded.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     /// Twitch Enhanced Broadcasting's plan belongs to the Studio stream that fetched it: gone
+    /// What a Studio's capture says reaches the dashboard once, through the host that owns that
+    /// engine (not a process-wide queue another engine could drain).
+    #[tokio::test]
+    async fn a_capture_notice_comes_through_its_own_host_once() {
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        fake.said.lock().unwrap().push(("mic-bluetooth".into(), "Using KREO KAST.".into(), "why".into()));
+        e.set_studio_host(fake);
+        let mut live = e.subscribe_live();
+        e.record_watch_tick().await;
+        e.record_watch_tick().await;
+        let mut seen = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["key"] == "mic-bluetooth" {
+                seen.push(v["data"].clone());
+            }
+        }
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!((seen[0]["level"].as_str(), seen[0]["detail"].as_str()), (Some("info"), Some("why")));
+    }
+
     /// when that stream stops, so OBS going live later never sends to an old address and key.
     #[tokio::test]
     async fn an_enhanced_broadcasting_plan_ends_with_its_stream() {
@@ -2976,6 +3552,40 @@ mod tests {
         });
         e.studio_stream(false).await.unwrap();
         assert!(crate::golive::lock_enhanced(&e).is_none());
+    }
+
+    #[tokio::test]
+    async fn levels_are_served_while_the_studio_queue_is_busy() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        fake.busy.store(true, SeqCst);
+        // A long edit holds the Studio's queue.
+        let held = tokio::spawn({
+            let e = e.clone();
+            async move { e.studio_act(StudioAct::AudioCare).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // With an engine running, the meters answer at once, not behind it.
+        fake.direct.store(true, SeqCst);
+        let t0 = std::time::Instant::now();
+        let v = tokio::time::timeout(std::time::Duration::from_millis(50), e.studio_levels(vec!["Mic".into()], true))
+            .await
+            .expect("levels waited for the busy queue")
+            .unwrap();
+        assert!(t0.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(v["Mic"]["peak"][0], -6.0);
+        // The default window is the long one; only `fast` asks for the short one.
+        fake.direct.store(true, SeqCst);
+        let slow = e.studio_levels(vec!["Mic".into()], false).await.unwrap();
+        assert_eq!(slow["Mic"]["peak"][0], -20.0);
+        // With none running, the queue answers (as before).
+        fake.direct.store(false, SeqCst);
+        fake.busy.store(false, SeqCst);
+        let v = e.studio_levels(vec!["Mic".into()], false).await.unwrap();
+        assert!(v.get("Mic").is_none(), "the fast path answered with no engine: {v}");
+        held.await.unwrap().unwrap();
     }
 
     #[test]
@@ -3112,7 +3722,7 @@ mod tests {
         for bad in ["../Untitled", "", ".x", "a/b"] {
             assert!(matches!(e.studio_import_obs(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
         }
-        let mut same = StudioAct::PasteFilters { name: "Mic".into(), from: "Mic".into() };
+        let mut same = StudioAct::PasteFilters { name: "Mic".into(), from: "Mic".into(), item: None, from_item: None };
         assert!(matches!(same.check(), Err(EngineError::Invalid(_))));
         assert!(matches!(
             failed("\"Cam\" isn't a web page.".into()),
@@ -3374,6 +3984,13 @@ mod tests {
             (
                 StudioAct::SetAudio {
                     name: "Mic".into(),
+                    change: AudioChange { push_to_talk_ms: Some(6_000), ..Default::default() },
+                },
+                "push_to_talk_ms",
+            ),
+            (
+                StudioAct::SetAudio {
+                    name: "Mic".into(),
                     change: AudioChange { volume_db: Some(40.0), ..Default::default() },
                 },
                 "volume_db",
@@ -3381,7 +3998,10 @@ mod tests {
             (StudioAct::SetChannel { channel: 7, device: None }, "channel"),
             (StudioAct::Levels { names: vec!["x".into(); 65] }, "names"),
             (StudioAct::Items { scene: "a\nb".into() }, "name"),
-            (StudioAct::AddFilter { name: "Mic".into(), filter: src("bad id", "Gate", Value::Null) }, "kind"),
+            (
+                StudioAct::AddFilter { name: "Mic".into(), filter: src("bad id", "Gate", Value::Null), item: None },
+                "kind",
+            ),
         ] {
             let err = e.studio_act(bad).await.unwrap_err();
             assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{err:?}");
@@ -3413,11 +4033,36 @@ mod tests {
             ("push_to_mute:Mic", "Alt+M"),
             ("split_record", "Alt+S"),
             ("undo", "Alt+Z"),
+            // Several keys for one action; OBS's separate start and stop.
+            ("record", "Alt+R|F9|Cmd+Shift+KeyR"),
+            ("stop_record", "F10"),
+            ("start_replay", "F11"),
+            // Vertical canvas preview & screenshot, plus per-scene hotkeys targeting vertical scenes.
+            ("vertical:show_preview", "Alt+1"),
+            ("vertical:hide_preview", "Alt+4"),
+            ("vertical:toggle_preview", "Alt+V"),
+            ("vertical:screenshot", "Alt+P"),
+            ("scene:Tall", "Alt+5"),
+            ("screenshot:Tall", "Alt+6"),
+            ("show:Tall\nCam", "Alt+7"),
+            ("hide:Tall\nCam", "Alt+8"),
         ] {
             hk.hotkeys.insert(action.into(), keys.into());
         }
         assert!(hk.check().is_ok(), "{:?}", hk.check());
-        for action in ["quick:11", "quick:0", "show:only one name", "media_explode:Intro", "filter:\nGate"] {
+        for action in [
+            "quick:11",
+            "quick:0",
+            "show:only one name",
+            "media_explode:Intro",
+            "filter:\nGate",
+            // Unwired Aitum Vertical outputs must stay rejected until standalone engine support exists.
+            "vertical:record",
+            "vertical:stream",
+            "vertical:clip",
+            "vertical:virtualcam",
+            "vertical:unknown",
+        ] {
             let mut bad = d.clone();
             bad.hotkeys.insert(action.into(), "F8".into());
             assert!(bad.check().is_err(), "{action} is refused");
@@ -3429,9 +4074,11 @@ mod tests {
             ("keyframe_s", StudioSettings { keyframe_s: 30, ..d.clone() }),
             ("profile", StudioSettings { profile: "ultra".into(), ..d.clone() }),
             ("scale", StudioSettings { scale: Some([1281, 720]), ..d.clone() }),
+            ("scale_filter", StudioSettings { scale_filter: "sharp".into(), ..d.clone() }),
             ("audio_kbps", StudioSettings { audio_kbps: 100, ..d.clone() }),
             ("width", StudioSettings { width: 100, ..d.clone() }),
             ("fps", StudioSettings { fps: 59, ..d.clone() }),
+            ("fps_ntsc", StudioSettings { fps: 50, fps_ntsc: true, ..d.clone() }),
             ("record_folder", StudioSettings { record_folder: Some("relative/path".into()), ..d.clone() }),
             ("record_format", StudioSettings { record_format: "avi".into(), ..d.clone() }),
             ("record_name", StudioSettings { record_name: "a/b".into(), ..d.clone() }),
@@ -3442,10 +4089,17 @@ mod tests {
             ("record_quality", StudioSettings { record_quality: "ultra".into(), ..d.clone() }),
             ("reconnect", StudioSettings { reconnect_every_s: 0, ..d.clone() }),
             ("delay_s", StudioSettings { delay_s: 4000, ..d.clone() }),
+            ("delay_max_mb", StudioSettings { delay_max_mb: 8, ..d.clone() }),
             ("sample_rate", StudioSettings { sample_rate: 96_000, ..d.clone() }),
+            ("audio_track_names", StudioSettings { audio_track_names: vec!["x".repeat(41)], ..d.clone() }),
         ] {
             let err = e.studio_set_settings(bad).await.unwrap_err();
             assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with(field)), "{field}: {err:?}");
+        }
+        for keys in ["F9|", "|F9", "F9||F8", "A|B|C|D|E", "F9|F8;x"] {
+            let mut bad = d.clone();
+            bad.hotkeys.insert("record".into(), keys.into());
+            assert!(bad.check().is_err(), "{keys:?} is refused");
         }
         let mut bad = d.clone();
         bad.hotkeys.insert("explode".into(), "F9".into());
@@ -3456,6 +4110,13 @@ mod tests {
         // A file from an older version (fields missing) still reads, with defaults.
         let old: StudioSettings = serde_json::from_str(r#"{ "video_kbps": 4500 }"#).unwrap();
         assert_eq!((old.video_kbps, old.fps), (4500, 30));
+        // The projector options are off until asked for: today's behaviour.
+        assert!(
+            !old.projector_on_top
+                && !old.projector_one_per_screen
+                && !old.projector_restore
+                && !old.projector_hide_cursor
+        );
         assert!(
             !StudioAct::Audio { scene: "x".into() }.changes() && StudioAct::RemoveScene { scene: "x".into() }.changes()
         );
@@ -3475,5 +4136,54 @@ mod tests {
             assert!(message.ends_with('.') && !message.starts_with(char::is_lowercase), "{message}");
             assert!(!message.starts_with("Name:"), "{message}");
         }
+    }
+
+    #[test]
+    fn item_filter_acts_validate_and_track_changes() {
+        let tgt = ItemTarget { scene: "Vertical".into(), id: 2 };
+        let mut good = [
+            StudioAct::Filters { name: String::new(), item: Some(tgt.clone()) },
+            StudioAct::AddFilter {
+                name: String::new(),
+                filter: NewSource {
+                    kind: "ferrocast_rounded_corners".into(),
+                    name: "Round".into(),
+                    settings: Value::Null,
+                },
+                item: Some(tgt.clone()),
+            },
+            StudioAct::UpdateFilter {
+                name: String::new(),
+                filter: "Round".into(),
+                settings: serde_json::json!({ "radius": 8 }),
+                item: Some(tgt.clone()),
+            },
+            StudioAct::PasteFilters {
+                name: String::new(),
+                from: "Cam".into(),
+                item: Some(tgt.clone()),
+                from_item: None,
+            },
+            StudioAct::SourcePicture { name: "Cam".into(), width: 256, filters: true, item: Some(tgt.clone()) },
+            StudioAct::SetItemFilterScope { scene: "Vertical".into(), id: 2, own: true },
+        ];
+        for a in &mut good {
+            assert!(a.check().is_ok(), "{a:?}");
+        }
+        assert!(!good[0].changes());
+        assert!(!good[4].changes());
+        assert!(good[1].changes());
+        assert!(good[2].changes());
+        assert!(good[3].changes());
+        assert!(good[5].changes());
+
+        let mut bad_scope = StudioAct::SetItemFilterScope { scene: "bad\nscene".into(), id: 2, own: true };
+        assert!(matches!(bad_scope.check(), Err(EngineError::Invalid(_))));
+        let mut bad_target =
+            StudioAct::Filters { name: String::new(), item: Some(ItemTarget { scene: "".into(), id: 1 }) };
+        assert!(matches!(bad_target.check(), Err(EngineError::Invalid(_))));
+        let mut bad_pic_name =
+            StudioAct::SourcePicture { name: "a\nb".into(), width: 256, filters: true, item: Some(tgt) };
+        assert!(matches!(bad_pic_name.check(), Err(EngineError::Invalid(_))));
     }
 }

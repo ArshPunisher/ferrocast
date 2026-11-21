@@ -43,14 +43,17 @@ mod polls;
 mod pro;
 pub mod speech_model;
 pub use pro::{ProStatus, ProView};
+pub mod obsws;
 mod recap;
 mod relay;
 mod remote;
+pub mod safe_mode;
 pub mod smart;
 pub use remote::{
     IN_FLIGHT as REMOTE_IN_FLIGHT, MAX_RESPONSE as REMOTE_MAX_RESPONSE, RemoteHandler, RemoteRequest, RemoteResponse,
     TunnelView,
 };
+pub use safe_mode::{SafeModeStatus, StartOptions};
 mod snapshot;
 pub mod speech;
 mod starter;
@@ -187,6 +190,7 @@ struct Inner {
     cloud_tts: speech::CloudTts,
     /// Pro dashboard from anywhere: the tunnel to the relay and the server's handler.
     remote: remote::Remote,
+    obsws: obsws::Runtime,
     /// Pro 24/7 cloud bot: the pushed config's version and hashes, counters seen.
     cloud_bot: cloud_bot::CloudBot,
     /// Cloud sync and "Use cloud overlays" (docs/CLOUD.md §1.1): the switches and URLs.
@@ -203,6 +207,8 @@ struct Inner {
     automations: Mutex<automation::Automations>,
     /// Logic plugins that are on, loaded and ready to be told about events.
     plugin_logic: Mutex<plugins::Running>,
+    /// Unclean-exit detection and Safe Mode state.
+    safe_mode: Mutex<safe_mode::SafeModeState>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -218,12 +224,18 @@ impl Engine {
     /// Opens the store in `data_dir`, loads state, and starts the pipeline and alert tasks.
     /// Must be called inside a tokio runtime.
     pub async fn start(data_dir: &Path) -> Result<Engine, EngineError> {
+        Self::start_with_mode(data_dir, false).await
+    }
+
+    /// Starts the desktop engine with unclean-exit detection and optional `--safe-mode` lock.
+    pub async fn start_with_mode(data_dir: &Path, safe_mode_flag: bool) -> Result<Engine, EngineError> {
         let engine = Self::start_with(
             data_dir,
             Arc::from(ferrocast_secrets::best_available(data_dir)),
             PlatformApps::from_env(),
         )
         .await?;
+        engine.init_safe_mode(data_dir, safe_mode_flag);
         // OBS's own settings file in its usual place (`start_with` leaves this empty so
         // tests never read the developer's real OBS).
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
@@ -232,7 +244,7 @@ impl Engine {
         engine.watch_live();
         engine.start_golive(ferrocast_golive::ingest::DEFAULT_PORT).await;
         engine.share_ffmpeg();
-        // Installed plugins' effects that are on (OBS-COMPETE.md §4).
+        // Installed plugins' effects that are on (skipped in Safe Mode).
         engine.load_plugins();
         Ok(engine)
     }
@@ -244,6 +256,12 @@ impl Engine {
         secrets: Arc<dyn ferrocast_secrets::Secrets>,
     ) -> Result<Engine, EngineError> {
         Self::start_with(data_dir, secrets, PlatformApps::default()).await
+    }
+
+    /// Like [`Engine::start_with_secrets`] with an in-memory secret store (for tests outside
+    /// `ferrocast-engine` that shouldn't touch the OS keychain or start background watchers).
+    pub async fn start_with_memory_secrets(data_dir: &Path) -> Result<Engine, EngineError> {
+        Self::start_with_secrets(data_dir, Arc::new(ferrocast_secrets::MemorySecrets::default())).await
     }
 
     /// Full control over secrets and platform apps (tests point the apps at fakes).
@@ -331,6 +349,7 @@ impl Engine {
                 cloud_backup: Default::default(),
                 cloud_tts: Default::default(),
                 remote: Default::default(),
+                obsws: Default::default(),
                 cloud_bot: Default::default(),
                 cloud_sync: Mutex::new(Default::default()),
                 smart: Mutex::new(Default::default()),
@@ -339,6 +358,7 @@ impl Engine {
                 studio_host: Default::default(),
                 automations: Mutex::new(Default::default()),
                 plugin_logic: Mutex::new(Default::default()),
+                safe_mode: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -449,6 +469,14 @@ impl Engine {
 
     pub fn store(&self) -> Arc<Store> {
         self.inner.store.clone()
+    }
+
+    /// Flushes persistent engine state (SQLite WAL) cleanly during application quit, before
+    /// deleting clean-exit markers.
+    pub fn shutdown(&self) {
+        if let Err(err) = self.inner.store.checkpoint() {
+            tracing::warn!(%err, "SQLite WAL checkpoint failed during engine shutdown");
+        }
     }
 
     pub(crate) fn state(&self) -> std::sync::RwLockReadGuard<'_, State> {
@@ -623,7 +651,8 @@ impl Engine {
     }
 }
 
-/// Deletes old chat from the log at start and every six hours (alerts and tips are kept).
+/// Deletes old chat, stale ephemeral TTS audio, and expired daily transcripts at start and every
+/// six hours (alerts, tips, and user-uploaded media are kept).
 async fn prune(engine: Engine) {
     loop {
         let days = engine.settings().keep_chat_days.max(1);
@@ -631,6 +660,34 @@ async fn prune(engine: Engine) {
             Ok(n) if n > 0 => tracing::info!(removed = n, "pruned old chat"),
             Ok(_) => {}
             Err(err) => tracing::warn!(%err, "couldn't prune old chat"),
+        }
+        // Clean up orphaned ephemeral TTS files older than 1 hour, preserving any alert still in
+        // the queue and any cached voice previews.
+        let mut keep_ids = engine.cloud_tts().preview_ids();
+        {
+            let q = engine.inner.queue.lock().await;
+            if let Some(id) = q.playing().and_then(|p| p.alert.tts_audio.as_ref()) {
+                keep_ids.push(id.clone());
+            }
+            for w in q.waiting() {
+                if let Some(id) = w.alert.tts_audio.as_ref() {
+                    keep_ids.push(id.clone());
+                }
+            }
+        }
+        let cutoff = now().0 - 3_600_000;
+        match engine.db(move |s| repo::media::prune_speech(s, cutoff, &keep_ids)).await {
+            Ok(n) if n > 0 => tracing::info!(removed = n, "pruned old tts audio"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(%err, "couldn't prune old tts audio"),
+        }
+        if let Some(dir) = engine.transcript_dir() {
+            let now_ms = now().0;
+            if let Ok(n) = tokio::task::spawn_blocking(move || crate::studio::transcript::prune(&dir, now_ms)).await
+                && n > 0
+            {
+                tracing::info!(removed = n, "pruned old transcripts");
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
     }

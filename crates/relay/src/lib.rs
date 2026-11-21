@@ -743,7 +743,7 @@ async fn kick_callback(State(st): State<AppState>, Query(q): Query<Callback>) ->
     }
     let payload = json!({
         "tokens": { "access_token": tokens.access_token, "refresh_token": tokens.refresh_token,
-                    "expires_at": now_ms() + tokens.expires_in.clamp(0, 86_400 * 30) * 1000 },
+                    "expires_at": now_ms() + tokens.expires_in.clamp(600, 86_400 * 30) * 1000 },
         "user": { "id": broadcaster, "name": user["name"], "avatar_url": user["profile_picture"] },
     });
     if st.enqueue(&install, "kick_connected", &payload).is_err() {
@@ -775,15 +775,26 @@ async fn kick_refresh(
         st.http.post(format!("{}/oauth/token", st.cfg.kick_id_url)).form(&form).send().await.map_err(|_| {
             ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Couldn't reach Kick. Try again.")
         })?;
+    // Kick refusing the refresh token (400 or 401) is a sign-out; Kick being down or busy, or a
+    // gateway in front of it answering 403, 404 or 408, is not.
+    if !res.status().is_success() && !matches!(res.status().as_u16(), 400 | 401) {
+        return Err(ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick had a problem. Try again."));
+    }
     if !res.status().is_success() {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "sign_in_needed", "Kick needs you to sign in again."));
+        // Kick answers a refused refresh token with an OAuth error in JSON; a gateway or proxy that
+        // answers 400/401 with anything else is not Kick's verdict.
+        let body = res.text().await.unwrap_or_default();
+        if serde_json::from_str::<Value>(&body).is_ok_and(|v| v.get("error").is_some()) {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "sign_in_needed", "Kick needs you to sign in again."));
+        }
+        return Err(ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick had a problem. Try again."));
     }
     let t: kick::TokenResponse = res
         .json()
         .await
         .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "kick_unreachable", "Kick sent a bad answer."))?;
     Ok(axum::Json(json!({ "access_token": t.access_token, "refresh_token": t.refresh_token,
-                          "expires_at": now_ms() + t.expires_in.clamp(0, 86_400 * 30) * 1000 }))
+                          "expires_at": now_ms() + t.expires_in.clamp(600, 86_400 * 30) * 1000 }))
     .into_response())
 }
 

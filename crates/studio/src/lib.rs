@@ -40,13 +40,13 @@ use serde::{Deserialize, Serialize};
 /// The kind id of Ferrocast's Web page source (macOS; OBS's Browser source keys).
 pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
-pub use collection::png_data_url;
 pub use collection::{
     AudioInfo, BOUNDS, CHANNEL_KEYS, Captions, DEINTERLACE, Face, FaceFollow, FilterInfo, FollowLook, ItemEdit,
     ItemInfo, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, SceneInfo, SoundTap, SourceUse, StudioOptions,
     TBarState, TapReader, Transform, TransitionInfo, VERTICAL_SIZE, VerticalInfo, WebAct, ask_captions_access,
     captions_access, find_busy, find_faces, focus_x,
 };
+pub use collection::{jpeg_data_url, png_data_url};
 pub use projector::{MultiviewLayout, MultiviewLook, ProjectorOf, Screen};
 
 /// What went wrong in the Studio.
@@ -337,6 +337,20 @@ pub enum CameraShows {
     Source(String),
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub(crate) struct AloneGuard {
+    pub(crate) shared: std::sync::Arc<own::Shared>,
+    pub(crate) name: String,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for AloneGuard {
+    fn drop(&mut self) {
+        self.shared.release_alone(&self.name);
+    }
+}
+
 /// The virtual camera: on Linux what's on air sent to a v4l2loopback camera; on Windows
 /// Ferrocast Camera (`wincam`); a Mac needs a signed camera extension, not here yet, so
 /// turning it on there says why.
@@ -346,6 +360,10 @@ pub struct VirtualCamera {
     pub(crate) cam: virtualcam::Loopback,
     #[cfg(target_os = "windows")]
     pub(crate) cam: wincam::Camera,
+    // Declared AFTER `cam` so `wincam::Camera` stops and joins its thread before the solo scene
+    // is released (Rust drops fields in declaration order).
+    #[cfg(target_os = "windows")]
+    pub(crate) _alone: Option<AloneGuard>,
 }
 
 impl VirtualCamera {
@@ -425,12 +443,18 @@ impl RecordPlan {
 }
 
 /// How a recording is going.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecordStats {
+    /// False once the recording stopped, by itself too (a full disk, a drive taken away).
     pub active: bool,
     pub paused: bool,
     pub bytes: u64,
     pub frames: u32,
+    /// Why it stopped, in one line, when it did by itself ("the disk is full").
+    pub error: Option<String>,
+    /// Times it went on in a new file because the video encoder was rebuilt (display sleep, the
+    /// system taking the session back).
+    pub auto_splits: u32,
 }
 
 /// How video and sound are encoded.
@@ -441,19 +465,31 @@ pub struct EncodeSettings {
     pub video_kbps: u32,
     /// Varying bitrate (VBR) instead of steady (CBR).
     pub vbr: bool,
+    /// Strict 1× VBV / 1 s DataRateLimits CBR used when capped for a platform limit.
+    #[serde(default)]
+    pub strict_cbr: bool,
     /// Constant quality instead of a bitrate (recordings): 0 is lossless, 18 very high.
     pub quality: Option<u32>,
     /// Seconds between keyframes (platforms ask for 2; 0 lets the encoder pick).
     pub keyframe_s: u32,
     /// "high", "main" or "baseline".
     pub profile: String,
+    /// B-frames in the Mac's encoder (off by default).
     pub bframes: bool,
     /// Sent at this size instead of the canvas's.
     pub scale: Option<(u32, u32)>,
+    /// How a picture sent at another size is scaled: "bilinear", "bicubic" (OBS's default),
+    /// "lanczos" or "area".
+    #[serde(default = "default_scale_filter")]
+    pub scale_filter: String,
     pub audio_kbps: u32,
     /// The encoder's own options (OBS's keys), applied over the ones above.
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn default_scale_filter() -> String {
+    "bicubic".into()
 }
 
 impl EncodeSettings {
@@ -463,11 +499,13 @@ impl EncodeSettings {
             video_encoder: id.into(),
             video_kbps: 6000,
             vbr: false,
+            strict_cbr: false,
             quality: None,
             keyframe_s: 2,
             profile: "high".into(),
-            bframes: true,
+            bframes: false,
             scale: None,
+            scale_filter: default_scale_filter(),
             audio_kbps: 160,
             extra: Default::default(),
         }
@@ -568,9 +606,59 @@ pub struct StreamStats {
     /// A direct destination's network (ping, loss, resends), once it's connected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<ferrocast_golive::Link>,
-    /// Why a direct destination is trying again, in words.
+    /// Why a direct destination is trying again or failed, in words.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// True when the sender gave up for this stream (`PushState::Failed`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+    /// Attempts made before giving up.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempts: u32,
+    /// Full cause and what to do, behind an (i).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// True when the server/platform refused the stream rather than a network outage.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refused: bool,
+    /// What the stream delay holds now, in megabytes (left out without a delay).
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub delay_mb: f32,
+}
+
+fn is_zero_f32(v: &f32) -> bool {
+    *v == 0.0
+}
+
+/// A delayed stream's tail being sent after it ended: seconds to go, megabytes left.
+pub fn delay_drain() -> Option<(f64, f64)> {
+    own::delay_drain()
+}
+
+/// The most memory a stream delay holds, in megabytes (from the next stream).
+pub fn set_delay_cap_mb(mb: u32) {
+    own::set_delay_cap_mb(mb);
+}
+
+/// The sound's format from the settings: the rate the engine mixes at (44100 or 48000, from the next
+/// start) and the names of the six audio tracks in a recording's file.
+pub fn set_audio_format(rate: u32, track_names: Vec<String>) {
+    own::set_audio_format(rate, track_names);
+}
+
+/// Broadcast timing (29.97, 59.94, 23.976 for a canvas of 30, 60, 24 fps), from the next time the
+/// engine opens.
+pub fn set_ntsc(on: bool) {
+    own::set_ntsc(on);
+}
+
+/// Ends any delayed tail being sent (the streamer chose Stop now).
+pub fn discard_delay() {
+    own::discard_delay();
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// The app in front (its name as the Dock shows it), for a scene per game. None where it

@@ -169,11 +169,8 @@ pub(crate) fn playlist(p: Playlist, feed: Feed) -> Worker {
                 };
                 played = true;
                 while !m.ended() {
-                    // NV12 for the card where FFmpeg plays it; a Mac's own player gives RGBA.
-                    #[cfg(not(target_os = "macos"))]
+                    // NV12 for opaque FFmpeg-decoded clips; RGBA for AVFoundation and alpha clips.
                     let fresh = m.frame_nv12().map(|y| feed.yuv(y)).is_some();
-                    #[cfg(target_os = "macos")]
-                    let fresh = false;
                     if !fresh && let Some(pic) = m.frame_at(now_ns()) {
                         feed.picture(pic);
                     }
@@ -183,6 +180,11 @@ pub(crate) fn playlist(p: Playlist, feed: Feed) -> Worker {
                     if !wait(stop, Duration::from_millis(5)) {
                         return;
                     }
+                }
+                // A file that stopped because it couldn't be played (cut off, unreadable): the next
+                // one plays, and the log says why this one stopped.
+                if let Some(why) = m.error() {
+                    tracing::warn!(file = %p.files[i].display(), %why, "a playlist file stopped with a problem: next");
                 }
             }
             // Round again; a list where nothing opens waits before trying again.

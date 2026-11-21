@@ -431,6 +431,10 @@ fn the_relays_kick_scopes_are_the_apps() {
 struct DirectStudio {
     started: std::sync::Mutex<Vec<(String, String, String)>>,
     stopped: std::sync::Mutex<Vec<String>>,
+    settings: std::sync::Mutex<crate::studio_host::StudioSettings>,
+    caps: std::sync::Mutex<Vec<Option<crate::studio_host::StreamCap>>>,
+    /// Set: `set_stream_cap` refuses with this (the encoder is shared with a recording).
+    cap_refused: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -460,10 +464,15 @@ impl crate::studio_host::StudioHost for DirectStudio {
         Err("n/a".into())
     }
     async fn settings(&self) -> crate::studio_host::StudioSettings {
-        Default::default()
+        self.settings.lock().unwrap().clone()
     }
-    async fn set_settings(&self, _s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+    async fn set_settings(&self, s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        *self.settings.lock().unwrap() = s;
         Ok(None)
+    }
+    async fn set_stream_cap(&self, cap: Option<crate::studio_host::StreamCap>) -> Result<(), String> {
+        self.caps.lock().unwrap().push(cap);
+        self.cap_refused.lock().unwrap().clone().map_or(Ok(()), Err)
     }
     async fn stats(&self) -> Result<serde_json::Value, String> {
         Err("n/a".into())
@@ -560,7 +569,7 @@ async fn srt_rist_and_webrtc_servers_go_straight_from_the_studio() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(why.unwrap().contains("Ferrocast picture"));
+    assert!(why.unwrap().contains("go out from Studio"));
     drop(obs);
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
@@ -608,7 +617,7 @@ async fn test_connection_tries_the_server_and_says_how_it_went() {
     let d =
         e.add_golive_destination("Mine", &format!("rtmp://127.0.0.1:{port}/live"), "k", Canvas::Main).await.unwrap();
     let r = e.golive_test(&d.id).await.unwrap();
-    assert!(r.ok && r.message.contains("answered"), "{r:?}");
+    assert!(r.ok && r.message.contains("reachable"), "{r:?}");
     // Nothing there: said, not an error.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let r = e.golive_test_address(&format!("rtmp://127.0.0.1:{closed}/live"), "").await.unwrap();
@@ -741,4 +750,947 @@ async fn enhanced_broadcasting_is_twitchs_and_says_why_when_it_cant() {
     // Off again: kept off.
     let cfg = e.set_golive_enhanced("twitch", false).await.unwrap();
     assert!(cfg.destinations.iter().all(|d| !d.enhanced));
+}
+
+/// M10-01: Test connection, Pre-flight and Upload check never POST or PUT to YouTube (no silent
+/// PUBLIC broadcasts), and a 403 on broadcast creation during real Go Live blocks the destination
+/// with a clear one-line reason instead of streaming into nothing.
+#[tokio::test]
+async fn youtube_test_preflight_and_upload_check_make_zero_writes_and_403_blocks_golive() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Obs, platform};
+    use std::sync::Mutex;
+
+    let (rtmp_port, mut rtmp_got) = platform("yt-key").await;
+    let writes: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let writes_b = writes.clone();
+    let writes_put = writes.clone();
+    let writes_s = writes.clone();
+    let writes_bind = writes.clone();
+    let rtmp_url = format!("rtmp://127.0.0.1:{rtmp_port}/live2");
+    let app = axum::Router::new()
+        .route(
+            "/api/liveStreams",
+            axum::routing::get({
+                let rtmp_url = rtmp_url.clone();
+                move || {
+                    let rtmp_url = rtmp_url.clone();
+                    async move {
+                        axum::Json(json!({ "items": [{
+                            "id": "s1",
+                            "snippet": { "title": "Default", "isDefaultStream": true },
+                            "cdn": {
+                                "resolution": "variable",
+                                "frameRate": "variable",
+                                "ingestionType": "rtmp",
+                                "ingestionInfo": { "streamName": "yt-key", "ingestionAddress": rtmp_url }
+                            }
+                        }] }))
+                    }
+                }
+            })
+            .post(move || {
+                let w = writes_s.clone();
+                async move {
+                    w.lock().unwrap().push("POST /liveStreams".into());
+                    (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({ "error": { "message": "forbidden" } })))
+                }
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|| async { axum::Json(json!({ "items": [] })) })
+                .post(move || {
+                    let w = writes_b.clone();
+                    async move {
+                        w.lock().unwrap().push("POST /liveBroadcasts".into());
+                        (
+                            axum::http::StatusCode::FORBIDDEN,
+                            axum::Json(json!({
+                                "error": {
+                                    "message": "Live streaming is not enabled on this channel.",
+                                    "errors": [{ "reason": "liveStreamingNotEnabled" }]
+                                }
+                            })),
+                        )
+                    }
+                })
+                .put(move || {
+                    let w = writes_put.clone();
+                    async move {
+                        w.lock().unwrap().push("PUT /liveBroadcasts".into());
+                        (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({ "error": { "message": "forbidden" } })))
+                    }
+                }),
+        )
+        .route(
+            "/api/liveBroadcasts/bind",
+            axum::routing::post(move || {
+                let w = writes_bind.clone();
+                async move {
+                    w.lock().unwrap().push("POST /liveBroadcasts/bind".into());
+                    (axum::http::StatusCode::FORBIDDEN, axum::Json(json!({ "error": { "message": "forbidden" } })))
+                }
+            }),
+        );
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(rest, app).await });
+
+    let (e, _dir) = engine().await;
+    let ep = ferrocast_youtube::Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    };
+    let tokens = ferrocast_youtube::Tokens {
+        access_token: "a".into(),
+        refresh_token: "r".into(),
+        expires_at: crate::now().0 + 3_600_000,
+    };
+    let api = Arc::new(ferrocast_youtube::Api::new(
+        ferrocast_youtube::http_client(),
+        ep,
+        ferrocast_youtube::AppCredentials { client_id: "c".into(), client_secret: "s".into() },
+        tokens,
+        Arc::new(|_| Ok(())),
+    ));
+    e.register_connector(Arc::new(ferrocast_youtube::YoutubeConnector { api, live: Arc::default() }));
+
+    // Enable both YouTube main and vertical.
+    let order: Vec<(String, bool)> = GoLiveConfig::default()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == crate::golive::YOUTUBE_VERTICAL))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    // 1. Test connection (main + vertical): succeeds with ZERO writes to YouTube.
+    let r_main = e.golive_test("youtube").await.unwrap();
+    assert!(r_main.ok, "{r_main:?}");
+    let r_vert = e.golive_test(crate::golive::YOUTUBE_VERTICAL).await.unwrap();
+    assert!(r_vert.ok, "{r_vert:?}");
+    assert!(writes.lock().unwrap().is_empty(), "golive_test wrote to YouTube: {:?}", writes.lock().unwrap());
+
+    // 2. Pre-flight: passes for both with ZERO writes to YouTube.
+    let checks = e.golive_preflight().await;
+    assert_eq!(checks.iter().find(|c| c.id == "dest:youtube").unwrap().status, ferrocast_core::show::CheckStatus::Ok);
+    assert_eq!(
+        checks.iter().find(|c| c.id == format!("dest:{}", crate::golive::YOUTUBE_VERTICAL)).unwrap().status,
+        ferrocast_core::show::CheckStatus::Ok
+    );
+    assert!(writes.lock().unwrap().is_empty(), "golive_preflight wrote to YouTube: {:?}", writes.lock().unwrap());
+
+    // 3. Upload check (with an offline local Twitch connector so no external network is touched):
+    // still makes ZERO writes to YouTube.
+    #[derive(Debug)]
+    struct LocalTwitch(String);
+    #[async_trait::async_trait]
+    impl ferrocast_connector::Connector for LocalTwitch {
+        fn platform(&self) -> Platform {
+            Platform::Twitch
+        }
+        fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+            Default::default()
+        }
+        async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "tw-k".into(), backup: None, note: None })
+        }
+    }
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    e.register_connector(Arc::new(LocalTwitch(format!("rtmp://127.0.0.1:{closed}/app"))));
+    let order_with_tw: Vec<(String, bool)> = GoLiveConfig::default()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == crate::golive::YOUTUBE_VERTICAL || d.id == "twitch"))
+        .collect();
+    e.set_golive_destinations(order_with_tw).await.unwrap();
+    // Fails fast on closed local Twitch port, after probing YouTube read-only.
+    let _ = e.golive_upload_check().await;
+    assert!(writes.lock().unwrap().is_empty(), "golive_upload_check wrote to YouTube: {:?}", writes.lock().unwrap());
+
+    // 4. Actual Go Live: POST /liveBroadcasts returns 403 -> destination is blocked with a clear
+    // one-line reason and never spawns a forwarder or publishes RTMP into nothing.
+    let order_yt: Vec<(String, bool)> =
+        GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
+    e.set_golive_destinations(order_yt).await.unwrap();
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let _obs = Obs::publish(port, "live", &key).await.unwrap();
+    let mut blocked = None;
+    for _ in 0..100 {
+        blocked = e.golive_view().await.destinations.iter().find(|d| d.id == "youtube").and_then(|d| d.blocked.clone());
+        if blocked.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let reason = blocked.expect("403 on make_broadcast must block go-live");
+    assert!(!reason.contains('\n'), "reason must be one line: {reason:?}");
+    assert!(reason.contains("Live streaming is not enabled"), "{reason}");
+    let yt_view = e.golive_view().await.destinations.into_iter().find(|d| d.id == "youtube").unwrap();
+    assert!(yt_view.health.is_none(), "blocked destination must not start a forwarder: {yt_view:?}");
+    let published = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+        while let Some(g) = rtmp_got.recv().await {
+            if matches!(g, ferrocast_testkit::rtmp::Got::Publish(_)) {
+                return Some(g);
+            }
+        }
+        None
+    })
+    .await;
+    assert!(published.is_err(), "must never publish RTMP when broadcast creation failed: {published:?}");
+}
+
+/// M9-04 / Contract C-1: a platform that keeps refusing (or Kick accepting then closing) gives up
+/// into `PushState::Failed` with a clear reason, stops retrying, and when it was the only enabled
+/// destination the Studio stops showing LIVE while keeping the failed state visible.
+#[tokio::test]
+async fn destination_give_up_marks_failed_and_stops_studio_live() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_golive::push::PushState;
+    use ferrocast_testkit::rtmp::{Obs, platform, platform_dropping};
+
+    #[derive(Debug, Default)]
+    struct LiveHost {
+        streaming: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::studio_host::StudioHost for LiveHost {
+        async fn status(&self) -> crate::studio_host::StudioStatus {
+            crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            self.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::studio_host::StudioStatus { available: true, running: false, ..Default::default() })
+        }
+        async fn kinds(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "inputs": [] }))
+        }
+        async fn options(&self, _: String) -> Result<serde_json::Value, String> {
+            Ok(json!([]))
+        }
+        async fn preview(&self, _: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _: String) -> Result<serde_json::Value, String> {
+            Ok(json!({}))
+        }
+        async fn settings(&self) -> crate::studio_host::StudioSettings {
+            Default::default()
+        }
+        async fn set_settings(&self, _: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<serde_json::Value, String> {
+            let on = self.streaming.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(
+                json!({ "stream": if on { json!({ "active": true, "reconnecting": false, "error": null }) } else { serde_json::Value::Null } }),
+            )
+        }
+        async fn record(&self, _: bool) -> Result<serde_json::Value, String> {
+            Ok(json!({}))
+        }
+        async fn record_pause(&self, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<serde_json::Value, String> {
+            Ok(json!({ "devices": [] }))
+        }
+        async fn act(&self, _: crate::studio_host::StudioAct) -> Result<serde_json::Value, String> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn stream_start(
+            &self,
+            _: String,
+            _: String,
+            _: Vec<(u32, u32, u32)>,
+        ) -> Result<serde_json::Value, String> {
+            self.streaming.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(json!({ "active": true, "error": null }))
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            self.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<serde_json::Value, String> {
+            let on = self.streaming.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(if on { json!({ "active": true, "error": null }) } else { serde_json::Value::Null })
+        }
+        async fn obs_collections(&self) -> Result<serde_json::Value, String> {
+            Ok(json!([]))
+        }
+        async fn import_obs(&self, _: String) -> Result<serde_json::Value, String> {
+            Ok(json!({}))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LocalKick(String);
+    #[async_trait::async_trait]
+    impl ferrocast_connector::Connector for LocalKick {
+        fn platform(&self) -> Platform {
+            Platform::Kick
+        }
+        fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+            Default::default()
+        }
+        async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "kick-k".into(), backup: None, note: None })
+        }
+    }
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(LiveHost::default());
+    e.set_studio_host(host.clone());
+
+    // 1. Kick alone, refusing multistreaming (accept then close after 40 ms): gives up and
+    //    stops the Studio stream so the Studio stops showing LIVE.
+    let (kport, _kgot) = platform_dropping("kick-k", std::time::Duration::from_millis(40)).await;
+    e.register_connector(Arc::new(LocalKick(format!("rtmp://127.0.0.1:{kport}/app"))));
+    let order: Vec<(String, bool)> =
+        GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "kick")).collect();
+    e.set_golive_destinations(order).await.unwrap();
+    let mut adv = e.golive_config().advanced;
+    adv.per
+        .insert("kick".into(), crate::golive::DestAdvanced { first_retry_s: 1, max_retry_s: 1, ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let _obs = Obs::publish(port, "live", &key).await.unwrap();
+
+    // Wait for Kick to hit PushState::Failed and Studio to stop showing LIVE.
+    let mut failed_state = None;
+    for _ in 0..100 {
+        let v = e.golive_view().await;
+        if let Some(PushState::Failed { .. }) =
+            v.destinations.iter().find(|d| d.id == "kick").and_then(|d| d.health.as_ref()).map(|h| &h.state)
+            && !host.streaming.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            failed_state = v.destinations.into_iter().find(|d| d.id == "kick").and_then(|d| d.health).map(|h| h.state);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    match failed_state {
+        Some(PushState::Failed { attempts, reason, detail, refused }) => {
+            assert_eq!(attempts, ferrocast_golive::push::DEFAULT_MAX_ATTEMPTS);
+            assert!(refused);
+            assert!(reason.contains("Kick refused"), "{reason}");
+            assert!(detail.as_deref().is_some_and(|d| d.contains("Allow multistreaming")), "{detail:?}");
+        }
+        other => panic!("Kick should have reached Failed and stopped Studio stream: {other:?}"),
+    }
+    assert!(
+        !e.studio_stream_stats().await.unwrap()["active"].as_bool().unwrap_or(false),
+        "Studio must not show LIVE after every enabled destination failed"
+    );
+    drop(_obs);
+
+    // 2. Two destinations (good custom + bad-key custom): bad-key reaches Failed while good
+    //    stays Live and Studio stays LIVE.
+    let (gport, _ggot) = platform("good-key").await;
+    let (bport, _bgot) = platform("right-key").await;
+    let good = e
+        .add_golive_destination(
+            "Good",
+            &format!("rtmp://127.0.0.1:{gport}/app"),
+            "good-key",
+            crate::golive::Canvas::Main,
+        )
+        .await
+        .unwrap();
+    let bad = e
+        .add_golive_destination(
+            "Bad",
+            &format!("rtmp://127.0.0.1:{bport}/app"),
+            "wrong-key",
+            crate::golive::Canvas::Main,
+        )
+        .await
+        .unwrap();
+    let mut order2: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == good.id || d.id == bad.id)).collect();
+    order2.sort_by_key(|(id, _)| if *id == good.id { 0 } else { 1 });
+    e.set_golive_destinations(order2).await.unwrap();
+    let mut adv2 = e.golive_config().advanced;
+    adv2.per
+        .insert(bad.id.clone(), crate::golive::DestAdvanced { first_retry_s: 1, max_retry_s: 1, ..Default::default() });
+    e.set_golive_advanced(adv2).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    let _obs2 = Obs::publish(port, "live", &key).await.unwrap();
+    let mut saw_bad_failed = false;
+    for _ in 0..80 {
+        let v = e.golive_view().await;
+        let bad_h = v.destinations.iter().find(|d| d.id == bad.id).and_then(|d| d.health.as_ref());
+        let good_h = v.destinations.iter().find(|d| d.id == good.id).and_then(|d| d.health.as_ref());
+        if matches!(bad_h.map(|h| &h.state), Some(PushState::Failed { refused: true, .. }))
+            && matches!(good_h.map(|h| &h.state), Some(PushState::Live))
+        {
+            saw_bad_failed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(saw_bad_failed, "bad destination should fail while good stays live");
+    assert!(
+        e.studio_stream_stats().await.unwrap()["active"].as_bool() == Some(true),
+        "Studio must stay LIVE while at least one destination is still live"
+    );
+}
+
+/// S11: the privacy the streamer chose reaches every YouTube broadcast Ferrocast makes. The Api
+/// the engine builds reads the setting when it makes one, so a change applies at once.
+#[tokio::test]
+async fn the_youtube_privacy_setting_reaches_the_broadcasts_ferrocast_makes() {
+    use std::sync::Mutex;
+
+    // Default, and what it must accept and refuse.
+    let (e, _dir) = engine().await;
+    assert_eq!(e.settings().youtube_privacy, "public", "as before unless chosen");
+    let bad = e.patch_settings(json!({ "youtube_privacy": "friends" }).as_object().unwrap()).await.unwrap_err();
+    assert!(
+        bad.to_string().contains("youtube_privacy: use one of public, unlisted, private."),
+        "names the field and the choices: {bad}"
+    );
+    assert_eq!(e.settings().youtube_privacy, "public", "a refused value changes nothing");
+    let bad = e.patch_settings(json!({ "youtube_privacy": 3 }).as_object().unwrap()).await.unwrap_err();
+    assert!(bad.to_string().contains("youtube_privacy: must be text."), "{bad}");
+
+    // A fake YouTube that only records the privacy of each broadcast made.
+    let made: Arc<Mutex<Vec<String>>> = Arc::default();
+    let rec = made.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/liveStreams",
+            axum::routing::get(|| async {
+                axum::Json(json!({ "items": [{
+                    "id": "s1", "snippet": { "title": "Default", "isDefaultStream": true },
+                    "cdn": { "resolution": "variable", "frameRate": "variable", "ingestionType": "rtmp",
+                             "ingestionInfo": { "streamName": "k", "ingestionAddress": "rtmp://127.0.0.1:9/live2" } }
+                }] }))
+            }),
+        )
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|| async { axum::Json(json!({ "items": [] })) }).post(
+                move |axum::Json(b): axum::Json<serde_json::Value>| {
+                    let rec = rec.clone();
+                    async move {
+                        rec.lock().unwrap().push(b["status"]["privacyStatus"].as_str().unwrap_or("").to_string());
+                        axum::Json(json!({ "id": "made-1" }))
+                    }
+                },
+            ),
+        )
+        .route("/api/liveBroadcasts/bind", axum::routing::post(|| async { axum::Json(json!({ "id": "made-1" })) }))
+        .route(
+            "/api/videos",
+            axum::routing::get(|| async { axum::Json(json!({ "items": [{ "snippet": {} }] })) })
+                .put(|| async { axum::Json(json!({})) }),
+        );
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(rest, app).await });
+    let dir = tempfile::tempdir().unwrap();
+    let apps = crate::PlatformApps {
+        youtube: Some(ferrocast_youtube::AppCredentials { client_id: "c".into(), client_secret: "s".into() }),
+        youtube_endpoints: ferrocast_youtube::Endpoints {
+            authorize: format!("{base}/auth"),
+            token: format!("{base}/token"),
+            api: format!("{base}/api"),
+            grpc: "http://127.0.0.1:9".into(),
+        },
+        ..Default::default()
+    };
+    let e = Engine::start_with(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()), apps).await.unwrap();
+    let tokens = ferrocast_youtube::Tokens {
+        access_token: "a".into(),
+        refresh_token: "r".into(),
+        expires_at: crate::now().0 + 3_600_000,
+    };
+    let info = ferrocast_core::stream_info::StreamInfo { title: Some("Ranked".into()), ..Default::default() };
+    // Each Api is built first and the setting changed after: it is read when the broadcast is made.
+    for chosen in ["public", "unlisted", "private"] {
+        let api = e.youtube_api(tokens.clone()).unwrap();
+        e.patch_settings(json!({ "youtube_privacy": chosen }).as_object().unwrap()).await.unwrap();
+        api.update_broadcast_info(&info).await.unwrap();
+    }
+    assert_eq!(*made.lock().unwrap(), ["public", "unlisted", "private"]);
+
+    // A saved value that is none of the three (the file was edited by hand; validation only runs
+    // on a save from the dashboard) never publishes: unlisted.
+    let mut odd = e.settings();
+    odd.youtube_privacy = "friends".into();
+    e.save_settings(odd).await.unwrap();
+    e.youtube_api(tokens).unwrap().update_broadcast_info(&info).await.unwrap();
+    assert_eq!(made.lock().unwrap().last().map(String::as_str), Some("unlisted"));
+}
+
+#[tokio::test]
+async fn light_hub_destination_checks_light_hub_rules_and_eb_is_exempt() {
+    let (e, _dir) = engine().await;
+    let g = e.golive();
+    let order: Vec<(String, bool)> = GoLiveConfig::default()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "twitch" || d.id == "youtube"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+    e.set_golive_light("twitch", true).await.unwrap();
+
+    // Main hub runs at 12,000 kbps H.264 2 s (for YouTube); light hub runs at 3,000 kbps H.264 2 s.
+    let push_stream = |hub: &ferrocast_golive::Hub, frame_bytes: usize| {
+        hub.start();
+        hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
+        for i in 0..=40u32 {
+            let ts = i * 100;
+            let mut d = vec![if i % 20 == 0 { 0x17 } else { 0x27 }, 0x01];
+            d.resize(frame_bytes, 0);
+            hub.video(ts, d.into());
+        }
+    };
+    push_stream(&g.hub, 150_000); // ~12,000 kbps
+    push_stream(&g.lhub, 37_500); // ~3,000 kbps
+    let feeds = [keep_streaming(g.hub.clone(), 150_000, 4_000), keep_streaming(g.lhub.clone(), 37_500, 4_000)];
+
+    let v = e.golive_view().await;
+    let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert!(twitch.rules.is_empty(), "light-hub Twitch checked against lhub (3 Mbps): {:?}", twitch.rules);
+    assert!(twitch.issues.is_empty(), "{:?}", twitch.issues);
+
+    // Move Twitch off light onto main hub with Enhanced Broadcasting enabled -> still exempt from 6,000 kbps rule.
+    e.set_golive_light("twitch", false).await.unwrap();
+    e.set_golive_enhanced("twitch", true).await.unwrap();
+    let v = e.golive_view().await;
+    let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert!(twitch.rules.is_empty(), "Twitch EB must be exempt from legacy 6,000 limit: {:?}", twitch.rules);
+    assert!(twitch.issues.is_empty(), "{:?}", twitch.issues);
+
+    // Turning EB off exposes C-2 structured rule data against main hub's 12,000 kbps.
+    e.set_golive_enhanced("twitch", false).await.unwrap();
+    let v = e.golive_view().await;
+    let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert_eq!(twitch.issues.len(), 1);
+    assert_eq!(twitch.issues[0].code, ferrocast_golive::probe::RuleCode::Bitrate);
+    assert_eq!(twitch.issues[0].fix_kbps, Some(5_500));
+    assert!(!twitch.rules.is_empty());
+    feeds.iter().for_each(tokio::task::JoinHandle::abort);
+}
+
+#[tokio::test]
+async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        video_kbps: 14_000,
+        vbr: true,
+        keyframe_s: 4,
+        video_encoder: Some("com.apple.videotoolbox.videoencoder.ave.hevc".into()),
+        ..Default::default()
+    };
+    e.set_studio_host(studio.clone());
+    // Signed in (a destination that can't start sets no limit).
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Kick)));
+
+    let enable_only = |target: &str| {
+        GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == target)).collect::<Vec<_>>()
+    };
+
+    // Twitch enabled: Studio gets 6,000 kbps H.264 2 s cap; DestinationView shows calm C-2 chip.
+    e.set_golive_destinations(enable_only("twitch")).await.unwrap();
+    let v = e.golive_view().await;
+    let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    let cap_view = twitch.capped.as_ref().expect("twitch C-2 capped chip");
+    assert_eq!(cap_view.kbps, 6_000);
+    assert_eq!(cap_view.summary, "Capped at 6,000 kbps for Twitch");
+    assert!(!cap_view.separate_encode);
+
+    e.studio_stream(true).await.unwrap();
+    let last_cap = studio.caps.lock().unwrap().last().copied().flatten();
+    assert_eq!(
+        last_cap,
+        Some(crate::studio_host::StreamCap {
+            max_kbps: Some(6_000),
+            h264_only: true,
+            keyframe_secs: 2,
+            no_bframes: false
+        })
+    );
+
+    // While Studio holds the live stream, small VT accounting above 6,000 produces zero nagging warnings.
+    let hub = &e.golive().hub;
+    hub.start();
+    hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
+    for i in 0..=40u32 {
+        let ts = i * 100;
+        let mut d = vec![if i % 20 == 0 { 0x17 } else { 0x27 }, 0x01];
+        d.resize(82_000, 0); // ~6,560 kbps FLV total before VT CappedCbr tightening
+        hub.video(ts, d.into());
+    }
+    let v = e.golive_view().await;
+    let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert!(twitch.capped.is_some());
+    assert!(twitch.issues.is_empty(), "capped Studio stream must not nag mid-stream: {:?}", twitch.issues);
+
+    // Switching to Kick only updates cap to 8,000 kbps.
+    e.set_golive_destinations(enable_only("kick")).await.unwrap();
+    let last_cap = studio.caps.lock().unwrap().last().copied().flatten();
+    assert_eq!(
+        last_cap,
+        Some(crate::studio_host::StreamCap {
+            max_kbps: Some(8_000),
+            h264_only: true,
+            keyframe_secs: 2,
+            no_bframes: false
+        })
+    );
+    let v = e.golive_view().await;
+    let kick = v.destinations.iter().find(|d| d.id == "kick").unwrap();
+    assert_eq!(kick.capped.as_ref().map(|c| c.summary.as_str()), Some("Capped at 8,000 kbps for Kick"));
+
+    // Power-user override (C-6) disables automatic cap and removes the chip.
+    let mut adv = e.golive_config().advanced;
+    adv.ignore_service_limits = true;
+    e.set_golive_advanced(adv).await.unwrap();
+    assert_eq!(studio.caps.lock().unwrap().last().copied().flatten(), None);
+    let v = e.golive_view().await;
+    let kick = v.destinations.iter().find(|d| d.id == "kick").unwrap();
+    assert_eq!(kick.capped, None);
+    e.studio_stream(false).await.unwrap();
+}
+
+// What `SignedIn` was last told about the keys of the vertical canvas.
+// (Per thread: each test runs on its own, so tests that resolve in parallel don't overwrite it.)
+thread_local! {
+    static VERTICAL_KEYS_TOLD: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A platform that is signed in and gives a local address and a key (so its destination can start).
+#[derive(Debug)]
+struct SignedIn(ferrocast_core::event::Platform);
+#[async_trait::async_trait]
+impl ferrocast_connector::Connector for SignedIn {
+    fn platform(&self) -> ferrocast_core::event::Platform {
+        self.0
+    }
+    fn set_vertical_keys(&self, keys: Vec<String>) {
+        VERTICAL_KEYS_TOLD.with(|t| *t.borrow_mut() = keys);
+    }
+    fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+        Default::default()
+    }
+    async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+        // YouTube gives a backup server beside its own; the others don't.
+        let backup =
+            (self.0 == ferrocast_core::event::Platform::Youtube).then(|| "rtmp://127.0.0.1:10/app".to_string());
+        // YouTube says which key it used; the others don't.
+        let note = (self.0 == ferrocast_core::event::Platform::Youtube).then(|| "Ferrocast · variable".to_string());
+        Ok(ferrocast_connector::Ingest { url: "rtmp://127.0.0.1:9/app".into(), key: "k".into(), backup, note })
+    }
+}
+
+fn twitch_studio_settings() -> crate::studio_host::StudioSettings {
+    crate::studio_host::StudioSettings { video_kbps: 14_000, vbr: true, keyframe_s: 4, ..Default::default() }
+}
+
+/// After a burst (frames every 100 ms of stream, a keyframe every 2 s, up to `ts`), the same
+/// stream keeps arriving on `hub` at its own pace, as a real one does, until aborted. The
+/// measured rate reads 0 three seconds after the last packet, and on Windows each view takes
+/// about 2 s (it dials OBS, and a refused connect takes that long there): a burst pushed once had
+/// gone stale by the second view, and the rules it was meant to trip said nothing.
+fn keep_streaming(hub: Arc<ferrocast_golive::Hub>, frame_bytes: usize, mut ts: u32) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            ts += 100;
+            let mut d = vec![if (ts / 100).is_multiple_of(20) { 0x17 } else { 0x27 }, 0x01];
+            d.resize(frame_bytes, 0);
+            hub.video(ts, d.into());
+        }
+    })
+}
+
+/// A stream of `kbps` on the main hub, as the Studio's would arrive.
+fn push_main(e: &crate::Engine, frame_bytes: usize) {
+    let hub = &e.golive().hub;
+    hub.start();
+    hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
+    for i in 0..=40u32 {
+        let mut d = vec![if i % 20 == 0 { 0x17 } else { 0x27 }, 0x01];
+        d.resize(frame_bytes, 0);
+        hub.video(i * 100, d.into());
+    }
+}
+
+/// The cap is for the streams that go out: a destination that can't start (Twitch with nobody
+/// signed in) sets no limit, so a YouTube stream was held to 6,000 kbps by a switch that did
+/// nothing.
+#[tokio::test]
+async fn a_destination_that_cannot_start_sets_no_limit() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = twitch_studio_settings();
+    e.set_studio_host(studio.clone());
+    let both: Vec<(String, bool)> = GoLiveConfig::default()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "twitch" || d.id == "youtube"))
+        .collect();
+    e.set_golive_destinations(both).await.unwrap();
+    assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000), "Twitch on, as far as anyone knows");
+    // It couldn't start (no account): the stream is YouTube's alone.
+    e.golive().blocked.lock().unwrap().insert("twitch".into(), "Connect Twitch first.".into());
+    assert_eq!(e.studio_limit(), None);
+    e.sync_stream_cap().await;
+    assert_eq!(studio.caps.lock().unwrap().last().copied().flatten(), None, "lifted for the stream on air");
+    // It can: the limit is back.
+    e.golive().blocked.lock().unwrap().clear();
+    assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000));
+}
+
+/// A cap the Studio couldn't put on the stream on air (its encoder is shared with a recording)
+/// isn't claimed: no badge says the stream is held, and the bitrate warning isn't held back, so
+/// the 7,011 kbps one comes back instead of silence. The codec rule still speaks when capped.
+#[tokio::test]
+async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = twitch_studio_settings();
+    e.set_studio_host(studio.clone());
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    let only_twitch = || {
+        GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "twitch")).collect::<Vec<_>>()
+    };
+    e.set_golive_destinations(only_twitch()).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    // 7,011 kbps arrives, and goes on arriving.
+    push_main(&e, 90_000);
+    let feed = keep_streaming(e.golive().hub.clone(), 90_000, 4_000);
+    let twitch = |v: &crate::golive::GoLiveView| v.destinations.iter().find(|d| d.id == "twitch").cloned().unwrap();
+    let v = e.golive_view().await;
+    assert!(twitch(&v).capped.is_some(), "held: the badge says so");
+    assert!(twitch(&v).issues.is_empty(), "held: its rounding isn't nagged about");
+    // The Studio can't apply it on the stream on air.
+    *studio.cap_refused.lock().unwrap() = Some("the stream shares its encoder with the recording".into());
+    e.set_golive_destinations(only_twitch().into_iter().chain([]).collect()).await.unwrap();
+    e.sync_stream_cap().await;
+    let v = e.golive_view().await;
+    assert_eq!(twitch(&v).capped, None, "not claimed");
+    assert_eq!(twitch(&v).issues.len(), 1, "{:?}", twitch(&v).issues);
+    assert_eq!(twitch(&v).issues[0].code, ferrocast_golive::probe::RuleCode::Bitrate);
+    // Applied again (the recording stopped): held, as before.
+    *studio.cap_refused.lock().unwrap() = None;
+    e.sync_stream_cap().await;
+    let v = e.golive_view().await;
+    assert!(twitch(&v).capped.is_some() && twitch(&v).issues.is_empty());
+    feed.abort();
+    e.studio_stream(false).await.unwrap();
+}
+
+/// YouTube's backup server reaches the forwarder as a second target for the same key; a server the
+/// person typed in themselves, and the platforms that have none, get none.
+#[tokio::test]
+async fn a_backup_server_reaches_the_destination_for_youtube_only() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    let cfg = e.golive_config();
+    let dest = |id: &str| cfg.destinations.iter().find(|d| d.id == id).cloned().unwrap();
+    let yt = e.resolve(&dest("youtube")).await.unwrap();
+    assert_eq!(yt.backup.as_ref().map(|t| t.port), Some(10), "{:?}", yt.backup);
+    assert_eq!(yt.target.port, 9);
+    assert_eq!(yt.key, "k", "the same key");
+    assert!(e.resolve(&dest("twitch")).await.unwrap().backup.is_none());
+    // Its own address chosen for YouTube: no backup beside it.
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert(
+        "youtube".into(),
+        crate::golive::DestAdvanced { server: Some("rtmp://127.0.0.1:11/app".into()), ..Default::default() },
+    );
+    e.set_golive_advanced(adv).await.unwrap();
+    let own = e.resolve(&dest("youtube")).await.unwrap();
+    assert!(own.backup.is_none() && own.target.port == 11);
+}
+
+/// Which key YouTube's stream went to ("Ferrocast · variable") shows in its details, once it has
+/// started; Twitch, which says nothing, shows none. The key itself never does.
+#[tokio::test]
+async fn the_key_a_youtube_destination_sent_to_is_named_in_its_view() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    let cfg = e.golive_config();
+    let dest = |id: &str| cfg.destinations.iter().find(|d| d.id == id).cloned().unwrap();
+    let note =
+        |v: &crate::golive::GoLiveView, id: &str| v.destinations.iter().find(|d| d.id == id).unwrap().key_note.clone();
+    assert_eq!(note(&e.golive_view().await, "youtube"), None, "nothing before it starts");
+    e.resolve(&dest("youtube")).await.unwrap();
+    e.resolve(&dest("twitch")).await.unwrap();
+    let v = e.golive_view().await;
+    assert_eq!(note(&v, "youtube").as_deref(), Some("Ferrocast · variable"));
+    assert_eq!(note(&v, "twitch"), None);
+    assert!(!serde_json::to_string(&v).unwrap().contains("\"k\""), "never the key");
+}
+
+/// The keys of the custom servers on the vertical canvas (and only those) are told to the platform
+/// before the normal stream's key is asked for, so a YouTube key set by hand for vertical video is
+/// never given to the normal stream.
+#[tokio::test]
+async fn the_keys_set_for_the_vertical_canvas_are_told_to_the_platform_before_its_key_is_asked() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    e.add_golive_destination("Shorts box", "rtmp://127.0.0.1:9/app", "vert-key", crate::golive::Canvas::Vertical)
+        .await
+        .unwrap();
+    e.add_golive_destination("Main box", "rtmp://127.0.0.1:9/app", "main-key", crate::golive::Canvas::Main)
+        .await
+        .unwrap();
+    let cfg = e.golive_config();
+    let yt = cfg.destinations.iter().find(|d| d.id == "youtube").cloned().unwrap();
+    e.resolve(&yt).await.unwrap();
+    assert_eq!(VERTICAL_KEYS_TOLD.with(|t| t.borrow().clone()), vec!["vert-key".to_string()]);
+}
+
+/// The Studio's Advanced reconnect settings reach every Go live destination (they didn't: a
+/// platform always got six tries a second apart): off means no retry, tries and the first wait are
+/// the Studio's, a destination's own changed first wait wins, and OBS-only streaming keeps the defaults.
+#[tokio::test]
+async fn the_studios_reconnect_settings_govern_the_go_live_destinations() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    let cfg = e.golive_config();
+    let yt = cfg.destinations.iter().find(|d| d.id == "youtube").cloned().unwrap();
+    // No Studio: Go live's own defaults.
+    let plain = e.resolve(&yt).await.unwrap().retry;
+    assert_eq!(plain, ferrocast_golive::push::Retry::default());
+    let studio = Arc::new(DirectStudio::default());
+    e.set_studio_host(studio.clone());
+    // Reconnecting on, 2 tries, every 3 s.
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        reconnect: true,
+        reconnect_tries: 2,
+        reconnect_every_s: 3,
+        ..Default::default()
+    };
+    let r = e.resolve(&yt).await.unwrap().retry;
+    assert_eq!((r.max_attempts, r.first.as_secs()), (2, 3));
+    // A first wait set on the destination itself still wins.
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert("youtube".into(), crate::golive::DestAdvanced { first_retry_s: 7, ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+    let r = e.resolve(&yt).await.unwrap().retry;
+    assert_eq!((r.max_attempts, r.first.as_secs()), (2, 7));
+    // Off: no retry at all.
+    studio.settings.lock().unwrap().reconnect = false;
+    assert!(e.resolve(&yt).await.unwrap().retry.is_never());
+}
+
+/// The IP version and the pinned connection of Go live's Advanced settings reach every RTMP
+/// destination (and its backup server), and a nonsense connection is refused with the field's name.
+#[tokio::test]
+async fn the_ip_version_and_connection_chosen_reach_the_destinations() {
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    let cfg = e.golive_config();
+    let yt = cfg.destinations.iter().find(|d| d.id == "youtube").cloned().unwrap();
+    let plain = e.resolve(&yt).await.unwrap();
+    assert_eq!((plain.target.family, plain.target.bind.clone()), (ferrocast_golive::IpFamily::Auto, None));
+    let mut adv = e.golive_config().advanced;
+    adv.ip_family = ferrocast_golive::IpFamily::V4;
+    adv.bind = Some("en7".into());
+    e.set_golive_advanced(adv).await.unwrap();
+    let d = e.resolve(&yt).await.unwrap();
+    assert_eq!((d.target.family, d.target.bind.as_deref()), (ferrocast_golive::IpFamily::V4, Some("en7")));
+    let backup = d.backup.expect("YouTube's backup server");
+    assert_eq!((backup.family, backup.bind.as_deref()), (ferrocast_golive::IpFamily::V4, Some("en7")));
+    let mut bad = e.golive_config().advanced;
+    bad.bind = Some("  ".into());
+    assert!(e.set_golive_advanced(bad).await.unwrap_err().to_string().contains("bind"));
+}
+
+#[tokio::test]
+async fn whip_disables_bframes_even_with_ignore_service_limits_and_shows_capped_notice() {
+    use crate::golive::Canvas;
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings { bframes: true, ..Default::default() };
+    e.set_studio_host(studio.clone());
+    let whip = e.add_golive_destination("WebRTC", "https://whip.example.com/whip", "tok", Canvas::Main).await.unwrap();
+
+    // Even when ignore_service_limits is true, WHIP cannot carry B-frames so Studio must be told.
+    let mut adv = e.golive_config().advanced;
+    adv.ignore_service_limits = true;
+    e.set_golive_advanced(adv).await.unwrap();
+
+    assert_eq!(
+        studio.caps.lock().unwrap().last().copied().flatten(),
+        Some(crate::studio_host::StreamCap { max_kbps: None, h264_only: false, keyframe_secs: 0, no_bframes: true })
+    );
+    let v = e.golive_view().await;
+    let row = v.destinations.iter().find(|d| d.id == whip.id).unwrap();
+    let cap = row.capped.as_ref().expect("WHIP with b_frames on must explain why B-frames are off");
+    assert!(cap.summary.to_ascii_lowercase().contains("b-frames"), "{}", cap.summary);
 }

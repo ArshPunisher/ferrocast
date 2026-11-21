@@ -125,6 +125,10 @@ pub fn parse(text: &str) -> Option<Invocation<'_>> {
     Some(Invocation { word, args: parts.take(20).collect() })
 }
 
+/// Hard cap on tracked per-user command cooldown entries so busy 8-hour streams or raids never
+/// grow memory without bound.
+const MAX_COOLDOWN_ENTRIES: usize = 20_000;
+
 /// Remembers when commands last ran.
 #[derive(Debug, Default)]
 pub struct Cooldowns {
@@ -133,6 +137,41 @@ pub struct Cooldowns {
 }
 
 impl Cooldowns {
+    /// Current `(global, per_user)` map sizes (for monitoring and soak tests).
+    pub fn len(&self) -> (usize, usize) {
+        (self.global.len(), self.per_user.len())
+    }
+
+    /// Drops cooldowns for deleted commands or elapsed windows, and evicts the oldest half if
+    /// still over [`MAX_COOLDOWN_ENTRIES`].
+    fn prune_if_needed(&mut self, commands: &[Command], now: Millis) {
+        let global_cap = commands.len().saturating_mul(2).max(256);
+        if self.global.len() >= global_cap {
+            let active: HashMap<&str, i64> =
+                commands.iter().map(|c| (c.id.as_str(), i64::from(c.cooldown_s))).collect();
+            self.global.retain(|id, last| active.get(id.as_str()).is_some_and(|&cd| now.seconds_since(*last) < cd));
+        }
+        if self.per_user.len() >= MAX_COOLDOWN_ENTRIES {
+            let active: HashMap<&str, i64> =
+                commands.iter().map(|c| (c.id.as_str(), i64::from(c.user_cooldown_s))).collect();
+            self.per_user
+                .retain(|(id, _), last| active.get(id.as_str()).is_some_and(|&cd| now.seconds_since(*last) < cd));
+            if self.per_user.len() >= MAX_COOLDOWN_ENTRIES {
+                let mut times: Vec<i64> = self.per_user.values().map(|m| m.0).collect();
+                let mid = times.len() / 2;
+                let (_, cutoff, _) = times.select_nth_unstable(mid);
+                let cutoff = *cutoff;
+                self.per_user.retain(|_, last| last.0 > cutoff);
+                while self.per_user.len() >= MAX_COOLDOWN_ENTRIES {
+                    if let Some(k) = self.per_user.keys().next().cloned() {
+                        self.per_user.remove(&k);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
     /// Whether `actor` could run `cmd` now (access and cooldowns), without recording a
     /// use. The engine asks before doing slow work for a command, like a platform lookup.
     pub fn ready(&self, cmd: &Command, actor: &Actor, now: Millis) -> bool {
@@ -203,6 +242,7 @@ pub fn run(
             }
         }
     }
+    cooldowns.prune_if_needed(commands, now);
     cooldowns.global.insert(cmd.id.clone(), now);
     cooldowns.per_user.insert(user_key, now);
 
@@ -444,5 +484,70 @@ mod timer_tests {
         assert!(timer().validate().is_ok());
         assert!(Timer { message: " ".into(), ..timer() }.validate().is_err());
         assert!(Timer { message: "{bad".into(), ..timer() }.validate().is_err());
+    }
+
+    /// Past the cap only the oldest half of the cooldowns still running goes; the recent ones keep
+    /// blocking their viewers (the oldest are the nearest to being over anyway).
+    #[test]
+    fn at_the_cap_the_recent_cooldowns_still_block() {
+        let c = Command {
+            id: "hi".into(),
+            name: "!hi".into(),
+            aliases: vec![],
+            response: "hi".into(),
+            access: Access::Everyone,
+            cooldown_s: 0,
+            user_cooldown_s: 3600,
+            platforms: vec![],
+            enabled: true,
+        };
+        let mut cd = Cooldowns::default();
+        let actor = |i: usize| {
+            let mut a = Actor::named(Platform::Twitch, &format!("u{i}"));
+            a.id = Some(format!("u{i}"));
+            a
+        };
+        for i in 0..=MAX_COOLDOWN_ENTRIES {
+            let at = Millis(i as i64 * 10);
+            assert!(
+                run(std::slice::from_ref(&c), &mut cd, Platform::Twitch, &actor(i), "!hi", &Vars::new(), at).is_ok()
+            );
+        }
+        let now = Millis(MAX_COOLDOWN_ENTRIES as i64 * 10 + 10);
+        for i in [MAX_COOLDOWN_ENTRIES, MAX_COOLDOWN_ENTRIES - 1, MAX_COOLDOWN_ENTRIES - 5_000] {
+            assert!(!cd.ready(&c, &actor(i), now), "u{i} ran seconds ago, still waiting");
+        }
+    }
+
+    #[test]
+    fn command_cooldowns_stay_bounded_and_prune_deleted_commands() {
+        let mut c = Command {
+            id: "hi".into(),
+            name: "!hi".into(),
+            aliases: vec![],
+            response: "hi {user}".into(),
+            access: Access::Everyone,
+            cooldown_s: 0,
+            user_cooldown_s: 3600,
+            platforms: vec![],
+            enabled: true,
+        };
+        let mut cd = Cooldowns::default();
+        // 25,000 unique viewers all within the 1-hour user cooldown window: must stay <= cap.
+        for i in 0..25_000 {
+            let name = format!("u{i}");
+            let mut a = Actor::named(Platform::Twitch, &name);
+            a.id = Some(name);
+            assert!(run(&[c.clone()], &mut cd, Platform::Twitch, &a, "!hi", &Vars::new(), Millis(i * 10)).is_ok());
+            assert!(cd.len().1 <= MAX_COOLDOWN_ENTRIES, "per_user exceeded cap: {}", cd.len().1);
+        }
+        // Deleted commands are purged once prune runs.
+        for i in 0..300 {
+            c.id = format!("deleted_{i}");
+            c.name = format!("!d{i}");
+            let a = Actor::named(Platform::Twitch, "u");
+            let _ = run(&[c.clone()], &mut cd, Platform::Twitch, &a, &c.name, &Vars::new(), Millis(500_000 + i));
+        }
+        assert!(cd.len().0 <= 256, "global stayed bounded: {}", cd.len().0);
     }
 }

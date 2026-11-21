@@ -64,6 +64,7 @@ impl Default for TextStyle {
 pub struct TextRenderer {
     fonts: FontSystem,
     cache: SwashCache,
+    renders: usize,
 }
 
 impl std::fmt::Debug for TextRenderer {
@@ -80,14 +81,22 @@ impl Default for TextRenderer {
 
 /// The largest text picture (a runaway chat log can't make a huge texture).
 const MAX_SIDE: usize = 8192;
+/// Reset the rasterized glyph cache periodically so animated countdowns/chat over days
+/// cannot accumulate rasterized glyph bitmaps indefinitely.
+const CACHE_RESET_EVERY: usize = 2000;
 
 impl TextRenderer {
     pub fn new() -> Self {
-        Self { fonts: FontSystem::new(), cache: SwashCache::new() }
+        Self { fonts: FontSystem::new(), cache: SwashCache::new(), renders: 0 }
     }
 
     /// The text as a picture (straight alpha), just big enough for it, its outline and shadow.
     pub fn render(&mut self, text: &str, style: &TextStyle) -> Picture {
+        self.renders = self.renders.saturating_add(1);
+        if self.renders >= CACHE_RESET_EVERY {
+            self.cache = SwashCache::new();
+            self.renders = 0;
+        }
         let text = match style.last_lines {
             Some(n) => {
                 let lines: Vec<&str> = text.lines().collect();
@@ -308,5 +317,17 @@ mod tests {
         if let (Some((ty, tr)), Some((by, br))) = (top, bottom) {
             assert!(by > ty && tr > br, "red fades from the top");
         }
+    }
+
+    #[test]
+    fn glyph_cache_resets_periodically() {
+        let mut r = TextRenderer::new();
+        let style = TextStyle { size: 18.0, ..Default::default() };
+        r.renders = CACHE_RESET_EVERY - 2;
+        let _ = r.render("a", &style);
+        assert_eq!(r.renders, CACHE_RESET_EVERY - 1);
+        let p = r.render("b", &style);
+        assert_eq!(r.renders, 0, "cache reset on reaching threshold");
+        assert!(p.width > 0 && p.height > 0);
     }
 }

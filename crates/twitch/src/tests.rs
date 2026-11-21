@@ -342,6 +342,78 @@ async fn an_old_sign_in_without_the_broadcast_scope_says_reconnect() {
     let unknown = connector_for(&ep, vec![]);
     let err = unknown.update_stream_info(&info).await.unwrap_err();
     assert!(matches!(err, ConnectorError::MissingScope { .. }), "{err:?}");
+    // And it never spent the single-use refresh token on it (a missing scope isn't an expiry).
+    assert_eq!(st.lock().unwrap().refreshes, 0, "a missing scope must not refresh the sign-in");
+}
+
+/// Saving the refreshed tokens failed (a keychain hiccup): they're still used, so the next
+/// refresh doesn't present the refresh token Twitch already retired.
+#[tokio::test]
+async fn a_refresh_whose_save_fails_keeps_the_new_tokens() {
+    let (st, ep) = fake().await;
+    st.lock().unwrap().fail_next_with_401 = true;
+    let tokens = Tokens {
+        access_token: "access-0".into(),
+        refresh_token: "refresh-0".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes: vec![],
+    };
+    let auth = Arc::new(Auth::new(
+        http_client(),
+        ep.clone(),
+        "client".into(),
+        tokens,
+        Arc::new(|_: &Tokens| Err("the keychain is locked".to_string())),
+    ));
+    let helix = Helix::new(auth.clone());
+    assert_eq!(helix.me().await.unwrap().id, "111", "the call still goes through");
+    assert_eq!(st.lock().unwrap().refreshes, 1);
+    assert_ne!(auth.access().await.unwrap(), "access-0", "the fresh access token is the one in use");
+}
+
+/// The keychain was only briefly locked: the next use saves the new tokens (the app may quit
+/// long before the next refresh, and the saved refresh token is the retired one).
+#[tokio::test]
+async fn tokens_that_couldnt_be_saved_are_saved_at_the_next_use() {
+    let (st, ep) = fake().await;
+    st.lock().unwrap().fail_next_with_401 = true;
+    let tokens = Tokens {
+        access_token: "access-0".into(),
+        refresh_token: "refresh-0".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes: vec![],
+    };
+    let saved = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let (sv, at) = (saved.clone(), attempts.clone());
+    let auth = Arc::new(Auth::new(
+        http_client(),
+        ep,
+        "client".into(),
+        tokens,
+        Arc::new(move |t: &Tokens| {
+            // Locked for the first two tries.
+            if at.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                return Err("the keychain is locked".to_string());
+            }
+            sv.lock().unwrap().push(t.refresh_token.clone());
+            Ok(())
+        }),
+    ));
+    let helix = Helix::new(auth.clone());
+    helix.me().await.unwrap();
+    assert!(saved.lock().unwrap().is_empty(), "the refresh's save failed");
+    auth.access().await.unwrap();
+    assert!(saved.lock().unwrap().is_empty(), "the second try failed too");
+    // Not asked again at every call (a 30 s wait); after it, the next use saves.
+    auth.access().await.unwrap();
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2, "the Keychain was left alone for a while");
+    auth.forget_save_cooldown();
+    auth.access().await.unwrap();
+    assert_eq!(saved.lock().unwrap().len(), 1, "the third try saved the new tokens");
+    let before = attempts.load(std::sync::atomic::Ordering::SeqCst);
+    auth.access().await.unwrap();
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), before, "saved: no more tries");
 }
 
 #[tokio::test]
@@ -394,4 +466,165 @@ fn ingest_lists_are_read_leniently() {
         ),
         Some("rtmps://b/app".into())
     );
+}
+
+// --- limits and the ingest list (M10-05, M10-07) ---------------------------------------
+
+/// A Twitch that answers Helix requests from a script (status, `ratelimit-reset` header, body) and
+/// counts them, and serves an ingest list that can be switched off. Plain HTTP over a socket.
+async fn scripted_twitch(
+    script: Vec<(u16, Option<i64>, serde_json::Value)>,
+    ingests_up: Arc<std::sync::atomic::AtomicBool>,
+) -> (Endpoints, Arc<std::sync::Mutex<(usize, usize)>>) {
+    use std::collections::VecDeque;
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let queue = Arc::new(std::sync::Mutex::new(VecDeque::from(script)));
+    let hits = Arc::new(std::sync::Mutex::new((0usize, 0usize))); // (helix, ingests)
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let (q, h) = (queue.clone(), hits.clone());
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = l.accept().await else { return };
+            let (q, h, up) = (q.clone(), h.clone(), ingests_up.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (code, reset, body) = if path.starts_with("/ingests") {
+                    h.lock().unwrap().1 += 1;
+                    if up.load(Ordering::SeqCst) {
+                        (
+                            200,
+                            None,
+                            json!({ "ingests": [
+                                { "name": "US East: Old (deprecated)", "availability": 1.0, "url_template_secure": "rtmps://old.example:443/app/{stream_key}" },
+                                { "name": "US East: Ashburn", "availability": 1.0, "url_template_secure": "rtmps://ash.example:443/app/{stream_key}" },
+                            ] }),
+                        )
+                    } else {
+                        (502, None, json!({}))
+                    }
+                } else {
+                    h.lock().unwrap().0 += 1;
+                    q.lock().unwrap().pop_front().unwrap_or((
+                        200,
+                        None,
+                        json!({ "data": [{ "id": "1", "login": "l", "display_name": "L" }] }),
+                    ))
+                };
+                let body = body.to_string();
+                let reset = reset.map(|r| format!("ratelimit-reset: {r}\r\n")).unwrap_or_default();
+                let res = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-type: application/json\r\n{reset}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(res.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (Endpoints { ingest: base.clone(), id: base.clone(), api: base.clone(), eventsub: base }, hits)
+}
+
+fn helix_for(ep: Endpoints) -> Helix {
+    let tokens = Tokens {
+        access_token: "a".into(),
+        refresh_token: "r".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes: vec![],
+    };
+    Helix::new(Arc::new(Auth::new(http_client(), ep, "client".into(), tokens, Arc::new(|_: &Tokens| Ok(())))))
+}
+
+/// A 429 that asks for a second is waited out and the request sent again, wherever Helix is used;
+/// one that asks for longer is the person's to be told, not waited for.
+#[tokio::test]
+async fn a_short_429_is_waited_out_and_a_long_one_is_told() {
+    let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let soon = now_ms() / 1000 + 1;
+    let (ep, hits) =
+        scripted_twitch(vec![(429, Some(soon), json!({ "message": "Too many requests" }))], up.clone()).await;
+    let helix = helix_for(ep);
+    assert_eq!(helix.me().await.unwrap().id, "1", "the second try went through");
+    assert_eq!(hits.lock().unwrap().0, 2);
+
+    let far = now_ms() / 1000 + 40;
+    let (ep, hits) = scripted_twitch(vec![(429, Some(far), json!({}))], up).await;
+    let err = helix_for(ep).me().await.unwrap_err();
+    assert!(matches!(err, TwitchError::RateLimited(w) if w > Duration::from_secs(30)), "{err:?}");
+    assert_eq!(hits.lock().unwrap().0, 1, "not tried again: 40 s is too long to hold a click");
+}
+
+/// The nearest server is read from Twitch's list once, not on every Go live; a list that can't be
+/// read later uses the one picked before, and only with none ever read is it Twitch's own address.
+#[tokio::test]
+async fn the_ingest_list_is_read_once_and_a_blip_keeps_the_picked_server() {
+    let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (ep, hits) = scripted_twitch(vec![], up.clone()).await;
+    let helix = helix_for(ep.clone());
+    assert_eq!(helix.nearest_ingest().await, "rtmps://ash.example:443/app", "the retired server is skipped");
+    assert_eq!(helix.nearest_ingest().await, "rtmps://ash.example:443/app");
+    assert_eq!(hits.lock().unwrap().1, 1, "the list was read once for two Go lives");
+    // Kept for no time at all, with the list down: the one picked before, not the fallback.
+    let helix = helix_for(ep.clone()).with_ingest_cache(Duration::ZERO);
+    assert_eq!(helix.nearest_ingest().await, "rtmps://ash.example:443/app");
+    up.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(helix.nearest_ingest().await, "rtmps://ash.example:443/app", "a blip doesn't change the server");
+    // Never read, list down: Twitch's own secure address.
+    assert_eq!(helix_for(ep).nearest_ingest().await, crate::ingest::FALLBACK_INGEST);
+}
+
+/// A Helix that refuses the token just issued: a missing scope says so; a plain 401 is a network-style
+/// failure the first two times and a sign-out the third (not an endless loop of refreshes).
+#[tokio::test]
+async fn a_fresh_token_helix_refuses_names_the_scope_then_ends_in_a_sign_in() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn server(helix_body: &'static str) -> Endpoints {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (status, body) = if head.contains("/oauth2/token") {
+                        (
+                            200,
+                            r#"{"access_token":"fresh","refresh_token":"r2","expires_in":3600,"scope":[]}"#.to_string(),
+                        )
+                    } else {
+                        (401, helix_body.to_string())
+                    };
+                    let r = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(r.as_bytes()).await;
+                });
+            }
+        });
+        Endpoints { ingest: base.clone(), id: base.clone(), api: base.clone(), eventsub: base }
+    }
+    let tokens = || Tokens {
+        access_token: "old".into(),
+        refresh_token: "r".into(),
+        expires_at: now_ms() + 3_600_000,
+        scopes: vec![],
+    };
+    // (b) the permission to fix is named, not hidden as a network error.
+    let ep = server(r#"{"status":401,"message":"Missing scope: channel:read:stream_key"}"#).await;
+    let helix = Helix::new(Arc::new(Auth::new(http_client(), ep, "c".into(), tokens(), Arc::new(|_| Ok(())))));
+    let e = helix.me().await.unwrap_err();
+    assert!(matches!(e, TwitchError::MissingScope(_)), "{e:?}");
+    // (a) a token refused every time ends in a sign-in, after two network-style failures.
+    let ep = server(r#"{"status":401,"message":"Invalid OAuth token"}"#).await;
+    let helix = Helix::new(Arc::new(Auth::new(http_client(), ep, "c".into(), tokens(), Arc::new(|_| Ok(())))));
+    for _ in 0..2 {
+        assert!(matches!(helix.me().await.unwrap_err(), TwitchError::Network(_)));
+    }
+    assert_eq!(helix.me().await.unwrap_err(), TwitchError::SignInNeeded);
 }

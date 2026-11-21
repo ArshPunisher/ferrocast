@@ -22,6 +22,12 @@ const LOOK_W: u32 = 32;
 const LOOK_H: u32 = 18;
 
 /// OBS's global sound channels, in its saved collection: Desktop Audio 1-2, Mic/Aux 1-4.
+#[derive(Clone, Copy)]
+enum FilterTarget<'a> {
+    Source(&'a str),
+    Item { scene: &'a str, id: i64 },
+}
+
 const CHANNEL_KEYS: [&str; 6] = [
     "DesktopAudioDevice1",
     "DesktopAudioDevice2",
@@ -34,6 +40,52 @@ const CHANNEL_KEYS: [&str; 6] = [
 /// The hidden scenes Studio Mode puts on air: copies of a scene's layout (two, so the old one is
 /// still there while the transition to the new one plays). Not a name anyone can type.
 pub(crate) const PROGRAM_COPY: [&str; 2] = ["\u{1}On air 1", "\u{1}On air 2"];
+
+/// Reads each named source's levels (dBFS, floored at -100), from the engine's wait-free
+/// meters: over the long (300 ms) window, or `fast` over a few blocks.
+fn read_levels(
+    e: &own::Shared,
+    names: &[String],
+    fast: bool,
+) -> std::collections::HashMap<String, crate::collection::LevelInfo> {
+    names
+        .iter()
+        .filter_map(|n| {
+            let (id, _) = e.engine.source_named(n)?;
+            let l = if fast { e.engine.levels_fast(id)? } else { e.engine.levels(id)? };
+            // Silence is -100, not -inf: JSON has no infinity, so it went out as null, which
+            // the page read as 0 dB, a full red meter the moment the sound stopped.
+            let floor = |v: [f32; 2]| v.map(|x| if x.is_finite() { x.max(-100.0) } else { -100.0 });
+            Some((
+                n.clone(),
+                crate::collection::LevelInfo {
+                    peak: floor(l.peak),
+                    magnitude: floor(l.rms),
+                    input_peak: floor(l.input_peak),
+                    gated: l.gated,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The running engine, for readers that must not wait for the Studio's main thread (the meters
+/// poll thirty times a second). Weak: the picture-size check counts strong holders.
+static LIVE_ENGINE: std::sync::Mutex<std::sync::Weak<own::Shared>> = std::sync::Mutex::new(std::sync::Weak::new());
+
+fn publish_engine(shared: Option<&Arc<own::Shared>>) {
+    *LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()) = shared.map_or_else(std::sync::Weak::new, Arc::downgrade);
+}
+
+/// The meters (the long window, or `fast` over a few blocks), read without the Studio's main thread. None when no engine
+/// is running (the caller then asks the main thread, which says why).
+pub fn levels_now(
+    names: &[String],
+    fast: bool,
+) -> Option<std::collections::HashMap<String, crate::collection::LevelInfo>> {
+    let e = LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()).upgrade()?;
+    Some(read_levels(&e, names, fast))
+}
 
 /// The scene store.
 #[derive(Debug)]
@@ -63,12 +115,15 @@ pub struct Stage {
     ndis: RefCell<std::collections::HashMap<String, (String, crate::ndi_io::NdiIn)>>,
     /// NDI sources that didn't start, with why (said once, tried again at each edit).
     ndi_failed: RefCell<std::collections::HashMap<String, String>>,
-    /// Remove background filters at work, by their mask picture's name.
+    /// Remove background at work: one worker for each source that has it, by the source's name.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     cutouts: RefCell<std::collections::HashMap<String, crate::cutout::Cutout>>,
     /// The frame rate as last worked out: when, the engine's frames and skipped count then,
     /// and the rate over the second before (`stats`).
     fps_seen: std::cell::Cell<Option<(std::time::Instant, u64, u64, f64)>>,
+    /// The encoders' dropped-frame count when this stage began (the count is the program's): what
+    /// the stats call "skipped" is what came after.
+    dropped_base: u64,
 }
 
 fn fail(msg: impl Into<String>) -> StudioError {
@@ -98,6 +153,101 @@ fn kind_of(s: &Value) -> &str {
 
 fn is_scene(s: &Value) -> bool {
     matches!(s.get("id").and_then(Value::as_str), Some("scene" | "group"))
+}
+
+/// A web page whose sound isn't sent to the mixer ("Control audio via Ferrocast" off, OBS's
+/// `reroute_audio`): a picture, with no sound row.
+fn silent_page(kind: &str, src: &Value) -> bool {
+    matches!(kind, "browser_source" | "ferrocast_web")
+        && src.pointer("/settings/reroute_audio").and_then(Value::as_bool) != Some(true)
+}
+
+/// The device a source reads (its `device_id` setting), for telling a capture card from a mic.
+fn device_of(s: &Value) -> &str {
+    s.pointer("/settings/device_id").and_then(Value::as_str).unwrap_or("")
+}
+
+/// Words in a device's or a source's name that say it is a capture card or a video interface:
+/// its sound is the game's or the camera's, not a voice (the owner's "USB2 Digital Audio" is a
+/// MacroSilicon card whose id reads "USB2 Video").
+const CAPTURE_CARD_WORDS: [&str; 12] = [
+    "capture",
+    "cam link",
+    "elgato",
+    "hdmi",
+    "av.io",
+    "avermedia",
+    "magewell",
+    "blackmagic",
+    "decklink",
+    "usb video",
+    "usb2 video",
+    "digital audio",
+];
+
+/// Whether a sound is judged as a microphone when the owner hasn't said: a microphone input or one
+/// of OBS's Mic/Aux channels, unless its name says capture card. The desktop's and an app's sound
+/// (and everything that isn't an input device) never is.
+pub fn mic_by_default(kind: &str, name: &str, device: &str, channel: Option<u32>) -> bool {
+    if matches!(channel, Some(1 | 2)) {
+        return false;
+    }
+    let input = matches!(
+        kind,
+        "coreaudio_input_capture" | "wasapi_input_capture" | "pulse_input_capture" | "alsa_input_capture"
+    );
+    if !input && !matches!(channel, Some(3..=6)) {
+        return false;
+    }
+    let (name, device) = (name.to_lowercase(), device.to_lowercase());
+    !CAPTURE_CARD_WORDS.iter().any(|w| name.contains(w) || device.contains(w))
+}
+
+/// Whether `kind` can produce audio (excludes picture-only sources and video-only cameras).
+fn is_audio_kind(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "scene"
+            | "group"
+            | "image_source"
+            | "color_source"
+            | "color_source_v2"
+            | "color_source_v3"
+            | "text_ft2_source"
+            | "text_ft2_source_v2"
+            | "text_gdiplus"
+            | "text_gdiplus_v2"
+            | "text_gdiplus_v3"
+            | "ferrocast_clone"
+            | "source-clone"
+            | "ferrocast_countdown"
+            | "ferrocast_visualizer"
+            | "ferrocast_web_text"
+            | "ferrocast_inputs"
+            | "slideshow"
+            | "slideshow_v2"
+            | "image_slide_show"
+    ) && !PICTURE_ONLY_DEVICES.contains(&kind)
+}
+
+fn source_has_audio(src: &Value) -> bool {
+    src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0) && is_audio_kind(kind_of(src))
+}
+
+/// Updates any compressor filter on `source` whose `sidechain_source` names `from` to `to`.
+/// OBS's "none" means no ducking (the engine never keys by a source of that name), so a source
+/// called that, renamed, leaves it alone.
+fn rename_sidechain_refs(source: &mut Value, from: &str, to: &str) {
+    if from.trim().eq_ignore_ascii_case("none") {
+        return;
+    }
+    for flt in source.get_mut("filters").and_then(Value::as_array_mut).into_iter().flatten() {
+        if kind_of(flt) == "compressor_filter"
+            && flt.pointer("/settings/sidechain_source").and_then(Value::as_str) == Some(from)
+        {
+            flt["settings"]["sidechain_source"] = json!(to);
+        }
+    }
 }
 
 /// Takes out the sources no scene shows any more, as OBS does when a source's last item goes:
@@ -202,6 +352,117 @@ fn new_item(source: &Value, id: i64) -> Value {
     })
 }
 
+fn has_item_filter_override(it: &Value) -> bool {
+    it.get("ferrocast_filters").and_then(Value::as_array).is_some()
+}
+
+fn clone_filters_with_fresh_uuids(filters: &[Value], keep: impl Fn(&Value) -> bool) -> Vec<Value> {
+    filters
+        .iter()
+        .filter(|f| keep(f))
+        .map(|f| {
+            let mut copy = f.clone();
+            copy["uuid"] = json!(uuid());
+            copy
+        })
+        .collect()
+}
+
+fn video_filters_from(source: &Value) -> Vec<Value> {
+    let list = source.get("filters").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    clone_filters_with_fresh_uuids(list, |f| !ferrocore::obs::is_audio_filter_kind(kind_of(f)))
+}
+
+/// What Remove background has to work on: each source and the mask pictures its filters feed
+/// (the engine names them: `source: filter` for the source's own filters, `scene#item: filter`
+/// for an item's own). The mask comes from the picture alone, so one worker serves all of them.
+/// Hidden items are left out. Studio Mode's copies of the scene on air count as scenes.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn cutout_plan(sources: &[Value], doc: &Value) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut want: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut add = |source: &str, mask: String| {
+        let l = want.entry(source.to_string()).or_default();
+        if !l.contains(&mask) {
+            l.push(mask);
+        }
+    };
+    let mut shared_users: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut clone_users: Vec<(String, String)> = Vec::new();
+    let mut containers: Vec<(String, Vec<Value>)> = Vec::new();
+    for s in sources {
+        let kind = kind_of(s);
+        if matches!(kind, "scene" | "group") {
+            let items = s.pointer("/settings/items").and_then(Value::as_array).cloned().unwrap_or_default();
+            containers.push((name_of(s).to_string(), items));
+        } else if matches!(kind, "ferrocast_clone" | "source-clone")
+            && s.pointer("/settings/filters").and_then(Value::as_bool) != Some(false)
+            && let Some(target) = s.pointer("/settings/clone").and_then(Value::as_str)
+        {
+            clone_users.push((name_of(s).to_string(), target.to_string()));
+        }
+    }
+    for k in ["program_copy", "program_prev"] {
+        let c = &doc["ferrocast"][k];
+        if let (Some(private), Some(items)) = (c["private"].as_str(), c["items"].as_array())
+            && PROGRAM_COPY.contains(&private)
+        {
+            containers.push((private.to_string(), items.clone()));
+        }
+    }
+    for (container, items) in &containers {
+        for it in items {
+            if it.get("visible").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let src_name = name_of(it).to_string();
+            if let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                let item_id = it.get("id").and_then(Value::as_i64).unwrap_or(0);
+                for f in ov.iter().filter(|f| is_active_cutout(f)) {
+                    add(&src_name, format!("{container}#{item_id}: {}", cutout_filter_name(f)));
+                }
+            } else {
+                shared_users.insert(src_name);
+            }
+        }
+    }
+    // Any clone that brings its target's filters keeps source-level cutouts on that target live
+    // when at least one placement uses the clone without an item override.
+    loop {
+        let mut changed = false;
+        for (clone_name, target) in &clone_users {
+            if shared_users.contains(clone_name) && shared_users.insert(target.clone()) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for s in sources {
+        if matches!(kind_of(s), "scene" | "group") {
+            continue;
+        }
+        let source = name_of(s).to_string();
+        if !shared_users.contains(&source) {
+            continue;
+        }
+        for f in s.get("filters").and_then(Value::as_array).into_iter().flatten().filter(|f| is_active_cutout(f)) {
+            add(&source, format!("{source}: {}", cutout_filter_name(f)));
+        }
+    }
+    want
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn is_active_cutout(f: &Value) -> bool {
+    kind_of(f) == "ferrocast_remove_background" && f.get("enabled").and_then(Value::as_bool) != Some(false)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn cutout_filter_name(f: &Value) -> &str {
+    f.get("name").and_then(Value::as_str).unwrap_or("ferrocast_remove_background")
+}
+
 /// Cameras and capture cards: a picture only. Their sound is a device of its own (a capture
 /// card's "USB2 Digital Audio"), with a row of its own in the mixer: theirs showed a second,
 /// silent row (owner, 17 Nov; OBS shows one), and Sound bars mustn't listen to them.
@@ -237,6 +498,7 @@ impl Stage {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
             fps_seen: std::cell::Cell::new(None),
+            dropped_base: ferrocore::video::dropped_frames(),
         };
         s.add_scene(first_scene)?;
         Ok(s)
@@ -266,6 +528,7 @@ impl Stage {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             cutouts: RefCell::default(),
             fps_seen: std::cell::Cell::new(None),
+            dropped_base: ferrocore::video::dropped_frames(),
         };
         if s.scenes().is_empty() {
             s.add_scene(first_scene)?;
@@ -304,6 +567,7 @@ impl Stage {
         shared.engine.set_true_peak(self.true_peak.get());
         shared.engine.set_low_latency(self.low_latency.get());
         *self.engine.borrow_mut() = Some(shared.clone());
+        publish_engine(Some(&shared));
         self.sync_pages();
         Ok(shared)
     }
@@ -321,38 +585,21 @@ impl Stage {
         out
     }
 
-    /// Starts or stops finding the person for each Remove background filter that's on.
+    /// Starts or stops finding the person for each Remove background filter that's on: one
+    /// worker for each source, feeding every filter's mask picture.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sync_cutouts(&self, e: &Arc<own::Shared>) {
-        let want: Vec<(String, String)> = self
-            .sources_list()
-            .iter()
-            .flat_map(|s| {
-                let source = name_of(s).to_string();
-                s.get("filters")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter(|f| {
-                        f.get("versioned_id").or_else(|| f.get("id")).and_then(Value::as_str)
-                            == Some("ferrocast_remove_background")
-                            && f.get("enabled").and_then(Value::as_bool) != Some(false)
-                    })
-                    .map(move |f| {
-                        let fname = f.get("name").and_then(Value::as_str).unwrap_or("ferrocast_remove_background");
-                        // The engine names the mask picture so (ferrocore::obs).
-                        (format!("{source}: {fname}"), source.clone())
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let want = cutout_plan(&self.sources_list(), &self.doc.borrow());
         let mut cutouts = self.cutouts.borrow_mut();
         // Gone, or working for an engine that's gone (a new canvas): stopped.
-        cutouts.retain(|mask, c| c.serves(e) && want.iter().any(|(m, _)| m == mask));
-        for (mask, source) in want {
-            cutouts
-                .entry(mask.clone())
-                .or_insert_with(|| crate::cutout::Cutout::start(Arc::downgrade(e), source, mask));
+        cutouts.retain(|source, c| c.serves(e) && want.contains_key(source));
+        for (source, masks) in want {
+            match cutouts.get(&source) {
+                Some(c) => c.set_masks(masks),
+                None => {
+                    cutouts.insert(source.clone(), crate::cutout::Cutout::start(Arc::downgrade(e), source, masks));
+                }
+            }
         }
     }
 
@@ -371,6 +618,7 @@ impl Stage {
             .collect();
         let mut ndis = self.ndis.borrow_mut();
         ndis.retain(|name, (was, _)| want.iter().any(|(n, src)| n == name && src == was));
+        self.ndi_failed.borrow_mut().retain(|name, _| want.iter().any(|(n, _)| n == name));
         for (name, src) in want {
             let Some(feed) = e.engine.source_named(&name).and_then(|(id, _)| e.engine.fed(id)) else { continue };
             match ndis.get(&name) {
@@ -730,7 +978,11 @@ impl Stage {
     }
 
     /// Puts a scene on air, through the Studio's transition (the engine plays it).
+    /// When the vertical canvas is enabled, its own scenes switch there instead.
     pub fn set_current(&self, name: &str) -> Result<(), StudioError> {
+        if self.vertical().is_some() && self.vertical_order().iter().any(|n| n == name) {
+            return self.set_vertical_current(name);
+        }
         self.scene_index(name)?;
         // The scene's own way in (its Transition Override), else the Studio's.
         let t = self.scene_transition_of(name)?.unwrap_or_else(|| self.transition());
@@ -749,8 +1001,8 @@ impl Stage {
             // the preview wait for the next transition.
             return self.send_copy_on_air(name, &t.kind, u64::from(t.ms));
         }
-        if was != name
-            && let Some(e) = self.engine.borrow().as_ref()
+        if let Some(e) = self.engine.borrow().as_ref()
+            && (was != name || e.is_black())
         {
             e.go_with(name, &t.kind, u64::from(t.ms), &self.transition_settings(&t.kind))?;
         }
@@ -763,6 +1015,11 @@ impl Stage {
         // A group belongs to one scene (as in OBS): the copy gets groups of its own, holding the
         // same sources, so changing one scene's group leaves the other's alone.
         for it in items.iter_mut() {
+            if let Some(ov) = it.get_mut("ferrocast_filters").and_then(Value::as_array_mut) {
+                for f in ov {
+                    f["uuid"] = json!(uuid());
+                }
+            }
             let gname = name_of(it).to_string();
             let Ok(src) = self.source(&gname) else { continue };
             if kind_of(&src) != "group" {
@@ -809,8 +1066,11 @@ impl Stage {
                 }
             }
             for k in CHANNEL_KEYS {
-                if let Some(s) = d.get_mut(k).filter(|s| name_of(s) == name) {
-                    s["name"] = json!(new_name);
+                if let Some(s) = d.get_mut(k) {
+                    if name_of(s) == name {
+                        s["name"] = json!(new_name);
+                    }
+                    rename_sidechain_refs(s, name, new_name);
                 }
             }
             if let Some(l) = d["sources"].as_array_mut() {
@@ -818,6 +1078,7 @@ impl Stage {
                     if name_of(s) == name {
                         s["name"] = json!(new_name);
                     }
+                    rename_sidechain_refs(s, name, new_name);
                     if let Some(items) = s.pointer_mut("/settings/items").and_then(Value::as_array_mut) {
                         for i in items.iter_mut().filter(|i| name_of(i) == name) {
                             i["name"] = json!(new_name);
@@ -870,12 +1131,20 @@ impl Stage {
     /// the canvas and every move or resize use this (9 Nov: a cropped source kept the outline
     /// of its whole picture).
     fn size_of(&self, source: &str) -> (u32, u32) {
+        self.item_size_of(source, None)
+    }
+
+    fn item_size_of(&self, source: &str, item: Option<&Value>) -> (u32, u32) {
         let (w, h) = self.own_size_of(source);
         if w == 0 || h == 0 {
             return (w, h);
         }
         let s = self.source(source).unwrap_or(Value::Null);
-        let filters = s.get("filters").and_then(Value::as_array).cloned().unwrap_or_default();
+        let filters = item
+            .and_then(|it| it.get("ferrocast_filters").and_then(Value::as_array))
+            .or_else(|| s.get("filters").and_then(Value::as_array))
+            .cloned()
+            .unwrap_or_default();
         let effects: Vec<ferrocore::Effect> = filters
             .iter()
             .filter(|f| f.get("enabled").and_then(Value::as_bool) != Some(false))
@@ -939,7 +1208,7 @@ impl Stage {
     fn info_with(&self, it: &Value, expand: bool) -> ItemInfo {
         let name = name_of(it).to_string();
         let src = self.source(&name).unwrap_or(Value::Null);
-        let (w, h) = self.size_of(&name);
+        let (w, h) = self.item_size_of(&name, Some(it));
         let p = ferrocore::obs::placement_of(it);
         let a = ferrocore::draw_transform(&p, w, h);
         let (cw, ch) = ferrocore::cropped(w, h, p.crop);
@@ -947,23 +1216,8 @@ impl Stage {
         let kind = kind_of(&src).to_string();
         let media =
             matches!(kind.as_str(), "ffmpeg_source" | "vlc_source" | "slideshow" | "slideshow_v2" | "ferrocast_replay");
-        let audio = src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0)
-            && !matches!(
-                kind.as_str(),
-                "scene"
-                    | "group"
-                    | "image_source"
-                    | "color_source_v3"
-                    | "text_ft2_source_v2"
-                    // A copy has no sound of its own: its source's is heard once.
-                    | "ferrocast_clone"
-                    | "source-clone"
-                    | "ferrocast_countdown"
-                    | "ferrocast_visualizer"
-                    | "ferrocast_web_text"
-                    | "ferrocast_inputs"
-            )
-            && !PICTURE_ONLY_DEVICES.contains(&kind.as_str());
+        // A web page with "Control audio in Ferrocast" off has no sound row (S60).
+        let audio = source_has_audio(&src) && !silent_page(&kind, &src);
         // A group's sources, top first, each framed on the canvas through the group.
         let children = if kind == "group" && expand {
             self.scene_items(&name)
@@ -1003,6 +1257,7 @@ impl Stage {
             top_field_first: false,
             media,
             kind,
+            own_filters: has_item_filter_override(it),
         }
     }
 
@@ -1080,7 +1335,7 @@ impl Stage {
 
     /// How a group's own pixels map onto the canvas.
     fn group_map(&self, group_item: &Value) -> ferrocore::Affine {
-        let (w, h) = self.size_of(name_of(group_item));
+        let (w, h) = self.item_size_of(name_of(group_item), Some(group_item));
         ferrocore::draw_transform(&ferrocore::obs::placement_of(group_item), w, h)
     }
 
@@ -1092,7 +1347,7 @@ impl Stage {
         let kids = self.scene_items(&gname)?;
         // Nothing to fit yet, or a source that doesn't know its size yet (a camera or a video
         // still opening reads 0×0): fitting now would shrink the group round nothing.
-        if kids.is_empty() || kids.iter().any(|c| matches!(self.size_of(name_of(c)), (0, _) | (_, 0))) {
+        if kids.is_empty() || kids.iter().any(|c| matches!(self.item_size_of(name_of(c), Some(c)), (0, _) | (_, 0))) {
             return Ok(());
         }
         let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
@@ -1174,6 +1429,15 @@ impl Stage {
 
     /// Puts `source` (an existing one) at the top of `scene` → its item.
     fn place(&self, scene: &str, source: &Value) -> Result<ItemInfo, StudioError> {
+        self.place_with(scene, source, None)
+    }
+
+    fn place_with(
+        &self,
+        scene: &str,
+        source: &Value,
+        override_filters: Option<Vec<Value>>,
+    ) -> Result<ItemInfo, StudioError> {
         let floor = self.top_id(scene);
         let item = self.with_items(scene, |items, set| {
             let id = set
@@ -1184,7 +1448,10 @@ impl Stage {
                 .max(items.iter().filter_map(|i| i.get("id")?.as_i64()).max().unwrap_or(0))
                 + 1;
             set.insert("id_counter".into(), json!(id));
-            let it = new_item(source, id);
+            let mut it = new_item(source, id);
+            if let Some(ov) = override_filters {
+                it["ferrocast_filters"] = Value::Array(ov);
+            }
             items.push(it.clone());
             it
         })?;
@@ -1255,19 +1522,22 @@ impl Stage {
         Ok((info, false))
     }
 
-    /// Shows a source already made (in another scene) in `scene` too.
+    /// Shows a source already made (in another scene) in `scene` too. When the source already
+    /// carries video filters, the new item gets its own copy (`own_filters: true`) so edits on one
+    /// canvas do not change the other.
     pub fn add_existing(&self, scene: &str, name: &str) -> Result<ItemInfo, StudioError> {
         let source = self.source(name)?;
         if name == scene {
             return Err(fail("A scene can't show itself."));
         }
-        self.place(scene, &source)
+        let video = video_filters_from(&source);
+        self.place_with(scene, &source, (!video.is_empty()).then_some(video))
     }
 
     pub fn transform(&self, scene: &str, id: i64) -> Result<Transform, StudioError> {
         let it = self.item(scene, id)?;
         let p = ferrocore::obs::placement_of(&it);
-        let (w, h) = self.size_of(name_of(&it));
+        let (w, h) = self.item_size_of(name_of(&it), Some(&it));
         Ok(Transform {
             x: p.x,
             y: p.y,
@@ -1548,6 +1818,16 @@ impl Stage {
                 let mut s = src.clone();
                 s["name"] = json!(copy);
                 s["uuid"] = json!(uuid());
+                let src_flts = src.get("filters").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+                if let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                    let mut combined = clone_filters_with_fresh_uuids(ov, |_| true);
+                    combined.extend(clone_filters_with_fresh_uuids(src_flts, |f| {
+                        ferrocore::obs::is_audio_filter_kind(kind_of(f))
+                    }));
+                    s["filters"] = Value::Array(combined);
+                } else {
+                    s["filters"] = Value::Array(clone_filters_with_fresh_uuids(src_flts, |_| true));
+                }
                 self.fresh_ids(scene, &mut s);
                 self.edit(|d| d["sources"].as_array_mut().map(|l| l.push(s.clone())));
                 // Inside a group: the copy goes in the same group, just above the original (OBS).
@@ -1555,6 +1835,9 @@ impl Stage {
                 if home != scene {
                     let next = self.top_id(scene) + 1;
                     let mut c = it.clone();
+                    if let Some(obj) = c.as_object_mut() {
+                        obj.remove("ferrocast_filters");
+                    }
                     c["id"] = json!(next);
                     c["name"] = json!(copy);
                     c["source_uuid"] = s["uuid"].clone();
@@ -1753,7 +2036,7 @@ impl Stage {
             for (k, v) in new {
                 s["settings"][k] = v.clone();
             }
-            if ["window", "display", "type"].iter().any(|k| new.contains_key(*k)) {
+            if ["window", "display", "monitor", "type"].iter().any(|k| new.contains_key(*k)) {
                 let kind = kind_of(s).to_string();
                 remember_capture(&kind, &mut s["settings"], new.contains_key("window"));
             }
@@ -1797,7 +2080,29 @@ impl Stage {
             tracks: (1..=6u8).filter(|t| mixers & (1 << (t - 1)) != 0).collect(),
             // Making sound: our engine has it running (a device opened, a file playing).
             active: self.engine.borrow().as_ref().is_some_and(|e| e.engine.source_named(name_of(s)).is_some()),
+            push_to_talk: s.get("push-to-talk").and_then(Value::as_bool).unwrap_or(false),
+            push_to_talk_ms: s.get("push-to-talk-delay").and_then(Value::as_u64).unwrap_or(0).min(5_000) as u32,
+            push_to_mute: s.get("push-to-mute").and_then(Value::as_bool).unwrap_or(false),
+            push_to_mute_ms: s.get("push-to-mute-delay").and_then(Value::as_u64).unwrap_or(0).min(5_000) as u32,
+            mic: s
+                .get("ferrocast_mic")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| mic_by_default(kind_of(s), name_of(s), device_of(s), channel)),
+            shown: true,
         }
+    }
+
+    /// "This is a mic" on or off for a sound (the live watch judges only mics): kept in the
+    /// source, `None` back to what its kind says.
+    pub fn set_mic(&self, name: &str, on: Option<bool>) -> Result<(), StudioError> {
+        self.with_source(name, |s| match on {
+            Some(on) => s["ferrocast_mic"] = json!(on),
+            None => {
+                if let Some(o) = s.as_object_mut() {
+                    o.remove("ferrocast_mic");
+                }
+            }
+        })
     }
 
     pub fn audio_of(&self, name: &str) -> Result<AudioInfo, StudioError> {
@@ -1818,12 +2123,57 @@ impl Stage {
             .collect()
     }
 
+    /// Global channels plus every audio source in the collection (including off-scene sources),
+    /// without rendering or saving anything.
+    pub fn all_audio(&self) -> Vec<AudioInfo> {
+        let mut out = self.channels();
+        for s in self.sources_list() {
+            if source_has_audio(&s) {
+                let name = name_of(&s);
+                if !out.iter().any(|a| a.name == name) {
+                    out.push(self.audio_info(&s, None));
+                }
+            }
+        }
+        out
+    }
+
     pub fn set_volume(&self, name: &str, volume_db: f32) -> Result<(), StudioError> {
         self.with_source(name, |s| s["volume"] = json!(mul_of(volume_db.clamp(-100.0, 26.0))))
     }
 
     pub fn set_muted(&self, name: &str, muted: bool) -> Result<(), StudioError> {
         self.with_source(name, |s| s["muted"] = json!(muted))
+    }
+
+    /// Push-to-talk (`talk`) or push-to-mute on or off for a sound, and its release delay (OBS's
+    /// keys: `push-to-talk`, `push-to-talk-delay`, in ms, at most 5 s).
+    pub fn set_push(&self, name: &str, talk: bool, on: Option<bool>, delay_ms: Option<u32>) -> Result<(), StudioError> {
+        let key = if talk { "push-to-talk" } else { "push-to-mute" };
+        self.with_source(name, |s| {
+            if let Some(on) = on {
+                s[key] = json!(on);
+            }
+            if let Some(ms) = delay_ms {
+                s[format!("{key}-delay")] = json!(ms.min(5_000));
+            }
+        })
+    }
+
+    /// A push-to-talk (`talk`) or push-to-mute key went down or up for a sound. False when the
+    /// sound hasn't that switched on (the caller then does what a key did before: toggles the mute).
+    pub fn push_key(&self, name: &str, talk: bool, down: bool) -> Result<bool, StudioError> {
+        let on = {
+            let src = self.source(name)?;
+            src.get(if talk { "push-to-talk" } else { "push-to-mute" }).and_then(Value::as_bool).unwrap_or(false)
+        };
+        if on
+            && let Some(e) = self.engine.borrow().clone()
+            && let Some((id, _)) = e.engine.source_named(name)
+        {
+            e.engine.push_key(id, talk, down);
+        }
+        Ok(on)
     }
 
     pub fn set_balance(&self, name: &str, balance: f32) -> Result<(), StudioError> {
@@ -1865,15 +2215,38 @@ impl Stage {
     }
 
     pub fn filters(&self, name: &str) -> Result<Vec<FilterInfo>, StudioError> {
-        Ok(self
-            .filter_list(name)?
-            .iter()
-            .map(|f| FilterInfo {
-                name: name_of(f).to_string(),
-                kind: kind_of(f).to_string(),
-                enabled: f.get("enabled").and_then(Value::as_bool).unwrap_or(true),
-            })
-            .collect())
+        self.target_filters(FilterTarget::Source(name))
+    }
+
+    pub fn item_filters(&self, scene: &str, id: i64) -> Result<Vec<FilterInfo>, StudioError> {
+        self.target_filters(FilterTarget::Item { scene, id })
+    }
+
+    fn target_filters(&self, target: FilterTarget<'_>) -> Result<Vec<FilterInfo>, StudioError> {
+        let to_info = |f: &Value, scope: Option<&str>| FilterInfo {
+            name: name_of(f).to_string(),
+            kind: kind_of(f).to_string(),
+            enabled: f.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            scope: scope.map(str::to_string),
+        };
+        match target {
+            FilterTarget::Source(name) => Ok(self.filter_list(name)?.iter().map(|f| to_info(f, None)).collect()),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src = self.filter_list(name_of(&it))?;
+                if let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) {
+                    let mut out: Vec<FilterInfo> = ov.iter().map(|f| to_info(f, Some("item"))).collect();
+                    out.extend(
+                        src.iter()
+                            .filter(|f| ferrocore::obs::is_audio_filter_kind(kind_of(f)))
+                            .map(|f| to_info(f, Some("source"))),
+                    );
+                    Ok(out)
+                } else {
+                    Ok(src.iter().map(|f| to_info(f, Some("source"))).collect())
+                }
+            }
+        }
     }
 
     fn with_filters<T>(&self, name: &str, f: impl FnOnce(&mut Vec<Value>) -> T) -> Result<T, StudioError> {
@@ -1885,10 +2258,146 @@ impl Stage {
         })
     }
 
+    /// Switches a scene item between `"This picture only"` (`own = true`: copies the source's
+    /// video filters into an item override) and `"Everywhere this source is used"` (`own = false`:
+    /// clears the item override so it shares the source's filters again). Audio filters always stay
+    /// per source.
+    pub fn set_item_filter_scope(&self, scene: &str, id: i64, own: bool) -> Result<ItemInfo, StudioError> {
+        let it = self.item(scene, id)?;
+        let src = self.source(name_of(&it))?;
+        if own {
+            if !has_item_filter_override(&it) {
+                let video = video_filters_from(&src);
+                self.with_item(scene, id, |i| {
+                    i["ferrocast_filters"] = Value::Array(video);
+                })?;
+            }
+        } else if has_item_filter_override(&it) {
+            self.with_item(scene, id, |i| {
+                if let Some(obj) = i.as_object_mut() {
+                    obj.remove("ferrocast_filters");
+                }
+            })?;
+        }
+        self.item(scene, id).map(|i| self.info_of(&i))
+    }
+
+    fn target_owner_label(&self, target: FilterTarget<'_>) -> Result<String, StudioError> {
+        match target {
+            FilterTarget::Source(name) => Ok(name.to_string()),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                Ok(name_of(&it).to_string())
+            }
+        }
+    }
+
+    /// Resolves `(source_name, write_to_item_override)` for mutating a filter on `target`.
+    fn resolve_filter_store(
+        &self,
+        target: FilterTarget<'_>,
+        kind: Option<&str>,
+        filter_name: Option<&str>,
+    ) -> Result<(String, bool), StudioError> {
+        match target {
+            FilterTarget::Source(name) => Ok((name.to_string(), false)),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src_name = name_of(&it).to_string();
+                let src = self.source(&src_name)?;
+                let Some(ov) = it.get("ferrocast_filters").and_then(Value::as_array) else {
+                    return Ok((src_name, false));
+                };
+                if let Some(k) = kind {
+                    return Ok((src_name, !ferrocore::obs::is_audio_filter_kind(k)));
+                }
+                if let Some(fname) = filter_name {
+                    if ov.iter().any(|f| name_of(f) == fname) {
+                        return Ok((src_name, true));
+                    }
+                    let is_src_audio = src.get("filters").and_then(Value::as_array).is_some_and(|l| {
+                        l.iter().any(|f| name_of(f) == fname && ferrocore::obs::is_audio_filter_kind(kind_of(f)))
+                    });
+                    return Ok((src_name, !is_src_audio));
+                }
+                Ok((src_name, true))
+            }
+        }
+    }
+
+    fn with_target_filters<T>(
+        &self,
+        target: FilterTarget<'_>,
+        kind: Option<&str>,
+        filter_name: Option<&str>,
+        f: impl FnOnce(&mut Vec<Value>) -> T,
+    ) -> Result<T, StudioError> {
+        let (src_name, on_item) = self.resolve_filter_store(target, kind, filter_name)?;
+        match (target, on_item) {
+            (FilterTarget::Item { scene, id }, true) => self.with_item(scene, id, |it| {
+                let mut list = it.get("ferrocast_filters").and_then(Value::as_array).cloned().unwrap_or_default();
+                let out = f(&mut list);
+                it["ferrocast_filters"] = Value::Array(list);
+                out
+            }),
+            _ => self.with_filters(&src_name, f),
+        }
+    }
+
+    fn target_filter_value(&self, target: FilterTarget<'_>, filter: &str) -> Result<Value, StudioError> {
+        let owner = self.target_owner_label(target)?;
+        match target {
+            FilterTarget::Source(name) => self
+                .filter_list(name)?
+                .into_iter()
+                .find(|f| name_of(f) == filter)
+                .ok_or_else(|| fail(format!("\"{owner}\" has no filter called \"{filter}\"."))),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src = self.filter_list(name_of(&it))?;
+                let found = match it.get("ferrocast_filters").and_then(Value::as_array) {
+                    Some(ov) => ov.iter().find(|f| name_of(f) == filter).cloned().or_else(|| {
+                        src.into_iter()
+                            .find(|f| name_of(f) == filter && ferrocore::obs::is_audio_filter_kind(kind_of(f)))
+                    }),
+                    None => src.into_iter().find(|f| name_of(f) == filter),
+                };
+                found.ok_or_else(|| fail(format!("\"{owner}\" has no filter called \"{filter}\".")))
+            }
+        }
+    }
+
     pub fn add_filter(&self, name: &str, kind: &str, filter: &str, settings: &Value) -> Result<(), StudioError> {
+        self.add_target_filter(FilterTarget::Source(name), kind, filter, settings)
+    }
+
+    pub fn add_item_filter(
+        &self,
+        scene: &str,
+        id: i64,
+        kind: &str,
+        filter: &str,
+        settings: &Value,
+    ) -> Result<(), StudioError> {
+        self.add_target_filter(FilterTarget::Item { scene, id }, kind, filter, settings)
+    }
+
+    fn add_target_filter(
+        &self,
+        target: FilterTarget<'_>,
+        kind: &str,
+        filter: &str,
+        settings: &Value,
+    ) -> Result<(), StudioError> {
         check_name(filter)?;
-        if self.filter_list(name)?.iter().any(|f| name_of(f) == filter) {
-            return Err(fail(format!("\"{name}\" already has a filter called \"{filter}\".")));
+        let owner = self.target_owner_label(target)?;
+        // Free in the list it's shown in, and in the one it's written to (a sound filter added
+        // through an item goes to the source's own).
+        let (store, on_item) = self.resolve_filter_store(target, Some(kind), None)?;
+        let taken_in_store = !on_item
+            && self.names_on_source(&store, ferrocore::obs::is_audio_filter_kind(kind))?.iter().any(|n| n == filter);
+        if taken_in_store || self.target_filters(target)?.iter().any(|f| f.name == filter) {
+            return Err(fail(format!("\"{owner}\" already has a filter called \"{filter}\".")));
         }
         let mut set = crate::kinds::defaults(kind).unwrap_or_else(|| json!({}));
         // A new shadow spills past the box and the picture keeps its size. Not a default: an
@@ -1905,44 +2414,204 @@ impl Stage {
             "id": kind, "versioned_id": kind, "name": filter, "uuid": uuid(), "enabled": true,
             "settings": set,
         });
-        self.with_filters(name, |l| l.push(f))
+        self.with_target_filters(target, Some(kind), None, |l| l.push(f))
     }
 
     pub fn remove_filter(&self, name: &str, filter: &str) -> Result<(), StudioError> {
-        let gone = self.with_filters(name, |l| {
+        self.remove_target_filter(FilterTarget::Source(name), filter)
+    }
+
+    pub fn remove_item_filter(&self, scene: &str, id: i64, filter: &str) -> Result<(), StudioError> {
+        self.remove_target_filter(FilterTarget::Item { scene, id }, filter)
+    }
+
+    fn remove_target_filter(&self, target: FilterTarget<'_>, filter: &str) -> Result<(), StudioError> {
+        let owner = self.target_owner_label(target)?;
+        let gone = self.with_target_filters(target, None, Some(filter), |l| {
             let n = l.len();
             l.retain(|f| name_of(f) != filter);
             n != l.len()
         })?;
-        if gone { Ok(()) } else { Err(fail(format!("\"{name}\" has no filter called \"{filter}\"."))) }
+        if gone { Ok(()) } else { Err(fail(format!("\"{owner}\" has no filter called \"{filter}\"."))) }
     }
 
+    /// Switches a source's filter. The item overrides that came from it (a copy made when the
+    /// source was added to another scene) have a filter of the same name and kind: they follow,
+    /// so a hotkey, a Stream Deck button or obs-websocket reaches every scene the source is in.
+    /// An item's own filter of that name that is a different kind is left alone.
     pub fn set_filter_enabled(&self, name: &str, filter: &str, on: bool) -> Result<(), StudioError> {
-        self.with_filter(name, filter, |f| f["enabled"] = json!(on))
+        let kind = self.filter_list(name)?.iter().find(|f| name_of(f) == filter).map(|f| kind_of(f).to_string());
+        self.set_target_filter_enabled(FilterTarget::Source(name), filter, on)?;
+        let Some(kind) = kind else { return Ok(()) };
+        let follows = |it: &Value| {
+            name_of(it) == name
+                && it.get("ferrocast_filters").and_then(Value::as_array).is_some_and(|l| {
+                    l.iter().any(|f| {
+                        name_of(f) == filter && kind_of(f) == kind && f["enabled"].as_bool().unwrap_or(true) != on
+                    })
+                })
+        };
+        let any = self
+            .sources_list()
+            .iter()
+            .any(|s| s.pointer("/settings/items").and_then(Value::as_array).is_some_and(|l| l.iter().any(follows)));
+        if any {
+            self.edit(|d| {
+                for s in d["sources"].as_array_mut().into_iter().flatten() {
+                    for it in s.pointer_mut("/settings/items").and_then(Value::as_array_mut).into_iter().flatten() {
+                        if !follows(it) {
+                            continue;
+                        }
+                        for f in it["ferrocast_filters"].as_array_mut().into_iter().flatten() {
+                            if name_of(f) == filter && kind_of(f) == kind {
+                                f["enabled"] = json!(on);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Ok(())
+    }
+
+    pub fn set_item_filter_enabled(&self, scene: &str, id: i64, filter: &str, on: bool) -> Result<(), StudioError> {
+        self.set_target_filter_enabled(FilterTarget::Item { scene, id }, filter, on)
+    }
+
+    fn set_target_filter_enabled(&self, target: FilterTarget<'_>, filter: &str, on: bool) -> Result<(), StudioError> {
+        self.with_target_filter(target, filter, |f| f["enabled"] = json!(on))
     }
 
     pub fn filter_settings(&self, name: &str, filter: &str) -> Result<Value, StudioError> {
-        self.filter_list(name)?
-            .into_iter()
-            .find(|f| name_of(f) == filter)
-            .map(|f| with_defaults(&f))
-            .ok_or_else(|| fail(format!("\"{name}\" has no filter called \"{filter}\".")))
+        self.target_filter_settings(FilterTarget::Source(name), filter)
+    }
+
+    pub fn item_filter_settings(&self, scene: &str, id: i64, filter: &str) -> Result<Value, StudioError> {
+        self.target_filter_settings(FilterTarget::Item { scene, id }, filter)
+    }
+
+    fn target_filter_settings(&self, target: FilterTarget<'_>, filter: &str) -> Result<Value, StudioError> {
+        self.target_filter_value(target, filter).map(|f| with_defaults(&f))
     }
 
     /// A filter's settings form.
     pub fn filter_options(&self, name: &str, filter: &str) -> Result<Vec<crate::OptionInfo>, StudioError> {
-        let f = self
-            .filter_list(name)?
-            .into_iter()
-            .find(|f| name_of(f) == filter)
-            .ok_or_else(|| fail(format!("\"{name}\" has no filter called \"{filter}\".")))?;
-        crate::kinds::options(kind_of(&f))
-            .ok_or_else(|| fail(format!("Ferrocast's own engine doesn't run \"{filter}\" yet.")))
+        self.target_filter_options(FilterTarget::Source(name), filter)
+    }
+
+    pub fn item_filter_options(
+        &self,
+        scene: &str,
+        id: i64,
+        filter: &str,
+    ) -> Result<Vec<crate::OptionInfo>, StudioError> {
+        self.target_filter_options(FilterTarget::Item { scene, id }, filter)
+    }
+
+    fn target_filter_options(
+        &self,
+        target: FilterTarget<'_>,
+        filter: &str,
+    ) -> Result<Vec<crate::OptionInfo>, StudioError> {
+        let owner = self.target_owner_label(target)?;
+        let f = self.target_filter_value(target, filter)?;
+        let kind = kind_of(&f);
+        let mut opts = crate::kinds::options(kind)
+            .ok_or_else(|| fail(format!("Ferrocast's own engine doesn't run \"{filter}\" yet.")))?;
+        if kind == "compressor_filter"
+            && let Some(o) = opts.iter_mut().find(|o| o.key == "sidechain_source")
+        {
+            let mut choices = vec!["None".to_string()];
+            let mut values = vec![json!("none")];
+            let entries = self.audio_source_entries(&owner);
+            let saved = f
+                .pointer("/settings/sidechain_source")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("none"));
+            let mut matched_saved = false;
+            for (src_name, uuid) in &entries {
+                choices.push(src_name.clone());
+                if let Some(sv) = saved
+                    && sv != src_name
+                    && uuid.as_deref().is_some_and(|u| u.eq_ignore_ascii_case(sv))
+                {
+                    values.push(json!(sv));
+                    matched_saved = true;
+                } else {
+                    if saved == Some(src_name.as_str()) {
+                        matched_saved = true;
+                    }
+                    values.push(json!(src_name));
+                }
+            }
+            if let Some(sv) = saved
+                && !matched_saved
+            {
+                choices.push(format!("{sv} (missing)"));
+                values.push(json!(sv));
+            }
+            o.choices = choices;
+            o.values = values;
+        }
+        Ok(opts)
+    }
+
+    /// Whether `src` makes sound a compressor could duck under: it has a sound track, and the import
+    /// gives its kind sound on this platform (a Windows display capture has none: the import drops a
+    /// compressor keyed to it).
+    fn has_sound_to_key(&self, src: &Value) -> bool {
+        src.get("mixers").and_then(Value::as_u64).is_some_and(|m| m > 0)
+            && ferrocore::obs::source_has_sound(src, (self.canvas.width, self.canvas.height))
+    }
+
+    /// Other audio sources in this collection (global channels first, then scene sources),
+    /// excluding `exclude` and non-audio sources, for sidechain pickers.
+    fn audio_source_entries(&self, exclude: &str) -> Vec<(String, Option<String>)> {
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        for s in self.channels_list() {
+            let n = name_of(&s);
+            if n.is_empty() || n == exclude || out.iter().any(|(x, _)| x == n) {
+                continue;
+            }
+            let uuid = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string);
+            out.push((n.to_string(), uuid));
+        }
+        for s in self.sources_list() {
+            let n = name_of(&s);
+            if n.is_empty() || n == exclude || is_scene(&s) || out.iter().any(|(x, _)| x == n) {
+                continue;
+            }
+            if !is_audio_kind(kind_of(&s)) || !self.has_sound_to_key(&s) {
+                continue;
+            }
+            let uuid = s.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()).map(str::to_string);
+            out.push((n.to_string(), uuid));
+        }
+        out
+    }
+
+    /// Broken sidechain compressor loops in the current scene collection (`(source, key)`).
+    pub fn sidechain_cycles(&self) -> Vec<(String, String)> {
+        ferrocore::obs::sidechain_cycles(&self.doc.borrow())
     }
 
     pub fn update_filter(&self, name: &str, filter: &str, settings: &Value) -> Result<(), StudioError> {
+        self.update_target_filter(FilterTarget::Source(name), filter, settings)
+    }
+
+    pub fn update_item_filter(&self, scene: &str, id: i64, filter: &str, settings: &Value) -> Result<(), StudioError> {
+        self.update_target_filter(FilterTarget::Item { scene, id }, filter, settings)
+    }
+
+    fn update_target_filter(
+        &self,
+        target: FilterTarget<'_>,
+        filter: &str,
+        settings: &Value,
+    ) -> Result<(), StudioError> {
         let Some(new) = settings.as_object() else { return Err(fail("settings: an object.")) };
-        self.with_filter(name, filter, |f| {
+        self.with_target_filter(target, filter, |f| {
             if !f["settings"].is_object() {
                 f["settings"] = json!({});
             }
@@ -1954,7 +2623,15 @@ impl Stage {
 
     /// Moves a filter up or down its list (`Up`, `Down`, `Top`, `Bottom`).
     pub fn move_filter(&self, name: &str, filter: &str, edit: ItemEdit) -> Result<(), StudioError> {
-        self.with_filters(name, |l| {
+        self.move_target_filter(FilterTarget::Source(name), filter, edit)
+    }
+
+    pub fn move_item_filter(&self, scene: &str, id: i64, filter: &str, edit: ItemEdit) -> Result<(), StudioError> {
+        self.move_target_filter(FilterTarget::Item { scene, id }, filter, edit)
+    }
+
+    fn move_target_filter(&self, target: FilterTarget<'_>, filter: &str, edit: ItemEdit) -> Result<(), StudioError> {
+        self.with_target_filters(target, None, Some(filter), |l| {
             let Some(at) = l.iter().position(|f| name_of(f) == filter) else { return };
             let f = l.remove(at);
             let to = match edit {
@@ -1970,24 +2647,139 @@ impl Stage {
 
     /// Copies `from`'s filters onto `name` (OBS's Paste Filters), each its own copy.
     pub fn paste_filters(&self, name: &str, from: &str) -> Result<(), StudioError> {
-        let copies = self.filter_list(from)?;
-        let have: Vec<String> = self.filter_list(name)?.iter().map(|f| name_of(f).to_string()).collect();
-        self.with_filters(name, |l| {
-            for mut f in copies {
-                let mut n = name_of(&f).to_string();
-                while have.contains(&n) || l.iter().any(|g| name_of(g) == n) {
-                    n.push_str(" 2");
-                }
-                f["name"] = json!(n);
-                f["uuid"] = json!(uuid());
-                l.push(f);
-            }
-        })
+        self.paste_target_filters(FilterTarget::Source(name), FilterTarget::Source(from))
     }
 
-    fn with_filter(&self, name: &str, filter: &str, f: impl FnOnce(&mut Value)) -> Result<(), StudioError> {
-        let found = self.with_filters(name, |l| l.iter_mut().find(|x| name_of(x) == filter).map(f).is_some())?;
-        if found { Ok(()) } else { Err(fail(format!("\"{name}\" has no filter called \"{filter}\"."))) }
+    /// Copies filters from a source (`from_item: None`) or an item override (`from_item: Some`)
+    /// onto `name`.
+    pub fn paste_filters_from(
+        &self,
+        name: &str,
+        from: &str,
+        from_item: Option<(&str, i64)>,
+    ) -> Result<(), StudioError> {
+        let src = match from_item {
+            Some((scene, id)) => FilterTarget::Item { scene, id },
+            None => FilterTarget::Source(from),
+        };
+        self.paste_target_filters(FilterTarget::Source(name), src)
+    }
+
+    /// Copies `from`'s video (and when shared or audio, audio) filters onto a scene item.
+    pub fn paste_item_filters(&self, scene: &str, id: i64, from: &str) -> Result<(), StudioError> {
+        self.paste_target_filters(FilterTarget::Item { scene, id }, FilterTarget::Source(from))
+    }
+
+    /// Copies filters from a source (`from_item: None`) or another item override onto `(scene, id)`.
+    pub fn paste_item_filters_from(
+        &self,
+        scene: &str,
+        id: i64,
+        from: &str,
+        from_item: Option<(&str, i64)>,
+    ) -> Result<(), StudioError> {
+        let src = match from_item {
+            Some((fscene, fid)) => FilterTarget::Item { scene: fscene, id: fid },
+            None => FilterTarget::Source(from),
+        };
+        self.paste_target_filters(FilterTarget::Item { scene, id }, src)
+    }
+
+    /// The filter names a new filter written to `source`'s own list must not take: that list's,
+    /// and for a sound filter (also shown in every item's own list of that source) theirs too.
+    fn names_on_source(&self, source: &str, audio: bool) -> Result<Vec<String>, StudioError> {
+        let mut names: Vec<String> = self.filter_list(source)?.iter().map(|f| name_of(f).to_string()).collect();
+        if audio {
+            for s in self.sources_list() {
+                for it in s.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten() {
+                    if name_of(it) == source {
+                        let own = it.get("ferrocast_filters").and_then(Value::as_array).into_iter().flatten();
+                        names.extend(own.map(|f| name_of(f).to_string()));
+                    }
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    fn target_filter_values(&self, target: FilterTarget<'_>) -> Result<Vec<Value>, StudioError> {
+        match target {
+            FilterTarget::Source(name) => self.filter_list(name),
+            FilterTarget::Item { scene, id } => {
+                let it = self.item(scene, id)?;
+                let src = self.filter_list(name_of(&it))?;
+                match it.get("ferrocast_filters").and_then(Value::as_array) {
+                    Some(ov) => {
+                        let mut out = ov.clone();
+                        out.extend(src.into_iter().filter(|f| ferrocore::obs::is_audio_filter_kind(kind_of(f))));
+                        Ok(out)
+                    }
+                    None => Ok(src),
+                }
+            }
+        }
+    }
+
+    fn paste_target_filters(&self, target: FilterTarget<'_>, from: FilterTarget<'_>) -> Result<(), StudioError> {
+        let copies = self.target_filter_values(from)?;
+        let mut have: Vec<String> = self.target_filters(target)?.into_iter().map(|f| f.name).collect();
+        // And the names in the source's own list, where what isn't an item's own lands.
+        let (store, _) = self.resolve_filter_store(target, None, None)?;
+        have.extend(self.names_on_source(&store, true)?);
+        let rename_unique = |f: &mut Value, have: &mut Vec<String>| {
+            let mut n = name_of(f).to_string();
+            while have.contains(&n) {
+                n.push_str(" 2");
+            }
+            have.push(n.clone());
+            f["name"] = json!(n);
+            f["uuid"] = json!(uuid());
+        };
+        if let FilterTarget::Item { scene, id } = target {
+            let it = self.item(scene, id)?;
+            if has_item_filter_override(&it) {
+                let (mut video, mut audio) = (Vec::new(), Vec::new());
+                for mut f in copies {
+                    rename_unique(&mut f, &mut have);
+                    if ferrocore::obs::is_audio_filter_kind(kind_of(&f)) {
+                        audio.push(f);
+                    } else {
+                        video.push(f);
+                    }
+                }
+                if !video.is_empty() {
+                    self.with_item(scene, id, |i| {
+                        let mut list =
+                            i.get("ferrocast_filters").and_then(Value::as_array).cloned().unwrap_or_default();
+                        list.extend(video);
+                        i["ferrocast_filters"] = Value::Array(list);
+                    })?;
+                }
+                if !audio.is_empty() {
+                    self.with_filters(name_of(&it), |l| l.extend(audio))?;
+                }
+                return Ok(());
+            }
+        }
+        let mut renamed = Vec::with_capacity(copies.len());
+        for mut f in copies {
+            rename_unique(&mut f, &mut have);
+            renamed.push(f);
+        }
+        self.with_target_filters(target, None, None, |l| l.extend(renamed))
+    }
+
+    fn with_target_filter(
+        &self,
+        target: FilterTarget<'_>,
+        filter: &str,
+        f: impl FnOnce(&mut Value),
+    ) -> Result<(), StudioError> {
+        let owner = self.target_owner_label(target)?;
+        let found = self.with_target_filters(target, None, Some(filter), |l| {
+            l.iter_mut().find(|x| name_of(x) == filter).map(f).is_some()
+        })?;
+        if found { Ok(()) } else { Err(fail(format!("\"{owner}\" has no filter called \"{filter}\"."))) }
     }
 
     // ------------------------------------------------------------------ pictures
@@ -2011,6 +2803,32 @@ impl Stage {
         Ok(self.source_picture_job(name, width, filters)?.and_then(|job| job()))
     }
 
+    /// [`Self::item_picture_job`] run on this thread.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_pixels(
+        &self,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<(Vec<u8>, u32, u32, (u32, u32))>, StudioError> {
+        Ok(self.item_picture_job(scene, id, width, filters)?.and_then(|job| job()))
+    }
+
+    /// Like [`Self::item_picture_pixels`], failing if `expected_source` is given and does not
+    /// match the item's source name.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_pixels_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<(Vec<u8>, u32, u32, (u32, u32))>, StudioError> {
+        Ok(self.item_picture_job_for(expected_source, scene, id, width, filters)?.and_then(|job| job()))
+    }
+
     /// [`Self::source_picture_pixels`] in two: what's needed is read here (on the window's
     /// thread), and the drawing and reading back off the graphics card is the job, for any
     /// thread: done on the window's thread it held the window up each time (the drawer and the
@@ -2019,6 +2837,54 @@ impl Stage {
     pub fn source_picture_job(
         &self,
         name: &str,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
+    {
+        self.picture_job_for(name, None, width, filters)
+    }
+
+    /// Like [`Self::source_picture_job`], using one scene item's video filter list when
+    /// `filters` is true.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_job(
+        &self,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
+    {
+        self.item_picture_job_for(None, scene, id, width, filters)
+    }
+
+    /// Like [`Self::item_picture_job`], verifying `expected_source` matches the item when given.
+    #[allow(clippy::type_complexity)]
+    pub fn item_picture_job_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+        width: u32,
+        filters: bool,
+    ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
+    {
+        let it = self.item(scene, id)?;
+        let src = name_of(&it);
+        if let Some(want) = expected_source
+            && want != src
+        {
+            return Err(fail(format!("There's no source called \"{want}\" for item {id} in \"{scene}\".")));
+        }
+        let home = self.home(scene, id);
+        self.picture_job_for(src, Some((home, id)), width, filters)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn picture_job_for(
+        &self,
+        name: &str,
+        item: Option<(String, i64)>,
         width: u32,
         filters: bool,
     ) -> Result<Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32, (u32, u32))> + Send + 'static + use<>>, StudioError>
@@ -2040,12 +2906,63 @@ impl Stage {
         let (w, h) = (w as u32, h as u32);
         Ok(Some(move || {
             let px = if filters {
-                e.engine.snapshot_source_filtered(id, (w, h))
+                match &item {
+                    Some((home, item_id)) => e.engine.snapshot_item_filtered(home, *item_id, id, (w, h)),
+                    None => e.engine.snapshot_source_filtered(id, (w, h)),
+                }
             } else {
                 e.engine.snapshot_source_at(id, (w, h))
             };
             px.map(|px| (px, w, h, (sw, sh)))
         }))
+    }
+
+    /// Reuses an already-open capture source matching `(kind, key, value)` for a picker
+    /// thumbnail so the picker never opens a second camera session or grabs hardware unnecessarily.
+    #[allow(clippy::type_complexity)]
+    pub fn matching_device_picture_job(
+        &self,
+        kind: &str,
+        key: &str,
+        value: &Value,
+        width: u32,
+    ) -> Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32)> + Send + 'static + use<>> {
+        let want_camera = PICTURE_ONLY_DEVICES.contains(&kind);
+        let want_screen = matches!(
+            kind,
+            "screen_capture" | "display_capture" | "window_capture" | "monitor_capture" | "xshm_input" | "game_capture"
+        );
+        if !want_camera && !want_screen {
+            return None;
+        }
+        let matched = self.sources_list().into_iter().find(|s| {
+            let sk = kind_of(s);
+            let kind_matches = if want_camera {
+                PICTURE_ONLY_DEVICES.contains(&sk)
+            } else {
+                sk == kind
+                    || (matches!(sk, "screen_capture" | "display_capture" | "monitor_capture")
+                        && matches!(kind, "screen_capture" | "display_capture" | "monitor_capture"))
+            };
+            if !kind_matches {
+                return false;
+            }
+            let set = s.get("settings").and_then(Value::as_object);
+            let Some(set) = set else { return false };
+            if let Some(v) = set.get(key) {
+                return v == value;
+            }
+            if want_camera {
+                return ["device", "uid", "video_device_id"].iter().any(|k| set.get(*k).is_some_and(|v| v == value));
+            }
+            false
+        })?;
+        let name = name_of(&matched).to_string();
+        let job = self.source_picture_job(&name, width.clamp(64, 320), false).ok().flatten()?;
+        Some(move || {
+            let (px, pw, ph, _) = job()?;
+            Some((px, pw, ph))
+        })
     }
 
     /// A scene's picture `width` wide as RGBA pixels (with its height).
@@ -2441,7 +3358,7 @@ impl Stage {
             return Err(fail(format!("\"{name}\" isn't a group.")));
         }
         let p = ferrocore::obs::placement_of(&g);
-        let (gw, gh) = self.size_of(&name);
+        let (gw, gh) = self.item_size_of(&name, Some(&g));
         let to_canvas = ferrocore::draw_transform(&p, gw, gh);
         // Each side on its own, so a group scaled more one way keeps its sources' shapes.
         let (scale, turn) = (self.group_scale(&g), p.rotation);
@@ -2493,6 +3410,16 @@ impl Stage {
 
     // ------------------------------------------------------------------ the engine itself
 
+    /// What the engine running now mixes and paces at: the sound rate, and whether it runs at the
+    /// broadcast rate (29.97, 59.94, 23.976). None before it has started. These change only when
+    /// the engine opens again.
+    pub fn engine_format(&self) -> Option<(u32, bool)> {
+        self.engine.borrow().as_ref().map(|s| {
+            let c = s.engine.config();
+            (c.sample_rate, c.ntsc)
+        })
+    }
+
     /// The canvas everything is drawn at.
     pub fn canvas(&self) -> Canvas {
         self.canvas
@@ -2522,6 +3449,7 @@ impl Stage {
             return Err(fail("The picture size can't change while streaming or recording. Stop first."));
         }
         *self.engine.borrow_mut() = None;
+        publish_engine(None);
         self.canvas = canvas;
         Ok(())
     }
@@ -2530,6 +3458,12 @@ impl Stage {
     pub fn stats(&self) -> crate::EngineStats {
         let (cpu, memory_mb) = crate::system::usage();
         let s = self.engine.borrow().as_ref().map(|e| e.engine.stats()).unwrap_or_default();
+        // Frames the encoders left out (FFmpeg's queue full, VideoToolbox's drops), apart from the
+        // frames the engine didn't draw in time (`lagged`): the health meter names the encoder
+        // from these. Never more than the frames given to them (a new engine counts from 0 again).
+        let encoded = s.frames.min(u64::from(u32::MAX)) as u32;
+        let skipped =
+            ferrocore::video::dropped_frames().saturating_sub(self.dropped_base).min(u64::from(encoded)) as u32;
         crate::EngineStats {
             cpu,
             fps: self.fps_now(s.frames, s.skipped, std::time::Instant::now()),
@@ -2537,8 +3471,8 @@ impl Stage {
             lagged: s.skipped.min(u64::from(u32::MAX)) as u32,
             frames: s.frames.min(u64::from(u32::MAX)) as u32,
             memory_mb,
-            skipped: 0,
-            encoded: s.frames.min(u64::from(u32::MAX)) as u32,
+            skipped,
+            encoded,
             recovered: s.recovered.min(u64::from(u32::MAX)) as u32,
             restarts: s.restarts.min(u64::from(u32::MAX)) as u32,
             encode_ms: f64::from(s.encode_ms),
@@ -2595,24 +3529,7 @@ impl Stage {
     /// Each named source's sound now (dBFS; -100 is silence): the mixer's meters.
     pub fn levels(&self, names: &[String]) -> std::collections::HashMap<String, crate::collection::LevelInfo> {
         let Some(e) = self.engine.borrow().clone() else { return Default::default() };
-        names
-            .iter()
-            .filter_map(|n| {
-                let (id, _) = e.engine.source_named(n)?;
-                let l = e.engine.levels(id)?;
-                // Silence is -100, not -inf: JSON has no infinity, so it went out as null, which
-                // the page read as 0 dB, a full red meter the moment the sound stopped.
-                let floor = |v: [f32; 2]| v.map(|x| if x.is_finite() { x.max(-100.0) } else { -100.0 });
-                Some((
-                    n.clone(),
-                    crate::collection::LevelInfo {
-                        peak: floor(l.peak),
-                        magnitude: floor(l.rms),
-                        input_peak: floor(l.input_peak),
-                    },
-                ))
-            })
-            .collect()
+        read_levels(&e, names, false)
     }
 
     /// Ferrocast's sound care: `{ ducking: { voices, music, depth_db } | null, loudness_lufs:
@@ -2818,8 +3735,10 @@ impl Stage {
             self.source(name)?;
             let e = self.engine()?;
             let (scene, w, h) = crate::own::show_alone(&e.engine, name, (self.canvas.width, self.canvas.height))?;
-            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()))?;
-            return Ok((px, (w, h)));
+            e.keep_alone(name);
+            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()));
+            e.release_alone(name);
+            return px.map(|px| (px, (w, h)));
         };
         let px = self.engine()?.engine.snapshot_scene_at(name, size, size).map_err(|e| fail(e.to_string()))?;
         Ok((px, size))
@@ -3059,7 +3978,7 @@ impl Stage {
     pub fn virtual_camera(&self, source: Option<&str>) -> Result<crate::VirtualCamera, StudioError> {
         let e = self.engine()?;
         let canvas = (self.canvas.width, self.canvas.height);
-        let (scene, size) = match source {
+        let (scene, size, alone) = match source {
             Some(name) => {
                 if e.engine.source_named(name).is_none()
                     && self.scene_index(name).is_err()
@@ -3068,12 +3987,13 @@ impl Stage {
                     return Err(fail(format!("There's no source called \"{name}\".")));
                 }
                 let (scene, w, h) = own::show_alone(&e.engine, name, canvas)?;
-                (Some(scene), (w, h))
+                e.keep_alone(name);
+                (Some(scene), (w, h), Some(crate::AloneGuard { shared: e.clone(), name: name.to_string() }))
             }
-            None => (None, canvas),
+            None => (None, canvas, None),
         };
         let cam = crate::wincam::Camera::start(Arc::downgrade(&e), scene, size, self.canvas.fps).map_err(fail)?;
-        Ok(crate::VirtualCamera { cam })
+        Ok(crate::VirtualCamera { cam, _alone: alone })
     }
 
     /// Listens to a source's sound (mono, 48 kHz) for anything that wants it: Whisper captions.
@@ -3440,32 +4360,50 @@ impl Stage {
             .collect())
     }
 
-    /// The sounds a scene makes (its sources with sound) and the global channels.
+    /// The sounds a scene makes: the global channels first, then its sources with sound, top first,
+    /// with those inside its groups and the scenes shown inside it (OBS hears them all; so does
+    /// the engine's mixer). `shown` says whether it is on air through every item above it.
     pub fn audio(&self, scene: &str) -> Result<Vec<AudioInfo>, StudioError> {
-        let mut out: Vec<AudioInfo> = Vec::new();
-        // Its sources top first, and those inside its groups with them (OBS's mixer lists a
-        // group's sources too; owner, 11 Nov: a video put in a group lost its sound row).
-        let mut all = Vec::new();
+        // The devices heard in every scene first (Desktop Audio, Mic/Aux), then the scene's own
+        // sources: the same order in "This scene" and "All", so a mic never jumps.
+        let mut out: Vec<AudioInfo> = self.channels();
+        let mut path = vec![scene.to_string()];
+        self.collect_audio(scene, true, &mut out, &mut path)?;
+        Ok(out)
+    }
+
+    /// `scene`'s sounds into `out`; `path` is the scenes entered so far (no scene is entered twice,
+    /// and nesting stops a few deep, as the engine's own walk does).
+    fn collect_audio(
+        &self,
+        scene: &str,
+        shown: bool,
+        out: &mut Vec<AudioInfo>,
+        path: &mut Vec<String>,
+    ) -> Result<(), StudioError> {
         for it in self.scene_items(scene)?.iter().rev() {
             let name = name_of(it);
-            if self.source(name).is_ok_and(|s| kind_of(&s) == "group") {
-                all.extend(self.scene_items(name).unwrap_or_default().into_iter().rev());
-            } else {
-                all.push(it.clone());
+            let on = shown && it.get("visible").and_then(Value::as_bool).unwrap_or(true);
+            let Ok(src) = self.source(name) else { continue };
+            if is_scene(&src) {
+                // A group's sources, or a scene inside this one.
+                if path.len() < 5 && !path.iter().any(|p| p == name) {
+                    path.push(name.to_string());
+                    let _ = self.collect_audio(name, on, out, path);
+                    path.pop();
+                }
+            } else if self.info_of(it).audio {
+                // Listed where it's first seen, on air when any placement of it is.
+                if let Some(a) = out.iter_mut().find(|a| a.name == name) {
+                    a.shown |= on;
+                } else {
+                    let mut info = self.audio_info(&src, None);
+                    info.shown = on;
+                    out.push(info);
+                }
             }
         }
-        for it in &all {
-            let name = name_of(it);
-            if let Ok(src) = self.source(name)
-                && !is_scene(&src)
-                && self.info_of(it).audio
-                && !out.iter().any(|a| a.name == name)
-            {
-                out.push(self.audio_info(&src, None));
-            }
-        }
-        out.extend(self.channels());
-        Ok(out)
+        Ok(())
     }
 
     /// Deinterlacing: our engine's sources are never interlaced.
@@ -3609,6 +4547,25 @@ impl Stage {
         }
     }
 
+    /// Which web page sources stopped drawing (their browser's watchdog gave up): (name, stalled).
+    pub fn stalled_pages(&self) -> Vec<(String, bool)> {
+        // Web pages are drawn only on a Mac and Windows: elsewhere there are none to stall.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.pages.borrow().iter().map(|(name, (_, page))| (name.clone(), page.stalled())).collect()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// What the captures this collection's engine opened want said on the dashboard, since the
+    /// last call (each engine keeps its own).
+    pub fn take_notices(&self) -> Vec<ferrocore::notices::Notice> {
+        self.engine.borrow().as_ref().map(|e| e.engine.take_notices()).unwrap_or_default()
+    }
+
     /// Low latency sound (Settings); kept for every engine made.
     pub fn set_low_latency(&self, on: bool) {
         self.low_latency.set(on);
@@ -3734,6 +4691,12 @@ impl StageOutput {
 
     pub fn record_stats(&self) -> RecordStats {
         self.own.record_stats()
+    }
+
+    /// Why this recording stopped by itself (a full disk, a drive taken away): a short phrase,
+    /// and what to do with the system's own words. None while it runs, or for a stream.
+    pub fn record_problem(&self) -> Option<(String, String)> {
+        self.own.record_problem().map(|p| (p.reason, p.detail))
     }
 
     /// Which encoder the output uses ("h264_nvenc"…), while it runs.
@@ -4181,6 +5144,8 @@ pub struct StageProjector {
     win: crate::ffi::projector_window::Win,
     /// A multiview's layout (shared with its window's clicks and resizes).
     multiview: Option<std::rc::Rc<RefCell<MultiviewState>>>,
+    /// Source name pinned via `keep_alone`, released on `Drop`.
+    alone: Option<String>,
 }
 
 /// What a multiview shows and where: the scenes, Studio Mode's preview, the look, the canvas
@@ -4294,16 +5259,16 @@ impl Stage {
         use crate::ProjectorOf as P;
         let shared = self.engine()?;
         let canvas = (self.canvas.width, self.canvas.height);
-        let (title, scene, size) = match of {
+        let (title, scene, size, alone) = match of {
             P::Program | P::Multiview => {
                 let title = if *of == P::Multiview { "Multiview" } else { "Projector: what's on air" };
-                (title.to_string(), None, canvas)
+                (title.to_string(), None, canvas, None)
             }
             P::Source(name) => {
                 let canvas = self.canvas_of(name);
                 let (scene, w, h) = own::show_alone(&shared.engine, name, canvas)?;
                 shared.keep_alone(name);
-                (format!("Projector: {name}"), Some(scene), (w, h))
+                (format!("Projector: {name}"), Some(scene), (w, h), Some(name.clone()))
             }
         };
         let aspect = f64::from(size.0.max(1)) / f64::from(size.1.max(1));
@@ -4344,15 +5309,27 @@ impl Stage {
             }
             None => Box::new(|_, _, _, _| {}),
         };
-        let hooks = crate::ffi::projector_window::Hooks { click, close: on_close, resize };
-        let win = crate::ffi::projector_window::open(&title, aspect, screen, hooks)
-            .ok_or_else(|| fail("The projector's window couldn't be made."))?;
+        let hooks =
+            crate::ffi::projector_window::Hooks { click, close: on_close, resize, hide_cursor: Default::default() };
+        let Some(win) = crate::ffi::projector_window::open(&title, aspect, screen, hooks) else {
+            if let Some(name) = &alone {
+                shared.release_alone(name);
+            }
+            return Err(fail("The projector's window couldn't be made."));
+        };
         let (pw, ph) = win.pixels();
         // SAFETY: the window's view lives as long as the StageProjector, which stops the engine
         // drawing in it before the window goes (`Drop`).
         #[allow(unsafe_code)]
-        let id = unsafe { shared.engine.start_preview_of(win.view_ptr(), pw, ph, size, scene) }
-            .map_err(|e| fail(format!("the projector couldn't be drawn: {e}")))?;
+        let id = match unsafe { shared.engine.start_preview_of(win.view_ptr(), pw, ph, size, scene) } {
+            Ok(id) => id,
+            Err(e) => {
+                if let Some(name) = &alone {
+                    shared.release_alone(name);
+                }
+                return Err(fail(format!("the projector couldn't be drawn: {e}")));
+            }
+        };
         id_cell.set(Some(id));
         shared.engine.set_preview_look(
             id,
@@ -4362,7 +5339,7 @@ impl Stage {
             mv.borrow_mut().view = (pw, ph);
             mv.borrow().apply(&shared, id);
         }
-        Ok(StageProjector { shared, id, win, multiview })
+        Ok(StageProjector { shared, id, win, multiview, alone })
     }
 }
 
@@ -4376,6 +5353,11 @@ impl StageProjector {
     /// Keeps the window above the others, or not.
     pub fn set_on_top(&self, on: bool) {
         self.win.set_on_top(on);
+    }
+
+    /// Hides the pointer while it is over the window (OBS's "Hide cursor over projectors").
+    pub fn set_hide_cursor(&self, on: bool) {
+        self.win.set_hide_cursor(on);
     }
 
     /// A multiview follows the scenes, Studio Mode's preview and its look (nothing to do when
@@ -4395,6 +5377,9 @@ impl StageProjector {
 impl Drop for StageProjector {
     fn drop(&mut self) {
         self.shared.engine.stop_preview(self.id);
+        if let Some(name) = &self.alone {
+            self.shared.release_alone(name);
+        }
         self.win.close();
     }
 }
@@ -4498,6 +5483,9 @@ pub fn can_share(
     let mut stream_encode = s.encode.clone();
     stream_encode.scale = None;
     stream_encode.video_kbps = plan.encode.video_kbps;
+    // The rate control is compared too: a stream held strictly under a platform's limit
+    // (`strict_cbr`) that joined a recording's plain CBR encoder would lose its 1x VBV and burst
+    // past the limit with nothing saying so.
     if stream_encode != plan.encode {
         return Err("the recording is encoded another way than the stream".into());
     }
@@ -4520,33 +5508,38 @@ pub fn can_share(
 }
 
 /// Logs `what` the first time this run (a profile from before Ferrocore keeps its muxer
-/// settings, with no box left to clear them: said once, not at every recording).
+/// settings, with no box left to clear them: said once, not at every recording). Bounded so
+/// varied warnings over weeks never grow unboundedly.
 fn say_once(what: String) {
-    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    const MAX_SAID: usize = 256;
+    static SAID: std::sync::Mutex<std::collections::VecDeque<String>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
     if !said.contains(&what) {
         tracing::warn!("{what}");
-        said.push(what);
+        if said.len() >= MAX_SAID {
+            said.pop_front();
+        }
+        said.push_back(what);
     }
 }
 
 /// Notes what a screen capture's window or display is, beside its number, so it's found
 /// again when the number changes: the window's app and title (OBS's "owner_name" and
-/// "window_name"; a game or browser gets a new window number each time it opens), and on a
-/// Mac the display's UUID (OBS's "display_uuid"; a display's number changes when it's plugged
-/// back in or the Mac restarts).
+/// "window_name"; a game or browser gets a new window number each time it opens), on a Mac
+/// the display's UUID ("display_uuid"), and on Windows its PnP device path ("monitor_id").
 ///
 /// `picked`: a window was picked now. Otherwise (only the method changed) a window's names stay
 /// as they are, even when its saved number isn't open any more: they're how it's found again.
 fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
-    if !matches!(kind, "screen_capture" | "display_capture" | "window_capture" | "game_capture") {
+    if !matches!(kind, "screen_capture" | "display_capture" | "monitor_capture" | "window_capture" | "game_capture") {
         return;
     }
     let ty = set.get("type").and_then(Value::as_u64).unwrap_or(0);
     let window = set.get("window").and_then(Value::as_u64).map(|w| w as u32);
-    let is_window = (kind != "screen_capture" && kind != "display_capture") || ty == 1;
+    let is_window = !matches!(kind, "screen_capture" | "display_capture" | "monitor_capture") || ty == 1;
     let Some(id) = window.filter(|_| is_window) else {
-        remember_display(set);
+        remember_display(kind, set);
         return;
     };
     if !picked {
@@ -4565,21 +5558,37 @@ fn remember_capture(kind: &str, set: &mut Value, picked: bool) {
     }
 }
 
-/// A Mac display's UUID beside its number (elsewhere a display has none to keep).
-fn remember_display(set: &mut Value) {
-    #[cfg(target_os = "macos")]
-    if let Some(d) = set.get("display").and_then(Value::as_u64) {
-        match ferrocore::screen::display_uuid(d as u32) {
-            Some(u) => set["display_uuid"] = json!(u),
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+fn remember_display_id(set: &mut Value, index_key: &str, id_key: &str, lookup: impl FnOnce(u32) -> Option<String>) {
+    if let Some(d) = set.get(index_key).and_then(Value::as_u64) {
+        match lookup(d as u32) {
+            Some(u) => set[id_key] = json!(u),
             None => {
                 if let Some(o) = set.as_object_mut() {
-                    o.remove("display_uuid");
+                    o.remove(id_key);
                 }
             }
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = set;
+}
+
+/// Stamps or clears the OS display identifier (`display_uuid` on macOS, `monitor_id` on Windows)
+/// alongside the numeric display index.
+fn remember_display(kind: &str, set: &mut Value) {
+    match kind {
+        "monitor_capture" => {
+            #[cfg(target_os = "windows")]
+            remember_display_id(set, "monitor", "monitor_id", ferrocore::screen::display_uuid);
+            #[cfg(not(target_os = "windows"))]
+            let _ = set;
+        }
+        _ => {
+            #[cfg(target_os = "macos")]
+            remember_display_id(set, "display", "display_uuid", ferrocore::screen::display_uuid);
+            #[cfg(not(target_os = "macos"))]
+            let _ = set;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4617,8 +5626,16 @@ mod tests {
                 .contains("Enhanced")
         );
         assert!(why(&s, &plan, true, 30).contains("30 fps"));
-        let high = RecordPlan { encode: crate::EncodeSettings { quality: Some(16), ..enc }, ..plan };
+        let high = RecordPlan { encode: crate::EncodeSettings { quality: Some(16), ..enc.clone() }, ..plan.clone() };
         assert!(why(&s, &high, true, 60).contains("another way"));
+        // A stream held strictly under a platform's limit doesn't join a plain CBR encoder (it
+        // would lose its 1x VBV and burst past the limit, unseen), and the other way round.
+        let strict = crate::EncodeSettings { strict_cbr: true, ..enc };
+        let strict_stream = StreamSettings { encode: strict.clone(), ..s.clone() };
+        assert!(why(&strict_stream, &plan, true, 60).contains("another way"));
+        let strict_plan = RecordPlan { encode: strict, ..plan };
+        assert_eq!(can_share(&strict_stream, &strict_plan, true, 60, 60), Ok(()));
+        assert!(why(&s, &strict_plan, true, 60).contains("another way"));
     }
 
     /// A picked display is noted by its UUID (found again when its number changes); a window's
@@ -4631,6 +5648,15 @@ mod tests {
             remember_capture("screen_capture", &mut set, true);
             assert_eq!(set["display_uuid"].as_str(), ferrocore::screen::display_uuid(d).as_deref());
         }
+        // Windows `monitor_capture` stamps `monitor_id` beside `monitor` and clears it when unresolvable.
+        let mut win_set = json!({ "monitor": 1, "capture_cursor": true });
+        remember_display_id(&mut win_set, "monitor", "monitor_id", |d| {
+            assert_eq!(d, 1);
+            Some(r"\\?\DISPLAY#DELA0D4#5&1234&0&UID4353#{e6f07b5f}".into())
+        });
+        assert_eq!(win_set["monitor_id"], r"\\?\DISPLAY#DELA0D4#5&1234&0&UID4353#{e6f07b5f}");
+        remember_display_id(&mut win_set, "monitor", "monitor_id", |_| None);
+        assert!(win_set.get("monitor_id").is_none(), "{win_set}");
         let mut set = json!({ "type": 1, "window": 0xFFFF_FFF0u32, "owner_name": "Old", "window_name": "Old" });
         remember_capture("screen_capture", &mut set, true);
         assert!(set.get("owner_name").is_none() && set.get("window_name").is_none(), "{set}");
@@ -5047,6 +6073,64 @@ mod tests {
         assert_eq!(px(300, 10), [255, 0, 0]);
         ok(s.edit_item("Main", red.id, ItemEdit::Hide));
         assert_eq!(px(300, 10), [0, 0, 0], "hidden");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn plan(s: &Stage) -> std::collections::BTreeMap<String, Vec<String>> {
+        super::cutout_plan(&s.sources_list(), &s.doc.borrow())
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn one_cutout_worker_serves_every_scene_a_camera_is_in() {
+        let s = stage();
+        let dev = json!({ "device": "cam-1" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        ok(s.add_filter("Cam", "ferrocast_remove_background", "Cut", &json!({})));
+        ok(s.add_scene("Other"));
+        let other = ok(s.add_existing("Other", "Cam"));
+        assert!(other.own_filters, "copy-on-add gave the item its own filters");
+        ok(s.duplicate_scene("Other", "Third"));
+        let p = plan(&s);
+        assert_eq!(p.len(), 1, "one worker for one camera: {p:?}");
+        let masks = &p["Cam"];
+        assert_eq!(masks.len(), 3, "{masks:?}");
+        assert!(masks.contains(&"Cam: Cut".to_string()));
+        assert!(masks.iter().any(|m| m.starts_with("Other#")));
+        assert!(masks.iter().any(|m| m.starts_with("Third#")));
+        // A hidden item feeds nothing.
+        ok(s.edit_item("Other", other.id, ItemEdit::Hide));
+        assert_eq!(plan(&s)["Cam"].len(), 2);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn renaming_a_source_moves_its_cutout_worker() {
+        let s = stage();
+        let dev = json!({ "device": "cam-1" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        ok(s.add_filter("Cam", "ferrocast_remove_background", "Cut", &json!({})));
+        ok(s.add_scene("Other"));
+        ok(s.add_existing("Other", "Cam"));
+        ok(s.rename("Cam", "Webcam"));
+        let p = plan(&s);
+        assert_eq!(p.keys().collect::<Vec<_>>(), vec!["Webcam"], "keyed by the source, so the old worker stops");
+    }
+
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn studio_mode_copies_of_the_scene_on_air_get_their_masks() {
+        let s = stage();
+        let dev = json!({ "device": "cam-1" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        ok(s.add_filter("Cam", "ferrocast_remove_background", "Cut", &json!({})));
+        ok(s.add_scene("Other"));
+        let other = ok(s.add_existing("Other", "Cam"));
+        let items = s.scene_items("Other").unwrap_or_else(|e| panic!("{e}"));
+        s.doc.borrow_mut()["ferrocast"]["program_copy"] =
+            json!({ "scene": "Other", "items": items, "private": PROGRAM_COPY[0] });
+        let masks = plan(&s)["Cam"].clone();
+        assert!(masks.contains(&format!("{}#{}: Cut", PROGRAM_COPY[0], other.id)), "{masks:?}");
     }
 
     #[test]
@@ -5646,6 +6730,21 @@ mod tests {
     }
 
     #[test]
+    fn set_current_switches_an_active_vertical_scene_leaving_main_alone() {
+        let s = stage();
+        let main_before = s.current();
+        ok(s.add_scene("Main 2"));
+        ok(s.start_vertical("Tall"));
+        ok(s.add_vertical_scene("Tall 2"));
+        ok(s.set_current("Tall 2"));
+        assert_eq!(s.current(), main_before);
+        let v = s.vertical().unwrap_or_else(|| panic!("vertical should be on"));
+        assert_eq!(v.current, "Tall 2");
+        s.stop_vertical();
+        assert!(s.set_current("Tall").is_err(), "turned off vertical doesn't switch via set_current");
+    }
+
+    #[test]
     fn missing_files_are_found_and_replaced() {
         let s = stage();
         ok(s.add_source("Main", "image_source", "Logo", &json!({ "file": "/nowhere/logo.png" }), false));
@@ -5672,6 +6771,106 @@ mod tests {
         assert!((ok(s.audio_of("Mic/Aux")).volume_db + 3.0).abs() < 0.01);
         ok(s.set_channel(4, None));
         assert!(s.channels().is_empty());
+    }
+
+    /// The live watch judges only microphones: a capture card's sound (the owner's "USB2 Digital
+    /// Audio", even as a Mic/Aux channel), the desktop's and an app's are not, unless the owner
+    /// says so ("This is a mic"), and a real mic can be said not to be.
+    #[test]
+    fn only_microphones_are_judged_unless_the_owner_says_otherwise() {
+        let s = stage();
+        ok(s.set_channel(3, Some(("coreaudio_input_capture", "KREO KAST", &json!({})))));
+        ok(s.set_channel(4, Some(("coreaudio_input_capture", "USB2 Digital Audio", &json!({})))));
+        ok(s.set_channel(1, Some(("coreaudio_output_capture", "Desktop Audio", &json!({})))));
+        ok(s.add_source(
+            "Main",
+            "coreaudio_input_capture",
+            "Line",
+            &json!({ "device_id": "AppleUSBAudioEngine:MACROSILICON:USB2 Video:15930196:4,3" }),
+            false,
+        ));
+        ok(s.add_source("Main", "sck_audio_capture", "Spotify", &json!({}), false));
+        let mic = |n: &str| ok(s.audio_of(n)).mic;
+        assert!(mic("KREO KAST"));
+        assert!(!mic("USB2 Digital Audio"), "a capture card by its name");
+        assert!(!mic("Desktop Audio"));
+        assert!(!mic("Line"), "a capture card by its device id");
+        assert!(!mic("Spotify"), "an app's sound");
+        // The owner's word wins, both ways, and can be taken back.
+        ok(s.set_mic("USB2 Digital Audio", Some(true)));
+        ok(s.set_mic("KREO KAST", Some(false)));
+        assert!(mic("USB2 Digital Audio") && !mic("KREO KAST"));
+        ok(s.set_mic("USB2 Digital Audio", None));
+        assert!(!mic("USB2 Digital Audio"));
+        // Kept in the collection.
+        ok(s.set_mic("Line", Some(true)));
+        let again = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &s.save("x"), "Scene"));
+        assert!(ok(again.audio_of("Line")).mic);
+    }
+
+    /// A mic inside a scene shown inside this one is heard (the engine mixes it, OBS lists it) and
+    /// is in the list; hidden anywhere above it, it is listed but not `shown`.
+    #[test]
+    fn a_mic_in_a_nested_scene_is_listed_and_a_hidden_one_is_not_shown() {
+        let s = stage();
+        ok(s.add_scene("Audio"));
+        ok(s.add_source("Audio", "coreaudio_input_capture", "Mic", &json!({}), false));
+        ok(s.add_source("Main", "ffmpeg_source", "Game", &json!({ "local_file": "/no/such.mp4" }), false));
+        let nested = ok(s.add_existing("Main", "Audio"));
+        let rows = || ok(s.audio("Main"));
+        let mic = || rows().into_iter().find(|a| a.name == "Mic").unwrap_or_else(|| panic!("no Mic row"));
+        assert!(mic().shown && mic().mic, "the nested mic is there, on air");
+        assert!(rows().iter().any(|a| a.name == "Game" && a.shown));
+        // The nested scene hidden: its mic is not heard.
+        ok(s.edit_item("Main", nested.id, ItemEdit::Hide));
+        assert!(!mic().shown);
+        // A hidden item of its own is not shown either.
+        let own = ok(s.add_source("Main", "coreaudio_input_capture", "Desk", &json!({}), false));
+        ok(s.edit_item("Main", own.id, ItemEdit::Hide));
+        assert!(!ok(s.audio("Main")).iter().find(|a| a.name == "Desk").unwrap_or_else(|| panic!("no Desk")).shown);
+        // A scene inside itself doesn't loop.
+        ok(s.add_existing("Audio", "Main"));
+        assert!(!ok(s.audio("Main")).is_empty());
+    }
+
+    /// A sound placed twice is on air when any of its placements is: a hidden scene above that
+    /// holds the mic too doesn't make the visible one read as hidden (the first one seen won).
+    #[test]
+    fn a_sound_is_shown_when_any_of_its_placements_is() {
+        let s = stage();
+        ok(s.add_source("Main", "coreaudio_input_capture", "Mic", &json!({}), false));
+        ok(s.add_scene("Audio"));
+        ok(s.add_existing("Audio", "Mic"));
+        let nested = ok(s.add_existing("Main", "Audio"));
+        ok(s.edit_item("Main", nested.id, ItemEdit::Hide));
+        let rows = ok(s.audio("Main"));
+        let mics: Vec<_> = rows.iter().filter(|a| a.name == "Mic").collect();
+        assert_eq!(mics.len(), 1, "listed once");
+        assert!(mics[0].shown, "on air through its own visible item");
+    }
+
+    /// Push-to-talk and push-to-mute are kept in the sound's own settings (OBS's keys), clamped to
+    /// 5 s, and a key for a sound without them on answers false (the old mute shortcut then runs).
+    #[test]
+    fn a_sounds_push_to_talk_and_push_to_mute_are_kept_and_asked() {
+        let s = stage();
+        ok(s.set_channel(3, Some(("coreaudio_input_capture", "Mic/Aux", &json!({})))));
+        let a = ok(s.audio_of("Mic/Aux"));
+        assert!(!a.push_to_talk && !a.push_to_mute && a.push_to_talk_ms == 0);
+        assert!(!ok(s.push_key("Mic/Aux", true, true)), "not switched on: the caller mutes as before");
+        ok(s.set_push("Mic/Aux", true, Some(true), Some(250)));
+        ok(s.set_push("Mic/Aux", false, Some(true), Some(99_999)));
+        let a = ok(s.audio_of("Mic/Aux"));
+        assert_eq!((a.push_to_talk, a.push_to_talk_ms), (true, 250));
+        assert_eq!((a.push_to_mute, a.push_to_mute_ms), (true, 5_000), "at most 5 s");
+        assert!(ok(s.push_key("Mic/Aux", true, true)));
+        // Only the delay changes when only it is sent.
+        ok(s.set_push("Mic/Aux", true, None, Some(100)));
+        assert_eq!(ok(s.audio_of("Mic/Aux")).push_to_talk_ms, 100);
+        assert!(ok(s.audio_of("Mic/Aux")).push_to_talk);
+        // And they survive a save and a load.
+        let again = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &s.save("x"), "Scene"));
+        assert_eq!(ok(again.audio_of("Mic/Aux")).push_to_talk_ms, 100);
     }
 
     #[test]
@@ -5708,6 +6907,34 @@ mod tests {
         assert!(!ok(s.fade_to_black()));
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert_eq!(px(), [255, 0, 0], "back");
+    }
+
+    #[test]
+    fn switching_scene_clears_fade_to_black() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "color": 4278190335u32 }), false));
+        ok(s.add_scene("Blue"));
+        ok(s.add_source("Blue", "color_source_v3", "BlueSrc", &json!({ "color": 4294901760u32 }), false));
+        ok(s.set_transition(&TransitionInfo { kind: "cut_transition".into(), ms: 0 }));
+        let px = || {
+            e.engine.snapshot().map(|p| p[(90 * 320 + 160) * 4..(90 * 320 + 160) * 4 + 3].to_vec()).unwrap_or_default()
+        };
+        assert!(ok(s.fade_to_black()) && s.is_black());
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        assert_eq!(px(), [0, 0, 0]);
+        // Switching to another scene clears `seen.black` so edits don't restore black.
+        ok(s.set_current("Blue"));
+        assert!(!s.is_black(), "go_with cleared seen.black");
+        ok(s.add_scene("Extra"));
+        assert_eq!(px(), [0, 0, 255], "stays on Blue after edit");
+        // Fading to black and re-selecting the current scene also brings it back.
+        assert!(ok(s.fade_to_black()) && s.is_black());
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        assert_eq!(px(), [0, 0, 0]);
+        ok(s.set_current("Blue"));
+        assert!(!s.is_black(), "set_current on same scene cleared seen.black");
+        assert_eq!(px(), [0, 0, 255], "restored Blue");
     }
 
     #[test]
@@ -5748,5 +6975,330 @@ mod tests {
         assert_eq!(s.scenes().len(), 1, "still not in the main list");
         ok(s.rename("Main", "First"));
         assert!(ok(s.scene_transition_of("First")).is_some(), "its override came along");
+    }
+
+    /// A second holder makes the solo scene (`show_alone`) and, an instant before it counts itself
+    /// (`keep_alone`), the first holder lets go and removes it: the second must not be left
+    /// holding a scene that is gone.
+    #[test]
+    fn a_holder_that_joins_as_the_last_one_leaves_still_has_its_scene() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        let _ = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Card",
+            &json!({ "color": 4278190335u32, "width": 160, "height": 90 }),
+            false,
+        ));
+        let (scene, _, _) = ok(own::show_alone(&e.engine, "Card", (320, 180)));
+        e.keep_alone("Card"); // the first holder
+        // The second holder's `show_alone` found the scene there; now the first one closes.
+        let (again, _, _) = ok(own::show_alone(&e.engine, "Card", (320, 180)));
+        assert_eq!(again, scene);
+        e.release_alone("Card");
+        assert!(e.engine.scene(&scene).is_none(), "the last holder took it away");
+        // The second holder counts itself: its scene must be there.
+        e.keep_alone("Card");
+        assert!(e.engine.scene(&scene).is_some(), "a holder always has its solo scene");
+        e.release_alone("Card");
+        assert!(e.engine.scene(&scene).is_none());
+    }
+
+    #[test]
+    fn solo_scenes_are_refcounted_and_removed_on_last_release() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        let _ = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Card",
+            &json!({ "color": 4278190335u32, "width": 160, "height": 90 }),
+            false,
+        ));
+        let base_scenes = e.engine.scene_names().len();
+        for _ in 0..1_000 {
+            let (scene, _, _) = ok(own::show_alone(&e.engine, "Card", (320, 180)));
+            e.keep_alone("Card");
+            e.keep_alone("Card");
+            assert_eq!(e.alone_count(), 1);
+            assert!(e.engine.scene(&scene).is_some());
+            e.release_alone("Card");
+            assert_eq!(e.alone_count(), 1, "still held by second owner");
+            assert!(e.engine.scene(&scene).is_some());
+            e.release_alone("Card");
+            assert_eq!(e.alone_count(), 0);
+            assert!(e.engine.scene(&scene).is_none(), "hidden solo scene removed at refcount 0");
+        }
+        assert_eq!(e.engine.scene_names().len(), base_scenes);
+    }
+
+    /// "Duck under" lists what can key: a source with no sound track (mixers 0) can't, and a
+    /// picture-only one never; a source whose sound is turned off again leaves the list.
+    #[test]
+    fn duck_under_lists_only_sources_that_have_sound() {
+        let s = stage();
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/a.mp3" }), false));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Voice", &json!({ "local_file": "/v.mp3" }), false));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Silent clip", &json!({ "local_file": "/s.mp4" }), false));
+        ok(s.set_tracks("Silent clip", &[]));
+        ok(s.add_filter("Music", "compressor_filter", "Duck", &json!({})));
+        let listed = |s: &Stage| {
+            let opts = ok(s.filter_options("Music", "Duck"));
+            opts.iter().find(|o| o.key == "sidechain_source").map(|o| o.choices.clone()).unwrap_or_default()
+        };
+        assert_eq!(listed(&s), vec!["None", "Voice"], "no sound track, no key");
+        ok(s.set_tracks("Silent clip", &[1]));
+        assert_eq!(listed(&s), vec!["None", "Voice", "Silent clip"]);
+    }
+
+    /// A filter added or pasted through an item takes a name free where it is written: a sound
+    /// filter goes to the source's own list, which can hold a picture filter of that name the
+    /// item's own list doesn't show (its copy removed). Two of a name there: a change by name
+    /// edited the first, a removal took both.
+    #[test]
+    fn a_filter_added_through_an_item_takes_a_name_free_where_it_is_written() {
+        let s = stage();
+        let it = ok(s.add_source("Main", "color_source_v3", "Card", &json!({}), false));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Clip", &json!({ "local_file": "/c.mp4" }), false));
+        ok(s.add_filter("Card", "crop_filter", "Crop", &json!({})));
+        ok(s.set_item_filter_scope("Main", it.id, true));
+        ok(s.remove_item_filter("Main", it.id, "Crop"));
+        assert!(
+            s.add_item_filter("Main", it.id, "gain_filter", "Crop", &json!({})).is_err(),
+            "taken in the source's list"
+        );
+        // Pasted the same way: renamed, never two of a name in the list it lands in.
+        ok(s.add_filter("Clip", "gain_filter", "Crop", &json!({})));
+        ok(s.paste_item_filters("Main", it.id, "Clip"));
+        let names: Vec<String> = ok(s.filter_list("Card")).iter().map(|f| name_of(f).to_string()).collect();
+        let crops = names.iter().filter(|n| *n == "Crop").count();
+        assert_eq!(crops, 1, "one \"Crop\" in the source's list: {names:?}");
+    }
+
+    /// A source called "none" renamed leaves every compressor's "none" (no ducking, the default)
+    /// alone: it turned all of them into ducking under the renamed source.
+    #[test]
+    fn renaming_a_source_called_none_leaves_no_ducking_alone() {
+        let s = stage();
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "none", &json!({ "local_file": "/n.mp3" }), false));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/a.mp3" }), false));
+        ok(s.add_filter("Music", "compressor_filter", "Duck", &json!({})));
+        assert_eq!(ok(s.filter_settings("Music", "Duck"))["sidechain_source"], json!("none"));
+        ok(s.rename("none", "Voice"));
+        assert_eq!(ok(s.filter_settings("Music", "Duck"))["sidechain_source"], json!("none"), "still no ducking");
+    }
+
+    #[test]
+    fn compressor_filter_options_list_other_audio_sources_and_follow_renames() {
+        let s = stage();
+        ok(s.set_channel(3, Some(("coreaudio_input_capture", "Mic", &json!({ "device_id": "default" })))));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Music", &json!({ "local_file": "/a.mp3" }), false));
+        let _ = ok(s.add_source("Main", "color_source_v3", "Back", &json!({}), false));
+        ok(s.add_filter("Music", "compressor_filter", "Duck", &json!({})));
+
+        let opts = ok(s.filter_options("Music", "Duck"));
+        let sc = opts.iter().find(|o| o.key == "sidechain_source").expect("sidechain_source option");
+        assert_eq!(sc.label, "Duck under");
+        assert_eq!(sc.choices, vec!["None", "Mic"]);
+        assert_eq!(sc.values, vec![json!("none"), json!("Mic")]);
+        assert!(!sc.help.is_empty(), "Duck under carries (i) help text");
+
+        // Point Music's compressor at Mic, then rename Mic -> Voice: reference follows.
+        ok(s.update_filter("Music", "Duck", &json!({ "sidechain_source": "Mic" })));
+        ok(s.rename("Mic", "Voice"));
+        assert_eq!(ok(s.filter_settings("Music", "Duck"))["sidechain_source"], json!("Voice"));
+        assert!(s.sidechain_cycles().is_empty());
+
+        // Creating a mutual loop Voice -> Music is surfaced by sidechain_cycles().
+        ok(s.add_filter("Voice", "compressor_filter", "DuckBack", &json!({ "sidechain_source": "Music" })));
+        assert_eq!(s.sidechain_cycles(), vec![("Voice".into(), "Music".into())]);
+    }
+
+    #[test]
+    fn adding_filtered_source_to_vertical_or_another_scene_copies_video_filters_only() {
+        let s = stage();
+        ok(s.start_vertical("Vertical"));
+        ok(s.add_scene("Other"));
+        let dev = json!({ "device": "cam-1" });
+        let main_cam = ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        assert!(!main_cam.own_filters);
+        ok(s.add_filter("Cam", "ferrocast_rounded_corners", "Round", &json!({ "radius": 12 })));
+        ok(s.add_filter("Cam", "gain_filter", "Boost", &json!({ "db": -3.0 })));
+
+        // Reusing an already-filtered camera onto Vertical detaches its video filters automatically.
+        let (vert_cam, reused) = ok(s.add_source_or_reuse("Vertical", "av_capture_input_v2", "Cam V", &dev, true));
+        assert!(reused);
+        assert!(vert_cam.own_filters, "Vertical gets its own copy of existing video filters");
+        let vert_flts = ok(s.item_filters("Vertical", vert_cam.id));
+        assert_eq!(vert_flts.len(), 2);
+        assert_eq!(vert_flts[0].name, "Round");
+        assert_eq!(vert_flts[0].scope.as_deref(), Some("item"));
+        assert_eq!(vert_flts[1].name, "Boost");
+        assert_eq!(vert_flts[1].scope.as_deref(), Some("source"));
+
+        // Editing Vertical's Round filter & adding Tint leaves Main/Cam untouched.
+        ok(s.update_item_filter("Vertical", vert_cam.id, "Round", &json!({ "radius": 4 })));
+        ok(s.add_item_filter("Vertical", vert_cam.id, "ferrocast_border", "Edge", &json!({ "width": 6 })));
+        assert_eq!(ok(s.item_filter_settings("Vertical", vert_cam.id, "Round"))["radius"], 4);
+        assert_eq!(ok(s.filter_settings("Cam", "Round"))["radius"], 12);
+        assert_eq!(ok(s.filters("Cam")).len(), 2);
+
+        // Adding Cam to another normal scene also copies Cam's current video filters cleanly.
+        let other_cam = ok(s.add_existing("Other", "Cam"));
+        assert!(other_cam.own_filters);
+        let other_flts = ok(s.item_filters("Other", other_cam.id));
+        assert_eq!(other_flts.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["Round", "Boost"]);
+        assert_eq!(ok(s.item_filter_settings("Other", other_cam.id, "Round"))["radius"], 12);
+
+        // Sources without video filters (even with audio filters) stay shared by default.
+        ok(s.add_source("Main", "coreaudio_input_capture", "Mic", &json!({}), false));
+        ok(s.add_filter("Mic", "gain_filter", "GateGain", &json!({ "db": 2.0 })));
+        let vert_mic = ok(s.add_existing("Vertical", "Mic"));
+        assert!(!vert_mic.own_filters);
+    }
+
+    #[test]
+    fn a_source_filter_switch_reaches_item_copies_of_the_same_filter() {
+        let s = stage();
+        let dev = json!({ "device": "cam-1" });
+        ok(s.add_source("Main", "av_capture_input_v2", "Cam", &dev, false));
+        ok(s.add_filter("Cam", "ferrocast_rounded_corners", "Round", &json!({ "radius": 12 })));
+        ok(s.add_scene("Other"));
+        let other = ok(s.add_existing("Other", "Cam"));
+        assert!(other.own_filters);
+        // A different kind under the same name on another item is left alone.
+        ok(s.add_scene("Third"));
+        let third = ok(s.add_existing("Third", "Cam"));
+        ok(s.remove_item_filter("Third", third.id, "Round"));
+        ok(s.add_item_filter("Third", third.id, "ferrocast_border", "Round", &json!({ "width": 3 })));
+        ok(s.set_filter_enabled("Cam", "Round", false));
+        assert!(!ok(s.filters("Cam"))[0].enabled);
+        assert!(!ok(s.item_filters("Other", other.id))[0].enabled, "the copy follows the source-level switch");
+        assert!(ok(s.item_filters("Third", third.id))[0].enabled, "another kind is not touched");
+        ok(s.set_filter_enabled("Cam", "Round", true));
+        assert!(ok(s.item_filters("Other", other.id))[0].enabled);
+    }
+
+    #[test]
+    fn item_filter_scope_switches_cleanly_while_audio_stays_shared() {
+        let s = stage();
+        ok(s.add_scene("Two"));
+        let one = ok(s.add_source("Main", "ffmpeg_source", "Clip", &json!({ "local_file": "/a.mp4" }), false));
+        let two = ok(s.add_existing("Two", "Clip"));
+        assert!(!one.own_filters && !two.own_filters);
+
+        ok(s.add_filter("Clip", "ferrocast_rounded_corners", "Round", &json!({ "radius": 20 })));
+        assert_eq!(ok(s.item_filters("Two", two.id)).len(), 1);
+
+        // Detach Two's item, delete Round on Two, add Border on Two; audio filter stays shared.
+        let detached = ok(s.set_item_filter_scope("Two", two.id, true));
+        assert!(detached.own_filters);
+        ok(s.remove_item_filter("Two", two.id, "Round"));
+        ok(s.add_item_filter("Two", two.id, "ferrocast_border", "Edge", &json!({ "width": 5 })));
+        ok(s.add_item_filter("Two", two.id, "gain_filter", "Trim", &json!({ "db": -4.0 })));
+
+        assert_eq!(
+            ok(s.item_filters("Main", one.id)).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["Round", "Trim"],
+            "Main keeps Round and receives shared audio filter Trim"
+        );
+        assert_eq!(
+            ok(s.item_filters("Two", two.id)).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["Edge", "Trim"],
+            "Two has only Edge + shared Trim"
+        );
+
+        // Switching Two back to shared restores Cam's shared video filters.
+        let shared = ok(s.set_item_filter_scope("Two", two.id, false));
+        assert!(!shared.own_filters);
+        assert_eq!(
+            ok(s.item_filters("Two", two.id)).iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["Round", "Trim"]
+        );
+    }
+
+    #[test]
+    fn item_override_crop_frames_independently_and_roundtrips_save_load() {
+        let s = stage();
+        ok(s.start_vertical("Vertical"));
+        let main_card = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Card",
+            &json!({ "color": 4278190335u32, "width": 1920, "height": 1080 }),
+            false,
+        ));
+        let vert_card = ok(s.add_existing("Vertical", "Card"));
+        let vert_card = ok(s.set_item_filter_scope("Vertical", vert_card.id, true));
+        ok(s.add_item_filter("Vertical", vert_card.id, "crop_filter", "Crop", &json!({ "left": 200, "top": 100 })));
+
+        let m = ok(s.items("Main")).into_iter().find(|i| i.id == main_card.id).unwrap();
+        let v = ok(s.items("Vertical")).into_iter().find(|i| i.id == vert_card.id).unwrap();
+        assert_eq!(m.frame[0..4], [1920.0, 0.0, 0.0, 1080.0]);
+        assert_eq!(v.frame[0..4], [1720.0, 0.0, 0.0, 980.0]);
+        let vt = ok(s.transform("Vertical", vert_card.id));
+        assert_eq!((vt.width, vt.height), (1720, 980));
+
+        // Save and reload preserves override and frame; old collection without override stays shared.
+        let saved = s.save("Roundtrip");
+        let imported = ferrocore::obs::import(&saved, (1920, 1080));
+        let main_imp = imported.scenes.iter().find(|(n, _)| n == "Main").unwrap().1.clone();
+        let vert_imp = imported.scenes.iter().find(|(n, _)| n == "Vertical").unwrap().1.clone();
+        assert!(main_imp[0].effects.is_empty());
+        assert_eq!(vert_imp[0].effects.len(), 1);
+
+        let reloaded = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &saved, "Main"));
+        let rv = ok(reloaded.items("Vertical")).into_iter().find(|i| i.id == vert_card.id).unwrap();
+        assert!(rv.own_filters);
+        assert_eq!(rv.frame[0..4], [1720.0, 0.0, 0.0, 980.0]);
+    }
+
+    #[test]
+    fn paste_move_duplicate_and_item_picture_respect_item_filter_overrides() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        ok(s.start_vertical("Vertical"));
+        let main_red = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Red",
+            &json!({ "color": 4278190335u32, "width": 320, "height": 180 }),
+            false,
+        ));
+        ok(s.add_source("Main", "color_source_v3", "Donor", &json!({ "width": 64, "height": 36 }), false));
+        ok(s.add_filter("Donor", "color_filter_v2", "Dim", &json!({ "brightness": -0.5 })));
+        ok(s.add_filter("Donor", "ferrocast_rounded_corners", "Round", &json!({ "radius": 30 })));
+
+        let vert_red = ok(s.add_existing("Vertical", "Red"));
+        ok(s.set_item_filter_scope("Vertical", vert_red.id, true));
+        ok(s.paste_item_filters("Vertical", vert_red.id, "Donor"));
+        ok(s.move_item_filter("Vertical", vert_red.id, "Round", ItemEdit::Top));
+        let flts = ok(s.item_filters("Vertical", vert_red.id));
+        assert_eq!(flts.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["Round", "Dim"]);
+        ok(s.set_item_filter_enabled("Vertical", vert_red.id, "Round", false));
+        assert!(!ok(s.item_filters("Vertical", vert_red.id))[0].enabled);
+
+        // Main item picture has no filters; Vertical item picture shows Dim only (not Round).
+        // Passing mismatched source name onto item picture fails cleanly.
+        assert!(s.item_picture_pixels_for(Some("Donor"), "Vertical", vert_red.id, 160, true).is_err());
+        let (main_px, _, _, _) = ok(s.item_picture_pixels("Main", main_red.id, 160, true)).unwrap();
+        let (vert_px, vw, vh, _) = ok(s.item_picture_pixels("Vertical", vert_red.id, 160, true)).unwrap();
+        let mid = ((vh as usize / 2) * vw as usize + (vw as usize / 2)) * 4;
+        assert!(main_px[mid] > vert_px[mid] + 40, "item picture renders item override");
+
+        // Paste filters directly from Vertical's item override back onto Main's item.
+        ok(s.paste_filters_from("Red", "", Some(("Vertical", vert_red.id))));
+        assert_eq!(ok(s.filters("Red")).len(), 2);
+
+        // Duplicating Vertical item copies its active item filters onto the duplicated source.
+        ok(s.edit_item("Vertical", vert_red.id, ItemEdit::Duplicate));
+        let vert_items = ok(s.items("Vertical"));
+        assert_eq!(vert_items.len(), 2);
+        let dup = vert_items.iter().find(|i| i.id != vert_red.id).unwrap();
+        assert!(!dup.own_filters);
+        assert_eq!(ok(s.filters(&dup.name)).len(), 2);
     }
 }

@@ -104,7 +104,7 @@ impl Default for ShowConfig {
         ShowConfig {
             preset_id: None,
             starting_scene: None,
-            // no countdown until a live scene is chosen, so the default config is valid
+            // no countdown by default
             countdown_s: 0,
             live_scene: None,
             alerts_on: true,
@@ -127,6 +127,18 @@ impl Default for ShowConfig {
 }
 
 impl ShowConfig {
+    /// Whether this Show config does more than a plain stream (starting or ending scene,
+    /// countdown, Discord go-live post, preset, or replay buffer). Matches the dashboard's
+    /// Show vs "Just go live" choice so hotkeys and backend actions agree.
+    pub fn is_show_style(&self) -> bool {
+        self.discord
+            || self.starting_scene.is_some()
+            || self.ending_scene.is_some()
+            || self.countdown_s > 0
+            || self.preset_id.is_some()
+            || self.replay_buffer
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for (field, s) in [
             ("starting_scene", &self.starting_scene),
@@ -146,9 +158,6 @@ impl ShowConfig {
             && (m.trim().is_empty() || m.chars().count() > 400 || m.chars().any(char::is_control))
         {
             return Err("at_zero.chat: 1 to 400 characters on one line, or turn it off.".into());
-        }
-        if self.countdown_s > 0 && self.at_zero.switch && self.live_scene.is_none() {
-            return Err("live_scene: pick the scene to switch to when the countdown ends.".into());
         }
         if let Some(m) = &self.recap_message {
             if m.trim().is_empty() || m.chars().count() > 400 {
@@ -190,6 +199,8 @@ pub const SILENT_DB: f32 = -60.0;
 
 // ------------------------------------------------------------------ live watch
 
+pub mod audio_watch;
+
 /// One look at what's going out, every couple of seconds while live (ms since the epoch).
 #[derive(Debug, Clone, Default)]
 pub struct WatchSample {
@@ -200,6 +211,13 @@ pub struct WatchSample {
     pub cameras: Vec<(String, bool, u64)>,
     /// Each running destination (its name) and whether it's sending.
     pub destinations: Vec<(String, bool)>,
+    /// Every mic's levels (the auto-discovered ones too).
+    pub levels: Vec<audio_watch::MicLevel>,
+    /// The scene on air, when it could be read.
+    pub scene: Option<audio_watch::SceneLook>,
+    /// The scene on air is one the Show's own flow uses (starting, ending, BRB): a mic is often
+    /// muted on purpose there, so no muted or quiet notice.
+    pub scene_exempt: bool,
 }
 
 /// A live mistake to tell the streamer about, or that it's fixed (`cleared`).
@@ -208,8 +226,74 @@ pub struct LiveAlert {
     pub id: String,
     /// `warn` or `error`.
     pub level: &'static str,
+    /// One short line (about 60 characters).
     pub message: String,
+    /// The rest (a cause, what to check), behind an (i) on the page; an older dashboard ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub cleared: bool,
+    /// The source (or scene) this is about, for a one-tap fix; an older dashboard ignores it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The one-tap fix the page may offer: `unmute`, `gain_up` (+6 dB) or `pick_scene`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<&'static str>,
+    /// A second button that says "this is on purpose": `muted_on_purpose` silences this alert
+    /// for the rest of the stream (`LiveWatch::silence`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dismiss: Option<&'static str>,
+}
+
+impl LiveAlert {
+    /// Something wrong, in one line.
+    pub fn raised(id: impl Into<String>, level: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            level,
+            message: message.into(),
+            detail: None,
+            cleared: false,
+            source: None,
+            action: None,
+            dismiss: None,
+        }
+    }
+
+    /// It's fine again, in one line.
+    pub fn fixed(id: impl Into<String>, level: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            level,
+            message: message.into(),
+            detail: None,
+            cleared: true,
+            source: None,
+            action: None,
+            dismiss: None,
+        }
+    }
+
+    /// The one-tap fix for `source`.
+    #[must_use]
+    pub fn action(mut self, source: &str, action: &'static str) -> Self {
+        self.source = Some(source.to_string());
+        self.action = Some(action);
+        self
+    }
+
+    /// A button that says it is on purpose (the alert is silenced for the stream).
+    #[must_use]
+    pub fn dismissable(mut self, dismiss: &'static str) -> Self {
+        self.dismiss = Some(dismiss);
+        self
+    }
+
+    /// What the line leaves out.
+    #[must_use]
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
 }
 
 /// Since when each thing has been wrong, and what's been said: a pure state machine the
@@ -224,6 +308,12 @@ pub struct LiveWatch {
     sending: std::collections::HashMap<String, i64>,
     /// Alerts raised and not yet cleared.
     raised: std::collections::BTreeSet<String>,
+    /// Per-mic history (muted talk, silence, the voice's level) and since when the scene on air
+    /// has had no picture.
+    mics: std::collections::HashMap<String, audio_watch::MicTrack>,
+    empty_since: Option<i64>,
+    /// Alerts the streamer said are on purpose, for this stream.
+    silenced: std::collections::BTreeSet<String>,
 }
 
 impl LiveWatch {
@@ -232,9 +322,30 @@ impl LiveWatch {
         *self = LiveWatch::default();
     }
 
+    /// A new stream, or a wake: everything starts fresh, and what was raised is told cleared (the
+    /// page would keep showing it, and nothing else would ever clear it). Returns those frames.
+    pub fn reset_telling(&mut self) -> Vec<LiveAlert> {
+        let told: Vec<LiveAlert> =
+            self.raised.iter().map(|id| LiveAlert::fixed(id.clone(), "warn", "That's no longer watched.")).collect();
+        self.reset();
+        told
+    }
+
+    /// The streamer says this alert is on purpose (a muted mic): it is cleared now and not
+    /// raised again for the rest of the stream. Returns the frame that clears it, if it was up.
+    pub fn silence(&mut self, id: &str) -> Option<LiveAlert> {
+        self.silenced.insert(id.to_string());
+        self.raised.remove(id).then(|| LiveAlert::fixed(id, "warn", "Silenced for this stream."))
+    }
+
     /// The alerts raised now (and not cleared).
     pub fn raised(&self) -> Vec<String> {
         self.raised.iter().cloned().collect()
+    }
+
+    /// Tracked `(heard, changed, dark, sending)` map sizes (for monitoring and soak tests).
+    pub fn tracked_counts(&self) -> (usize, usize, usize, usize) {
+        (self.heard.len(), self.changed.len(), self.dark.len(), self.sending.len())
     }
 
     /// One sample → the alerts to raise and to clear.
@@ -244,20 +355,25 @@ impl LiveWatch {
             return out;
         }
         let secs = |since: i64| (s.at - since).max(0) / 1000;
-        let mut set =
-            |out: &mut Vec<LiveAlert>, id: String, bad: bool, level: &'static str, message: String, fixed: String| {
-                match (bad, self.raised.contains(&id)) {
-                    (true, false) => {
-                        self.raised.insert(id.clone());
-                        out.push(LiveAlert { id, level, message, cleared: false });
-                    }
-                    (false, true) => {
-                        self.raised.remove(&id);
-                        out.push(LiveAlert { id, level, message: fixed, cleared: true });
-                    }
-                    _ => {}
+        let mut set = |out: &mut Vec<LiveAlert>,
+                       id: String,
+                       bad: bool,
+                       level: &'static str,
+                       message: String,
+                       detail: &str,
+                       fixed: String| {
+            match (bad, self.raised.contains(&id)) {
+                (true, false) => {
+                    self.raised.insert(id.clone());
+                    out.push(LiveAlert::raised(id, level, message).detail(detail));
                 }
-            };
+                (false, true) => {
+                    self.raised.remove(&id);
+                    out.push(LiveAlert::fixed(id, level, fixed));
+                }
+                _ => {}
+            }
+        };
         for (name, db) in &s.mics {
             let heard = *self.heard.entry(name.clone()).or_insert(s.at);
             let heard = if *db > SILENT_DB { s.at } else { heard };
@@ -268,10 +384,8 @@ impl LiveWatch {
                 format!("mic:{name}"),
                 bad,
                 "error",
-                format!(
-                    "{name} hasn't heard a sound for {} minutes: is it unplugged or muted on the device?",
-                    secs(heard) / 60
-                ),
+                format!("{name} has no sound ({} min)", secs(heard) / 60),
+                "Is it unplugged, or muted on the device?",
                 format!("{name} hears you again."),
             );
         }
@@ -293,10 +407,8 @@ impl LiveWatch {
                 format!("camera:{name}:black"),
                 black_bad,
                 "error",
-                format!(
-                    "{name} has been black for {} s: is the lens covered, or another app using it?",
-                    secs(dark_since)
-                ),
+                format!("{name} is black ({} s)", secs(dark_since)),
+                "Is the lens covered, or is another app using the camera?",
                 format!("{name} has a picture again."),
             );
             let frozen_bad = cfg.camera_frozen_s > 0 && !*black && secs(changed) >= i64::from(cfg.camera_frozen_s);
@@ -305,7 +417,8 @@ impl LiveWatch {
                 format!("camera:{name}:frozen"),
                 frozen_bad,
                 "warn",
-                format!("{name} has shown the very same picture for {} s: it may have frozen.", secs(changed)),
+                format!("{name} looks frozen ({} s)", secs(changed)),
+                "It shows the same picture, so it may have frozen. Reconnect or restart it.",
                 format!("{name} is moving again."),
             );
         }
@@ -318,12 +431,21 @@ impl LiveWatch {
                 format!("destination:{name}"),
                 bad,
                 "error",
-                format!("{name} hasn't been getting your stream for {} s.", secs(sent)),
+                format!("{name} isn't getting your stream ({} s)", secs(sent)),
+                "Look at its state in Go live: it says why.",
                 format!("{name} is getting your stream again."),
             );
         }
+        self.tick_audio(cfg, s, &mut out);
         // Gone from the sample (a camera removed, a destination stopped): not watched, so
-        // whatever it raised is cleared (BRB by itself comes back too).
+        // drop its tracking state and clear whatever it raised (BRB by itself comes back too).
+        let live_mics: std::collections::HashSet<&str> = s.mics.iter().map(|(n, _)| n.as_str()).collect();
+        let live_cams: std::collections::HashSet<&str> = s.cameras.iter().map(|(n, _, _)| n.as_str()).collect();
+        let live_dests: std::collections::HashSet<&str> = s.destinations.iter().map(|(n, _)| n.as_str()).collect();
+        self.heard.retain(|n, _| live_mics.contains(n.as_str()));
+        self.changed.retain(|n, _| live_cams.contains(n.as_str()));
+        self.dark.retain(|n, _| live_cams.contains(n.as_str()));
+        self.sending.retain(|n, _| live_dests.contains(n.as_str()));
         let mut present = std::collections::BTreeSet::new();
         for (n, _) in &s.mics {
             present.insert(format!("mic:{n}"));
@@ -335,10 +457,18 @@ impl LiveWatch {
         for (n, _) in &s.destinations {
             present.insert(format!("destination:{n}"));
         }
+        for m in &s.levels {
+            for kind in ["muted", "quiet", "silent"] {
+                present.insert(format!("mic:{kind}:{}", m.name));
+            }
+        }
+        if s.scene.is_some() || self.empty_since.is_some() {
+            present.insert("scene:empty".to_string());
+        }
         let gone: Vec<String> = self.raised.iter().filter(|id| !present.contains(*id)).cloned().collect();
         for id in gone {
             self.raised.remove(&id);
-            out.push(LiveAlert { id, level: "warn", message: "That's no longer watched.".into(), cleared: true });
+            out.push(LiveAlert::fixed(id, "warn", "That's no longer watched."));
         }
         out
     }
@@ -390,13 +520,7 @@ pub fn ready(checks: &[Check]) -> bool {
 /// The disk check, from the free space where recordings go (MB).
 pub fn disk_check(free_mb: Option<f64>, min_gb: u32) -> Check {
     match free_mb {
-        None => Check::new(
-            "disk",
-            "Disk space",
-            CheckStatus::Skip,
-            "The Studio isn't started, so free space is unknown.",
-            None,
-        ),
+        None => Check::new("disk", "Disk space", CheckStatus::Skip, "Studio isn't started: free space unknown.", None),
         Some(mb) => {
             let gb = mb / 1024.0;
             let label = format!("{gb:.0} GB free where recordings go.");
@@ -405,7 +529,7 @@ pub fn disk_check(free_mb: Option<f64>, min_gb: u32) -> Check {
                     "disk",
                     "Disk space",
                     CheckStatus::Fail,
-                    format!("{label} Recordings and replays will fail."),
+                    format!("{gb:.0} GB free: recordings and replays will fail."),
                     fix("Free up space", "#/studio/golive"),
                 )
             } else if gb < f64::from(min_gb) {
@@ -413,7 +537,7 @@ pub fn disk_check(free_mb: Option<f64>, min_gb: u32) -> Check {
                     "disk",
                     "Disk space",
                     CheckStatus::Warn,
-                    format!("{label} Less than the {min_gb} GB you asked for."),
+                    format!("{gb:.0} GB free, less than your {min_gb} GB minimum."),
                     None,
                 )
             } else {
@@ -623,7 +747,7 @@ impl ScenesConfig {
         let asked = asked.trim();
         if asked.is_empty() {
             return Err(if self.chat_allowed.is_empty() {
-                "No scenes are allowed from chat yet (Studio, OBS).".into()
+                "No scenes allowed from chat yet: tick some in Scene control.".into()
             } else {
                 format!("Scenes: {}.", self.chat_allowed.join(", "))
             });
@@ -870,7 +994,7 @@ mod tests {
         let mut c = ShowConfig::default();
         assert!(c.validate().is_ok(), "the default config saves as it is");
         c.countdown_s = 300;
-        assert!(c.validate().unwrap_err().starts_with("live_scene"), "a countdown needs a live scene");
+        assert!(c.validate().is_ok(), "a countdown without live_scene uses the scene on air at Go live");
         c.live_scene = Some("Gameplay".into());
         assert!(c.validate().is_ok());
         c.countdown_s = 5;
@@ -1016,6 +1140,7 @@ mod watch_tests {
             mics: vec![("Mic".into(), db)],
             cameras: vec![("Cam".into(), black, sig)],
             destinations: vec![("Twitch".into(), up)],
+            ..Default::default()
         };
         // All fine, the picture moving.
         for t in 0..10 {
@@ -1028,8 +1153,15 @@ mod watch_tests {
         }
         assert_eq!(said.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), ["camera:Cam:black"]);
         assert!(!said[0].cleared);
+        // One short line, and what to check behind the (i).
+        assert!(said[0].message.chars().count() <= 60, "{}", said[0].message);
+        assert!(said[0].detail.as_deref().unwrap_or("").contains("lens"), "{:?}", said[0]);
+        let wire = serde_json::to_value(&said[0]).unwrap();
+        assert!(wire["detail"].is_string() && wire["cleared"] == false, "{wire}");
         // Back, moving: cleared.
         let back = w.tick(&cfg, &sample(40, -20.0, false, 99, true));
+        let cleared = serde_json::to_value(back.iter().find(|a| a.cleared).unwrap()).unwrap();
+        assert!(cleared.get("detail").is_none(), "a plain line has no detail key: {cleared}");
         assert!(back.iter().any(|a| a.id == "camera:Cam:black" && a.cleared));
         // Frozen (not black) for 30 s.
         let mut said = Vec::new();
@@ -1061,5 +1193,24 @@ mod watch_tests {
         assert!(c.validate().unwrap_err().contains("watch.mic_silent_s"));
         c.watch.mic_silent_s = 0;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn live_watch_prunes_removed_sources_and_destinations() {
+        let cfg = LiveWatchConfig::default();
+        let mut w = LiveWatch::default();
+        for i in 0..1_000 {
+            let s = WatchSample {
+                at: i * 2_000,
+                mics: vec![(format!("Mic {i}"), -90.0)],
+                cameras: vec![(format!("Cam {i}"), true, i as u64)],
+                destinations: vec![(format!("Dest {i}"), false)],
+                ..Default::default()
+            };
+            let _ = w.tick(&cfg, &s);
+            assert_eq!(w.tracked_counts(), (1, 1, 1, 1));
+        }
+        let _ = w.tick(&cfg, &WatchSample { at: 3_000_000, ..Default::default() });
+        assert_eq!(w.tracked_counts(), (0, 0, 0, 0));
     }
 }

@@ -13,6 +13,38 @@ use crate::{Kind, Kinds, OptionInfo};
 /// Kinds whose form lists what's on this computer now (cameras, screens, windows, mics, NDI):
 /// reading those can take seconds (on Windows FFmpeg asks DirectShow for the cameras), so
 /// they're read off the window's thread and kept a moment for the next ask.
+/// The options our own encoder offers for encoder `id` (the settings' "Your own"): x264's
+/// preset and tune; the system's encoders take their settings from the plain ones.
+pub fn own_encoder_options(id: &str) -> Vec<serde_json::Value> {
+    if !id.to_ascii_lowercase().contains("x264") {
+        return Vec::new();
+    }
+    let list = |key: &str, label: &str, help: &str, names: &[&str], default: &str| {
+        serde_json::json!({
+            "key": key, "label": label, "kind": "list", "help": help,
+            "visible": true, "enabled": true, "min": null, "max": null, "step": null,
+            "slider": false, "suffix": "", "default": default,
+            "choices": names, "values": names, "group": []
+        })
+    };
+    vec![
+        list(
+            "preset",
+            "Preset",
+            "Slower presets look better at the same size and use more of the computer.",
+            &ferrocore::video::X264_PRESETS,
+            "veryfast",
+        ),
+        list(
+            "tune",
+            "Tune",
+            "What the picture is mostly like; leave it off if unsure.",
+            &ferrocore::video::X264_TUNES,
+            "",
+        ),
+    ]
+}
+
 pub fn lists_devices(kind: &str) -> bool {
     matches!(
         kind,
@@ -166,6 +198,7 @@ pub fn kinds() -> Kinds {
             kind("ferrocast_look", "Look"),
             kind("ferrocast_shader", "Shader Effect"),
             kind("ferrocast_freeze", "Freeze"),
+            kind("ferrocast_video_delay", "Video Delay"),
             kind("gain_filter", "Gain"),
             kind("noise_gate_filter", "Noise Gate"),
             kind("compressor_filter", "Compressor"),
@@ -508,6 +541,15 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
         "ferrocast_replay" => vec![opt("switch", "Show its scene while it plays", "bool")],
         // Nothing to set: its switch freezes and unfreezes.
         "ferrocast_freeze" => vec![],
+        // Pictures held in memory: the longer and bigger, the more it takes (capped).
+        "ferrocast_video_delay" => vec![
+            opt("delay_ms", "Delay", "int").range(0.0, 20_000.0, 10.0).unit(" ms").hint(
+                "Pictures wait in memory, as video. The longest that fits: about 5.7 s at 1080p30, 2.9 s at 1080p60, \
+                 1.6 s at 1440p60, 0.7 s at 4K60 (a third of that for a picture with transparency). \
+                 Past it the delay is cut short.",
+            ),
+            opt("audio", "Delay its sound too", "bool"),
+        ],
         // Its choices are the collection's sources and scenes (Stage::options fills them in).
         "ferrocast_clone" => {
             vec![opt("clone", "Source", "list").choices(&[]), opt("filters", "Include its filters", "bool")]
@@ -580,11 +622,24 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
         ],
         "ffmpeg_source" => vec![
             opt("is_local_file", "From a file on this computer", "bool"),
-            opt("local_file", "File", "path").file(MEDIA),
-            opt("looping", "Loop", "bool"),
+            opt("local_file", "File", "path").file(MEDIA).when("is_local_file", &[json!(true)]),
+            opt("input", "Address", "text").when("is_local_file", &[json!(false)]),
+            opt("input_format", "Format", "text").when("is_local_file", &[json!(false)]),
+            opt("reconnect_delay_sec", "Reconnect after", "int")
+                .range(1.0, 60.0, 1.0)
+                .unit(" s")
+                .when("is_local_file", &[json!(false)]),
+            opt("ffmpeg_options", "FFmpeg options", "text").when("is_local_file", &[json!(false)]),
+            opt("looping", "Loop", "bool").when("is_local_file", &[json!(true)]),
             opt("restart_on_activate", "Start over when shown", "bool"),
             opt("close_when_inactive", "Let go of the file when hidden", "bool"),
-            opt("speed_percent", "Speed", "int").range(1.0, 200.0, 1.0).slider().unit("%"),
+            opt("clear_on_media_end", "Clear when it ends", "bool").when("is_local_file", &[json!(true)]),
+            opt("hw_decode", "Hardware decoding", "bool"),
+            opt("speed_percent", "Speed", "int")
+                .range(1.0, 200.0, 1.0)
+                .slider()
+                .unit("%")
+                .when("is_local_file", &[json!(true)]),
         ],
         "screen_capture" => {
             let mut v = vec![opt("type", "What to capture", "list").choices(&[
@@ -739,6 +794,7 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("height", "Height", "int").range(1.0, 8192.0, 1.0),
             opt("fps", "Frame rate", "int").range(1.0, 60.0, 1.0),
             opt("css", "Your own CSS", "text").multiline(),
+            opt("reroute_audio", "Control audio in Ferrocast", "bool"),
         ],
         // Transitions.
         "swipe_transition" | "slide_transition" => {
@@ -882,22 +938,30 @@ fn form(kind: &str) -> Option<Vec<OptionInfo>> {
             opt("attack_time", "Attack", "int").range(1.0, 500.0, 1.0).unit(" ms"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
             opt("output_gain", "Volume after", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
+            opt("sidechain_source", "Duck under", "list")
+                .choices(&[("None", json!("none"))])
+                .hint("Lower this sound while another source plays, like your mic."),
         ],
         "limiter_filter" => vec![
             opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
         ],
-        "expander_filter" | "upward_compressor_filter" => vec![
-            // OBS's ranges: an expander's ratio is 1 to 20, an upward compressor's 0 to 1.
-            if kind == "upward_compressor_filter" {
-                opt("ratio", "Ratio", "float").range(0.0, 1.0, 0.01).slider().unit(":1")
-            } else {
-                opt("ratio", "Ratio", "float").range(1.0, 20.0, 0.1).slider().unit(":1")
-            },
+        "expander_filter" => vec![
+            opt("presets", "Preset", "list").choices(&[("Expander", json!("expander")), ("Gate", json!("gate"))]),
+            opt("ratio", "Ratio", "float").range(1.0, 20.0, 0.1).slider().unit(":1"),
             opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
             opt("attack_time", "Attack", "int").range(1.0, 100.0, 1.0).unit(" ms"),
             opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
             opt("output_gain", "Volume after", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
+            opt("detector", "Detection", "list").choices(&[("RMS", json!("RMS")), ("Peak", json!("peak"))]),
+        ],
+        "upward_compressor_filter" => vec![
+            opt("ratio", "Ratio", "float").range(0.0, 1.0, 0.01).slider().unit(":1"),
+            opt("threshold", "Threshold", "float").range(-60.0, 0.0, 0.1).slider().unit(" dB"),
+            opt("attack_time", "Attack", "int").range(1.0, 100.0, 1.0).unit(" ms"),
+            opt("release_time", "Release", "int").range(1.0, 1000.0, 1.0).unit(" ms"),
+            opt("output_gain", "Volume after", "float").range(-32.0, 32.0, 0.1).slider().unit(" dB"),
+            opt("knee_width", "Knee width", "float").range(0.0, 20.0, 0.5).slider().unit(" dB"),
         ],
         "basic_eq_filter" => vec![
             opt("low", "Low", "float").range(-20.0, 20.0, 0.1).slider().unit(" dB"),
@@ -976,6 +1040,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
         "ndi_source" => json!({ "ndi_source_name": "" }),
         "ferrocast_clone" => json!({ "clone": "", "filters": true }),
         "ferrocast_freeze" => json!({}),
+        "ferrocast_video_delay" => json!({ "delay_ms": 200, "audio": false }),
         "ferrocast_replay" => json!({ "local_file": "", "switch": true }),
         "ferrocast_visualizer" => json!({
             "source": "", "bars": 32, "width": 800, "height": 200, "color": 0xFFFF_FFFFu32, "mirror": false,
@@ -1011,9 +1076,20 @@ pub fn defaults(kind: &str) -> Option<Value> {
             "drop_shadow": false, "word_wrap": false, "custom_width": 0, "antialiasing": true,
             "align": "left", "bk_color": 0xFF00_0000u32, "bk_opacity": 0,
         }),
-        "ffmpeg_source" => {
-            json!({ "is_local_file": true, "local_file": "", "looping": false, "restart_on_activate": true, "close_when_inactive": false, "speed_percent": 100 })
-        }
+        "ffmpeg_source" => json!({
+            "is_local_file": true,
+            "local_file": "",
+            "input": "",
+            "input_format": "",
+            "reconnect_delay_sec": 2,
+            "ffmpeg_options": "",
+            "looping": false,
+            "restart_on_activate": true,
+            "close_when_inactive": false,
+            "clear_on_media_end": true,
+            "hw_decode": true,
+            "speed_percent": 100,
+        }),
         "screen_capture" => json!({ "type": 0, "show_cursor": true, "application": "", "exclude_apps": [] }),
         "av_capture_input" | "av_capture_input_v2" => json!({ "device": "", "resolution": "", "fps": 0 }),
         "coreaudio_input_capture" => json!({ "device_id": "default" }),
@@ -1030,6 +1106,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
             "is_local_file": false, "local_file": "", "url": "https://obsproject.com/browser-source",
             "width": 800, "height": 600, "fps": 30,
             "css": "body { background-color: rgba(0, 0, 0, 0); margin: 0px auto; overflow: hidden; }",
+            "reroute_audio": false,
         }),
         "chroma_key_filter" | "chroma_key_filter_v2" => {
             json!({ "key_color_type": "green", "similarity": 400, "smoothness": 80, "spill": 100, "opacity": 1.0, "contrast": 0.0, "brightness": 0.0, "gamma": 0.0 })
@@ -1062,7 +1139,7 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "speed_x": 0.0, "speed_y": 0.0, "limit_cx": false, "cx": 100, "limit_cy": false, "cy": 100, "loop": true })
         }
         "gain_filter" => json!({ "db": 0.0 }),
-        "ferrocast_deepfilter" => json!({ "strength": 100 }),
+        "ferrocast_deepfilter" => json!({ "strength": 40 }),
         "ferrocast_vst" => json!({ "path": "", "cid": "", "name": "", "state": "" }),
         "noise_suppress_filter" | "noise_suppress_filter_v2" => json!({ "method": "rnnoise", "suppress_level": -30 }),
         "ferrocast_remove_background" => json!({ "mode": 0, "soft": 10, "blur": 24 }),
@@ -1070,14 +1147,21 @@ pub fn defaults(kind: &str) -> Option<Value> {
             json!({ "close_threshold": -32.0, "open_threshold": -26.0, "attack_time": 25, "hold_time": 200, "release_time": 150 })
         }
         "compressor_filter" => {
-            json!({ "ratio": 10.0, "threshold": -18.0, "attack_time": 6, "release_time": 60, "output_gain": 0.0 })
+            json!({
+                "ratio": 10.0,
+                "threshold": -18.0,
+                "attack_time": 6,
+                "release_time": 60,
+                "output_gain": 0.0,
+                "sidechain_source": "none"
+            })
         }
         "limiter_filter" => json!({ "threshold": -6.0, "release_time": 60 }),
         "expander_filter" => {
-            json!({ "ratio": 2.0, "threshold": -40.0, "attack_time": 10, "release_time": 50, "output_gain": 0.0 })
+            json!({ "presets": "expander", "ratio": 2.0, "threshold": -40.0, "attack_time": 10, "release_time": 50, "output_gain": 0.0, "detector": "RMS" })
         }
         "upward_compressor_filter" => {
-            json!({ "ratio": 0.5, "threshold": -20.0, "attack_time": 10, "release_time": 50, "output_gain": 0.0 })
+            json!({ "ratio": 0.5, "threshold": -20.0, "attack_time": 10, "release_time": 50, "output_gain": 0.0, "knee_width": 10.0 })
         }
         "basic_eq_filter" => json!({ "low": 0.0, "mid": 0.0, "high": 0.0 }),
         "invert_polarity_filter" => json!({}),

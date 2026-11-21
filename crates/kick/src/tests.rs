@@ -295,3 +295,42 @@ fn kick_servers_get_ivs_app_when_kick_leaves_it_out() {
     assert_eq!(with_app("rtmps://x.live-video.net:443/app/"), "rtmps://x.live-video.net:443/app");
     assert_eq!(with_app(" rtmps://x/custom "), "rtmps://x/custom");
 }
+
+/// The relay already spent Kick's refresh token when the new one comes back: a save that fails
+/// (a keychain hiccup) must not throw it away, and is tried again at the next use.
+#[tokio::test]
+async fn a_refresh_whose_save_fails_keeps_the_new_tokens_and_saves_them_later() {
+    let (base, seen) = fake_api(true).await;
+    let tokens = KickTokens { access_token: "old".into(), refresh_token: "r".into(), expires_at: now_ms() + 3_600_000 };
+    let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let saved = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (at, sv, sn) = (attempts.clone(), saved.clone(), seen.clone());
+    let kick = KickApi::new(
+        &base,
+        tokens,
+        Arc::new(move |_rt| {
+            let sn = sn.clone();
+            Box::pin(async move {
+                sn.lock().unwrap().refreshed += 1;
+                Ok(KickTokens {
+                    access_token: "new".into(),
+                    refresh_token: "r2".into(),
+                    expires_at: now_ms() + 3_600_000,
+                })
+            })
+        }),
+        Arc::new(move |t| {
+            if at.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err("the keychain is locked".into());
+            }
+            sv.lock().unwrap().push(t.refresh_token.clone());
+            Ok(())
+        }),
+    );
+    assert_eq!(kick.me().await.unwrap().id, "42", "the call goes through on the new tokens");
+    assert_eq!(seen.lock().unwrap().refreshed, 1);
+    assert!(saved.lock().unwrap().is_empty());
+    kick.me().await.unwrap();
+    assert_eq!(*saved.lock().unwrap(), vec!["r2".to_string()], "the next use saved them");
+    assert_eq!(seen.lock().unwrap().refreshed, 1, "no second refresh");
+}

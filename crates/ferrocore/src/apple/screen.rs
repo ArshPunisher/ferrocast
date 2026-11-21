@@ -15,13 +15,18 @@ use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send};
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_core_video::{
-    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferGetHeight, CVPixelBufferGetPixelFormatType,
-    CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRow,
+    CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount, CVPixelBufferGetWidth, CVPixelBufferGetWidthOfPlane,
+    CVPixelBufferIsPlanar, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+    kCVPixelFormatType_32ARGB, kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA,
+    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    kCVPixelFormatType_422YpCbCr8, kCVPixelFormatType_422YpCbCr8_yuvs, kCVPixelFormatType_422YpCbCr8FullRange,
 };
 use objc2_foundation::{NSArray, NSError};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCRunningApplication, SCShareableContent, SCStream, SCStreamConfiguration,
-    SCStreamOutput, SCStreamOutputType, SCWindow,
+    SCStreamDelegate, SCStreamErrorCode, SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 
 use crate::{AvError, Picture};
@@ -133,10 +138,18 @@ unsafe fn apps_filter(
     }
 }
 
-/// How long ScreenCaptureKit gets to answer.
+/// How long ScreenCaptureKit gets to answer startup queries.
 const WAIT: Duration = Duration::from_secs(10);
+/// How long Drop waits for `stopCaptureWithCompletionHandler:` when shutting down a live stream.
+const STOP_WAIT: Duration = Duration::from_millis(200);
+/// Maximum time `follow_apps` holds frames waiting for `updateContentFilter_completionHandler:`.
+const FILTER_WAIT: Duration = Duration::from_secs(2);
 /// kCVPixelFormatType_32BGRA.
-const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
+const BGRA: u32 = kCVPixelFormatType_32BGRA;
+
+fn stop_wait_timeout(was_stopped: bool) -> Option<Duration> {
+    (!was_stopped).then_some(STOP_WAIT)
+}
 
 fn content() -> Result<Retained<SCShareableContent>, AvError> {
     let (tx, rx) = mpsc::channel();
@@ -181,6 +194,15 @@ pub fn still(target: Target, width: u32) -> Result<Picture, AvError> {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGGetOnlineDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    /// Whether Screen Recording is allowed to this app now. Never shows a prompt.
+    fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
+/// Whether macOS lets this app record the screen now (System Settings → Privacy & Security),
+/// asked without prompting.
+pub fn screen_access_granted() -> bool {
+    // SAFETY: a plain CoreGraphics query with no arguments.
+    unsafe { CGPreflightScreenCaptureAccess() }
 }
 
 #[link(name = "ColorSync", kind = "framework")]
@@ -406,6 +428,46 @@ struct Shared {
     hold: AtomicBool,
     /// A window capture: its stream, kept at the window's own size as it is resized.
     fit: Mutex<Option<WindowFit>>,
+    /// Set as soon as ScreenCaptureKit stops the stream (or Drop begins) so Drop and privacy stop cleanly.
+    has_stopped: AtomicBool,
+    /// Why ScreenCaptureKit stopped the stream (`SCStreamDelegate::stream:didStopWithError:`).
+    stopped: Mutex<Option<String>>,
+}
+
+/// How a capture's end for a turned-off permission begins (the watchdog tells it from a crash).
+pub(crate) const PERMISSION_REVOKED: &str = "screen recording permission was revoked";
+
+fn format_stream_error(code: isize, desc: &str) -> String {
+    match SCStreamErrorCode(code) {
+        SCStreamErrorCode::UserDeclined | SCStreamErrorCode::MissingEntitlements => {
+            format!("{PERMISSION_REVOKED} ({desc})")
+        }
+        SCStreamErrorCode::NoCaptureSource | SCStreamErrorCode::NoDisplayList | SCStreamErrorCode::NoWindowList => {
+            format!("the captured display or window is gone ({desc})")
+        }
+        SCStreamErrorCode::UserStopped | SCStreamErrorCode::SystemStoppedStream => {
+            format!("macOS stopped screen capture ({desc})")
+        }
+        SCStreamErrorCode::FailedApplicationConnectionInvalid
+        | SCStreamErrorCode::FailedApplicationConnectionInterrupted => {
+            format!("macOS screen capture connection was interrupted ({desc})")
+        }
+        _ => format!("screen capture stopped ({desc})"),
+    }
+}
+
+fn record_stream_error(shared: &Shared, reason: String) {
+    shared.has_stopped.store(true, Ordering::Release);
+    shared.hold.store(false, Ordering::Release);
+    if let Ok(mut stopped) = shared.stopped.lock()
+        && stopped.is_none()
+    {
+        *stopped = Some(reason);
+    }
+    // Break SCStream -> Output -> Shared -> WindowFit -> SCStream retain cycle on stream failure.
+    if let Ok(mut fit) = shared.fit.lock() {
+        *fit = None;
+    }
 }
 
 /// What a window capture needs to follow the window's size, as OBS's ScreenCaptureKit capture
@@ -493,6 +555,9 @@ define_class!(
     unsafe impl SCStreamOutput for Output {
         #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
         fn did_output(&self, _stream: &SCStream, sample: &CMSampleBuffer, kind: SCStreamOutputType) {
+            if self.ivars().has_stopped.load(Ordering::Acquire) {
+                return;
+            }
             if kind == SCStreamOutputType::Audio {
                 if let Some(piece) = sound_of(sample)
                     && let Ok(mut q) = self.ivars().sound.lock()
@@ -507,7 +572,7 @@ define_class!(
             if kind != SCStreamOutputType::Screen {
                 return;
             }
-            if self.ivars().hold.load(Ordering::Relaxed) {
+            if self.ivars().hold.load(Ordering::Acquire) {
                 return;
             }
             self.ivars().follow_window(sample);
@@ -523,6 +588,17 @@ define_class!(
                 *l = Some(surface);
                 self.ivars().frames.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    unsafe impl SCStreamDelegate for Output {
+        #[unsafe(method(stream:didStopWithError:))]
+        fn did_stop(&self, _stream: &SCStream, error: Option<&NSError>) {
+            let reason = match error {
+                Some(e) => format_stream_error(e.code(), &e.localizedDescription().to_string()),
+                None => "screen capture stopped unexpectedly".into(),
+            };
+            record_stream_error(self.ivars(), reason);
         }
     }
 );
@@ -608,6 +684,8 @@ pub struct Surface {
     image: CFRetained<objc2_core_video::CVImageBuffer>,
     width: u32,
     height: u32,
+    #[cfg(test)]
+    copy_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 // SAFETY: a CoreVideo buffer is reference counted and the system itself passes it between its
@@ -621,13 +699,19 @@ impl std::fmt::Debug for Surface {
 }
 
 impl Surface {
-    /// None for a buffer that isn't 32-bit BGRA or has no size.
+    /// None for a buffer that isn't non-planar 32-bit BGRA or has no size.
     pub(crate) fn of(image: CFRetained<objc2_core_video::CVImageBuffer>) -> Option<Self> {
         let (w, h) = (CVPixelBufferGetWidth(&image), CVPixelBufferGetHeight(&image));
-        if w == 0 || h == 0 || CVPixelBufferGetPixelFormatType(&image) != BGRA {
+        if w == 0 || h == 0 || CVPixelBufferIsPlanar(&image) || CVPixelBufferGetPixelFormatType(&image) != BGRA {
             return None;
         }
-        Some(Self { image, width: u32::try_from(w).ok()?, height: u32::try_from(h).ok()? })
+        Some(Self {
+            image,
+            width: u32::try_from(w).ok()?,
+            height: u32::try_from(h).ok()?,
+            #[cfg(test)]
+            copy_counter: None,
+        })
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -648,59 +732,274 @@ impl Surface {
     /// Reads the pixels where they are: `f` gets them (BGRA, `stride` bytes a row), or None when
     /// the system won't let them be read.
     pub fn with_bytes<R>(&self, f: impl FnOnce(&[u8], usize) -> R) -> Option<R> {
-        // SAFETY: locking a live pixel buffer read-only; unlocked below with the same flag.
-        if unsafe { CVPixelBufferLockBaseAddress(&self.image, CVPixelBufferLockFlags::ReadOnly) } != 0 {
+        if CVPixelBufferIsPlanar(&self.image) || CVPixelBufferGetPixelFormatType(&self.image) != BGRA {
             return None;
         }
+        let _lock = PixelLock::read_only(&self.image)?;
         let stride = CVPixelBufferGetBytesPerRow(&self.image);
         let base = CVPixelBufferGetBaseAddress(&self.image).cast::<u8>();
         let h = self.height as usize;
-        let out = if base.is_null() || stride < self.width as usize * 4 {
-            None
-        } else {
-            // SAFETY: the locked buffer holds `h` rows of `stride` bytes at `base`, and nothing
-            // writes to it while it is locked for reading.
-            Some(f(unsafe { std::slice::from_raw_parts(base, stride * h) }, stride))
-        };
-        // SAFETY: locked above.
-        unsafe { CVPixelBufferUnlockBaseAddress(&self.image, CVPixelBufferLockFlags::ReadOnly) };
-        out
+        if base.is_null() || stride < self.width as usize * 4 {
+            return None;
+        }
+        // SAFETY: the locked buffer holds `h` rows of `stride` bytes at `base`, and nothing
+        // writes to it while it is locked for reading.
+        Some(f(unsafe { std::slice::from_raw_parts(base, stride * h) }, stride))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_copy_counter(mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.copy_counter = Some(counter);
+        self
     }
 
     /// The frame as an RGBA picture (a copy, for the ways that need one).
     pub fn to_picture(&self) -> Option<Picture> {
+        #[cfg(test)]
+        if let Some(c) = &self.copy_counter {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         copy_bgra(&self.image)
+    }
+}
+
+struct PixelLock<'a>(&'a objc2_core_video::CVPixelBuffer);
+
+impl<'a> PixelLock<'a> {
+    fn read_only(image: &'a objc2_core_video::CVPixelBuffer) -> Option<Self> {
+        // SAFETY: locking a live pixel buffer read-only; unlocked on Drop with the same flag.
+        (unsafe { CVPixelBufferLockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) } == 0).then_some(Self(image))
+    }
+}
+
+impl Drop for PixelLock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: locked read-only in `read_only`.
+        unsafe { CVPixelBufferUnlockBaseAddress(self.0, CVPixelBufferLockFlags::ReadOnly) };
     }
 }
 
 /// A BGRA pixel buffer's pixels as RGBA rows (premultiplied, as ScreenCaptureKit gives them).
 pub(crate) fn copy_bgra(image: &objc2_core_video::CVPixelBuffer) -> Option<Picture> {
-    // SAFETY: locking a live pixel buffer read-only; unlocked below with the same flag.
-    if unsafe { CVPixelBufferLockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) } != 0 {
+    if CVPixelBufferIsPlanar(image) || CVPixelBufferGetPixelFormatType(image) != BGRA {
         return None;
     }
+    let _lock = PixelLock::read_only(image)?;
     let (w, h, stride) =
         (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image), CVPixelBufferGetBytesPerRow(image));
+    let (w_u32, h_u32) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
     let base = CVPixelBufferGetBaseAddress(image).cast::<u8>();
-    let mut out = None;
-    if !base.is_null() && w > 0 && h > 0 && stride >= w * 4 {
-        // Each pixel is turned as one 32-bit word (blue and red swapped) so the loop compiles to
-        // wide vector moves; a byte-by-byte `extend_from_slice` per pixel was the biggest CPU
-        // cost in a 1080p recording.
-        let mut rgba = vec![0u8; w * h * 4];
-        for (y, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
-            // SAFETY: the locked buffer holds `h` rows of `stride` bytes at `base`.
-            let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) };
+    if base.is_null() || w == 0 || h == 0 || stride < w * 4 {
+        return None;
+    }
+    // Each pixel is turned as one 32-bit word (blue and red swapped) so the loop compiles to
+    // wide vector moves; a byte-by-byte `extend_from_slice` per pixel was the biggest CPU
+    // cost in a 1080p recording.
+    // A kept buffer when there is one (every byte is written below): a fresh one each frame was
+    // page faults and zero-filling on the thread that decodes the clip.
+    let mut rgba = crate::pixel_buffer(w * h * 4);
+    for (y, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
+        // SAFETY: the locked buffer holds `h` rows of `stride` bytes at `base`.
+        let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) };
+        for (d, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(row.as_chunks::<4>().0) {
+            let v = u32::from_le_bytes(*s);
+            *d = ((v & 0xFF00_FF00) | (v << 16 & 0x00FF_0000) | (v >> 16 & 0x0000_00FF)).to_le_bytes();
+        }
+    }
+    Some(Picture { width: w_u32, height: h_u32, rgba, premultiplied: true })
+}
+
+/// Converts any supported CoreVideo camera/capture buffer (`32BGRA`, `32ARGB`, `32RGBA`,
+/// bi-planar `420v`/`420f`, or packed 4:2:2 `2vuy`/`yuvs`/`yuvf`) safely to RGBA. Returns
+/// `None` instead of misreading stride/planes for unknown formats.
+pub(crate) fn copy_video_frame(image: &objc2_core_video::CVPixelBuffer, bt709: bool) -> Option<Picture> {
+    let fmt = CVPixelBufferGetPixelFormatType(image);
+    if fmt == kCVPixelFormatType_32BGRA {
+        return copy_bgra(image);
+    }
+    if fmt == kCVPixelFormatType_32ARGB || fmt == kCVPixelFormatType_32RGBA {
+        return copy_packed_rgba32(image, fmt == kCVPixelFormatType_32ARGB);
+    }
+    if fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+        let full = fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+        return copy_biplanar_420(image, bt709, full);
+    }
+    if fmt == kCVPixelFormatType_422YpCbCr8
+        || fmt == kCVPixelFormatType_422YpCbCr8_yuvs
+        || fmt == kCVPixelFormatType_422YpCbCr8FullRange
+    {
+        let full = fmt == kCVPixelFormatType_422YpCbCr8FullRange;
+        let u_first = fmt == kCVPixelFormatType_422YpCbCr8;
+        return copy_packed_422(image, bt709, full, u_first);
+    }
+    None
+}
+
+fn copy_packed_rgba32(image: &objc2_core_video::CVPixelBuffer, argb: bool) -> Option<Picture> {
+    if CVPixelBufferIsPlanar(image) {
+        return None;
+    }
+    let _lock = PixelLock::read_only(image)?;
+    let (w, h, stride) =
+        (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image), CVPixelBufferGetBytesPerRow(image));
+    let (w_u32, h_u32) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
+    let base = CVPixelBufferGetBaseAddress(image).cast::<u8>();
+    if base.is_null() || w == 0 || h == 0 || stride < w * 4 {
+        return None;
+    }
+    let mut rgba = vec![0u8; w * h * 4];
+    for (y, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
+        // SAFETY: the locked buffer holds `h` rows of `stride` bytes at `base`.
+        let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) };
+        if argb {
             for (d, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(row.as_chunks::<4>().0) {
-                let v = u32::from_le_bytes(*s);
-                *d = ((v & 0xFF00_FF00) | (v << 16 & 0x00FF_0000) | (v >> 16 & 0x0000_00FF)).to_le_bytes();
+                *d = [s[1], s[2], s[3], s[0]];
+            }
+        } else {
+            out.copy_from_slice(row);
+        }
+    }
+    Some(Picture { width: w_u32, height: h_u32, rgba, premultiplied: true })
+}
+
+#[derive(Clone, Copy)]
+struct YuvCoeffs {
+    ry: f32,
+    ru: f32,
+    rv: f32,
+    rc: f32,
+    gy: f32,
+    gu: f32,
+    gv: f32,
+    gc: f32,
+    by: f32,
+    bu: f32,
+    bv: f32,
+    bc: f32,
+}
+
+impl YuvCoeffs {
+    fn new(bt709: bool, full: bool) -> Self {
+        let r = crate::compose::yuv_rows(bt709, full);
+        Self {
+            ry: r[0],
+            ru: r[1],
+            rv: r[2],
+            rc: r[3] * 255.0 + 0.5,
+            gy: r[4],
+            gu: r[5],
+            gv: r[6],
+            gc: r[7] * 255.0 + 0.5,
+            by: r[8],
+            bu: r[9],
+            bv: r[10],
+            bc: r[11] * 255.0 + 0.5,
+        }
+    }
+
+    #[inline]
+    fn rgba(self, y: u8, u: u8, v: u8) -> [u8; 4] {
+        let (yf, uf, vf) = (f32::from(y), f32::from(u), f32::from(v));
+        let clamp = |c: f32| c.clamp(0.0, 255.0) as u8;
+        [
+            clamp(self.ry * yf + self.ru * uf + self.rv * vf + self.rc),
+            clamp(self.gy * yf + self.gu * uf + self.gv * vf + self.gc),
+            clamp(self.by * yf + self.bu * uf + self.bv * vf + self.bc),
+            255,
+        ]
+    }
+}
+
+fn copy_biplanar_420(image: &objc2_core_video::CVPixelBuffer, bt709: bool, full: bool) -> Option<Picture> {
+    if !CVPixelBufferIsPlanar(image) || CVPixelBufferGetPlaneCount(image) < 2 {
+        return None;
+    }
+    let _lock = PixelLock::read_only(image)?;
+    let (w, h) = (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (w_u32, h_u32) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
+    let y_w = CVPixelBufferGetWidthOfPlane(image, 0);
+    let y_h = CVPixelBufferGetHeightOfPlane(image, 0);
+    let uv_w = CVPixelBufferGetWidthOfPlane(image, 1);
+    let uv_h = CVPixelBufferGetHeightOfPlane(image, 1);
+    let y_stride = CVPixelBufferGetBytesPerRowOfPlane(image, 0);
+    let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(image, 1);
+    let y_base = CVPixelBufferGetBaseAddressOfPlane(image, 0).cast::<u8>();
+    let uv_base = CVPixelBufferGetBaseAddressOfPlane(image, 1).cast::<u8>();
+    let min_uv_bytes = w.div_ceil(2) * 2;
+    if y_base.is_null()
+        || uv_base.is_null()
+        || y_w < w
+        || y_h < h
+        || uv_w < w.div_ceil(2)
+        || uv_h < h.div_ceil(2)
+        || y_stride < w
+        || uv_stride < min_uv_bytes
+    {
+        return None;
+    }
+    let coeffs = YuvCoeffs::new(bt709, full);
+    let mut rgba = vec![0u8; w * h * 4];
+    for (y, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
+        // SAFETY: plane 0 holds at least `h` rows of `y_stride >= w` bytes; plane 1 holds `h.div_ceil(2)` rows of `uv_stride >= min_uv_bytes` bytes.
+        let (y_row, uv_row) = unsafe {
+            (
+                std::slice::from_raw_parts(y_base.add(y * y_stride), w),
+                std::slice::from_raw_parts(uv_base.add((y / 2) * uv_stride), min_uv_bytes),
+            )
+        };
+        for (x, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let uv = (x / 2) * 2;
+            *px = coeffs.rgba(y_row[x], uv_row[uv], uv_row[uv + 1]);
+        }
+    }
+    Some(Picture { width: w_u32, height: h_u32, rgba, premultiplied: true })
+}
+
+fn copy_packed_422(image: &objc2_core_video::CVPixelBuffer, bt709: bool, full: bool, u_first: bool) -> Option<Picture> {
+    if CVPixelBufferIsPlanar(image) {
+        return None;
+    }
+    let _lock = PixelLock::read_only(image)?;
+    let (w, h, stride) =
+        (CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image), CVPixelBufferGetBytesPerRow(image));
+    let (w_u32, h_u32) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
+    let base = CVPixelBufferGetBaseAddress(image).cast::<u8>();
+    let min_row_bytes = w.div_ceil(2) * 4;
+    if base.is_null() || w == 0 || h == 0 || stride < min_row_bytes {
+        return None;
+    }
+    let coeffs = YuvCoeffs::new(bt709, full);
+    let mut rgba = vec![0u8; w * h * 4];
+    for (y, out) in rgba.chunks_exact_mut(w * 4).enumerate() {
+        // SAFETY: the locked buffer holds `h` rows of `stride >= min_row_bytes` bytes.
+        let row = unsafe { std::slice::from_raw_parts(base.add(y * stride), min_row_bytes) };
+        let dst = out.as_chunks_mut::<4>().0;
+        for (pair_idx, m) in row.as_chunks::<4>().0.iter().enumerate() {
+            let (y0, u, y1, v) = if u_first { (m[1], m[0], m[3], m[2]) } else { (m[0], m[1], m[2], m[3]) };
+            let x0 = pair_idx * 2;
+            dst[x0] = coeffs.rgba(y0, u, v);
+            if x0 + 1 < w {
+                dst[x0 + 1] = coeffs.rgba(y1, u, v);
             }
         }
-        out = Some(Picture { width: w as u32, height: h as u32, rgba, premultiplied: true });
     }
-    // SAFETY: locked above.
-    unsafe { CVPixelBufferUnlockBaseAddress(image, CVPixelBufferLockFlags::ReadOnly) };
-    out
+    Some(Picture { width: w_u32, height: h_u32, rgba, premultiplied: true })
+}
+
+struct PrivacyStop {
+    flag: Arc<AtomicBool>,
+    wake: mpsc::Sender<()>,
+}
+
+impl PrivacyStop {
+    fn signal(&self) {
+        self.flag.store(true, Ordering::Release);
+        let _ = self.wake.send(());
+    }
 }
 
 /// A running capture; dropping it stops.
@@ -710,7 +1009,7 @@ pub struct ScreenCapture {
     _queue: dispatch2::DispatchRetained<DispatchQueue>,
     shared: Arc<Shared>,
     /// Tells the thread that keeps apps out (when there is one) to stop.
-    privacy: Option<Arc<AtomicBool>>,
+    privacy: Option<PrivacyStop>,
     /// The window captured (a Window Capture): its closing ends the capture.
     window: Option<u32>,
     /// The display captured (a Display or Application Capture): its going (unplugged)
@@ -855,8 +1154,14 @@ impl ScreenCapture {
                 config.setChannelCount(2);
                 config.setExcludesCurrentProcessAudio(true);
             }
-            let stream = SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None);
             let shared = Arc::new(Shared::default());
+            let output = Output::new(shared.clone());
+            let stream = SCStream::initWithFilter_configuration_delegate(
+                SCStream::alloc(),
+                &filter,
+                &config,
+                Some(ProtocolObject::from_ref(&*output)),
+            );
             if let Target::Window(_) = target
                 && let Ok(mut fit) = shared.fit.lock()
             {
@@ -867,25 +1172,32 @@ impl ScreenCapture {
                     size: (width, height),
                 });
             }
-            let output = Output::new(shared.clone());
+            let clear_fit = || {
+                if let Ok(mut fit) = shared.fit.lock() {
+                    *fit = None;
+                }
+            };
             let queue = DispatchQueue::new("ferrocast.screen", DispatchQueueAttr::SERIAL);
-            stream
-                .addStreamOutput_type_sampleHandlerQueue_error(
+            if let Err(e) = stream.addStreamOutput_type_sampleHandlerQueue_error(
+                ProtocolObject::from_ref(&*output),
+                SCStreamOutputType::Screen,
+                Some(&queue),
+            ) {
+                clear_fit();
+                return Err(AvError::Source(format!("the capture couldn't start ({})", e.localizedDescription())));
+            }
+            if sound
+                && let Err(e) = stream.addStreamOutput_type_sampleHandlerQueue_error(
                     ProtocolObject::from_ref(&*output),
-                    SCStreamOutputType::Screen,
+                    SCStreamOutputType::Audio,
                     Some(&queue),
                 )
-                .map_err(|e| AvError::Source(format!("the capture couldn't start ({})", e.localizedDescription())))?;
-            if sound {
-                stream
-                    .addStreamOutput_type_sampleHandlerQueue_error(
-                        ProtocolObject::from_ref(&*output),
-                        SCStreamOutputType::Audio,
-                        Some(&queue),
-                    )
-                    .map_err(|e| {
-                        AvError::Source(format!("the Mac's sound couldn't be captured ({})", e.localizedDescription()))
-                    })?;
+            {
+                clear_fit();
+                return Err(AvError::Source(format!(
+                    "the Mac's sound couldn't be captured ({})",
+                    e.localizedDescription()
+                )));
             }
             let (tx, rx) = mpsc::channel();
             let done = RcBlock::new(move |e: *mut NSError| {
@@ -899,8 +1211,14 @@ impl ScreenCapture {
             stream.startCaptureWithCompletionHandler(Some(&done));
             match rx.recv_timeout(WAIT) {
                 Ok(Ok(())) => {}
-                Ok(Err(m)) => return Err(AvError::Source(format!("the capture couldn't start ({m})"))),
-                Err(_) => return Err(AvError::Source("macOS didn't start the capture".into())),
+                Ok(Err(m)) => {
+                    clear_fit();
+                    return Err(AvError::Source(format!("the capture couldn't start ({m})")));
+                }
+                Err(_) => {
+                    clear_fit();
+                    return Err(AvError::Source("macOS didn't start the capture".into()));
+                }
             }
             let privacy = match (target, only) {
                 (Target::Display(id), Some(only)) => {
@@ -935,17 +1253,31 @@ impl ScreenCapture {
         self.shared.sound.lock().map(|mut s| s.drain(..).collect()).unwrap_or_default()
     }
 
+    /// ScreenCaptureKit sets `excludesCurrentProcessAudio = true`, so captured sound excludes
+    /// Ferrocast's own monitor playback.
+    pub fn excludes_self_audio(&self) -> bool {
+        true
+    }
+
+    /// Output device id for non-self-excluding loopback (`None` here: SCK excludes self).
+    pub fn loopback_device(&self) -> Option<&str> {
+        None
+    }
+
     /// Frames received since the start.
     pub fn frames(&self) -> u64 {
         self.shared.frames.load(Ordering::Relaxed)
     }
 
-    /// Why it ended, if it did: a captured window that closed (its app quit). ScreenCaptureKit
-    /// then just sends nothing, as for a window that doesn't change, so the watchdog never
-    /// opened it again, and the app's new window (found by its app and title) never came back.
-    /// And a captured display that went (unplugged): its stream died with it, and
-    /// the picture stayed black or frozen after it came back (projects-60).
+    /// Why it ended, if it did: reported by ScreenCaptureKit's delegate (sleep, permission revoked,
+    /// system stop, or gone display/window), a captured window that closed (its app quit), or a
+    /// captured display that went (unplugged).
     pub fn ended(&self) -> Option<String> {
+        if let Ok(stopped) = self.shared.stopped.lock()
+            && let Some(reason) = stopped.as_ref()
+        {
+            return Some(reason.clone());
+        }
         if let Some(id) = self.display {
             let now = active_displays();
             // An empty answer is a failed question, not every display gone.
@@ -956,10 +1288,32 @@ impl ScreenCapture {
     }
 }
 
+struct HoldGuard<'a>(&'a AtomicBool);
+
+impl Drop for HoldGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn apply_filter_update(
+    shared: &Shared,
+    trigger: impl FnOnce(RcBlock<dyn Fn(*mut NSError)>),
+    timeout: Duration,
+) -> bool {
+    shared.hold.store(true, Ordering::Release);
+    let _release = HoldGuard(&shared.hold);
+    let (tx, rx) = mpsc::channel();
+    let done = RcBlock::new(move |e: *mut NSError| {
+        let _ = tx.send(e.is_null());
+    });
+    trigger(done);
+    rx.recv_timeout(timeout) == Ok(true)
+}
+
 /// Looks twice a second for apps `names` names that started (or ended) since, and gives the
 /// stream a filter that leaves them out (or, `only`, shows only them); the picture holds until
-/// macOS has taken it (and keeps holding, trying again, if it refuses). Stops when the flag is
-/// set.
+/// macOS has taken it (or releases on error/timeout). Stops when `PrivacyStop` or stream stop is set.
 fn follow_apps(
     stream: SendStream,
     shared: Arc<Shared>,
@@ -967,53 +1321,89 @@ fn follow_apps(
     names: Vec<String>,
     only: bool,
     mut hidden: Vec<i32>,
-) -> Arc<AtomicBool> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stopped = stop.clone();
+) -> PrivacyStop {
+    let flag = Arc::new(AtomicBool::new(false));
+    let (wake, wake_rx) = mpsc::channel();
+    let stopped = flag.clone();
     let _ = std::thread::Builder::new().name("ferrocast-privacy".into()).spawn(move || {
         let stream = stream;
         loop {
-            std::thread::sleep(PRIVACY_EVERY);
-            if stopped.load(Ordering::Relaxed) {
+            match wake_rx.recv_timeout(PRIVACY_EVERY) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if stopped.load(Ordering::Acquire) || shared.has_stopped.load(Ordering::Acquire) {
                 return;
             }
-            let Ok(c) = content() else { continue };
-            // SAFETY: the content is live; the stream is live (this thread holds it).
-            unsafe {
-                let Ok((filter, pids)) = apps_filter(&c, display, &names, only) else { continue };
-                if pids == hidden || stopped.load(Ordering::Relaxed) {
-                    continue;
+            // Drain Objective-C autoreleased objects every poll tick on this raw Rust thread
+            // (matches OBS `mac-window-capture.m` `@autoreleasepool`), and skip allocating a new
+            // `SCContentFilter` when the matching PIDs haven't changed.
+            objc2::rc::autoreleasepool(|_| {
+                let Ok(c) = content() else { return };
+                // SAFETY: the content is live; the stream is live (this thread holds it).
+                unsafe {
+                    let (apps, pids) = hidden_apps(&c, &names);
+                    if pids == hidden || stopped.load(Ordering::Acquire) || shared.has_stopped.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(d) = c.displays().iter().find(|d| d.displayID() == display) else {
+                        return;
+                    };
+                    let none: Retained<NSArray<SCWindow>> = NSArray::new();
+                    let filter = if only {
+                        SCContentFilter::initWithDisplay_includingApplications_exceptingWindows(
+                            SCContentFilter::alloc(),
+                            &d,
+                            &apps,
+                            &none,
+                        )
+                    } else {
+                        SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                            SCContentFilter::alloc(),
+                            &d,
+                            &apps,
+                            &none,
+                        )
+                    };
+                    if apply_filter_update(
+                        &shared,
+                        |done| stream.0.updateContentFilter_completionHandler(&filter, Some(&done)),
+                        FILTER_WAIT,
+                    ) {
+                        hidden = pids;
+                    }
                 }
-                shared.hold.store(true, Ordering::Relaxed);
-                let (tx, rx) = mpsc::channel();
-                let done = RcBlock::new(move |e: *mut NSError| {
-                    let _ = tx.send(e.is_null());
-                });
-                stream.0.updateContentFilter_completionHandler(&filter, Some(&done));
-                if rx.recv_timeout(WAIT) == Ok(true) {
-                    hidden = pids;
-                    shared.hold.store(false, Ordering::Relaxed);
-                }
-            }
+            });
         }
     });
-    stop
+    PrivacyStop { flag, wake }
 }
 
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
         if let Some(stop) = &self.privacy {
-            stop.store(true, Ordering::Relaxed);
+            stop.signal();
         }
-        let (tx, rx) = mpsc::channel();
-        let done = RcBlock::new(move |_e: *mut NSError| {
-            let _ = tx.send(());
-        });
-        // SAFETY: the stream is live; stopping waits for ScreenCaptureKit (briefly) so no frame
-        // arrives at an output that's going.
+        let was_stopped = self.shared.has_stopped.swap(true, Ordering::AcqRel);
+        self.shared.hold.store(false, Ordering::Release);
+        if let Ok(mut latest) = self.shared.latest.lock() {
+            *latest = None;
+        }
+        if let Ok(mut fit) = self.shared.fit.lock() {
+            *fit = None;
+        }
+        // SAFETY: the stream is live; if ScreenCaptureKit already stopped it via delegate we
+        // skip `stopCaptureWithCompletionHandler:` completely, otherwise wait briefly so Drop
+        // never stalls for seconds after sleep or unplug, then detach outputs cleanly.
         unsafe {
-            self.stream.stopCaptureWithCompletionHandler(Some(&done));
-            let _ = rx.recv_timeout(WAIT);
+            if let Some(wait) = stop_wait_timeout(was_stopped) {
+                let (tx, rx) = mpsc::channel();
+                let done = RcBlock::new(move |_e: *mut NSError| {
+                    let _ = tx.send(());
+                });
+                self.stream.stopCaptureWithCompletionHandler(Some(&done));
+                let _ = rx.recv_timeout(wait);
+            }
             let _ = self
                 .stream
                 .removeStreamOutput_type_error(ProtocolObject::from_ref(&*self.output), SCStreamOutputType::Screen);
@@ -1025,7 +1415,7 @@ impl Drop for ScreenCapture {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1092,13 +1482,26 @@ mod tests {
     }
 
     /// A BGRA pixel buffer with `rows` rows of `width` pixels, each pixel `bgra`, and a stride
-    /// wider than the row (the system pads them).
-    fn bgra_buffer(width: usize, rows: usize, bgra: [u8; 4]) -> Option<CFRetained<objc2_core_video::CVImageBuffer>> {
+    /// wider than the row (the system pads them). Backed by an IOSurface, like real camera and
+    /// screen frames, so `zerocopy::texture` runs in tests too.
+    pub(crate) fn bgra_buffer(
+        width: usize,
+        rows: usize,
+        bgra: [u8; 4],
+    ) -> Option<CFRetained<objc2_core_video::CVImageBuffer>> {
         use std::ptr::NonNull;
+        let attrs = super::super::Dict::new()?;
+        let empty = super::super::Dict::new()?;
+        // SAFETY: kCVPixelBufferIOSurfacePropertiesKey is a static CoreVideo CFString constant.
+        let key: super::super::CFTypeRef =
+            unsafe { std::ptr::from_ref(objc2_core_video::kCVPixelBufferIOSurfacePropertiesKey).cast() };
+        attrs.set(key, empty.0.0);
+        // SAFETY: `attrs.0.0` is a live CFDictionary.
+        let attrs_cf: &objc2_core_foundation::CFDictionary = unsafe { &*attrs.0.0.cast() };
         let mut out: *mut objc2_core_video::CVPixelBuffer = std::ptr::null_mut();
-        // SAFETY: a new buffer asked for with no attributes; `out` is a valid pointer to fill.
+        // SAFETY: `attrs_cf` holds IOSurface attributes; `out` is a valid pointer to fill.
         let r = unsafe {
-            objc2_core_video::CVPixelBufferCreate(None, width, rows, BGRA, None, NonNull::new(&raw mut out)?)
+            objc2_core_video::CVPixelBufferCreate(None, width, rows, BGRA, Some(attrs_cf), NonNull::new(&raw mut out)?)
         };
         if r != 0 {
             return None;
@@ -1148,5 +1551,161 @@ mod tests {
         // The same frame as an RGBA picture (the other way to take it) agrees.
         let p = surface.to_picture().unwrap_or_else(|| panic!("a picture"));
         assert_eq!(&p.rgba[..4], &[250, 120, 10, 255]);
+    }
+
+    fn pixel_buffer(width: usize, rows: usize, format: u32) -> Option<CFRetained<objc2_core_video::CVImageBuffer>> {
+        use std::ptr::NonNull;
+        let mut out: *mut objc2_core_video::CVPixelBuffer = std::ptr::null_mut();
+        // SAFETY: creating a plain pixel buffer for tests; `out` is valid to fill.
+        let r = unsafe {
+            objc2_core_video::CVPixelBufferCreate(None, width, rows, format, None, NonNull::new(&raw mut out)?)
+        };
+        if r != 0 {
+            return None;
+        }
+        // SAFETY: `out` is a new +1 retained buffer on success; CFRetained owns it.
+        unsafe { Some(CFRetained::from_raw(NonNull::new(out)?)) }
+    }
+
+    #[test]
+    fn copy_bgra_rejects_non_bgra_and_planar_buffers() {
+        use objc2_core_video::{
+            kCVPixelFormatType_32ARGB, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8,
+        };
+        // 32ARGB: same 4-bpp stride as BGRA, must not be misread as BGRA.
+        let Some(argb) = pixel_buffer(8, 4, kCVPixelFormatType_32ARGB) else { return };
+        assert!(copy_bgra(&argb).is_none(), "32ARGB must be rejected by copy_bgra");
+        // Packed 4:2:2 UYVY (2vuy): 2-bpp stride, must be rejected.
+        let Some(uyvy) = pixel_buffer(8, 4, kCVPixelFormatType_422YpCbCr8) else { return };
+        assert!(copy_bgra(&uyvy).is_none(), "2vuy must be rejected by copy_bgra");
+        // Planar NV12 (420v): planar buffer must be rejected by copy_bgra.
+        let Some(nv12) = pixel_buffer(8, 4, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) else { return };
+        assert!(copy_bgra(&nv12).is_none(), "420v planar buffer must be rejected by copy_bgra");
+    }
+
+    pub(crate) fn buffer_retain_count(buf: &objc2_core_video::CVImageBuffer) -> isize {
+        // SAFETY: reading CF retain count on a live CVImageBuffer.
+        unsafe { super::super::CFGetRetainCount(std::ptr::from_ref(buf).cast()) }
+    }
+
+    #[test]
+    fn copy_video_frame_converts_yuv_and_argb_safely() {
+        use objc2_core_video::{
+            CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane, kCVPixelFormatType_1Monochrome,
+            kCVPixelFormatType_32ARGB, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8,
+        };
+        // 32ARGB: [A, R, G, B] -> [R, G, B, A].
+        let Some(argb) = pixel_buffer(4, 2, kCVPixelFormatType_32ARGB) else { return };
+        // SAFETY: locking freshly created test pixel buffer for writing.
+        unsafe { CVPixelBufferLockBaseAddress(&argb, CVPixelBufferLockFlags::empty()) };
+        let (stride, base) = (CVPixelBufferGetBytesPerRow(&argb), CVPixelBufferGetBaseAddress(&argb).cast::<u8>());
+        for y in 0..2 {
+            for x in 0..4 {
+                // SAFETY: inside locked 4x2 ARGB pixel buffer.
+                unsafe {
+                    std::ptr::copy_nonoverlapping([255u8, 200, 100, 50].as_ptr(), base.add(y * stride + x * 4), 4)
+                };
+            }
+        }
+        // SAFETY: locked above.
+        unsafe { CVPixelBufferUnlockBaseAddress(&argb, CVPixelBufferLockFlags::empty()) };
+        let pic = copy_video_frame(&argb, true).unwrap_or_else(|| panic!("32ARGB conversion"));
+        assert_eq!(&pic.rgba[..4], &[200, 100, 50, 255]);
+
+        // Bi-planar 420v (NV12) BT.709 TV white (Y=235, Cb=128, Cr=128).
+        let Some(nv12) = pixel_buffer(4, 2, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) else { return };
+        // SAFETY: locking freshly created planar buffer for writing.
+        unsafe { CVPixelBufferLockBaseAddress(&nv12, CVPixelBufferLockFlags::empty()) };
+        let y_stride = CVPixelBufferGetBytesPerRowOfPlane(&nv12, 0);
+        let y_base = CVPixelBufferGetBaseAddressOfPlane(&nv12, 0).cast::<u8>();
+        let uv_base = CVPixelBufferGetBaseAddressOfPlane(&nv12, 1).cast::<u8>();
+        for row in 0..2 {
+            // SAFETY: plane 0 has 2 rows of 4 Y bytes.
+            unsafe { std::ptr::write_bytes(y_base.add(row * y_stride), 235, 4) };
+        }
+        for x in 0..2 {
+            // SAFETY: plane 1 has 1 row of 2 [Cb, Cr] pairs.
+            unsafe { std::ptr::copy_nonoverlapping([128u8, 128].as_ptr(), uv_base.add(x * 2), 2) };
+        }
+        // SAFETY: locked above.
+        unsafe { CVPixelBufferUnlockBaseAddress(&nv12, CVPixelBufferLockFlags::empty()) };
+        let pic = copy_video_frame(&nv12, true).unwrap_or_else(|| panic!("420v conversion"));
+        assert_eq!(pic.rgba[..4], [255, 255, 255, 255]);
+
+        // Packed 4:2:2 UYVY (2vuy) BT.709 TV white ([128, 235, 128, 235]).
+        let Some(uyvy) = pixel_buffer(4, 2, kCVPixelFormatType_422YpCbCr8) else { return };
+        // SAFETY: locking test pixel buffer for writing.
+        unsafe { CVPixelBufferLockBaseAddress(&uyvy, CVPixelBufferLockFlags::empty()) };
+        let (stride, base) = (CVPixelBufferGetBytesPerRow(&uyvy), CVPixelBufferGetBaseAddress(&uyvy).cast::<u8>());
+        for y in 0..2 {
+            for x in 0..2 {
+                // SAFETY: inside locked 4x2 2vuy pixel buffer (2 macropixels per row).
+                unsafe {
+                    std::ptr::copy_nonoverlapping([128u8, 235, 128, 235].as_ptr(), base.add(y * stride + x * 4), 4);
+                }
+            }
+        }
+        // SAFETY: locked above.
+        unsafe { CVPixelBufferUnlockBaseAddress(&uyvy, CVPixelBufferLockFlags::empty()) };
+        let pic = copy_video_frame(&uyvy, true).unwrap_or_else(|| panic!("2vuy conversion"));
+        assert_eq!(pic.rgba[..4], [255, 255, 255, 255]);
+
+        // Unsupported formats return None cleanly instead of misreading memory.
+        let Some(mono) = pixel_buffer(4, 2, kCVPixelFormatType_1Monochrome) else { return };
+        assert!(copy_video_frame(&mono, true).is_none());
+    }
+
+    #[test]
+    fn stream_delegate_error_marks_capture_ended_for_sleep_permission_or_gone() {
+        let shared = Arc::new(Shared::default());
+        shared.hold.store(true, Ordering::Release);
+        let output = Output::new(shared.clone());
+        // Output responds to SCStreamDelegate selector `stream:didStopWithError:`.
+        // SAFETY: calling NSObject's `respondsToSelector:` on a live `Output`.
+        let responds: bool = unsafe { msg_send![&*output, respondsToSelector: objc2::sel!(stream:didStopWithError:)] };
+        assert!(responds, "Output must implement SCStreamDelegate::stream:didStopWithError:");
+
+        let perm = format_stream_error(SCStreamErrorCode::UserDeclined.0, "user declined");
+        assert!(perm.contains("permission"));
+        let gone = format_stream_error(SCStreamErrorCode::NoCaptureSource.0, "no display");
+        assert!(gone.contains("gone"));
+        let sleep_reason = format_stream_error(SCStreamErrorCode::SystemStoppedStream.0, "system stopped");
+        assert!(sleep_reason.contains("stopped"));
+
+        record_stream_error(&shared, sleep_reason.clone());
+        assert!(shared.has_stopped.load(Ordering::Acquire));
+        assert!(!shared.hold.load(Ordering::Acquire), "delegate error must release hold");
+        assert_eq!(shared.stopped.lock().ok().and_then(|s| s.clone()), Some(sleep_reason));
+    }
+
+    #[test]
+    fn follow_apps_clears_hold_on_error_and_timeout() {
+        let shared = Arc::new(Shared::default());
+        let domain = objc2_foundation::NSString::from_str("SCStreamErrorDomain");
+        // SAFETY: creating a test NSError with valid NSString domain.
+        let err = unsafe { NSError::errorWithDomain_code_userInfo(&domain, -3808, None) };
+
+        let ok = apply_filter_update(
+            &shared,
+            |done| done.call((Retained::as_ptr(&err).cast_mut(),)),
+            Duration::from_millis(200),
+        );
+        assert!(!ok);
+        assert!(!shared.hold.load(Ordering::Acquire), "error must clear hold");
+
+        let ok = apply_filter_update(&shared, |_done| {}, Duration::from_millis(15));
+        assert!(!ok);
+        assert!(!shared.hold.load(Ordering::Acquire), "timeout must clear hold");
+
+        let ok = apply_filter_update(&shared, |done| done.call((std::ptr::null_mut(),)), Duration::from_millis(200));
+        assert!(ok);
+        assert!(!shared.hold.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn screen_drop_wait_is_bounded_and_skips_when_already_stopped() {
+        assert_eq!(stop_wait_timeout(true), None);
+        let wait = stop_wait_timeout(false);
+        assert!(wait.is_some_and(|d| d <= Duration::from_millis(500)));
     }
 }

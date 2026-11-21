@@ -109,11 +109,30 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// Read-only ingest server address for connection tests, pre-flight and upload checks.
+    /// Must never create, bind or mutate broadcasts or stream keys on the platform.
+    /// Platforms whose [`ingest`](Self::ingest) is already read-only inherit it by default.
+    async fn peek_ingest(&self) -> Result<String> {
+        self.ingest().await.map(|i| i.url)
+    }
+
+    /// Read-only vertical ingest server address for connection tests, pre-flight and upload
+    /// checks; must never create, bind or mutate broadcasts or stream keys on the platform.
+    async fn peek_vertical_ingest(&self) -> Result<String> {
+        self.peek_ingest().await
+    }
+
     /// Where this channel streams to and with which key, fetched from the platform so the
-    /// streamer never pastes it (Go live everywhere).
+    /// streamer never pastes it (Go live everywhere). May create or bind a live broadcast
+    /// when actually going live.
     async fn ingest(&self) -> Result<Ingest> {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "give out the stream key" })
     }
+
+    /// The stream keys the vertical canvas is set to send to by hand (a custom server on it): a
+    /// platform that hands out keys must not give any of them to the normal stream. Platforms with
+    /// one key per channel ignore it.
+    fn set_vertical_keys(&self, _keys: Vec<String>) {}
 
     /// Where an upright (vertical) stream goes, made by Ferrocast when needed (YouTube Shorts
     /// live). Platforms with one live per channel don't have one.
@@ -129,6 +148,11 @@ pub struct Ingest {
     /// `rtmp://` or `rtmps://` server address, without the key.
     pub url: String,
     pub key: String,
+    /// Another server for the same key, tried when this one can't be reached (YouTube's backup
+    /// ingest). The same scheme as `url`.
+    pub backup: Option<String>,
+    /// Which key it is, for the destination's details ("Ferrocast · variable"); never the key.
+    pub note: Option<String>,
 }
 
 impl std::fmt::Debug for Ingest {

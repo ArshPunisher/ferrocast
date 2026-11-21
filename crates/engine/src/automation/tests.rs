@@ -197,7 +197,7 @@ impl StudioHost for Studio {
             }
             StudioAct::SetCurrent { scene } => format!("scene {scene}"),
             StudioAct::EditItem { scene, id, edit } => format!("{edit:?} {scene} {id}"),
-            StudioAct::EditFilter { name, filter, edit } => format!("{edit:?} {name} {filter}"),
+            StudioAct::EditFilter { name, filter, edit, .. } => format!("{edit:?} {name} {filter}"),
             other => format!("{other:?}"),
         };
         self.did.lock().unwrap_or_else(|e| e.into_inner()).push(line);
@@ -368,4 +368,21 @@ async fn a_scene_rule_runs_when_its_scene_goes_on_air() {
     e.with_automations(|a| a.scene = Some("Other".into()));
     e.automation_tick().await;
     until(|| did(&studio).contains(&"record false".to_string())).await;
+}
+
+#[tokio::test]
+async fn truncated_automations_loads_bak() {
+    let (e, _dir, _studio, _chat) = engine().await;
+    let r1 = rule("one", When::Scene { name: "Main".into() }, vec![Step::Record { on: false }]);
+    let r2 = rule("two", When::Scene { name: "Other".into() }, vec![Step::SaveReplay]);
+    e.set_automations(vec![r1.clone()]).unwrap_or_else(|err| panic!("{err}"));
+    e.set_automations(vec![r2]).unwrap_or_else(|err| panic!("{err}"));
+
+    let file = e.automations_file();
+    let raw = std::fs::read(&file).unwrap_or_else(|err| panic!("{err}"));
+    std::fs::write(&file, &raw[..raw.len() / 2]).unwrap_or_else(|err| panic!("{err}"));
+
+    e.with_automations(|a| a.loaded = false);
+    let loaded = e.automations();
+    assert_eq!(loaded, vec![r1]);
 }

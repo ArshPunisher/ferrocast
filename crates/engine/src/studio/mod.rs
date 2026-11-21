@@ -23,6 +23,7 @@ pub(crate) mod game_scenes;
 pub(crate) mod live_watch;
 pub mod moments;
 pub mod obs_tools;
+pub(crate) mod record_watch;
 pub(crate) mod rig;
 pub(crate) mod rules;
 pub mod show;
@@ -56,8 +57,18 @@ pub(crate) const STREAM_INFO_KEY: &str = "stream_info";
 /// How often watch time is credited (minutes for everyone who chatted meanwhile).
 const WATCH_TICK: Duration = Duration::from_secs(300);
 
+/// Who currently holds BRB on air, so automatic releases (ads, away, black camera) never
+/// pull the streamer off a manual BRB or another active hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum BrbHold {
+    Manual,
+    AdBreak,
+    Away,
+    BlackCam,
+}
+
 /// Studio's runtime state, one per engine.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Studio {
     pub counters: Mutex<BTreeMap<String, i64>>,
     pub counter_defs: RwLock<Vec<CounterDef>>,
@@ -72,18 +83,34 @@ pub(crate) struct Studio {
     pub watching: Mutex<HashSet<(Platform, String)>>,
     pub lane: Mutex<VecDeque<moments::LaneItem>>,
     pub spike: Mutex<SpikeMeter>,
-    pub show: Mutex<Option<show::ShowRun>>,
+    /// Single locked state machine for the Show, countdown, and delayed stream stop.
+    pub machine: Mutex<show::BroadcastMachine>,
+    /// Serializes stream start/stop, delayed stop, and Studio stop so no click order races.
+    pub output_lock: tokio::sync::Mutex<()>,
+    /// Monotonic origin for Show timers (`away`, `live_watch`) so wall-clock jumps never fire them.
+    pub mono_origin: std::time::Instant,
+    /// Last monotonic sample timestamp seen by `live_watch_tick` (for wake-jump detection).
+    pub last_watch_mono: Mutex<Option<i64>>,
     /// Wakes the countdown when a show starts, is skipped or cancelled.
     pub show_wake: Notify,
     /// The last OBS reading and what it means.
     pub health: Mutex<Option<(HealthSample, Health)>>,
     /// The scene to go back to after BRB.
     pub brb_from: Mutex<Option<String>>,
+    /// Active BRB holds (Manual, AdBreak, Away, BlackCam).
+    pub brb_holds: Mutex<HashSet<BrbHold>>,
     /// One health watcher per engine.
     pub health_watching: std::sync::atomic::AtomicBool,
     /// The live watch (a silent mic, a black or frozen camera, a destination down) and its
     /// one loop.
     pub live_watch: Mutex<ferrocast_core::show::LiveWatch>,
+    /// What was said about the recording now (a stop, low room), so each is said once.
+    pub record_watch: Mutex<record_watch::RecordWatch>,
+    /// Web page sources already said to have stopped drawing (said once, and again when they
+    /// draw).
+    pub stalled_noted: Mutex<HashSet<String>>,
+    /// What was said about broken sidechain loops, so each loop is reported once.
+    pub sidechain_watch: Mutex<record_watch::SidechainWatch>,
     pub live_watching: std::sync::atomic::AtomicBool,
     /// Cameras black now that put the show on BRB by itself (it comes back when none is).
     pub auto_brb: Mutex<std::collections::BTreeSet<String>>,
@@ -99,9 +126,52 @@ pub(crate) struct Studio {
     pub rules_busy: Mutex<HashSet<usize>>,
 }
 
+impl Default for Studio {
+    fn default() -> Self {
+        Self {
+            counters: Mutex::default(),
+            counter_defs: RwLock::default(),
+            modules: RwLock::default(),
+            scenes: RwLock::default(),
+            moments: RwLock::default(),
+            show_cfg: RwLock::default(),
+            duels: Mutex::default(),
+            cooldowns: Mutex::default(),
+            watching: Mutex::default(),
+            lane: Mutex::default(),
+            spike: Mutex::default(),
+            machine: Mutex::default(),
+            output_lock: tokio::sync::Mutex::new(()),
+            mono_origin: std::time::Instant::now(),
+            last_watch_mono: Mutex::default(),
+            show_wake: Notify::new(),
+            health: Mutex::default(),
+            brb_from: Mutex::default(),
+            brb_holds: Mutex::default(),
+            health_watching: std::sync::atomic::AtomicBool::default(),
+            live_watch: Mutex::default(),
+            record_watch: Mutex::default(),
+            stalled_noted: Mutex::default(),
+            sidechain_watch: Mutex::default(),
+            live_watching: std::sync::atomic::AtomicBool::default(),
+            auto_brb: Mutex::default(),
+            live_health: Mutex::default(),
+            auto_quality: Mutex::default(),
+            scene_now: Mutex::default(),
+            autoreplies: autoreplies::AutoReplies::default(),
+            rules_busy: Mutex::default(),
+        }
+    }
+}
+
 impl Engine {
     pub(crate) fn studio(&self) -> &Studio {
         &self.inner.studio
+    }
+
+    /// Monotonic milliseconds since this engine started (immune to wall-clock / NTP jumps).
+    pub(crate) fn mono_ms(&self) -> i64 {
+        i64::try_from(self.studio().mono_origin.elapsed().as_millis()).unwrap_or(i64::MAX)
     }
 
     /// Loads Studio's settings and counter values. A setting that no longer parses keeps

@@ -1,6 +1,8 @@
 //! Audio encoding: interleaved 32-bit float sound in, AAC-LC frames out (what RTMP platforms and
 //! MP4 take). macOS uses AudioToolbox's encoder (`apple/aac.rs`).
 
+use std::sync::Mutex;
+
 use crate::AvError;
 
 /// Samples per AAC frame, per channel.
@@ -50,9 +52,9 @@ impl std::fmt::Debug for Inner {
     }
 }
 
-/// An AAC encoder: the system's own (AudioToolbox on a Mac), else FFmpeg's.
+/// The encoding itself: samples in, AAC frames out, timed by the samples counted.
 #[derive(Debug)]
-pub struct AudioEncoder {
+struct Core {
     inner: Inner,
     config: AudioConfig,
     pending: Vec<f32>,
@@ -60,55 +62,15 @@ pub struct AudioEncoder {
     frames: i64,
 }
 
-impl AudioEncoder {
-    pub fn new(config: AudioConfig) -> Result<Self, AvError> {
-        Self::check(&config)?;
-        #[cfg(target_os = "macos")]
-        if !std::env::var("FERROCAST_AV_ENCODER").is_ok_and(|v| v == "ffmpeg") {
-            return Ok(Self {
-                inner: Inner::Native(crate::apple::aac::Encoder::new(&config)?),
-                config,
-                pending: Vec::new(),
-                frames: 0,
-            });
-        }
-        Self::ffmpeg(config)
-    }
-
-    /// Through FFmpeg, whatever the system.
-    pub fn ffmpeg(config: AudioConfig) -> Result<Self, AvError> {
-        Self::check(&config)?;
-        Ok(Self { inner: Inner::Ffmpeg(crate::ffenc::Audio::new(&config)?), config, pending: Vec::new(), frames: 0 })
-    }
-
-    fn check(config: &AudioConfig) -> Result<(), AvError> {
-        if aac_config(config.sample_rate, config.channels).is_none() || config.channels > 2 {
-            return Err(AvError::Encoder(format!(
-                "AAC takes 1 or 2 channels at a standard rate, not {} at {} Hz",
-                config.channels, config.sample_rate
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn config(&self) -> &AudioConfig {
-        &self.config
-    }
-
-    /// The AudioSpecificConfig.
-    pub fn header(&self) -> Vec<u8> {
-        aac_config(self.config.sample_rate, self.config.channels).map(|c| c.to_vec()).unwrap_or_default()
-    }
-
-    /// Ends: the frames still inside the encoder (FFmpeg keeps some back; the Mac's gives each
-    /// at once). Samples short of a whole frame are left out.
-    pub fn flush(&mut self) -> Result<Vec<AudioPacket>, AvError> {
+impl Core {
+    fn flush(&mut self) -> Vec<AudioPacket> {
         let rest = match &mut self.inner {
             #[cfg(target_os = "macos")]
             Inner::Native(_) => Vec::new(),
             Inner::Ffmpeg(e) => e.flush(),
         };
-        Ok(self.stamp(rest, self.priming()))
+        let priming = self.priming();
+        self.stamp(rest, priming)
     }
 
     fn priming(&self) -> u32 {
@@ -135,8 +97,7 @@ impl AudioEncoder {
         out
     }
 
-    /// Adds interleaved samples; returns every whole AAC frame now ready.
-    pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<AudioPacket>, AvError> {
+    fn encode(&mut self, pcm: &[f32]) -> Result<Vec<AudioPacket>, AvError> {
         self.pending.extend_from_slice(pcm);
         let n = AAC_FRAME * self.config.channels as usize;
         let mut out = Vec::new();
@@ -154,9 +115,544 @@ impl AudioEncoder {
     }
 }
 
+/// What the encoder's own thread is asked.
+enum Job {
+    Pcm(Vec<f32>),
+    /// Answered with `Reply::Fence` once every sample before it is encoded.
+    Fence,
+    /// Ends the encoder, within the stop's deadline when there is one (see `ffenc::finishing_by`:
+    /// that deadline lives in the stopping thread, so it is carried here).
+    Flush(Option<std::time::Instant>),
+}
+
+enum Reply {
+    Packets(Result<Vec<AudioPacket>, AvError>),
+    Fence,
+    Flushed(Vec<AudioPacket>),
+}
+
+/// The encoder on a thread of its own: samples queue to it, packets come back to be taken
+/// without waiting.
+#[derive(Debug)]
+struct Threaded {
+    tx: Option<std::sync::mpsc::SyncSender<Job>>,
+    rx: Option<std::sync::mpsc::Receiver<Reply>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// Samples the queue had no room for: sent with the next call, none are ever dropped (the
+    /// packets' times count samples, so a gap would move all later sound).
+    backlog: Vec<f32>,
+    /// Asks the thread to leave the queued sound unencoded (the encoder is being dropped).
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the thread has ended.
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Jobs queued at most (about 1.4 s of 21 ms blocks); beyond that samples wait in the backlog.
+const QUEUE: usize = 64;
+/// The backlog's limit, in seconds of sound: past it the encoder is called stuck (and stops).
+const BACKLOG_SECS: usize = 3;
+/// How long `settle` waits for an encoder that doesn't answer.
+const SETTLE_WITHIN: std::time::Duration =
+    if cfg!(test) { std::time::Duration::from_millis(300) } else { std::time::Duration::from_secs(5) };
+/// Past a stop's deadline, how long the answer of a flush is still waited for.
+const FLUSH_GRACE: std::time::Duration =
+    if cfg!(test) { std::time::Duration::from_millis(100) } else { std::time::Duration::from_secs(2) };
+/// How long dropping an encoder waits for its thread before leaving it to end alone (an FFmpeg
+/// stuck writing would else hold whoever dropped it: the engine's lock, in `heal`).
+const DROP_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Sets a flag when dropped (the thread ended, a panic included).
+struct SetOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Threaded {
+    /// A thread answering each job with `work`.
+    fn spawn_with(mut work: impl FnMut(Job) -> Reply + Send + 'static) -> Result<Self, AvError> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, jobs) = std::sync::mpsc::sync_channel::<Job>(QUEUE);
+        let (out, rx) = std::sync::mpsc::channel::<Reply>();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let (cancel_in, done_in) = (cancel.clone(), done.clone());
+        let handle = std::thread::Builder::new()
+            .name("ferrocast-aac".into())
+            .spawn(move || {
+                let _ended = SetOnDrop(done_in);
+                while let Ok(job) = jobs.recv() {
+                    if cancel_in.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if out.send(work(job)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(|e| AvError::Encoder(format!("the sound encoder's thread didn't start ({e})")))?;
+        Ok(Self { tx: Some(tx), rx: Some(rx), handle: Some(handle), backlog: Vec::new(), cancel, done })
+    }
+
+    /// `core` on a thread; when the thread won't start, `core` comes back with the error.
+    fn spawn(core: Core) -> Result<Self, Box<(AvError, Option<Core>)>> {
+        let slot = std::sync::Arc::new(Mutex::new(Some(core)));
+        let held = slot.clone();
+        let started = Self::spawn_with(move |job| {
+            let mut guard = held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(core) = guard.as_mut() else { return Reply::Packets(Err(Self::gone())) };
+            match job {
+                Job::Pcm(pcm) => Reply::Packets(core.encode(&pcm)),
+                Job::Fence => Reply::Fence,
+                Job::Flush(Some(by)) => Reply::Flushed(crate::ffenc::finishing_by(by, || core.flush())),
+                Job::Flush(None) => Reply::Flushed(core.flush()),
+            }
+        });
+        // The thread never ran, so the core is still in the slot.
+        started.map_err(|e| Box::new((e, slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take())))
+    }
+
+    fn gone() -> AvError {
+        AvError::Encoder("the sound encoder stopped".into())
+    }
+
+    /// Queues `pcm` (with any backlog) without waiting.
+    fn push(&mut self, pcm: &[f32], limit: usize) -> Result<(), AvError> {
+        let tx = self.tx.as_ref().ok_or_else(Self::gone)?;
+        let mut job = std::mem::take(&mut self.backlog);
+        job.extend_from_slice(pcm);
+        if job.is_empty() {
+            return Ok(());
+        }
+        match tx.try_send(Job::Pcm(job)) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(Job::Pcm(back))) => {
+                if back.len() > limit {
+                    // Stopped for good: sound given after a hole would be timed as if there were
+                    // none, so no more is taken (the output is made again, `heal`).
+                    self.tx = None;
+                    return Err(AvError::Encoder("the sound encoder fell too far behind".into()));
+                }
+                self.backlog = back;
+                Ok(())
+            }
+            Err(_) => Err(Self::gone()),
+        }
+    }
+
+    /// Packets finished so far.
+    fn take(&mut self) -> Result<Vec<AudioPacket>, AvError> {
+        let rx = self.rx.as_ref().ok_or_else(Self::gone)?;
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            if let Reply::Packets(p) = r {
+                out.extend(p?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Queues `job`, waiting for room until `by`.
+    fn send_by(&self, mut job: Job, by: std::time::Instant) -> Result<(), AvError> {
+        let tx = self.tx.as_ref().ok_or_else(Self::gone)?;
+        loop {
+            match tx.try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Full(back)) => {
+                    if std::time::Instant::now() >= by {
+                        return Err(AvError::Encoder("the sound encoder isn't answering".into()));
+                    }
+                    job = back;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Err(Self::gone()),
+            }
+        }
+    }
+
+    /// Waits until everything pushed is encoded (or, with `flush`, the encoder ended); its
+    /// packets. An error the encoder made on the way comes after the fence has been read, so the
+    /// next fence doesn't find this one's answer waiting. Never waits past the stop's deadline
+    /// (or `SETTLE_WITHIN`) and a little more.
+    fn fence(&mut self, flush: bool) -> Result<Vec<AudioPacket>, AvError> {
+        let now = std::time::Instant::now();
+        let by = if flush {
+            crate::ffenc::finish_deadline().unwrap_or(now + crate::ffenc::FINISH_WITHIN)
+        } else {
+            now + SETTLE_WITHIN
+        };
+        let limit = by + FLUSH_GRACE;
+        if !self.backlog.is_empty() {
+            let rest = std::mem::take(&mut self.backlog);
+            self.send_by(Job::Pcm(rest), limit)?;
+        }
+        self.send_by(if flush { Job::Flush(Some(by)) } else { Job::Fence }, limit)?;
+        let rx = self.rx.as_ref().ok_or_else(Self::gone)?;
+        let (mut out, mut failed) = (Vec::new(), None);
+        loop {
+            let left = limit.saturating_duration_since(std::time::Instant::now());
+            let reply = rx.recv_timeout(left).map_err(|e| match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    AvError::Encoder("the sound encoder isn't answering".into())
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => Self::gone(),
+            })?;
+            match reply {
+                Reply::Packets(Ok(p)) => out.extend(p),
+                Reply::Packets(Err(e)) => {
+                    failed.get_or_insert(e);
+                }
+                Reply::Fence if !flush => break,
+                Reply::Flushed(p) if flush => {
+                    out.extend(p);
+                    break;
+                }
+                Reply::Fence | Reply::Flushed(_) => {}
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+}
+
+impl Drop for Threaded {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // What is queued is left unencoded, and nobody is listening for answers.
+        self.cancel.store(true, Ordering::Release);
+        self.tx = None;
+        self.rx = None;
+        let Some(h) = self.handle.take() else { return };
+        // A thread stuck inside its encoder (an FFmpeg that doesn't read) must not hold whoever
+        // drops this (the engine's lock, in `heal`): it is left to end by itself, when the
+        // encoder it owns is let go or unblocks.
+        let t = std::time::Instant::now();
+        while !self.done.load(Ordering::Acquire) && t.elapsed() < DROP_WAIT {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if self.done.load(Ordering::Acquire) {
+            let _ = h.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Mode {
+    Here(Core),
+    Thread(Threaded),
+    /// Only while `move_off_thread` has the encoder in hand.
+    Moved,
+}
+
+/// An AAC encoder: the system's own (AudioToolbox on a Mac), else FFmpeg's. It encodes in the
+/// caller's thread, or (`off_thread`) on one of its own: `encode` then only queues the sound
+/// and hands back what the thread has finished, the same packets with the same times a little
+/// later; `settle` waits for all of it.
+#[derive(Debug)]
+pub struct AudioEncoder {
+    mode: Mode,
+    config: AudioConfig,
+}
+
+impl AudioEncoder {
+    pub fn new(config: AudioConfig) -> Result<Self, AvError> {
+        Self::check(&config)?;
+        #[cfg(target_os = "macos")]
+        if !std::env::var("FERROCAST_AV_ENCODER").is_ok_and(|v| v == "ffmpeg") {
+            let inner = Inner::Native(crate::apple::aac::Encoder::new(&config)?);
+            return Ok(Self { mode: Mode::Here(Core { inner, config, pending: Vec::new(), frames: 0 }), config });
+        }
+        Self::ffmpeg(config)
+    }
+
+    /// Through FFmpeg, whatever the system.
+    pub fn ffmpeg(config: AudioConfig) -> Result<Self, AvError> {
+        Self::check(&config)?;
+        let inner = Inner::Ffmpeg(crate::ffenc::Audio::new(&config)?);
+        Ok(Self { mode: Mode::Here(Core { inner, config, pending: Vec::new(), frames: 0 }), config })
+    }
+
+    /// Moves the encoding to a thread of its own (nothing encoded yet is lost: call it before
+    /// the first sample). Already off the thread: unchanged. If the thread won't start the
+    /// encoder stays as it was.
+    pub fn move_off_thread(&mut self) -> Result<(), AvError> {
+        match std::mem::replace(&mut self.mode, Mode::Moved) {
+            Mode::Here(core) => match Threaded::spawn(core) {
+                Ok(t) => {
+                    self.mode = Mode::Thread(t);
+                    Ok(())
+                }
+                Err(failed) => {
+                    let (e, core) = *failed;
+                    if let Some(core) = core {
+                        self.mode = Mode::Here(core);
+                    }
+                    Err(e)
+                }
+            },
+            other => {
+                self.mode = other;
+                Ok(())
+            }
+        }
+    }
+
+    /// `move_off_thread`, by value.
+    pub fn off_thread(mut self) -> Result<Self, AvError> {
+        self.move_off_thread()?;
+        Ok(self)
+    }
+
+    /// Whether it encodes on its own thread.
+    pub fn is_off_thread(&self) -> bool {
+        matches!(self.mode, Mode::Thread(_))
+    }
+
+    fn check(config: &AudioConfig) -> Result<(), AvError> {
+        if aac_config(config.sample_rate, config.channels).is_none() || config.channels > 2 {
+            return Err(AvError::Encoder(format!(
+                "AAC takes 1 or 2 channels at a standard rate, not {} at {} Hz",
+                config.channels, config.sample_rate
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn config(&self) -> &AudioConfig {
+        &self.config
+    }
+
+    /// The AudioSpecificConfig.
+    pub fn header(&self) -> Vec<u8> {
+        aac_config(self.config.sample_rate, self.config.channels).map(|c| c.to_vec()).unwrap_or_default()
+    }
+
+    /// Ends: the frames still inside the encoder (FFmpeg keeps some back; the Mac's gives each
+    /// at once), and on a thread, everything queued first. Samples short of a whole frame are
+    /// left out.
+    pub fn flush(&mut self) -> Result<Vec<AudioPacket>, AvError> {
+        match &mut self.mode {
+            Mode::Here(c) => Ok(c.flush()),
+            Mode::Thread(t) => t.fence(true),
+            Mode::Moved => Err(Threaded::gone()),
+        }
+    }
+
+    /// Adds interleaved samples; returns every whole AAC frame now ready (on a thread: those it
+    /// has finished, without waiting).
+    pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<AudioPacket>, AvError> {
+        let limit = BACKLOG_SECS * self.config.sample_rate as usize * self.config.channels as usize;
+        match &mut self.mode {
+            Mode::Here(c) => c.encode(pcm),
+            Mode::Thread(t) => {
+                t.push(pcm, limit)?;
+                t.take()
+            }
+            Mode::Moved => Err(Threaded::gone()),
+        }
+    }
+
+    /// Waits until all sound given so far is encoded, and returns what that made (nothing when
+    /// it encodes here: `encode` returned it already). For the moments the output's files or
+    /// pauses change, so packets land on the same side of them as when encoding here.
+    pub fn settle(&mut self) -> Result<Vec<AudioPacket>, AvError> {
+        match &mut self.mode {
+            Mode::Here(_) => Ok(Vec::new()),
+            Mode::Thread(t) => t.fence(false),
+            Mode::Moved => Err(Threaded::gone()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tone in blocks of 480 frames (stereo), as the mixer gives it.
+    fn tone(blocks: usize) -> Vec<Vec<f32>> {
+        (0..blocks)
+            .map(|b| {
+                (0..480)
+                    .flat_map(|n| {
+                        let v = (((b * 480 + n) as f32) * 0.03).sin() * 0.4;
+                        [v, -v]
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn cfg() -> AudioConfig {
+        AudioConfig { sample_rate: 48000, channels: 2, bitrate_kbps: 128 }
+    }
+
+    /// Whether an AAC encoder can open here: a Mac always; elsewhere only with FFmpeg (a CI runner
+    /// has none, and these tests are about the thread, not the encoder).
+    fn aac_here() -> bool {
+        let ok = AudioEncoder::new(cfg()).is_ok();
+        if !ok {
+            eprintln!("no AAC encoder here (no FFmpeg): skipped");
+        }
+        ok
+    }
+
+    /// On a thread of its own the encoder makes the same frames with the same times: what comes
+    /// back is the same list, at the end (and `settle` hands over what is owed meanwhile).
+    #[test]
+    fn a_thread_makes_the_same_packets_with_the_same_times() {
+        if !aac_here() {
+            return;
+        }
+        let blocks = tone(400);
+        let mut here = AudioEncoder::new(cfg()).unwrap_or_else(|e| panic!("{e}"));
+        let mut there = AudioEncoder::new(cfg()).and_then(AudioEncoder::off_thread).unwrap_or_else(|e| panic!("{e}"));
+        assert!(there.is_off_thread() && !here.is_off_thread());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for (i, blk) in blocks.iter().enumerate() {
+            a.extend(here.encode(blk).unwrap_or_else(|e| panic!("{e}")));
+            b.extend(there.encode(blk).unwrap_or_else(|e| panic!("{e}")));
+            if i % 97 == 50 {
+                // A cut: everything given so far is in `b` now, as in `a`.
+                b.extend(there.settle().unwrap_or_else(|e| panic!("{e}")));
+                assert_eq!(a.len(), b.len(), "settled at block {i}");
+            }
+        }
+        a.extend(here.flush().unwrap_or_else(|e| panic!("{e}")));
+        b.extend(there.flush().unwrap_or_else(|e| panic!("{e}")));
+        assert!(a.len() > 150, "{} packets", a.len());
+        assert_eq!(a, b, "same packets, same times");
+    }
+
+    /// Prints what `encode` costs the calling thread, here and with the thread (`--nocapture`).
+    #[test]
+    fn the_calling_thread_pays_only_for_queueing() {
+        let blocks = tone(1000);
+        let time = |mut e: AudioEncoder| {
+            let mut worst = std::time::Duration::ZERO;
+            let t0 = std::time::Instant::now();
+            for b in &blocks {
+                let t = std::time::Instant::now();
+                let _ = e.encode(b);
+                worst = worst.max(t.elapsed());
+            }
+            let total = t0.elapsed();
+            let _ = e.flush();
+            (total, worst)
+        };
+        if !aac_here() {
+            return;
+        }
+        let here = time(AudioEncoder::new(cfg()).unwrap_or_else(|e| panic!("{e}")));
+        let there = time(AudioEncoder::new(cfg()).and_then(AudioEncoder::off_thread).unwrap_or_else(|e| panic!("{e}")));
+        println!(
+            "encode() on the caller: here {:.1} us/block (worst {:.0} us), on a thread {:.1} us/block (worst {:.0} us)",
+            here.0.as_secs_f64() * 1e6 / 1000.0,
+            here.1.as_secs_f64() * 1e6,
+            there.0.as_secs_f64() * 1e6 / 1000.0,
+            there.1.as_secs_f64() * 1e6
+        );
+        assert!(there.0 < here.0, "queueing is cheaper than encoding");
+    }
+
+    fn pkt(at: i64) -> AudioPacket {
+        AudioPacket { pts_us: at, data: vec![at as u8] }
+    }
+
+    /// An encoder that error on a job doesn't leave its fence's answer in the channel for the
+    /// next fence to take as its own (which would end that wait before its sound was encoded).
+    #[test]
+    fn a_failed_job_does_not_confuse_the_next_fence() {
+        let mut n = 0;
+        let mut t = Threaded::spawn_with(move |job| match job {
+            Job::Pcm(_) => {
+                n += 1;
+                if n == 1 {
+                    Reply::Packets(Err(AvError::Encoder("boom".into())))
+                } else {
+                    Reply::Packets(Ok(vec![pkt(7)]))
+                }
+            }
+            Job::Fence => Reply::Fence,
+            Job::Flush(_) => Reply::Flushed(Vec::new()),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        t.push(&[0.0; 8], 1000).unwrap_or_else(|e| panic!("{e}"));
+        assert!(t.fence(false).is_err(), "the first job's error is reported");
+        t.push(&[0.0; 8], 1000).unwrap_or_else(|e| panic!("{e}"));
+        let got = t.fence(false).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(got, vec![pkt(7)], "the second fence waited for the second job");
+    }
+
+    /// An encoder stuck inside its work doesn't hold whoever drops it (the engine's lock, in
+    /// `heal`) and a settle that gets no answer ends with an error instead of waiting forever.
+    #[test]
+    fn a_stuck_encoder_holds_nobody() {
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let mut t = Threaded::spawn_with(move |_job| {
+            let _ = stuck.recv();
+            Reply::Fence
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        t.push(&[0.0; 8], 1000).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = std::time::Instant::now();
+        assert!(t.fence(false).is_err(), "no answer: an error");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(3), "{:?}", t0.elapsed());
+        let t1 = std::time::Instant::now();
+        drop(t);
+        assert!(
+            t1.elapsed() < std::time::Duration::from_secs(2),
+            "dropping didn't wait for the thread: {:?}",
+            t1.elapsed()
+        );
+        drop(release);
+    }
+
+    /// Past the backlog's limit the encoder stops for good: sound given after a hole would be
+    /// timed as if there were none.
+    #[test]
+    fn an_overflowing_encoder_stops_instead_of_shifting_time() {
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let mut t = Threaded::spawn_with(move |_job| {
+            let _ = stuck.recv();
+            Reply::Fence
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut failed = false;
+        for _ in 0..(QUEUE * 4) {
+            if t.push(&[0.0; 8], 16).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "the backlog's limit was reached");
+        assert!(t.push(&[0.0; 8], 16).is_err(), "and nothing more is taken");
+        drop(t);
+        drop(release);
+    }
+
+    /// A queue with no room keeps the sound (nothing is dropped, so no later time moves).
+    #[test]
+    fn a_full_queue_keeps_the_sound() {
+        if !aac_here() {
+            return;
+        }
+        let mut here = AudioEncoder::new(cfg()).unwrap_or_else(|e| panic!("{e}"));
+        let mut there = AudioEncoder::new(cfg()).and_then(AudioEncoder::off_thread).unwrap_or_else(|e| panic!("{e}"));
+        // Far more blocks than the queue holds, given without ever taking time to let it drain.
+        let blocks = tone(QUEUE * 3);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for blk in &blocks {
+            a.extend(here.encode(blk).unwrap_or_else(|e| panic!("{e}")));
+            b.extend(there.encode(blk).unwrap_or_else(|e| panic!("{e}")));
+        }
+        a.extend(here.flush().unwrap_or_else(|e| panic!("{e}")));
+        b.extend(there.flush().unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn config_for_48k_stereo() {

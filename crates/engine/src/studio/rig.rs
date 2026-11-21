@@ -32,6 +32,89 @@ impl Rig {
     }
 }
 
+/// Sources that make sound but draw nothing: a scene holding only these shows black.
+pub(crate) fn audio_only_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "coreaudio_input_capture"
+            | "coreaudio_output_capture"
+            | "sck_audio_capture"
+            | "wasapi_input_capture"
+            | "wasapi_output_capture"
+            | "wasapi_process_output_capture"
+            | "pulse_input_capture"
+            | "pulse_output_capture"
+            | "alsa_input_capture"
+            | "jack_output_capture"
+    )
+}
+
+/// Scans a Studio scene's items JSON for any visible non-group, non-scene source.
+/// Visible nested scenes are pushed into `nested` for the caller to inspect with cycle detection.
+fn studio_items_have_visible(items: &Value, nested: &mut Vec<String>) -> bool {
+    let Some(list) = items.as_array() else { return false };
+    for item in list {
+        if item.get("visible").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        let kind = item.get("kind").and_then(Value::as_str);
+        // The Studio's own items carry `"group": false, "children": []` on every ordinary source,
+        // so an array of children says nothing: a group says so itself (20 Nov, the real app called
+        // every scene empty and the Show never switched to its starting or live scene).
+        let is_group = item.get("group").and_then(Value::as_bool) == Some(true) || kind == Some("group");
+        if is_group {
+            if let Some(children) = item.get("children")
+                && studio_items_have_visible(children, nested)
+            {
+                return true;
+            }
+            continue;
+        }
+        if kind == Some("scene") {
+            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                nested.push(name.to_string());
+            }
+            continue;
+        }
+        // A mic or desktop sound is no picture (19 Nov: a scene with only a mic counted as shown).
+        if kind.is_some_and(audio_only_kind) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Deep emptiness check for OBS scenes: ignores disabled items and recurses into nested scenes
+/// with cycle protection. Returns `None` if `scene` isn't in `scenes`.
+fn obs_scene_is_empty(scenes: &ferrocast_obs::control::Scenes, scene: &str) -> Option<bool> {
+    scenes.scenes.iter().find(|s| s.name == scene)?;
+    let mut visited = std::collections::HashSet::new();
+    let mut todo = vec![scene];
+    visited.insert(scene);
+    while let Some(name) = todo.pop() {
+        let Some(sc) = scenes.scenes.iter().find(|s| s.name == name) else { continue };
+        for item in &sc.items {
+            if !item.enabled {
+                continue;
+            }
+            if item.kind.is_none()
+                && let Some(sub) = scenes.scenes.iter().find(|s| s.name == item.source)
+            {
+                if visited.insert(sub.name.as_str()) {
+                    todo.push(sub.name.as_str());
+                }
+                continue;
+            }
+            if item.kind.as_deref().is_some_and(audio_only_kind) {
+                continue;
+            }
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 /// A source called `name` among a scene's items (groups' children too) → its id and whether
 /// it shows.
 fn find_item(items: &Value, name: &str) -> Option<(i64, bool)> {
@@ -42,6 +125,28 @@ fn find_item(items: &Value, name: &str) -> Option<(i64, bool)> {
         }
         i.get("children").and_then(|c| find_item(c, name))
     })
+}
+
+/// [`Engine::rig_scene_is_empty`] for the Studio on items already read (`items`: scene name ->
+/// its items, the scene and every scene shown inside it). `None` when `scene` isn't in them.
+pub(crate) fn studio_scene_is_empty_in(items: &serde_json::Map<String, Value>, scene: &str) -> Option<bool> {
+    let root = items.get(scene)?;
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(scene.to_string());
+    let mut nested = Vec::new();
+    if studio_items_have_visible(root, &mut nested) {
+        return Some(false);
+    }
+    while let Some(sub) = nested.pop() {
+        if !visited.insert(sub.clone()) {
+            continue;
+        }
+        let Some(list) = items.get(&sub) else { continue };
+        if studio_items_have_visible(list, &mut nested) {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 impl Engine {
@@ -57,8 +162,8 @@ impl Engine {
             Err(_) => Err(EngineError::Refused {
                 status: 409,
                 code: "studio_stopped",
-                message: "The Studio isn't started.".into(),
-                hint: "Start it in Studio, Go live (or open OBS, if you stream with OBS).".into(),
+                message: "Studio isn't started.".into(),
+                hint: "Start it in Go live, or open OBS if you use OBS.".into(),
                 retry_after: None,
             }),
         }
@@ -81,18 +186,35 @@ impl Engine {
         }
     }
 
-    /// How many sources `scene` has (the Studio's; None for OBS or a scene not found).
-    pub(crate) async fn rig_scene_items(&self, rig: &Rig, scene: &str) -> Option<u64> {
+    /// Whether `scene` has no visible sources at all (recursing through groups and nested scenes,
+    /// ignoring hidden items and empty groups). `None` if the scene list can't be read or the
+    /// scene doesn't exist, so `rig_switch` surfaces the real error.
+    pub(crate) async fn rig_scene_is_empty(&self, rig: &Rig, scene: &str) -> Option<bool> {
         match rig {
-            Rig::Obs(_) => None,
+            Rig::Obs(c) => {
+                let scenes = ferrocast_obs::control::scenes(c).await.ok()?;
+                obs_scene_is_empty(&scenes, scene)
+            }
             Rig::Studio => {
-                let v = self.studio_act(StudioAct::Scenes).await.ok()?;
-                v.get("scenes")?
-                    .as_array()?
-                    .iter()
-                    .find(|s| s.get("name").and_then(Value::as_str) == Some(scene))?
-                    .get("items")?
-                    .as_u64()
+                let root = self.studio_act(StudioAct::Items { scene: scene.into() }).await.ok()?;
+                let mut visited = std::collections::HashSet::new();
+                visited.insert(scene.to_string());
+                let mut nested = Vec::new();
+                if studio_items_have_visible(&root, &mut nested) {
+                    return Some(false);
+                }
+                while let Some(sub) = nested.pop() {
+                    if !visited.insert(sub.clone()) {
+                        continue;
+                    }
+                    let Ok(items) = self.studio_act(StudioAct::Items { scene: sub }).await else {
+                        continue;
+                    };
+                    if studio_items_have_visible(&items, &mut nested) {
+                        return Some(false);
+                    }
+                }
+                Some(true)
             }
         }
     }
@@ -222,10 +344,20 @@ impl Engine {
     }
 
     pub(crate) async fn rig_set_streaming(&self, rig: &Rig, on: bool) -> Result<(), EngineError> {
+        let _out = self.studio().output_lock.lock().await;
+        self.rig_set_streaming_locked(rig, on).await
+    }
+
+    /// Runs Start/Stop Streaming on `rig` while the caller already holds `studio().output_lock`.
+    pub(crate) async fn rig_set_streaming_locked(&self, rig: &Rig, on: bool) -> Result<(), EngineError> {
         match rig {
-            Rig::Obs(c) if on => ferrocast_obs::control::start_stream(c).await.map_err(obs_error),
+            Rig::Obs(c) if on => {
+                ferrocast_obs::control::start_stream(c).await.map_err(obs_error)?;
+                self.on_stream_started();
+                Ok(())
+            }
             Rig::Obs(c) => ferrocast_obs::control::stop_stream(c).await.map_err(obs_error),
-            Rig::Studio => self.studio_stream(on).await.map(drop),
+            Rig::Studio => self.studio_stream_locked(on).await.map(drop),
         }
     }
 
@@ -322,5 +454,112 @@ mod tests {
         assert_eq!(find_item(&items, "Camera"), Some((5, false)));
         assert_eq!(find_item(&items, "Mic"), None);
         assert_eq!(find_item(&Value::Null, "Game"), None);
+    }
+
+    /// The shape the Studio's items route really answers with: every ordinary source has
+    /// `"group": false` and an empty `"children"` array. A scene of them is not empty.
+    #[test]
+    fn a_scene_of_ordinary_studio_sources_is_not_empty() {
+        let mut nested = Vec::new();
+        let colour = serde_json::json!([{
+            "audio": false, "blend": "normal", "children": [], "group": false, "id": 1,
+            "kind": "color_source_v3", "locked": false, "name": "Blue", "visible": true
+        }]);
+        assert!(studio_items_have_visible(&colour, &mut nested), "one visible colour source is a picture");
+        let mixed = serde_json::json!([
+            { "children": [], "group": false, "id": 2, "kind": "coreaudio_input_capture", "name": "Mic", "visible": true },
+            { "children": [], "group": false, "id": 1, "kind": "screen_capture", "name": "Screen", "visible": true }
+        ]);
+        assert!(studio_items_have_visible(&mixed, &mut nested));
+        // Hidden ones, and a group with nothing in it, still count as empty.
+        let empty = serde_json::json!([
+            { "children": [], "group": false, "id": 3, "kind": "av_capture_input", "name": "Cam", "visible": false },
+            { "children": [], "group": true, "id": 4, "kind": "group", "name": "Nothing", "visible": true }
+        ]);
+        assert!(!studio_items_have_visible(&empty, &mut nested));
+    }
+
+    #[test]
+    fn studio_deep_empty_check_handles_hidden_items_groups_and_nested_scenes() {
+        let mut nested = Vec::new();
+        assert!(!studio_items_have_visible(&serde_json::json!([]), &mut nested));
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([{ "id": 1, "name": "Cam", "kind": "av_capture_input", "visible": false }]),
+            &mut nested,
+        ));
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([{ "id": 2, "name": "EmptyGrp", "kind": "group", "group": true, "visible": true, "children": [] }]),
+            &mut nested,
+        ));
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([{
+                "id": 3, "name": "AllHidden", "kind": "group", "group": true, "visible": true,
+                "children": [{ "id": 4, "name": "Cam", "kind": "av_capture_input", "visible": false }]
+            }]),
+            &mut nested,
+        ));
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([{
+                "id": 5, "name": "HiddenGrp", "kind": "group", "group": true, "visible": false,
+                "children": [{ "id": 6, "name": "Cam", "kind": "av_capture_input", "visible": true }]
+            }]),
+            &mut nested,
+        ));
+        assert!(studio_items_have_visible(
+            &serde_json::json!([{
+                "id": 7, "name": "Outer", "kind": "group", "group": true, "visible": true,
+                "children": [{
+                    "id": 8, "name": "Inner", "kind": "group", "group": true, "visible": true,
+                    "children": [{ "id": 9, "name": "Cam", "kind": "av_capture_input", "visible": true }]
+                }]
+            }]),
+            &mut nested,
+        ));
+        // Visible nested scene is queued; hidden nested scene is ignored.
+        nested.clear();
+        assert!(!studio_items_have_visible(
+            &serde_json::json!([
+                { "id": 10, "name": "SubHidden", "kind": "scene", "visible": false },
+                { "id": 11, "name": "SubVisible", "kind": "scene", "visible": true }
+            ]),
+            &mut nested,
+        ));
+        assert_eq!(nested, vec!["SubVisible"]);
+    }
+
+    #[test]
+    fn obs_deep_empty_check_handles_disabled_items_and_cycles() {
+        use ferrocast_obs::control::{Scene, SceneItem, Scenes};
+        let scenes = Scenes {
+            current: Some("A".into()),
+            scenes: vec![
+                Scene { name: "Empty".into(), items: vec![] },
+                Scene {
+                    name: "Hidden".into(),
+                    items: vec![SceneItem { id: 1, source: "Cam".into(), enabled: false, kind: Some("dshow".into()) }],
+                },
+                Scene {
+                    name: "CycleA".into(),
+                    items: vec![SceneItem { id: 1, source: "CycleB".into(), enabled: true, kind: None }],
+                },
+                Scene {
+                    name: "CycleB".into(),
+                    items: vec![SceneItem { id: 1, source: "CycleA".into(), enabled: true, kind: None }],
+                },
+                Scene {
+                    name: "ViaNested".into(),
+                    items: vec![SceneItem { id: 1, source: "Leaf".into(), enabled: true, kind: None }],
+                },
+                Scene {
+                    name: "Leaf".into(),
+                    items: vec![SceneItem { id: 1, source: "Cam".into(), enabled: true, kind: Some("dshow".into()) }],
+                },
+            ],
+        };
+        assert_eq!(obs_scene_is_empty(&scenes, "Missing"), None);
+        assert_eq!(obs_scene_is_empty(&scenes, "Empty"), Some(true));
+        assert_eq!(obs_scene_is_empty(&scenes, "Hidden"), Some(true));
+        assert_eq!(obs_scene_is_empty(&scenes, "CycleA"), Some(true));
+        assert_eq!(obs_scene_is_empty(&scenes, "ViaNested"), Some(false));
     }
 }

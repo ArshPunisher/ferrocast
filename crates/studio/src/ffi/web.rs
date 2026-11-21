@@ -542,6 +542,11 @@ impl std::fmt::Debug for FedPage {
 }
 
 impl FedPage {
+    /// The Mac's page is drawn by the system's own web view: it has no stall of this kind.
+    pub(crate) fn stalled(&self) -> bool {
+        false
+    }
+
     /// Opens `url` at `w`×`h` with `css`, snapshotted `fps` times a second into `feed`.
     pub(crate) fn open(url: &str, w: u32, h: u32, css: &str, fps: u32, feed: ferrocore::engine::Feed) -> Option<Self> {
         let mtm = MainThreadMarker::new()?;

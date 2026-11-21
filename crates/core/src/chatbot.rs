@@ -172,23 +172,52 @@ pub fn counter_op_for(args: &[&str], is_mod: bool) -> Result<CounterOp, BadCount
     }
 }
 
+/// Hard cap on tracked keyed cooldown entries.
+const MAX_KEYED_COOLDOWNS: usize = 20_000;
+
 /// "Once per N seconds per key" for counter and module commands (`!deaths:*`,
-/// `!deaths:<user>`). Bounded: past 20,000 keys the ones older than an hour go.
+/// `!deaths:<user>`). Bounded: expired entries are pruned first, then oldest half evicted past
+/// [`MAX_KEYED_COOLDOWNS`].
 #[derive(Debug, Default, Clone)]
 pub struct KeyedCooldowns {
-    last: std::collections::HashMap<String, i64>,
+    /// `(last_ms, expires_at_ms)` so expired entries prune by their own window.
+    last: std::collections::HashMap<String, (i64, i64)>,
 }
 
 impl KeyedCooldowns {
+    /// Current number of tracked keys (for monitoring and soak tests).
+    pub fn len(&self) -> usize {
+        self.last.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.last.is_empty()
+    }
+
     /// Whether `key` may run now (`now_ms`); records the use when it may.
     pub fn take(&mut self, key: &str, seconds: i64, now_ms: i64) -> bool {
-        if self.last.get(key).is_some_and(|last| now_ms - last < seconds * 1000) {
+        if self.last.get(key).is_some_and(|(last, _)| now_ms - last < seconds * 1000) {
             return false;
         }
-        if self.last.len() > 20_000 {
-            self.last.retain(|_, last| now_ms - *last < 3_600_000);
+        if self.last.len() >= MAX_KEYED_COOLDOWNS {
+            self.last.retain(|_, (_, exp)| now_ms < *exp);
+            if self.last.len() >= MAX_KEYED_COOLDOWNS {
+                let mut times: Vec<i64> = self.last.values().map(|(last, _)| *last).collect();
+                let mid = times.len() / 2;
+                let (_, cutoff, _) = times.select_nth_unstable(mid);
+                let cutoff = *cutoff;
+                self.last.retain(|_, (last, _)| *last > cutoff);
+                while self.last.len() >= MAX_KEYED_COOLDOWNS {
+                    if let Some(k) = self.last.keys().next().cloned() {
+                        self.last.remove(&k);
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
-        self.last.insert(key.to_string(), now_ms);
+        let exp = now_ms.saturating_add(seconds.saturating_mul(1000));
+        self.last.insert(key.to_string(), (now_ms, exp));
         true
     }
 }
@@ -853,5 +882,14 @@ mod tests {
         assert!(d.challenge(c("a", "b", 100), 0).is_ok());
         assert!(d.take_for("twitch", "b", 100).is_none(), "expired");
         assert!(d.open.is_empty());
+    }
+
+    #[test]
+    fn keyed_cooldowns_enforce_hard_cap() {
+        let mut kc = KeyedCooldowns::default();
+        for i in 0..25_000 {
+            assert!(kc.take(&format!("k{i}"), 3600, i * 10));
+            assert!(kc.len() <= MAX_KEYED_COOLDOWNS, "len exceeded cap: {}", kc.len());
+        }
     }
 }

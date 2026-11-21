@@ -26,7 +26,12 @@ pub const DEFAULT_PORT: u16 = 1935;
 /// A handshake must finish quickly; anything slower isn't OBS.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// OBS sends packets many times a second; silence this long means it's gone.
-const IDLE: Duration = Duration::from_secs(30);
+const IDLE: Duration = Duration::from_secs(25);
+
+// A sender that connected and then sends nothing is hung up on after IDLE; if that were as long as
+// `push::STAYED_LIVE_MS` the sender would count each such session as one that "stayed live", reset
+// its retry count every time, and flap forever every ~32 s (the S42 log) instead of reaching Failed.
+const _: () = assert!(IDLE.as_millis() < crate::push::STAYED_LIVE_MS as u128);
 /// Local connections at once (OBS uses one; a few more for retries and the upload check).
 const MAX_CONNECTIONS: usize = 4;
 

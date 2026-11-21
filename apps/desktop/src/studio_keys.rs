@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ferrocast_engine::studio_host::{AudioChange, FilterEdit, ItemEdit, MediaAct, StudioAct};
 use ferrocast_engine::{Engine, EngineError};
@@ -17,8 +18,73 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 /// The Studio's shortcuts registered now and what each does, and the queue their presses go
 /// through: one worker runs them in order, so a quick push-to-talk tap never ends unmuted.
 pub struct StudioKeys {
-    keys: Mutex<HashMap<Shortcut, String>>,
+    keys: Mutex<HashMap<Shortcut, Vec<String>>>,
     queue: tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+    /// What the settings last asked for (kept while the keys are let go for a shortcut field).
+    wanted: Mutex<BTreeMap<String, String>>,
+    /// Whether a shortcut field is waiting for a key (the global shortcuts are let go).
+    gate: Mutex<CaptureGate>,
+}
+
+/// How long a shortcut field's "waiting for a key" holds the global shortcuts without being
+/// asked again (the page asks every few seconds): if the page goes away without saying so,
+/// they come back by themselves.
+pub(crate) const CAPTURE_HOLD: Duration = Duration::from_secs(30);
+
+/// What a "waiting for a key" call changes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Capture {
+    /// The shortcuts are to be let go now.
+    Suspend,
+    /// Still waiting: the hold is extended.
+    Renew,
+    /// The shortcuts are to be put back now.
+    Resume,
+    /// Nothing changes.
+    Nothing,
+}
+
+/// Whether the global shortcuts are let go for a shortcut field, and until when (the pure part,
+/// tested without a window).
+#[derive(Debug, Default)]
+pub(crate) struct CaptureGate {
+    until: Option<Instant>,
+}
+
+impl CaptureGate {
+    /// The page says it is waiting for a key (`on`) or has stopped.
+    pub(crate) fn set(&mut self, on: bool, now: Instant) -> Capture {
+        match (on, self.until) {
+            (true, None) => {
+                self.until = Some(now + CAPTURE_HOLD);
+                Capture::Suspend
+            }
+            (true, Some(_)) => {
+                self.until = Some(now + CAPTURE_HOLD);
+                Capture::Renew
+            }
+            (false, Some(_)) => {
+                self.until = None;
+                Capture::Resume
+            }
+            (false, None) => Capture::Nothing,
+        }
+    }
+
+    /// The hold ran out (the page never said it stopped) → the shortcuts are to be put back.
+    pub(crate) fn expire(&mut self, now: Instant) -> bool {
+        match self.until {
+            Some(t) if now >= t => {
+                self.until = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.until.is_some()
+    }
 }
 
 impl StudioKeys {
@@ -32,64 +98,170 @@ impl StudioKeys {
                 }
             }
         });
-        StudioKeys { keys: Mutex::new(HashMap::new()), queue }
+        StudioKeys {
+            keys: Mutex::new(HashMap::new()),
+            queue,
+            wanted: Mutex::new(BTreeMap::new()),
+            gate: Mutex::new(CaptureGate::default()),
+        }
     }
 }
 
+/// What the settings ask for: each key once, with every action it runs (a key may be shared by
+/// several actions, as in OBS, and an action may have several keys), and the keys that aren't
+/// keys this computer knows.
+pub(crate) fn plan(wanted: &BTreeMap<String, String>) -> (Vec<(Shortcut, Vec<String>)>, Vec<String>) {
+    let mut by_key: Vec<(Shortcut, Vec<String>)> = Vec::new();
+    let mut unknown = Vec::new();
+    for (action, value) in wanted {
+        for keys in value.split('|') {
+            match keys.parse::<Shortcut>() {
+                Ok(sc) => match by_key.iter_mut().find(|(k, _)| *k == sc) {
+                    Some((_, actions)) => {
+                        if !actions.contains(action) {
+                            actions.push(action.clone());
+                        }
+                    }
+                    None => by_key.push((sc, vec![action.clone()])),
+                },
+                Err(_) => unknown.push(keys.to_string()),
+            }
+        }
+    }
+    (by_key, unknown)
+}
+
 /// Registers these shortcuts in place of the old ones → the keys that couldn't be (taken by
-/// another app, used twice, or not keys this computer knows).
+/// another app, or not keys this computer knows).
 pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> {
     let Some(state) = app.try_state::<StudioKeys>() else { return Vec::new() };
+    *state.wanted.lock().unwrap_or_else(|p| p.into_inner()) = wanted.clone();
+    // A shortcut field is waiting for a key: they are put in when it is done.
+    if state.gate.lock().unwrap_or_else(|p| p.into_inner()).active() {
+        return Vec::new();
+    }
     let mut map = state.keys.lock().unwrap_or_else(|p| p.into_inner());
     for (sc, _) in map.drain() {
         let _ = app.global_shortcut().unregister(sc);
     }
-    let mut failed = Vec::new();
-    for (action, keys) in wanted {
-        match keys.parse::<Shortcut>() {
-            Ok(sc) if !map.contains_key(&sc) => match app.global_shortcut().register(sc) {
-                Ok(()) => {
-                    tracing::info!(keys, action, "a Studio shortcut is set");
-                    map.insert(sc, action.clone());
-                }
-                Err(e) => {
-                    tracing::warn!(keys, error = %e, "a Studio shortcut couldn't be registered");
-                    failed.push(keys.clone());
-                }
-            },
-            _ => failed.push(keys.clone()),
+    let (planned, mut failed) = plan(wanted);
+    for (sc, actions) in planned {
+        match app.global_shortcut().register(sc) {
+            Ok(()) => {
+                tracing::info!(keys = %sc, ?actions, "a Studio shortcut is set");
+                map.insert(sc, actions);
+            }
+            Err(e) => {
+                tracing::warn!(keys = %sc, error = %e, "a Studio shortcut couldn't be registered");
+                failed.push(sc.to_string());
+            }
         }
     }
     failed
 }
 
+/// A shortcut field of the dashboard waits for a key (`on`) or has stopped: every global
+/// shortcut of the app is let go for the wait, so the page gets each key (those assigned already
+/// too) and no action runs from it, then they are put back (also when the page goes away
+/// without saying so: after [`CAPTURE_HOLD`]).
+pub(crate) fn capture(app: &AppHandle, on: bool) {
+    let Some(state) = app.try_state::<StudioKeys>() else { return };
+    let change = state.gate.lock().unwrap_or_else(|p| p.into_inner()).set(on, Instant::now());
+    match change {
+        Capture::Suspend => {
+            tracing::info!("the shortcuts are let go while a shortcut field waits for a key");
+            let _ = app.global_shortcut().unregister_all();
+            watch_capture(app.clone());
+        }
+        Capture::Renew => watch_capture(app.clone()),
+        Capture::Resume => restore(app),
+        Capture::Nothing => {}
+    }
+}
+
+/// Puts the shortcuts back when the hold runs out.
+fn watch_capture(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(CAPTURE_HOLD + Duration::from_millis(200)).await;
+        let Some(state) = app.try_state::<StudioKeys>() else { return };
+        let expired = state.gate.lock().unwrap_or_else(|p| p.into_inner()).expire(Instant::now());
+        if expired {
+            tracing::warn!("a shortcut field never said it stopped waiting: the shortcuts are back");
+            restore(&app);
+        }
+    });
+}
+
+/// The app's shortcuts back after a shortcut field: the show-window key, the panic key and the
+/// Studio's.
+fn restore(app: &AppHandle) {
+    crate::restore_app_shortcuts(app);
+    let wanted = match app.try_state::<StudioKeys>() {
+        Some(s) => s.wanted.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        None => return,
+    };
+    let _ = apply(app, &wanted);
+}
+
 /// Runs the Studio's action for this shortcut → false when it isn't one of the Studio's.
 pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> bool {
     let Some(keys) = app.try_state::<StudioKeys>() else { return false };
-    let Some(action) = keys.keys.lock().unwrap_or_else(|p| p.into_inner()).get(shortcut).cloned() else {
+    let Some(actions) = keys.keys.lock().unwrap_or_else(|p| p.into_inner()).get(shortcut).cloned() else {
         return false;
     };
     let pressed = state == ShortcutState::Pressed;
-    tracing::debug!(action, pressed, "a Studio shortcut");
-    // Only push to talk and push to mute act on letting go.
-    if !pressed && !action.starts_with("push_to_talk:") && !action.starts_with("push_to_mute:") {
-        return true;
+    for action in actions {
+        tracing::debug!(action, pressed, "a Studio shortcut");
+        // Only push to talk and push to mute act on letting go.
+        if !pressed && !action.starts_with("push_to_talk:") && !action.starts_with("push_to_mute:") {
+            continue;
+        }
+        let _ = keys.queue.send((action, pressed));
     }
-    let _ = keys.queue.send((action, pressed));
     true
 }
 
 async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineError> {
     match action {
         "go_live" => {
-            engine.studio_stream(true).await?;
+            engine.go_live().await?;
         }
         "end_stream" => {
-            engine.studio_stream(false).await?;
+            engine.end_live().await?;
         }
         "record" => {
             let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
             engine.studio_record(!on).await?;
+        }
+        "start_record" => {
+            let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
+            if !on {
+                engine.studio_record(true).await?;
+            }
+        }
+        "stop_record" => {
+            let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
+            if on {
+                engine.studio_record(false).await?;
+            }
+        }
+        "unpause_record" => {
+            let paused = engine.studio_stats().await?["record"]["paused"].as_bool().unwrap_or(false);
+            if paused {
+                engine.studio_record_pause(false).await?;
+            }
+        }
+        "start_replay" | "stop_replay" => {
+            let on = engine.studio_stats().await?["replay"]["active"].as_bool().unwrap_or(false);
+            if on != (action == "start_replay") {
+                engine.studio_replay(action == "start_replay").await?;
+            }
+        }
+        "start_virtualcam" | "stop_virtualcam" => {
+            let on = engine.studio_stats().await?["virtualcam"]["active"].as_bool().unwrap_or(false);
+            if on != (action == "start_virtualcam") {
+                engine.studio_virtual_camera(action == "start_virtualcam", None).await?;
+            }
         }
         "pause_record" => {
             let paused = engine.studio_stats().await?["record"]["paused"].as_bool().unwrap_or(false);
@@ -123,6 +295,32 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
         }
         "screenshot" => {
             engine.studio_act(StudioAct::ScreenshotProgram).await?;
+        }
+        "vertical:show_preview" | "vertical:hide_preview" | "vertical:toggle_preview" => {
+            // There is no preview of its own to show or hide (the page places it): these keys
+            // turn the vertical picture on and off, and while the Studio streams (connecting
+            // and reconnecting too) that ends the vertical stream or starts one: not then.
+            if !engine.studio_stream_stats().await?.is_null() {
+                tracing::warn!(action, "the vertical preview keys do nothing while the Studio streams");
+                return Ok(());
+            }
+            let on = !engine.studio_act(StudioAct::Scenes).await?["vertical"].is_null();
+            let want = match action {
+                "vertical:show_preview" => true,
+                "vertical:hide_preview" => false,
+                _ => !on,
+            };
+            if want && !on {
+                start_vertical_with_fallback(engine).await?;
+            } else if !want && on {
+                engine.studio_act(StudioAct::StopVertical).await?;
+            }
+        }
+        "vertical:screenshot" => {
+            let scenes = engine.studio_act(StudioAct::Scenes).await?;
+            if let Some(name) = scenes["vertical"]["current"].as_str().filter(|s| !s.is_empty()) {
+                engine.studio_act(StudioAct::Screenshot { name: name.to_string() }).await?;
+            }
         }
         "undo" => {
             engine.studio_act(StudioAct::Undo).await?;
@@ -160,7 +358,7 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                     engine.studio_act(StudioAct::EditItem { scene: scene.to_string(), id, edit }).await?;
                 }
             } else if let Some((source, filter)) = pair("filter:") {
-                let list = engine.studio_act(StudioAct::Filters { name: source.to_string() }).await?;
+                let list = engine.studio_act(StudioAct::Filters { name: source.to_string(), item: None }).await?;
                 let on = list
                     .as_array()
                     .and_then(|l| l.iter().find(|f| f["name"] == Value::String(filter.into())))
@@ -168,7 +366,12 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                     .unwrap_or(false);
                 let edit = if on { FilterEdit::Disable } else { FilterEdit::Enable };
                 engine
-                    .studio_act(StudioAct::EditFilter { name: source.to_string(), filter: filter.to_string(), edit })
+                    .studio_act(StudioAct::EditFilter {
+                        name: source.to_string(),
+                        filter: filter.to_string(),
+                        edit,
+                        item: None,
+                    })
                     .await?;
             } else if let Some(name) = a.strip_prefix("screenshot:") {
                 engine.studio_act(StudioAct::Screenshot { name: name.to_string() }).await?;
@@ -183,15 +386,40 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                 };
                 engine.studio_act(StudioAct::Media { name: name.to_string(), what: Some(what), seek_ms: None }).await?;
             } else if let Some(name) = a.strip_prefix("push_to_mute:") {
-                // Held: muted; let go: heard.
-                engine.studio_act(audio(name, pressed)).await?;
+                // Switched on for the sound: the mixer gates it (with its release delay, in samples).
+                // Not: held mutes it, let go hears it, as before.
+                let gated = engine
+                    .studio_act(StudioAct::PushKey { name: name.to_string(), talk: false, down: pressed })
+                    .await?;
+                if gated != Value::Bool(true) {
+                    engine.studio_act(audio(name, pressed)).await?;
+                }
             } else if let Some(name) = a.strip_prefix("mute:") {
                 let muted = muted(engine, name).await?;
                 engine.studio_act(audio(name, !muted)).await?;
             } else if let Some(name) = a.strip_prefix("push_to_talk:") {
-                // Held: heard; let go: muted.
-                engine.studio_act(audio(name, !pressed)).await?;
+                let gated =
+                    engine.studio_act(StudioAct::PushKey { name: name.to_string(), talk: true, down: pressed }).await?;
+                if gated != Value::Bool(true) {
+                    // Held: heard; let go: muted.
+                    engine.studio_act(audio(name, !pressed)).await?;
+                }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Enables the vertical canvas, picking a free default scene name if `"Vertical"` is already
+/// used by a main scene or source (`studio_name_taken`). If vertical scenes already exist from
+/// before, the engine ignores `scene` and restores them.
+async fn start_vertical_with_fallback(engine: &Engine) -> Result<(), EngineError> {
+    for n in 1..=10 {
+        let scene = if n == 1 { "Vertical".to_string() } else { format!("Vertical {n}") };
+        match engine.studio_act(StudioAct::StartVertical { scene }).await {
+            Ok(_) => return Ok(()),
+            Err(EngineError::Refused { code: "studio_name_taken", .. }) if n < 10 => continue,
+            Err(e) => return Err(e),
         }
     }
     Ok(())
@@ -207,4 +435,323 @@ async fn muted(engine: &Engine, name: &str) -> Result<bool, EngineError> {
         .and_then(|l| l.iter().find(|a| a["name"] == Value::String(name.into())))
         .and_then(|a| a["muted"].as_bool())
         .unwrap_or(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CAPTURE_HOLD, Capture, CaptureGate};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn waiting_for_a_key_lets_the_shortcuts_go_and_stopping_puts_them_back() {
+        let mut g = CaptureGate::default();
+        let t = Instant::now();
+        assert!(!g.active());
+        assert_eq!(g.set(true, t), Capture::Suspend);
+        assert!(g.active());
+        // The page asks again every few seconds: nothing is let go twice.
+        assert_eq!(g.set(true, t + Duration::from_secs(10)), Capture::Renew);
+        assert_eq!(g.set(false, t + Duration::from_secs(12)), Capture::Resume);
+        assert!(!g.active());
+        // Stopping when it wasn't waiting changes nothing.
+        assert_eq!(g.set(false, t + Duration::from_secs(13)), Capture::Nothing);
+    }
+
+    #[test]
+    fn a_page_that_goes_away_gives_the_shortcuts_back_after_the_hold() {
+        let mut g = CaptureGate::default();
+        let t = Instant::now();
+        g.set(true, t);
+        assert!(!g.expire(t + CAPTURE_HOLD - Duration::from_secs(1)));
+        assert!(g.active());
+        // Asked again at 20 s: held until 50 s.
+        g.set(true, t + Duration::from_secs(20));
+        assert!(!g.expire(t + CAPTURE_HOLD + Duration::from_secs(1)));
+        assert!(g.expire(t + Duration::from_secs(20) + CAPTURE_HOLD));
+        assert!(!g.active());
+        // Nothing to give back twice.
+        assert!(!g.expire(t + Duration::from_secs(100)));
+    }
+
+    use super::*;
+
+    fn wanted(list: &[(&str, &str)]) -> BTreeMap<String, String> {
+        list.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect()
+    }
+
+    #[test]
+    fn an_action_may_have_several_keys() {
+        let (planned, unknown) = plan(&wanted(&[("record", "Alt+R|F9")]));
+        assert!(unknown.is_empty());
+        assert_eq!(planned.len(), 2);
+        assert!(planned.iter().all(|(_, a)| a == &["record".to_string()]));
+    }
+
+    #[test]
+    fn a_key_shared_by_two_actions_runs_both() {
+        let (planned, _) = plan(&wanted(&[("mute:Mic", "F8"), ("scene:BRB", "F8"), ("record", "F9")]));
+        assert_eq!(planned.len(), 2);
+        let shared = planned.iter().find(|(_, a)| a.len() == 2).map(|(_, a)| a.clone()).unwrap();
+        assert_eq!(shared, vec!["mute:Mic".to_string(), "scene:BRB".to_string()]);
+    }
+
+    #[test]
+    fn keys_this_computer_does_not_know_are_reported_not_dropped_silently() {
+        let (planned, unknown) = plan(&wanted(&[("record", "F9|Nonsense+Key"), ("undo", "Alt+Z")]));
+        assert_eq!(planned.len(), 2);
+        assert_eq!(unknown, vec!["Nonsense+Key".to_string()]);
+    }
+
+    #[test]
+    fn the_same_key_twice_on_one_action_counts_once() {
+        let (planned, _) = plan(&wanted(&[("record", "F9|F9")]));
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].1.len(), 1);
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeHost {
+        vertical_on: std::sync::atomic::AtomicBool,
+        vertical_current: Mutex<Option<String>>,
+        taken_names: Mutex<Vec<String>>,
+        acts: Mutex<Vec<StudioAct>>,
+        /// The Studio streams (its stream stats aren't null).
+        streaming: std::sync::atomic::AtomicBool,
+        /// How often the vertical stream was told to stop.
+        vstream_stops: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeHost {
+        fn take_acts(&self) -> Vec<StudioAct> {
+            std::mem::take(&mut *self.acts.lock().unwrap_or_else(|p| p.into_inner()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrocast_engine::studio_host::StudioHost for FakeHost {
+        async fn status(&self) -> ferrocast_engine::studio_host::StudioStatus {
+            ferrocast_engine::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn options(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn act(&self, act: StudioAct) -> Result<Value, String> {
+            self.acts.lock().unwrap_or_else(|p| p.into_inner()).push(act.clone());
+            match act {
+                StudioAct::Scenes => {
+                    let on = self.vertical_on.load(std::sync::atomic::Ordering::SeqCst);
+                    let cur = self.vertical_current.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    Ok(serde_json::json!({
+                        "scenes": [],
+                        "current": "Scene",
+                        "vertical": if on {
+                            serde_json::json!({
+                                "width": 1080,
+                                "height": 1920,
+                                "scenes": [],
+                                "current": cur.unwrap_or_default()
+                            })
+                        } else {
+                            Value::Null
+                        }
+                    }))
+                }
+                StudioAct::StartVertical { scene } => {
+                    if self.taken_names.lock().unwrap_or_else(|p| p.into_inner()).contains(&scene) {
+                        return Err(format!("name: \"{scene}\" is taken: pick another name."));
+                    }
+                    self.vertical_on.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut cur = self.vertical_current.lock().unwrap_or_else(|p| p.into_inner());
+                    if cur.is_none() {
+                        *cur = Some(scene);
+                    }
+                    Ok(Value::Null)
+                }
+                StudioAct::StopVertical => {
+                    self.vertical_on.store(false, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Value::Null)
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
+            Default::default()
+        }
+        async fn set_settings(
+            &self,
+            _s: ferrocast_engine::studio_host::StudioSettings,
+        ) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record(&self, _on: bool) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({ "devices": [] }))
+        }
+        async fn stream_start(
+            &self,
+            _server: String,
+            _key: String,
+            _tracks: Vec<(u32, u32, u32)>,
+        ) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(if self.streaming.load(std::sync::atomic::Ordering::SeqCst) {
+                serde_json::json!({ "active": true, "reconnecting": false, "error": null })
+            } else {
+                Value::Null
+            })
+        }
+        async fn vertical_stream_stop(&self) -> Result<(), String> {
+            self.vstream_stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn import_obs(&self, _id: String) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+    }
+
+    async fn test_engine(host: std::sync::Arc<FakeHost>) -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap_or_else(|e| panic!("engine: {e}"));
+        engine.set_studio_host(host);
+        (engine, dir)
+    }
+
+    #[tokio::test]
+    async fn vertical_preview_actions_toggle_start_and_stop_through_the_engine() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run(&engine, "vertical:hide_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes]);
+
+        run(&engine, "vertical:show_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StartVertical { scene: "Vertical".into() }]);
+
+        run(&engine, "vertical:show_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes]);
+
+        run(&engine, "vertical:toggle_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StopVertical]);
+
+        run(&engine, "vertical:toggle_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StartVertical { scene: "Vertical".into() }]);
+
+        run(&engine, "vertical:hide_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StopVertical]);
+
+        engine.shutdown();
+    }
+
+    /// While the Studio streams, the vertical preview keys would end the vertical stream (hide,
+    /// toggle) or start one and make a scene (show): they do nothing then.
+    #[tokio::test]
+    async fn vertical_preview_keys_never_turn_the_vertical_picture_on_or_off_while_streaming() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+        host.streaming.store(true, SeqCst);
+
+        // On air with the vertical picture on: hide and toggle leave it (and its stream) on.
+        host.vertical_on.store(true, SeqCst);
+        for key in ["vertical:hide_preview", "vertical:toggle_preview", "vertical:show_preview"] {
+            run(&engine, key, true).await.unwrap_or_else(|e| panic!("{key}: {e}"));
+            let acts = host.take_acts();
+            assert!(
+                !acts.iter().any(|a| matches!(a, StudioAct::StopVertical | StudioAct::StartVertical { .. })),
+                "{key} while live: {acts:?}"
+            );
+            assert!(host.vertical_on.load(SeqCst), "{key} turned the vertical picture off while live");
+        }
+        assert_eq!(host.vstream_stops.load(SeqCst), 0, "the vertical stream was stopped while live");
+
+        // On air with it off: show and toggle don't start it (that would start a vertical stream).
+        host.vertical_on.store(false, SeqCst);
+        for key in ["vertical:show_preview", "vertical:toggle_preview"] {
+            run(&engine, key, true).await.unwrap_or_else(|e| panic!("{key}: {e}"));
+            let acts = host.take_acts();
+            assert!(!acts.iter().any(|a| matches!(a, StudioAct::StartVertical { .. })), "{key} while live: {acts:?}");
+            assert!(!host.vertical_on.load(SeqCst), "{key} turned the vertical picture on while live");
+        }
+
+        // Off air the keys work again.
+        host.streaming.store(false, SeqCst);
+        run(&engine, "vertical:toggle_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::StartVertical { scene: "Vertical".into() }]);
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn vertical_show_preview_picks_a_free_scene_name_if_vertical_is_taken() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        host.taken_names.lock().unwrap_or_else(|p| p.into_inner()).push("Vertical".into());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run(&engine, "vertical:show_preview", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            host.take_acts(),
+            vec![
+                StudioAct::Scenes,
+                StudioAct::StartVertical { scene: "Vertical".into() },
+                StudioAct::StartVertical { scene: "Vertical 2".into() },
+            ]
+        );
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn vertical_screenshot_captures_the_active_vertical_scene_when_on() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run(&engine, "vertical:screenshot", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes]);
+
+        host.vertical_on.store(true, std::sync::atomic::Ordering::SeqCst);
+        *host.vertical_current.lock().unwrap_or_else(|p| p.into_inner()) = Some("Tall".into());
+
+        run(&engine, "vertical:screenshot", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::Screenshot { name: "Tall".into() }]);
+        engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn scene_hotkey_forwards_vertical_scene_to_set_current() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run(&engine, "scene:Tall", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(host.take_acts(), vec![StudioAct::SetCurrent { scene: "Tall".into() }]);
+        engine.shutdown();
+    }
 }

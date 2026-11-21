@@ -254,6 +254,10 @@ async fn follow(mut ws: Ws, mut welcome: Welcome, sink: &EventSink) -> End {
                 if reason == "authorization_revoked" {
                     return End::SignInNeeded;
                 }
+                // Any other reason (too many failed deliveries, a version removed...) leaves that
+                // topic dead on this session while the connector says Connected: chat or sub alerts
+                // gone for the rest of the stream. A new session subscribes everything again.
+                return End::Lost(format!("Twitch revoked {kind} ({reason})"));
             }
             _ => {}
         }
@@ -293,6 +297,61 @@ async fn deliver(v: &Value, sink: &EventSink) -> bool {
         return true;
     };
     sink.send(map::map(kind, id, event, Millis(now_ms()))).await.is_ok()
+}
+
+#[cfg(test)]
+mod revocation_tests {
+    use super::*;
+    use futures_util::SinkExt;
+    use serde_json::json;
+
+    /// A session that sends a welcome, then `frames`, then stays quiet (keepalive 10 minutes).
+    async fn session_sending(frames: Vec<Value>) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((sock, _)) = l.accept().await else { return };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(sock).await else { return };
+            let welcome = json!({
+                "metadata": { "message_type": "session_welcome" },
+                "payload": { "session": { "id": "s1", "keepalive_timeout_seconds": 600 } }
+            });
+            let _ = ws.send(Message::Text(welcome.to_string().into())).await;
+            for f in frames {
+                let _ = ws.send(Message::Text(f.to_string().into())).await;
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        url
+    }
+
+    fn revocation(kind: &str, status: &str) -> Value {
+        json!({
+            "metadata": { "message_type": "revocation" },
+            "payload": { "subscription": { "type": kind, "status": status } }
+        })
+    }
+
+    async fn ends_with(status: &str) -> End {
+        let url = session_sending(vec![revocation("channel.chat.message", status)]).await;
+        let (ws, welcome) = connect(&url).await.expect("welcome");
+        let (sink, _rx) = tokio::sync::mpsc::channel(8);
+        tokio::time::timeout(Duration::from_secs(2), follow(ws, welcome, &sink))
+            .await
+            .expect("the session ended (a revoked subscription is never carried on silently)")
+    }
+
+    /// Twitch revoking a subscription for any reason leaves that topic dead on this session
+    /// (`channel.chat.message`: no chat; `channel.subscribe`: no sub alerts) while the connector says
+    /// Connected. Only a sign-out needed a new sign-in; every other reason reconnects, which
+    /// subscribes everything again.
+    #[tokio::test]
+    async fn a_revoked_subscription_reconnects_so_it_is_subscribed_again() {
+        for reason in ["notification_failures_exceeded", "version_removed", "user_removed", "moderator_removed"] {
+            assert!(matches!(ends_with(reason).await, End::Lost(_)), "{reason} should end the session");
+        }
+        assert!(matches!(ends_with("authorization_revoked").await, End::SignInNeeded));
+    }
 }
 
 #[cfg(test)]

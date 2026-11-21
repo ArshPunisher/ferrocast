@@ -17,6 +17,10 @@ pub use apple::media;
 pub use apple::screen;
 #[cfg(target_os = "windows")]
 mod win;
+// Built for its tests elsewhere too (format picking, pacing, monitor matching).
+#[cfg(any(target_os = "windows", test))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod win_logic;
 /// Cameras and microphones (Windows: DirectShow through FFmpeg, WASAPI).
 #[cfg(target_os = "windows")]
 pub use win::camera;
@@ -41,7 +45,9 @@ pub use linux::media;
 pub use linux::screen;
 pub mod afx;
 pub mod audio;
+pub mod audio_thread;
 mod compose;
+pub mod delay;
 pub mod engine;
 pub mod ffenc;
 pub mod ffsrc;
@@ -53,10 +59,14 @@ pub mod mkv;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod monitor;
 pub mod mp4;
+pub mod notices;
 pub mod obs;
 pub mod pipeline;
 pub mod preview;
+pub mod rnnoise;
+pub mod rt;
 pub mod shaderfx;
+mod sleep;
 /// Sound in through cpal: microphones, and the computer's own sound (Windows).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod sound_in;
@@ -65,8 +75,17 @@ mod transform;
 pub mod video;
 
 pub use compose::bt709_limited;
-pub use compose::{Compositor, PendingNv12};
+pub use compose::{Compositor, Drawn, PendingNv12, SHADER_TIME_WRAP_MS, shader_time_s};
 pub use transform::{Affine, BOTTOM, Bounds, LEFT, Placement, RIGHT, TOP, cropped, draw_transform, output_scale};
+
+/// Sleeps for `dur` with sub-millisecond timer granularity on Windows (a high-resolution waitable
+/// timer instead of the 15.625 ms default `Sleep` tick) and `std::thread::sleep` elsewhere.
+pub(crate) fn sleep_precise(dur: std::time::Duration) {
+    #[cfg(target_os = "windows")]
+    win::timer::sleep(dur);
+    #[cfg(not(target_os = "windows"))]
+    std::thread::sleep(dur);
+}
 
 /// Reads a file a collection names, safely: a plain file only (never a device or a pipe, which
 /// could be read forever) and at most `max` bytes (more is an error saying so).
@@ -113,6 +132,20 @@ pub enum Filter {
     Bicubic,
     Lanczos,
     Area,
+}
+
+impl Filter {
+    /// The downscale filters a stream can be sent with, by name (OBS's: bilinear, bicubic, lanczos,
+    /// area); None for anything else.
+    pub fn downscale_named(name: &str) -> Option<Self> {
+        match name {
+            "bilinear" => Some(Self::Bilinear),
+            "bicubic" => Some(Self::Bicubic),
+            "lanczos" => Some(Self::Lanczos),
+            "area" => Some(Self::Area),
+            _ => None,
+        }
+    }
 }
 
 impl Filter {
@@ -168,6 +201,111 @@ pub struct Picture {
     pub premultiplied: bool,
 }
 
+/// Big pictures' pixel buffers kept for the next one (a 1440p clip frame is 15 MB, a fresh buffer
+/// a frame was page faults and zero-filling every frame). Only Mac capture copies (and tests) use it.
+#[cfg(any(target_os = "macos", test))]
+struct PooledBuffer {
+    buf: Vec<u8>,
+    last_used_seq: u64,
+    last_used_at: std::time::Instant,
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct PixelPool {
+    entries: Vec<PooledBuffer>,
+    seq: u64,
+    drops_since_req: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl PixelPool {
+    const fn new() -> Self {
+        Self { entries: Vec::new(), seq: 0, drops_since_req: 0 }
+    }
+
+    fn prune_stale(&mut self, now: std::time::Instant) {
+        let seq = self.seq;
+        self.entries.retain(|e| {
+            seq.saturating_sub(e.last_used_seq) < POOL_MISS_LIMIT
+                && now.saturating_duration_since(e.last_used_at) < POOL_TTL
+        });
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+static PIXELS: std::sync::Mutex<PixelPool> = std::sync::Mutex::new(PixelPool::new());
+#[cfg(any(target_os = "macos", test))]
+static POOL_HAS_ITEMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Smallest buffer worth keeping, most kept, most bytes kept (fits 4x4K or 2x5K), and idle limits.
+#[cfg(any(target_os = "macos", test))]
+const POOL_MIN: usize = 1 << 20;
+#[cfg(any(target_os = "macos", test))]
+const POOL_MAX: usize = 4;
+#[cfg(any(target_os = "macos", test))]
+const POOL_BYTES: usize = 128 << 20;
+#[cfg(any(target_os = "macos", test))]
+const POOL_MISS_LIMIT: u64 = 60;
+#[cfg(any(target_os = "macos", test))]
+const POOL_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A pixel buffer of exactly `len` bytes whose contents are not defined (the caller writes every
+/// byte): a kept one when it fits, else a new zeroed one. Only the Mac's capture copies use it.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn pixel_buffer(len: usize) -> Vec<u8> {
+    if (len >= POOL_MIN || POOL_HAS_ITEMS.load(std::sync::atomic::Ordering::Relaxed))
+        && let Ok(mut pool) = PIXELS.lock()
+    {
+        let now = std::time::Instant::now();
+        pool.seq = pool.seq.saturating_add(1);
+        pool.drops_since_req = 0;
+        let hit = if len >= POOL_MIN {
+            pool.entries
+                .iter()
+                .position(|e| e.buf.capacity() >= len && e.buf.capacity() <= len + len / 4)
+                .map(|i| pool.entries.remove(i).buf)
+        } else {
+            None
+        };
+        pool.prune_stale(now);
+        POOL_HAS_ITEMS.store(!pool.entries.is_empty(), std::sync::atomic::Ordering::Release);
+        drop(pool);
+        if let Some(mut b) = hit {
+            // Cut to size or grown within what it has: bytes the caller overwrites anyway.
+            b.resize(len, 0);
+            return b;
+        }
+    }
+    vec![0u8; len]
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for Picture {
+    fn drop(&mut self) {
+        if self.rgba.capacity() < POOL_MIN || self.rgba.capacity() > POOL_BYTES {
+            return;
+        }
+        let buf = std::mem::take(&mut self.rgba);
+        if let Ok(mut pool) = PIXELS.lock() {
+            let now = std::time::Instant::now();
+            pool.drops_since_req = pool.drops_since_req.saturating_add(1);
+            pool.prune_stale(now);
+            if pool.drops_since_req >= POOL_MISS_LIMIT {
+                pool.entries.clear();
+                POOL_HAS_ITEMS.store(false, std::sync::atomic::Ordering::Release);
+                return;
+            }
+            let mut kept: usize = pool.entries.iter().map(|e| e.buf.capacity()).sum();
+            while !pool.entries.is_empty() && (pool.entries.len() >= POOL_MAX || kept + buf.capacity() > POOL_BYTES) {
+                let evicted = pool.entries.remove(0);
+                kept = kept.saturating_sub(evicted.buf.capacity());
+            }
+            let seq = pool.seq;
+            pool.entries.push(PooledBuffer { buf, last_used_seq: seq, last_used_at: now });
+            POOL_HAS_ITEMS.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 impl Picture {
     /// One colour, `width`×`height` (OBS's Color source).
     pub fn solid(width: u32, height: u32, rgba: [u8; 4]) -> Self {
@@ -185,6 +323,90 @@ impl Picture {
         }
         Self { width, height, rgba, premultiplied: true }
     }
+
+    /// Resizes proportionally so width is at most `max_width` (bilinear/triangle filter).
+    pub fn scaled_to_width(&self, max_width: u32) -> Self {
+        let max_w = max_width.clamp(16, 1280);
+        if self.width <= max_w || self.width == 0 || self.height == 0 {
+            return self.clone();
+        }
+        let target_h = ((u64::from(self.height) * u64::from(max_w)) / u64::from(self.width)).max(1) as u32;
+        let Some(img) = image::RgbaImage::from_raw(self.width, self.height, self.rgba.clone()) else {
+            return self.clone();
+        };
+        let resized = image::imageops::resize(&img, max_w, target_h, image::imageops::FilterType::Triangle);
+        Self { width: max_w, height: target_h, rgba: resized.into_raw(), premultiplied: self.premultiplied }
+    }
+
+    /// Encodes RGBA pixels over opaque black as JPEG bytes (`quality` clamped to 40..=95).
+    pub fn encode_jpeg_rgba(
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        premultiplied: bool,
+        quality: u8,
+    ) -> Result<Vec<u8>, AvError> {
+        if width == 0 || height == 0 || rgba.len() < width as usize * height as usize * 4 {
+            return Err(AvError::BadPixels(width, height));
+        }
+        let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+        for px in rgba.as_chunks::<4>().0.iter().take(width as usize * height as usize) {
+            if premultiplied {
+                rgb.extend_from_slice(&px[..3]);
+            } else {
+                let a = u16::from(px[3]);
+                rgb.push(((u16::from(px[0]) * a + 127) / 255) as u8);
+                rgb.push(((u16::from(px[1]) * a + 127) / 255) as u8);
+                rgb.push(((u16::from(px[2]) * a + 127) / 255) as u8);
+            }
+        }
+        let mut out = Vec::with_capacity((width as usize * height as usize) / 4);
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality.clamp(40, 95));
+        enc.encode(&rgb, width, height, image::ExtendedColorType::Rgb8)
+            .map_err(|e| AvError::Encoder(format!("jpeg thumbnail encode failed ({e})")))?;
+        Ok(out)
+    }
+}
+
+/// One-shot still of a display or window across platforms, stopping immediately after the first
+/// frame or early if `cancel` flips to `true`.
+pub fn screen_still_cancel(
+    target: screen::Target,
+    width: u32,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Picture, AvError> {
+    let w = width.clamp(64, 320);
+    let cap = screen::ScreenCapture::start(target, w, w, 4, false)?;
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+    while std::time::Instant::now() < until {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AvError::Source("thumbnail request cancelled".into()));
+        }
+        if let Some(p) = cap.take() {
+            return Ok(p.scaled_to_width(w));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    Err(AvError::Source("the screen gave no picture in time".into()))
+}
+
+/// One-shot still of a camera or capture card across platforms, stopping immediately after the
+/// first frame or early if `cancel` flips to `true`.
+pub fn camera_still_cancel(id: &str, width: u32, cancel: &std::sync::atomic::AtomicBool) -> Result<Picture, AvError> {
+    let w = width.clamp(64, 320);
+    let spec = engine::CameraSpec { id: id.to_string(), size: None, fps: None };
+    let cap = camera::Capture::camera(&spec)?;
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    while std::time::Instant::now() < until {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(AvError::Source("thumbnail request cancelled".into()));
+        }
+        if let Some((p, _)) = cap.take_frame() {
+            return Ok(p.scaled_to_width(w));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    Err(AvError::Source("the camera gave no picture in time".into()))
 }
 
 /// Ferrocast's own picture filters, applied to an item's picture in order before it's placed
@@ -331,6 +553,13 @@ pub enum Effect {
     /// Holds the source's last picture: new ones aren't taken in while it's on (Exeldro's Freeze
     /// filter). It draws nothing itself; turning it off lets new pictures in again.
     Freeze,
+    /// Video Delay (OBS's Render Delay and Video Delay Async): the source's pictures shown `ms`
+    /// late (0 to 20 000), and with `audio` its sound too. Draws nothing itself: the engine
+    /// holds the pictures back.
+    Delay {
+        ms: u32,
+        audio: bool,
+    },
     /// OBS's Sharpen (0 to 1).
     Sharpen {
         sharpness: f32,
@@ -642,5 +871,109 @@ mod placed {
         assert_eq!(Effect::placed_size(&[shadow(true), crop(4)], 100, 100), (100, 100));
         // A crop into the picture after the shadow: all of the shadow goes, the box shrinks.
         assert_eq!(Effect::placed_size(&[shadow(true), crop(20)], 100, 100), (80, 80));
+    }
+}
+
+#[cfg(test)]
+mod pixel_pool {
+    use super::{Picture, pixel_buffer};
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clear_pool() {
+        if let Ok(mut pool) = super::PIXELS.lock() {
+            pool.entries.clear();
+            pool.seq = 0;
+            pool.drops_since_req = 0;
+            super::POOL_HAS_ITEMS.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn pool_count() -> usize {
+        super::PIXELS.lock().map_or(0, |p| p.entries.len())
+    }
+
+    /// A dropped big picture's buffer is the next one's, with no new allocation or zero-fill; a
+    /// small one is never kept; a buffer too big for the size asked for is left in the pool.
+    #[test]
+    fn a_dropped_big_picture_gives_its_buffer_to_the_next() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pool();
+        const LEN: usize = 7_654_320; // a size no other test uses
+        let mut buf = pixel_buffer(LEN);
+        assert_eq!(buf.len(), LEN);
+        buf.fill(0xAB);
+        let at = buf.as_ptr();
+        drop(Picture { width: 1912, height: 1002, rgba: buf, premultiplied: false });
+        let again = pixel_buffer(LEN);
+        assert_eq!(again.as_ptr(), at, "the same memory came back");
+        assert_eq!(again.len(), LEN);
+        assert!(again.iter().all(|b| *b == 0xAB), "kept as it was: the caller overwrites every byte");
+        // A little under: cut to size, same memory.
+        drop(Picture { width: 1, height: 1, rgba: again, premultiplied: false });
+        let smaller = pixel_buffer(LEN - 4);
+        assert_eq!(smaller.as_ptr(), at);
+        assert_eq!(smaller.len(), LEN - 4);
+        drop(Picture { width: 1, height: 1, rgba: smaller, premultiplied: false });
+        // Much smaller wanted: a new one, the big one stays for its own size.
+        let other = pixel_buffer(LEN / 2);
+        assert_ne!(other.as_ptr(), at);
+        assert!(other.iter().all(|b| *b == 0), "a new one is zeroed");
+        // Small pictures are not kept.
+        let small = Picture::solid(8, 8, [1, 2, 3, 4]);
+        assert!(small.rgba.capacity() < super::POOL_MIN);
+        let again = pixel_buffer(LEN);
+        assert_eq!(again.as_ptr(), at, "still the big one");
+    }
+
+    #[test]
+    fn rev22_p2_evicts_stale_resolutions_so_new_size_hits() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pool();
+        const LEN_1080P: usize = 1920 * 1080 * 4;
+        const LEN_1440P: usize = 2560 * 1440 * 4;
+        // Fill pool to POOL_MAX with 1080p buffers.
+        for _ in 0..4 {
+            drop(Picture { width: 1920, height: 1080, rgba: vec![0u8; LEN_1080P], premultiplied: false });
+        }
+        // New active 1440p resolution must evict an older 1080p entry and reuse its own buffer.
+        let mut buf = pixel_buffer(LEN_1440P);
+        buf.fill(0xAB);
+        let ptr = buf.as_ptr();
+        drop(Picture { width: 2560, height: 1440, rgba: buf, premultiplied: false });
+        let reused = pixel_buffer(LEN_1440P);
+        assert_eq!(reused.as_ptr(), ptr, "new active 1440p resolution must hit after evicting stale 1080p");
+        assert!(reused.iter().all(|b| *b == 0xAB), "1440p buffer must come from pool, not a fresh zeroed alloc");
+
+        // Also: 3x 4K (94.9 MiB) followed by 5K (56.25 MiB) must evict stale 4K entries and hit on 5K.
+        clear_pool();
+        const LEN_4K: usize = 3840 * 2160 * 4;
+        const LEN_5K: usize = 5120 * 2880 * 4;
+        for _ in 0..3 {
+            drop(Picture { width: 3840, height: 2160, rgba: vec![0u8; LEN_4K], premultiplied: false });
+        }
+        let mut buf5k = pixel_buffer(LEN_5K);
+        buf5k.fill(0xCD);
+        let ptr5k = buf5k.as_ptr();
+        drop(Picture { width: 5120, height: 2880, rgba: buf5k, premultiplied: false });
+        let reused5k = pixel_buffer(LEN_5K);
+        assert_eq!(reused5k.as_ptr(), ptr5k, "5K capture must evict stale 4K entries instead of 0% hits");
+        assert!(reused5k.iter().all(|b| *b == 0xCD), "5K buffer must come from pool, not a fresh zeroed alloc");
+    }
+
+    #[test]
+    fn rev22_p2_drops_unrequested_buffers_after_n_frames() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pool();
+        const LEN_4K: usize = 3840 * 2160 * 4;
+        const LEN_SMALL_BIG: usize = 2_000_000;
+        drop(Picture { width: 3840, height: 2160, rgba: vec![0u8; LEN_4K], premultiplied: false });
+        assert_eq!(pool_count(), 1);
+        // Request a mismatched size for many frames without ever touching 4K again.
+        for _ in 0..120 {
+            let _ = pixel_buffer(LEN_SMALL_BIG);
+        }
+        assert_eq!(pool_count(), 0, "stale unrequested 4K buffer must be dropped after N mismatching frames");
     }
 }

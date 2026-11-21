@@ -41,7 +41,7 @@ impl Ducker {
     /// One block of `secs`: whether a voice is heard → the music's gain at its start and end.
     pub fn step(&mut self, talking: bool, secs: f32) -> (f32, f32) {
         let from = self.gain;
-        self.quiet_s = if talking { 0.0 } else { self.quiet_s + secs };
+        self.quiet_s = if talking { 0.0 } else { (self.quiet_s + secs).min(DUCK_HOLD_S + 1.0) };
         let low = 10f32.powf(self.cfg.depth_db.min(0.0) / 20.0);
         let (want, take) = if self.quiet_s < DUCK_HOLD_S { (low, DUCK_ATTACK_S) } else { (1.0, DUCK_RELEASE_S) };
         // The whole way down (or up) in `take`, evenly: it arrives, no long tail.
@@ -59,12 +59,28 @@ struct Biquad {
     z: [f64; 2],
 }
 
+/// Flushes tiny `f64` biquad decay tails well above IEEE 754 `f64` subnormal range (`2.2e-308`)
+/// so silent audio tracks never incur x86 denormal stalls (M2-06).
+#[inline]
+fn flush_denormal_f64(x: f64) -> f64 {
+    if x.abs() < 1e-30 { 0.0 } else { x }
+}
+
 impl Biquad {
     fn run(&mut self, x: f64) -> f64 {
         let y = self.b[0] * x + self.z[0];
         self.z[0] = self.b[1] * x - self.a[0] * y + self.z[1];
         self.z[1] = self.b[2] * x - self.a[1] * y;
         y
+    }
+
+    fn flush(&mut self) {
+        self.z[0] = flush_denormal_f64(self.z[0]);
+        self.z[1] = flush_denormal_f64(self.z[1]);
+    }
+
+    fn is_zero(&self) -> bool {
+        self.z[0] == 0.0 && self.z[1] == 0.0
     }
 }
 
@@ -143,29 +159,67 @@ impl Loudness {
 
     /// One interleaved stereo block, in place.
     pub fn process(&mut self, buf: &mut [f32]) {
-        let hop = (self.rate * 0.1) as usize;
-        for f in buf.as_chunks::<2>().0 {
-            let mut sum = 0.0;
-            for (c, x) in f.iter().enumerate() {
-                let y = self.k[c].iter_mut().fold(f64::from(*x), |v, b| b.run(v));
-                sum += y * y;
-            }
-            self.acc += sum;
-            self.acc_n += 1;
-            if self.acc_n == hop {
-                self.windows.push_back(self.acc / hop as f64);
-                if self.windows.len() > 30 {
-                    self.windows.pop_front();
+        let hop = (self.rate * 0.1).max(1.0) as usize;
+        let frames = buf.len() / 2;
+        let silent = buf.iter().all(|&s| s == 0.0);
+        let biquads_zero = self.k.iter().flatten().all(Biquad::is_zero);
+        if silent && biquads_zero {
+            // Fast path for silent/unused tracks (tracks 2–6 when empty): advance window counts
+            // identically without running 4 f64 biquads per frame.
+            let mut rem = frames;
+            while rem > 0 {
+                let take = (hop - self.acc_n).min(rem);
+                self.acc_n += take;
+                rem -= take;
+                if self.acc_n == hop {
+                    self.windows.push_back(self.acc / hop as f64);
+                    if self.windows.len() > 30 {
+                        self.windows.pop_front();
+                    }
+                    self.acc = 0.0;
+                    self.acc_n = 0;
                 }
-                self.acc = 0.0;
-                self.acc_n = 0;
             }
+        } else {
+            for f in buf.as_chunks::<2>().0 {
+                let mut sum = 0.0;
+                for (c, x) in f.iter().enumerate() {
+                    let y = self.k[c].iter_mut().fold(f64::from(*x), |v, b| b.run(v));
+                    sum += y * y;
+                }
+                self.acc += sum;
+                self.acc_n += 1;
+                if self.acc_n == hop {
+                    self.windows.push_back(self.acc / hop as f64);
+                    if self.windows.len() > 30 {
+                        self.windows.pop_front();
+                    }
+                    self.acc = 0.0;
+                    self.acc_n = 0;
+                }
+            }
+            for ch in &mut self.k {
+                for b in ch {
+                    b.flush();
+                }
+            }
+            self.acc = flush_denormal_f64(self.acc);
         }
-        let secs = (buf.len() / 2) as f64 / self.rate;
+        let secs = frames as f64 / self.rate;
         if let Some(l) = self.lufs().filter(|l| *l > GATE_LUFS) {
             let want = (self.target - l).clamp(-MAX_GAIN_DB, MAX_GAIN_DB);
             let step = GAIN_DB_PER_S * secs;
             self.gain_db += (want - self.gain_db).clamp(-step, step);
+        }
+        if silent {
+            if self.limit < 1.0 {
+                let decay = (-secs as f32 / LIMIT_RELEASE_S).exp();
+                self.limit = 1.0 - (1.0 - self.limit) * decay;
+                if (1.0 - self.limit).abs() < 1e-6 {
+                    self.limit = 1.0;
+                }
+            }
+            return;
         }
         let g = 10f32.powf(self.gain_db as f32 / 20.0);
         let release = 1.0 - (-1.0 / (LIMIT_RELEASE_S * self.rate as f32)).exp();
@@ -175,9 +229,21 @@ impl Loudness {
             // Down at once to fit under the ceiling, back up gently.
             let need = if peak * self.limit > CEILING { CEILING / peak } else { 1.0 };
             self.limit = if need < self.limit { need } else { self.limit + (need - self.limit) * release };
-            f[0] = (l * self.limit).clamp(-1.0, 1.0);
-            f[1] = (r * self.limit).clamp(-1.0, 1.0);
+            f[0] = crate::mix::clip(l * self.limit);
+            f[1] = crate::mix::clip(r * self.limit);
         }
+        if (1.0 - self.limit).abs() < 1e-6 {
+            self.limit = 1.0;
+        }
+    }
+
+    #[cfg(test)]
+    fn has_subnormal(&self) -> bool {
+        self.k.iter().flatten().any(|b| b.z[0].is_subnormal() || b.z[1].is_subnormal())
+            || self.acc.is_subnormal()
+            || self.gain_db.is_subnormal()
+            || self.limit.is_subnormal()
+            || self.windows.iter().any(|w| w.is_subnormal())
     }
 }
 
@@ -253,5 +319,39 @@ mod tests {
             g = d.step(false, block).1;
         }
         assert!(g > 0.95, "back: {g}");
+    }
+
+    /// Loudness K-weighting biquads never decay into `f64` subnormals during extended silence,
+    /// and the silent-track fast path still drains the 3 s loudness window cleanly (M2-06).
+    #[test]
+    fn loudness_never_enters_subnormal_state_on_silence() {
+        let mut l = Loudness::new(-14.0, RATE);
+        let mut imp = vec![0.0f32; 2048];
+        imp[0] = 0.95;
+        imp[1] = -0.95;
+        l.process(&mut imp);
+        let mut zero = vec![0.0f32; 2048];
+        for _ in 0..500 {
+            zero.fill(0.0);
+            l.process(&mut zero);
+            assert!(!l.has_subnormal(), "Loudness entered subnormal state during silence");
+            assert!(zero.iter().all(|v| *v == 0.0), "silent block stays silent");
+        }
+        // After ~10 s of silence, K-weighted windows have drained to silence (no phantom LUFS).
+        assert!(l.lufs().is_none(), "3 s window drained to silence: {:?}", l.lufs());
+    }
+
+    #[test]
+    fn ducker_quiet_accumulator_stays_bounded_after_8_hours() {
+        let mut d = Ducker::new(Ducking::default());
+        let block = 1024.0 / RATE as f32;
+        // 8 hours of quiet music: ~1.35M blocks.
+        for _ in 0..1_350_000 {
+            let _ = d.step(false, block);
+        }
+        assert!(d.quiet_s <= DUCK_HOLD_S + 1.01, "quiet_s stayed bounded: {}", d.quiet_s);
+        // Voice returns: immediately ducks again.
+        let (_, g) = d.step(true, block);
+        assert!(g < 1.0, "ducker still responds immediately after 8 h: {g}");
     }
 }

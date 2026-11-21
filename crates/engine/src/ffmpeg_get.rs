@@ -88,7 +88,7 @@ pub async fn download_verified(
     }
     let got = Sha256::digest(&body).iter().map(|b| format!("{b:02x}")).collect::<String>();
     if got != sha256 {
-        return Err("the downloaded file isn't the expected one (its checksum differs), so it wasn't used".into());
+        return Err("the downloaded file's checksum differs, so it wasn't used".into());
     }
     let dest = dest.to_path_buf();
     tokio::task::spawn_blocking(move || unpack(&body, &dest)).await.map_err(|e| e.to_string())??;
@@ -112,7 +112,10 @@ fn unpack(gz: &[u8], dest: &Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
     }
-    std::fs::rename(&part, dest).map_err(|e| format!("couldn't save ffmpeg: {e}"))?;
+    if let Err(e) = ferrocast_store::durable::rename_patiently(&part, dest) {
+        let _ = ferrocast_store::durable::remove_patiently(&part);
+        return Err(format!("couldn't save ffmpeg: {e}"));
+    }
     Ok(())
 }
 

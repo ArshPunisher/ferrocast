@@ -45,10 +45,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate: RateControl::Cbr,
         keyframe_secs: 2,
         software: false,
+        profile: ferrocore::video::H264Profile::High,
+        bframes: false,
+        preset: None,
+        tune: None,
     };
     let audio = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
     let e = Engine::new(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() }, video, audio)?;
-    e.set_source(1, SourceKind::Media { path: clip.clone(), looping: true })?;
+    e.set_source(1, SourceKind::Media { path: clip.clone(), options: ferrocore::media::MediaOptions::looping(true) })?;
     e.set_scene(
         "Main",
         vec![SceneItem::new(

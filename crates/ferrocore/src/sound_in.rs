@@ -3,7 +3,7 @@
 //! the device's format, the engine gets 48 kHz stereo floats, stamped with its clock.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -13,8 +13,16 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crate::AvError;
 use crate::engine::now_ns;
 
-/// Sound kept for the engine: 48 kHz stereo pieces with when they came.
-type Pieces = Arc<Mutex<VecDeque<(Vec<f32>, u64)>>>;
+/// Sound kept for the engine: 48 kHz stereo pieces with when they came, how many came in all
+/// (the watchdog's sign of life), and why the device stopped if it did.
+#[derive(Debug, Default)]
+struct Kept {
+    pieces: Mutex<VecDeque<(Vec<f32>, u64)>>,
+    count: AtomicU64,
+    fault: Mutex<Option<String>>,
+}
+
+type Pieces = Arc<Kept>;
 
 /// Sound kept before it's taken (about 5 s).
 const MAX_PIECES: usize = 500;
@@ -96,6 +104,8 @@ pub struct SoundIn {
     sound: Pieces,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    excludes_self: bool,
+    device_id: Option<String>,
 }
 
 impl Drop for SoundIn {
@@ -108,28 +118,83 @@ impl Drop for SoundIn {
 }
 
 impl SoundIn {
-    /// Starts `which` (on its own thread: a stream stays where it was made).
-    pub fn start(which: Which) -> Result<Self, AvError> {
-        let sound: Pieces = Arc::default();
+    #[cfg(target_os = "windows")]
+    fn start_process_loopback(
+        name: &str,
+        sound: Pieces,
+        timeout: Duration,
+        run_fn: impl FnOnce(Arc<AtomicBool>, std::sync::mpsc::Sender<Result<(), String>>, Pieces) + Send + 'static,
+    ) -> Result<Self, AvError> {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let (s, st) = (sound.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || run_fn(st, ready_tx, s))
+            .map_err(|e| AvError::Source(e.to_string()))?;
+        match ready_rx.recv_timeout(timeout) {
+            Ok(Ok(())) => Ok(SoundIn { sound, stop, thread: Some(thread), excludes_self: true, device_id: None }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(AvError::Source(e))
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Release);
+                Err(AvError::Source("the sound device didn't answer".into()))
+            }
+        }
+    }
+
+    /// Starts `which` (on its own thread: a stream stays where it was made).
+    pub fn start(which: Which) -> Result<Self, AvError> {
+        let sound: Pieces = Arc::default();
         #[cfg(target_os = "windows")]
         if let Which::Process(pid) = which {
-            let thread = std::thread::Builder::new()
-                .name("ferrocast-app-sound".into())
-                .spawn(move || {
+            return Self::start_process_loopback(
+                "ferrocast-app-sound",
+                sound,
+                Duration::from_secs(8),
+                move |st, tx, s| {
+                    crate::afx::enable_ftz_daz();
                     let mut conv = Convert::new(2, RATE);
-                    crate::win::app_sound::run(pid, st, ready_tx, |data| keep(&s, conv.push(data)));
-                })
-                .map_err(|e| AvError::Source(e.to_string()))?;
-            return Self::started(sound, stop, thread, ready_rx);
+                    let s2 = s.clone();
+                    crate::win::app_sound::run(pid, st.clone(), tx, |data| keep(&s2, conv.push(data)));
+                    // Back while not asked to stop: the app's sound ended (it quit, or Windows
+                    // let go of it). Said, so the watchdog starts it again.
+                    note_unexpected_exit(&st, &s, "the app's sound stopped");
+                },
+            );
         }
+        #[cfg(target_os = "windows")]
+        if matches!(which, Which::Loopback) {
+            match Self::start_process_loopback(
+                "ferrocast-desktop-sound",
+                sound.clone(),
+                Duration::from_secs(6),
+                |st, tx, s| {
+                    crate::afx::enable_ftz_daz();
+                    let mut conv = Convert::new(2, RATE);
+                    let s2 = s.clone();
+                    crate::win::app_sound::run_excluding_self(st.clone(), tx, |data| keep(&s2, conv.push(data)));
+                    // Back while not asked to stop: audio service restarted or endpoint dropped.
+                    // Record the fault so `Heal` or the watchdog restarts desktop audio.
+                    note_unexpected_exit(&st, &s, "the computer's sound stopped");
+                },
+            ) {
+                Ok(si) => return Ok(si),
+                Err(why) => {
+                    tracing::info!(error = %why, "process-excluding desktop audio unavailable; falling back to device loopback");
+                }
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<Option<String>, String>>();
+        let (s, st) = (sound.clone(), stop.clone());
         let thread = std::thread::Builder::new()
             .name("ferrocast-sound-in".into())
             .spawn(move || {
-                let stream = match open(&which, s) {
-                    Ok(stream) => stream,
+                let (stream, device_id) = match open(&which, s) {
+                    Ok(opened) => opened,
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                         return;
@@ -139,7 +204,7 @@ impl SoundIn {
                     let _ = ready_tx.send(Err(format!("it didn't start ({e})")));
                     return;
                 }
-                let _ = ready_tx.send(Ok(()));
+                let _ = ready_tx.send(Ok(device_id));
                 while !st.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -154,10 +219,10 @@ impl SoundIn {
         sound: Pieces,
         stop: Arc<AtomicBool>,
         thread: JoinHandle<()>,
-        ready_rx: std::sync::mpsc::Receiver<Result<(), String>>,
+        ready_rx: std::sync::mpsc::Receiver<Result<Option<String>, String>>,
     ) -> Result<Self, AvError> {
         match ready_rx.recv_timeout(Duration::from_secs(8)) {
-            Ok(Ok(())) => Ok(SoundIn { sound, stop, thread: Some(thread) }),
+            Ok(Ok(device_id)) => Ok(SoundIn { sound, stop, thread: Some(thread), excludes_self: false, device_id }),
             Ok(Err(e)) => Err(AvError::Source(e)),
             Err(_) => {
                 // Late: if it opens after all, it closes again at once.
@@ -167,9 +232,160 @@ impl SoundIn {
         }
     }
 
+    /// Whether this capture already excludes Ferrocast's own audio output.
+    pub fn excludes_self(&self) -> bool {
+        self.excludes_self
+    }
+
+    /// Resolved output device id when capturing a speaker loopback (`None` otherwise).
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
+    }
+
     /// Sound since the last call, oldest first: 48 kHz stereo.
     pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
-        self.sound.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+        self.sound.pieces.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default()
+    }
+
+    /// Pieces received since the start: a microphone sends all the time, so a count that stops
+    /// growing means it stopped.
+    pub fn received(&self) -> u64 {
+        self.sound.count.load(Ordering::Relaxed)
+    }
+
+    /// Why the device stopped, if it did (unplugged, its format changed, the app quit). Before
+    /// 20 Nov this was only logged and the watchdog never saw it: a Windows mic unplugged and
+    /// plugged back stayed silent for the rest of the stream (OBS's WASAPI source reconnects).
+    pub fn ended(&self) -> Option<String> {
+        self.sound.fault.lock().ok().and_then(|f| f.clone())
+    }
+}
+
+/// Whether an error from cpal means the stream stopped (it must be opened again). An overrun
+/// (WASAPI's "data discontinuity" after a stall), a reroute the stream followed, or real-time
+/// priority refused are reported too, but the stream goes on: restarting a working mic for those
+/// would cut it (cpal 0.18 `wasapi/stream.rs` `process_input`).
+fn stops(kind: cpal::ErrorKind) -> bool {
+    !matches!(kind, cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied)
+}
+
+/// Sound that starts itself again when its device stops (speakers unplugged, the default
+/// changed), in the background, beside a picture that goes on: restarting the whole capture for
+/// its sound blinked the video (the review, 20 Nov). Without a picture (`heals` false) it
+/// doesn't: its stop is said by [`Heal::ended`] and the watchdog starts the source again.
+#[derive(Debug)]
+pub struct Heal {
+    which: Which,
+    heals: bool,
+    /// What the first sound was (leaves us out, its device), for while a restart is under way.
+    first: (bool, Option<String>),
+    slot: Mutex<Slot>,
+}
+
+#[derive(Debug, Default)]
+struct Slot {
+    now: Option<SoundIn>,
+    /// A start on its own thread (it can wait seconds for the device); the old one is let go
+    /// there too, so the frame loop never waits for it.
+    starting: Option<JoinHandle<Result<SoundIn, AvError>>>,
+    next_try: u64,
+    tries: u32,
+    /// Pieces counted by sound that was replaced, so the count keeps growing.
+    before: u64,
+}
+
+impl Heal {
+    pub fn new(sound: SoundIn, which: Which, heals: bool) -> Self {
+        let first = (sound.excludes_self(), sound.device_id().map(str::to_string));
+        Heal { which, heals, first, slot: Mutex::new(Slot { now: Some(sound), ..Slot::default() }) }
+    }
+
+    /// Sound since the last call; first a look at whether it must start again.
+    pub fn take_sound(&self) -> Vec<(Vec<f32>, u64)> {
+        let Ok(mut slot) = self.slot.lock() else { return Vec::new() };
+        if self.heals {
+            self.tend(&mut slot, now_ns());
+        }
+        slot.now.as_ref().map(SoundIn::take_sound).unwrap_or_default()
+    }
+
+    fn tend(&self, slot: &mut Slot, now: u64) {
+        if slot.starting.as_ref().is_some_and(JoinHandle::is_finished) {
+            match slot.starting.take().map(JoinHandle::join) {
+                Some(Ok(Ok(s))) => {
+                    tracing::info!("a sound started again");
+                    slot.now = Some(s);
+                    slot.tries = 0;
+                }
+                other => {
+                    let e = match other {
+                        Some(Ok(Err(e))) => e.to_string(),
+                        _ => "its start failed".into(),
+                    };
+                    tracing::warn!(error = %e, "a sound didn't start again; it's tried later");
+                    slot.next_try = now + retry_ns(slot.tries);
+                    slot.tries += 1;
+                }
+            }
+        }
+        let stopped = slot.now.as_ref().is_none_or(|s| s.ended().is_some());
+        if stopped && slot.starting.is_none() && now >= slot.next_try {
+            let old = slot.now.take();
+            if let Some(o) = &old {
+                slot.before += o.received();
+                tracing::warn!(why = ?o.ended(), "a sound stopped: it's started again");
+            }
+            let which = self.which.clone();
+            slot.starting = std::thread::Builder::new()
+                .name("ferrocast-sound-heal".into())
+                .spawn(move || {
+                    drop(old);
+                    SoundIn::start(which)
+                })
+                .ok();
+        }
+    }
+
+    /// Whether it leaves out Ferrocast's own playback (process loopback that excludes us): as
+    /// the sound it has now, else as it started.
+    pub fn excludes_self(&self) -> bool {
+        self.slot.lock().ok().and_then(|s| s.now.as_ref().map(SoundIn::excludes_self)).unwrap_or(self.first.0)
+    }
+
+    /// The output device it hears, if it's a device's loopback.
+    pub fn device_id(&self) -> Option<String> {
+        self.slot
+            .lock()
+            .ok()
+            .and_then(|s| s.now.as_ref().map(|n| n.device_id().map(str::to_string)))
+            .unwrap_or_else(|| self.first.1.clone())
+    }
+
+    /// Pieces received since the start, across restarts.
+    pub fn received(&self) -> u64 {
+        self.slot.lock().map(|s| s.before + s.now.as_ref().map_or(0, SoundIn::received)).unwrap_or(0)
+    }
+
+    /// Why it stopped, when it doesn't start itself again.
+    pub fn ended(&self) -> Option<String> {
+        if self.heals {
+            return None;
+        }
+        self.slot.lock().ok()?.now.as_ref()?.ended()
+    }
+}
+
+/// The wait before try `n` at starting sound again: 2 s, doubling, 30 s at most.
+fn retry_ns(n: u32) -> u64 {
+    (2_000_000_000u64 << n.min(4)).min(30_000_000_000)
+}
+
+/// Notes why the sound stopped (the first reason is kept).
+fn fault(sound: &Kept, why: String) {
+    if let Ok(mut f) = sound.fault.lock()
+        && f.is_none()
+    {
+        *f = Some(why);
     }
 }
 
@@ -183,7 +399,8 @@ fn keep(sound: &Pieces, pieces: Vec<Vec<f32>>) {
     }
     let now = now_ns();
     let n = pieces.len() as u64;
-    if let Ok(mut q) = sound.lock() {
+    sound.count.fetch_add(n, Ordering::Relaxed);
+    if let Ok(mut q) = sound.pieces.lock() {
         for (k, p) in pieces.into_iter().enumerate() {
             let len = (p.len() / 2) as u64 * 1_000_000_000 / u64::from(RATE);
             q.push_back((p, now.saturating_sub((n - k as u64) * len)));
@@ -194,8 +411,8 @@ fn keep(sound: &Pieces, pieces: Vec<Vec<f32>>) {
     }
 }
 
-/// The device and its stream, feeding `sound`.
-fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
+/// The device and its stream, feeding `sound` (plus resolved device id for loopback).
+fn open(which: &Which, sound: Pieces) -> Result<(cpal::Stream, Option<String>), String> {
     let host = cpal::default_host();
     let dev = match which {
         Which::Loopback => host.default_output_device().ok_or("there are no speakers to hear the computer from")?,
@@ -211,16 +428,34 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
         #[cfg(target_os = "windows")]
         Which::Process(_) => return Err("one app's sound doesn't come through cpal".into()),
     };
+    let device_id =
+        matches!(which, Which::Loopback).then(|| dev.id().map(|i| i.to_string()).unwrap_or_else(|_| "default".into()));
     let cfg = match which {
         Which::Loopback => dev.default_output_config(),
         _ => dev.default_input_config(),
     }
     .map_err(|e| format!("its format couldn't be read ({e})"))?;
     let mut conv = Convert::new(usize::from(cfg.channels()), cfg.sample_rate());
-    let mut keep = move |data: &[f32]| keep(&sound, conv.push(data));
-    let err = |e: cpal::Error| tracing::warn!(%e, "a sound input stopped");
+    let errs = sound.clone();
+    let mut ftz = false;
+    let mut keep = move |data: &[f32]| {
+        if !ftz {
+            crate::afx::enable_ftz_daz();
+            ftz = true;
+        }
+        keep(&sound, conv.push(data));
+    };
+    let err = move |e: cpal::Error| {
+        if !stops(e.kind()) {
+            // A glitch (a buffer overrun) or a reroute the stream followed: it goes on.
+            tracing::debug!(%e, "a sound input glitched");
+            return;
+        }
+        tracing::warn!(%e, "a sound input stopped");
+        fault(&errs, format!("it stopped ({e})"));
+    };
     let config = cfg.config();
-    match cfg.sample_format() {
+    let stream = match cfg.sample_format() {
         cpal::SampleFormat::F32 => dev.build_input_stream(config, move |d: &[f32], _: &_| keep(d), err, None),
         cpal::SampleFormat::I16 => dev.build_input_stream(
             config,
@@ -236,7 +471,15 @@ fn open(which: &Which, sound: Pieces) -> Result<cpal::Stream, String> {
         ),
         other => return Err(format!("its sample format ({other}) isn't supported")),
     }
-    .map_err(|e| format!("it couldn't be opened ({e})"))
+    .map_err(|e| format!("it couldn't be opened ({e})"))?;
+    Ok((stream, device_id))
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn note_unexpected_exit(stop: &AtomicBool, sound: &Pieces, why: &str) {
+    if !stop.load(Ordering::Acquire) {
+        fault(sound, why.into());
+    }
 }
 
 #[cfg(test)]
@@ -248,12 +491,76 @@ mod tests {
     fn a_burst_of_pieces_gets_times_one_after_another() {
         let sound: Pieces = Arc::default();
         keep(&sound, vec![vec![0.0; 2048], vec![0.0; 2048], vec![0.0; 2048]]);
-        let q: Vec<u64> = sound.lock().map(|q| q.iter().map(|p| p.1).collect()).unwrap_or_default();
+        let q: Vec<u64> = sound.pieces.lock().map(|q| q.iter().map(|p| p.1).collect()).unwrap_or_default();
         let piece = 1024 * 1_000_000_000 / u64::from(RATE);
         assert_eq!(q.len(), 3);
         assert_eq!(q[1] - q[0], piece);
         assert_eq!(q[2] - q[1], piece);
         assert!(now_ns() - q[2] >= piece, "the newest began a piece ago");
+    }
+
+    /// The watchdog's signs: pieces are counted, and a device that stopped says why (the first
+    /// reason is kept). Without these a Windows mic that was unplugged stayed silent for good.
+    #[test]
+    fn a_device_that_stops_says_so_and_pieces_are_counted() {
+        let sound: Pieces = Arc::default();
+        let s =
+            SoundIn { sound: sound.clone(), stop: Arc::default(), thread: None, excludes_self: false, device_id: None };
+        assert_eq!((s.received(), s.ended()), (0, None));
+        keep(&sound, vec![vec![0.0; 2048], vec![0.0; 2048]]);
+        assert_eq!(s.received(), 2);
+        let _ = s.take_sound();
+        assert_eq!(s.received(), 2, "taking the sound doesn't reset the count");
+        fault(&sound, "it stopped (device not available)".into());
+        fault(&sound, "a later reason".into());
+        assert_eq!(s.ended().as_deref(), Some("it stopped (device not available)"));
+    }
+
+    /// A glitch isn't a stop; a lost device is.
+    #[test]
+    fn only_errors_that_end_the_stream_count_as_stopped() {
+        use cpal::ErrorKind as K;
+        for k in [K::Xrun, K::DeviceChanged, K::RealtimeDenied] {
+            assert!(!stops(k), "{k:?} goes on");
+        }
+        for k in [K::DeviceNotAvailable, K::StreamInvalidated, K::BackendError, K::DeviceBusy] {
+            assert!(stops(k), "{k:?} stops");
+        }
+    }
+
+    fn faulted() -> SoundIn {
+        let sound: Pieces = Arc::default();
+        fault(&sound, "it stopped (device not available)".into());
+        SoundIn { sound, stop: Arc::default(), thread: None, excludes_self: false, device_id: None }
+    }
+
+    /// Beside a picture, sound that stopped starts again on its own (here: a device that isn't
+    /// there, so the start fails and waits longer); alone, it says it stopped instead. No real
+    /// device is opened: the name matches none.
+    #[test]
+    fn sound_beside_a_picture_starts_itself_again() {
+        let gone = Which::Input(Some("ferrocast-test-no-such-device".into()));
+        let alone = Heal::new(faulted(), gone.clone(), false);
+        assert!(alone.ended().is_some(), "sound alone: the watchdog's job");
+        let _ = alone.take_sound();
+        assert!(alone.slot.lock().unwrap().starting.is_none(), "and it doesn't start itself");
+
+        let heal = Heal::new(faulted(), gone, true);
+        assert_eq!(heal.ended(), None, "beside a picture: never ends the capture");
+        let _ = heal.take_sound();
+        let handle = heal.slot.lock().unwrap().starting.take();
+        assert!(handle.as_ref().is_some(), "a start is under way");
+        heal.slot.lock().unwrap().starting = handle;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while heal.slot.lock().unwrap().starting.as_ref().is_some_and(|h| !h.is_finished()) {
+            assert!(std::time::Instant::now() < deadline, "the start never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = heal.take_sound();
+        let slot = heal.slot.lock().unwrap();
+        assert_eq!(slot.tries, 1, "the failed start counts");
+        assert!(slot.next_try > now_ns(), "and the next one waits");
+        assert_eq!((retry_ns(0), retry_ns(9)), (2_000_000_000, 30_000_000_000));
     }
 
     #[test]
@@ -271,5 +578,22 @@ mod tests {
         let p = c.push(&six);
         assert_eq!(p.len(), 2, "2048 frames: two pieces of 1024");
         assert_eq!(&p[0][2..4], &[0.25, 0.5]);
+    }
+
+    #[test]
+    fn unexpected_loopback_exit_records_fault_while_requested_stop_does_not() {
+        let sound: Pieces = Arc::default();
+        let stop = AtomicBool::new(true);
+        note_unexpected_exit(&stop, &sound, "the computer's sound stopped");
+        assert_eq!(sound.fault.lock().ok().and_then(|e| e.clone()), None, "normal stop leaves fault empty");
+
+        let crashed: Pieces = Arc::default();
+        let running = AtomicBool::new(false);
+        note_unexpected_exit(&running, &crashed, "the computer's sound stopped");
+        assert_eq!(
+            crashed.fault.lock().ok().and_then(|e| e.clone()).as_deref(),
+            Some("the computer's sound stopped"),
+            "unexpected exit reports a fault so Heal/watchdog restarts desktop audio"
+        );
     }
 }

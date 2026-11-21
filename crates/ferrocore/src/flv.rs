@@ -48,7 +48,7 @@ pub fn video_track_header(track: u8, record: &[u8]) -> Vec<u8> {
 pub fn video_track_tag(track: u8, p: &VideoPacket, start_us: i64) -> (u32, Vec<u8>) {
     let ms = |us: i64| (us - start_us).max(0) / 1000;
     let dts = ms(p.dts_us);
-    let cts = (ms(p.pts_us) - dts).clamp(-(1 << 23), (1 << 23) - 1) as i32;
+    let cts = (ms(p.pts_us) - dts).clamp(0, (1 << 23) - 1) as i32;
     let kind = if p.key { KEY } else { INTER };
     let mut out = Vec::with_capacity(p.data.len() + 10);
     out.push(EX_HEADER | kind << 4 | MULTITRACK);
@@ -59,7 +59,7 @@ pub fn video_track_tag(track: u8, p: &VideoPacket, start_us: i64) -> (u32, Vec<u
         out.extend_from_slice(&cts.to_be_bytes()[1..]);
     }
     out.extend_from_slice(&p.data);
-    (dts as u32, out)
+    (u32::try_from(dts).unwrap_or(u32::MAX), out)
 }
 
 /// A frame's tag, and its timestamp in milliseconds (the decode time; the composition offset is
@@ -67,7 +67,7 @@ pub fn video_track_tag(track: u8, p: &VideoPacket, start_us: i64) -> (u32, Vec<u
 pub fn video_tag(codec: VideoCodec, p: &VideoPacket, start_us: i64) -> (u32, Vec<u8>) {
     let ms = |us: i64| (us - start_us).max(0) / 1000;
     let dts = ms(p.dts_us);
-    let cts = (ms(p.pts_us) - dts).clamp(-(1 << 23), (1 << 23) - 1) as i32;
+    let cts = (ms(p.pts_us) - dts).clamp(0, (1 << 23) - 1) as i32;
     let kind = if p.key { KEY } else { INTER };
     let mut out = Vec::with_capacity(p.data.len() + 8);
     match codec {
@@ -161,6 +161,42 @@ mod tests {
         assert_eq!(t[0], 0x27);
     }
 
+    /// B-frames on the wire: a tag's time is the decode time and its composition time brings the
+    /// display time back, for H.264 and HEVC; the stream's own time starts at the first keyframe's
+    /// decode time, and tag times never go back.
+    #[test]
+    fn reordered_pictures_keep_their_display_time_through_the_composition_time() {
+        let f = 33_333i64;
+        let mut order = vec![0i64];
+        let mut g = 1;
+        while order.len() < 91 {
+            order.extend([g + 2, g, g + 1]);
+            g += 3;
+        }
+        order.truncate(90);
+        for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            let base = 5_000_000i64;
+            let start = base + (-2) * f;
+            let mut last = 0u32;
+            let mut seen_offset = false;
+            for (k, shown) in order.iter().enumerate() {
+                let p = packet(base + shown * f, base + (k as i64 - 2) * f, k == 0);
+                let (ms, t) = video_tag(codec, &p, start);
+                assert!(ms >= last, "tag times never go back");
+                last = ms;
+                let cts = match codec {
+                    VideoCodec::H264 => i64::from(u32::from_be_bytes([0, t[2], t[3], t[4]])),
+                    // CodedFrames (1) carries it after the fourcc; CodedFramesX (3) has none.
+                    VideoCodec::Hevc if t[0] & 0x0F == 1 => i64::from(u32::from_be_bytes([0, t[5], t[6], t[7]])),
+                    VideoCodec::Hevc => 0,
+                };
+                seen_offset |= cts > 0;
+                assert_eq!(i64::from(ms) + cts, (p.pts_us - start) / 1000, "{codec:?} picture {shown}");
+            }
+            assert!(seen_offset, "{codec:?}: some pictures have a composition time");
+        }
+    }
+
     #[test]
     fn hevc_tags_are_enhanced_rtmp() {
         assert_eq!(video_header(VideoCodec::Hevc, &[1])[..5], [0x90, b'h', b'v', b'c', b'1']);
@@ -183,5 +219,25 @@ mod tests {
         assert_eq!(&f.bytes[..5], b"FLV\x01\x05");
         // Tag: kind, size 3, time 0x020304 + extended 0x01, stream 0, body, previous size 14.
         assert_eq!(&f.bytes[13..], &[9, 0, 0, 3, 2, 3, 4, 1, 0, 0, 0, 7, 7, 7, 0, 0, 0, 14]);
+    }
+
+    #[test]
+    fn video_tag_never_emits_negative_cts() {
+        let p = packet(100_000, 105_000, false);
+        let (_, t_h264) = video_tag(VideoCodec::H264, &p, 0);
+        let cts_h264 = ((t_h264[2] as i32) << 16 | (t_h264[3] as i32) << 8 | (t_h264[4] as i32)) << 8 >> 8;
+        assert!(cts_h264 >= 0, "H264 cts must be >= 0, got {cts_h264}");
+
+        let (_, t_hevc) = video_tag(VideoCodec::Hevc, &p, 0);
+        if t_hevc[0] & 0x0F == 1 {
+            let cts_hevc = ((t_hevc[5] as i32) << 16 | (t_hevc[6] as i32) << 8 | (t_hevc[7] as i32)) << 8 >> 8;
+            assert!(cts_hevc >= 0, "HEVC cts must be >= 0, got {cts_hevc}");
+        }
+
+        let (_, t_track) = video_track_tag(1, &p, 0);
+        if t_track[1] & 0x0F == 1 {
+            let cts_track = ((t_track[7] as i32) << 16 | (t_track[8] as i32) << 8 | (t_track[9] as i32)) << 8 >> 8;
+            assert!(cts_track >= 0, "track cts must be >= 0, got {cts_track}");
+        }
     }
 }

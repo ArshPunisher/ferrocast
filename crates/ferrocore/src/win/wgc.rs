@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use windows::Foundation::TypedEventHandler;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
@@ -23,32 +23,77 @@ use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::Interface;
 
+use crate::win_logic::{WgcPacer, is_fatal_wgc_hresult};
 use crate::{AvError, Picture};
+
+struct WinRtGuard(bool);
+
+impl Drop for WinRtGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: balances the single successful `RoInitialize` call on this thread.
+            unsafe { RoUninitialize() };
+        }
+    }
+}
+
+thread_local! {
+    static WINRT_THREAD: WinRtGuard = {
+        // SAFETY: initializes WinRT MTA once per thread; `S_OK`/`S_FALSE` return `Ok(())` and are
+        // balanced by `RoUninitialize` when the thread exits, while `RPC_E_CHANGED_MODE` returns
+        // `Err` (apartment already initialized differently) and must not be uninitialized.
+        WinRtGuard(unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok())
+    };
+}
+
+fn ensure_winrt_init() {
+    let _ = WINRT_THREAD.try_with(|_| ());
+}
 
 /// What the frames leave for the engine.
 #[derive(Debug, Default)]
 struct Shared {
     latest: Mutex<Option<Surface>>,
     frames: AtomicU64,
+    /// True while `Reader` holds a GPU staging copy of a paced-out frame waiting to flush on still.
+    deferred_pending: AtomicBool,
     /// The window closed (or the display went).
     closed: AtomicBool,
+    /// A frame callback or Direct3D read hit a fatal error (e.g. DXGI device loss).
+    failed: AtomicBool,
+    error: Mutex<Option<String>>,
 }
 
-/// The GPU side a frame is read through (used on the pool's thread, one frame at a time).
+/// The GPU side a frame is read through (used under `Mutex<Reader>`).
 struct Reader {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     /// A CPU-readable copy of the last size seen.
     staging: Option<(ID3D11Texture2D, u32, u32)>,
+    /// Latest paced-out frame copied on the GPU so a burst ending on a rejected frame flushes once due.
+    deferred_staging: Option<(ID3D11Texture2D, u32, u32)>,
+    deferred_size: Option<(u32, u32)>,
     max: (u32, u32),
-    every: Duration,
-    last: Option<Instant>,
+    pacer: WgcPacer,
     /// Pixel buffers handed back by the engine, used again (no 8 MB of fresh memory a frame).
     spare: Spare,
 }
+
+// SAFETY: Every D3D11 immediate-context and staging-texture operation on `Reader` runs under
+// `Arc<Mutex<Reader>>`, and `ID3D11Device` is free-threaded per Microsoft's D3D11 specification.
+unsafe impl Send for Reader {}
+
+/// Thread-safe handle to the D3D11 device so `Wgc::ended()` can poll `GetDeviceRemovedReason`.
+struct D3dDevice(ID3D11Device);
+
+// SAFETY: ID3D11Device is free-threaded per Microsoft's D3D11 specification; `ended()` only calls
+// `GetDeviceRemovedReason()` which is safe from any thread.
+unsafe impl Send for D3dDevice {}
+// SAFETY: Same free-threaded guarantee as Send for read-only status inspection.
+unsafe impl Sync for D3dDevice {}
 
 /// The WinRT device the pool is recreated with on its own thread.
 struct PoolDevice(IDirect3DDevice);
@@ -67,8 +112,10 @@ impl PoolDevice {
 pub struct Wgc {
     session: GraphicsCaptureSession,
     pool: Direct3D11CaptureFramePool,
+    d3d: D3dDevice,
     token: i64,
     shared: Arc<Shared>,
+    reader: Arc<Mutex<Reader>>,
 }
 
 impl std::fmt::Debug for Wgc {
@@ -157,9 +204,8 @@ impl Wgc {
         cursor: bool,
     ) -> Result<Self, AvError> {
         let fail = |what: &str, e: windows::core::Error| AvError::Source(format!("Windows' capture {what} ({e})"));
-        // WinRT on this thread (already set up a different way is fine too).
-        // SAFETY: initialises this thread's apartment; a second call is harmless.
-        let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
+        // WinRT once per thread (already set up a different way is fine too; uninitialized on exit).
+        ensure_winrt_init();
         if !Self::supported() {
             return Err(AvError::Source("this Windows has no capture of its own (it needs 10, 1903 or later)".into()));
         }
@@ -185,45 +231,65 @@ impl Wgc {
         let _ = session.SetIsCursorCaptureEnabled(cursor);
         let _ = session.SetIsBorderRequired(false);
         let shared = Arc::new(Shared::default());
-        let reader = Mutex::new(Reader {
+        let d3d_handle = D3dDevice(d3d.clone());
+        let reader = Arc::new(Mutex::new(Reader {
             device: d3d,
             context,
             staging: None,
+            deferred_staging: None,
+            deferred_size: None,
             max: (max.0.max(16), max.1.max(16)),
-            every: Duration::from_secs_f64(1.0 / f64::from(fps.clamp(1, 240))),
-            last: None,
+            pacer: WgcPacer::new(fps),
             spare: Spare::default(),
-        });
+        }));
         let pool_size = Mutex::new(size);
-        let (s, dev) = (shared.clone(), PoolDevice(device.clone()));
+        let (s, dev, reader_cb) = (shared.clone(), PoolDevice(device.clone()), reader.clone());
         let token = pool
             .FrameArrived(&TypedEventHandler::<Direct3D11CaptureFramePool, windows::core::IInspectable>::new(
                 move |pool, _| {
                     let Some(pool) = pool.as_ref() else { return Ok(()) };
-                    let frame = pool.TryGetNextFrame()?;
-                    // A window resized: the pool follows (the frame after is the new size).
-                    let content = frame.ContentSize()?;
-                    {
-                        let mut ps = pool_size.lock().unwrap_or_else(|p| p.into_inner());
-                        if content.Width != ps.Width || content.Height != ps.Height {
-                            *ps = SizeInt32 { Width: content.Width.max(1), Height: content.Height.max(1) };
-                            pool.Recreate(dev.get(), DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, *ps)?;
+                    let res: windows::core::Result<()> = (|| {
+                        let frame = pool.TryGetNextFrame()?;
+                        // A window resized: the pool follows (the frame after is the new size).
+                        let content = frame.ContentSize()?;
+                        {
+                            let mut ps = pool_size.lock().unwrap_or_else(|p| p.into_inner());
+                            if content.Width != ps.Width || content.Height != ps.Height {
+                                *ps = SizeInt32 { Width: content.Width.max(1), Height: content.Height.max(1) };
+                                pool.Recreate(dev.get(), DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, *ps)?;
+                            }
                         }
-                    }
-                    let mut r = reader.lock().unwrap_or_else(|p| p.into_inner());
-                    // At the canvas's rate at most.
-                    if r.last.is_some_and(|t| t.elapsed() < r.every) {
-                        return Ok(());
-                    }
-                    r.last = Some(Instant::now());
-                    let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
-                    // SAFETY: the frame's surface is a D3D11 texture on our device.
-                    let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
-                    let w = (content.Width.max(1) as u32).min(texture_width(&texture));
-                    let h = (content.Height.max(1) as u32).min(texture_height(&texture));
-                    if let Some(p) = r.read(&texture, w, h)? {
-                        *s.latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(p);
-                        s.frames.fetch_add(1, Ordering::Relaxed);
+                        let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
+                        // SAFETY: the frame's surface is a D3D11 texture on our device.
+                        let texture: ID3D11Texture2D = unsafe { access.GetInterface()? };
+                        let w = (content.Width.max(1) as u32).min(texture_width(&texture));
+                        let h = (content.Height.max(1) as u32).min(texture_height(&texture));
+                        let now = Instant::now();
+                        let mut r = reader_cb.lock().unwrap_or_else(|p| p.into_inner());
+                        if !r.pacer.accept(now) {
+                            // Keep only the newest rejected texture on the GPU so a burst ending on a
+                            // paced-out frame flushes when quiet without pinning pool buffers.
+                            r.defer(&texture, w, h)?;
+                            r.pacer.defer(now);
+                            s.deferred_pending.store(true, Ordering::Release);
+                            return Ok(());
+                        }
+                        s.deferred_pending.store(false, Ordering::Release);
+                        if let Some(p) = r.read(&texture, w, h)? {
+                            *s.latest.lock().unwrap_or_else(|p| p.into_inner()) = Some(p);
+                            s.frames.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(())
+                    })();
+                    if let Err(e) = res {
+                        if !is_fatal_wgc_hresult(e.code().0) {
+                            return Ok(());
+                        }
+                        if let Ok(mut err) = s.error.lock() {
+                            *err = Some(format!("Windows' capture stopped ({e})"));
+                        }
+                        s.failed.store(true, Ordering::Release);
+                        return Err(e);
                     }
                     Ok(())
                 },
@@ -236,7 +302,7 @@ impl Wgc {
                 Ok(())
             }));
         session.StartCapture().map_err(|e| fail("didn't start", e))?;
-        Ok(Wgc { session, pool, token, shared })
+        Ok(Wgc { session, pool, d3d: d3d_handle, token, shared, reader })
     }
 
     /// The newest picture (taken), as RGBA: a copy (the engine uses `take_surface`).
@@ -246,16 +312,56 @@ impl Wgc {
 
     /// The newest frame as BGRA, for sending to the card as it is (taken).
     pub fn take_surface(&self) -> Option<Surface> {
-        self.shared.latest.lock().ok()?.take()
+        if let Some(surface) = self.shared.latest.lock().ok().and_then(|mut g| g.take()) {
+            return Some(surface);
+        }
+        if self.shared.deferred_pending.load(Ordering::Acquire)
+            && let Ok(mut r) = self.reader.try_lock()
+            && r.pacer.flush_due(Instant::now())
+        {
+            self.shared.deferred_pending.store(false, Ordering::Release);
+            match r.read_deferred() {
+                Ok(Some(surface)) => {
+                    self.shared.frames.fetch_add(1, Ordering::Relaxed);
+                    return Some(surface);
+                }
+                Ok(None) => {}
+                Err(e) if is_fatal_wgc_hresult(e.code().0) => {
+                    if let Ok(mut err) = self.shared.error.lock() {
+                        *err = Some(format!("Windows' capture stopped ({e})"));
+                    }
+                    self.shared.failed.store(true, Ordering::Release);
+                }
+                Err(_) => {}
+            }
+        }
+        None
     }
 
     pub fn frames(&self) -> u64 {
         self.shared.frames.load(Ordering::Relaxed)
     }
 
-    /// Why it ended, if it did.
+    /// Why it ended, if it did: item closed, frame callback error, or D3D11 device loss/TDR.
     pub fn ended(&self) -> Option<String> {
-        self.shared.closed.load(Ordering::Acquire).then(|| "what it captured closed".to_string())
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Some("what it captured closed".to_string());
+        }
+        if self.shared.failed.load(Ordering::Acquire) {
+            return Some(
+                self.shared
+                    .error
+                    .lock()
+                    .ok()
+                    .and_then(|e| e.clone())
+                    .unwrap_or_else(|| "Windows' capture failed".to_string()),
+            );
+        }
+        // SAFETY: ID3D11Device::GetDeviceRemovedReason is thread-safe and read-only.
+        if let Err(e) = unsafe { self.d3d.0.GetDeviceRemovedReason() } {
+            return Some(format!("the graphics device reset ({e})"));
+        }
+        None
     }
 }
 
@@ -274,59 +380,108 @@ fn texture_height(t: &ID3D11Texture2D) -> u32 {
     desc(t).Height
 }
 
+fn ensure_staging_tex<'a>(
+    device: &ID3D11Device,
+    slot: &'a mut Option<(ID3D11Texture2D, u32, u32)>,
+    full: &D3D11_TEXTURE2D_DESC,
+) -> windows::core::Result<Option<&'a ID3D11Texture2D>> {
+    if slot.as_ref().is_none_or(|(_, sw, sh)| (*sw, *sh) != (full.Width, full.Height)) {
+        let d = D3D11_TEXTURE2D_DESC {
+            Usage: D3D11_USAGE_STAGING,
+            BindFlags: D3D11_BIND_FLAG(0).0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            MiscFlags: D3D11_RESOURCE_MISC_FLAG(0).0 as u32,
+            ..*full
+        };
+        let mut t = None;
+        // SAFETY: a description copied from a real texture, an out pointer of ours.
+        unsafe { device.CreateTexture2D(&d, None, Some(&mut t))? };
+        let Some(t) = t else { return Ok(None) };
+        *slot = Some((t, full.Width, full.Height));
+    }
+    Ok(slot.as_ref().map(|(t, ..)| t))
+}
+
+fn read_from_staging(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    staging: &ID3D11Texture2D,
+    w: u32,
+    h: u32,
+    max: (u32, u32),
+    spare: &Spare,
+) -> windows::core::Result<Surface> {
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    // SAFETY: `staging` is a staging texture on `device`; the map is unmapped before returning.
+    unsafe { context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+    let (ow, oh) = crate::ffsrc::fit((w, h), max);
+    let mut bgra = spare.get(ow as usize * oh as usize * 4);
+    let pitch = mapped.RowPitch as usize;
+    let base = mapped.pData as *const u8;
+    let out_row = ow as usize * 4;
+    // Which source column each output column reads, worked out once a frame (not per pixel).
+    let cols: Vec<usize> =
+        if ow == w { Vec::new() } else { (0..ow as usize).map(|x| x * w as usize / ow as usize * 4).collect() };
+    for y in 0..oh as usize {
+        let sy = y * h as usize / oh as usize;
+        // SAFETY: row `sy` < the texture's height, inside the mapped data (RowPitch apart).
+        let row = unsafe { std::slice::from_raw_parts(base.add(sy * pitch), w as usize * 4) };
+        let out = &mut bgra[y * out_row..(y + 1) * out_row];
+        if ow == w {
+            out.copy_from_slice(row);
+        } else {
+            for (o, &sx) in out.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
+                o.copy_from_slice(&row[sx..sx + 4]);
+            }
+        }
+        opaque(out);
+    }
+    // SAFETY: the map made above.
+    unsafe { context.Unmap(staging, 0) };
+    // SAFETY: verify the D3D11 device wasn't removed mid-readback before accepting pixels.
+    unsafe { device.GetDeviceRemovedReason()? };
+    Ok(Surface {
+        bytes: bgra,
+        width: ow,
+        height: oh,
+        spare: spare.clone(),
+        #[cfg(test)]
+        copy_counter: None,
+    })
+}
+
 impl Reader {
+    /// Copies a paced-out texture on the GPU without CPU mapping so it can flush when a burst ends.
+    fn defer(&mut self, texture: &ID3D11Texture2D, w: u32, h: u32) -> windows::core::Result<()> {
+        let full = desc(texture);
+        let Some(staging) = ensure_staging_tex(&self.device, &mut self.deferred_staging, &full)? else {
+            return Ok(());
+        };
+        // SAFETY: both textures share `self.device` with identical dimensions and format.
+        unsafe { self.context.CopyResource(staging, texture) };
+        self.deferred_size = Some((w, h));
+        Ok(())
+    }
+
+    /// Reads back the previously deferred GPU copy once the pacer allows it.
+    fn read_deferred(&mut self) -> windows::core::Result<Option<Surface>> {
+        let Some((w, h)) = self.deferred_size.take() else { return Ok(None) };
+        let Some((staging, ..)) = self.deferred_staging.as_ref() else { return Ok(None) };
+        Ok(Some(read_from_staging(&self.device, &self.context, staging, w, h, self.max, &self.spare)?))
+    }
+
     /// The texture's top-left `w`×`h` as BGRA, fitted into `max` (nearest pixel when it's
     /// bigger: only what's kept is read). Opaque: a window's empty corners would otherwise show
     /// through (Windows leaves their alpha 0).
     fn read(&mut self, texture: &ID3D11Texture2D, w: u32, h: u32) -> windows::core::Result<Option<Surface>> {
+        self.deferred_size = None;
         let full = desc(texture);
-        if self.staging.as_ref().is_none_or(|(_, sw, sh)| (*sw, *sh) != (full.Width, full.Height)) {
-            let d = D3D11_TEXTURE2D_DESC {
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: D3D11_BIND_FLAG(0).0 as u32,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: D3D11_RESOURCE_MISC_FLAG(0).0 as u32,
-                ..full
-            };
-            let mut t = None;
-            // SAFETY: a description copied from a real texture, an out pointer of ours.
-            unsafe { self.device.CreateTexture2D(&d, None, Some(&mut t))? };
-            let Some(t) = t else { return Ok(None) };
-            self.staging = Some((t, full.Width, full.Height));
-        }
-        let Some((staging, ..)) = self.staging.as_ref() else { return Ok(None) };
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        // SAFETY: both textures are on this device with the same size and format; the map is
-        // read and let go before this returns.
-        unsafe {
-            self.context.CopyResource(staging, texture);
-            self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
-        }
-        let (ow, oh) = crate::ffsrc::fit((w, h), self.max);
-        let mut bgra = self.spare.get(ow as usize * oh as usize * 4);
-        let pitch = mapped.RowPitch as usize;
-        let base = mapped.pData as *const u8;
-        let out_row = ow as usize * 4;
-        // Which source column each output column reads, worked out once a frame (not per pixel).
-        let cols: Vec<usize> =
-            if ow == w { Vec::new() } else { (0..ow as usize).map(|x| x * w as usize / ow as usize * 4).collect() };
-        for y in 0..oh as usize {
-            let sy = y * h as usize / oh as usize;
-            // SAFETY: row `sy` < the texture's height, inside the mapped data (RowPitch apart).
-            let row = unsafe { std::slice::from_raw_parts(base.add(sy * pitch), w as usize * 4) };
-            let out = &mut bgra[y * out_row..(y + 1) * out_row];
-            if ow == w {
-                out.copy_from_slice(row);
-            } else {
-                for (o, &sx) in out.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
-                    o.copy_from_slice(&row[sx..sx + 4]);
-                }
-            }
-            opaque(out);
-        }
-        // SAFETY: the map made above.
-        unsafe { self.context.Unmap(staging, 0) };
-        Ok(Some(Surface { bytes: bgra, width: ow, height: oh, spare: self.spare.clone() }))
+        let Some(staging) = ensure_staging_tex(&self.device, &mut self.staging, &full)? else {
+            return Ok(None);
+        };
+        // SAFETY: both textures are on this device with the same size and format.
+        unsafe { self.context.CopyResource(staging, texture) };
+        Ok(Some(read_from_staging(&self.device, &self.context, staging, w, h, self.max, &self.spare)?))
     }
 }
 
@@ -362,6 +517,8 @@ pub struct Surface {
     width: u32,
     height: u32,
     spare: Spare,
+    #[cfg(test)]
+    copy_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl std::fmt::Debug for Surface {
@@ -386,8 +543,19 @@ impl Surface {
         Some(f(&self.bytes, self.width as usize * 4))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_copy_counter(mut self, counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.copy_counter = Some(counter);
+        self
+    }
+
     /// As an RGBA picture (a copy).
     pub fn to_picture(&self) -> Picture {
+        #[cfg(test)]
+        if let Some(c) = &self.copy_counter {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut rgba = vec![0u8; self.bytes.len()];
         bgra_to_rgba(&self.bytes, &mut rgba);
         Picture { width: self.width, height: self.height, rgba, premultiplied: false }

@@ -107,17 +107,147 @@ pub async fn voices() -> Vec<Voice> {
     }
 }
 
-/// Speaks `text` into a WAV file at `out`.
+/// Lines waiting for the voice, at most; one more is let go (the overlay reads it with the
+/// browser's voice). A raid or a gift-sub bomb would else start a speech process per alert.
+const MAX_QUEUED: usize = 16;
+
+/// One line is spoken at a time: each is a `say` or a PowerShell with the .NET runtime (60-100 MB
+/// and a core on Windows). The app has one [`Line`]; a test can make its own, so a flood of lines
+/// in one test never fills the line another is waiting in.
+#[derive(Debug)]
+pub struct Line {
+    gate: tokio::sync::Semaphore,
+    /// Lines in the line, the one being spoken included.
+    line: std::sync::atomic::AtomicUsize,
+}
+
+impl Line {
+    pub const fn new() -> Self {
+        Self { gate: tokio::sync::Semaphore::const_new(1), line: std::sync::atomic::AtomicUsize::new(0) }
+    }
+}
+
+impl Default for Line {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The app's line of text waiting for the voice.
+static VOICE: Line = Line::new();
+
+/// How many lines are being spoken at once and the most there were (tests count their own: a
+/// process-wide counter picked up other tests' calls and cancelled futures).
+#[derive(Debug, Default)]
+pub struct Gauge {
+    active: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+}
+
+impl Gauge {
+    /// The most lines spoken at the same moment so far.
+    pub fn peak(&self) -> usize {
+        self.peak.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Counts one line in a [`Gauge`] for as long as it lives (also when its future is dropped).
+struct Counted<'a>(Option<&'a Gauge>);
+
+impl<'a> Counted<'a> {
+    fn new(gauge: Option<&'a Gauge>) -> Self {
+        if let Some(g) = gauge {
+            let now = g.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            g.peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self(gauge)
+    }
+}
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        if let Some(g) = self.0 {
+            g.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Takes a place in a voice's line, or says there's no room.
+struct Place<'a>(&'a Line);
+
+impl<'a> Place<'a> {
+    fn take(voice: &'a Line) -> Option<Self> {
+        let before = voice.line.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if before >= MAX_QUEUED {
+            voice.line.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            return None;
+        }
+        Some(Place(voice))
+    }
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        self.0.line.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// A name no other line's input file shares: the process, a counter and the clock (the clock
+/// alone repeats on Windows, ~15 ms granularity, and two lines deleted each other's input).
+fn input_name() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("tts-{}-{seq}-{}.txt", std::process::id(), rand_suffix())
+}
+
+/// Speaks `text` into a WAV file at `out`. One at a time, in order; with a long line of them
+/// waiting, the newest are let go (`Err`).
 pub async fn synthesize(text: &str, voice: Option<&str>, work: &Path, out: &Path) -> Result<(), SpeechError> {
+    synthesize_counted(text, voice, work, out, None).await
+}
+
+/// As [`synthesize`], counting the lines spoken at once in `gauge` (tests).
+pub async fn synthesize_counted(
+    text: &str,
+    voice: Option<&str>,
+    work: &Path,
+    out: &Path,
+    gauge: Option<&Gauge>,
+) -> Result<(), SpeechError> {
+    synthesize_in(&VOICE, text, voice, work, out, gauge).await
+}
+
+/// As [`synthesize_counted`] in a line of its own (tests).
+pub async fn synthesize_in(
+    line: &Line,
+    text: &str,
+    voice: Option<&str>,
+    work: &Path,
+    out: &Path,
+    gauge: Option<&Gauge>,
+) -> Result<(), SpeechError> {
+    let Some(_place) = Place::take(line) else {
+        return Err(SpeechError::Failed("too many lines are waiting to be read".into()));
+    };
+    let _turn = line.gate.acquire().await.map_err(|_| SpeechError::Failed("the voice is closed".into()))?;
+    let _counted = Counted::new(gauge);
+    synthesize_inner(text, voice, work, out).await
+}
+
+async fn synthesize_inner(text: &str, voice: Option<&str>, work: &Path, out: &Path) -> Result<(), SpeechError> {
     tokio::fs::create_dir_all(work).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
-    let input: PathBuf =
-        work.join(format!("tts-{}.txt", std::process::id() as u64 * 1_000_000 + u64::from(rand_suffix())));
+    let input: PathBuf = work.join(input_name());
     tokio::fs::write(&input, text.as_bytes()).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
     let result = run(&input, voice.and_then(safe_voice), out).await;
     let _ = tokio::fs::remove_file(&input).await;
     result?;
-    let head = tokio::fs::read(out).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
-    if !(head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WAVE")) {
+    // Only the first 12 bytes tell a WAV: not the whole file read into memory.
+    let mut head = [0u8; 12];
+    let ok = match tokio::fs::File::open(out).await {
+        Ok(mut f) => tokio::io::AsyncReadExt::read_exact(&mut f, &mut head).await.is_ok(),
+        Err(e) => return Err(SpeechError::Failed(e.to_string())),
+    };
+    if !(ok && head.starts_with(b"RIFF") && &head[8..12] == b"WAVE") {
         let _ = tokio::fs::remove_file(out).await;
         return Err(SpeechError::Failed("the voice didn't produce a WAV file".into()));
     }
@@ -202,5 +332,72 @@ mod tests {
         assert!(bytes.starts_with(b"RIFF") && bytes.len() > 1_000);
         assert!(!std::path::Path::new("/tmp/pwned").exists());
         assert!(!voices().await.is_empty());
+    }
+
+    #[test]
+    fn input_names_never_repeat_even_across_threads() {
+        let all: Vec<String> = (0..8)
+            .map(|_| std::thread::spawn(|| (0..2_000).map(|_| input_name()).collect::<Vec<_>>()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len());
+    }
+
+    /// A raid's worth of lines at once: one voice at a time, a long line of them let go (review
+    /// GAPS #11).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_alert_flood_speaks_one_at_a_time_and_lets_a_long_line_go() {
+        let dir = tempfile::tempdir().unwrap();
+        // The old behaviour (no gate, every line at once): several voices at the same time.
+        let ungated_gauge = std::sync::Arc::new(Gauge::default());
+        let ungated: Vec<_> = (0..6)
+            .map(|i| {
+                let (work, out) = (dir.path().to_path_buf(), dir.path().join(format!("old{i}.wav")));
+                let gauge = ungated_gauge.clone();
+                tokio::spawn(async move {
+                    let _counted = Counted::new(Some(&gauge));
+                    synthesize_inner("hi", None, &work, &out).await
+                })
+            })
+            .collect();
+        for t in ungated {
+            t.await.unwrap().unwrap();
+        }
+        assert!(ungated_gauge.peak() > 1, "without the gate, voices overlap");
+        let gauge = std::sync::Arc::new(Gauge::default());
+        // This test's own line: its flood never fills the global one other tests wait in.
+        let own = std::sync::Arc::new(Line::new());
+        let work = dir.path().to_path_buf();
+        let tasks: Vec<_> = (0..40)
+            .map(|i| {
+                let (work, out) = (work.clone(), dir.path().join(format!("{i}.wav")));
+                let gauge = gauge.clone();
+                let own = own.clone();
+                tokio::spawn(async move { synthesize_in(&own, "hi", None, &work, &out, Some(&gauge)).await })
+            })
+            .collect();
+        let mut done = 0;
+        let mut dropped = 0;
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok(()) => done += 1,
+                Err(e) if e.to_string().contains("too many") => dropped += 1,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(gauge.peak(), 1, "never two voices at once");
+        assert!(dropped > 0 && done >= 1 && done + dropped == 40, "done {done}, dropped {dropped}");
+        assert!(done <= MAX_QUEUED + 1);
+        // No input file is left behind.
+        let left = std::fs::read_dir(&work)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "txt"))
+            .count();
+        assert_eq!(left, 0);
     }
 }

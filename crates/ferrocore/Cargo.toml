@@ -24,6 +24,8 @@ half = "2"
 naga = { version = "30", features = ["wgsl-in"] }
 # A VST plugin's saved state in a collection (obs.rs `vst_effect`).
 base64 = "0.22"
+# RNNoise in pure Rust (BSD-3-Clause, no unsafe without `capi`): "Remove background noise".
+nnnoiseless = { version = "0.5.2", default-features = false }
 
 
 [dev-dependencies]
@@ -42,6 +44,8 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
+    # Needed by CreateWaitableTimerExW's optional SECURITY_ATTRIBUTES parameter (high-res timers).
+    "Win32_Security",
     # Whether a window is cloaked (left out of the window list).
     "Win32_Graphics_Dwm",
     # Windows' own capture (Windows.Graphics.Capture) through Direct3D 11.
@@ -62,6 +66,8 @@ windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    # Sleep inhibition while live streaming or recording.
+    "Win32_System_Power",
 ] }
 # `#[implement]` (a COM object of ours) names windows-core directly.
 windows-core = "0.61"
@@ -72,7 +78,7 @@ libc = "0.2"
 objc2 = { version = "0.6", features = ["exception"] }
 block2 = "0.6"
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "block2", "objc2"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSString", "NSObject", "NSValue", "NSDictionary", "NSURL"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSNotification", "NSString", "NSObject", "NSValue", "NSDictionary", "NSURL"] }
 objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "block2", "dispatch2", "libc", "objc2-core-media", "objc2-core-graphics", "objc2-core-foundation", "SCShareableContent", "SCStream", "SCError"] }
 objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMBase", "CMTime", "CMTimeRange", "CMFormatDescription", "CMBlockBuffer", "objc2-core-video", "objc2-core-audio-types"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std"] }

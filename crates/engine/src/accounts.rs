@@ -18,6 +18,29 @@ use crate::{Engine, EngineError, now};
 /// The key of the notice [`Engine::browser_didnt_open`] sends.
 pub const BROWSER_NOTICE: &str = "browser";
 
+/// What the keychain holds for a saved sign-in: nothing, something unreadable, or the tokens.
+/// A keychain that can't be read (locked, a hiccup at boot) is not the streamer being signed out:
+/// the sign-in is kept and the connector isn't told "sign in again".
+pub(crate) enum Saved<T> {
+    Missing,
+    Unreadable,
+    Found(T),
+}
+
+pub(crate) fn saved_tokens<T: serde::de::DeserializeOwned>(
+    secrets: &dyn ferrocast_secrets::Secrets,
+    key: &str,
+) -> Saved<T> {
+    match secrets.get(key) {
+        Err(e) => {
+            tracing::warn!(error = %e, key, "the saved sign-in couldn't be read from the keychain; it is kept");
+            Saved::Unreadable
+        }
+        Ok(None) => Saved::Missing,
+        Ok(Some(j)) => serde_json::from_str(&j).map_or(Saved::Missing, Saved::Found),
+    }
+}
+
 const TWITCH_TOKENS: &str = "twitch-tokens";
 const YOUTUBE_TOKENS: &str = "youtube-tokens";
 /// How long the browser sign-in for YouTube may take.
@@ -133,16 +156,22 @@ impl Engine {
                     Ok(Poll::SlowDown) => interval += Duration::from_secs(5),
                     Ok(Poll::Done(tokens)) => {
                         if let Err(e) = engine.finish_twitch(tokens).await {
-                            engine.notice(
+                            engine.notice_detail(
                                 "account:twitch",
                                 NoticeLevel::Error,
-                                &format!("Twitch sign-in didn't finish: {e}"),
+                                "Twitch sign-in didn't finish",
+                                &e.to_string(),
                             );
                         }
                         return;
                     }
                     Err(e) => {
-                        engine.notice("account:twitch", NoticeLevel::Warn, &e.to_string());
+                        engine.notice_detail(
+                            "account:twitch",
+                            NoticeLevel::Warn,
+                            "Twitch sign-in failed",
+                            &e.to_string(),
+                        );
                         return;
                     }
                 }
@@ -227,51 +256,90 @@ impl Engine {
         let Ok(accounts) = self.db(repo::settings::accounts).await else {
             return;
         };
+        let mut unreadable = Vec::new();
         for a in accounts {
-            if a.platform == "kick" {
-                self.resume_kick(a.clone()).await;
-                continue;
+            if self.resume_account(&a).await {
+                unreadable.push(a);
             }
-            if a.platform == "youtube" {
-                let saved = self.inner.secrets.get(YOUTUBE_TOKENS).ok().flatten();
-                match saved.and_then(|j| serde_json::from_str::<ferrocast_youtube::Tokens>(&j).ok()) {
-                    Some(t) => match self.youtube_api(t) {
-                        Ok(api) => self.start_youtube(api, a.clone()),
-                        Err(e) => tracing::warn!(%e, "YouTube is saved but can't start"),
-                    },
-                    None => {
-                        let _ = self
-                            .submit(Event::live(
-                                Platform::Youtube,
-                                None,
-                                Millis(0),
-                                EventKind::Connector(ConnectorStatus::SignInNeeded),
-                            ))
-                            .await;
+        }
+        if unreadable.is_empty() {
+            return;
+        }
+        // A keychain that can't be read (locked at boot, a hiccup) leaves those accounts off: say so,
+        // and try again until it opens, instead of staying off without a word until the next start.
+        let names: Vec<&str> = unreadable.iter().map(|a| a.platform.as_str()).collect();
+        self.notice_detail(
+            "accounts:keychain",
+            NoticeLevel::Warn,
+            "Your saved sign-ins can't be read yet",
+            &format!(
+                "The keychain didn't open ({}). Ferrocast keeps them and tries again every 30 seconds.",
+                names.join(", ")
+            ),
+        );
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut left = unreadable;
+            while !left.is_empty() {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let mut still = Vec::new();
+                for a in left {
+                    if engine.resume_account(&a).await {
+                        still.push(a);
                     }
                 }
-                continue;
+                left = still;
             }
-            if a.platform == "twitch" {
-                let saved = self.inner.secrets.get(TWITCH_TOKENS).ok().flatten();
-                match saved.and_then(|j| serde_json::from_str::<Tokens>(&j).ok()) {
-                    Some(t) => match self.twitch_auth(t) {
-                        Ok(auth) => self.start_twitch(auth, a),
-                        Err(e) => tracing::warn!(%e, "Twitch is saved but can't start"),
-                    },
-                    None => {
-                        let _ = self
-                            .submit(Event::live(
-                                Platform::Twitch,
-                                None,
-                                Millis(0),
-                                EventKind::Connector(ConnectorStatus::SignInNeeded),
-                            ))
-                            .await;
-                    }
+            engine.notice("accounts:keychain", NoticeLevel::Info, "Your saved sign-ins are back.");
+        });
+    }
+
+    /// Starts one saved account's adapter. `true` when its keychain entry couldn't be read (nothing
+    /// was done: it is kept, to be tried again).
+    async fn resume_account(&self, a: &repo::settings::Account) -> bool {
+        if a.platform == "kick" {
+            return self.resume_kick(a.clone()).await;
+        }
+        if a.platform == "youtube" {
+            match saved_tokens::<ferrocast_youtube::Tokens>(&*self.inner.secrets, YOUTUBE_TOKENS) {
+                Saved::Unreadable => return true,
+                Saved::Found(t) => match self.youtube_api(t) {
+                    Ok(api) => self.start_youtube(api, a.clone()),
+                    Err(e) => tracing::warn!(%e, "YouTube is saved but can't start"),
+                },
+                Saved::Missing => {
+                    let _ = self
+                        .submit(Event::live(
+                            Platform::Youtube,
+                            None,
+                            Millis(0),
+                            EventKind::Connector(ConnectorStatus::SignInNeeded),
+                        ))
+                        .await;
+                }
+            }
+            return false;
+        }
+        if a.platform == "twitch" {
+            match saved_tokens::<Tokens>(&*self.inner.secrets, TWITCH_TOKENS) {
+                Saved::Unreadable => return true,
+                Saved::Found(t) => match self.twitch_auth(t) {
+                    Ok(auth) => self.start_twitch(auth, a.clone()),
+                    Err(e) => tracing::warn!(%e, "Twitch is saved but can't start"),
+                },
+                Saved::Missing => {
+                    let _ = self
+                        .submit(Event::live(
+                            Platform::Twitch,
+                            None,
+                            Millis(0),
+                            EventKind::Connector(ConnectorStatus::SignInNeeded),
+                        ))
+                        .await;
                 }
             }
         }
+        false
     }
 
     /// Signs a platform out: stops its adapter, forgets its tokens and account.
@@ -320,14 +388,17 @@ impl Engine {
             match ferrocast_youtube::oauth::finish(&http, &ep, &app, pending, YOUTUBE_SIGN_IN).await {
                 Ok(tokens) => {
                     if let Err(e) = engine.finish_youtube(tokens).await {
-                        engine.notice(
+                        engine.notice_detail(
                             "account:youtube",
                             NoticeLevel::Error,
-                            &format!("YouTube sign-in didn't finish: {e}"),
+                            "YouTube sign-in didn't finish",
+                            &e.to_string(),
                         );
                     }
                 }
-                Err(e) => engine.notice("account:youtube", NoticeLevel::Warn, &e.to_string()),
+                Err(e) => {
+                    engine.notice_detail("account:youtube", NoticeLevel::Warn, "YouTube sign-in failed", &e.to_string())
+                }
             }
         });
         Ok(ConnectFlow::Browser { url })
@@ -349,10 +420,11 @@ impl Engine {
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
         self.start_youtube(api, account);
-        self.notice(
+        self.notice_detail(
             "account:youtube",
             NoticeLevel::Info,
-            "YouTube is connected. Chat shows up whenever you're live there.",
+            "YouTube is connected",
+            "Chat shows up whenever you're live there.",
         );
         Ok(())
     }
@@ -362,20 +434,38 @@ impl Engine {
         self.inner.secrets.set(key, &json).map_err(|e| EngineError::Unavailable(e.to_string()))
     }
 
-    fn youtube_api(&self, tokens: ferrocast_youtube::Tokens) -> Result<Arc<ferrocast_youtube::Api>, EngineError> {
+    pub(crate) fn youtube_api(
+        &self,
+        tokens: ferrocast_youtube::Tokens,
+    ) -> Result<Arc<ferrocast_youtube::Api>, EngineError> {
         let app = self.apps().youtube.clone().ok_or_else(|| EngineError::Unavailable("no YouTube app".into()))?;
         let secrets = self.inner.secrets.clone();
         let persist = Arc::new(move |t: &ferrocast_youtube::Tokens| {
             let json = serde_json::to_string(t).map_err(|e| e.to_string())?;
             secrets.set(YOUTUBE_TOKENS, &json).map_err(|e| e.to_string())
         });
-        Ok(Arc::new(ferrocast_youtube::Api::new(
-            ferrocast_youtube::http_client(),
-            self.apps().youtube_endpoints.clone(),
-            app,
-            tokens,
-            persist,
-        )))
+        // The privacy of the broadcasts it makes is read from the settings each time, so a change
+        // applies to the next one. A weak link: the Api lives inside the engine's connectors.
+        let engine = Arc::downgrade(&self.inner);
+        let privacy: ferrocast_youtube::PrivacySource = Arc::new(move || {
+            // A value that isn't one of the three (a hand-edited file) must not publish: unlisted.
+            engine
+                .upgrade()
+                .map(|inner| Engine { inner }.settings().youtube_privacy)
+                .map_or(ferrocast_youtube::Privacy::Unlisted, |v| {
+                    ferrocast_youtube::Privacy::parse(&v).unwrap_or(ferrocast_youtube::Privacy::Unlisted)
+                })
+        });
+        Ok(Arc::new(
+            ferrocast_youtube::Api::new(
+                ferrocast_youtube::http_client(),
+                self.apps().youtube_endpoints.clone(),
+                app,
+                tokens,
+                persist,
+            )
+            .with_privacy(privacy),
+        ))
     }
 
     fn start_youtube(&self, api: Arc<ferrocast_youtube::Api>, account: repo::settings::Account) {
@@ -413,18 +503,146 @@ impl Engine {
     /// browser. Every screen shows it; the connect dialog also offers its link to copy, so
     /// the person isn't left waiting for a browser that never opens.
     pub fn browser_didnt_open(&self) {
-        self.notice(
+        self.notice_detail(
             BROWSER_NOTICE,
             NoticeLevel::Warn,
-            "Ferrocast couldn't open your browser. Try again in a moment, or open your browser first.",
+            "Ferrocast couldn't open your browser",
+            "Try again in a moment, or open your browser first.",
         );
+    }
+
+    /// Turns the Studio's background saves into dashboard notices: one calm line per file that
+    /// can't be saved (the OS error behind the (i)), replaced by a one-line "saving again" when it
+    /// works. Call once at start-up; a later call replaces the earlier watcher.
+    pub fn watch_saves(&self) {
+        let engine = self.clone();
+        ferrocast_store::durable::set_save_observer(move |e| engine.save_notice(e));
+    }
+
+    fn save_notice(&self, e: &ferrocast_store::durable::SaveEvent) {
+        let (key, what) = save_subject(&e.file);
+        match &e.error {
+            Some(f) => {
+                let notice = Notice::new(NoticeLevel::Warn, save_failure_message(what, f.kind, f.raw_os_error))
+                    .key(key)
+                    .detail(f.describe());
+                self.send_live(LiveFrame::new("notice", &notice));
+            }
+            None => self.notice(&key, NoticeLevel::Info, &format!("Saving {what} again.")),
+        }
     }
 
     /// One line on the dashboard. Notices with the same `key` replace each other there.
     pub(crate) fn notice(&self, key: &str, level: NoticeLevel, message: &str) {
-        self.send_live(LiveFrame::new(
-            "notice",
-            &Notice { key: Some(key.to_string()), level, message: message.to_string(), action: None },
-        ));
+        self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key)));
+    }
+
+    /// A notice with an action the dashboard makes as a request (a POST of `body` to `href`).
+    pub(crate) fn notice_post(
+        &self,
+        key: &str,
+        level: NoticeLevel,
+        message: &str,
+        detail: &str,
+        action: (&str, &str, serde_json::Value),
+    ) {
+        let n = Notice::new(level, message).key(key).detail(detail).post_action(action.0, action.1, action.2);
+        self.send_live(LiveFrame::new("notice", &n));
+    }
+
+    /// The same with what the line leaves out (the engine's own words), behind an (i) on the page.
+    pub(crate) fn notice_detail(&self, key: &str, level: NoticeLevel, message: &str, detail: &str) {
+        self.send_live(LiveFrame::new("notice", &Notice::new(level, message).key(key).detail(detail)));
+    }
+}
+
+/// A stable, non-personal key for a saved file (its folder and name, never the full path, which
+/// holds the user's home folder) and what to call it.
+fn save_subject(file: &std::path::Path) -> (String, &'static str) {
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let folder = file.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+    let what = match (folder, name) {
+        ("collections", _) => "your scenes",
+        ("profiles", _) => "your Studio settings",
+        (_, "library.json") => "your list of scenes and settings",
+        (_, "session.json") => "the Studio's session note",
+        _ => "a Studio file",
+    };
+    (format!("save:{folder}/{name}"), what)
+}
+
+/// What to tell the person for a failed save, by why it failed.
+fn save_failure_message(what: &str, kind: std::io::ErrorKind, raw: Option<i32>) -> String {
+    use std::io::ErrorKind as K;
+    // Windows: a file another program holds open (sharing 32, lock 33) or a busy one.
+    if matches!(raw, Some(32 | 33)) || matches!(kind, K::ResourceBusy | K::WouldBlock) {
+        return format!("Couldn't save {what}: the file is in use by another program.");
+    }
+    match kind {
+        K::StorageFull | K::QuotaExceeded => format!("Couldn't save {what}: the disk is full. Free some space."),
+        K::PermissionDenied => format!("Couldn't save {what}: Ferrocast isn't allowed to write there."),
+        K::NotFound => format!("Couldn't save {what}: its folder is missing."),
+        _ => format!("Couldn't save {what}."),
+    }
+}
+
+#[cfg(test)]
+mod save_notice_tests {
+    use super::*;
+    use std::io::ErrorKind as K;
+
+    #[test]
+    fn each_failure_has_its_own_plain_reason() {
+        let m = |k, r| save_failure_message("your scenes", k, r);
+        assert_eq!(m(K::StorageFull, None), "Couldn't save your scenes: the disk is full. Free some space.");
+        assert_eq!(m(K::QuotaExceeded, None), "Couldn't save your scenes: the disk is full. Free some space.");
+        assert_eq!(
+            m(K::PermissionDenied, Some(13)),
+            "Couldn't save your scenes: Ferrocast isn't allowed to write there."
+        );
+        assert_eq!(
+            m(K::PermissionDenied, Some(32)),
+            "Couldn't save your scenes: the file is in use by another program."
+        );
+        assert_eq!(
+            m(K::PermissionDenied, Some(33)),
+            "Couldn't save your scenes: the file is in use by another program."
+        );
+        assert_eq!(m(K::ResourceBusy, None), "Couldn't save your scenes: the file is in use by another program.");
+        assert_eq!(m(K::NotFound, None), "Couldn't save your scenes: its folder is missing.");
+        assert_eq!(m(K::InvalidData, None), "Couldn't save your scenes.");
+    }
+
+    #[test]
+    fn the_key_has_no_home_folder_in_it() {
+        let (key, what) = save_subject(std::path::Path::new("/Users/someone/Library/studio/collections/main.json"));
+        assert_eq!((key.as_str(), what), ("save:collections/main.json", "your scenes"));
+        assert!(!key.contains("someone"));
+    }
+}
+
+#[cfg(test)]
+mod saved_tokens_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Locked;
+    impl ferrocast_secrets::Secrets for Locked {
+        fn get(&self, _: &str) -> Result<Option<String>, ferrocast_secrets::SecretError> {
+            Err(ferrocast_secrets::SecretError::Unavailable("the keychain is locked".into()))
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_keychain_that_cant_be_read_is_not_a_missing_sign_in() {
+        assert!(matches!(saved_tokens::<Tokens>(&Locked, "twitch-tokens"), Saved::Unreadable));
+        let mem = ferrocast_secrets::MemorySecrets::default();
+        assert!(matches!(saved_tokens::<Tokens>(&mem, "twitch-tokens"), Saved::Missing));
     }
 }

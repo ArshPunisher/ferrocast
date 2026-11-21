@@ -27,6 +27,9 @@ pub(crate) fn tick(engine: &Engine, last: &mut LastPost, t: Millis) -> Vec<(Stri
         let st = engine.state();
         (st.timers.clone(), st.live.clone(), st.session.chat_lines.clone(), st.settings.bot_enabled)
     };
+    // Drop entries for deleted timers so `last` never grows across create/delete cycles.
+    let active: std::collections::HashSet<&str> = timers.iter().map(|tm| tm.id.as_str()).collect();
+    last.retain(|(id, _), _| active.contains(id.as_str()));
     let mut posted = Vec::new();
     if !bot_on {
         return posted;
@@ -57,4 +60,24 @@ pub(crate) fn tick(engine: &Engine, last: &mut LastPost, t: Millis) -> Vec<(Stri
         }
     }
     posted
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn deleted_timers_are_pruned_from_last_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn ferrocast_secrets::Secrets> = Arc::new(ferrocast_secrets::MemorySecrets::default());
+        let engine = Engine::start_with_secrets(dir.path(), secrets).await.unwrap();
+        let mut last: LastPost = HashMap::new();
+        for i in 0..1_000 {
+            last.insert((format!("deleted-{i}"), Platform::Twitch), (Millis(i * 1000), 10));
+        }
+        let _ = tick(&engine, &mut last, Millis(2_000_000));
+        assert!(last.is_empty(), "deleted timer entries must be pruned, left {}", last.len());
+    }
 }

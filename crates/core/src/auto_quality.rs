@@ -135,7 +135,10 @@ impl AutoQuality {
             None => false,
             Some(l) => Self::trouble(l, &s),
         };
+        // Down at the look before: the first look with platforms live again proves nothing either.
+        let was_down = s_dests_all_down(&self.last);
         self.last = Some(s);
+        let now_down = s_dests_all_down(&self.last);
         if at - started < GRACE_MS {
             return None;
         }
@@ -148,13 +151,24 @@ impl AutoQuality {
             }
             return None;
         }
-        if self.pct < 100 && at - self.last_trouble >= CALM_MS && at - self.last_change >= CALM_MS {
+        // Every platform down: nothing is being sent, so a quiet look proves nothing.
+        if !was_down
+            && !now_down
+            && self.pct < 100
+            && at - self.last_trouble >= CALM_MS
+            && at - self.last_change >= CALM_MS
+        {
             self.pct = (self.pct + UP).min(100);
             self.last_change = at;
             return Some(self.pct);
         }
         None
     }
+}
+
+/// Whether the last look showed platforms and none sending.
+fn s_dests_all_down(last: &Option<Signals>) -> bool {
+    last.as_ref().is_some_and(|s| !s.dests.is_empty() && s.dests.iter().all(|d| !d.live))
 }
 
 #[cfg(test)]
@@ -206,6 +220,50 @@ mod tests {
         }
         assert_eq!(seen, [50, 60, 70, 80, 90, 100]);
         assert!(!q.struggling(at));
+    }
+
+    /// While every platform is down (a network outage) nothing is being sent, so "quiet" proves
+    /// nothing: the quality holds where it was and only steps back up after they are live and calm.
+    #[test]
+    fn it_holds_the_quality_while_every_platform_is_down() {
+        let mut q = AutoQuality::default();
+        quiet(&mut q, 0, 12_000, &all([0, 0, 0]));
+        assert_eq!(q.tick(12_000, all([5, 5, 5])), Some(85));
+        let down = Signals {
+            dests: ["twitch", "youtube", "kick"]
+                .map(|id| Dest { id: id.into(), dropped: 5, live_ms: 0, live: false })
+                .to_vec(),
+            ..Default::default()
+        };
+        let mut at = 14_000;
+        while at < 200_000 {
+            assert_eq!(q.tick(at, down.clone()), None, "no step up with nothing live, at {at}");
+            at += 2_000;
+        }
+        assert_eq!(q.pct(), 85, "held");
+        // Live again and calm: it climbs after the usual calm, not at the first look.
+        let mut up_at_first_live_look = None;
+        let mut up = None;
+        for i in 0..40 {
+            let s = Signals {
+                dests: ["twitch", "youtube", "kick"]
+                    .map(|id| Dest { id: id.into(), dropped: 0, live_ms: 60_000, live: true })
+                    .to_vec(),
+                ..Default::default()
+            };
+            if let Some(p) = q.tick(200_000 + i * 2_000, s) {
+                if i == 0 {
+                    up_at_first_live_look = Some(p);
+                }
+                up = Some(p);
+                break;
+            }
+        }
+        assert_eq!(up, Some(95));
+        assert!(
+            up_at_first_live_look.is_none(),
+            "the first look with platforms back stepped the quality up: {up_at_first_live_look:?}"
+        );
     }
 
     #[test]

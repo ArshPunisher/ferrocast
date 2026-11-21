@@ -54,12 +54,7 @@ impl Engine {
                 tracing::warn!(%err, what, "platform action failed");
                 engine.send_live(LiveFrame::new(
                     "notice",
-                    &Notice {
-                        key: None,
-                        level: NoticeLevel::Warn,
-                        message: format!("Couldn't {what} on {platform}: {err}"),
-                        action: None,
-                    },
+                    &Notice::new(NoticeLevel::Warn, format!("{platform}: couldn't {what}")).detail(err.to_string()),
                 ));
             }
         });
@@ -429,17 +424,18 @@ impl Engine {
         }
         // Every open dashboard shows the same switches and one clear line (R-22).
         self.send_live(LiveFrame::new("panic", &json!({ "on": on, "plan": cfg })));
-        let message = if on {
-            "Panic mode is on. Chat is locked down and alerts are paused.".to_string()
+        let (message, what) = if on {
+            ("Panic mode is on", "Chat is locked down and alerts are paused.")
         } else {
-            "Panic mode is off. Chat and alerts are back to normal.".to_string()
+            ("Panic mode is off", "Chat and alerts are back to normal.")
         };
-        let (level, message) = if failed.is_empty() {
-            (if on { NoticeLevel::Warn } else { NoticeLevel::Info }, message)
+        let notice = if failed.is_empty() {
+            Notice::new(if on { NoticeLevel::Warn } else { NoticeLevel::Info }, message).detail(what)
         } else {
-            (NoticeLevel::Error, format!("{message} Some changes didn't apply: {}.", failed.join("; ")))
+            Notice::new(NoticeLevel::Error, format!("{message}, some changes failed"))
+                .detail(format!("{what} Some changes didn't apply: {}.", failed.join("; ")))
         };
-        self.send_live(LiveFrame::new("notice", &Notice { key: Some("panic".into()), level, message, action: None }));
+        self.send_live(LiveFrame::new("notice", &notice.key("panic")));
         Ok(PanicResult { on, applied })
     }
 
@@ -631,6 +627,7 @@ impl Engine {
             "connectors": st.connectors,
             "panic": st.panic_on,
             "session": st.session,
+            "safe_mode": self.safe_mode_status(),
         })
     }
 

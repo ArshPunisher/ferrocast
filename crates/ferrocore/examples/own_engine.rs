@@ -61,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         retry: Retry::default(),
         extra_audio: false,
         extra_video: false,
+        backup: None,
     };
     let pusher = rt.spawn(push::run(dest, hub.clone(), health_tx, stop));
 
@@ -89,6 +90,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate: RateControl::Cbr,
         keyframe_secs: 2,
         software: false,
+        profile: ferrocore::video::H264Profile::High,
+        bframes: false,
+        preset: None,
+        tune: None,
     };
     let mut pipe =
         Pipeline::new(video, AudioConfig { sample_rate: RATE, channels: 2, bitrate_kbps: 160 }, Some(&recorded))?;

@@ -19,6 +19,9 @@ use crate::frames::{Audience, LiveFrame, OverlayFrame};
 use crate::{Engine, EngineError, now};
 
 const FLUSH: Duration = Duration::from_millis(250);
+/// Hard cap on `GiveawaySlot::told` (matching `Giveaway::MAX_ENTRANTS`) so a paid-giveaway raid
+/// cannot grow the set without bound.
+const MAX_TOLD: usize = 100_000;
 
 #[derive(Debug, Default)]
 pub(crate) struct GiveawaySlot {
@@ -119,7 +122,7 @@ impl Engine {
             match self.db(move |s| repo::giveaways::pay_entry(s, &gid, p, &u, cost)).await {
                 Ok(Change::Done(_)) => {}
                 Ok(Change::NotEnough { have }) => {
-                    if slot.told.insert(person.to_string()) {
+                    if slot.told.len() < MAX_TOLD && slot.told.insert(person.to_string()) {
                         let reply = safe_reply(&format!(
                             "@{}, entering costs {} and you have {}.",
                             actor.display_name,
@@ -206,7 +209,9 @@ impl Engine {
             }
             g.ended = true;
             g.open = false;
-            (g.view(), g.card(), g.id.clone())
+            let out = (g.view(), g.card(), g.id.clone());
+            slot.told.clear();
+            out
         };
         self.db(move |s| repo::giveaways::settle(s, &id)).await?;
         self.broadcast_giveaway(Some((view.clone(), card)));
@@ -215,7 +220,12 @@ impl Engine {
 
     /// Cancels it and gives every entry fee back. Returns how many people were refunded.
     pub async fn cancel_giveaway(&self) -> Result<usize, EngineError> {
-        let g = self.inner.giveaway.lock().await.giveaway.take().ok_or(NO_GIVEAWAY)?;
+        let g = {
+            let mut slot = self.inner.giveaway.lock().await;
+            slot.told.clear();
+            slot.dirty = false;
+            slot.giveaway.take().ok_or(NO_GIVEAWAY)?
+        };
         let id = g.id.clone();
         let refunded = if g.ended { 0 } else { self.db(move |s| repo::giveaways::refund(s, Some(&id))).await? };
         self.broadcast_giveaway(None);

@@ -266,6 +266,47 @@ async fn a_platform_that_needs_signing_in_shows_one_reconnect_notice() {
     assert!(notices[0]["data"]["message"].as_str().unwrap().starts_with("Kick"));
 }
 
+/// The relay answering the link with 401 has forgotten this install. It keeps which install owns a
+/// Kick channel, so the new install the next try registers owns none: Kick's events would never
+/// come, with Kick looking connected. While Kick is signed in, the install is forgotten as before
+/// and the streamer is asked to sign in to Kick again (as the refresh path does).
+#[tokio::test]
+async fn a_relay_that_forgot_this_install_while_kick_is_signed_in_asks_for_a_new_kick_sign_in() {
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!("http://{}", rl.local_addr().unwrap());
+    let app = axum::Router::new()
+        .route("/v1/link", axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }))
+        .route(
+            "/v1/installs",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({ "install_id": "n", "install_secret": "s" }))
+            }),
+        );
+    tokio::spawn(async move { axum::serve(rl, app).await });
+    let secrets = mem();
+    secrets.set("relay-install", "old.secret").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let apps = PlatformApps { relay_url: Some(relay), ..PlatformApps::default() };
+    let e = Engine::start_with(dir.path(), secrets.clone(), apps).await.unwrap();
+    e.register_connector(FakePlatform::new(Platform::Kick));
+    let mut live = e.subscribe_live();
+    e.ensure_relay_link();
+    let mut asked = false;
+    for _ in 0..300 {
+        while let Ok(f) = live.try_recv() {
+            let v: Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["message"].as_str().is_some_and(|m| m.starts_with("Kick")) {
+                asked = true;
+            }
+        }
+        if asked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(asked, "Kick was never asked to sign in again");
+}
+
 #[tokio::test]
 async fn session_numbers_follow_tips_refunds_bits_and_viewers() {
     let (e, _d) = engine().await;
@@ -474,6 +515,9 @@ async fn panic_mode_switches_modes_and_pauses_alerts() {
         let v = serde_json::from_str::<Value>(&f.text).unwrap();
         if v["type"] == "notice" {
             assert_eq!(v["data"]["key"], "panic", "panic notices replace each other on the dashboard");
+            // One short line, what it did behind its (i).
+            assert_eq!(v["data"]["message"], "Panic mode is on");
+            assert!(v["data"]["detail"].as_str().unwrap().contains("locked down"), "{v}");
         }
         kinds.push(v["type"].as_str().unwrap_or("").to_string());
     }
@@ -1753,7 +1797,8 @@ async fn a_browser_that_didnt_open_reaches_the_dashboard() {
     assert_eq!(notices[0]["key"], crate::BROWSER_NOTICE);
     assert_eq!(notices[0]["level"], "warn");
     let message = notices[0]["message"].as_str().unwrap();
-    assert!(message.contains("couldn't open your browser") && message.contains("Try again"), "{message}");
+    assert_eq!(message, "Ferrocast couldn't open your browser");
+    assert!(notices[0]["detail"].as_str().unwrap().contains("Try again"), "{:?}", notices[0]);
 }
 
 #[tokio::test]
@@ -1786,4 +1831,47 @@ async fn a_new_stream_starts_with_empty_chat() {
     }
     assert!(!again, "one stream, one clear");
     assert_eq!(e.stream_started_at(), Some(start));
+}
+
+#[tokio::test]
+async fn a_failed_background_save_gives_one_notice_and_a_later_success_replaces_it() {
+    let (e, d) = engine().await;
+    e.watch_saves();
+    let mut live = e.subscribe_live();
+    // The folder's place is taken by a file, so the save fails at once (not a passing lock).
+    let blocker = d.path().join("savetest");
+    std::fs::write(&blocker, b"x").unwrap();
+    let file = blocker.join("collections").join("main.json");
+    for _ in 0..3 {
+        ferrocast_store::durable::queue_json_bytes(&file, b"{}".to_vec());
+        assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)));
+    }
+    let notices = |live: &mut tokio::sync::broadcast::Receiver<crate::frames::LiveFrame>| {
+        let mut out = Vec::new();
+        while let Ok(f) = live.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "notice" && v["data"]["key"].as_str().is_some_and(|k| k.starts_with("save:")) {
+                out.push(v["data"].clone());
+            }
+        }
+        out
+    };
+    let failed = notices(&mut live);
+    assert_eq!(failed.len(), 1, "one notice per failing file, not per attempt: {failed:?}");
+    assert_eq!(failed[0]["level"], "warn");
+    // The parent being a file: NotADirectory/NotFound-class, not a lock.
+    assert!(failed[0]["message"].as_str().unwrap().starts_with("Couldn't save your scenes"));
+    assert!(failed[0]["detail"].as_str().is_some_and(|d| !d.is_empty()));
+    let text = failed[0].to_string();
+    let tmp = d.path().to_string_lossy().to_string();
+    assert!(!text.contains(&tmp) && !text.contains("savetest"), "no path in the notice: {text}");
+    assert_eq!(failed[0]["key"], "save:collections/main.json");
+    // Fixed: the same key says it's saving again, replacing the warning on the dashboard.
+    std::fs::remove_file(&blocker).unwrap();
+    ferrocast_store::durable::queue_json_bytes(&file, b"{}".to_vec());
+    assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)));
+    let back = notices(&mut live);
+    assert_eq!(back.len(), 1, "{back:?}");
+    assert_eq!(back[0]["key"], failed[0]["key"]);
+    assert_eq!(back[0]["level"], "info");
 }

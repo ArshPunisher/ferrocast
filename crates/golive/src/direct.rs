@@ -11,7 +11,9 @@ use srt_tokio::options::{DataRate, LiveBandwidthMode, Percent};
 use tokio::sync::{broadcast, watch};
 
 use crate::hub::{Frame, Hub, Live, Subscription};
-use crate::push::{Ended, Health, Link, PushState, Retry, backoff, set_state};
+use crate::push::{
+    Ended, Health, Link, PushState, REFUSED_MAX_ATTEMPTS, Retry, STAYED_LIVE_MS, backoff, now_ms, set_state,
+};
 use crate::ts::{PACKET, TsMuxer};
 
 /// How long a connection may take.
@@ -230,10 +232,49 @@ pub async fn run(d: Direct, hub: Arc<Hub>, health: watch::Sender<Health>, mut st
                     if !still_on(&live.borrow()) {
                         break;
                     }
-                    if health.borrow().state == PushState::Live {
+                    let (was_live, live_for_ms) = {
+                        let h = health.borrow();
+                        (h.state == PushState::Live, now_ms().saturating_sub(h.since_ms))
+                    };
+                    if was_live && live_for_ms >= STAYED_LIVE_MS {
                         attempt = 0;
                     }
                     attempt = attempt.saturating_add(1);
+                    let server_refused = matches!(err, DirectError::Refused(_) | DirectError::Address(_));
+                    let limit = if d.retry.is_never() {
+                        1
+                    } else if d.retry.max_attempts == 0 {
+                        0
+                    } else if server_refused {
+                        d.retry.max_attempts.min(REFUSED_MAX_ATTEMPTS)
+                    } else {
+                        d.retry.max_attempts
+                    };
+                    if limit > 0 && attempt >= limit {
+                        let full = err.to_string();
+                        let (reason, detail) = if full.chars().count() <= 60 {
+                            (full, None)
+                        } else if server_refused {
+                            ("The server refused the stream.".into(), Some(full))
+                        } else {
+                            ("Couldn't send to the server.".into(), Some(full))
+                        };
+                        tracing::warn!(
+                            dest = %d.id,
+                            attempts = attempt,
+                            refused = server_refused,
+                            error = %err,
+                            "direct destination failed, giving up for this stream"
+                        );
+                        set_state(
+                            &health,
+                            PushState::Failed { attempts: attempt, reason, detail, refused: server_refused },
+                        );
+                        tokio::select! {
+                            _ = stop.wait_for(|s| *s) => break 'streams,
+                            _ = live.wait_for(|l| !still_on(l)) => break,
+                        }
+                    }
                     let wait = backoff(attempt, &d.retry);
                     tracing::info!(dest = %d.id, attempt, error = %err, "direct destination failed, retrying");
                     set_state(

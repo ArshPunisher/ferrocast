@@ -54,20 +54,17 @@ pub async fn reach(url: &str, key: &str) -> Reach {
     match kind {
         Kind::Srt => match crate::direct::srt_reach(&d).await {
             Ok((rtt, latency)) => {
-                let mut r = Reach::ok(rtt, format!("Your SRT server answered. Ping {} ms.", ms(rtt)));
+                let mut r = Reach::ok(rtt, format!("SRT server reachable ({} ms).", ms(rtt)));
                 if let Some(l) = latency {
                     r.srt_latency_ms = Some(ms(l));
-                    r.message.push_str(&format!(
-                        " This distance needs a delay of {} ms; Ferrocast uses it when the address doesn't set one.",
-                        ms(l)
-                    ));
+                    r.message.push_str(&format!(" Latency {} ms, unless the address sets one.", ms(l)));
                 }
                 r
             }
             Err(e) => Reach::failed(e.to_string()),
         },
         Kind::Rist => match crate::rist::reach(&d).await {
-            Ok(rtt) => Reach::ok(rtt, format!("Your RIST receiver answered. Ping {} ms.", ms(rtt))),
+            Ok(rtt) => Reach::ok(rtt, format!("RIST receiver reachable ({} ms).", ms(rtt))),
             Err(e) => Reach::failed(e.to_string()),
         },
         Kind::Whip => match crate::whip::reach(&d).await {
@@ -96,7 +93,7 @@ async fn rtmp(url: &str) -> Reach {
     };
     let took = started.elapsed();
     match tokio::time::timeout(Duration::from_secs(10), crate::conn::handshake(&mut s, PeerType::Client)).await {
-        Ok(Ok(_)) => Reach::ok(took, format!("{} answered. The stream key is checked when you go live.", t.host)),
+        Ok(Ok(_)) => Reach::ok(took, format!("{} reachable. The key is checked when you go live.", t.host)),
         Ok(Err(e)) => Reach::failed(format!("{} answered, but {e}.", t.host)),
         Err(_) => Reach::failed(format!("{} took too long to answer.", t.host)),
     }

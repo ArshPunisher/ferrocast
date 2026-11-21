@@ -7,8 +7,12 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::rig::Rig;
+use crate::Engine;
 use crate::studio_host::StudioAct;
-use crate::{Engine, now};
+
+/// A 1-second tick gap longer than this means the machine slept or froze: reset silence
+/// tracking rather than treating the suspend duration as being away.
+const WAKE_JUMP_MS: i64 = 5_000;
 
 /// Louder than this on any mic is talking (a quiet room stays well under it).
 pub const TALKING_DBFS: f64 = -40.0;
@@ -32,6 +36,13 @@ pub struct Away {
 }
 
 impl Away {
+    /// Clears pending silence accumulation after a system sleep/wake jump without releasing
+    /// an active BRB state we already put on air.
+    pub fn on_wake_jump(&mut self) {
+        self.quiet_since = None;
+        self.talking_for = 0;
+    }
+
     pub fn step(&mut self, at_ms: i64, talking: bool, live: bool, minutes: u32, brb: bool) -> Step {
         if !live || minutes == 0 {
             *self = Away::default();
@@ -75,12 +86,18 @@ pub fn talking(levels: &Value, mics: &[String]) -> bool {
 
 pub(crate) async fn run(engine: Engine) {
     let mut away = Away::default();
+    let mut last_mono = engine.mono_ms();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
+        let mono = engine.mono_ms();
+        if mono - last_mono > WAKE_JUMP_MS {
+            away.on_wake_jump();
+        }
+        last_mono = mono;
         let cfg = engine.scenes_config();
         let live = engine.stream_started_at().is_some();
         if cfg.away_minutes == 0 || !live || cfg.brb_scene.is_none() {
-            away.step(now().0, false, false, 0, false);
+            away.step(mono, false, false, 0, false);
             continue;
         }
         let Ok(Rig::Studio) = engine.rig().await else { continue };
@@ -92,7 +109,7 @@ pub(crate) async fn run(engine: Engine) {
         let brb_scene = cfg.brb_scene.clone().unwrap_or_default();
         let on_air = engine.rig_scenes(&Rig::Studio).await.ok().and_then(|(c, _)| c);
         let brb = on_air.as_deref() == Some(brb_scene.as_str());
-        match away.step(now().0, talking(&levels, &mics), live, cfg.away_minutes, brb) {
+        match away.step(mono, talking(&levels, &mics), live, cfg.away_minutes, brb) {
             Step::Stay => {}
             Step::GoAway => {
                 tracing::info!(minutes = cfg.away_minutes, "away: quiet a while, BRB on");
@@ -178,5 +195,17 @@ mod tests {
         assert!(!talking(&json!({ "Mic": { "peak": [null, null] } }), &mics));
         assert!(!talking(&json!({}), &mics));
         assert!(!talking(&json!({ "Other": { "peak": [0.0, 0.0] } }), &mics));
+    }
+
+    #[test]
+    fn wake_jump_resets_silence_without_triggering_false_away() {
+        let mut a = Away::default();
+        assert_eq!(a.step(0, false, true, 2, false), Step::Stay);
+        assert_eq!(a.step(MIN, false, true, 2, false), Step::Stay);
+        // System sleeps for 10 minutes and wakes up: silence timer resets cleanly.
+        a.on_wake_jump();
+        assert_eq!(a.step(11 * MIN, false, true, 2, false), Step::Stay);
+        assert_eq!(a.step(12 * MIN + 59_000, false, true, 2, false), Step::Stay);
+        assert_eq!(a.step(13 * MIN, false, true, 2, false), Step::GoAway);
     }
 }

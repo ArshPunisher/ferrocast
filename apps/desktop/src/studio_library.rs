@@ -21,6 +21,36 @@ pub struct Shelf {
     pub list: Vec<Entry>,
 }
 
+/// Windows reserves these stems (even with an extension like `.json`) for DOS devices: creating
+/// `con.json` or `nul.json` fails or writes to a device instead of a file.
+fn is_win_reserved_device(id: &str) -> bool {
+    matches!(
+        id,
+        "con"
+            | "prn"
+            | "aux"
+            | "nul"
+            | "com1"
+            | "com2"
+            | "com3"
+            | "com4"
+            | "com5"
+            | "com6"
+            | "com7"
+            | "com8"
+            | "com9"
+            | "lpt1"
+            | "lpt2"
+            | "lpt3"
+            | "lpt4"
+            | "lpt5"
+            | "lpt6"
+            | "lpt7"
+            | "lpt8"
+            | "lpt9"
+    )
+}
+
 impl Shelf {
     fn first() -> Shelf {
         Shelf { current: "untitled".into(), list: vec![Entry { id: "untitled".into(), name: "Untitled".into() }] }
@@ -53,8 +83,10 @@ impl Shelf {
         if slug.is_empty() {
             slug = "set".into();
         }
-        // "current" and "import" are words in the routes (/library/{kind}/current): never ids.
-        let free = |id: &str| !matches!(id, "current" | "import") && self.get(id).is_none();
+        // "current" and "import" are words in the routes (/library/{kind}/current), and Windows
+        // reserves DOS device names (con, nul, com1..com9, lpt1..lpt9) even with `.json`: never ids.
+        let free =
+            |id: &str| !matches!(id, "current" | "import") && !is_win_reserved_device(id) && self.get(id).is_none();
         if free(&slug) {
             return slug;
         }
@@ -136,12 +168,10 @@ impl Library {
 
 /// The library, made the first time from the files earlier versions kept (moved, not copied).
 pub fn load(data: &Path) -> Library {
-    if let Some(lib) =
-        std::fs::read(index(data)).ok().and_then(|b| serde_json::from_slice::<Library>(&b).ok()).filter(|l| {
-            l.collections.get(&l.collections.current).is_some() && l.profiles.get(&l.profiles.current).is_some()
-        })
-    {
-        return lib;
+    if let Some(loaded) = ferrocast_store::durable::load_json_with_backup::<Library>(&index(data), |l| {
+        l.collections.get(&l.collections.current).is_some() && l.profiles.get(&l.profiles.current).is_some()
+    }) {
+        return loaded.value;
     }
     let lib = Library { collections: Shelf::first(), profiles: Shelf::first() };
     for (old, kind) in [("scenes.json", Kind::Collections), ("settings.json", Kind::Profiles)] {
@@ -151,7 +181,7 @@ pub fn load(data: &Path) -> Library {
             if let Some(dir) = to.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if let Err(e) = std::fs::rename(&from, &to) {
+            if let Err(e) = ferrocast_store::durable::rename_patiently(&from, &to) {
                 tracing::warn!(error = %e, file = %from.display(), "an earlier Studio file couldn't move into the library");
             }
         }
@@ -162,16 +192,8 @@ pub fn load(data: &Path) -> Library {
 
 /// Writes the library, whole or not at all.
 pub fn save(data: &Path, lib: &Library) {
-    let file = index(data);
-    let tmp = file.with_extension("json.tmp");
-    let written = serde_json::to_vec_pretty(lib)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| {
-            std::fs::create_dir_all(root(data))?;
-            std::fs::write(&tmp, bytes)
-        })
-        .and_then(|()| std::fs::rename(&tmp, &file));
-    if let Err(e) = written {
+    // Queued: this runs on the async runtime and the main thread; reads see the queued bytes.
+    if let Err(e) = ferrocast_store::durable::queue_json_pretty(&index(data), lib) {
         tracing::warn!(error = %e, "the Studio's library couldn't be saved");
     }
 }
@@ -189,6 +211,11 @@ pub fn check_name(name: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// Saves are queued; tests that then touch the file by hand let them land first.
+    fn settle() {
+        assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)));
+    }
+
     #[test]
     fn earlier_files_become_the_first_of_each() {
         let dir = tempfile::tempdir().unwrap();
@@ -197,6 +224,7 @@ mod tests {
         std::fs::write(studio.join("scenes.json"), b"{\"sources\":[]}").unwrap();
         std::fs::write(studio.join("settings.json"), b"{}").unwrap();
         let lib = load(dir.path());
+        settle();
         assert_eq!(lib.collections.get(&lib.collections.current).unwrap().name, "Untitled");
         assert!(!studio.join("scenes.json").exists(), "moved, not copied");
         assert_eq!(std::fs::read(lib.current_file(dir.path(), Kind::Collections)).unwrap(), b"{\"sources\":[]}");
@@ -213,6 +241,10 @@ mod tests {
         assert_eq!(s.new_id("✨✨"), "set");
         assert_eq!(s.new_id("Current"), "current-2", "route words aren't ids");
         assert_eq!(s.new_id("import"), "import-2");
+        assert_eq!(s.new_id("CON"), "con-2", "Windows DOS device names aren't ids");
+        assert_eq!(s.new_id("nul"), "nul-2");
+        assert_eq!(s.new_id("COM1"), "com1-2");
+        assert_eq!(s.new_id("lpt9"), "lpt9-2");
         assert_eq!(s.free_name("untitled"), "untitled 2");
         s.list.push(Entry { id: "show".into(), name: "Show".into() });
         assert_eq!(s.free_name("Show"), "Show 2");
@@ -228,7 +260,44 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("studio")).unwrap();
         std::fs::write(index(dir.path()), b"{oops").unwrap();
         let lib = load(dir.path());
+        settle();
         assert_eq!(lib.collections.list.len(), 1);
         assert_eq!(lib.profiles.current, "untitled");
+    }
+
+    #[test]
+    fn truncated_library_falls_back_to_bak() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut lib = load(dir.path());
+        settle();
+        lib.collections.list.push(Entry { id: "gaming".into(), name: "Gaming".into() });
+        lib.collections.current = "gaming".into();
+        save(dir.path(), &lib);
+        settle();
+
+        let bytes = std::fs::read(index(dir.path())).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(index(dir.path()), &bytes[..bytes.len() / 3]).unwrap_or_else(|e| panic!("{e}"));
+
+        let recovered = load(dir.path());
+        settle();
+        assert_eq!(recovered.collections.list.len(), 1, "last good library before truncation was .bak");
+        assert!(ferrocast_store::durable::backup_path(&index(dir.path())).exists());
+
+        // Second save -> third save preserves second save in .bak and survives truncation.
+        let mut lib2 = recovered;
+        lib2.collections.list.push(Entry { id: "gaming".into(), name: "Gaming".into() });
+        lib2.collections.current = "gaming".into();
+        save(dir.path(), &lib2);
+        settle();
+        let mut lib3 = lib2.clone();
+        lib3.profiles.list.push(Entry { id: "podcast".into(), name: "Podcast".into() });
+        save(dir.path(), &lib3);
+        settle();
+
+        let full = std::fs::read(index(dir.path())).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(index(dir.path()), &full[..full.len() / 2]).unwrap_or_else(|e| panic!("{e}"));
+        let loaded = load(dir.path());
+        settle();
+        assert_eq!(loaded.collections.current, "gaming");
     }
 }

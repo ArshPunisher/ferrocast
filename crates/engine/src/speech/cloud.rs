@@ -18,7 +18,7 @@ use ferrocast_store::repo;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::frames::{LiveFrame, Notice, NoticeAction, NoticeLevel};
+use crate::frames::{LiveFrame, Notice, NoticeLevel};
 use crate::{Engine, EngineError, now};
 
 /// Ferrocast voice ids start with their provider: `google:hi-IN-Neural2-A`.
@@ -78,6 +78,13 @@ pub(crate) struct CloudTts {
     previews: Mutex<HashMap<String, String>>,
 }
 
+impl CloudTts {
+    /// Media ids of currently cached voice previews (kept during periodic TTS cleanup).
+    pub(crate) fn preview_ids(&self) -> Vec<String> {
+        lock(&self.previews).values().cloned().collect()
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -126,7 +133,7 @@ fn refused(status: u16, code: &'static str, message: &str, hint: &str) -> Engine
 }
 
 impl Engine {
-    fn cloud_tts(&self) -> &CloudTts {
+    pub(crate) fn cloud_tts(&self) -> &CloudTts {
         &self.inner.cloud_tts
     }
 
@@ -299,12 +306,10 @@ impl Engine {
         let end = if why.ends_with('.') { "" } else { "." };
         self.send_live(LiveFrame::new(
             "notice",
-            &Notice {
-                key: Some(NOTICE_KEY.into()),
-                level: NoticeLevel::Warn,
-                message: format!("{why}{end} Reading with {instead} for now."),
-                action: Some(NoticeAction { label: "Voice settings".into(), href: "#/settings/tts".into() }),
-            },
+            &Notice::new(NoticeLevel::Warn, "Reading with this PC's voice for now")
+                .key(NOTICE_KEY)
+                .detail(format!("{why}{end} Reading with {instead} for now."))
+                .action("Voice settings", "#/settings/tts"),
         ));
     }
 
@@ -325,7 +330,12 @@ impl Engine {
         if let Some(cv) = &cloud {
             match self.cloud_speak(text, cv).await {
                 Ok(bytes) => {
-                    match self.db(move |s| Ok(repo::media::save(s, "speech.ogg", &bytes).ok())).await.ok().flatten() {
+                    match self
+                        .db(move |s| Ok(repo::media::save_speech(s, "speech.ogg", &bytes).ok()))
+                        .await
+                        .ok()
+                        .flatten()
+                    {
                         Some(m) => {
                             self.cloud_tts().noticed.store(false, Ordering::Relaxed);
                             *lock(&self.cloud_tts().last_fallback) = None;
@@ -354,7 +364,8 @@ impl Engine {
         }
         let bytes = tokio::fs::read(&out).await.ok()?;
         let _ = tokio::fs::remove_file(&out).await;
-        let saved = self.db(move |s| Ok(repo::media::save(s, "speech.wav", &bytes).ok())).await.ok().flatten()?;
+        let saved =
+            self.db(move |s| Ok(repo::media::save_speech(s, "speech.wav", &bytes).ok())).await.ok().flatten()?;
         Some(Spoken {
             url: format!("/api/v1/media/{}", saved.id),
             media_id: saved.id,
