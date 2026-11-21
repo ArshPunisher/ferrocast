@@ -143,6 +143,11 @@ const DROPPED: u32 = 1 << 1;
 /// kCVAttachmentMode_ShouldPropagate.
 const PROPAGATE: u32 = 1;
 
+/// Reorder depth (in frames) used to shift decode timestamps before presentation timestamps so
+/// `dts <= pts` (`cts >= 0`) holds in steady state without clamping. VideoToolbox's real-time
+/// H.264 and HEVC encoders reorder up to two frames (and B-pyramids up to three).
+const REORDER_DEPTH: i64 = 3;
+
 /// What the encoder's callback fills, on VideoToolbox's own thread.
 #[derive(Debug, Default)]
 struct Sink {
@@ -154,30 +159,140 @@ struct Sink {
     /// Times VideoToolbox has called back (a frame, a drop, an error: anything), to tell a
     /// session that went quiet from one that is working.
     callbacks: u64,
+    /// Video rate fraction used to space decode times by exact rational frame intervals.
+    fps_num: i64,
+    fps_den: i64,
     /// With B-frames: how far decode times are moved back (µs) so none is after its picture's
-    /// presentation time (VideoToolbox counts decode times from the first picture's own), and the
-    /// last decode time given (they must rise).
+    /// presentation time (`REORDER_DEPTH` frame intervals).
     dts_shift: i64,
+    /// Capture timestamps (µs) of frames submitted to VideoToolbox and not yet output or dropped,
+    /// keyed by the monotonic `frame_refcon` id.
+    pending: Vec<(usize, i64)>,
+    /// Presentation time (µs) anchoring the current continuous decode-order grid, and packets
+    /// emitted on that grid so far.
+    anchor_pts: Option<i64>,
+    decode_idx: i64,
+    /// Last decode time given (they must strictly rise).
     last_dts: Option<i64>,
+    /// Set once if the last-resort clamp ever has to break steady-state spacing.
+    clamp_logged: bool,
     /// Tests: the session stops answering (callbacks return at once, as a wedged one's would).
     #[cfg(test)]
     mute: bool,
 }
 
 impl Sink {
-    /// Shifts decode time by `dts_shift`, forces strict monotonicity against `last_dts`, and keeps
-    /// `pts >= dts` so RTMP composition times are never negative.
-    fn normalize(&mut self, mut pts: i64, raw_dts: i64) -> (i64, i64) {
-        let mut dts = if self.dts_shift > 0 { (raw_dts - self.dts_shift).min(pts) } else { raw_dts.min(pts) };
+    fn step_us(&self, frames: i64) -> i64 {
+        if self.fps_num > 0 && self.fps_den > 0 {
+            (i128::from(frames) * 1_000_000 * i128::from(self.fps_den) / i128::from(self.fps_num)) as i64
+        } else if self.dts_shift > 0 {
+            frames * (self.dts_shift / REORDER_DEPTH).max(1)
+        } else {
+            frames * 33_333
+        }
+    }
+
+    fn warn_clamp_once(&mut self, pts: i64, dts: i64, last: i64) {
+        if !self.clamp_logged {
+            self.clamp_logged = true;
+            tracing::warn!(
+                pts_us = pts,
+                dts_us = dts,
+                last_dts_us = last,
+                "VideoToolbox B-frame decode timestamp clamped to stay monotonic"
+            );
+        }
+    }
+
+    fn step_within_headroom(&self, last: i64, min_pending: i64, slots: i64, one_frame: i64) -> Option<i64> {
+        (min_pending > last).then(|| {
+            let headroom = min_pending - last;
+            last + (headroom / slots.max(1)).clamp(1, one_frame).min(headroom)
+        })
+    }
+
+    /// Computes `dts` in decode order spaced by the frame interval and shifted back by `dts_shift`
+    /// so `dts <= pts` holds without clamping in steady state; never alters the frame's real `pts`.
+    /// Clamping acts only as a last-resort guard (logged once if it ever fires).
+    fn normalize(&mut self, pts: i64, _raw_dts: i64) -> (i64, i64) {
+        let one_frame = self.step_us(1).max(1);
+        if self.dts_shift <= 0 {
+            let mut dts = pts;
+            if let Some(last) = self.last_dts
+                && dts <= last
+            {
+                dts = last + 1;
+                self.warn_clamp_once(pts, dts, last);
+            }
+            self.last_dts = Some(dts);
+            return (pts, dts);
+        }
+
+        // Earliest PTS among this frame and all frames still buffered in VideoToolbox: keeping
+        // `dts <= min_pending` guarantees no buffered B-frame can ever arrive with `pts < dts`.
+        let min_pending = self.pending.iter().map(|&(_, p)| p).min().map_or(pts, |m| m.min(pts));
+        let slots = (self.pending.len() as i64 + 1).max(REORDER_DEPTH + 1);
+
+        let mut dts = if let Some(anchor) = self.anchor_pts {
+            self.decode_idx += 1;
+            let grid_dts = anchor + self.step_us(self.decode_idx) - self.dts_shift;
+            let ideal_dts = min_pending - self.dts_shift;
+            if ideal_dts - grid_dts > one_frame {
+                // Capture timeline jumped forward across dropped/skipped frames and the reorder
+                // window has drained past the gap: re-anchor cleanly onto the post-gap timeline.
+                self.anchor_pts = Some(min_pending);
+                self.decode_idx = 0;
+                ideal_dts
+            } else {
+                grid_dts
+            }
+        } else {
+            let ideal_dts = min_pending - self.dts_shift;
+            match self.last_dts {
+                Some(last) if ideal_dts <= last => {
+                    // Resumed after `set_min_dts` (encoder reshape/rebuild) where the previous
+                    // encoder's DTS sits ahead of `min_pending - dts_shift`: step smoothly inside
+                    // `(last, min_pending]` until `ideal_dts` overtakes `last`.
+                    if let Some(stepped) = self.step_within_headroom(last, min_pending, slots, one_frame) {
+                        stepped
+                    } else {
+                        let clamped = last + 1;
+                        self.warn_clamp_once(pts, clamped, last);
+                        clamped
+                    }
+                }
+                _ => {
+                    self.anchor_pts = Some(min_pending);
+                    self.decode_idx = 0;
+                    ideal_dts
+                }
+            }
+        };
+
+        // Guard against `dts` overtaking `min_pending` (e.g. if encoder reorder depth ever exceeds
+        // `REORDER_DEPTH` or extreme capture jitter occurs): stay within `(last_dts, min_pending]`.
+        if dts > min_pending {
+            let clamped = match self.last_dts {
+                Some(last) => self.step_within_headroom(last, min_pending, slots, one_frame).unwrap_or(last + 1),
+                None => min_pending,
+            };
+            self.warn_clamp_once(pts, clamped, self.last_dts.unwrap_or(clamped));
+            dts = clamped;
+            self.anchor_pts = None;
+            self.decode_idx = 0;
+        }
+
+        // Last-resort monotonicity guard.
         if let Some(last) = self.last_dts
             && dts <= last
         {
-            let step = if pts > last { ((pts - last) / 4).clamp(1, 1_000) } else { 1 };
-            dts = last + step;
+            let clamped = self.step_within_headroom(last, min_pending, 4, one_frame).unwrap_or(last + 1);
+            self.warn_clamp_once(pts, clamped, last);
+            dts = clamped;
+            self.anchor_pts = None;
+            self.decode_idx = 0;
         }
-        if pts < dts {
-            pts = dts;
-        }
+
         self.last_dts = Some(dts);
         (pts, dts)
     }
@@ -214,6 +329,9 @@ pub(crate) struct Encoder {
     seen_callbacks: u64,
     /// Frames in a row the pool had none to give.
     pool_misses: u32,
+    /// Monotonic id passed as `frame_refcon` so `output` removes each emitted/dropped frame from
+    /// `Sink::pending`.
+    next_seq: usize,
     /// What each frame costs, logged once a minute (`vt_cost`).
     cost: Box<super::vt_cost::Cost>,
 }
@@ -352,11 +470,12 @@ impl Encoder {
         let sink = Arc::new(Mutex::new(Sink::default()));
         // Three frames: the deepest reordering VideoToolbox's real-time H.264 and HEVC use is two.
         // Only container times move, nothing waits.
-        let fps_for_shift = f64::from(cfg.fps_num) / f64::from(cfg.fps_den.max(1));
-        if reorder_on(cfg)
-            && let Ok(mut k) = sink.lock()
-        {
-            k.dts_shift = (3_000_000.0 / fps_for_shift.max(1.0)).round() as i64;
+        if let Ok(mut k) = sink.lock() {
+            k.fps_num = i64::from(cfg.fps_num.max(1));
+            k.fps_den = i64::from(cfg.fps_den.max(1));
+            if reorder_on(cfg) {
+                k.dts_shift = k.step_us(REORDER_DEPTH);
+            }
         }
         let mut session: CFTypeRef = ptr::null();
         let codec = if cfg.codec == VideoCodec::H264 { AVC1 } else { HVC1 };
@@ -452,6 +571,7 @@ impl Encoder {
             quiet: (0, std::time::Instant::now()),
             seen_callbacks: 0,
             pool_misses: 0,
+            next_seq: 1,
             cost: Box::new(super::vt_cost::Cost::new()),
         })
     }
@@ -493,6 +613,8 @@ impl Encoder {
     pub(crate) fn set_min_dts(&mut self, last_dts: i64) {
         if let Ok(mut s) = self.sink.lock() {
             s.last_dts = Some(s.last_dts.map_or(last_dts, |prev| prev.max(last_dts)));
+            s.anchor_pts = None;
+            s.decode_idx = 0;
         }
     }
 
@@ -623,8 +745,14 @@ impl Encoder {
         } else {
             None
         };
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        if let Ok(mut sink) = self.sink.lock() {
+            sink.pending.push((seq, pts_us));
+        }
         let mut flags = 0u32;
-        // SAFETY: session and buffer are live; props is a live dictionary or null; flags is ours.
+        // SAFETY: session and buffer are live; props is a live dictionary or null; flags is ours;
+        // `frame_refcon` carries `seq` as an opaque token, never dereferenced.
         let s = unsafe {
             VTCompressionSessionEncodeFrame(
                 self.session.0,
@@ -632,11 +760,16 @@ impl Encoder {
                 CMTime::us(pts_us),
                 CMTime::us(self.frame_us),
                 props.as_ref().map_or(ptr::null(), |d| d.0.0),
-                ptr::null_mut(),
+                ptr::without_provenance_mut(seq),
                 &raw mut flags,
             )
         };
         if s != 0 {
+            if let Ok(mut sink) = self.sink.lock()
+                && let Some(pos) = sink.pending.iter().position(|(id, _)| *id == seq)
+            {
+                sink.pending.swap_remove(pos);
+            }
             self.lost = recoverable(s);
             return Err(fail("encode a frame", s));
         }
@@ -754,7 +887,7 @@ impl Drop for Encoder {
 }
 
 /// VideoToolbox's output callback: one encoded frame (or a dropped one, or an error).
-extern "C" fn output(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus, flags: u32, sbuf: *const c_void) {
+extern "C" fn output(refcon: *mut c_void, frame: *mut c_void, status: OSStatus, flags: u32, sbuf: *const c_void) {
     if refcon.is_null() {
         return;
     }
@@ -765,6 +898,12 @@ extern "C" fn output(refcon: *mut c_void, _frame: *mut c_void, status: OSStatus,
     #[cfg(test)]
     if sink.mute {
         return;
+    }
+    let seq = frame as usize;
+    if seq != 0
+        && let Some(pos) = sink.pending.iter().position(|(id, _)| *id == seq)
+    {
+        sink.pending.swap_remove(pos);
     }
     sink.callbacks += 1;
     if status != 0 {
@@ -1023,10 +1162,168 @@ mod tests {
             assert!(out.windows(2).all(|w| w[1].dts_us > w[0].dts_us), "dts must strictly increase");
             assert!(out.iter().all(|p| p.dts_us <= p.pts_us), "never emit negative cts");
         }
-        // Even if last_dts pushes past an incoming frame's pts - dts_shift (or kCMTimeInvalid hits),
-        // normalize keeps dts strictly rising and pts >= dts (cts >= 0).
+        // Even when an external `last_dts` forces monotonicity, `pts` is never altered and the
+        // last-resort clamp logs at most once.
         let mut sink = Sink { dts_shift: 100_000, last_dts: Some(110_000), ..Default::default() };
         let (pts, dts) = sink.normalize(100_000, 100_000);
-        assert!(dts > 110_000 && pts >= dts, "pts={pts} dts={dts}");
+        assert_eq!(pts, 100_000, "real pts must never be altered");
+        assert!(dts > 110_000 && sink.clamp_logged, "pts={pts} dts={dts}");
+    }
+
+    #[test]
+    fn bframes_set_min_dts_smooth_catchup_never_alters_pts() {
+        let mut sink = Sink { fps_num: 30, fps_den: 1, dts_shift: 100_000, ..Default::default() };
+        // Previous encoder ended at 433_343; new 30 fps session starts at pts = 500_000 with B-frames.
+        sink.last_dts = Some(433_343);
+        let input_order = [500_000i64, 533_333, 566_666, 599_999, 633_332, 666_665, 699_998, 733_331];
+        let decode_order = [500_000i64, 633_332, 566_666, 533_333, 599_999, 733_331, 666_665, 699_998];
+        let mut pending: Vec<(usize, i64)> = input_order.iter().enumerate().map(|(i, &p)| (i + 1, p)).collect();
+        let mut out = Vec::new();
+        for p in decode_order {
+            if let Some(pos) = pending.iter().position(|x| x.1 == p) {
+                pending.swap_remove(pos);
+            }
+            sink.pending = pending.clone();
+            out.push(sink.normalize(p, p));
+        }
+        assert_eq!(out.iter().map(|&(p, _)| p).collect::<Vec<_>>(), decode_order);
+        assert!(out.iter().all(|&(p, d)| d <= p), "cts >= 0 across reshape catchup: {out:?}");
+        assert!(out[0].1 > 433_343, "stays strictly above old last_dts");
+        assert!(out.windows(2).all(|w| w[1].1 > w[0].1), "dts strictly rises: {out:?}");
+        assert!(!sink.clamp_logged, "smooth catchup does not trip the last-resort clamp");
+    }
+
+    /// Two or more GOPs at 60 fps (and 60000/1001) with B-frames: every output picture keeps its
+    /// exact input PTS, decode timestamps stay <= PTS (cts >= 0), and consecutive DTS step by ~one
+    /// frame interval across keyframes with no 1 ms clamp steps.
+    #[test]
+    fn bframes_60fps_two_gops_preserve_pts_and_steady_dts_spacing() {
+        for (codec, fps_num, fps_den) in
+            [(VideoCodec::H264, 60, 1), (VideoCodec::Hevc, 60, 1), (VideoCodec::H264, 60_000, 1001)]
+        {
+            let frame_us = (1_000_000.0 * f64::from(fps_den) / f64::from(fps_num)).round() as i64;
+            let cfg = VideoConfig {
+                codec,
+                width: 640,
+                height: 360,
+                fps_num,
+                fps_den,
+                bitrate_kbps: 3000,
+                keyframe_secs: 1,
+                bframes: true,
+                ..config()
+            };
+            let Ok(mut e) = Encoder::new(&cfg) else { continue };
+            let mut out = Vec::new();
+            let mut input_pts = Vec::with_capacity(180);
+            let y_base = vec![90u8; 640 * 360];
+            let uv_base = vec![128u8; 640 * 180];
+            for i in 0..180i64 {
+                let pts = (i128::from(i) * 1_000_000 * i128::from(fps_den) / i128::from(fps_num)) as i64;
+                input_pts.push(pts);
+                let mut y = y_base.clone();
+                let stripe = ((i as usize * 37) % 360) * 640;
+                let end = (stripe + 640 * 6).min(y.len());
+                for b in &mut y[stripe..end] {
+                    *b = ((i * 23) % 251) as u8;
+                }
+                let f = Frame::Nv12 { y: &y, y_stride: 640, uv: &uv_base, uv_stride: 640 };
+                out.extend(e.encode(f, pts, i == 0 || i == 90).unwrap_or_else(|er| panic!("{er}")));
+            }
+            out.extend(e.flush().unwrap_or_else(|er| panic!("{er}")));
+            assert_eq!(out.len(), 180, "{codec:?} {fps_num}/{fps_den}: every frame comes out");
+            assert!(
+                !e.sink.lock().unwrap_or_else(|p| p.into_inner()).clamp_logged,
+                "{codec:?} {fps_num}/{fps_den}: steady state must never hit last-resort clamp"
+            );
+
+            let keys: Vec<usize> = out.iter().enumerate().filter(|(_, p)| p.key).map(|(i, _)| i).collect();
+            assert!(keys.len() >= 2, "{codec:?}: expected 2+ GOPs, got keyframes at {keys:?}");
+            assert!(out.windows(2).filter(|w| w[1].pts_us < w[0].pts_us).count() > 0, "{codec:?}: reordered B-frames");
+
+            let mut got_pts: Vec<i64> = out.iter().map(|p| p.pts_us).collect();
+            got_pts.sort_unstable();
+            assert_eq!(got_pts, input_pts, "{codec:?}: every output PTS must equal its exact input frame time");
+
+            assert!(out.iter().all(|p| p.dts_us <= p.pts_us), "{codec:?}: dts <= pts on every frame");
+
+            let bad_gaps: Vec<_> = out
+                .windows(2)
+                .enumerate()
+                .filter_map(|(idx, w)| {
+                    let gap = w[1].dts_us - w[0].dts_us;
+                    ((gap - frame_us).abs() > 1_000).then_some((idx, gap, w[0].dts_us, w[1].dts_us, w[1].key))
+                })
+                .collect();
+            assert!(
+                bad_gaps.is_empty(),
+                "{codec:?} {fps_num}/{fps_den}: DTS steps must stay ~{frame_us} us (keys={keys:?}): {bad_gaps:?}"
+            );
+        }
+    }
+
+    /// Frame skips / dropped ticks in a 60 fps B-frame encode must never alter real capture PTS
+    /// or trigger 1 ms clamp steps in decode timestamps.
+    #[test]
+    fn bframes_60fps_with_frame_skips_preserve_pts_without_1ms_clamping() {
+        let frame_us = 16_667i64;
+        let cfg = VideoConfig {
+            codec: VideoCodec::H264,
+            width: 640,
+            height: 360,
+            fps_num: 60,
+            fps_den: 1,
+            bitrate_kbps: 3000,
+            keyframe_secs: 1,
+            bframes: true,
+            ..config()
+        };
+        let Ok(mut e) = Encoder::new(&cfg) else { return };
+        let mut out = Vec::new();
+        let mut input_pts = Vec::new();
+        let mut pts = 0i64;
+        let y_base = vec![90u8; 640 * 360];
+        let uv_base = vec![128u8; 640 * 180];
+        for i in 0..140i64 {
+            // Simulate 2-frame engine stalls across multiple GOP phases (pre-skip B-frame buffered behind post-skip frame).
+            if matches!(i, 14 | 31 | 63 | 80) {
+                pts += frame_us * 3;
+            } else if i > 0 {
+                pts += frame_us;
+            }
+            input_pts.push(pts);
+            let mut y = y_base.clone();
+            let stripe = ((i as usize * 37) % 360) * 640;
+            let end = (stripe + 640 * 6).min(y.len());
+            for b in &mut y[stripe..end] {
+                *b = ((i * 23) % 251) as u8;
+            }
+            let f = Frame::Nv12 { y: &y, y_stride: 640, uv: &uv_base, uv_stride: 640 };
+            out.extend(e.encode(f, pts, i == 0).unwrap_or_else(|er| panic!("{er}")));
+        }
+        out.extend(e.flush().unwrap_or_else(|er| panic!("{er}")));
+        assert_eq!(out.len(), 140);
+        assert!(
+            !e.sink.lock().unwrap_or_else(|p| p.into_inner()).clamp_logged,
+            "frame skips must re-anchor cleanly without hitting the last-resort clamp"
+        );
+
+        let mut got_pts: Vec<i64> = out.iter().map(|p| p.pts_us).collect();
+        got_pts.sort_unstable();
+        assert_eq!(got_pts, input_pts, "PTS must never be altered when frames skip");
+        assert!(out.iter().all(|p| p.dts_us <= p.pts_us), "dts <= pts must hold across skips");
+
+        let tiny_or_backwards: Vec<_> = out
+            .windows(2)
+            .enumerate()
+            .filter_map(|(idx, w)| {
+                let gap = w[1].dts_us - w[0].dts_us;
+                (gap < frame_us / 2).then_some((idx, gap, w[0].pts_us, w[0].dts_us, w[1].pts_us, w[1].dts_us))
+            })
+            .collect();
+        assert!(
+            tiny_or_backwards.is_empty(),
+            "no 1 ms clamp steps or backwards DTS on skipped frames: {tiny_or_backwards:?}"
+        );
     }
 }
