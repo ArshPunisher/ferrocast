@@ -1940,7 +1940,6 @@ async fn an_interrupting_rule_replaces_the_playing_alert_and_others_queue() {
     assert!(e.queue().await.waiting.is_empty());
     // A raid has no interrupting rule: it waits behind the playing follow.
     e.test("raid", None).await.unwrap();
-    eventually(|| true).await;
     for _ in 0..300 {
         if !e.queue().await.waiting.is_empty() {
             break;
