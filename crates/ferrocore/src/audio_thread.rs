@@ -163,6 +163,8 @@ pub(crate) enum AfxJob {
         items: Vec<(u64, AudioEffect)>,
     },
     DropFilters(Vec<AudioFilter>),
+    /// The list of heard sources a newer one replaced.
+    DropHeard(Arc<[u64]>),
     DropPlugins(Vec<Box<dyn SoundPlugin>>),
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     DropFeeder(Feeder),
@@ -185,6 +187,7 @@ fn run_afx_bg(rx: mpsc::Receiver<AfxJob>, cmd_tx: mpsc::Sender<AudioCmd>, builde
                 }
             }
             AfxJob::DropFilters(filters) => drop(filters),
+            AfxJob::DropHeard(old) => drop(old),
             AfxJob::DropPlugins(plugins) => drop(plugins),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             AfxJob::DropFeeder(feeder) => drop(feeder),
@@ -532,7 +535,12 @@ impl<C: AudioClock> AudioRunner<C> {
             }
             AudioCmd::SetHeard(heard) => {
                 self.mixer.sync_active_sorted(&heard);
-                self.heard = heard;
+                // The list it had is freed on the background thread, not here (a scene switch
+                // must not free memory on the real-time thread).
+                let old = std::mem::replace(&mut self.heard, heard);
+                if let Some(afx) = &self.afx_tx {
+                    let _ = afx.send(AfxJob::DropHeard(old));
+                }
             }
             AudioCmd::SetLowLatency(on) => self.mixer.set_low_latency(on),
             AudioCmd::SetTruePeak(on) => self.mixer.set_true_peak(on),

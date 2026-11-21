@@ -8,8 +8,9 @@
 //! (`FERROCAST_SOAK_SECS`, 15 s); the long one is `#[ignore]`d (default 300 s):
 //! `cargo test -p ferrocore --release --test soak_engine -- --ignored --nocapture`.
 //!
-//! Asserts: no allocation on the audio thread once idle (a steady mix; control commands during the
-//! churn, a scene change or effects swap, may allocate and their count is printed), frame times inside a budget, almost no skipped frames, memory (RSS) and
+//! Asserts: no allocation or free on the audio thread after its first second (during the churn too:
+//! scene switches, effects swaps, hide/show, the talk key). The first second is set-up: a source
+//! appearing registers on the audio thread and allocates there (`FERROCAST_SOAK_TRACE=1` prints where), frame times inside a budget, almost no skipped frames, memory (RSS) and
 //! thread count not growing, no panics (`Stats::recovered` stays 0), a clean stop.
 //! Skipped (and passes) where there is no graphics card.
 
@@ -30,16 +31,70 @@ use ferrocore::{Effect, Picture, Placement};
 /// Counts allocations made by the thread called `ferrocast-audio`, and all others apart.
 struct Counting;
 static AUDIO_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+/// `FERROCAST_SOAK_TRACE=1`: where the audio thread allocates, by call chain.
+static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static AUDIO_FREES: AtomicUsize = AtomicUsize::new(0);
+static WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SITES: Mutex<std::collections::BTreeMap<String, u32>> = Mutex::new(std::collections::BTreeMap::new());
 thread_local! {
     static BUSY: Cell<bool> = const { Cell::new(false) };
+    /// 0: not looked up yet, 1: the audio thread, 2: another one (looked up once, while the
+    /// thread's own data is alive: asking its name at the very end of its life panics).
+    static WHO: Cell<u8> = const { Cell::new(0) };
+}
+
+fn is_audio_thread() -> bool {
+    WHO.try_with(|w| {
+        if w.get() == 0 {
+            w.set(if std::thread::current().name() == Some("ferrocast-audio") { 1 } else { 2 });
+        }
+        w.get() == 1
+    })
+    .unwrap_or(false)
 }
 
 fn note() {
+    note_kind(&AUDIO_ALLOCS);
+}
+
+fn note_kind(counter: &AtomicUsize) {
     // Looking up the thread's name must not count (or recurse into) itself.
     let _ = BUSY.try_with(|b| {
         if !b.replace(true) {
-            if std::thread::current().name() == Some("ferrocast-audio") {
-                AUDIO_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            if is_audio_thread() {
+                counter.fetch_add(1, Ordering::Relaxed);
+                if TRACE.load(Ordering::Relaxed) || WARM.load(Ordering::Relaxed) {
+                    let bt = std::backtrace::Backtrace::force_capture().to_string();
+                    let frames: Vec<&str> = bt
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.starts_with("at "))
+                        .map(|l| l.split_once(": ").map_or(l, |x| x.1))
+                        .skip_while(|l| !l.starts_with("__rust_"))
+                        .skip_while(|l| l.starts_with("__rust_"))
+                        .filter(|l| {
+                            ![
+                                "alloc::",
+                                "hashbrown",
+                                "core::",
+                                "std::",
+                                "soak_engine",
+                                "Counting",
+                                "<alloc",
+                                "<core",
+                                "<std",
+                            ]
+                            .iter()
+                            .any(|x| l.starts_with(x))
+                        })
+                        .map(|l| l.split('<').next().unwrap_or(l))
+                        .take(9)
+                        .collect();
+                    let warm = if WARM.load(Ordering::Relaxed) { "after 1s" } else { "first 1s" };
+                    let kind = if std::ptr::eq(counter, &AUDIO_ALLOCS) { "alloc" } else { "free" };
+                    let frames = [kind, warm].into_iter().chain(frames).collect::<Vec<_>>();
+                    *SITES.lock().unwrap_or_else(|p| p.into_inner()).entry(frames.join(" <- ")).or_insert(0) += 1;
+                }
             }
             b.set(false);
         }
@@ -59,6 +114,7 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.alloc_zeroed(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        note_kind(&AUDIO_FREES);
         // SAFETY: a pointer and layout from `alloc`.
         unsafe { System.dealloc(p, l) }
     }
@@ -132,7 +188,10 @@ fn set_scenes(e: &Engine, round: u64) {
     a.push(Effect::Delay { ms: 300, audio: true });
     e.set_scene("A", vec![cam_item(a, true), SceneItem::new(MIC, Placement::default())]);
     // B: the same camera with another list of its own, hidden every third round.
-    e.set_scene("B", vec![cam_item(round_fx(40.0), !round.is_multiple_of(3)), SceneItem::new(CARD, Placement::default())]);
+    e.set_scene(
+        "B",
+        vec![cam_item(round_fx(40.0), !round.is_multiple_of(3)), SceneItem::new(CARD, Placement::default())],
+    );
     // C: the camera plain, over a card that is hidden and shown.
     let mut card = SceneItem::new(CARD, Placement { x: 200.0, ..Placement::default() });
     card.visible = on;
@@ -144,6 +203,7 @@ fn run(secs: u64) {
         eprintln!("skipped: no H.264 encoder here");
         return;
     }
+    TRACE.store(std::env::var_os("FERROCAST_SOAK_TRACE").is_some(), Ordering::Relaxed);
     let Some(e) = engine() else {
         eprintln!("skipped: no engine (no graphics card)");
         return;
@@ -183,6 +243,7 @@ fn run(secs: u64) {
     let (mut rss_mark, mut threads_mark, mut spikes, mut samples) = (0u64, 0usize, 0u64, 0u64);
     let mut worst = 0.0f32;
     let mut idle_from: Option<(Instant, usize)> = None;
+    let (mut warm_allocs, mut warm_frees) = (0usize, 0usize);
     let mut tick = 0u64;
     let mut base = None;
     while started.elapsed() < churn_end + Duration::from_secs(4) {
@@ -224,6 +285,11 @@ fn run(secs: u64) {
             }
             worst = worst.max(s.frame_ms);
         }
+        if tick == 50 {
+            WARM.store(true, Ordering::Relaxed);
+            warm_allocs = AUDIO_ALLOCS.load(Ordering::SeqCst);
+            warm_frees = AUDIO_FREES.load(Ordering::SeqCst);
+        }
         if rss_mark == 0 && now > warm {
             rss_mark = rss_kb();
             threads_mark = threads();
@@ -233,21 +299,37 @@ fn run(secs: u64) {
     }
     let idle_allocs = base.map_or(0, |b| AUDIO_ALLOCS.load(Ordering::SeqCst) - b);
     let churn_allocs = idle_from.map_or(0, |(_, a)| a);
+    let steady_allocs = AUDIO_ALLOCS.load(Ordering::SeqCst) - warm_allocs;
+    let steady_frees = AUDIO_FREES.load(Ordering::SeqCst) - warm_frees;
     let (rss_end, threads_end) = (rss_kb(), threads());
     let st = e.stats();
     let (video_tags, audio_tags) = *tags.lock().unwrap();
     eprintln!(
         "soak {secs}s: {} frames, {} skipped, worst {worst:.1} ms, {spikes}/{samples} samples over 60 ms, \
-         audio-thread allocations: {churn_allocs} from start to end of churn (warm-up and control commands), {idle_allocs} idle; rss {rss_mark} -> {rss_end} kB; \
+         audio-thread allocations: {churn_allocs} from start to end of churn (warm-up and control commands), {idle_allocs} idle; rss {rss_mark} -> {rss_end} kB; audio-thread allocations after the first second (churn and idle) {steady_allocs}, frees {steady_frees}; \
          threads {threads_mark} -> {threads_end}; tags {video_tags} video {audio_tags} audio; recovered {}",
         st.frames, st.skipped, st.recovered
     );
 
+    for (site, n) in SITES.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        eprintln!("audio-thread allocation x{n} : {site}");
+    }
     assert_eq!(st.recovered, 0, "a fault was caught in the render loop");
     assert!(video_tags > secs && audio_tags > secs, "the output kept getting pictures and sound");
     let share = st.skipped as f64 * 100.0 / (st.frames + st.skipped).max(1) as f64;
     assert!(share < 5.0, "{share:.1}% of frame times skipped");
     assert!(spikes * 50 <= samples, "{spikes} of {samples} frames took over 60 ms (worst {worst} ms)");
+    assert_eq!(
+        steady_allocs, 0,
+        "the audio thread allocated {steady_allocs} times after its first second (scene switches, effects, hide/show, talk key)"
+    );
+    // The one thing left: std's unbounded command channel frees a block of its own for about
+    // every 31 commands it has carried (and allocates one on the sending side; the audio thread
+    // sends only drop jobs). A bounded channel would remove it, at the cost of senders waiting.
+    assert!(
+        steady_frees <= 2 + secs as usize / 5,
+        "the audio thread freed {steady_frees} buffers after its first second"
+    );
     assert_eq!(idle_allocs, 0, "the audio thread allocated {idle_allocs} times while idle");
     assert!(rss_end < rss_mark + 150_000, "memory grew from {rss_mark} to {rss_end} kB");
     assert!(threads_end <= threads_mark + 2, "threads grew from {threads_mark} to {threads_end}");
