@@ -4514,7 +4514,15 @@ impl Stage {
 
     /// Which web page sources stopped drawing (their browser's watchdog gave up): (name, stalled).
     pub fn stalled_pages(&self) -> Vec<(String, bool)> {
-        self.pages.borrow().iter().map(|(name, (_, page))| (name.clone(), page.stalled())).collect()
+        // Web pages are drawn only on a Mac and Windows: elsewhere there are none to stall.
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.pages.borrow().iter().map(|(name, (_, page))| (name.clone(), page.stalled())).collect()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Vec::new()
+        }
     }
 
     /// What the captures this collection's engine opened want said on the dashboard, since the
