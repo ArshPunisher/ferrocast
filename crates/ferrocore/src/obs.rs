@@ -412,6 +412,13 @@ pub fn audio_effect_from(kind: &str, s: &Value) -> Option<AudioEffect> {
                 return Some(AudioEffect::Denoise { strength: strength as u32 });
             }
             let rnnoise = method == "rnnoise";
+            // RNNoise has its own inline engine (OBS ignores the level for it too); 0 dB is off.
+            if rnnoise {
+                return match s.get("suppress_level").and_then(Value::as_f64) {
+                    Some(v) if !v.is_finite() || v >= 0.0 => None,
+                    _ => Some(AudioEffect::Rnnoise { amount: 100 }),
+                };
+            }
             let level = match s.get("suppress_level").and_then(Value::as_f64) {
                 Some(v) if !v.is_finite() => return None,
                 Some(v) if v >= 0.0 => return None,
@@ -1253,6 +1260,13 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
         // Strong noise removal on the same mic): run once, at the stronger setting. Two in a
         // row cleaned no more and held the voice back twice as long, and the whole mix waited
         // for it (165 ms, 18 Nov).
+        if sound_effects.iter().any(|e| matches!(e, AudioEffect::Denoise { .. })) {
+            // Strong removal on the same mic already cleans: RNNoise would be a second pass.
+            sound_effects.retain(|e| !matches!(e, AudioEffect::Rnnoise { .. }));
+        } else {
+            let mut seen = false;
+            sound_effects.retain(|e| !matches!(e, AudioEffect::Rnnoise { .. }) || !std::mem::replace(&mut seen, true));
+        }
         let strongest = sound_effects
             .iter()
             .filter_map(|e| if let AudioEffect::Denoise { strength } = e { Some(*strength) } else { None })
@@ -1582,8 +1596,14 @@ mod tests {
             Some(AudioEffect::Denoise { strength }) => strength,
             other => panic!("{other:?}"),
         };
-        assert_eq!(at("rnnoise", -48), 40, "24 dB");
-        assert_eq!(at("rnnoise", -12), 20, "less than that stays");
+        let rn = |db: i64| {
+            audio_effect_from(
+                "noise_suppress_filter_v2",
+                &serde_json::json!({ "method": "rnnoise", "suppress_level": db }),
+            )
+        };
+        assert_eq!(rn(-48), Some(AudioEffect::Rnnoise { amount: 100 }), "RNNoise has its own engine");
+        assert_eq!(rn(-12), Some(AudioEffect::Rnnoise { amount: 100 }), "OBS ignores the level for it");
         assert_eq!(at("speex", -48), 80);
         assert_eq!(at("speex", -30), 50, "30 dB, as saved");
         assert_eq!(at("speex", -12), 20);
@@ -1591,7 +1611,7 @@ mod tests {
         // Omitted suppress_level on RNNoise (OBS hides it): the default, 24 dB.
         assert_eq!(
             audio_effect_from("noise_suppress_filter_v2", &serde_json::json!({ "method": "rnnoise" })),
-            Some(AudioEffect::Denoise { strength: 40 })
+            Some(AudioEffect::Rnnoise { amount: 100 })
         );
         // 0 dB turns noise suppression off completely (no filter, no 82.7 ms delay).
         assert_eq!(
@@ -1624,7 +1644,10 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(none("noise_suppress_filter"), 80);
-        assert_eq!(none("noise_suppress_filter_v2"), 40);
+        assert_eq!(
+            audio_effect_from("noise_suppress_filter_v2", &serde_json::json!({ "suppress_level": -48 })),
+            Some(AudioEffect::Rnnoise { amount: 100 })
+        );
         // Bypassed 0 dB filter is not reported in `skipped`.
         let doc = serde_json::json!({ "sources": [
             { "id": "color_source", "name": "S", "settings": {},
@@ -2252,6 +2275,20 @@ mod tests {
         let main = &got.scenes.iter().find(|(n, _)| n == "Main").map(|(_, i)| i.clone()).unwrap_or_default();
         assert_eq!(main.len(), 1, "the backup copy is left out");
         assert_eq!((main[0].scene.as_deref(), main[0].group), (Some("Pair"), Some((120, 80))));
+    }
+
+    /// OBS's RNNoise next to Strong noise removal on one mic: only the strong one stays.
+    #[test]
+    fn rnnoise_next_to_strong_removal_runs_once() {
+        let doc = serde_json::json!({ "sources": [
+            { "id": "coreaudio_input_capture", "name": "Mic", "settings": { "device_id": "default" },
+              "filters": [
+                { "id": "noise_suppress_filter_v2", "name": "A", "settings": { "method": "rnnoise" } },
+                { "id": "ferrocast_deepfilter", "name": "B", "settings": { "strength": 40 } } ] },
+            { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "Mic" }] } } ] });
+        let got = import(&doc, (1920, 1080));
+        let mic = got.sources.iter().find(|s| s.name == "Mic").expect("mic");
+        assert_eq!(mic.sound_effects, vec![AudioEffect::Denoise { strength: 40 }]);
     }
 
     /// Noise removal twice on one mic runs once, at the stronger setting.

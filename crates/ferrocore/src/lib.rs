@@ -63,6 +63,7 @@ pub mod notices;
 pub mod obs;
 pub mod pipeline;
 pub mod preview;
+pub mod rnnoise;
 pub mod rt;
 pub mod shaderfx;
 mod sleep;
