@@ -514,9 +514,19 @@ impl ferrocore::afx::SoundPlugin for Plugin {
             return false;
         }
         // Single short lock: check worker state, enqueue only once ready (drop-oldest if full),
-        // and drain any completed wet blocks without ever sleeping inside the mixer lock.
-        let ready = {
-            let mut q = self.shared.q.lock().unwrap_or_else(|e| e.into_inner());
+        // and drain any completed wet blocks without ever sleeping inside the mixer lock. Never
+        // waited for: the worker holding it (descheduled while it hands an answer back) would
+        // hold up the mixer however short its own work there is.
+        let ready = 'lock: {
+            let mut q = match self.shared.q.try_lock() {
+                Ok(q) => q,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                // Busy: this block isn't sent (`out_at` still moves on, so the worker tells the
+                // hole by the next block's index) and nothing new is taken; what came back already
+                // plays when it is this block's (`wet_for`), else the sound as it came, delayed
+                // the same.
+                Err(std::sync::TryLockError::WouldBlock) => break 'lock true,
+            };
             if q.dead {
                 self.failed_init = !self.ever_wet;
                 self.gave_up = true;
@@ -1470,6 +1480,71 @@ mod tests {
         }
         // (The first frames after the model is ready may start mid-ramp: that is a start, not a join.)
         assert_eq!(joined.load(std::sync::atomic::Ordering::SeqCst), 0, "frames made of two stretches");
+    }
+
+    /// The worker holding the queue's lock (descheduled while it hands an answer back) never holds
+    /// up the mixer: each block is back at once, the model's answers already here still play, and
+    /// once they run out the sound as it came plays, delayed the same as the model's. The sample
+    /// count moves on, so the worker sees the blocks that never came as a hole.
+    #[test]
+    fn the_mixer_never_waits_for_the_workers_lock() {
+        use ferrocore::afx::SoundPlugin as _;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let done = std::sync::Arc::new(AtomicUsize::new(0));
+        let d2 = done.clone();
+        let Ok(mut p) = Plugin::start_with(65, READY_WITHIN, move |_| {
+            let permits = std::sync::Arc::new(AtomicUsize::new(usize::MAX));
+            Ok(Gated { inner: MockEngine::new(0.25, None), permits, done: d2 })
+        }) else {
+            panic!("worker spawns");
+        };
+        let shared = p.shared.clone();
+        let t = std::time::Instant::now();
+        while !shared.q.lock().unwrap_or_else(|e| e.into_inner()).ready {
+            assert!(t.elapsed() < std::time::Duration::from_secs(5), "the model gets ready");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // A ramp, so where each output sample came from shows.
+        let block = |b: usize| -> Vec<f32> { (0..1024).map(|i| ((b * 1024 + i) % 8192) as f32 * 1e-4).collect() };
+        for b in 0..20 {
+            let (mut l, mut r) = (block(b), block(b));
+            assert!(p.process([&mut l, &mut r]));
+            // Answered and handed back before the next block.
+            let t = std::time::Instant::now();
+            while done.load(SeqCst) <= b || shared.q.lock().unwrap_or_else(|e| e.into_inner()).outbox.is_empty() {
+                assert!(t.elapsed() < std::time::Duration::from_secs(5), "the worker answers block {b}");
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        }
+        let held = shared.q.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mixer = std::thread::spawn(move || {
+            for b in 20..23 {
+                let (mut l, mut r) = (block(b), block(b));
+                let at = p.out_at;
+                let ok = p.process([&mut l, &mut r]);
+                let _ = tx.send((ok, p.out_at - at, l));
+            }
+            p
+        });
+        let got: Vec<_> = (0..3).map_while(|_| rx.recv_timeout(std::time::Duration::from_millis(500)).ok()).collect();
+        drop(held);
+        let p = mixer.join().unwrap_or_else(|_| panic!("the mixer's thread"));
+        assert_eq!(got.len(), 3, "the mixer waited for the worker's lock");
+        let late = MODEL_LATENCY + PIPE;
+        let want = |b: usize, i: usize| ((b * 1024 + i - late) % 8192) as f32 * 1e-4;
+        for (k, (ok, moved, out)) in got.iter().enumerate() {
+            let b = 20 + k;
+            assert!(*ok && *moved == 1024, "block {b} played, and the count moved on: {ok} {moved}");
+            // Block 20: the answer for 18 was taken before (the model's, in step). Blocks 21 and
+            // 22: the answer for 19 waits in the queue, the one for 20 never comes (not sent):
+            // the sound as it came, in step (after the ease from the last block).
+            let (gain, from) = if b == 20 { (0.25, 0) } else { (1.0, DECLICK) };
+            for (i, v) in out.iter().enumerate().skip(from) {
+                assert!((v - gain * want(b, i)).abs() < 1e-6, "block {b} sample {i}: {v} for {}", gain * want(b, i));
+            }
+        }
+        drop(p);
     }
 
     /// A model whose answer for a block is held back until the test lets it go (`permits`): an
