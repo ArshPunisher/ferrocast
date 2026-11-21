@@ -241,12 +241,17 @@ fn args(set: &Value, sound_to: &str, parts: Parts, use_hw: bool, timeout: Durati
             a.extend([format!("-{flag}"), us.to_string()]);
         }
     }
+    // Pictures decoded on the GPU when allowed (the source's own `hwaccel` then picks how), with
+    // CPU fallback in `run()`: with it off, its own `hwaccel` is left out too.
+    let hw_setting = set.get("hw_decode").and_then(Value::as_bool).unwrap_or(true);
+    let hw = parts.picture && use_hw && hw_setting && ferrocore::ffsrc::hw_decode_allowed();
     for (k, v) in &parsed {
+        if k == "hwaccel" && !hw {
+            continue;
+        }
         a.extend([format!("-{k}"), v.clone()]);
     }
-    // Pictures decoded on the GPU when allowed and not overridden, with CPU fallback in `run()`.
-    let hw_setting = set.get("hw_decode").and_then(Value::as_bool).unwrap_or(true);
-    if parts.picture && use_hw && hw_setting && ferrocore::ffsrc::hw_decode_allowed() && !has_opt("hwaccel") {
+    if hw && !has_opt("hwaccel") {
         a.extend(["-hwaccel".into(), "auto".into()]);
     }
     a.extend(["-i".into(), input.into()]);
@@ -726,6 +731,23 @@ mod tests {
         )
         .unwrap_or_default();
         assert!(!only.iter().any(|a| a == "-headers"), "{only:?}");
+    }
+
+    /// A source's own hardware decoder (`hwaccel` in its FFmpeg options) is used only when
+    /// hardware decoding is on for this attempt: not with "Use hardware decoding" off, not after a
+    /// decoder error turned it off (the CPU retry), and not for sound alone.
+    #[test]
+    fn an_explicit_hwaccel_follows_hardware_decoding() {
+        let set =
+            |hw: bool| json!({ "input": "rtmp://x/a", "hw_decode": hw, "ffmpeg_options": "hwaccel=videotoolbox" });
+        let has = |set: &Value, parts: Parts, use_hw: bool| {
+            args(set, "tcp://127.0.0.1:9", parts, use_hw, DEFAULT_TIMEOUT).unwrap_or_default().join(" ")
+        };
+        let on = has(&set(true), BOTH, true);
+        assert!(on.contains("-hwaccel videotoolbox") && !on.contains("-hwaccel auto"), "its own wins: {on}");
+        assert!(!has(&set(false), BOTH, true).contains("hwaccel"), "setting off");
+        assert!(!has(&set(true), BOTH, false).contains("hwaccel"), "the CPU retry");
+        assert!(!has(&set(true), Parts { picture: false, sound: true }, true).contains("hwaccel"), "sound alone");
     }
 
     /// A dead server or a 404 says nothing about the decoder: hardware decoding stays on and the
