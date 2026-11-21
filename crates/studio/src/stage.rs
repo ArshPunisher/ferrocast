@@ -1627,6 +1627,31 @@ impl Stage {
         Ok(self.info_of(&it))
     }
 
+    /// Moves and sizes several items at once, each as `set_item_box` does → the items, in the
+    /// order given. All of them or none: an id that isn't there is refused before any moves, and
+    /// a failure part way puts the collection back as it was.
+    pub fn set_item_boxes(
+        &self,
+        scene: &str,
+        boxes: &[(i64, f32, f32, f32, f32)],
+    ) -> Result<Vec<ItemInfo>, StudioError> {
+        for (id, ..) in boxes {
+            self.item(scene, *id)?;
+        }
+        let before = self.snapshot();
+        let mut out = Vec::with_capacity(boxes.len());
+        for &(id, x, y, w, h) in boxes {
+            match self.set_item_box(scene, id, x, y, w, h) {
+                Ok(i) => out.push(i),
+                Err(e) => {
+                    self.restore_all(&before);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Moves and sizes an item so its picture fills `x, y, w, h` on the canvas (a drag in the
     /// preview), keeping its turn and crop.
     pub fn set_item_box(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
@@ -5932,6 +5957,44 @@ mod tests {
         ok(s.set_transform("Main", wide.id, &t));
         ok(s.set_item_box("Main", wide.id, 0.0, 0.0, 800.0, 225.0));
         assert_eq!(ok(s.transform("Main", wide.id)).bounds, "fit");
+    }
+
+    /// Several items moved and sized at once (align, distribute, a group moved or resized): all
+    /// of them or none, so one step can be undone whole.
+    #[test]
+    fn several_items_are_moved_together_or_not_at_all() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 100, "height": 100 }), false));
+        let c = ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 100, "height": 100 }), false));
+        let frames = |s: &Stage| -> Vec<[f32; 6]> {
+            let list = ok(s.items("Main"));
+            [a.id, b.id, c.id].iter().map(|id| list.iter().find(|i| i.id == *id).map(|i| i.frame).unwrap()).collect()
+        };
+        let boxes = [(a.id, 10.0, 20.0, 200.0, 100.0), (b.id, 300.0, 40.0, 50.0, 50.0), (c.id, 0.0, 0.0, 100.0, 100.0)];
+        let moved = ok(s.set_item_boxes("Main", &boxes));
+        assert_eq!(moved.iter().map(|i| i.id).collect::<Vec<_>>(), [a.id, b.id, c.id], "in the order asked");
+        assert_eq!(
+            frames(&s),
+            [
+                [200.0, 0.0, 0.0, 100.0, 10.0, 20.0],
+                [50.0, 0.0, 0.0, 50.0, 300.0, 40.0],
+                [100.0, 0.0, 0.0, 100.0, 0.0, 0.0]
+            ]
+        );
+        // One that isn't there: nothing moves, and it says which.
+        let before = s.snapshot();
+        let bad = [(a.id, 500.0, 500.0, 10.0, 10.0), (999, 0.0, 0.0, 10.0, 10.0)];
+        let err = s.set_item_boxes("Main", &bad).unwrap_err().to_string();
+        assert!(err.contains("999"), "{err}");
+        assert_eq!(s.snapshot(), before, "the first one wasn't moved either");
+        // Nothing asked, nothing done.
+        assert!(ok(s.set_item_boxes("Main", &[])).is_empty());
+        // Items of a group move with the group's map applied, as one at a time does.
+        let group = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        let inside = ok(s.set_item_boxes("Main", &[(a.id, 0.0, 0.0, 200.0, 100.0), (b.id, 400.0, 0.0, 50.0, 50.0)]));
+        assert_eq!(inside.len(), 2);
+        assert!(group.group);
     }
 
     #[test]

@@ -137,6 +137,21 @@ impl History {
                 }
                 Some(fresh(format!("Move {}", item_name(c, scene, *id)?), Some(key), !*save))
             }
+            StudioAct::SetItemBoxes { scene, items, save } => {
+                // The same ids in any order are the same drag.
+                let mut ids: Vec<i64> = items.iter().map(|b| b.id).collect();
+                ids.sort_unstable();
+                let key = ("boxes", scene.clone(), ids.iter().fold(7i64, |h, i| h.wrapping_mul(31).wrapping_add(*i)));
+                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
+                {
+                    return Some(joined(*save));
+                }
+                let label = match ids.as_slice() {
+                    [one] => format!("Move {}", item_name(c, scene, *one)?),
+                    many => format!("Move {} sources", many.len()),
+                };
+                Some(fresh(label, Some(key), !*save))
+            }
             StudioAct::SetItemCrop { scene, id, save, .. } => {
                 let key = ("crop", scene.clone(), *id);
                 // A drag's crops are one step.
@@ -401,6 +416,45 @@ mod tests {
         assert_eq!(h.list().0, ["Move Box", "Add scene Two"]);
         assert_eq!(h.undo(&c), Ok(Some("Move Box".into())));
         assert_eq!(c.transform("Main", id).map(|t| t.x).ok(), Some(0.0), "back to before the drag");
+    }
+
+    /// Moving, aligning or spacing out several items is one step however many there are, and a
+    /// drag of them is one step too; undo puts every one of them back.
+    #[test]
+    fn several_items_moved_at_once_are_one_undo_step() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        let add = |name: &str| {
+            c.add_source("Main", "color_source_v3", name, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .id
+        };
+        let (a, b, d) = (add("A"), add("B"), add("C"));
+        let x_of = |id| c.transform("Main", id).map(|t| t.x).ok();
+        let run = |h: &mut History, ids: &[i64], x: f32, save: bool| {
+            let items: Vec<ItemBoxIn> = ids.iter().map(|&id| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 }).collect();
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let boxes: Vec<_> = ids.iter().map(|&id| (id, x, 0.0, 10.0, 10.0)).collect();
+            let out: Result<Value, String> =
+                c.set_item_boxes("Main", &boxes).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        // A drag of three: its moves are one step, labelled by how many.
+        for (x, save) in [(10.0, false), (20.0, false), (30.0, true)] {
+            run(&mut h, &[a, b, d], x, save);
+        }
+        assert_eq!(h.list().0, ["Move 3 sources"]);
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(30.0); 3]);
+        assert_eq!(h.undo(&c), Ok(Some("Move 3 sources".into())));
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(0.0); 3], "all three back");
+        assert_eq!(h.redo(&c), Ok(Some("Move 3 sources".into())));
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(30.0); 3]);
+        // Two of them is its own step; one alone reads as moving that one.
+        run(&mut h, &[a, b], 50.0, true);
+        run(&mut h, &[d], 60.0, true);
+        assert_eq!(h.list().0, ["Move C", "Move 2 sources", "Move 3 sources"]);
     }
 
     /// Owner's check, 11 Nov: edits to a group's sources, and moving a source in or out of a

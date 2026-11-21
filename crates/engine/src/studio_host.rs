@@ -1417,6 +1417,31 @@ pub struct ItemTarget {
     pub id: i64,
 }
 
+/// The most boxes one `SetItemBoxes` takes.
+pub const MAX_BOXES: usize = 500;
+
+/// One item's box in a batch (`SetItemBoxes`): its first corner and its sides, canvas pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct ItemBoxIn {
+    pub id: i64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// A box a preview edit sends: numbers on the canvas, sides of at least a pixel.
+fn check_box(x: f32, y: f32, w: f32, h: f32) -> Result<(), EngineError> {
+    const MAX: f32 = 100_000.0;
+    if ![x, y, w, h].iter().all(|v| v.is_finite() && v.abs() <= MAX) {
+        return Err(EngineError::Invalid("x, y, w, h: numbers from -100000 to 100000.".into()));
+    }
+    if w < 1.0 || h < 1.0 {
+        return Err(EngineError::Invalid("w, h: at least 1 pixel.".into()));
+    }
+    Ok(())
+}
+
 /// One thing to do to the scene collection. The routes build these; [`StudioAct::check`]
 /// refuses bad input before the host sees it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1630,6 +1655,15 @@ pub enum StudioAct {
         y: f32,
         w: f32,
         h: f32,
+        #[serde(default)]
+        save: bool,
+    },
+    /// Moves and sizes several items at once, each as `SetItemBox` does: aligning, spacing out, or
+    /// moving and resizing a group of picked items, as one undo step → the items, in the order
+    /// given. All of them or none. `save` at the end of a drag.
+    SetItemBoxes {
+        scene: String,
+        items: Vec<ItemBoxIn>,
         #[serde(default)]
         save: bool,
     },
@@ -1993,16 +2027,22 @@ impl StudioAct {
                 }
                 Ok(())
             }
-            A::SetItemBox { scene, x, y, w, h, .. } => {
+            A::SetItemBoxes { scene, items, .. } => {
                 check_source_name(scene)?;
-                const MAX: f32 = 100_000.0;
-                if ![*x, *y, *w, *h].iter().all(|v| v.is_finite() && v.abs() <= MAX) {
-                    return Err(EngineError::Invalid("x, y, w, h: numbers from -100000 to 100000.".into()));
+                if items.is_empty() || items.len() > MAX_BOXES {
+                    return Err(EngineError::Invalid(format!("items: 1 to {MAX_BOXES} boxes.")));
                 }
-                if *w < 1.0 || *h < 1.0 {
-                    return Err(EngineError::Invalid("w, h: at least 1 pixel.".into()));
+                for (n, b) in items.iter().enumerate() {
+                    if items[..n].iter().any(|o| o.id == b.id) {
+                        return Err(EngineError::Invalid(format!("items: item {} twice.", b.id)));
+                    }
+                    check_box(b.x, b.y, b.w, b.h)?;
                 }
                 Ok(())
+            }
+            A::SetItemBox { scene, x, y, w, h, .. } => {
+                check_source_name(scene)?;
+                check_box(*x, *y, *w, *h)
             }
             A::Transform { scene, .. } => check_source_name(scene),
             A::Undo | A::Redo | A::History | A::StudioMode { .. } | A::SetStudioOptions { .. } => Ok(()),
@@ -2145,8 +2185,10 @@ impl StudioAct {
     /// It changes the collection (the host saves it after).
     pub fn changes(&self) -> bool {
         use StudioAct as A;
-        if let A::SetItemBox { save: last, .. } | A::SetItemCrop { save: last, .. } | A::TBar { release: last, .. } =
-            self
+        if let A::SetItemBox { save: last, .. }
+        | A::SetItemBoxes { save: last, .. }
+        | A::SetItemCrop { save: last, .. }
+        | A::TBar { release: last, .. } = self
         {
             return *last;
         }
@@ -3777,6 +3819,22 @@ mod tests {
         ] {
             assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
         }
+        // Several boxes at once: one act, checked as a whole.
+        let one = |id, x| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 };
+        let many = |items: Vec<ItemBoxIn>, save| StudioAct::SetItemBoxes { scene: "Main".into(), items, save };
+        assert!(!many(vec![one(3, 0.0)], false).changes());
+        assert!(many(vec![one(3, 0.0)], true).changes());
+        e.studio_act(many(vec![one(3, 1.0), one(4, 2.0)], true)).await.unwrap();
+        for bad in [
+            many(vec![], true),
+            many((0..=MAX_BOXES as i64).map(|i| one(i, 0.0)).collect(), true),
+            many(vec![one(3, 0.0), one(3, 5.0)], true),
+            many(vec![one(3, f32::NAN)], true),
+            many(vec![ItemBoxIn { w: 0.5, ..one(3, 0.0) }], true),
+            StudioAct::SetItemBoxes { scene: String::new(), items: vec![one(3, 0.0)], save: true },
+        ] {
+            assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
         let pick =
             StudioAct::Select { scene: Some("Main".into()), id: Some(3), frames: false, also: vec![4], guides: false };
         assert!(!pick.changes());
@@ -3793,7 +3851,7 @@ mod tests {
         e.studio_act(StudioAct::Select { scene: None, id: None, frames: false, also: vec![], guides: false })
             .await
             .unwrap();
-        assert_eq!(fake.acts.lock().unwrap().len(), 4);
+        assert_eq!(fake.acts.lock().unwrap().len(), 5);
 
         // OBS's filter strings become dialog filters; "any file" is left to the dialog.
         let f = FilePick {
