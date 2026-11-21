@@ -195,6 +195,8 @@ const FIXED: &[&str] = &[
     "/queue/pause",
     "/queue/resume",
     "/queue/skip",
+    "/queue/mute",
+    "/queue/unmute",
     "/obs/scene",
     "/mod/ban",
     "/mod/unban",
@@ -496,5 +498,14 @@ mod tests {
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"notice","data":{"key":"account:twitch"}}"#));
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"queue","data":{}}"#));
         assert!(!live_frame_allowed(Role::Mod, "not json"));
+    }
+
+    #[test]
+    fn mute_is_an_owner_route_named_in_the_audit_and_never_a_mods() {
+        assert!(allowed(Role::Owner, "POST", "/queue/mute"));
+        assert!(allowed(Role::Owner, "POST", "/queue/unmute"));
+        assert!(!allowed(Role::Mod, "POST", "/queue/mute"));
+        assert_eq!(action("POST", "/queue/mute", false), "POST /queue/mute");
+        assert_eq!(action("POST", "/queue/unmute", false), "POST /queue/unmute");
     }
 }

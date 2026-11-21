@@ -69,6 +69,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/queue/pause", post(core::queue_pause))
         .route("/queue/resume", post(core::queue_resume))
         .route("/queue/skip", post(core::queue_skip))
+        .route("/queue/mute", post(core::queue_mute))
+        .route("/queue/unmute", post(core::queue_unmute))
         .route("/queue/clear", post(core::queue_clear))
         .route("/queue/{alert_id}/remove", post(core::queue_remove))
         .route("/events", get(core::events))

@@ -156,12 +156,12 @@ PUT `/overlays/{id}` can't change `design`. `design.follows` (set by the engine)
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/v1/alert-rules` | → `AlertRule[]` (see `core::alert`) |
-| PUT | `/api/v1/alert-rules/{id}` | `AlertRule` → `AlertRule` (400 with the validation message) |
+| PUT | `/api/v1/alert-rules/{id}` | `AlertRule` → `AlertRule` (400 with the validation message). `AlertRule.interrupt` (bool, default false): a new alert from this rule ends the one playing (a `hide`, then the new `show` at once, no gap) and goes to the front; while the queue is paused it just waits. `Variation.weight` (0 to 1000, default 1; 400 `variation 'x': weight must be 0 to 1000`): among the matching conditional looks of the highest priority one is picked by weight (a 0 is never picked while another has a weight; all 0 = equal chances); the default look only when no conditional one matches |
 | POST | `/api/v1/alert-rules` | `AlertRule` → `AlertRule` |
 | DELETE | `/api/v1/alert-rules/{id}` | → 204 |
 | POST | `/api/v1/test` | `{ kind, platform?, design_id?, amount? }` → 202 `{ ok: true }` (fires a `test` event through the real pipeline). `amount` (major units; bits, gifted subs, raid viewers or sub months for those kinds; above 0, up to 1,000,000,000) changes the sample's amount, else 400 `amount: …`. `design_id` shows it with that alert design instead of the one in use (the designer's "Send test alert"); 404 when unknown, 400 when it isn't an alert design |
-| GET | `/api/v1/queue` | → `{ paused, playing: { alert, started_at } \| null, waiting: { alert, priority, enqueued_at }[] }` |
-| POST | `/api/v1/queue/pause` · `/resume` · `/skip` · `/clear` | → queue |
+| GET | `/api/v1/queue` | → `{ paused, muted, playing: { alert, started_at } \| null, waiting: { alert, priority, enqueued_at }[] }`. `paused` and `muted` are saved with the queue and survive a restart |
+| POST | `/api/v1/queue/pause` · `/resume` · `/skip` · `/clear` · `/mute` · `/unmute` | → queue. Pause: waiting alerts keep waiting and nothing new starts (the one playing finishes). Skip: ends the playing alert now and the next waiting one starts after the gap (nothing playing is a no-op, still 200; each call skips one alert). Mute: alerts that start from now on show without their sound or speech (`sound`, `tts_text` and `tts_audio` are null in the `alert` frame); the one already playing is not cut. Pause, resume, mute and unmute are idempotent. |
 | POST | `/api/v1/queue/{alert_id}/remove` | → queue |
 | POST | `/api/v1/events/{event_id}/replay` | → `{ event_id }` |
 | GET | `/api/v1/events?before=<seq>&limit=50&kinds=follow,tip` | → `{ events: Event[], next_before: number \| null }` |

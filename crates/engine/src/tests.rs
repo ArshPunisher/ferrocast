@@ -1875,3 +1875,91 @@ async fn a_failed_background_save_gives_one_notice_and_a_later_success_replaces_
     assert_eq!(back[0]["key"], failed[0]["key"]);
     assert_eq!(back[0]["level"], "info");
 }
+
+#[tokio::test]
+async fn mute_and_pause_show_in_the_queue_and_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
+        assert!(!e.queue().await.muted);
+        let v = e.queue_set_muted(true).await;
+        assert!(v.muted && !v.paused);
+        e.queue_pause().await;
+    }
+    let e = Engine::start_with_secrets(dir.path(), mem()).await.unwrap();
+    let q = e.queue().await;
+    assert!(q.muted && q.paused);
+    assert!(!e.queue_set_muted(false).await.muted);
+}
+
+#[tokio::test]
+async fn a_muted_alert_reaches_the_overlay_without_sound() {
+    let (e, _d) = engine().await;
+    e.queue_set_muted(true).await;
+    e.test("follow", None).await.unwrap();
+    let mut shown = None;
+    for _ in 0..300 {
+        shown = e.queue().await.playing;
+        if shown.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let a = shown.expect("the alert started").alert;
+    assert!(a.sound.is_none() && a.tts_text.is_none() && a.tts_audio.is_none());
+}
+
+async fn playing_id(e: &Engine) -> Option<String> {
+    e.queue().await.playing.map(|p| p.alert.alert_id)
+}
+
+#[tokio::test]
+async fn an_interrupting_rule_replaces_the_playing_alert_and_others_queue() {
+    let (e, _d) = engine().await;
+    let mut rule = e.rules().into_iter().find(|r| r.kinds.iter().any(|k| k == "follow")).unwrap();
+    rule.interrupt = true;
+    e.save_rule(rule).await.unwrap();
+    e.test("follow", None).await.unwrap();
+    let mut first = None;
+    for _ in 0..300 {
+        first = playing_id(&e).await;
+        if first.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let first = first.expect("first alert started");
+    e.test("follow", None).await.unwrap();
+    for _ in 0..300 {
+        if playing_id(&e).await.is_some_and(|id| id != first) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_ne!(playing_id(&e).await.as_deref(), Some(first.as_str()), "the new follow ended the old one");
+    assert!(e.queue().await.waiting.is_empty());
+    // A raid has no interrupting rule: it waits behind the playing follow.
+    e.test("raid", None).await.unwrap();
+    for _ in 0..300 {
+        if !e.queue().await.waiting.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(e.queue().await.waiting.len(), 1);
+}
+
+#[tokio::test]
+async fn a_rule_without_interrupt_queues_behind_the_playing_alert() {
+    let (e, _d) = engine().await;
+    e.test("follow", None).await.unwrap();
+    e.test("follow", None).await.unwrap();
+    for _ in 0..300 {
+        let q = e.queue().await;
+        if q.playing.is_some() && q.waiting.len() == 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the second follow never queued");
+}

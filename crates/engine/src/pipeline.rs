@@ -495,7 +495,7 @@ impl Engine {
                 alert.tts_text = None;
             }
             let priority = if e.origin == Origin::Test { 0 } else { variation.priority };
-            self.enqueue_alert(alert, priority).await;
+            self.enqueue_alert(alert, priority, rule.interrupt).await;
             alerted = true;
         } else {
             reasons.push(format!(
