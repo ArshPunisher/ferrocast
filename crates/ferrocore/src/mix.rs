@@ -762,6 +762,9 @@ struct Scratch {
 /// How many given-back blocks are kept (the most a mix ahead of its reader needs, a second's).
 const MAX_POOL: usize = 64;
 
+/// Blocks made when the mixer is (a mix in steady state needs a dozen or so in flight).
+const PREFILL_POOL: usize = 32;
+
 /// Low latency sound: where the wait starts, and the most it waits beyond a filter's delay.
 const LOW_FLOOR_NS: u64 = 20_000_000;
 const LOW_CAP_NS: u64 = 60_000_000;
@@ -903,7 +906,8 @@ impl Mixer {
             key_bufs: Vec::new(),
             broken_cycles: Vec::new(),
             plan_scratch: PlanScratch::default(),
-            pool: Vec::new(),
+            // Made now, not on the first blocks: a block the pool lacks is allocated mid-mix.
+            pool: Self::prefilled_pool(),
             allocated: 0,
         }
     }
@@ -1022,9 +1026,19 @@ impl Mixer {
             }
             None => {
                 self.allocated += 1;
-                Block { ts_ns, tracks: vec![vec![0f32; BLOCK * 2]; TRACKS], monitor: vec![0f32; BLOCK * 2] }
+                Self::new_block(ts_ns)
             }
         }
+    }
+
+    fn prefilled_pool() -> Vec<Block> {
+        let mut pool = Vec::with_capacity(MAX_POOL);
+        pool.extend((0..PREFILL_POOL).map(|_| Self::new_block(0)));
+        pool
+    }
+
+    fn new_block(ts_ns: u64) -> Block {
+        Block { ts_ns, tracks: vec![vec![0f32; BLOCK * 2]; TRACKS], monitor: vec![0f32; BLOCK * 2] }
     }
 
     /// Tells the mixer which output device monitoring currently plays on (`None` when off or
@@ -1156,7 +1170,9 @@ impl Mixer {
                         settings,
                         output_capture: None,
                         active: true,
-                        queue: VecDeque::new(),
+                        // Room for a second of stereo: a stall that lets sound pile up must not grow it
+                        // mid-mix (the mixer's cap on waiting is a second).
+                        queue: VecDeque::with_capacity(self.rate as usize * 2),
                         start_ns: None,
                         resampler: None,
                         filters: Vec::new(),
@@ -1171,7 +1187,7 @@ impl Mixer {
                         ptm_hold: 0,
                         gated: false,
                         levels: Levels::default(),
-                        recent: VecDeque::new(),
+                        recent: VecDeque::with_capacity(METER_BLOCKS + 1),
                         tp: [[0.0; TP_TAPS]; 2],
                         adjust_ns: 0,
                         offset_ns: None,
@@ -3534,6 +3550,9 @@ mod steady_state_tests {
     #[test]
     fn blocks_not_given_back_are_simply_made_new() {
         let mut m = Mixer::new(48_000, 0);
+        // A new mixer holds blocks made ahead; none here, so each one is made new.
+        assert_eq!(m.pool.len(), PREFILL_POOL);
+        m.pool.clear();
         m.set(1, SourceSettings::default());
         let _ = m.mix_until(1_000_000_000);
         m.push(1, &[0.5; 2 * 4800], 2, 48_000, 1_000_000_000);
