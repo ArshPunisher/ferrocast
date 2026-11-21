@@ -123,8 +123,221 @@ pub enum OverlayError {
     Transform(String),
     #[error("layer '{id}': {message}")]
     Layer { id: String, message: String },
+    #[error("label '{id}': {message}")]
+    Label { id: String, message: String },
     #[error("widget '{id}': {message}")]
     Style { id: String, message: String },
+}
+
+/// Supported stream label data sources (local only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LabelSource {
+    LatestFollower,
+    LatestSub,
+    LatestGifter,
+    LatestTip,
+    LatestBits,
+    LatestRaid,
+    SessionFollows,
+    SessionSubs,
+    SessionBits,
+    SessionTips,
+    SessionRaids,
+    TopTipSession,
+    TopSupporterSession,
+    MonthlyFollows,
+    MonthlySubs,
+    MonthlyBits,
+    MonthlyTips,
+    MonthlyRaids,
+    TopTipMonthly,
+    TopSupporterMonthly,
+    AlltimeFollows,
+    AlltimeSubs,
+    AlltimeBits,
+    AlltimeTips,
+    AlltimeRaids,
+    TopTipAlltime,
+    TopSupporterAlltime,
+    #[serde(alias = "combo_train")]
+    HypeTrain,
+}
+
+impl LabelSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LabelSource::LatestFollower => "latest_follower",
+            LabelSource::LatestSub => "latest_sub",
+            LabelSource::LatestGifter => "latest_gifter",
+            LabelSource::LatestTip => "latest_tip",
+            LabelSource::LatestBits => "latest_bits",
+            LabelSource::LatestRaid => "latest_raid",
+            LabelSource::SessionFollows => "session_follows",
+            LabelSource::SessionSubs => "session_subs",
+            LabelSource::SessionBits => "session_bits",
+            LabelSource::SessionTips => "session_tips",
+            LabelSource::SessionRaids => "session_raids",
+            LabelSource::TopTipSession => "top_tip_session",
+            LabelSource::TopSupporterSession => "top_supporter_session",
+            LabelSource::MonthlyFollows => "monthly_follows",
+            LabelSource::MonthlySubs => "monthly_subs",
+            LabelSource::MonthlyBits => "monthly_bits",
+            LabelSource::MonthlyTips => "monthly_tips",
+            LabelSource::MonthlyRaids => "monthly_raids",
+            LabelSource::TopTipMonthly => "top_tip_monthly",
+            LabelSource::TopSupporterMonthly => "top_supporter_monthly",
+            LabelSource::AlltimeFollows => "alltime_follows",
+            LabelSource::AlltimeSubs => "alltime_subs",
+            LabelSource::AlltimeBits => "alltime_bits",
+            LabelSource::AlltimeTips => "alltime_tips",
+            LabelSource::AlltimeRaids => "alltime_raids",
+            LabelSource::TopTipAlltime => "top_tip_alltime",
+            LabelSource::TopSupporterAlltime => "top_supporter_alltime",
+            LabelSource::HypeTrain => "hype_train",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "latest_follower" => Some(Self::LatestFollower),
+            "latest_sub" => Some(Self::LatestSub),
+            "latest_gifter" => Some(Self::LatestGifter),
+            "latest_tip" => Some(Self::LatestTip),
+            "latest_bits" => Some(Self::LatestBits),
+            "latest_raid" => Some(Self::LatestRaid),
+            "session_follows" => Some(Self::SessionFollows),
+            "session_subs" => Some(Self::SessionSubs),
+            "session_bits" => Some(Self::SessionBits),
+            "session_tips" => Some(Self::SessionTips),
+            "session_raids" => Some(Self::SessionRaids),
+            "top_tip_session" => Some(Self::TopTipSession),
+            "top_supporter_session" => Some(Self::TopSupporterSession),
+            "monthly_follows" => Some(Self::MonthlyFollows),
+            "monthly_subs" => Some(Self::MonthlySubs),
+            "monthly_bits" => Some(Self::MonthlyBits),
+            "monthly_tips" => Some(Self::MonthlyTips),
+            "monthly_raids" => Some(Self::MonthlyRaids),
+            "top_tip_monthly" => Some(Self::TopTipMonthly),
+            "top_supporter_monthly" => Some(Self::TopSupporterMonthly),
+            "alltime_follows" => Some(Self::AlltimeFollows),
+            "alltime_subs" => Some(Self::AlltimeSubs),
+            "alltime_bits" => Some(Self::AlltimeBits),
+            "alltime_tips" => Some(Self::AlltimeTips),
+            "alltime_raids" => Some(Self::AlltimeRaids),
+            "top_tip_alltime" => Some(Self::TopTipAlltime),
+            "top_supporter_alltime" => Some(Self::TopSupporterAlltime),
+            "hype_train" | "combo_train" => Some(Self::HypeTrain),
+            _ => None,
+        }
+    }
+
+    pub fn is_train(self) -> bool {
+        matches!(self, Self::HypeTrain)
+    }
+
+    pub fn is_monthly(self) -> bool {
+        matches!(
+            self,
+            Self::MonthlyFollows
+                | Self::MonthlySubs
+                | Self::MonthlyBits
+                | Self::MonthlyTips
+                | Self::MonthlyRaids
+                | Self::TopTipMonthly
+                | Self::TopSupporterMonthly
+        )
+    }
+}
+
+fn default_label_template() -> String {
+    "{value}".into()
+}
+fn default_label_theme() -> String {
+    "molten".into()
+}
+fn default_train_window_s() -> u32 {
+    120
+}
+fn default_train_step_s() -> u32 {
+    15
+}
+fn default_train_max_s() -> u32 {
+    300
+}
+fn default_train_threshold() -> u32 {
+    3
+}
+
+/// Typed options for a `WidgetKind::Label` widget config JSON object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelOptions {
+    pub source: LabelSource,
+    #[serde(default = "default_label_template")]
+    pub template: String,
+    #[serde(default = "default_label_theme")]
+    pub theme: String,
+    #[serde(default)]
+    pub timezone_offset_min: i32,
+    #[serde(default = "default_train_window_s")]
+    pub train_window_s: u32,
+    #[serde(default = "default_train_step_s")]
+    pub train_step_s: u32,
+    #[serde(default = "default_train_max_s")]
+    pub train_max_s: u32,
+    #[serde(default = "default_train_threshold")]
+    pub train_threshold: u32,
+}
+
+/// Validates a `WidgetKind::Label` config object and parses its typed [`LabelOptions`].
+pub fn validate_label(config: &Value) -> Result<LabelOptions, String> {
+    let Some(obj) = config.as_object() else {
+        return Err("config: must be an object.".into());
+    };
+    let Some(raw_src) = obj.get("source").and_then(Value::as_str) else {
+        return Err("config.source: pick a label source.".into());
+    };
+    if LabelSource::parse(raw_src).is_none() {
+        return Err(format!("config.source: unknown label source '{raw_src}'."));
+    }
+    if let Some(t) = obj.get("template") {
+        let Some(s) = t.as_str() else {
+            return Err("config.template: must be text.".into());
+        };
+        if s.chars().count() > 240 {
+            return Err("config.template: can be up to 240 characters.".into());
+        }
+        crate::template::Template::parse(s).map_err(|e| format!("config.template: {e}."))?;
+    }
+    if let Some(theme) = obj.get("theme") {
+        let Some(t) = theme.as_str() else {
+            return Err("config.theme: must be text.".into());
+        };
+        if t.is_empty() || t.len() > 40 || !t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')) {
+            return Err("config.theme: use a valid theme id.".into());
+        }
+    }
+    let opts: LabelOptions =
+        serde_json::from_value(config.clone()).map_err(|e| format!("config: invalid label options ({e})."))?;
+    if !(-720..=840).contains(&opts.timezone_offset_min) {
+        return Err("config.timezone_offset_min: must be -720 to 840 minutes.".into());
+    }
+    if !(10..=3600).contains(&opts.train_window_s) {
+        return Err("config.train_window_s: must be 10 to 3600 seconds.".into());
+    }
+    if !(1..=600).contains(&opts.train_step_s) {
+        return Err("config.train_step_s: must be 1 to 600 seconds.".into());
+    }
+    if !(10..=7200).contains(&opts.train_max_s) {
+        return Err("config.train_max_s: must be 10 to 7200 seconds.".into());
+    }
+    if opts.train_max_s < opts.train_window_s {
+        return Err("config.train_max_s: must be at least train_window_s.".into());
+    }
+    if !(1..=50).contains(&opts.train_threshold) {
+        return Err("config.train_threshold: must be 1 to 50 events.".into());
+    }
+    Ok(opts)
 }
 
 pub const MAX_WIDGETS: usize = 40;
@@ -168,9 +381,14 @@ impl Overlay {
             if w.kind == WidgetKind::Layer {
                 crate::layer::validate(&w.config)
                     .map_err(|message| OverlayError::Layer { id: w.id.clone(), message })?;
-            } else if let Some(style) = w.config.get("style") {
-                crate::layer::validate_widget_style(style)
-                    .map_err(|message| OverlayError::Style { id: w.id.clone(), message })?;
+            } else {
+                if w.kind == WidgetKind::Label {
+                    validate_label(&w.config).map_err(|message| OverlayError::Label { id: w.id.clone(), message })?;
+                }
+                if let Some(style) = w.config.get("style") {
+                    crate::layer::validate_widget_style(style)
+                        .map_err(|message| OverlayError::Style { id: w.id.clone(), message })?;
+                }
             }
         }
         if let Some(d) = &self.design
@@ -299,5 +517,38 @@ mod tests {
         let many: Vec<Widget> =
             (0..41).map(|i| Widget::new(&i.to_string(), WidgetKind::Label, (0, 0, 10, 10), json!({}))).collect();
         assert!(matches!(overlay(many).validate(), Err(OverlayError::TooManyWidgets(_))));
+    }
+
+    #[test]
+    fn validates_label_sources_templates_and_train_bounds() {
+        let mut o = overlay(vec![Widget::new(
+            "lbl",
+            WidgetKind::Label,
+            (10, 10, 420, 64),
+            json!({
+                "source": "hype_train",
+                "template": "Hype {value}",
+                "theme": "molten",
+                "train_window_s": 120,
+                "train_step_s": 15,
+                "train_max_s": 300,
+                "train_threshold": 3,
+                "timezone_offset_min": 330
+            }),
+        )]);
+        assert!(o.validate().is_ok());
+
+        for bad in [
+            json!({}),
+            json!({ "source": "cloud_unknown" }),
+            json!({ "source": "monthly_tips", "template": "{unclosed" }),
+            json!({ "source": "hype_train", "train_window_s": 5 }),
+            json!({ "source": "hype_train", "train_window_s": 120, "train_max_s": 60 }),
+            json!({ "source": "hype_train", "train_threshold": 0 }),
+            json!({ "source": "monthly_subs", "timezone_offset_min": 900 }),
+        ] {
+            o.widgets[0].config = bad;
+            assert!(matches!(o.validate(), Err(OverlayError::Label { .. })), "should fail: {}", o.widgets[0].config);
+        }
     }
 }
