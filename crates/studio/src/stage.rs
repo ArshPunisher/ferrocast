@@ -1286,7 +1286,6 @@ impl Stage {
         let doc = own::engine_doc(&doc);
         let vertical = self.vertical_order();
         let sources: &[Value] = doc["sources"].as_array().map_or(&[], Vec::as_slice);
-        let scene = |name: &str| sources.iter().find(|s| name_of(s) == name && is_scene(s));
         fn walk(sources: &[Value], scene: &Value, depth: u32) -> bool {
             let items = scene.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten();
             for it in items {
@@ -6065,7 +6064,7 @@ mod tests {
         };
         let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 50, "height": 50 }), false));
         let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 50, "height": 50 }), false));
-        let c = ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 50, "height": 50 }), false));
+        ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 50, "height": 50 }), false));
         // A recording-only group: both of its sources go on being recording-only.
         let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
         ok(s.edit_item("Main", g.id, ItemEdit::RecordingOnly));
@@ -6123,10 +6122,10 @@ mod tests {
 
         // Studio Mode: what is on air is a copy of the scene's items; resetting the preview's
         // item to both doesn't change the copy, which still carries the flag.
-        let c = ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 50, "height": 50 }), false));
-        ok(s.edit_item("Main", c.id, ItemEdit::RecordingOnly));
+        let c = ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 50, "height": 50 }), false)).id;
+        ok(s.edit_item("Main", c, ItemEdit::RecordingOnly));
         s.set_studio_mode(true);
-        ok(s.edit_item("Main", c.id, ItemEdit::StreamAndRecording));
+        ok(s.edit_item("Main", c, ItemEdit::StreamAndRecording));
         assert!(s.has_selective_items(), "the copy on air still has a recording-only source");
         s.set_studio_mode(false);
         assert!(!s.has_selective_items(), "and with Studio Mode off, it's gone");
