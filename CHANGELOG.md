@@ -5,6 +5,31 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.5.0
+
+Smoother video, a stream that warns you before viewers notice, and many OBS features.
+
+- **Smoother video**: frames go straight to the encoder with no copy, and sound is encoded on
+  its own thread, so a busy computer no longer makes the picture stutter. In our tests late
+  frames fell from about 230 to 8 per 6 minutes, and recordings hold 60 fps.
+- **Warnings while you're live**: Ferrocast tells you when you're talking but your mic is
+  muted (with Unmute and "Muted on purpose"), when your voice is very quiet (with +6 dB), when a
+  mic gives no sound, and when viewers see a black screen. The same checks run before you go
+  live. A capture card's sound is never mistaken for your mic.
+- **Cleaner sound**: "Remove background noise" now uses RNNoise, light and with almost no
+  delay; "Strong noise removal" removes more. No more clicks when you turn noise removal on or
+  off, and a loud mic no longer distorts it.
+- **Vertical**: a camera in the vertical picture can have its own filters, and new shortcuts
+  show or hide the vertical picture and take a vertical screenshot.
+- **From OBS**: push-to-talk and push-to-mute, Video Delay, obs-websocket for Stream Deck and
+  Touch Portal (off until you turn it on, with a password), a Mac menu bar, more shortcuts
+  (several keys per action), projector options, preview lock and zoom with safe-area guides,
+  text size, row spacing and colour-blind meter colours.
+- **Safer quitting**: quitting while live or recording always asks first, also from the Dock.
+- **Fixes**: "A show is already running" can't get stuck, a stream can't stay on Be right back
+  after the computer sleeps, a stream delay no longer makes platforms reconnect, and YouTube
+  uses the right stream key.
+
 ## 3.4.0
 
 Stream and record 4K60 at once, steadier sound, and a Windows app that never freezes.
