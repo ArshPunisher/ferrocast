@@ -1091,8 +1091,16 @@ impl ferrocast_engine::studio_host::StudioHost for PausedHost {
         Ok(json!({}))
     }
     async fn act(&self, act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
+        use ferrocast_engine::studio_host::StudioAct as A;
+        let out = match &act {
+            A::CopySource { .. } => json!({ "item": { "name": "Cam" }, "sources": [{ "name": "Cam" }] }),
+            A::CopyFilters { name, .. } => json!({ "filters": [{ "name": "Gate" }], "from": name }),
+            A::PasteSource { .. } => json!({ "item": { "id": 9 }, "notes": ["a note"] }),
+            A::PasteFilterClip { .. } => json!({ "notes": [] }),
+            _ => Value::Null,
+        };
         self.acts.lock().unwrap().push(act);
-        Ok(Value::Null)
+        Ok(out)
     }
     async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
         ferrocast_engine::studio_host::StudioSettings::default()
@@ -1161,4 +1169,70 @@ async fn performance_mode_pauses_the_preview_and_says_so_without_the_desktop_app
     assert!(host.paused.load(std::sync::atomic::Ordering::SeqCst));
     // It never touched the scenes, the stream or a recording.
     assert!(host.acts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn copy_and_paste_over_the_api_with_every_error() {
+    let r = start().await;
+    // Nothing copied: a typed 404 with what to do, with or without the desktop app.
+    let res = r.get("/studio/engine/clipboard").await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "clipboard_empty", "{v}");
+    assert!(v["error"]["hint"].as_str().is_some_and(|h| h.contains("Copy")), "{v}");
+    for res in [
+        r.post("/studio/engine/clipboard/source", json!({ "scene": "Main", "id": 1 })).await,
+        r.post("/studio/engine/clipboard/filters", json!({ "name": "Mic" })).await,
+    ] {
+        assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
+    }
+    assert_eq!(
+        code(r.post("/studio/engine/clipboard/paste/source", json!({ "scene": "Main" })).await).await,
+        (StatusCode::NOT_FOUND, "clipboard_empty".into()),
+        "an empty clipboard is its own 404, before the app is asked"
+    );
+    let host = Arc::new(PausedHost::default());
+    r.engine.set_studio_host(host.clone());
+    // Bodies that aren't what the route takes: 400, nothing copied.
+    for (path, bad) in [
+        ("/studio/engine/clipboard/source", json!({})),
+        ("/studio/engine/clipboard/source", json!({ "scene": "Main", "id": "one" })),
+        ("/studio/engine/clipboard/filters", json!({ "name": 3 })),
+        ("/studio/engine/clipboard/paste/source", json!({})),
+    ] {
+        assert!(r.post(path, bad.clone()).await.status().is_client_error(), "{path} {bad}");
+    }
+    assert_eq!(
+        code(r.post("/studio/engine/clipboard/source", json!({ "scene": "", "id": 1 })).await).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    // Copy a source, read it back, paste it twice.
+    let (s, v) = body(r.post("/studio/engine/clipboard/source", json!({ "scene": "Main", "id": 1 })).await).await;
+    assert_eq!((s, v["kind"].as_str(), v["count"].as_u64()), (StatusCode::OK, Some("source"), Some(1)), "{v}");
+    let (s, v) = body(r.get("/studio/engine/clipboard").await).await;
+    assert_eq!((s, v["name"].as_str()), (StatusCode::OK, Some("Cam")), "{v}");
+    for _ in 0..2 {
+        let (s, v) = body(r.post("/studio/engine/clipboard/paste/source", json!({ "scene": "Two" })).await).await;
+        assert_eq!((s, v["notes"][0].as_str()), (StatusCode::OK, Some("a note")), "{v}");
+    }
+    // Filters in the clipboard are not a source: a 400 that says so.
+    let (s, v) = body(r.post("/studio/engine/clipboard/filters", json!({ "name": "Mic" })).await).await;
+    assert_eq!((s, v["kind"].as_str()), (StatusCode::OK, Some("filters")), "{v}");
+    let res = r.post("/studio/engine/clipboard/paste/source", json!({ "scene": "Two" })).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let (s, v) = body(
+        r.post("/studio/engine/clipboard/paste/filters", json!({ "name": "", "item": { "scene": "Main", "id": 2 } }))
+            .await,
+    )
+    .await;
+    assert_eq!((s, v["notes"].is_array()), (StatusCode::OK, true), "{v}");
+    // Clearing empties it (twice is fine); a session is needed for all of it.
+    for _ in 0..2 {
+        assert_eq!(r.delete("/studio/engine/clipboard").await.status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(r.get("/studio/engine/clipboard").await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        r.client.get(format!("{}/api/v1/studio/engine/clipboard", r.base)).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
 }

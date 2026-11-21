@@ -170,6 +170,18 @@ impl History {
                 Some(fresh(format!("Ungroup {}", item_name(c, scene, *id)?), None, false))
             }
             StudioAct::PasteCopy { name, .. } => Some(fresh(format!("Paste a copy of {name}"), None, false)),
+            StudioAct::PasteSource { clip, .. } => {
+                let name = clip.pointer("/sources/0/name").and_then(|n| n.as_str()).unwrap_or("source");
+                Some(fresh(format!("Paste {name}"), None, false))
+            }
+            StudioAct::PasteFilterClip { name, item, clip } => {
+                let from = clip.get("from").and_then(|n| n.as_str()).unwrap_or("a source");
+                let to = match item {
+                    Some(it) => item_name(c, &it.scene, it.id).unwrap_or_else(|| it.scene.clone()),
+                    None => name.clone(),
+                };
+                Some(fresh(format!("Paste filters from {from} to {to}"), None, false))
+            }
             StudioAct::AddExisting { name, .. } => Some(fresh(format!("Add {name}"), None, false)),
             StudioAct::SetItemTransition { scene, id, show, .. } => {
                 let what = if *show { "Show" } else { "Hide" };

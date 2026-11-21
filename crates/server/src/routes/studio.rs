@@ -54,6 +54,11 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/preview/selection", put(engine_select))
         .route("/studio/engine/preview/cursor", put(engine_cursor))
         .route("/studio/engine/preview/pause", get(engine_preview_paused).put(engine_set_preview_paused))
+        .route("/studio/engine/clipboard", get(engine_clipboard).delete(engine_clipboard_clear))
+        .route("/studio/engine/clipboard/source", post(engine_copy_source))
+        .route("/studio/engine/clipboard/filters", post(engine_copy_filters))
+        .route("/studio/engine/clipboard/paste/source", post(engine_paste_source))
+        .route("/studio/engine/clipboard/paste/filters", post(engine_paste_filters_clip))
         .route("/studio/engine/studio-mode", put(engine_studio_mode))
         .route("/studio/engine/studio-mode/preview", put(engine_set_preview))
         .route("/studio/engine/studio-mode/transition", post(engine_transition_now))
@@ -1249,6 +1254,54 @@ async fn engine_remove_item_filter(
     Path((scene, id, filter)): Path<(String, i64, String)>,
 ) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::RemoveFilter { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await
+}
+
+/// `GET /studio/engine/clipboard` → what is copied (`{ kind, name, from, count }`); 404
+/// `clipboard_empty` when nothing is.
+async fn engine_clipboard(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_clipboard()?))
+}
+
+async fn engine_clipboard_clear(State(app): State<AppState>) -> StatusCode {
+    app.engine.studio_clipboard_clear();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct CopySourceBody {
+    scene: String,
+    id: i64,
+}
+
+async fn engine_copy_source(State(app): State<AppState>, Body(b): Body<CopySourceBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_copy_source(b.scene, b.id).await?))
+}
+
+#[derive(Deserialize)]
+struct ClipFiltersBody {
+    name: String,
+    #[serde(default)]
+    item: Option<ItemTarget>,
+}
+
+async fn engine_copy_filters(State(app): State<AppState>, Body(b): Body<ClipFiltersBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_copy_filters(b.name, b.item).await?))
+}
+
+#[derive(Deserialize)]
+struct PasteSourceBody {
+    scene: String,
+}
+
+async fn engine_paste_source(State(app): State<AppState>, Body(b): Body<PasteSourceBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_paste_source(b.scene).await?))
+}
+
+async fn engine_paste_filters_clip(
+    State(app): State<AppState>,
+    Body(b): Body<ClipFiltersBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_paste_filters(b.name, b.item).await?))
 }
 
 #[derive(Deserialize)]

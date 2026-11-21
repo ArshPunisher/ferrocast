@@ -1618,6 +1618,23 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
                 None => c.paste_filters_from(&name, &from, src_item),
             })
         }
+        A::CopySource { scene, id } => v(Ok(c.copy_source(&scene, id)?.to_json())),
+        A::CopyFilters { name, item } => {
+            let item = item.as_ref().map(|i| (i.scene.as_str(), i.id));
+            v(Ok(c.copy_filters(&name, item)?.to_json()))
+        }
+        A::PasteSource { scene, clip } => {
+            let clip = ferrocast_studio::stage::SourceClip::from_json(&clip)
+                .ok_or_else(|| ferrocast_studio::StudioError::Failed("That isn't a copied source.".into()))?;
+            let (item, notes) = c.paste_source(&scene, &clip)?;
+            v(to_json!(json!({ "item": item, "notes": notes })))
+        }
+        A::PasteFilterClip { name, item, clip } => {
+            let clip = ferrocast_studio::stage::FilterClip::from_json(&clip)
+                .ok_or_else(|| ferrocast_studio::StudioError::Failed("That isn't a copy of filters.".into()))?;
+            let item = item.as_ref().map(|i| (i.scene.as_str(), i.id));
+            v(Ok(json!({ "notes": c.paste_filter_values(&name, item, &clip)? })))
+        }
         A::SetItemFilterScope { scene, id, own } => v(to_json!(c.set_item_filter_scope(&scene, id, own)?)),
         A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
         A::SetItemCrop { scene, id, crop, .. } => v(to_json!(c.set_item_crop(&scene, id, crop)?)),

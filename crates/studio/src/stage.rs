@@ -292,6 +292,42 @@ fn drop_unused(d: &mut Value) {
     list.retain(|s| scene(s) || used.contains(name_of(s)));
 }
 
+/// An item with its source (a group: every source in it), copied out of a collection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceClip {
+    pub item: Value,
+    /// The item's source first, then what a group holds.
+    pub sources: Vec<Value>,
+}
+
+impl SourceClip {
+    pub fn to_json(&self) -> Value {
+        json!({ "item": self.item, "sources": self.sources })
+    }
+
+    pub fn from_json(v: &Value) -> Option<SourceClip> {
+        let sources = v.get("sources")?.as_array()?.clone();
+        Some(SourceClip { item: v.get("item")?.clone(), sources })
+    }
+}
+
+/// Filters copied from a source or an item.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterClip {
+    pub filters: Vec<Value>,
+    pub from: String,
+}
+
+impl FilterClip {
+    pub fn to_json(&self) -> Value {
+        json!({ "filters": self.filters, "from": self.from })
+    }
+
+    pub fn from_json(v: &Value) -> Option<FilterClip> {
+        Some(FilterClip { filters: v.get("filters")?.as_array()?.clone(), from: v.get("from")?.as_str()?.to_string() })
+    }
+}
+
 /// A new id for something saved (OBS writes UUIDs; any unique string does).
 fn uuid() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2722,6 +2758,11 @@ impl Stage {
 
     fn paste_target_filters(&self, target: FilterTarget<'_>, from: FilterTarget<'_>) -> Result<(), StudioError> {
         let copies = self.target_filter_values(from)?;
+        self.paste_filter_list(target, copies)
+    }
+
+    /// Adds `copies` (filters as copied) to `target`, each its own copy with a name that's free.
+    fn paste_filter_list(&self, target: FilterTarget<'_>, copies: Vec<Value>) -> Result<(), StudioError> {
         let mut have: Vec<String> = self.target_filters(target)?.into_iter().map(|f| f.name).collect();
         // And the names in the source's own list, where what isn't an item's own lands.
         let (store, _) = self.resolve_filter_store(target, None, None)?;
@@ -2767,6 +2808,202 @@ impl Stage {
             renamed.push(f);
         }
         self.with_target_filters(target, None, None, |l| l.extend(renamed))
+    }
+
+    // ------------------------------------------------------------------ clipboard
+
+    /// Copies an item with its source (a group with every source inside it) out of this
+    /// collection, as plain data the Studio keeps while another collection is open.
+    pub fn copy_source(&self, scene: &str, id: i64) -> Result<SourceClip, StudioError> {
+        let item = self.item(scene, id)?;
+        let root = self.source(name_of(&item))?;
+        let mut sources = Vec::new();
+        self.collect_clip(&root, &mut sources, 0)?;
+        Ok(SourceClip { item, sources })
+    }
+
+    fn collect_clip(&self, src: &Value, out: &mut Vec<Value>, depth: usize) -> Result<(), StudioError> {
+        if kind_of(src) == "scene" {
+            return Err(fail(format!("\"{}\" is a scene: duplicate the scene instead of copying it.", name_of(src))));
+        }
+        if depth > 16 {
+            return Err(fail("Groups inside groups go too deep to copy."));
+        }
+        if out.iter().any(|o| name_of(o) == name_of(src)) {
+            return Ok(());
+        }
+        out.push(src.clone());
+        if kind_of(src) == "group" {
+            for child in src.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten() {
+                let c = self.source(name_of(child))?;
+                self.collect_clip(&c, out, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts a copied item and its sources into `scene` (of any collection) → the new item and
+    /// notes on what changed. A name taken becomes "Name 2"; a clone whose target isn't here is
+    /// an error; a kind this computer can't run is refused; a sidechain to a source that isn't
+    /// here is set to none.
+    pub fn paste_source(&self, scene: &str, clip: &SourceClip) -> Result<(ItemInfo, Vec<String>), StudioError> {
+        self.scene_items(scene)?;
+        let root_name = clip.sources.first().map(|s| name_of(s).to_string()).unwrap_or_default();
+        if clip.sources.is_empty() || name_of(&clip.item) != root_name {
+            return Err(fail("The copied source is empty."));
+        }
+        let can = crate::kinds::kinds().inputs;
+        for src in &clip.sources {
+            let kind = kind_of(src);
+            if kind != "group" && !can.iter().any(|k| k.id == kind) {
+                return Err(fail(format!(
+                    "\"{}\" is a {kind} source, which this computer can't run (it was copied on another system).",
+                    name_of(src)
+                )));
+            }
+        }
+        // New names, in order, each free here and unlike the others pasted with it.
+        let mut map: Vec<(String, String)> = Vec::new();
+        for src in &clip.sources {
+            let old = name_of(src).to_string();
+            let mut n = old.clone();
+            let mut k = 2;
+            while self.name_free(&n).is_err() || map.iter().any(|(_, new)| *new == n) {
+                n = format!("{old} {k}");
+                k += 1;
+            }
+            map.push((old, n));
+        }
+        let renamed = |old: &str| map.iter().find(|(o, _)| o == old).map(|(_, n)| n.clone());
+        let mut notes = Vec::new();
+        let mut fresh: Vec<Value> = Vec::new();
+        for src in &clip.sources {
+            let mut c = src.clone();
+            let old = name_of(src).to_string();
+            let new = renamed(&old).unwrap_or_else(|| old.clone());
+            c["name"] = json!(new);
+            c["uuid"] = json!(uuid());
+            if kind_of(&c) == "ferrocast_clone" {
+                let target = c.pointer("/settings/clone").and_then(Value::as_str).unwrap_or("").to_string();
+                if let Some(n) = renamed(&target) {
+                    c["settings"]["clone"] = json!(n);
+                } else if !target.is_empty() && self.source(&target).is_err() {
+                    return Err(fail(format!(
+                        "\"{old}\" shows \"{target}\", which isn't in this collection: paste that source first."
+                    )));
+                }
+            }
+            if let Some(fs) = c.get_mut("filters").and_then(Value::as_array_mut) {
+                self.fix_pasted_filters(fs, &new, &renamed, &mut notes);
+            }
+            fresh.push(c);
+        }
+        // A group's items point at the pasted children by their new names.
+        let uuids: Vec<(String, String)> =
+            fresh.iter().map(|c| (name_of(c).to_string(), c["uuid"].as_str().unwrap_or("").to_string())).collect();
+        for c in fresh.iter_mut().filter(|c| kind_of(c) == "group") {
+            if let Some(items) = c.pointer_mut("/settings/items").and_then(Value::as_array_mut) {
+                for it in items {
+                    if let Some(n) = renamed(name_of(it)) {
+                        it["source_uuid"] = json!(uuids.iter().find(|(x, _)| *x == n).map(|(_, u)| u.clone()));
+                        it["name"] = json!(n);
+                    }
+                }
+            }
+        }
+        let root = fresh[0].clone();
+        let mut item = clip.item.clone();
+        if let Some(ov) = item.get_mut("ferrocast_filters").and_then(Value::as_array_mut) {
+            self.fix_pasted_filters(ov, name_of(&root), &renamed, &mut notes);
+        }
+        self.edit(|d| {
+            if let Some(l) = d["sources"].as_array_mut() {
+                // Children first, so a group never lists a source that isn't there yet.
+                l.extend(fresh.iter().skip(1).cloned());
+                l.push(fresh[0].clone());
+            }
+        });
+        let placed = self.place(scene, &root)?;
+        item["id"] = json!(placed.id);
+        item["name"] = root["name"].clone();
+        item["source_uuid"] = root["uuid"].clone();
+        self.with_item(scene, placed.id, |i| *i = item)?;
+        let info = self.info_of(&self.item(scene, placed.id)?);
+        Ok((info, notes))
+    }
+
+    /// Fresh ids for pasted filters, and each sidechain to a source that isn't here set to none.
+    fn fix_pasted_filters(
+        &self,
+        filters: &mut [Value],
+        owner: &str,
+        renamed: &dyn Fn(&str) -> Option<String>,
+        notes: &mut Vec<String>,
+    ) {
+        for f in filters.iter_mut() {
+            f["uuid"] = json!(uuid());
+            if kind_of(f) != "compressor_filter" {
+                continue;
+            }
+            let Some(side) = f.pointer("/settings/sidechain_source").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            if side.trim().is_empty() || side.trim().eq_ignore_ascii_case("none") {
+                continue;
+            }
+            if let Some(n) = renamed(&side) {
+                f["settings"]["sidechain_source"] = json!(n);
+            } else if self.source(&side).is_err() {
+                f["settings"]["sidechain_source"] = json!("none");
+                notes.push(format!(
+                    "The compressor \"{}\" on \"{owner}\" listened to \"{side}\", which isn't in this collection: its sidechain is set to None.",
+                    name_of(f)
+                ));
+            }
+        }
+    }
+
+    /// Copies a source's (or an item's own) filters out as plain data.
+    pub fn copy_filters(&self, name: &str, item: Option<(&str, i64)>) -> Result<FilterClip, StudioError> {
+        let target = match item {
+            Some((scene, id)) => FilterTarget::Item { scene, id },
+            None => FilterTarget::Source(name),
+        };
+        let filters = self.target_filter_values(target)?;
+        let from = match item {
+            Some((scene, id)) => name_of(&self.item(scene, id)?).to_string(),
+            None => name.to_string(),
+        };
+        Ok(FilterClip { filters, from })
+    }
+
+    /// Pastes copied filters onto a source or an item → notes on what changed (a filter this
+    /// computer can't run is refused; a sidechain to a source that isn't here is set to none).
+    pub fn paste_filter_values(
+        &self,
+        name: &str,
+        item: Option<(&str, i64)>,
+        clip: &FilterClip,
+    ) -> Result<Vec<String>, StudioError> {
+        let can = crate::kinds::kinds().filters;
+        if let Some(f) = clip.filters.iter().find(|f| !can.iter().any(|k| k.id == kind_of(f))) {
+            return Err(fail(format!(
+                "The filter \"{}\" is a {} filter, which this computer can't run.",
+                name_of(f),
+                kind_of(f)
+            )));
+        }
+        let (target, owner) = match item {
+            Some((scene, id)) => (FilterTarget::Item { scene, id }, name_of(&self.item(scene, id)?).to_string()),
+            None => (FilterTarget::Source(name), name.to_string()),
+        };
+        // The target must exist before anything is changed.
+        self.target_filters(target)?;
+        let mut copies = clip.filters.clone();
+        let mut notes = Vec::new();
+        self.fix_pasted_filters(&mut copies, &owner, &|_| None, &mut notes);
+        self.paste_filter_list(target, copies)?;
+        Ok(notes)
     }
 
     fn with_target_filter(
@@ -6009,6 +6246,145 @@ mod tests {
         assert!(!s.sources().iter().any(|u| u.name == "Blue"), "its last item gone, the source goes too");
         assert!(s.add_existing("Main", "Blue").is_err());
         ok(s.add_source("Main", "color_source_v3", "Blue", &json!({}), false));
+    }
+
+    fn color(s: &Stage, name: &str) -> ItemInfo {
+        ok(s.add_source("Main", "color_source_v3", name, &json!({ "width": 200, "height": 100 }), false))
+    }
+
+    #[test]
+    fn a_source_copied_in_one_collection_pastes_into_another_with_its_place() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        ok(a.set_item_box("Main", red.id, 100.0, 50.0, 400.0, 200.0));
+        let clip = ok(a.copy_source("Main", red.id));
+        let (info, notes) = ok(b.paste_source("Main", &clip));
+        assert!(notes.is_empty());
+        assert_eq!(info.frame, [400.0, 0.0, 0.0, 200.0, 100.0, 50.0], "the same place and size");
+        assert!(b.sources().iter().any(|u| u.name == "Red"));
+        // The copy has its own identity: another paste is "Red 2", and the first is left alone.
+        let (second, _) = ok(b.paste_source("Main", &clip));
+        assert!(b.sources().iter().any(|u| u.name == "Red 2"));
+        assert_ne!(info.id, second.id);
+        let (third, _) = ok(b.paste_source("Main", &clip));
+        assert!(b.sources().iter().any(|u| u.name == "Red 3"));
+        assert_ne!(second.id, third.id);
+    }
+
+    #[test]
+    fn a_clip_survives_a_json_round_trip() {
+        let a = stage();
+        let red = color(&a, "Red");
+        let clip = ok(a.copy_source("Main", red.id));
+        assert_eq!(SourceClip::from_json(&clip.to_json()), Some(clip));
+        assert!(SourceClip::from_json(&json!({ "item": {} })).is_none());
+        assert!(FilterClip::from_json(&json!({ "filters": [] })).is_none());
+    }
+
+    #[test]
+    fn a_group_copy_carries_its_children() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        let blue = color(&a, "Blue");
+        let g = ok(a.group_together("Main", &[red.id, blue.id], "Pair"));
+        let clip = ok(a.copy_source("Main", g.id));
+        assert_eq!(clip.sources.len(), 3, "the group and both its sources");
+        // Blue is already in the destination: the pasted child takes another name.
+        color(&b, "Blue");
+        let (info, _) = ok(b.paste_source("Main", &clip));
+        let names: Vec<String> = b.sources().iter().map(|u| u.name.clone()).collect();
+        for n in ["Red", "Blue 2"] {
+            assert!(names.iter().any(|x| x == n), "{n} in {names:?}");
+        }
+        assert!(info.group, "pasted as a group");
+        let parts = ok(b.group_parts("Main", info.id));
+        assert_eq!(parts.0, "Pair");
+        assert!(parts.1.iter().any(|n| n == "Blue 2") && parts.1.iter().any(|n| n == "Red"), "{parts:?}");
+    }
+
+    #[test]
+    fn a_scene_is_not_copied_as_a_source() {
+        let a = stage();
+        ok(a.add_scene("Two"));
+        let it = ok(a.add_existing("Main", "Two"));
+        assert!(a.copy_source("Main", it.id).is_err());
+        assert!(a.copy_source("Main", 999).is_err(), "no such item");
+        assert!(a.copy_source("Nope", 1).is_err(), "no such scene");
+    }
+
+    #[test]
+    fn a_clone_needs_its_target_in_the_destination() {
+        let (a, b) = (stage(), stage());
+        color(&a, "Red");
+        let copy = ok(a.add_source("Main", "ferrocast_clone", "Copy", &json!({ "clone": "Red" }), false));
+        let clip = ok(a.copy_source("Main", copy.id));
+        let e = b.paste_source("Main", &clip).unwrap_err().to_string();
+        assert!(e.contains("Red") && e.contains("paste that source first"), "{e}");
+        assert!(!b.sources().iter().any(|u| u.name == "Copy"), "nothing half-pasted");
+        color(&b, "Red");
+        ok(b.paste_source("Main", &clip));
+        assert!(b.sources().iter().any(|u| u.name == "Copy"));
+    }
+
+    #[test]
+    fn a_kind_this_computer_cannot_run_is_refused() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        let mut clip = ok(a.copy_source("Main", red.id));
+        clip.sources[0]["versioned_id"] = json!("alien_capture_from_another_os");
+        let e = b.paste_source("Main", &clip).unwrap_err().to_string();
+        assert!(e.contains("can't run") && e.contains("Red"), "{e}");
+        assert!(b.sources().iter().all(|u| u.name != "Red"));
+        assert!(b.paste_source("Main", &SourceClip { item: json!({}), sources: vec![] }).is_err(), "an empty copy");
+        assert!(b.paste_source("Nowhere", &ok(a.copy_source("Main", red.id))).is_err(), "no such scene");
+    }
+
+    #[test]
+    fn filters_paste_across_collections_with_names_free_and_a_sidechain_set_to_none() {
+        let (a, b) = (stage(), stage());
+        let mic_a = ok(a.add_source("Main", "color_source_v3", "Mic", &json!({}), false));
+        ok(a.add_filter("Mic", "gain_filter", "Boost", &json!({ "db": 3.0 })));
+        ok(a.add_filter("Mic", "compressor_filter", "Duck", &json!({ "sidechain_source": "Music" })));
+        let clip = ok(a.copy_filters("Mic", None));
+        assert_eq!(clip.filters.len(), 2);
+        assert_eq!(clip.from, "Mic");
+        let _ = mic_a;
+        ok(b.add_source("Main", "color_source_v3", "Voice", &json!({}), false));
+        ok(b.add_filter("Voice", "gain_filter", "Boost", &json!({})));
+        let notes = ok(b.paste_filter_values("Voice", None, &clip));
+        let names: Vec<String> = ok(b.filters("Voice")).into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["Boost", "Boost 2", "Duck"], "a taken name gets a number");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Music") && notes[0].contains("None"), "{notes:?}");
+        // Pasting twice does not clash.
+        ok(b.paste_filter_values("Voice", None, &clip));
+        assert_eq!(ok(b.filters("Voice")).len(), 5);
+    }
+
+    #[test]
+    fn a_sidechain_to_a_source_that_is_there_is_kept() {
+        let (a, b) = (stage(), stage());
+        ok(a.add_source("Main", "color_source_v3", "Mic", &json!({}), false));
+        ok(a.add_filter("Mic", "compressor_filter", "Duck", &json!({ "sidechain_source": "Music" })));
+        let clip = ok(a.copy_filters("Mic", None));
+        ok(b.add_source("Main", "color_source_v3", "Voice", &json!({}), false));
+        ok(b.add_source("Main", "color_source_v3", "Music", &json!({}), false));
+        assert!(ok(b.paste_filter_values("Voice", None, &clip)).is_empty());
+    }
+
+    #[test]
+    fn filters_refuse_a_missing_target_an_unknown_kind_and_leave_nothing_behind() {
+        let (a, b) = (stage(), stage());
+        ok(a.add_source("Main", "color_source_v3", "Mic", &json!({}), false));
+        ok(a.add_filter("Mic", "gain_filter", "Boost", &json!({})));
+        let mut clip = ok(a.copy_filters("Mic", None));
+        assert!(b.paste_filter_values("Ghost", None, &clip).is_err(), "no such source");
+        ok(b.add_source("Main", "color_source_v3", "Voice", &json!({}), false));
+        clip.filters[0]["versioned_id"] = json!("alien_filter_from_another_os");
+        let e = b.paste_filter_values("Voice", None, &clip).unwrap_err().to_string();
+        assert!(e.contains("can't run"), "{e}");
+        assert!(ok(b.filters("Voice")).is_empty());
+        assert!(a.copy_filters("Ghost", None).is_err());
     }
 
     #[test]

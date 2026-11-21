@@ -1648,6 +1648,30 @@ pub enum StudioAct {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_item: Option<ItemTarget>,
     },
+    /// Copies an item and its source (a group with every source in it) out as plain data
+    /// (`{ item, sources }`), for the clipboard.
+    CopySource {
+        scene: String,
+        id: i64,
+    },
+    /// Copies a source's (or an item's own) filters out as plain data (`{ filters, from }`).
+    CopyFilters {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
+    },
+    /// Puts a copied source into `scene` of the open collection → `{ item, notes }`.
+    PasteSource {
+        scene: String,
+        clip: Value,
+    },
+    /// Puts copied filters on a source or an item → `{ notes }`.
+    PasteFilterClip {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
+        clip: Value,
+    },
     /// Moves and sizes an item from the preview: its box's first corner to (`x`, `y`), its
     /// sides `w` and `h` long, in canvas pixels → the item. `save` at the end of a drag.
     SetItemBox {
@@ -2018,6 +2042,16 @@ impl StudioAct {
                 }
                 Ok(())
             }
+            A::CopySource { scene, .. } => check_source_name(scene),
+            A::CopyFilters { name, item } => check_filter_target(name, item.as_ref()),
+            A::PasteSource { scene, clip } => {
+                check_source_name(scene)?;
+                check_clip(clip, "sources")
+            }
+            A::PasteFilterClip { name, item, clip } => {
+                check_filter_target(name, item.as_ref())?;
+                check_clip(clip, "filters")
+            }
             A::SetItemCrop { scene, crop, .. } => {
                 check_source_name(scene)?;
                 if crop.iter().any(|c| !(0..=100_000).contains(c)) {
@@ -2207,6 +2241,8 @@ impl StudioAct {
                 | A::AudioCare
                 | A::Privacy
                 | A::Filters { .. }
+                | A::CopySource { .. }
+                | A::CopyFilters { .. }
                 | A::Screenshot { .. }
                 | A::ScreenshotProgram
                 | A::Refresh
@@ -2234,6 +2270,15 @@ fn check_transition(t: &SceneTransition) -> Result<(), EngineError> {
 }
 
 /// A source or filter kind id from OBS (`color_source`, `com.example.thing`).
+/// A copied list (`key` an array) is at most 200 entries: it comes from the clipboard, but the
+/// route is the same one a script could call.
+fn check_clip(clip: &Value, key: &str) -> Result<(), EngineError> {
+    match clip.get(key).and_then(Value::as_array) {
+        Some(l) if !l.is_empty() && l.len() <= 200 => Ok(()),
+        _ => Err(EngineError::Invalid(format!("clip: a copy with 1 to 200 {key}."))),
+    }
+}
+
 fn check_filter_target(name: &str, item: Option<&ItemTarget>) -> Result<(), EngineError> {
     match item {
         Some(it) => {
@@ -3400,6 +3445,22 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             self.acts.lock().unwrap_or_else(|p| p.into_inner()).push(act.clone());
+            // Copies answer as the desktop's Stage does; everything else echoes the act.
+            match &act {
+                StudioAct::CopySource { .. } => {
+                    return Ok(serde_json::json!({
+                        "item": { "name": "Cam", "id": 4 },
+                        "sources": [{ "name": "Cam" }, { "name": "Mic" }],
+                    }));
+                }
+                StudioAct::CopyFilters { name, .. } if name == "Empty" => {
+                    return Ok(serde_json::json!({ "filters": [], "from": "Empty" }));
+                }
+                StudioAct::CopyFilters { name, .. } => {
+                    return Ok(serde_json::json!({ "filters": [{ "name": "Gate" }], "from": name }));
+                }
+                _ => {}
+            }
             Ok(serde_json::to_value(act).unwrap_or_default())
         }
         async fn stream_start(
@@ -3534,6 +3595,89 @@ mod tests {
         e.studio_capture_keys(true);
         e.studio_capture_keys(false);
         assert_eq!(*fake.captured.lock().unwrap_or_else(|p| p.into_inner()), vec![true, false]);
+    }
+
+    fn pasted(fake: &Fake) -> Vec<StudioAct> {
+        fake.acts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|a| matches!(a, StudioAct::PasteSource { .. } | StudioAct::PasteFilterClip { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// Copy and paste: the engine keeps the copy, hands it to the host on paste, says plainly
+    /// when nothing (or the wrong thing) is copied, and keeps it for another collection.
+    #[tokio::test]
+    async fn the_clipboard_keeps_a_copy_for_a_paste_in_any_collection() {
+        let (e, _d) = engine().await;
+        assert!(matches!(e.studio_clipboard().unwrap_err(), EngineError::Missing { code: "clipboard_empty", .. }));
+        assert!(matches!(
+            e.studio_paste_source("Main".into()).await.unwrap_err(),
+            EngineError::Missing { code: "clipboard_empty", .. }
+        ));
+        assert!(matches!(
+            e.studio_copy_source("Main".into(), 4).await.unwrap_err(),
+            EngineError::Refused { code: "studio_unavailable", .. }
+        ));
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        let c = e.studio_copy_source("Main".into(), 4).await.unwrap();
+        assert_eq!(c, serde_json::json!({ "kind": "source", "name": "Cam", "from": "Main", "count": 2 }));
+        assert_eq!(e.studio_clipboard().unwrap(), c);
+        // Another collection opens: the host's state changes, the copy stays.
+        e.studio_act(StudioAct::Refresh).await.unwrap();
+        assert_eq!(e.studio_clipboard().unwrap(), c);
+        e.studio_paste_source("Scene 2".into()).await.unwrap();
+        e.studio_paste_source("Scene 2".into()).await.unwrap();
+        let p = pasted(&fake);
+        assert_eq!(p.len(), 2, "a paste can be repeated");
+        let StudioAct::PasteSource { scene, clip } = &p[0] else { panic!("{p:?}") };
+        assert_eq!((scene.as_str(), clip["sources"].as_array().map(Vec::len)), ("Scene 2", Some(2)));
+        // The wrong kind says what is held; clearing empties it.
+        let wrong = e.studio_paste_filters("Mic".into(), None).await.unwrap_err();
+        assert!(matches!(&wrong, EngineError::Invalid(m) if m.contains("a source")), "{wrong:?}");
+        e.studio_clipboard_clear();
+        assert!(e.studio_clipboard().is_err());
+    }
+
+    #[tokio::test]
+    async fn copied_filters_paste_onto_a_source_or_an_item() {
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        let none = e.studio_copy_filters("Empty".into(), None).await.unwrap_err();
+        assert!(matches!(&none, EngineError::Invalid(m) if m.contains("Empty")), "{none:?}");
+        assert!(e.studio_clipboard().is_err(), "a failed copy leaves the clipboard as it was");
+        let c = e.studio_copy_filters("Mic".into(), None).await.unwrap();
+        assert_eq!(c, serde_json::json!({ "kind": "filters", "name": "Mic", "from": "Mic", "count": 1 }));
+        let wrong = e.studio_paste_source("Main".into()).await.unwrap_err();
+        assert!(matches!(&wrong, EngineError::Invalid(m) if m.contains("filters")), "{wrong:?}");
+        e.studio_paste_filters("Voice".into(), None).await.unwrap();
+        e.studio_paste_filters(String::new(), Some(ItemTarget { scene: "Main".into(), id: 3 })).await.unwrap();
+        assert_eq!(pasted(&fake).len(), 2);
+    }
+
+    #[test]
+    fn clipboard_acts_check_their_input_and_only_pastes_change_the_collection() {
+        let ok_clip = serde_json::json!({ "sources": [{ "name": "A" }], "filters": [{ "name": "F" }] });
+        assert!(StudioAct::PasteSource { scene: "Main".into(), clip: ok_clip.clone() }.check().is_ok());
+        assert!(StudioAct::PasteFilterClip { name: "Mic".into(), item: None, clip: ok_clip.clone() }.check().is_ok());
+        for bad in [serde_json::json!({}), serde_json::json!({ "sources": [] }), serde_json::json!({ "sources": 3 })] {
+            assert!(StudioAct::PasteSource { scene: "Main".into(), clip: bad }.check().is_err());
+        }
+        let many: Vec<_> = (0..201).map(|_| serde_json::json!({ "name": "x" })).collect();
+        assert!(
+            StudioAct::PasteFilterClip { name: "Mic".into(), item: None, clip: serde_json::json!({ "filters": many }) }
+                .check()
+                .is_err()
+        );
+        assert!(StudioAct::PasteSource { scene: String::new(), clip: ok_clip.clone() }.check().is_err());
+        assert!(!StudioAct::CopySource { scene: "Main".into(), id: 1 }.changes());
+        assert!(!StudioAct::CopyFilters { name: "Mic".into(), item: None }.changes());
+        assert!(StudioAct::PasteSource { scene: "Main".into(), clip: ok_clip.clone() }.changes());
+        assert!(StudioAct::PasteFilterClip { name: "Mic".into(), item: None, clip: ok_clip }.changes());
     }
 
     /// Performance mode: the engine asks the host to pause, answers what the host says, and

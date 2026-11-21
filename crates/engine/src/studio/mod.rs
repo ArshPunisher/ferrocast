@@ -19,6 +19,7 @@
 pub mod autoreplies;
 pub mod away;
 pub mod chatbot;
+pub mod clipboard;
 pub(crate) mod game_scenes;
 pub(crate) mod live_watch;
 pub mod moments;
@@ -127,6 +128,9 @@ pub(crate) struct Studio {
     pub rules_busy: Mutex<HashSet<usize>>,
     /// Items and filters held shown, hidden, on or off by a key held down (never saved).
     pub holds: Mutex<push_hold::Holds>,
+    /// The Studio's copy and paste of sources and filters: kept while another collection is
+    /// opened, gone when the app quits.
+    pub clipboard: Mutex<Option<clipboard::Clip>>,
 }
 
 impl Default for Studio {
@@ -164,6 +168,7 @@ impl Default for Studio {
             autoreplies: autoreplies::AutoReplies::default(),
             rules_busy: Mutex::default(),
             holds: Mutex::default(),
+            clipboard: Mutex::default(),
         }
     }
 }
