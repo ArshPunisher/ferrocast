@@ -2391,7 +2391,12 @@ impl Stage {
     ) -> Result<(), StudioError> {
         check_name(filter)?;
         let owner = self.target_owner_label(target)?;
-        if self.target_filters(target)?.iter().any(|f| f.name == filter) {
+        // Free in the list it's shown in, and in the one it's written to (a sound filter added
+        // through an item goes to the source's own).
+        let (store, on_item) = self.resolve_filter_store(target, Some(kind), None)?;
+        let taken_in_store = !on_item
+            && self.names_on_source(&store, ferrocore::obs::is_audio_filter_kind(kind))?.iter().any(|n| n == filter);
+        if taken_in_store || self.target_filters(target)?.iter().any(|f| f.name == filter) {
             return Err(fail(format!("\"{owner}\" already has a filter called \"{filter}\".")));
         }
         let mut set = crate::kinds::defaults(kind).unwrap_or_else(|| json!({}));
@@ -2680,6 +2685,23 @@ impl Stage {
         self.paste_target_filters(FilterTarget::Item { scene, id }, src)
     }
 
+    /// The filter names a new filter written to `source`'s own list must not take: that list's,
+    /// and for a sound filter (also shown in every item's own list of that source) theirs too.
+    fn names_on_source(&self, source: &str, audio: bool) -> Result<Vec<String>, StudioError> {
+        let mut names: Vec<String> = self.filter_list(source)?.iter().map(|f| name_of(f).to_string()).collect();
+        if audio {
+            for s in self.sources_list() {
+                for it in s.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten() {
+                    if name_of(it) == source {
+                        let own = it.get("ferrocast_filters").and_then(Value::as_array).into_iter().flatten();
+                        names.extend(own.map(|f| name_of(f).to_string()));
+                    }
+                }
+            }
+        }
+        Ok(names)
+    }
+
     fn target_filter_values(&self, target: FilterTarget<'_>) -> Result<Vec<Value>, StudioError> {
         match target {
             FilterTarget::Source(name) => self.filter_list(name),
@@ -2701,6 +2723,9 @@ impl Stage {
     fn paste_target_filters(&self, target: FilterTarget<'_>, from: FilterTarget<'_>) -> Result<(), StudioError> {
         let copies = self.target_filter_values(from)?;
         let mut have: Vec<String> = self.target_filters(target)?.into_iter().map(|f| f.name).collect();
+        // And the names in the source's own list, where what isn't an item's own lands.
+        let (store, _) = self.resolve_filter_store(target, None, None)?;
+        have.extend(self.names_on_source(&store, true)?);
         let rename_unique = |f: &mut Value, have: &mut Vec<String>| {
             let mut n = name_of(f).to_string();
             while have.contains(&n) {
@@ -7024,6 +7049,30 @@ mod tests {
         assert_eq!(listed(&s), vec!["None", "Voice"], "no sound track, no key");
         ok(s.set_tracks("Silent clip", &[1]));
         assert_eq!(listed(&s), vec!["None", "Voice", "Silent clip"]);
+    }
+
+    /// A filter added or pasted through an item takes a name free where it is written: a sound
+    /// filter goes to the source's own list, which can hold a picture filter of that name the
+    /// item's own list doesn't show (its copy removed). Two of a name there: a change by name
+    /// edited the first, a removal took both.
+    #[test]
+    fn a_filter_added_through_an_item_takes_a_name_free_where_it_is_written() {
+        let s = stage();
+        let it = ok(s.add_source("Main", "color_source_v3", "Card", &json!({}), false));
+        let _ = ok(s.add_source("Main", "ffmpeg_source", "Clip", &json!({ "local_file": "/c.mp4" }), false));
+        ok(s.add_filter("Card", "crop_filter", "Crop", &json!({})));
+        ok(s.set_item_filter_scope("Main", it.id, true));
+        ok(s.remove_item_filter("Main", it.id, "Crop"));
+        assert!(
+            s.add_item_filter("Main", it.id, "gain_filter", "Crop", &json!({})).is_err(),
+            "taken in the source's list"
+        );
+        // Pasted the same way: renamed, never two of a name in the list it lands in.
+        ok(s.add_filter("Clip", "gain_filter", "Crop", &json!({})));
+        ok(s.paste_item_filters("Main", it.id, "Clip"));
+        let names: Vec<String> = ok(s.filter_list("Card")).iter().map(|f| name_of(f).to_string()).collect();
+        let crops = names.iter().filter(|n| *n == "Crop").count();
+        assert_eq!(crops, 1, "one \"Crop\" in the source's list: {names:?}");
     }
 
     /// A source called "none" renamed leaves every compressor's "none" (no ducking, the default)
