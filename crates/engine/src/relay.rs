@@ -61,7 +61,7 @@ mod kick_401_tests {
         assert_eq!(kick_refresh_401(Some("something_new")), Kick401::Unclear);
     }
 }
-const KICK_TOKENS: &str = "kick-tokens";
+pub(crate) const KICK_TOKENS: &str = "kick-tokens";
 
 impl Engine {
     pub(crate) fn relay_url(&self) -> Result<String, EngineError> {

@@ -411,28 +411,31 @@ impl Engine {
     fn collect_known_secrets(&self) -> Vec<String> {
         let mut out = HashSet::new();
         let mut keys: Vec<String> = vec![
-            "twitch-tokens".into(),
-            "youtube-tokens".into(),
-            "kick-tokens".into(),
-            "obs-password".into(),
-            "discord-webhook".into(),
-            "relay-install".into(),
-            "ferrocast-session".into(),
-            "backup-key".into(),
-            "golive-ingest-key".into(),
-            "golive-obs-before".into(),
-            "golive-vertical-before".into(),
-            "tips-secret".into(),
-            "stripe-secret".into(),
-            "razorpay-secret".into(),
+            crate::accounts::TWITCH_TOKENS.into(),
+            crate::accounts::YOUTUBE_TOKENS.into(),
+            crate::relay::KICK_TOKENS.into(),
+            crate::relay::INSTALL.into(),
+            crate::obs::PASSWORD_KEY.into(),
+            crate::discord::WEBHOOK_KEY.into(),
+            crate::ferro_account::SESSION.into(),
+            crate::cloud_backup::KEY_SECRET.into(),
+            crate::golive::INGEST_KEY_SECRET.into(),
+            crate::golive::OBS_BEFORE_SECRET.into(),
+            crate::golive::VERTICAL_BEFORE_SECRET.into(),
+            crate::guests::INVITES.into(),
         ];
         for d in self.golive_config().destinations {
-            keys.push(format!("golive-custom-key:{}", d.id));
+            keys.push(format!("{}{}", crate::golive::CUSTOM_KEY_PREFIX, d.id));
         }
         for key in keys {
             if let Ok(Some(val)) = self.inner.secrets.get(&key) {
                 extract_secret_strings(&val, &mut out);
             }
+        }
+        if let ferrocast_obs::detect::Detection::Found(d) = ferrocast_obs::detect::detect(&self.obs_paths())
+            && let Some(pw) = d.password
+        {
+            extract_secret_strings(&pw, &mut out);
         }
         out.into_iter().collect()
     }
@@ -765,7 +768,7 @@ mod tests {
             .unwrap();
         secrets.set("obs-password", "obsPassFixture_4455").unwrap();
         secrets.set("discord-webhook", "https://discord.com/api/webhooks/111222333/webhookSecretToken_7788").unwrap();
-        secrets.set("golive-ingest-key", "live_fixture_streamkey_0099").unwrap();
+        secrets.set(crate::golive::INGEST_KEY_SECRET, "live_fixture_streamkey_0099").unwrap();
 
         let engine = Engine::start_with_secrets(dir.path(), secrets).await.unwrap();
 
@@ -922,5 +925,76 @@ mod tests {
         arc.by_name("logs/ferrocast.log").unwrap().read_to_string(&mut log_body).unwrap();
         assert!(!log_body.contains("short_ml_tok"), "multiline JSON leaked: {log_body}");
         assert!(!log_body.contains("PemLogSecretLineABC"), "PEM block leaked: {log_body}");
+    }
+
+    #[tokio::test]
+    async fn real_support_zip_scrubs_every_real_secret_store_key_and_obs_autodetect() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let obs_cfg_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+
+        let obs_cfg_path = obs_cfg_dir.path().join("config.json");
+        std::fs::write(
+            &obs_cfg_path,
+            r#"{"server_enabled":true,"server_port":4455,"auth_required":true,"server_password":"my obs autodetect phrase"}"#,
+        )
+        .unwrap();
+
+        let secrets = std::sync::Arc::new(MemorySecrets::default());
+        secrets.set("ferrocast-account-session", "my account sess phrase").unwrap();
+        secrets.set("cloud-backup-key", "my backup key phrase").unwrap();
+        secrets.set("golive_ingest_key", "my golive ingest phrase").unwrap();
+        secrets.set("golive_obs_before", r#"{"url":"rtmp://custom.example/s","key":"my obs before phrase"}"#).unwrap();
+        secrets
+            .set("golive_vertical_before", r#"{"url":"rtmp://vert.example/s","key":"my vert before phrase"}"#)
+            .unwrap();
+        secrets.set("guest-invites", r#"[{"id":"g1","token":"my guest invite phrase"}]"#).unwrap();
+
+        let engine = Engine::start_with_secrets(dir.path(), secrets).await.unwrap();
+        engine.set_obs_detect_paths(vec![obs_cfg_path]);
+        let _dest = engine
+            .add_golive_destination(
+                "CustomTest",
+                "rtmp://custom.example/app",
+                "opaqueCustomDestKey_666",
+                crate::golive::Canvas::Main,
+            )
+            .await
+            .unwrap();
+
+        // Plant each secret as plain words (no key= or prefix hints) so ONLY secret-store + OBS detection lookup catches them.
+        std::fs::write(
+            logs.join("ferrocast.log"),
+            concat!(
+                "2026-11-22T03:00:00Z INFO event my account sess phrase\n",
+                "2026-11-22T03:00:01Z INFO event my backup key phrase\n",
+                "2026-11-22T03:00:02Z INFO event my golive ingest phrase\n",
+                "2026-11-22T03:00:03Z INFO event my obs before phrase\n",
+                "2026-11-22T03:00:04Z INFO event my vert before phrase\n",
+                "2026-11-22T03:00:05Z INFO event opaqueCustomDestKey_666\n",
+                "2026-11-22T03:00:06Z INFO event my guest invite phrase\n",
+                "2026-11-22T03:00:07Z INFO event my obs autodetect phrase\n",
+            ),
+        )
+        .unwrap();
+
+        let (_name, bytes, _report) = engine.diagnostics_zip_bytes().await.unwrap();
+        let mut arc = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut log_body = String::new();
+        arc.by_name("logs/ferrocast.log").unwrap().read_to_string(&mut log_body).unwrap();
+
+        for secret in [
+            "my account sess phrase",
+            "my backup key phrase",
+            "my golive ingest phrase",
+            "my obs before phrase",
+            "my vert before phrase",
+            "opaqueCustomDestKey_666",
+            "my guest invite phrase",
+            "my obs autodetect phrase",
+        ] {
+            assert!(!log_body.contains(secret), "real secret {secret} leaked into log: {log_body}");
+        }
     }
 }
