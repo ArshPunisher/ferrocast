@@ -542,6 +542,27 @@ async fn the_designers_test_uses_its_design_and_chat_waits_for_a_viewer() {
 }
 
 #[tokio::test]
+async fn an_emote_wall_only_overlay_counts_as_a_chat_listener() {
+    let w = world().await;
+    let u = w.cloud_user("a@example.com").await;
+    w.bind_channels(&u);
+    let (id, token) = w.first_overlay(&u).await;
+    let (_, mut o) = w.web(&u, Method::GET, &format!("/c/api/v1/overlays/{id}"), None).await;
+    o["widgets"] = json!([
+        { "id": "ew", "kind": "emote_wall", "x": 0, "y": 0, "w": 1920, "h": 1080, "config": {} }
+    ]);
+    let (s, v) = w.web(&u, Method::PUT, &format!("/c/api/v1/overlays/{id}"), Some(o)).await;
+    assert_eq!(s, 200, "{v}");
+    let mut page = w.open_socket(&token, "").await;
+    next(&mut page).await;
+    let chat = json!({ "broadcaster_user_id": STREAMER_ID, "chatter_user_id": "7", "chatter_user_login": "v",
+                       "chatter_user_name": "V", "message_id": "c-ew", "message": { "text": "Kappa", "fragments": [] } });
+    assert_eq!(w.twitch_event("m-ew", "channel.chat.message", chat).await, 204);
+    let ev = next_of(&mut page, "event").await;
+    assert_eq!(ev["data"]["kind"]["type"], "chat_message", "{ev}");
+}
+
+#[tokio::test]
 async fn the_editors_lists_and_a_status_before_turning_on() {
     let w = world().await;
     let off = w.user("off@example.com");

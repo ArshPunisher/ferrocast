@@ -330,7 +330,7 @@ impl SocketGuard {
             return None;
         }
         *s.sockets.entry(o.id.clone()).or_default() += 1;
-        let chat = o.wants_chat();
+        let chat = o.wants_chat_events();
         if chat {
             s.chat_sockets += 1;
         }
@@ -508,7 +508,7 @@ async fn overlay_loop(
                     let ok = match &f.audience {
                         Audience::Overlay(_) => {
                             let ok = own_frame(&st, &bus, &mut overlay, &f, &mut tx).await;
-                            guard.set_chat(overlay.wants_chat());
+                            guard.set_chat(overlay.wants_chat_events());
                             ok
                         }
                         Audience::Labels => {
@@ -533,7 +533,7 @@ async fn overlay_loop(
                         return;
                     };
                     overlay = fresh;
-                    guard.set_chat(overlay.wants_chat());
+                    guard.set_chat(overlay.wants_chat_events());
                     super::goals::load(&st, &bus);
                     if !send_text(&mut tx, &snapshot(&bus, &overlay, false)).await {
                         return;
