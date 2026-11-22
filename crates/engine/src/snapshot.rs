@@ -71,7 +71,7 @@ impl Engine {
         }
         let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
         let view = self.overlay_view(&saved);
-        self.push_config(&saved);
+        self.push_config(&saved).await;
         Ok(view)
     }
 
@@ -80,13 +80,13 @@ impl Engine {
         let mut o = self.overlay(id).await?;
         o.name = name.to_string();
         let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
-        self.push_config(&saved);
+        self.push_config(&saved).await;
         Ok(self.overlay_view(&saved))
     }
 
     /// Sends an overlay's new layout (and initial widget state for newly added interactive
     /// widgets) to its open pages.
-    pub(crate) fn push_config(&self, o: &Overlay) {
+    pub(crate) async fn push_config(&self, o: &Overlay) {
         self.cloud_changed();
         let view = self.overlay_view(o);
         self.send_overlay(OverlayFrame::new(
@@ -97,7 +97,15 @@ impl Engine {
         ));
         let mut patch = serde_json::Map::new();
         if o.widgets.iter().any(|w| w.kind == WidgetKind::EndCredits) {
-            patch.insert("credits".into(), json!(self.state().session.credits));
+            // After a restart the in-memory session is empty: send what the log rebuilds.
+            let credits = match self.credits().await {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::warn!(%err, "couldn't rebuild the credits for an overlay edit");
+                    self.state().session.credits.clone()
+                }
+            };
+            patch.insert("credits".into(), json!(credits));
         }
         if o.widgets.iter().any(|w| w.kind == WidgetKind::ChatHighlight) {
             patch.insert("chat_highlight".into(), json!(self.chat_highlight()));

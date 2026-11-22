@@ -43,6 +43,8 @@ impl Engine {
                 Ok((support, ended, mods))
             })
             .await?;
+        // Support that came in after the stream went offline belongs to no stream.
+        let support: Vec<_> = support.into_iter().filter(|e| ended.is_none_or(|end| e.occurred_at.0 <= end)).collect();
         let mut credits = build_credits(&support, Some(Millis(start)));
         for m in mods {
             if credits.mods.len() < MAX_CREDITS_ROWS
@@ -481,6 +483,48 @@ mod tests {
             pushed |= matches!(f.audience, Audience::Widget(WidgetKind::EndCredits));
         }
         assert!(pushed, "open End Credits sources are told");
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_editing_an_overlay_keeps_the_last_streams_credits_and_drops_later_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Arc::new(MemorySecrets::default());
+        let engine = Engine::start_with_secrets(dir.path(), secrets.clone()).await.unwrap();
+        let t0 = now().0 - 120_000;
+        let at = |ms: i64, id: &str, kind: EventKind| Event::live(Platform::Twitch, Some(id.into()), Millis(t0 + ms), kind);
+        engine.ingest(at(0, "on", EventKind::StreamOnline { title: None })).await;
+        engine
+            .ingest(at(1000, "f-in", EventKind::Follow { actor: viewer(Platform::Twitch, "DuringStream", Roles::empty()) }))
+            .await;
+        engine.ingest(at(2000, "off", EventKind::StreamOffline)).await;
+        engine
+            .ingest(at(3000, "f-late", EventKind::Follow { actor: viewer(Platform::Twitch, "AfterOffline", Roles::empty()) }))
+            .await;
+        drop(engine);
+
+        let engine = Engine::start_with_secrets(dir.path(), secrets).await.unwrap();
+        let names: Vec<_> = engine.credits().await.unwrap().followers.into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["DuringStream"], "a follow after the stream ended is not in its credits");
+
+        let o = engine.create_overlay("Credits", ferrocast_core::overlay::Preset::Blank).await.unwrap();
+        let mut full = engine.overlay(&o.id).await.unwrap();
+        full.widgets = vec![
+            serde_json::from_value(
+                json!({ "id": "ec", "kind": "end_credits", "x": 0, "y": 0, "w": 800, "h": 600, "config": {} }),
+            )
+            .unwrap(),
+        ];
+        let mut rx = engine.subscribe_overlays();
+        engine.update_overlay(full).await.unwrap();
+        let mut sent = None;
+        while let Ok(f) = rx.try_recv() {
+            if f.text.contains("\"type\":\"state\"") && f.text.contains("credits") {
+                sent = Some(f.text.to_string());
+            }
+        }
+        let sent = sent.expect("a credits state frame follows the config");
+        assert!(sent.contains("DuringStream"), "saving a layout must not blank the credits: {sent}");
+        assert!(!sent.contains("AfterOffline"), "{sent}");
     }
 
     #[tokio::test]
