@@ -199,6 +199,10 @@ pub const MAX_CUSTOM_HTML: usize = 20_000;
 pub const MAX_CUSTOM_HTML_BYTES: usize = 80_000;
 /// Maximum custom schema fields per variation.
 pub const MAX_CUSTOM_FIELDS: usize = 32;
+/// Most looks one rule may hold.
+pub const MAX_VARIATIONS: usize = 20;
+/// Longest viewer-supplied value sent to the custom frame (characters).
+pub const MAX_CUSTOM_VAR_CHARS: usize = 2_000;
 pub const MAX_IN_MS: u32 = 3_000;
 pub const MAX_OUT_MS: u32 = 3_000;
 pub const MAX_TEXT_DELAY_MS: u32 = 10_000;
@@ -302,6 +306,8 @@ pub enum RuleError {
     NoKinds,
     #[error("'{0}' isn't an event type that can show an alert")]
     UnknownKind(String),
+    #[error("a rule can have up to {MAX_VARIATIONS} looks")]
+    TooManyVariations,
     #[error("the rule needs a default look (a variation without a condition)")]
     NoDefault,
     #[error("variation '{name}': {source}")]
@@ -764,6 +770,9 @@ impl AlertRule {
         if let Some(bad) = self.kinds.iter().find(|k| !ALERT_KINDS.contains(&k.as_str())) {
             return Err(RuleError::UnknownKind(bad.clone()));
         }
+        if self.variations.len() > MAX_VARIATIONS {
+            return Err(RuleError::TooManyVariations);
+        }
         if !self.variations.iter().any(|v| v.condition.is_none()) {
             return Err(RuleError::NoDefault);
         }
@@ -944,7 +953,10 @@ pub fn render(alert_id: &str, rule: &AlertRule, v: &Variation, event: &Event) ->
         html: v.html.clone(),
         css: v.css.clone(),
         fields: resolved_fields,
-        vars: base_vars,
+        vars: base_vars
+            .into_iter()
+            .map(|(k, v)| (k, v.chars().take(MAX_CUSTOM_VAR_CHARS).collect::<String>()))
+            .collect(),
     });
     RenderedAlert {
         alert_id: alert_id.into(),
@@ -1485,5 +1497,23 @@ mod tests {
             custom_rule("<p>{bogus}</p>").validate(),
             Err(RuleError::UnknownToken { ref token, .. }) if token == "bogus"
         ));
+    }
+
+    #[test]
+    fn caps_looks_per_rule_and_the_words_sent_to_the_custom_frame() {
+        let mut r = sub_rule();
+        let extra = r.variations[0].clone();
+        r.variations = (0..=MAX_VARIATIONS).map(|_| extra.clone()).collect();
+        assert!(matches!(r.validate(), Err(RuleError::TooManyVariations)));
+
+        let mut r = sub_rule();
+        r.variations[0].custom_enabled = true;
+        r.variations[0].html = "<p>{message}</p>".into();
+        let mut e = sub_with_months(3);
+        if let EventKind::Subscription { message, .. } = &mut e.kind {
+            *message = Some(crate::event::Content::plain(&"w".repeat(50_000)));
+        }
+        let custom = render("a", &r, &r.variations[0], &e).custom.unwrap();
+        assert!(custom.vars.values().all(|v| v.chars().count() <= MAX_CUSTOM_VAR_CHARS));
     }
 }
