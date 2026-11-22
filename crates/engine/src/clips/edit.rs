@@ -296,6 +296,8 @@ pub(crate) fn private_work_dir() -> std::io::Result<WorkDir> {
     for _ in 0..50 {
         let path =
             std::env::temp_dir().join(format!("ferrocast-burn-{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..)));
+        // `mut` is only needed for `mode`, which exists on Unix.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut b = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
