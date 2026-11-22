@@ -63,6 +63,10 @@ async fn live_loop(app: AppState, socket: WebSocket, since: Option<u64>) {
         LiveFrame::new("status", &app.engine.status()),
         LiveFrame::new("queue", &app.engine.queue().await),
     ];
+    let auto_config = app.engine.auto_config_status();
+    if auto_config.state != ferrocast_engine::studio::encoder_bench::AutoConfigStateKind::Idle {
+        hello.push(LiveFrame::new("auto_config", &auto_config));
+    }
     if let Some((since, (missed, gap))) = replay {
         // Too old to replay, or from before a restart: refetch instead. `missed` 0 means
         // "some, count unknown".

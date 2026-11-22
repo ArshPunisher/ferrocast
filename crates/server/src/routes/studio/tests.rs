@@ -1672,3 +1672,49 @@ async fn named_transition_and_matrix_routes_validate_and_forward() {
     assert_eq!(r.delete("/studio/engine/transitions/Quick%20Swipe%202").await.status(), StatusCode::NO_CONTENT);
     assert_eq!(host.acts.lock().unwrap().len(), 7);
 }
+
+#[tokio::test]
+async fn l1_ws_live_snapshot_emits_auto_config_when_non_idle() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let r = start().await;
+    let host = Arc::new(BenchRouteHost::default());
+    r.engine.set_studio_host(host);
+    r.engine.set_auto_config_timing_for_test(ferrocast_engine::studio::encoder_bench::BenchTiming::fast_test());
+
+    let ws_base = r.base.replace("http://", "ws://");
+    let (mut ws_idle, _) =
+        tokio_tungstenite::connect_async(format!("{ws_base}/api/v1/live?session={}", r.token)).await.unwrap();
+    let mut idle_frames = Vec::new();
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(400), ws_idle.next()).await;
+        let Ok(Some(Ok(Message::Text(text)))) = msg else { break };
+        idle_frames.push(serde_json::from_str::<Value>(&text).unwrap());
+    }
+    assert!(
+        idle_frames.iter().all(|f| f["type"] != "auto_config"),
+        "idle reconnect emitted auto_config: {idle_frames:?}"
+    );
+    drop(ws_idle);
+
+    let res = r
+        .post("/studio/engine/auto-config/apply", json!({ "encoder": "hardware", "fps": 60, "video_kbps": 6500 }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("{ws_base}/api/v1/live?session={}", r.token)).await.unwrap();
+
+    let mut frames = Vec::new();
+    for _ in 0..6 {
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(400), ws.next()).await;
+        let Ok(Some(Ok(Message::Text(text)))) = msg else { break };
+        frames.push(serde_json::from_str::<Value>(&text).unwrap());
+    }
+    let ac = frames.iter().find(|f| f["type"] == "auto_config").unwrap_or_else(|| {
+        panic!("expected initial auto_config frame when non-idle, got: {frames:?}");
+    });
+    assert_eq!(ac["data"]["state"], "applied");
+    assert_eq!(ac["data"]["applied"]["video_kbps"], 6500);
+}
