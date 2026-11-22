@@ -1168,6 +1168,12 @@ impl OwnStream {
     /// A recording "Same as stream" joining this running stream's encode, into `path` (one
     /// encode for both: the Mac's one video encoder can't do two at 4K60). Its stats count from
     /// now; when either ends the other goes on.
+    /// A stream and a recording are on this output together (Same as stream): one encode, so one
+    /// picture for both.
+    pub(crate) fn shares_encoder(&self) -> bool {
+        self.drawn.as_ref().is_some_and(|d| Arc::strong_count(&d.lease) > 1)
+    }
+
     /// Whether this output runs on engine `e` (each collection has its own).
     pub(crate) fn runs_on(&self, e: &Arc<Shared>) -> bool {
         self.drawn.as_ref().is_some_and(|d| Arc::ptr_eq(&d.shared, e))

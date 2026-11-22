@@ -449,7 +449,7 @@ impl Engine {
                 Ok(o) => match self.db(move |s| repo::overlays::put_synced(s, o)).await {
                     // Pages open on this PC's URL show the new layout too.
                     Ok(saved) => {
-                        self.push_config(&saved);
+                        self.push_config(&saved).await;
                         Ok(())
                     }
                     Err(e) => Err(e),

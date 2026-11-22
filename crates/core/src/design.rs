@@ -1130,7 +1130,9 @@ impl WidgetContent {
         if serde_json::to_string(&self.config).map(|s| s.len()).unwrap_or(usize::MAX) > 16 * 1024 {
             return Err("content.config: the settings are too big.".into());
         }
-        layer::validate_widget_style(&self.style).map_err(|e| e.replacen("config.style", "content.style", 1))
+        layer::validate_widget_style(&self.style).map_err(|e| e.replacen("config.style", "content.style", 1))?;
+        crate::overlay::validate_widget_config(self.widget, &self.config)
+            .map_err(|e| e.replacen("config.", "content.config.", 1))
     }
 
     /// The widget config with the style folded in, as an overlay stores it.
@@ -1850,6 +1852,7 @@ pub(crate) mod tests {
             kinds: vec!["follow".into()],
             platforms: vec![],
             variations: vec![Variation::new("v", "{name} followed!")],
+            interrupt: false,
         };
         let a = render("a", &rule, &rule.variations[0], &e);
         assert!(a.design.is_none());

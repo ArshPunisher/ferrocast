@@ -630,6 +630,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Cam" })).await,
         r.post("/studio/engine/sources/Alerts/web", json!({ "do": "interact" })).await,
         r.get("/studio/engine/obs-collections").await,
+        r.post("/studio/engine/obs-collections/preview", json!({ "id": "Untitled" })).await,
+        r.get("/studio/engine/streamlabs-collections").await,
+        r.post("/studio/engine/streamlabs-collections/preview", json!({ "id": "sl-1" })).await,
         r.post("/studio/engine/sources/Gameplay/screenshot", json!({})).await,
         r.put(
             "/studio/engine/scenes/Gameplay/transition",
@@ -638,6 +641,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         .await,
         r.put("/studio/engine/scenes/Gameplay/transition", json!({ "transition": null })).await,
         r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "scale_lanczos" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "stream_only" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "recording_only" })).await,
+        r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "stream_and_recording" })).await,
         r.post("/studio/engine/obs-collections/import", json!({ "id": "Untitled" })).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 10, "y": 20, "w": 640, "h": 360 })).await,
         r.put(
@@ -760,7 +766,9 @@ async fn the_studio_engine_needs_the_desktop_app() {
         (r.post("/studio/engine/record", json!({})).await, "record without on"),
         (r.post("/studio/engine/sources/Mic/paste-filters", json!({ "from": "Mic" })).await, "paste onto itself"),
         (r.post("/studio/engine/sources/Alerts/web", json!({ "do": "click" })).await, "unknown web act"),
+        (r.post("/studio/engine/obs-collections/preview", json!({ "id": "../x" })).await, "preview id with path"),
         (r.post("/studio/engine/obs-collections/import", json!({ "id": "../x" })).await, "id with a path"),
+        (r.post("/studio/engine/streamlabs-collections/preview", json!({ "id": "../x" })).await, "sl preview path"),
         (
             r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 0, "y": 0, "w": 0, "h": 360 })).await,
             "no width",
@@ -819,6 +827,10 @@ async fn the_studio_engine_needs_the_desktop_app() {
             "unknown scene transition",
         ),
         (r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "blend_glow" })).await, "unknown blend"),
+        (
+            r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "both" })).await,
+            "a word for where an item shows that isn't one",
+        ),
     ] {
         assert_eq!(code(bad).await.0, StatusCode::BAD_REQUEST, "{what}");
     }
@@ -894,6 +906,45 @@ impl ferrocast_engine::studio_host::StudioHost for LevelsStudio {
     }
     async fn import_obs(&self, _id: String) -> Result<Value, String> {
         Ok(Value::Null)
+    }
+    async fn preview_obs(&self, id: String) -> Result<Value, String> {
+        match id.as_str() {
+            "Untitled" => Ok(json!({
+                "source": "obs",
+                "id": "Untitled",
+                "name": "Untitled",
+                "scenes": 2,
+                "sources": 4,
+                "web_pages": 1,
+                "scene_names": ["Main", "BRB"],
+                "truncated_scenes": 0,
+                "device_resets": [],
+                "skipped": [],
+                "skipped_total": 0,
+                "missing": []
+            })),
+            "broken" => Err("OBS's scene collection \"broken\" couldn't be read because the JSON is damaged.".into()),
+            _ => Err(format!("OBS's scene collection \"{id}\" isn't there any more.")),
+        }
+    }
+    async fn preview_streamlabs(&self, id: String) -> Result<Value, String> {
+        match id.as_str() {
+            "sl-main" => Ok(json!({
+                "source": "streamlabs",
+                "id": "sl-main",
+                "name": "SL Main",
+                "scenes": 1,
+                "sources": 2,
+                "web_pages": 1,
+                "scene_names": ["Live"],
+                "truncated_scenes": 0,
+                "device_resets": [],
+                "skipped": [],
+                "skipped_total": 0,
+                "missing": []
+            })),
+            _ => Err("That Streamlabs scene collection isn't there any more.".into()),
+        }
     }
     fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
         Some(json!({ names[0].clone(): { "peak": [if fast { -6.0 } else { -20.0 }, -6.0] } }))
@@ -992,6 +1043,45 @@ impl ferrocast_engine::studio_host::StudioHost for ItemFilterHost {
     async fn import_obs(&self, _id: String) -> Result<Value, String> {
         Ok(Value::Null)
     }
+    async fn preview_obs(&self, id: String) -> Result<Value, String> {
+        match id.as_str() {
+            "Untitled" => Ok(json!({
+                "source": "obs",
+                "id": "Untitled",
+                "name": "Untitled",
+                "scenes": 2,
+                "sources": 4,
+                "web_pages": 1,
+                "scene_names": ["Main", "BRB"],
+                "truncated_scenes": 0,
+                "device_resets": [],
+                "skipped": [],
+                "skipped_total": 0,
+                "missing": []
+            })),
+            "broken" => Err("OBS's scene collection \"broken\" couldn't be read because the JSON is damaged.".into()),
+            _ => Err(format!("OBS's scene collection \"{id}\" isn't there any more.")),
+        }
+    }
+    async fn preview_streamlabs(&self, id: String) -> Result<Value, String> {
+        match id.as_str() {
+            "sl-main" => Ok(json!({
+                "source": "streamlabs",
+                "id": "sl-main",
+                "name": "SL Main",
+                "scenes": 1,
+                "sources": 2,
+                "web_pages": 1,
+                "scene_names": ["Live"],
+                "truncated_scenes": 0,
+                "device_resets": [],
+                "skipped": [],
+                "skipped_total": 0,
+                "missing": []
+            })),
+            _ => Err("That Streamlabs scene collection isn't there any more.".into()),
+        }
+    }
     async fn act(&self, act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
         self.acts.lock().unwrap().push(act.clone());
         match act {
@@ -1073,4 +1163,223 @@ async fn item_filter_routes_forward_item_target_and_validate_queries() {
     assert!(matches!(&acts[2], StudioAct::SetItemFilterScope { scene, id: 3, own: true } if scene == "Vertical"));
     assert!(matches!(&acts[3], StudioAct::EditFilter { edit: FilterEdit::Disable, item, .. } if item == &expected));
     assert!(matches!(&acts[10], StudioAct::SourcePicture { filters: true, item, .. } if item == &expected));
+}
+
+/// A Studio that keeps performance mode (the preview paused) and nothing else.
+#[derive(Debug, Default)]
+struct PausedHost {
+    paused: std::sync::atomic::AtomicBool,
+    acts: Mutex<Vec<ferrocast_engine::studio_host::StudioAct>>,
+}
+
+#[async_trait]
+impl ferrocast_engine::studio_host::StudioHost for PausedHost {
+    async fn status(&self) -> ferrocast_engine::studio_host::StudioStatus {
+        ferrocast_engine::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+    }
+    async fn start(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn kinds(&self) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn options(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn set_preview_paused(&self, paused: bool) -> Result<(), String> {
+        self.paused.store(paused, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn preview_paused(&self) -> bool {
+        self.paused.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    async fn defaults(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn act(&self, act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
+        use ferrocast_engine::studio_host::StudioAct as A;
+        let out = match &act {
+            A::CopySource { .. } => json!({ "item": { "name": "Cam" }, "sources": [{ "name": "Cam" }] }),
+            A::CopyFilters { name, .. } => json!({ "filters": [{ "name": "Gate" }], "from": name }),
+            A::PasteSource { .. } => json!({ "item": { "id": 9 }, "notes": ["a note"] }),
+            A::PasteFilterClip { .. } => json!({ "notes": [] }),
+            _ => Value::Null,
+        };
+        self.acts.lock().unwrap().push(act);
+        Ok(out)
+    }
+    async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
+        ferrocast_engine::studio_host::StudioSettings::default()
+    }
+    async fn set_settings(&self, _s: ferrocast_engine::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record(&self, _on: bool) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<Value, String> {
+        Ok(json!({ "devices": [] }))
+    }
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn obs_collections(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+}
+
+#[tokio::test]
+async fn performance_mode_pauses_the_preview_and_says_so_without_the_desktop_app() {
+    let r = start().await;
+    // No desktop app: the same plain 422 as every other Studio route.
+    for res in [
+        r.get("/studio/engine/preview/pause").await,
+        r.put("/studio/engine/preview/pause", json!({ "paused": true })).await,
+    ] {
+        assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
+    }
+    let host = Arc::new(PausedHost::default());
+    r.engine.set_studio_host(host.clone());
+    let (s, v) = body(r.get("/studio/engine/preview/pause").await).await;
+    assert_eq!((s, v["paused"].as_bool()), (StatusCode::OK, Some(false)), "{v}");
+    for (ask, now) in [(true, true), (true, true), (false, false), (false, false)] {
+        let (s, v) = body(r.put("/studio/engine/preview/pause", json!({ "paused": ask })).await).await;
+        assert_eq!((s, v["paused"].as_bool()), (StatusCode::OK, Some(now)), "{v}");
+    }
+    // A body that isn't `{ paused: bool }` is a 400 with a plain message, and changes nothing.
+    r.put("/studio/engine/preview/pause", json!({ "paused": true })).await;
+    for bad in [json!({}), json!({ "paused": "yes" }), json!({ "paused": null })] {
+        let res = r.put("/studio/engine/preview/pause", bad.clone()).await;
+        assert!(res.status().is_client_error(), "{bad}");
+    }
+    assert!(host.paused.load(std::sync::atomic::Ordering::SeqCst));
+    // It never touched the scenes, the stream or a recording.
+    assert!(host.acts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn copy_and_paste_over_the_api_with_every_error() {
+    let r = start().await;
+    // Nothing copied: a typed 404 with what to do, with or without the desktop app.
+    let res = r.get("/studio/engine/clipboard").await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "clipboard_empty", "{v}");
+    assert!(v["error"]["hint"].as_str().is_some_and(|h| h.contains("Copy")), "{v}");
+    for res in [
+        r.post("/studio/engine/clipboard/source", json!({ "scene": "Main", "id": 1 })).await,
+        r.post("/studio/engine/clipboard/filters", json!({ "name": "Mic" })).await,
+    ] {
+        assert_eq!(code(res).await, (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into()));
+    }
+    assert_eq!(
+        code(r.post("/studio/engine/clipboard/paste/source", json!({ "scene": "Main" })).await).await,
+        (StatusCode::NOT_FOUND, "clipboard_empty".into()),
+        "an empty clipboard is its own 404, before the app is asked"
+    );
+    let host = Arc::new(PausedHost::default());
+    r.engine.set_studio_host(host.clone());
+    // Bodies that aren't what the route takes: 400, nothing copied.
+    for (path, bad) in [
+        ("/studio/engine/clipboard/source", json!({})),
+        ("/studio/engine/clipboard/source", json!({ "scene": "Main", "id": "one" })),
+        ("/studio/engine/clipboard/filters", json!({ "name": 3 })),
+        ("/studio/engine/clipboard/paste/source", json!({})),
+    ] {
+        assert!(r.post(path, bad.clone()).await.status().is_client_error(), "{path} {bad}");
+    }
+    assert_eq!(
+        code(r.post("/studio/engine/clipboard/source", json!({ "scene": "", "id": 1 })).await).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    // Copy a source, read it back, paste it twice.
+    let (s, v) = body(r.post("/studio/engine/clipboard/source", json!({ "scene": "Main", "id": 1 })).await).await;
+    assert_eq!((s, v["kind"].as_str(), v["count"].as_u64()), (StatusCode::OK, Some("source"), Some(1)), "{v}");
+    let (s, v) = body(r.get("/studio/engine/clipboard").await).await;
+    assert_eq!((s, v["name"].as_str()), (StatusCode::OK, Some("Cam")), "{v}");
+    for _ in 0..2 {
+        let (s, v) = body(r.post("/studio/engine/clipboard/paste/source", json!({ "scene": "Two" })).await).await;
+        assert_eq!((s, v["notes"][0].as_str()), (StatusCode::OK, Some("a note")), "{v}");
+    }
+    // Filters in the clipboard are not a source: a 400 that says so.
+    let (s, v) = body(r.post("/studio/engine/clipboard/filters", json!({ "name": "Mic" })).await).await;
+    assert_eq!((s, v["kind"].as_str()), (StatusCode::OK, Some("filters")), "{v}");
+    let res = r.post("/studio/engine/clipboard/paste/source", json!({ "scene": "Two" })).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let (s, v) = body(
+        r.post("/studio/engine/clipboard/paste/filters", json!({ "name": "", "item": { "scene": "Main", "id": 2 } }))
+            .await,
+    )
+    .await;
+    assert_eq!((s, v["notes"].is_array()), (StatusCode::OK, true), "{v}");
+    // Clearing empties it (twice is fine); a session is needed for all of it.
+    for _ in 0..2 {
+        assert_eq!(r.delete("/studio/engine/clipboard").await.status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(r.get("/studio/engine/clipboard").await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        r.client.get(format!("{}/api/v1/studio/engine/clipboard", r.base)).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn import_preview_routes_validate_and_forward() {
+    let r = start().await;
+    let host = Arc::new(ItemFilterHost::default());
+    r.engine.set_studio_host(host);
+
+    let obs_ok = r.post("/studio/engine/obs-collections/preview", json!({ "id": "Untitled" })).await;
+    assert_eq!(obs_ok.status(), StatusCode::OK);
+    let body: Value = obs_ok.json().await.unwrap();
+    assert_eq!(body["scenes"], 2);
+    assert_eq!(body["web_pages"], 1);
+
+    let sl_ok = r.post("/studio/engine/streamlabs-collections/preview", json!({ "id": "sl-main" })).await;
+    assert_eq!(sl_ok.status(), StatusCode::OK);
+    let sl_body: Value = sl_ok.json().await.unwrap();
+    assert_eq!(sl_body["source"], "streamlabs");
+
+    assert_eq!(
+        r.post("/studio/engine/obs-collections/preview", json!({ "id": "../bad" })).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.post("/studio/engine/obs-collections/preview", json!({ "id": "missing" })).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        r.post("/studio/engine/obs-collections/preview", json!({ "id": "broken" })).await.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        r.post("/studio/engine/streamlabs-collections/preview", json!({ "id": "missing" })).await.status(),
+        StatusCode::NOT_FOUND
+    );
 }
