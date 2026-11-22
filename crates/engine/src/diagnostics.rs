@@ -78,6 +78,13 @@ impl Engine {
 
         let rec = {
             let mut guard = self.inner.stream_health.lock().unwrap_or_else(|p| p.into_inner());
+            // The await above gave a StreamOffline time to run. It clears the live flag before
+            // it closes the record, so seeing "live" here (under the record's lock) means its
+            // close comes after this open; seeing "not live" means the stream is already over
+            // and a record opened now would stay live forever.
+            if !self.state().live.values().any(|l| *l) {
+                return;
+            }
             let rec = guard.active.get_or_insert_with(|| StreamHealthRecord {
                 id: format!("stream-{}", at.0),
                 started_at: at,
@@ -1504,5 +1511,24 @@ mod tests {
         let missing = dir.path().join("nope");
         assert!(publish_no_replace(&tmp2, &missing, "a.zip", &no_links).is_err());
         assert!(!tmp2.exists());
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ended_during_the_start_does_not_leave_a_live_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let e =
+            Engine::start_with_secrets(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()))
+                .await
+                .unwrap();
+        // Nobody is live (the offline event already ran): opening a record is refused.
+        e.health_stream_started(Millis(1_000), Platform::Twitch).await;
+        assert!(e.inner.stream_health.lock().unwrap().active.is_none(), "no record for a stream that ended");
+        // Live: a record opens, and ending it closes it.
+        e.state_mut().live.insert(Platform::Twitch, true);
+        e.health_stream_started(Millis(2_000), Platform::Twitch).await;
+        assert!(e.inner.stream_health.lock().unwrap().active.is_some());
+        e.state_mut().live.insert(Platform::Twitch, false);
+        e.health_stream_ended(Millis(5_000)).await;
+        assert!(e.inner.stream_health.lock().unwrap().active.is_none());
     }
 }
