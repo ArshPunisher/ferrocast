@@ -115,10 +115,7 @@ impl CloudConfig {
     /// `secret`: any secret bytes (the decoded vault key); `None` keeps cloud mode off.
     pub fn new(overlay_origin: Option<&str>, overlays_dir: Option<PathBuf>, secret: Option<&[u8]>) -> CloudConfig {
         CloudConfig {
-            overlay_origin: overlay_origin
-                .and_then(|u| url::Url::parse(u).ok())
-                .map(|u| u.origin().ascii_serialization())
-                .filter(|o| o != "null"),
+            overlay_origin: overlay_origin.and_then(crate::config_origin),
             overlays_dir,
             key: secret.filter(|s| s.len() >= 16).map(|s| derive(s, "ferrocast cloud overlay v1")),
             max_active: DEFAULT_MAX_ACTIVE,
