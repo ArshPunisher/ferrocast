@@ -1157,6 +1157,26 @@ struct PreviewThread {
     surface: Arc<Mutex<crate::preview::PreviewSurface>>,
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+    /// Performance mode for this thread, readable without the engine's state lock.
+    paused: Arc<AtomicBool>,
+    /// Wakes the thread from its wait while paused (resume or stop).
+    wake: Arc<(Mutex<()>, Condvar)>,
+}
+
+/// Blocks while `paused` (and not `stop`): no timer, no lock on the engine state, no wakeups
+/// until `wake` is notified. Returns at once when it isn't paused.
+fn wait_while_paused(paused: &AtomicBool, stop: &AtomicBool, wake: &(Mutex<()>, Condvar)) {
+    let mut guard = wake.0.lock().unwrap_or_else(|e| e.into_inner());
+    while paused.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+        guard = wake.1.wait(guard).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Wakes a preview thread waiting in [`wait_while_paused`]. The lock is taken first so a
+/// notification can't slip in between the thread's check and its wait.
+fn wake_preview(wake: &(Mutex<()>, Condvar)) {
+    drop(wake.0.lock().unwrap_or_else(|e| e.into_inner()));
+    wake.1.notify_all();
 }
 
 /// Maximum time `Engine::drop` waits for the watchdog thread (which may be blocked in a slow OS
@@ -2763,15 +2783,18 @@ impl Engine {
             .insert(id, Preview { look: Default::default(), scene, size, multiview: None, paused: false });
         let surface = Arc::new(Mutex::new(surface));
         let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
         let thread = {
             let (state, gpu, surface, stop) = (self.state.clone(), self.gpu.clone(), surface.clone(), stop.clone());
+            let (paused, wake) = (paused.clone(), wake.clone());
             let every = Duration::from_secs(1) / self.config.fps.max(1);
             std::thread::Builder::new()
                 .name("ferrocast-preview".into())
-                .spawn(move || preview_loop(id, &state, &gpu, &surface, &stop, every))
+                .spawn(move || preview_loop(id, &state, &gpu, &surface, &stop, &(paused, wake), every))
                 .map_err(|e| AvError::Source(format!("the preview's thread didn't start ({e})")))?
         };
-        self.preview_threads().insert(id, PreviewThread { surface, stop, thread });
+        self.preview_threads().insert(id, PreviewThread { surface, stop, thread, paused, wake });
         Ok(id)
     }
 
@@ -2784,6 +2807,7 @@ impl Engine {
         let running = self.preview_threads().remove(&id);
         if let Some(p) = running {
             p.stop.store(true, Ordering::Release);
+            wake_preview(&p.wake);
             let _ = p.thread.join();
         }
         self.lock().previews.remove(&id);
@@ -2802,6 +2826,10 @@ impl Engine {
     pub fn set_preview_paused(&self, id: u64, paused: bool) {
         if let Some(p) = self.lock().previews.get_mut(&id) {
             p.paused = paused;
+        }
+        if let Some(t) = self.preview_threads().get(&id) {
+            t.paused.store(paused, Ordering::Release);
+            wake_preview(&t.wake);
         }
     }
 
@@ -3361,9 +3389,17 @@ fn preview_loop(
     gpu: &Compositor,
     surface: &Mutex<crate::preview::PreviewSurface>,
     stop: &AtomicBool,
+    pause: &(Arc<AtomicBool>, Arc<(Mutex<()>, Condvar)>),
     every: Duration,
 ) {
+    let (paused_flag, wake) = (&*pause.0, &*pause.1);
     while !stop.load(Ordering::Acquire) {
+        // Paused: asleep until resumed or stopped. No timer and no look at the engine's state,
+        // so it never competes with the outputs for that lock.
+        wait_while_paused(paused_flag, stop, wake);
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let started = Instant::now();
         let paused;
         let next = {
@@ -3797,7 +3833,7 @@ fn seen(st: &State) -> (std::collections::HashSet<u64>, HashMap<u64, (u32, bool)
     // A frame tap's scene too (the virtual camera showing one source alone), or its sources'
     // new pictures would wait and it would look frozen.
     roots.extend(st.taps.iter().filter_map(|(_, c, _)| c.scene.as_deref()));
-    for p in st.previews.values() {
+    for p in st.previews.values().filter(|p| !p.paused) {
         roots.extend(p.scene.as_deref());
         if let Some(mv) = &p.multiview {
             roots.extend(mv.boxes.iter().filter_map(|(b, _)| b.scene.as_deref()));
@@ -5755,6 +5791,49 @@ mod tests {
         e.lock().previews.insert(2, some_preview());
         e.set_preview_paused(1, true);
         assert_eq!((e.preview_paused(1), e.preview_paused(2)), (Some(true), Some(false)));
+    }
+
+    /// A paused preview thread sleeps until woken: not a timer, and it comes back at once on
+    /// resume and on stop (a stop used to wait out the 100 ms nap).
+    #[test]
+    fn a_paused_preview_thread_sleeps_until_resumed_or_stopped() {
+        let paused = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let (tx, rx) = mpsc::channel();
+        let (p, st, w) = (paused.clone(), stop.clone(), wake.clone());
+        let h = std::thread::spawn(move || {
+            wait_while_paused(&p, &st, &w);
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "it waits while paused");
+        let t = Instant::now();
+        paused.store(false, Ordering::Release);
+        wake_preview(&wake);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(t.elapsed() < Duration::from_millis(50), "resume is quick: {:?}", t.elapsed());
+        h.join().unwrap();
+        // Stop while paused.
+        paused.store(true, Ordering::Release);
+        let (tx, rx) = mpsc::channel();
+        let (p, st, w) = (paused.clone(), stop.clone(), wake.clone());
+        let h = std::thread::spawn(move || {
+            wait_while_paused(&p, &st, &w);
+            let _ = tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        stop.store(true, Ordering::Release);
+        wake_preview(&wake);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(t.elapsed() < Duration::from_millis(50), "stop is quick: {:?}", t.elapsed());
+        h.join().unwrap();
+        // Not paused: no waiting at all.
+        paused.store(false, Ordering::Release);
+        stop.store(false, Ordering::Release);
+        let t = Instant::now();
+        wait_while_paused(&paused, &stop, &wake);
+        assert!(t.elapsed() < Duration::from_millis(5));
     }
 
     #[test]

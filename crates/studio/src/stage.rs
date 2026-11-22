@@ -5557,6 +5557,9 @@ impl StageView {
             return;
         }
         self.shared.engine.set_preview_paused(self.id, paused);
+        if !paused {
+            self.push();
+        }
         self.view.set_opacity(self.shown_opacity());
     }
 
@@ -5584,6 +5587,10 @@ impl StageView {
     /// Keeps it with the stage (the app's tick): the vertical picture's scene on air, and the
     /// outlines taken from the items as they are now.
     pub fn follow(&self, stage: &Stage) {
+        // Paused: nothing is drawn, so nothing is sent to the engine either (it is sent once on resume).
+        if self.paused.get() {
+            return;
+        }
         if self.vertical {
             self.shared.engine.set_preview_scene(self.id, stage.vertical().map(|v| v.current));
         }
