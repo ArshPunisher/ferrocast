@@ -85,10 +85,7 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             // Only the origin counts: pages are served at `/<name>` on that host.
-            tip_url: env("RELAY_TIP_URL")
-                .and_then(|u| reqwest::Url::parse(&u).ok())
-                .map(|u| u.origin().ascii_serialization())
-                .filter(|o| o != "null"),
+            tip_url: env("RELAY_TIP_URL").and_then(|u| config_origin(&u)),
             kick_client_id: env("KICK_CLIENT_ID"),
             kick_client_secret: env("KICK_CLIENT_SECRET"),
             kick_id_url: env("KICK_ID_URL").unwrap_or_else(|| "https://id.kick.com".into()),
@@ -861,3 +858,45 @@ mod lapse_tests;
 mod load_tests;
 #[cfg(test)]
 mod tests;
+
+/// The origin (`https://host:port`) of a configured web address, or None when it isn't an http(s)
+/// address. Only http and https are looked at: `Url::origin()` follows `blob:` URLs by calling
+/// itself once per prefix (RUSTSEC-2026-0592, a stack overflow in url before 2.5.9), so an
+/// address with thousands of them never reaches it.
+pub(crate) fn config_origin(raw: &str) -> Option<String> {
+    let u = reqwest::Url::parse(raw).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(u.origin().ascii_serialization()).filter(|o| o != "null")
+}
+
+#[cfg(test)]
+mod origin_guard_tests {
+    use super::*;
+
+    fn nested() -> String {
+        format!("{}https://example.com/", "blob:".repeat(20_000))
+    }
+
+    #[test]
+    fn a_configured_address_with_thousands_of_blob_prefixes_is_refused_not_a_crash() {
+        assert_eq!(config_origin(&nested()), None);
+        assert_eq!(config_origin("blob:https://example.com/"), None);
+        assert_eq!(config_origin("https://tip.example.com/a/b?x=1").as_deref(), Some("https://tip.example.com"));
+        assert_eq!(config_origin("ftp://example.com/"), None);
+        assert_eq!(config_origin("nonsense"), None);
+    }
+
+    #[test]
+    fn every_config_that_takes_an_origin_survives_the_nested_blob_address() {
+        let n = nested();
+        let cloud = cloud::CloudConfig::new(Some(&n), None, None);
+        assert!(cloud.overlay_origin.is_none());
+        let remote = remote::RemoteConfig::new(Some(&n), None, None).with_web(Some(&n), &[n.as_str()]);
+        assert!(remote.origin.is_none() && remote.web.is_none() && remote.aliases.is_empty());
+        // A good address still works.
+        let ok = remote::RemoteConfig::new(Some("https://r.example.com/x"), None, None);
+        assert_eq!(ok.origin.as_deref(), Some("https://r.example.com"));
+    }
+}
