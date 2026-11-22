@@ -1313,7 +1313,7 @@ mod tests {
         let mut train = ComboTrain::new(cfg);
         // Arrivals out of order: 50 s, then 0 s, then 70 s. At 70 s the 0 s pulse is 70 s old.
         train.observe_at(&follow(50_000, "A"), Millis(50_000));
-        train.observe_at(&follow(0, "B"), Millis(50_000).max(Millis(0)));
+        train.observe_at(&follow(0, "B"), Millis(0));
         train.observe_at(&follow(70_000, "C"), Millis(70_000));
         assert!(!train.view(Millis(70_000)).active, "only two pulses are inside the window");
     }
