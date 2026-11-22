@@ -123,6 +123,10 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/golive/ingest"),
     ("POST", "/golive/destinations"),
     ("*", "/golive/destinations/*"),
+    // The Studio's lighter stream and Twitch Enhanced Broadcasting reshape the stream on air:
+    // the PC only (`*` is one segment, so the rule above does not reach these).
+    ("*", "/golive/destinations/*/light"),
+    ("*", "/golive/destinations/*/enhanced"),
     ("*", "/golive/test"),
     ("*", "/golive/networks"),
     // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.
@@ -413,6 +417,9 @@ mod tests {
             ("GET", "/accounts"),
             ("POST", "/accounts/twitch/connect"),
             ("DELETE", "/accounts/kick"),
+            ("PUT", "/golive/destinations/twitch/light"),
+            ("PUT", "/golive/destinations/twitch/enhanced"),
+            ("DELETE", "/golive/destinations/c_1"),
             ("POST", "/session/pair-code"),
             ("POST", "/session/pair"),
             ("GET", "/pro"),

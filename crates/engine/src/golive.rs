@@ -521,6 +521,8 @@ pub(crate) struct GoLive {
     running: Mutex<HashMap<String, Running>>,
     pub(crate) blocked: Mutex<HashMap<String, String>>,
     upload: Mutex<Option<UploadCheck>>,
+    /// Destinations turned on or off during this stream (for the session record).
+    pub(crate) dest_log: Mutex<Vec<ferrocast_core::diagnostics::DestinationEvent>>,
     /// The last stream's measured rate, for planning the next one (0: none yet).
     last_kbps: std::sync::atomic::AtomicU32,
     /// One upload check or OBS change at a time.
@@ -564,6 +566,38 @@ pub(crate) struct GoLive {
     /// a recording, say): the stream isn't held to it, so no badge says it is and no warning about
     /// its bitrate is held back.
     cap_failed: std::sync::atomic::AtomicBool,
+    /// Set while a destination change is applied to a running stream: the Studio's encoder is
+    /// shared by every other output (and a "Same as stream" recording), so its cap isn't touched.
+    /// The cap the Studio's running encode was given when it started: what the encode really
+    /// is, whatever the destinations say now (only a new stream gets a new one).
+    applied_cap: Mutex<Option<crate::studio_host::StreamCap>>,
+    /// Names by id of destinations that sent, for the session record (a deleted one keeps its name).
+    dest_names: Mutex<std::collections::HashMap<String, String>>,
+    /// A platform said the stream ended while the hub still runs (every destination was
+    /// switched off, the stream and recording go on): the session record closes with the hub.
+    health_end_pending: std::sync::atomic::AtomicBool,
+}
+
+/// The last title and category pushed count for this stream only when they were pushed lately
+/// and some platform took them; a push from weeks ago (or one that failed everywhere) would put
+/// an old title on a platform the streamer set up by hand today.
+pub(crate) fn recent_push(h: &ferrocast_core::stream_info::HistoryEntry, now_ms: i64) -> bool {
+    const HOURS_12_MS: i64 = 12 * 3_600_000;
+    now_ms.saturating_sub(h.at) < HOURS_12_MS && h.results.iter().any(|r| r.ok)
+}
+
+/// What the sound and the packaging add to a stream's measured rate over its video (the rules' own slack).
+const AUDIO_SLACK_KBPS: u32 = 400;
+/// How far a measured keyframe gap may run over a platform's before it counts as too long.
+const KEYFRAME_SLACK_MS: u32 = 500;
+
+/// Answers to the questions a mid-stream change asks first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DestinationConfirm {
+    /// Add it although the last upload check says it won't fit.
+    pub upload: bool,
+    /// Stop sending to the last destination.
+    pub last: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -613,6 +647,7 @@ impl Default for GoLive {
             running: Mutex::new(HashMap::new()),
             blocked: Mutex::new(HashMap::new()),
             upload: Mutex::new(None),
+            dest_log: Mutex::new(Vec::new()),
             last_kbps: std::sync::atomic::AtomicU32::new(0),
             busy: tokio::sync::Mutex::new(()),
             reconciling: tokio::sync::Mutex::new(()),
@@ -632,6 +667,9 @@ impl Default for GoLive {
             studio_video: Mutex::new(None),
             studio_live: std::sync::atomic::AtomicBool::new(false),
             cap_failed: std::sync::atomic::AtomicBool::new(false),
+            applied_cap: Mutex::new(None),
+            dest_names: Mutex::new(std::collections::HashMap::new()),
+            health_end_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -940,6 +978,57 @@ impl Engine {
         self.golive().cfg.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
+    /// Test helpers: a measured upload to judge a change against, and a destination that gave up.
+    #[cfg(test)]
+    pub(crate) fn seed_upload_for_test(&self, upload_kbps: u32) {
+        let verdict = probe::verdict_keeping(upload_kbps, &[], 20);
+        *lock(&self.golive().upload) =
+            Some(UploadCheck { at: now().0, measured_by: "twitch".into(), rows: Vec::new(), verdict });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upload_now_for_test(&self, cfg: &GoLiveConfig) -> Option<UploadCheck> {
+        self.upload_now(cfg)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_failed_for_test(&self, id: &str) {
+        let h = Health {
+            state: PushState::Failed { attempts: 3, reason: "refused".into(), detail: None, refused: false },
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
+            since_ms: 0,
+        };
+        lock(&self.golive().failed).insert(id.to_string(), h);
+        if let Some(r) = lock(&self.golive().running).remove(id) {
+            r.stop.send_replace(true);
+        }
+    }
+
+    /// Whether a stream is running that a destination change would be applied to.
+    pub(crate) fn health_end_deferred(&self) {
+        self.golive().health_end_pending.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn golive_stream_running(&self) -> bool {
+        self.golive().hub.live().borrow().on || self.golive().vhub.live().borrow().on
+    }
+
+    /// `reconcile`, for a change made while a stream runs: starts and stops only the outputs
+    /// that changed and leaves the Studio's encoder (its cap and shape) alone.
+    pub(crate) async fn reconcile_midstream(&self) {
+        // While a stream runs `sync_stream_cap` leaves its encoder alone, so this is `reconcile`.
+        self.reconcile().await;
+    }
+
+    /// The destinations sending right now (ids).
+    pub fn golive_running(&self) -> std::collections::BTreeSet<String> {
+        lock(&self.golive().running).keys().cloned().collect()
+    }
+
     pub(crate) fn note_studio_settings(&self, s: &crate::studio_host::StudioSettings) {
         *lock(&self.golive().studio_video) = Some(StudioCapConfig::from(s));
     }
@@ -987,6 +1076,19 @@ impl Engine {
     }
 
     pub(crate) async fn sync_stream_cap(&self) {
+        // A stream is running and its cap was applied: its encoder (shared by every output and a
+        // "Same as stream" recording) keeps it, whatever is ticked or unticked now. The next
+        // stream starts with a cap worked out again. (A cap that failed is tried again.)
+        if self.golive_stream_running() && !self.golive().cap_failed.load(std::sync::atomic::Ordering::Acquire) {
+            self.send_golive_pub();
+            return;
+        }
+        self.sync_stream_cap_now().await;
+    }
+
+    /// Works the cap out and applies it, on a running stream too: for what the streamer chose
+    /// on purpose (the Advanced switch that ignores the platforms' limits).
+    pub(crate) async fn sync_stream_cap_now(&self) {
         let Ok(host) = self.studio_host() else { return };
         let limit = self.studio_limit();
         let no_bframes = self.studio_no_bframes();
@@ -998,7 +1100,10 @@ impl Engine {
         });
         let failed = &self.golive().cap_failed;
         match host.set_stream_cap(cap).await {
-            Ok(()) => failed.store(false, std::sync::atomic::Ordering::Release),
+            Ok(()) => {
+                failed.store(false, std::sync::atomic::Ordering::Release);
+                *lock(&self.golive().applied_cap) = cap;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "couldn't update the Studio's stream cap");
                 // The stream on air isn't held to the platform's limit: said, and the view stops
@@ -1146,7 +1251,11 @@ impl Engine {
             vertical_live,
             vertical_stats,
             destinations,
-            upload: lock(&g.upload).clone(),
+            upload: if live || vertical_live {
+                self.upload_now(&cfg).or_else(|| lock(&g.upload).clone())
+            } else {
+                lock(&g.upload).clone()
+            },
             protect: cfg.protect,
             aitum_ok: cfg.aitum_ok,
             advanced: cfg.advanced.clone(),
@@ -1387,6 +1496,19 @@ impl Engine {
     /// Saves the destinations' order and switches (custom ones keep their name and server).
     /// While live, a newly ticked one starts and an unticked one stops at once.
     pub async fn set_golive_destinations(&self, order: Vec<(String, bool)>) -> Result<GoLiveConfig, EngineError> {
+        self.set_golive_destinations_checked(order, DestinationConfirm { upload: true, last: true }).await
+    }
+
+    /// Orders and ticks the destinations. While a stream runs, a newly ticked destination
+    /// starts only its own output and an unticked one stops only its own; the others, the
+    /// recording and the replay buffer are never touched. A destination the running encode
+    /// can't serve is refused (422), one that would not fit the measured upload, and removing
+    /// the last one, need `confirm` first (409).
+    pub async fn set_golive_destinations_checked(
+        &self,
+        order: Vec<(String, bool)>,
+        confirm: DestinationConfirm,
+    ) -> Result<GoLiveConfig, EngineError> {
         // Read, change and save under the config lock, so two saves never undo each other.
         let one_at_a_time = self.config_lock().await;
         let cfg = self.golive_config();
@@ -1406,18 +1528,261 @@ impl Engine {
             }
             next.push(DestinationConfig { enabled: *enabled, ..d.clone() });
         }
+        let added: Vec<DestinationConfig> = next
+            .iter()
+            .filter(|n| n.enabled && cfg.destinations.iter().any(|o| o.id == n.id && !o.enabled))
+            .cloned()
+            .collect();
+        let live = self.golive().hub.live().borrow().on || self.golive().vhub.live().borrow().on;
+        if live {
+            self.check_midstream(&cfg, &next, &added, confirm)?;
+        }
         let next = GoLiveConfig { destinations: next, ..self.golive_config() };
         self.save_golive(next.clone()).await?;
-        drop(one_at_a_time);
-        // Unticking a paused or failed destination clears it (ticking it again starts fresh).
+        // Unticking a paused or failed destination clears it (ticking it again starts fresh):
+        // under the config lock, so a second toggle can't have its fresh state cleared by this one.
         for d in next.destinations.iter().filter(|d| !d.enabled) {
             lock(&self.golive().protector).release(&d.id);
             lock(&self.golive().paused).remove(&d.id);
             lock(&self.golive().failed).remove(&d.id);
             lock(&self.golive().failed_alerted).remove(&d.id);
         }
-        self.reconcile().await;
+        drop(one_at_a_time);
+        self.reconcile_midstream().await;
+        if live {
+            // Only the ones still ticked and sending: a second toggle may have taken one away.
+            let now = self.golive_config();
+            let running = self.golive_running();
+            let still: Vec<DestinationConfig> = added
+                .into_iter()
+                .filter(|d| now.destinations.iter().any(|n| n.id == d.id && n.enabled) && running.contains(&d.id))
+                .collect();
+            self.push_stream_info_to(&still);
+        }
         Ok(next)
+    }
+
+    /// What may not happen to the running stream: a destination its encode can't serve, an
+    /// upload it would overload, and taking the last destination away.
+    fn check_midstream(
+        &self,
+        before: &GoLiveConfig,
+        next: &[DestinationConfig],
+        added: &[DestinationConfig],
+        confirm: DestinationConfirm,
+    ) -> Result<(), EngineError> {
+        for d in added {
+            if let Some(why) = self.midstream_misfit(next, d) {
+                return Err(refused("golive_needs_new_encode", why, "Stop and start the stream again with it ticked."));
+            }
+        }
+        // Per live canvas: the last destination ticked on a picture that is on air.
+        // Ones that have failed don't count as left: they send nothing, and with only failed
+        // ones left the stream would be ended for the failure.
+        let failed: std::collections::HashSet<String> = lock(&self.golive().failed).keys().cloned().collect();
+        let emptied = |canvas: Canvas, on_air: bool| {
+            on_air
+                && before.destinations.iter().any(|d| d.enabled && d.canvas == canvas && !failed.contains(&d.id))
+                && !next.iter().any(|d| d.enabled && d.canvas == canvas && !failed.contains(&d.id))
+        };
+        let g = self.golive();
+        let last_one =
+            emptied(Canvas::Main, g.hub.live().borrow().on) || emptied(Canvas::Vertical, g.vhub.live().borrow().on);
+        if !confirm.last && last_one {
+            return Err(EngineError::Refused {
+                status: 409,
+                code: "golive_last_destination",
+                message: "That's the last destination: nothing will be sent to a platform any more.".into(),
+                hint: "The stream and the recording keep going. Confirm to stop sending.".into(),
+                retry_after: None,
+            });
+        }
+        if !confirm.upload && !added.is_empty() {
+            let after = GoLiveConfig { destinations: next.to_vec(), ..before.clone() };
+            if let Some(check) = self.upload_now(&after)
+                && !check.verdict.fits
+            {
+                return Err(EngineError::Refused {
+                    status: 409,
+                    code: "golive_upload_exceeded",
+                    message: check.verdict.message,
+                    hint: "Confirm to add it anyway, or lower the bitrate first.".into(),
+                    retry_after: None,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Why `d` can't join the stream already running, or `None` when the running encode serves it
+    /// as it is. Only `d` itself is judged (the others already take this stream), against the
+    /// encode actually on air. Changing that encode would change every other output, so a
+    /// destination that needs it changed is refused instead.
+    fn midstream_misfit(&self, _next: &[DestinationConfig], d: &DestinationConfig) -> Option<String> {
+        use ferrocast_golive::flv::VideoCodec;
+        let g = self.golive();
+        let name = dest_name(d);
+        if d.canvas == Canvas::Vertical {
+            return (!g.vhub.live().borrow().on)
+                .then(|| "The vertical stream isn't running, so this destination can't join it now.".to_string());
+        }
+        // The main stream isn't running: it starts with it, nothing to disturb.
+        if !g.hub.live().borrow().on {
+            return None;
+        }
+        // On the Studio's lighter stream only while that stream really runs; from OBS "light"
+        // has no lighter copy and the destination takes the full stream.
+        if self.on_light(d) {
+            return None;
+        }
+        let studio_on = g.studio_live.load(std::sync::atomic::Ordering::Acquire);
+        let cfg = *lock(&g.studio_video);
+        let stats = g.hub.stats();
+        let direct = d.url.as_deref().and_then(direct_kind);
+        if d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main && direct.is_none() {
+            return Some(format!(
+                "{name} with Enhanced Broadcasting starts at the beginning of a stream: it can't join this one."
+            ));
+        }
+        if direct == Some("whip") {
+            if !studio_on {
+                return Some(format!(
+                    "{name} (WebRTC) is sent by the Ferrocast Studio: it can't join a stream from OBS."
+                ));
+            }
+            if cfg.is_some_and(|c| c.bframes) && !self.studio_no_bframes() {
+                return Some(format!(
+                    "{name} (WebRTC) can't carry B-frames, and this stream has them. Turning them off would change the stream every other output is sending."
+                ));
+            }
+            if matches!(stats.video_codec, Some(VideoCodec::Av1 | VideoCodec::Vp9)) {
+                return Some(format!("{name} (WebRTC) takes H.264 or HEVC and this stream is not."));
+            }
+            return None;
+        }
+        if direct.is_some() || self.golive_config().advanced.ignore_service_limits {
+            return None;
+        }
+        let limit = probe::ceiling(d.kind, d.enhanced);
+        // YouTube's own rules: no VP9.
+        if d.kind == Service::Youtube && matches!(stats.video_codec, Some(VideoCodec::Vp9)) {
+            return Some(format!("{name} doesn't take VP9, and this stream is VP9."));
+        }
+        let limit = limit?;
+        // What is on air: the Studio's configured video rate held to the cap it already has, or
+        // (from OBS) the measured rate less the sound and the packaging.
+        let on_air_kbps = if studio_on && let Some(c) = cfg {
+            c.video_kbps.min(lock(&g.applied_cap).and_then(|a| a.max_kbps).unwrap_or(u32::MAX))
+        } else {
+            stats.kbps.saturating_sub(AUDIO_SLACK_KBPS)
+        };
+        if on_air_kbps > limit.max_kbps {
+            return Some(format!(
+                "{name} takes at most {} kbps and this stream is sending {}. Changing the live encode would change every other output.",
+                limit.max_kbps, on_air_kbps
+            ));
+        }
+        if limit.h264_only && stats.video_codec.is_some_and(|c| c != VideoCodec::H264) {
+            return Some(format!(
+                "{name} takes H.264 only and this stream is not. Changing the live encode would change every other output."
+            ));
+        }
+        if limit.keyframe_secs > 0
+            && stats.keyframe_interval_ms.is_some_and(|k| k > limit.keyframe_secs * 1000 + KEYFRAME_SLACK_MS)
+        {
+            return Some(format!(
+                "{name} wants a keyframe every {} s and this stream sends one every {} s. Changing the live encode would change every other output.",
+                limit.keyframe_secs,
+                stats.keyframe_interval_ms.unwrap_or(0) / 1000
+            ));
+        }
+        None
+    }
+
+    /// The last upload check, worked out again for the destinations ticked in `cfg` (a stream
+    /// rate for each, as it is now); `None` when no check was ever made.
+    fn upload_now(&self, cfg: &GoLiveConfig) -> Option<UploadCheck> {
+        let g = self.golive();
+        let last = lock(&g.upload).clone()?;
+        let main = g.hub.stats().kbps;
+        let vert = g.vhub.stats().kbps;
+        let light = g.lhub.stats().kbps;
+        let rate = |d: &DestinationConfig| {
+            // What the destination really gets: the lighter stream's rate for a destination on it.
+            let live_rate = if d.canvas == Canvas::Vertical {
+                vert
+            } else if self.on_light(d) && light > 0 {
+                light
+            } else {
+                main
+            };
+            last.rows.iter().find(|r| r.id == d.id).map(|r| r.need_kbps).filter(|k| *k > 0 && live_rate == 0).unwrap_or(
+                if live_rate > 0 {
+                    live_rate
+                } else if d.canvas == Canvas::Vertical {
+                    DEFAULT_VERTICAL_NEED_KBPS
+                } else {
+                    DEFAULT_NEED_KBPS
+                },
+            )
+        };
+        // A backup waiting for its ticked main one sends only if that fails: not billed twice.
+        let enabled: Vec<&DestinationConfig> =
+            cfg.destinations.iter().filter(|d| d.enabled && !backs_up(cfg, &d.id).is_some_and(|p| p.enabled)).collect();
+        let streaming = g.hub.live().borrow().on || g.vhub.live().borrow().on;
+        let rows: Vec<UploadRow> = enabled
+            .iter()
+            .map(|d| {
+                let old = last.rows.iter().find(|r| r.id == d.id);
+                UploadRow {
+                    id: d.id.clone(),
+                    name: dest_name(d),
+                    server: old.and_then(|r| r.server.clone()),
+                    delay_ms: old.and_then(|r| r.delay_ms),
+                    need_kbps: rate(d),
+                    // A problem found by a check hours ago (unreachable then) isn't held against it
+                    // on a stream that is running now: it is billed as the stream is.
+                    problem: if streaming { None } else { old.and_then(|r| r.problem.clone()) },
+                }
+            })
+            .collect();
+        let needs: Vec<Need> = rows
+            .iter()
+            .filter(|r| r.problem.is_none())
+            .map(|r| Need { name: r.name.clone(), kbps: r.need_kbps })
+            .collect();
+        let verdict = probe::verdict_keeping(last.verdict.upload_kbps, &needs, cfg.advanced.keep_free_pct);
+        Some(UploadCheck { at: last.at, measured_by: last.measured_by, verdict, rows })
+    }
+
+    /// Gives a destination just added mid-stream the title and category already chosen for the
+    /// others (their platform's own), without waiting for anyone.
+    fn push_stream_info_to(&self, added: &[DestinationConfig]) {
+        let platforms: Vec<Platform> = added.iter().filter_map(|d| platform_of(d.kind)).collect();
+        if platforms.is_empty() {
+            return;
+        }
+        let engine = self.clone();
+        let want_youtube = platforms.contains(&Platform::Youtube);
+        tokio::spawn(async move {
+            let Ok(saved) = engine.stream_info_saved().await else { return };
+            let Some(last) = saved.history.first().filter(|h| recent_push(h, now().0)) else { return };
+            if let Err(e) = engine.apply_stream_info(last.info.clone(), Some(platforms), Some("added mid-stream")).await
+            {
+                tracing::warn!(error = %e, "couldn't give the title and category to a destination added mid-stream");
+            }
+            // YouTube may not have its broadcast yet: the title it waits with is given as soon as
+            // it has one. (`youtube_when_live` only wakes when a stream starts, and this one
+            // already has.)
+            if want_youtube {
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    if !engine.golive_stream_running() || engine.apply_youtube_pending().await {
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Gives destination `id` the Studio's lighter stream (720p, 3,000 kbps) or the full one.
@@ -1438,12 +1803,20 @@ impl Engine {
             return Ok(cfg);
         }
         d.light = on;
+        // Off while live puts it on the full stream: that must fit as a new destination does.
+        let moved = d.clone();
+        if !on && moved.enabled && self.golive_stream_running() {
+            let now: Vec<DestinationConfig> = cfg.destinations.clone();
+            if let Some(why) = self.midstream_misfit(&now, &moved) {
+                return Err(refused("golive_needs_new_encode", why, "Stop and start the stream again to change it."));
+            }
+        }
         self.save_golive(cfg.clone()).await?;
         drop(one_at_a_time);
         if let Some(r) = lock(&self.golive().running).remove(id) {
             r.stop.send_replace(true);
         }
-        self.reconcile().await;
+        self.reconcile_midstream().await;
         Ok(cfg)
     }
 
@@ -1528,7 +1901,11 @@ impl Engine {
             d.enhanced = on;
             self.save_golive(cfg.clone()).await?;
         }
-        self.sync_stream_cap().await;
+        // It takes effect the next time the Studio starts streaming: a running stream's encoder
+        // is shared by every output and isn't reshaped for it.
+        if !self.golive_stream_running() {
+            self.sync_stream_cap().await;
+        }
         Ok(cfg)
     }
 
@@ -1592,7 +1969,9 @@ impl Engine {
             kind: Service::Custom,
             name: Some(name.to_string()),
             url: Some(url),
-            enabled: true,
+            // While a stream runs it is added unticked: ticking it is the guarded step (the
+            // encode check, the upload question), and it starts at the next stream otherwise.
+            enabled: !self.golive_stream_running(),
             canvas,
             light: false,
             enhanced: false,
@@ -1600,7 +1979,7 @@ impl Engine {
         cfg.destinations.push(d.clone());
         self.save_golive(cfg).await?;
         drop(one_at_a_time);
-        self.reconcile().await;
+        self.reconcile_midstream().await;
         Ok(d)
     }
 
@@ -1738,6 +2117,24 @@ impl Engine {
         if cfg.destinations[i].kind != Service::Custom {
             return Err(EngineError::Invalid("Twitch, YouTube and Kick can be switched off, not removed.".into()));
         }
+        // The last one sending is stopped by switching it off, which asks first.
+        let gone = &cfg.destinations[i];
+        let canvas_on_air = match gone.canvas {
+            Canvas::Main => self.golive().hub.live().borrow().on,
+            Canvas::Vertical => self.golive().vhub.live().borrow().on,
+        };
+        if gone.enabled
+            && canvas_on_air
+            && !cfg.destinations.iter().enumerate().any(|(j, d)| j != i && d.enabled && d.canvas == gone.canvas)
+        {
+            return Err(EngineError::Refused {
+                status: 409,
+                code: "golive_last_destination",
+                message: "That's the last destination sending: removing it stops the sending.".into(),
+                hint: "Switch it off first (it asks), then remove it.".into(),
+                retry_after: None,
+            });
+        }
         cfg.destinations.remove(i);
         // Its Advanced settings go with it, so a saved set never names a missing destination
         // (nor one that backed something up).
@@ -1755,11 +2152,11 @@ impl Engine {
         let _ = self.inner.secrets.delete(&format!("{CUSTOM_KEY_PREFIX}{id}"));
         lock(&self.golive().failed).remove(id);
         lock(&self.golive().failed_alerted).remove(id);
-        self.reconcile().await;
+        self.reconcile_midstream().await;
         Ok(())
     }
 
-    async fn save_golive(&self, cfg: GoLiveConfig) -> Result<(), EngineError> {
+    pub(crate) async fn save_golive(&self, cfg: GoLiveConfig) -> Result<(), EngineError> {
         // A changed server (or any change) is tried again rather than trusting an old answer.
         lock(&self.golive().tested).clear();
         save_setting(self, CONFIG_KEY, &cfg).await?;
@@ -2058,6 +2455,10 @@ impl Engine {
     pub(crate) async fn reconcile(&self) {
         let g = self.golive();
         let _one = g.reconciling.lock().await;
+        let was_running: std::collections::HashSet<String> = lock(&g.running).keys().cloned().collect();
+        // Set below when a platform's "stream ended" was waiting for the hub to stop: the record
+        // closes after the last stops are noted in it.
+        let mut close_record = false;
         let (main_on, vertical_on, light_on) =
             (g.hub.live().borrow().on, g.vhub.live().borrow().on, g.lhub.live().borrow().on);
         let on = |d: &DestinationConfig| match d.canvas {
@@ -2089,6 +2490,7 @@ impl Engine {
         lock(&g.blocked).retain(|id, _| wanted(id));
         lock(&g.paused).retain(|id, _| wanted(id));
         if !main_on && !vertical_on {
+            close_record = g.health_end_pending.swap(false, std::sync::atomic::Ordering::AcqRel);
             lock(&g.protector).reset();
             // The next stream starts with every destination given its own chance again.
             *lock(&g.backup) = BackupState::default();
@@ -2110,6 +2512,25 @@ impl Engine {
         self.studio_sync_vertical().await;
         self.studio_sync_light().await;
         self.sync_stream_cap().await;
+        // Which destinations started or stopped sending, for the session record.
+        let now_running: std::collections::HashSet<String> = lock(&g.running).keys().cloned().collect();
+        // By id, with the name remembered, so one deleted while sending still gets its stop.
+        let names: std::collections::HashMap<String, String> = {
+            let mut known = lock(&g.dest_names);
+            for d in &cfg.destinations {
+                known.insert(d.id.clone(), dest_name(d));
+            }
+            known.clone()
+        };
+        for id in was_running.union(&now_running) {
+            let (was, is) = (was_running.contains(id), now_running.contains(id));
+            if was != is {
+                self.note_destination(id, names.get(id).map_or(id.as_str(), String::as_str), is);
+            }
+        }
+        if close_record {
+            self.health_stream_ended(now()).await;
+        }
         self.send_golive();
     }
 
@@ -2189,7 +2610,7 @@ impl Engine {
         if rules_changed {
             lock(&self.golive().protector).set_rules(cfg.advanced.rules.clone());
         }
-        self.sync_stream_cap().await;
+        self.sync_stream_cap_now().await;
         Ok(cfg)
     }
 
@@ -2562,6 +2983,10 @@ impl Engine {
     /// Stops a destination the protector just paused and shows why on its health line.
     pub(crate) fn pause(&self, id: String, top: String) {
         let g = self.golive();
+        // Unticked while the protector was choosing it: nothing to pause (and nothing to bring back).
+        if !self.golive_config().destinations.iter().any(|d| d.id == id && d.enabled) {
+            return;
+        }
         if let Some(r) = lock(&g.running).remove(&id) {
             r.stop.send_replace(true);
         }
@@ -2651,6 +3076,11 @@ impl Engine {
             Err(_) => false,
         };
         if !studio {
+            return;
+        }
+        // Nothing is sending to a platform (all switched off, the stream goes on for a
+        // recording): there is nothing to protect or step down.
+        if lock(&g.running).is_empty() {
             return;
         }
         let cfg = self.golive_config();

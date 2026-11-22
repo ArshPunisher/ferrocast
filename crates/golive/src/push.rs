@@ -333,10 +333,9 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                 set_state(&health, PushState::Connecting);
             }
             let mut live_at: Option<Instant> = None;
-            let outcome = tokio::select! {
-                _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
-                r = session(&dest, target, &hub, &health, stream, via.as_ref(), &mut live_at) => r,
-            };
+            // `stop` is watched inside the session: while connecting it gives up at once, and once
+            // live it closes the connection properly (not dropped mid-write).
+            let outcome = session(&dest, target, &hub, &health, stream, via.as_ref(), &mut live_at, stop.clone()).await;
             match outcome {
                 Ok(Ended::Stopped) => break 'streams,
                 Ok(Ended::StreamEnded) => break,
@@ -488,10 +487,17 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                                 _ = tokio::time::sleep(wait) => {}
                             }
                             let mut probe_live: Option<Instant> = None;
-                            let probed = tokio::select! {
-                                _ = stop.wait_for(|s| *s) => Ok(Ended::Stopped),
-                                r = session(&dest, target, &hub, &health, stream, via.as_ref(), &mut probe_live) => r,
-                            };
+                            let probed = session(
+                                &dest,
+                                target,
+                                &hub,
+                                &health,
+                                stream,
+                                via.as_ref(),
+                                &mut probe_live,
+                                stop.clone(),
+                            )
+                            .await;
                             match probed {
                                 Ok(Ended::Stopped) => break 'streams,
                                 Ok(Ended::StreamEnded) => break 'connect,
@@ -808,6 +814,7 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
 }
 
 /// One connection: connect, publish, forward until the stream ends, `stop`, or an error.
+#[allow(clippy::too_many_arguments)]
 async fn session(
     dest: &Destination,
     target: &Target,
@@ -816,8 +823,12 @@ async fn session(
     stream: u64,
     via: Option<&links::Network>,
     live_at: &mut Option<Instant>,
+    mut stop: watch::Receiver<bool>,
 ) -> Result<Ended, PushError> {
-    let mut p = Publisher::open(target, &dest.key, via).await?;
+    let mut p = tokio::select! {
+        _ = async { let _ = stop.wait_for(|s| *s).await; } => return Ok(Ended::Stopped),
+        p = Publisher::open(target, &dest.key, via) => p?,
+    };
     // Its name asks the system (a quick command): off the async threads.
     let label = match via {
         Some(n) => {
@@ -868,6 +879,12 @@ async fn session(
     let mut window = (Instant::now(), progress.load(Ordering::Relaxed));
     loop {
         tokio::select! {
+            // Stopped (a destination unticked): the connection is closed properly, as at the
+            // end of a stream, so the platform sees a clean end and not a reset.
+            _ = async { let _ = stop.wait_for(|s| *s).await; } => {
+                p.finish().await;
+                return Ok(Ended::Stopped);
+            }
             frame = rx.recv() => {
                 let frame = match frame {
                     Ok(f) => f,
