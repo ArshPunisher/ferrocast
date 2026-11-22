@@ -114,7 +114,10 @@ Dashboard/PC-session only (`OWNER_DENIED` over the remote relay). Lets local scr
 | POST | `/api/v1/api-keys` | `{ name /* 1-60 */, scopes: ApiKeyScope[] /* non-empty */, expires_at?: number \| null }` → `201 { key, token }` (`token` shown once) |
 | DELETE | `/api/v1/api-keys/{id}` | → `204` immediate revocation (`404` if missing) |
 
-Scopes: `read_only`, `chat`, `alerts`, `studio_control`, `go_live`, `settings`.
+Scopes: `read_only`, `chat`, `alerts`, `studio_control`, `go_live`, `settings`. Each scope is an exact allowlist (no wildcards): the routes a scope reaches are listed one per line in `crates/server/src/scope_snapshots/<scope>.txt`, and a test fails when a scope reaches a route that isn't there. `go_live` never reads or sets a stream key or where a stream goes (`PUT /golive/advanced`, OBS setup and restore, the ffmpeg download are the PC's); `studio_control` has no automations and no stream start; `alerts` can't add or change custom alert HTML or fields and doesn't touch OBS or delete media; `read_only` doesn't see overlay tokens.
+
+Where a key works: only from this PC (a loopback connection), never from a web page (a request with an `Origin` is refused), and from another device only when the owner switches on **API keys over LAN** (setting `api_keys_over_lan`, off by default, changeable on the PC only, not by a key or a paired phone). `/api-keys` management is this PC's own and is refused to a LAN peer or the relay tunnel. `?key=` is accepted on `/api/v1/live` only. Revoking a key, or a key reaching its expiry, closes its open `/api/v1/live` sockets (close code `4401`). Failed key attempts are counted per address (20 a minute, then `429`); `429`s write at most one audit row per key per minute; the audit path is a documented route template or `(unknown)`.
+
 Never reachable by any API key (even with all 6 scopes): `/api/v1/api-keys*`, `/api/v1/session/*`, `/api/v1/accounts*`, `/api/v1/pro*`, `/api/v1/tips*`, `/api/v1/discord*`, `/api/v1/plugins*`, `/api/v1/diagnostics*`, `/api/v1/export`, `/api/v1/import*`, `/api/v1/backups/*`, `/api/v1/updates/*`, `PUT /api/v1/settings` changes to `lan_access`, `PUT /api/v1/obs*`, go-live stream keys/ingest/destinations, and local filesystem/OS dialogs. Examples live in `examples/follow-reactor` (Node) and `examples/streamdeck-controller` (Python).
 
 ### Accounts
