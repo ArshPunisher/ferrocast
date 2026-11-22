@@ -277,8 +277,18 @@ pub fn scale_for_short_edge(canvas: [u32; 2], target_short: u32) -> [u32; 2] {
 
 /// Candidate `(width, height, fps)` ladder in descending quality order for benchmark runs.
 pub fn candidate_ladder(canvas: [u32; 2], fps_preference: u32) -> Vec<(u32, u32, u32)> {
+    candidate_ladder_for_mode(canvas, fps_preference, AutoConfigMode::Stream)
+}
+
+/// Candidate `(width, height, fps)` ladder in descending quality order for `mode` (`Stream` caps
+/// at 1080p; `Record` supports 1440p and 4K/2160p when the canvas is that size or larger).
+pub fn candidate_ladder_for_mode(canvas: [u32; 2], fps_preference: u32, mode: AutoConfigMode) -> Vec<(u32, u32, u32)> {
     let [cw, ch] = [canvas[0].max(128) & !1, canvas[1].max(72) & !1];
-    let top_short = cw.min(ch).min(1080);
+    let max_short = match mode {
+        AutoConfigMode::Stream => 1080,
+        AutoConfigMode::Record => 2160,
+    };
+    let top_short = cw.min(ch).min(max_short);
     let mut tiers = Vec::new();
     let add = |list: &mut Vec<(u32, u32, u32)>, short: u32, fps: u32| {
         let [w, rh] = scale_for_short_edge([cw, ch], short);
@@ -288,23 +298,23 @@ pub fn candidate_ladder(canvas: [u32; 2], fps_preference: u32) -> Vec<(u32, u32,
         }
     };
 
+    let step_fps = if fps_preference >= 60 { 60 } else { 30 };
+    add(&mut tiers, top_short, step_fps);
+    if mode == AutoConfigMode::Record {
+        for tier in [1440, 1080] {
+            if top_short > tier {
+                add(&mut tiers, tier, step_fps);
+            }
+        }
+    }
+    if top_short > 720 {
+        add(&mut tiers, 720, step_fps);
+    }
     if fps_preference >= 60 {
-        add(&mut tiers, top_short, 60);
-        if top_short > 720 {
-            add(&mut tiers, 720, 60);
-        }
         add(&mut tiers, 720.min(top_short), 30);
-        if top_short > 480 {
-            add(&mut tiers, 480, 30);
-        }
-    } else {
-        add(&mut tiers, top_short, 30);
-        if top_short > 720 {
-            add(&mut tiers, 720, 30);
-        }
-        if top_short > 480 {
-            add(&mut tiers, 480, 30);
-        }
+    }
+    if top_short > 480 {
+        add(&mut tiers, 480, 30);
     }
     tiers
 }
@@ -399,8 +409,10 @@ fn preset_quality_rank(preset: Option<&str>) -> u8 {
     }
 }
 
-fn record_kbps_for(height: u32, fps: u32) -> u32 {
-    match (height, fps >= 60) {
+fn record_kbps_for(short_edge: u32, fps: u32) -> u32 {
+    match (short_edge, fps >= 60) {
+        (h, true) if h >= 2160 => 32_000,
+        (h, false) if h >= 2160 => 22_000,
         (h, true) if h >= 1440 => 18_000,
         (h, false) if h >= 1440 => 12_000,
         (h, true) if h >= 1080 => 12_000,
@@ -439,7 +451,7 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
     let (cap_w, cap_h, cap_fps) = match &ceiling {
         Some(c) => (c.max_width, c.max_height, c.max_fps),
         None => {
-            let [w, h] = scale_for_short_edge([cw, ch], canvas_short.min(1440));
+            let [w, h] = scale_for_short_edge([cw, ch], canvas_short.min(2160));
             (w, h, if input.fps_preference >= 60 { 60 } else { 30 })
         }
     };
@@ -507,7 +519,7 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
             (ceil.bitrate_kbps.min(tier_max).max(1500), LimitedBy::Headroom)
         }
         (None, _) => {
-            let why_limit = if !best.passed || out_short < canvas_short.min(1440) || out_fps < cap_fps {
+            let why_limit = if !best.passed || out_short < canvas_short.min(2160) || out_fps < cap_fps {
                 LimitedBy::Headroom
             } else {
                 LimitedBy::Balanced
@@ -981,5 +993,46 @@ mod tests {
         .unwrap();
         assert_eq!(rec_tight.scale, Some([480, 852]));
         assert_eq!(rec_tight.fps, 30);
+    }
+
+    #[test]
+    fn m1_record_mode_ladder_supports_1440p_and_4k() {
+        let ladder_4k = candidate_ladder_for_mode([3840, 2160], 60, AutoConfigMode::Record);
+        assert_eq!(
+            ladder_4k,
+            vec![
+                (3840, 2160, 60),
+                (2560, 1440, 60),
+                (1920, 1080, 60),
+                (1280, 720, 60),
+                (1280, 720, 30),
+                (852, 480, 30),
+            ]
+        );
+
+        let ladder_1440 = candidate_ladder_for_mode([2560, 1440], 60, AutoConfigMode::Record);
+        assert_eq!(
+            ladder_1440,
+            vec![(2560, 1440, 60), (1920, 1080, 60), (1280, 720, 60), (1280, 720, 30), (852, 480, 30)]
+        );
+
+        let cands = vec![
+            meas(EncoderFamily::VideoToolbox, None, 3840, 2160, 60, 4.0, Some(15.0)),
+            meas(EncoderFamily::VideoToolbox, None, 2560, 1440, 60, 2.5, Some(12.0)),
+        ];
+        let rec_4k = pick_recommendation(
+            &cands,
+            &PickInput {
+                mode: AutoConfigMode::Record,
+                fps_preference: 60,
+                canvas: [3840, 2160],
+                upload_kbps: None,
+                platforms: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(rec_4k.scale, None);
+        assert_eq!((rec_4k.width, rec_4k.height, rec_4k.fps), (3840, 2160, 60));
+        assert!(rec_4k.video_kbps >= 24_000, "4K60 record bitrate should scale above 1440p: {}", rec_4k.video_kbps);
     }
 }

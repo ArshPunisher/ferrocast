@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use crate::golive::{Canvas, UploadCheck};
 use ferrocast_golive::bench::{
     AutoConfigMode, BenchCandidate, BenchRecommendation, CandidateMeasurement, EncoderFamily, PickInput,
-    PlatformTarget, candidate_ladder, evaluate_candidate, pick_recommendation, stream_ceiling,
+    PlatformTarget, candidate_ladder, candidate_ladder_for_mode, evaluate_candidate, pick_recommendation,
+    stream_ceiling,
 };
 use ferrocore::{
     Blend, Bounds, Compositor, Content, Effect, Filter, Item, Picture, Placement, Scene, ffenc,
@@ -1752,7 +1753,7 @@ impl Engine {
             let mut cache = std::collections::HashMap::new();
             let sampler =
                 BackgroundLoadSampler::start(host_cpu_supported, rt_handle, engine_ref.clone(), cancel_clone.clone());
-            let ladder = candidate_ladder(canvas, fps_pref);
+            let ladder = candidate_ladder_for_mode(canvas, fps_pref, mode);
             let deadline = start_encode + timing.total_encode_budget;
             let mut results: Vec<BenchCandidate> = Vec::new();
             let mut hw_encoders = Vec::new();
@@ -1785,7 +1786,16 @@ impl Engine {
                 }
             };
 
-            let target_bitrate = ceil_clone.as_ref().map_or(8000, |c| c.bitrate_kbps);
+            let target_bitrate = ceil_clone.as_ref().map_or_else(
+                || {
+                    if mode == AutoConfigMode::Record && canvas[0].min(canvas[1]) >= 1440 {
+                        18_000
+                    } else {
+                        8_000
+                    }
+                },
+                |c| c.bitrate_kbps,
+            );
             let mut best_viable_tier = ladder[0];
 
             // 1. Hardware encoders first (VideoToolbox / NVENC / QSV / AMF / MF).
