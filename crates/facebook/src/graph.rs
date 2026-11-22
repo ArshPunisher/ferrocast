@@ -142,7 +142,12 @@ impl Graph {
         if id.is_empty() {
             return Err(FacebookError::Protocol("a live video without an id".into()));
         }
-        Ok(LiveVideo { id, server, key, permalink: v.get("permalink_url").and_then(Value::as_str).map(String::from) })
+        Ok(LiveVideo {
+            id,
+            server,
+            key,
+            permalink: v.get("permalink_url").and_then(Value::as_str).and_then(public_link),
+        })
     }
 
     /// The Page's live video that is live now, when there is one.
@@ -217,6 +222,20 @@ impl Graph {
         self.call(Method::POST, &format!("/{}", graph_id(live_id)?), &[], Some(Value::Object(body))).await?;
         Ok(applied)
     }
+}
+
+/// A link Graph sends back, as an address the dashboard may open: `https` only. Graph writes the
+/// permalink relative to facebook.com (`/page/videos/1`), so a path is completed; anything else
+/// (`javascript:`, `data:`, `http:`, `//host`, an address with a password) is dropped.
+pub(crate) fn public_link(raw: &str) -> Option<String> {
+    let full = if raw.starts_with('/') && !raw.starts_with("//") && !raw.contains('\\') {
+        format!("https://www.facebook.com{raw}")
+    } else {
+        raw.to_string()
+    };
+    let u = url::Url::parse(&full).ok()?;
+    (u.scheme() == "https" && u.host_str().is_some() && u.username().is_empty() && u.password().is_none())
+        .then(|| u.to_string())
 }
 
 /// A Graph id is letters, digits, `_` and `-` and nothing else: no `/`, `.`, `?`, `#` or `%` that

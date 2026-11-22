@@ -319,3 +319,38 @@ async fn an_id_that_is_not_a_plain_id_never_reaches_graph() {
         assert!(matches!(g.delete_comment(ok).await, Err(FacebookError::Network(_))), "{ok}");
     }
 }
+
+#[test]
+fn a_permalink_is_an_https_address_or_nothing() {
+    use crate::graph::public_link;
+    // Graph writes a path relative to facebook.com.
+    assert_eq!(public_link("/page/videos/1").as_deref(), Some("https://www.facebook.com/page/videos/1"));
+    assert_eq!(
+        public_link("https://www.facebook.com/p/videos/2").as_deref(),
+        Some("https://www.facebook.com/p/videos/2")
+    );
+    for bad in [
+        "javascript:alert(1)",
+        "JaVaScRiPt:alert(1)",
+        "data:text/html,<script>1</script>",
+        "http://www.facebook.com/p/videos/2",
+        "//evil.example/x",
+        "/\\evil.example/x",
+        "relative/no-slash",
+        "ftp://x/y",
+        "",
+        "https://",
+        "https://user:pass@evil.example/x",
+    ] {
+        assert_eq!(public_link(bad), None, "{bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_live_video_comes_back_with_a_usable_permalink() {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let base = fake_graph(seen).await;
+    let g = Graph::new(&base, "page", "TOKEN");
+    let v = g.create_live_video("t", None, Some(1_800_000_000)).await.unwrap();
+    assert_eq!(v.permalink.as_deref(), Some("https://www.facebook.com/page/videos/1"));
+}
