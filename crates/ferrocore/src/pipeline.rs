@@ -2212,6 +2212,25 @@ mod bframe_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A new empty folder for one test run: never the same twice, in this process or another.
+    fn unique_dir(what: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("ferrocore-{what}-{}-{n}-{t}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        dir
+    }
+
+    /// Removes its folder when dropped (a failing assertion leaves nothing behind).
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Stream sound tags (time, bytes) and each file's sound packet times.
     type SoundRun = (Vec<(u32, Vec<u8>)>, Vec<Vec<(f64, f64)>>);
 
@@ -2253,7 +2272,16 @@ mod bframe_tests {
             let y: Vec<u8> = (0..320 * 180).map(|p| ((p + i as usize * 7) % 251) as u8).collect();
             let uv = vec![128u8; 320 * 90];
             tags.extend(pipe.video(Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 }, ts).ok()?);
+            // The system encoder hands a frame's packet over when it likes (late on a busy machine),
+            // and a split happens when the keyframe comes out: ask it to finish this frame now, so
+            // every sound packet meets the split at the same place in both runs (state, not a sleep).
+            #[cfg(target_os = "macos")]
+            {
+                let ready = pipe.video.flush().ok()?;
+                tags.extend(pipe.video_out(ready).ok()?);
+            }
             tags.extend(pipe.audio(&tone(i), ts).ok()?);
+            #[cfg(not(target_os = "macos"))]
             std::thread::sleep(std::time::Duration::from_millis(3));
         }
         tags.extend(pipe.finish().ok()?);
@@ -2275,8 +2303,10 @@ mod bframe_tests {
         if !have("ffprobe") {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("ferrocore-aacthread-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        // A folder of its own per run (process id plus a counter and the clock), removed at the end
+        // even when an assertion fails, so concurrent tests and runs never share files.
+        let dir = unique_dir("aacthread");
+        let _cleanup = RemoveOnDrop(dir.clone());
         let (Some(here), Some(there)) = (sound_run(false, &dir), sound_run(true, &dir)) else { return };
         assert!(here.0.len() > 100, "{} sound tags", here.0.len());
         assert_eq!(here.0.len(), there.0.len(), "same number of stream sound tags");
@@ -2286,7 +2316,6 @@ mod bframe_tests {
             assert!(!a.is_empty(), "file {i} has sound");
             assert_eq!(a, b, "file {i}: sound packet times identical");
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Raw AAC tags' times (the sequence headers left out) from a stream with a `heal` in it.
