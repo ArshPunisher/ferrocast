@@ -14,6 +14,7 @@ pub mod overlays;
 pub mod recap;
 pub mod rules;
 pub mod settings;
+pub mod store_catalog;
 pub mod stream_health;
 pub mod studio;
 pub mod viewers;
