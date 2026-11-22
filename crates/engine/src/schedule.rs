@@ -8,7 +8,6 @@ use ferrocast_connector::{ConnectorError, StreamInfo};
 use ferrocast_core::event::Platform;
 use ferrocast_store::repo;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 use crate::frames::{LiveFrame, Notice, NoticeLevel};
 use crate::{Engine, EngineError};
@@ -18,6 +17,11 @@ const MAX_PLANS: usize = 50;
 const TICK: Duration = Duration::from_secs(30);
 /// A plan this long past its start is dropped.
 const KEEP_AFTER_START_MS: i64 = 24 * 3_600_000;
+/// Past this long after its start a plan's reminder is not said any more ("planned for now" would
+/// be wrong after the PC slept): it is marked done quietly.
+const STALE_REMINDER_MS: i64 = 30 * 60_000;
+/// A plan can start at most this far ahead (a year and a day: a date, not an overflow).
+const MAX_AHEAD_MS: i64 = 366 * 24 * 3_600_000;
 /// Platforms a plan can name.
 const PLATFORMS: &[Platform] = &[Platform::Twitch, Platform::Youtube, Platform::Kick, Platform::Facebook];
 
@@ -62,9 +66,6 @@ fn default_remind() -> u32 {
     10
 }
 
-/// One writer at a time: a plan is read, changed and saved whole.
-static WRITE: Mutex<()> = Mutex::const_new(());
-
 fn slug(p: Platform) -> String {
     crate::platform_key(p).to_string()
 }
@@ -90,8 +91,12 @@ impl Engine {
     }
 
     pub async fn schedule_create(&self, new: NewScheduled) -> Result<ScheduledStream, EngineError> {
-        if new.start_ms <= crate::now().0 {
+        let at = crate::now().0;
+        if new.start_ms <= at {
             return Err(EngineError::Invalid("start: pick a time in the future.".into()));
+        }
+        if new.start_ms > at.saturating_add(MAX_AHEAD_MS) {
+            return Err(EngineError::Invalid("start: at most a year ahead.".into()));
         }
         if new.platforms.is_empty() || new.platforms.iter().any(|p| !PLATFORMS.contains(p)) {
             return Err(EngineError::Invalid(
@@ -111,6 +116,13 @@ impl Engine {
                 platforms.push(p);
             }
         }
+        // A full schedule is refused before any platform is asked: a broadcast made for a plan that
+        // then can't be saved is lost (YouTube's costs 50 quota units).
+        if self.schedule_list().await?.len() >= MAX_PLANS {
+            return Err(EngineError::Conflict(format!(
+                "You can plan up to {MAX_PLANS} streams. Delete one that's done."
+            )));
+        }
         // The platforms are asked outside the write lock: they may be slow.
         let mut broadcasts = Vec::new();
         for p in &platforms {
@@ -127,7 +139,7 @@ impl Engine {
             reminded: false,
             broadcasts,
         };
-        let _w = WRITE.lock().await;
+        let _w = self.config_lock().await;
         let mut all = self.schedule_list().await?;
         if all.len() >= MAX_PLANS {
             return Err(EngineError::Conflict(format!(
@@ -164,7 +176,7 @@ impl Engine {
     }
 
     pub async fn schedule_delete(&self, id: &str) -> Result<(), EngineError> {
-        let _w = WRITE.lock().await;
+        let _w = self.config_lock().await;
         let mut all = self.schedule_list().await?;
         let before = all.len();
         all.retain(|p| p.id != id);
@@ -177,19 +189,27 @@ impl Engine {
     /// One pass: the reminders now due (each once), and long-past plans dropped. Returns the
     /// reminders' text. It only ever tells: nothing is started here.
     pub async fn schedule_tick(&self, at_ms: i64) -> Result<Vec<String>, EngineError> {
-        let _w = WRITE.lock().await;
+        let _w = self.config_lock().await;
         let mut all = self.schedule_list().await?;
+        // Dropped first: a plan that is going is not reminded about on its way out.
+        let n = all.len();
+        all.retain(|p| at_ms < p.start_ms.saturating_add(KEEP_AFTER_START_MS));
         let mut said = Vec::new();
-        let mut changed = false;
+        let mut changed = all.len() != n;
         for p in &mut all {
-            if !p.reminded && at_ms >= p.start_ms - i64::from(p.remind_minutes) * 60_000 {
+            let due = p.start_ms.saturating_sub(i64::from(p.remind_minutes) * 60_000);
+            if !p.reminded && at_ms >= due {
                 p.reminded = true;
                 changed = true;
+                // Long after the start (the PC was asleep): nothing to say, only to mark done.
+                if at_ms > p.start_ms.saturating_add(STALE_REMINDER_MS) {
+                    continue;
+                }
                 let title = p.info.title.clone().unwrap_or_default();
                 let msg = if at_ms >= p.start_ms {
                     format!("Time to stream: \"{title}\" was planned for now.")
                 } else {
-                    let mins = ((p.start_ms - at_ms) + 59_999) / 60_000;
+                    let mins = (p.start_ms.saturating_sub(at_ms).saturating_add(59_999)) / 60_000;
                     format!("\"{title}\" starts in {mins} minute{}.", if mins == 1 { "" } else { "s" })
                 };
                 self.send_live(LiveFrame::new(
@@ -199,9 +219,7 @@ impl Engine {
                 said.push(msg);
             }
         }
-        let n = all.len();
-        all.retain(|p| at_ms < p.start_ms + KEEP_AFTER_START_MS);
-        if changed || all.len() != n {
+        if changed {
             self.schedule_save(all).await?;
         }
         Ok(said)

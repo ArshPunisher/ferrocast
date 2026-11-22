@@ -157,7 +157,68 @@ async fn deleting_removes_it_and_an_unknown_id_is_not_found() {
 async fn long_past_plans_are_dropped() {
     let (e, _d) = engine().await;
     let item = e.schedule_create(input("Show", &[Platform::Twitch], HOUR)).await.unwrap();
-    e.schedule_tick(item.start_ms + 3 * 24 * HOUR).await.unwrap();
+    // Dropped without a "planned for now" toast on the very tick that drops it.
+    let said = e.schedule_tick(item.start_ms + 3 * 24 * HOUR).await.unwrap();
+    assert!(said.is_empty(), "{said:?}");
     assert!(e.schedule_list().await.unwrap().is_empty());
     let _: Option<ScheduledStream> = None;
+}
+
+#[tokio::test]
+async fn a_plan_long_overdue_gets_no_reminder_but_one_just_past_still_does() {
+    let (e, _d) = engine().await;
+    let item = e.schedule_create(input("Show", &[Platform::Twitch], HOUR)).await.unwrap();
+    // The PC slept through it: 5 hours on, "was planned for now" would be wrong. It is marked
+    // reminded quietly and stays listed (it is dropped a day after its start).
+    let said = e.schedule_tick(item.start_ms + 5 * HOUR).await.unwrap();
+    assert!(said.is_empty(), "{said:?}");
+    let all = e.schedule_list().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(all[0].reminded);
+    // A few minutes past the start (a late tick) still says it.
+    let (e2, _d2) = engine().await;
+    let item2 = e2.schedule_create(input("Show", &[Platform::Twitch], HOUR)).await.unwrap();
+    let said = e2.schedule_tick(item2.start_ms + 5 * 60_000).await.unwrap();
+    assert_eq!(said.len(), 1);
+    assert!(said[0].contains("planned for now"), "{said:?}");
+}
+
+#[tokio::test]
+async fn a_full_schedule_refuses_before_any_platform_is_asked() {
+    let (e, _d) = engine().await;
+    for i in 0..50 {
+        e.schedule_create(input(&format!("S{i}"), &[Platform::Twitch], HOUR)).await.unwrap();
+    }
+    let yt = Arc::new(Fake::default());
+    e.register_connector(yt.clone());
+    let err = e.schedule_create(input("one too many", &[Platform::Youtube], HOUR)).await.unwrap_err();
+    assert!(matches!(err, EngineError::Conflict(_)), "{err:?}");
+    assert!(yt.made.lock().unwrap().is_empty(), "a broadcast (50 quota units) was made and thrown away");
+}
+
+#[tokio::test]
+async fn a_start_too_far_away_is_refused_and_a_stored_one_cannot_panic_the_tick() {
+    let (e, _d) = engine().await;
+    for start_ms in [i64::MAX, now().0 + 367 * 24 * HOUR] {
+        let mut n = input("Show", &[Platform::Twitch], HOUR);
+        n.start_ms = start_ms;
+        let err = e.schedule_create(n).await.unwrap_err();
+        assert!(matches!(&err, EngineError::Invalid(m) if m.starts_with("start:")), "{err:?}");
+    }
+    // A year ahead is fine.
+    let mut n = input("Show", &[Platform::Twitch], HOUR);
+    n.start_ms = now().0 + 360 * 24 * HOUR;
+    e.schedule_create(n).await.unwrap();
+    // A plan saved with a huge start (older data, a hand edit) is harmless to the tick.
+    let bad = ScheduledStream {
+        id: "s_bad".into(),
+        info: StreamInfo { title: Some("x".into()), ..Default::default() },
+        platforms: vec![Platform::Twitch],
+        start_ms: i64::MAX,
+        remind_minutes: 10,
+        reminded: false,
+        broadcasts: vec![],
+    };
+    e.db(move |s| ferrocast_store::repo::settings::set(s, "schedule", &vec![bad])).await.unwrap();
+    e.schedule_tick(now().0).await.unwrap();
 }
