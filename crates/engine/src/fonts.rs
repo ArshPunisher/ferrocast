@@ -437,9 +437,11 @@ fn bundled_matches_spec(spec: &FontSpec, bundled: &[&BundledFontFile]) -> bool {
     let raw_low = spec.raw_ref.as_deref().map(|r| r.rsplit(['/', '\\']).next().unwrap_or(r).to_ascii_lowercase());
     bundled.iter().any(|b| {
         b.declared_families.iter().any(|f| f.eq_ignore_ascii_case(&fam_low))
-            || raw_low
-                .as_ref()
-                .is_some_and(|r| b.archive_path.rsplit('/').next().is_some_and(|fname| fname.eq_ignore_ascii_case(r)))
+            // The file's name only counts when the file doesn't say what family it holds.
+            || (b.declared_families.is_empty()
+                && raw_low.as_ref().is_some_and(|r| {
+                    b.archive_path.rsplit('/').next().is_some_and(|fname| fname.eq_ignore_ascii_case(r))
+                }))
     })
 }
 

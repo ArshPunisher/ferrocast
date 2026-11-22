@@ -187,10 +187,13 @@ fn sanitize_pack_dest(pack_dir: &Path, rel_path: &str) -> Option<PathBuf> {
 /// Writes a pack's files under `pack_dir`; on any failure what was written is removed, so a
 /// failed import leaves no half-made folder behind. Returns each file's path, and the count and
 /// size of the media.
+/// Where each file went, how many media files, and their size.
+type Copied = Result<(Vec<String>, usize, u64), EngineError>;
+
 fn copy_pack_assets(
     pack_dir: &Path,
     assets: Vec<super::overlay_parse::UnpackedAsset>,
-) -> Result<(Vec<String>, usize, u64), EngineError> {
+) -> (Vec<super::overlay_parse::UnpackedAsset>, Copied) {
     let copy = || -> Result<(Vec<String>, usize, u64), EngineError> {
         let mut out_paths = Vec::with_capacity(assets.len());
         let mut count = 0usize;
@@ -217,7 +220,8 @@ fn copy_pack_assets(
     if res.is_err() {
         let _ = count_and_remove_dir(pack_dir);
     }
-    res
+    // The files go back to the caller: a later refusal can put the preview back.
+    (assets, res)
 }
 
 /// Removes `dir` and says how many files were in it. Links are counted and removed as links:
@@ -330,10 +334,10 @@ impl Engine {
         // Moved, not copied: a pack's media can be hundreds of megabytes.
         let assets = std::mem::take(&mut parsed.assets);
         let pack_dir_for_copy = pack_dir.clone();
-        let (asset_paths, media_copied, media_bytes) =
-            tokio::task::spawn_blocking(move || copy_pack_assets(&pack_dir_for_copy, assets))
-                .await
-                .map_err(|e| EngineError::Internal(e.to_string()))??;
+        let (assets_back, copied) = tokio::task::spawn_blocking(move || copy_pack_assets(&pack_dir_for_copy, assets))
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let (asset_paths, media_copied, media_bytes) = copied?;
 
         // 2. Resolve & install missing fonts solely from Google Fonts into `<data>/fonts/`.
         let installed = tokio::task::spawn_blocking(ferrocore::fonts::installed_system_font_families)
@@ -406,6 +410,9 @@ impl Engine {
         // recording may have started since, and the collection mustn't be swapped under it.
         if let Err(e) = self.ensure_idle_for_switch("scene collections").await {
             rollback_media_and_overlays().await;
+            // Nothing was used up: the same preview can be imported once the show has ended.
+            parsed.assets = assets_back;
+            stage_preview(&self.inner.overlay_import, preview_id.to_string(), parsed);
             return Err(e);
         }
 

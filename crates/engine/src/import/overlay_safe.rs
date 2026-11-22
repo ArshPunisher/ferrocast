@@ -440,6 +440,15 @@ pub(super) fn make_safe(doc: &mut Value, n_assets: usize, resolve: &dyn Fn(&str)
     let mut left_out = BTreeSet::new();
     let list = root.get("sources").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
     for s in list {
+        let name = s.get("name").and_then(Value::as_str).unwrap_or("");
+        if name.chars().count() > MAX_NAME && source_kind_ok(s.get("id").and_then(Value::as_str).unwrap_or("")) {
+            // Not shortened (scene items refer to it by name): left out, with its scene items.
+            left_out.insert(name.to_string());
+            let short: String = name.chars().take(40).collect();
+            cx.note(format!("Left out “{short}…”: its name is longer than {MAX_NAME} characters."));
+        }
+    }
+    for s in list {
         let kind = s.get("id").and_then(Value::as_str).unwrap_or("");
         let name = s.get("name").and_then(Value::as_str).unwrap_or("");
         if !source_kind_ok(kind) {
@@ -455,7 +464,7 @@ pub(super) fn make_safe(doc: &mut Value, n_assets: usize, resolve: &dyn Fn(&str)
         let Some(o) = s.as_object() else { continue };
         let kind = o.get("id").and_then(Value::as_str).unwrap_or("");
         let name = o.get("name").and_then(Value::as_str).unwrap_or("");
-        if !source_kind_ok(kind) {
+        if !source_kind_ok(kind) || left_out.contains(name) {
             continue;
         }
         let mut m = plain_settings(o, &["id", "versioned_id", "name"]);

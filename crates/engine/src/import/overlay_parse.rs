@@ -329,11 +329,12 @@ pub fn sanitize_archive_path(raw: &str) -> Result<String, EngineError> {
         // Windows drops a trailing dot or space (two names become one) and keeps device names
         // (`CON`, `NUL`, `COM1`) for the device, with or without an extension.
         let stem = seg.split('.').next().unwrap_or(seg).to_ascii_uppercase();
+        // `COM1`..`COM9` and `LPT1`..`LPT9`, and Windows also reserves them with superscript digits.
+        let last = stem.chars().nth(3);
         let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
             || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-                && stem.len() == 4
-                && stem.as_bytes()[3].is_ascii_digit()
-                && stem.as_bytes()[3] != b'0');
+                && stem.chars().count() == 4
+                && last.is_some_and(|c| matches!(c, '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}')));
         if seg.ends_with('.') || seg.ends_with(' ') || seg.starts_with(' ') || device {
             return Err(bad(format!("The theme pack contains an unsafe path \"{raw}\".")));
         }
@@ -495,7 +496,9 @@ fn extract_zip(zip_bytes: &[u8]) -> Result<ExtractedZip, EngineError> {
         }
 
         let packed = entry.compressed_size().max(1);
-        let too_squashed = |unpacked: u64| unpacked >= RATIO_CHECK_FROM && unpacked / packed > MAX_RATIO;
+        // Text (JSON) can pack tightly and legitimately; its size is bounded by its own cap.
+        let too_squashed =
+            |unpacked: u64| kind != EntryKind::Json && unpacked >= RATIO_CHECK_FROM && unpacked / packed > MAX_RATIO;
         let bomb = || {
             refused(
                 413,
@@ -1693,7 +1696,21 @@ fn parse_obs_or_own3d_pack(
         }
         for (idx, (sc_name, list)) in widgets_by_scene.into_iter().enumerate() {
             let ph_key = format!("{OVERLAY_PLACEHOLDER_PREFIX}own3d-{idx}");
-            let src_name = format!("{sc_name} Overlay");
+            // A name no source of the pack has (it could have a source called "Main Overlay").
+            let taken: BTreeSet<String> = doc
+                .get("sources")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter().filter_map(|s| s.get("name").and_then(Value::as_str)).map(str::to_lowercase).collect()
+                })
+                .unwrap_or_default();
+            let mut src_name = format!("{sc_name} Overlay");
+            for n in 2.. {
+                if !taken.contains(&src_name.to_lowercase()) {
+                    break;
+                }
+                src_name = format!("{sc_name} Overlay ({n})");
+            }
             if let Some(sources) = doc.get_mut("sources").and_then(Value::as_array_mut) {
                 let mut added_to_scene = false;
                 for s in sources.iter_mut() {

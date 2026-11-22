@@ -1088,6 +1088,7 @@ async fn an_endless_font_stylesheet_or_file_is_cut_off_as_it_arrives() {
         // Give the server a moment to notice the closed connection, then see how far it got.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let got = sent.load(Ordering::Relaxed);
+        assert!(got > 0, "{what}: the body began streaming (else this proves nothing)");
         assert!(got < cap_hint, "{what}: the whole {total} bytes were read ({got} sent), not cut off");
         handle.abort();
     }
@@ -1183,12 +1184,13 @@ async fn start_slow_font_server(delay_ms: u64) -> (String, Arc<AtomicUsize>, tok
 #[tokio::test]
 async fn a_show_that_starts_while_an_import_downloads_fonts_stops_the_import() {
     let (e, dir) = engine().await;
-    let (base, hits, handle) = start_slow_font_server(500).await;
+    let (base, hits, handle) = start_slow_font_server(1500).await;
     e.set_google_fonts_api(&base);
     let png = make_tiny_png();
     let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
     let zip = build_zip(vec![("config.json", &cfg, None), ("assets/frame.png", &png, None)]);
     let prev = e.preview_overlay_pack(zip, "slow.overlay".into()).await.unwrap();
+    let prev_id = prev.preview_id.clone();
     let before = studio_library::load(dir.path()).collections.current;
     let e2 = e.clone();
     let importing = tokio::spawn(async move {
@@ -1209,6 +1211,13 @@ async fn a_show_that_starts_while_an_import_downloads_fonts_stops_the_import() {
     }
     assert_eq!(studio_library::load(dir.path()).collections.current, before, "the collection was not swapped");
     assert!(files_under(&dir.path().join("studio").join("packs")).is_empty(), "the copied media was removed");
+    // The show ends: the same preview can be imported (the refusal didn't use it up).
+    e.studio().machine.lock().unwrap_or_else(|p| p.into_inner()).phase = crate::studio::show::BroadcastPhase::Idle;
+    let ok = e
+        .import_overlay_pack(OverlayPackImportReq { preview_id: prev_id, ..Default::default() })
+        .await
+        .unwrap_or_else(|e| panic!("the preview should still be there: {e:?}"));
+    assert_eq!(ok.media_copied, 1);
     handle.abort();
 }
 
@@ -1340,7 +1349,8 @@ fn a_copy_that_fails_halfway_removes_what_it_wrote() {
     let dir = tempfile::tempdir().unwrap();
     let pack = dir.path().join("studio").join("packs").join("p1");
     // `a` is written as a file, then `a/b` can't be (its folder is a file).
-    let res = copy_pack_assets(&pack, vec![asset("assets/ok.png", b"1"), asset("a", b"2"), asset("a/b", b"3")]);
+    let (_back, res) =
+        copy_pack_assets(&pack, vec![asset("assets/ok.png", b"1"), asset("a", b"2"), asset("a/b", b"3")]);
     assert!(res.is_err());
     assert!(!pack.exists(), "the half-written pack folder is gone");
 }
@@ -1393,4 +1403,70 @@ fn kinds_that_are_the_same_on_every_computer_have_a_name() {
         assert_eq!(portable(from), to, "{from}");
     }
     assert_eq!(portable("something_else"), "");
+}
+
+// ---- CodeRabbit follow-ups on the security fixes ----------------------------------------------
+
+#[test]
+fn a_big_json_of_mostly_spaces_is_not_a_zip_bomb() {
+    let mut cfg = serde_json::to_vec_pretty(&streamlabs_sample_json(vec![])).unwrap();
+    cfg.extend(std::iter::repeat_n(b' ', 3 * 1024 * 1024)); // trailing whitespace packs ~1000:1
+    let zip = build_zip(vec![("config.json", &cfg, None)]);
+    assert!(parse_overlay_zip(&zip, "x.overlay").is_ok(), "valid JSON isn't judged by its ratio");
+}
+
+#[test]
+fn a_family_installed_here_is_not_reported_as_the_packs_when_the_file_declares_another() {
+    let installed: std::collections::BTreeSet<String> = ["FerroMockFont".to_string()].into();
+    let (_e, dir) = ((), tempfile::tempdir().unwrap());
+    let ttf = make_test_ttf("SomethingElse");
+    let bundled = vec![crate::fonts::BundledFontFile {
+        archive_path: "fonts/FerroMockFont.ttf".into(), // named for the installed family...
+        bytes: ttf,
+        ext: "ttf",
+        declared_families: vec!["SomethingElse".into()], // ...but declares another
+    }];
+    let spec = crate::fonts::parse_font_spec(Some("FerroMockFont"), None, 0, None).unwrap();
+    let out = crate::fonts::preview_fonts(dir.path(), &[spec], &bundled, &installed);
+    assert_eq!(out[0].status, FontStatus::Installed, "{:?}", out[0]);
+}
+
+#[test]
+fn superscript_device_names_and_long_source_names_are_refused() {
+    use crate::import::overlay_parse::sanitize_archive_path;
+    for bad in ["assets/COM\u{b9}.png", "assets/lpt\u{b2}", "assets/COM\u{b3}.json"] {
+        assert!(sanitize_archive_path(bad).is_err(), "{bad}");
+    }
+    assert!(sanitize_archive_path("assets/com10.png").is_ok());
+    // A source whose name is too long to keep whole is left out with its scene items, not renamed.
+    let long = "L".repeat(201);
+    let p = obs_pack(vec![json!({ "name": long, "id": "color_source_v3", "settings": { "width": 1 } })], vec![]);
+    assert!(source(&p, &long).is_none());
+    assert_eq!(source(&p, "Main").unwrap()["settings"]["items"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn a_generated_overlay_source_never_takes_the_name_of_one_the_pack_has() {
+    let png = make_tiny_png();
+    let doc = json!({
+        "name": "Own", "current_scene": "Main", "scene_order": [{ "name": "Main" }],
+        "transitions": [{ "name": "Fade", "id": "fade_transition", "settings": {} }],
+        "sources": [
+            { "name": "Main", "id": "scene", "settings": { "items": [ { "id": 1, "name": "Main Overlay" } ] } },
+            { "name": "Main Overlay", "id": "image_source", "settings": { "file": "assets/a.png" } }
+        ],
+        "widgets": [ { "scene": "Main", "name": "Alerts", "type": "alertbox" } ]
+    });
+    let json_bytes = serde_json::to_vec(&doc).unwrap();
+    let p = parse_overlay_zip(
+        &build_zip(vec![("scenes.json", &json_bytes, None), ("assets/a.png", &png, None)]),
+        "own.overlay",
+    )
+    .unwrap();
+    // No overlay was made (create_overlays off): the generated source goes, the pack's own stays.
+    let out = finalize_doc(&p.doc_template, &["/x/a.png".to_string()], &BTreeMap::new());
+    let names: Vec<&str> = out["sources"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(names.contains(&"Main Overlay"), "the pack's own source is kept: {names:?}");
+    let items = out["sources"][0]["settings"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "and its scene item: {items:?}");
 }
