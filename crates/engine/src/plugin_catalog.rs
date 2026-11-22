@@ -87,9 +87,19 @@ fn refused(status: u16, code: &'static str, message: impl Into<String>, hint: &s
     EngineError::Refused { status, code, message: message.into(), hint: hint.into(), retry_after: None }
 }
 
+/// What a verified signature's trusted comment says (it is signed too): when it was signed and
+/// which file name it was signed under. The file name keeps one catalog's signature from
+/// passing as another's, even with the same key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedFor {
+    pub timestamp: i64,
+    pub file: String,
+}
+
 /// Checks `list` against its minisign signature (`sig`, base64 as `cargo tauri signer sign`
-/// writes it) and the key (base64 too).
-pub fn verify(list: &[u8], sig: &str, key: &str) -> Result<(), String> {
+/// writes it) and the key (base64 too), and reads the signed trusted comment
+/// (`timestamp:<epoch>\tfile:<name>`). The comment is required.
+pub fn verify_signed(list: &[u8], sig: &str, key: &str) -> Result<SignedFor, String> {
     let b64 = |s: &str| {
         base64::engine::general_purpose::STANDARD.decode(s.trim()).ok().and_then(|b| String::from_utf8(b).ok())
     };
@@ -97,7 +107,33 @@ pub fn verify(list: &[u8], sig: &str, key: &str) -> Result<(), String> {
     let key = minisign_verify::PublicKey::decode(&key).map_err(|e| format!("the catalog key: {e}"))?;
     let sig = b64(sig).ok_or("the catalog's signature isn't readable")?;
     let sig = minisign_verify::Signature::decode(&sig).map_err(|e| format!("the catalog's signature: {e}"))?;
-    key.verify(list, &sig, false).map_err(|_| "the catalog's signature doesn't match".to_string())
+    key.verify(list, &sig, false).map_err(|_| "the catalog's signature doesn't match".to_string())?;
+    let mut timestamp = None;
+    let mut file = None;
+    for part in sig.trusted_comment().split('\t') {
+        if let Some(t) = part.strip_prefix("timestamp:") {
+            timestamp = t.trim().parse::<i64>().ok();
+        } else if let Some(f) = part.strip_prefix("file:") {
+            file = Some(f.trim().to_string());
+        }
+    }
+    match (timestamp, file) {
+        (Some(timestamp), Some(file)) => Ok(SignedFor { timestamp, file }),
+        _ => Err("the catalog's signature has no readable timestamp and file name".into()),
+    }
+}
+
+/// The file name the plugin catalog is signed under.
+pub const PLUGIN_CATALOG_FILE: &str = "catalog.json";
+
+/// Checks the plugin catalog: its signature, and that it was signed as the plugin catalog (a
+/// Store catalog's signature, made with the same key, is refused here).
+pub fn verify(list: &[u8], sig: &str, key: &str) -> Result<(), String> {
+    let s = verify_signed(list, sig, key)?;
+    if s.file != PLUGIN_CATALOG_FILE {
+        return Err("the signature is for another catalog".into());
+    }
+    Ok(())
 }
 
 /// The address of an entry's file: an https one on GitHub, or a plain path beside the catalog
@@ -171,12 +207,49 @@ pub fn entries(list: &[u8], src: &Source) -> Result<Vec<Entry>, String> {
     Ok(out)
 }
 
-/// Whether `new` is a later version than `old` (numbers dot by dot; anything else: differs).
+/// Whether `new` is a later version than `old`, by semver order: the numbers dot by dot, a
+/// release after its own prerelease, prerelease parts compared one by one (numbers as numbers,
+/// words after numbers). Build metadata (`+x`) doesn't order. A version that can't be read is
+/// never "newer": a garbled or replayed one is not offered as an update.
 pub fn newer(new: &str, old: &str) -> bool {
-    let nums = |v: &str| v.split(['.', '-', '+']).map(|p| p.parse::<u64>().ok()).collect::<Option<Vec<_>>>();
-    match (nums(new), nums(old)) {
-        (Some(a), Some(b)) => a > b,
-        _ => new != old,
+    use std::cmp::Ordering;
+    fn parse(v: &str) -> Option<(Vec<u64>, Vec<String>)> {
+        let v = v.split('+').next().unwrap_or(v);
+        let (core, pre) = match v.split_once('-') {
+            Some((c, p)) => (c, Some(p)),
+            None => (v, None),
+        };
+        let nums: Option<Vec<u64>> = core.split('.').map(|p| p.parse::<u64>().ok()).collect();
+        let nums = nums.filter(|n| !n.is_empty())?;
+        let pre = pre.map(|p| p.split('.').map(str::to_string).collect()).unwrap_or_default();
+        Some((nums, pre))
+    }
+    let (Some((a, ap)), Some((b, bp))) = (parse(new), parse(old)) else { return false };
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        match a.get(i).unwrap_or(&0).cmp(b.get(i).unwrap_or(&0)) {
+            Ordering::Equal => {}
+            o => return o == Ordering::Greater,
+        }
+    }
+    match (ap.is_empty(), bp.is_empty()) {
+        (true, true) => false,
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => {
+            for (x, y) in ap.iter().zip(bp.iter()) {
+                let o = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => x.cmp(y),
+                };
+                if o != Ordering::Equal {
+                    return o == Ordering::Greater;
+                }
+            }
+            ap.len() > bp.len()
+        }
     }
 }
 
@@ -425,6 +498,19 @@ mod tests {
         let got = entries(json!({ "plugins": list }).to_string().as_bytes(), &src).unwrap_or_default();
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(newer("1.10.0", "1.9.2") && !newer("1.0", "1.0") && newer("2", "1.9") && !newer("1.0.0", "1.2"));
+    }
+
+    #[test]
+    fn a_prerelease_or_older_version_is_never_an_update() {
+        assert!(newer("1.0.0", "1.0.0-alpha.1"), "the release follows its prerelease");
+        assert!(!newer("1.0.0-alpha.1", "1.0.0"), "a prerelease is not newer than the release");
+        assert!(newer("1.0.0-beta.10", "1.0.0-beta.2"), "numbers in a prerelease compare as numbers");
+        assert!(!newer("1.0.0-beta.2", "1.0.0-beta.10"));
+        assert!(newer("1.0.0-beta", "1.0.0-alpha"), "words compare in order");
+        assert!(!newer("1.0.0-alpha.1", "1.0.0-alpha.1"));
+        assert!(!newer("garbage", "1.0.0"), "what can't be read is not offered as an update");
+        assert!(newer("1.0.1+build5", "1.0.0"));
+        assert!(!newer("1.0.0+build9", "1.0.0"), "build metadata doesn't order versions");
     }
 
     /// Browse and install from a catalog served here: the list checked, the file checked, a
