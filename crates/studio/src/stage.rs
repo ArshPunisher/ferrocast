@@ -976,30 +976,7 @@ impl Stage {
 
     /// The main picture's scenes, in order.
     fn order(&self) -> Vec<String> {
-        let vertical = self.vertical_order();
-        let d = self.doc.borrow();
-        let scenes: Vec<String> = self
-            .sources_list()
-            .iter()
-            .filter(|s| s.get("id").and_then(Value::as_str) == Some("scene"))
-            .map(|s| name_of(s).to_string())
-            .filter(|n| !vertical.contains(n))
-            .collect();
-        let mut out: Vec<String> = d
-            .get("scene_order")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|o| o.get("name").and_then(Value::as_str))
-            .filter(|n| scenes.iter().any(|s| s == n))
-            .map(String::from)
-            .collect();
-        for s in scenes {
-            if !out.contains(&s) {
-                out.push(s);
-            }
-        }
-        out
+        main_scenes(&self.doc.borrow())
     }
 
     fn scene_items(&self, scene: &str) -> Result<Vec<Value>, StudioError> {
@@ -6155,26 +6132,57 @@ pub fn saved_named_transitions(doc: Option<&Value>) -> Vec<NamedTransition> {
     })
 }
 
+/// A collection's main-picture scenes in order: the ones in `scene_order`, then any scene that
+/// has a source entry but isn't listed there; never the vertical canvas's. A running Studio and a
+/// saved collection read scenes the same way through this.
+fn main_scenes(d: &Value) -> Vec<String> {
+    let vertical: Vec<String> = d
+        .pointer("/ferrocast/vertical/scene_order")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|o| o.get("name").and_then(Value::as_str).map(String::from))
+        .collect();
+    let scenes: Vec<String> = d
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("id").and_then(Value::as_str) == Some("scene"))
+        .map(|s| name_of(s).to_string())
+        .filter(|n| !vertical.contains(n))
+        .collect();
+    let mut out: Vec<String> = d
+        .get("scene_order")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|o| o.get("name").and_then(Value::as_str))
+        .filter(|n| scenes.iter().any(|s| s == n))
+        .map(String::from)
+        .collect();
+    for s in scenes {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
 /// The matrix rules of a saved collection, without the ones naming a scene or transition that
 /// is no longer there (the same filter a running Studio applies).
 pub fn saved_transition_matrix(doc: Option<&Value>) -> Vec<TransitionMatrixRule> {
     let Some(d) = doc else { return Vec::new() };
     let valid_tr: std::collections::HashSet<String> =
         named_transitions_from_doc(d).into_iter().map(|t| t.name).collect();
-    let valid_scenes: std::collections::HashSet<&str> = d
-        .get("scene_order")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|s| s.get("name").and_then(Value::as_str))
-        .collect();
+    let valid_scenes: std::collections::HashSet<String> = main_scenes(d).into_iter().collect();
     transition_matrix_from_doc(d)
         .into_iter()
         .filter(|r| {
             !(r.from.is_none() && r.to.is_none())
                 && valid_tr.contains(&r.transition)
-                && r.from.as_deref().is_none_or(|f| valid_scenes.contains(f))
-                && r.to.as_deref().is_none_or(|t| valid_scenes.contains(t))
+                && r.from.as_ref().is_none_or(|f| valid_scenes.contains(f))
+                && r.to.as_ref().is_none_or(|t| valid_scenes.contains(t))
         })
         .collect()
 }
@@ -8586,6 +8594,35 @@ mod tests {
         let rules = transition_matrix_from_doc(d);
         let r = rules.iter().find(|r| r.from.is_none() && r.to.as_deref() == Some(scene))?;
         named_transitions_from_doc(d).into_iter().find(|t| t.name == r.transition)
+    }
+
+    #[test]
+    fn a_stopped_studio_and_a_running_one_read_the_same_matrix() {
+        // BRB is a scene in `sources` but missing from `scene_order`; a rule targets it, and the
+        // vertical canvas's scene is never a target.
+        let doc = json!({
+            "current_scene": "A",
+            "sources": [
+                { "id": "scene", "name": "A", "settings": { "items": [] } },
+                { "id": "scene", "name": "BRB", "settings": { "items": [] } },
+                { "id": "scene", "name": "V", "settings": { "items": [] } }
+            ],
+            "scene_order": [{ "name": "A" }],
+            "ferrocast": {
+                "vertical": { "scene_order": [{ "name": "V" }] },
+                "transition_matrix": [
+                    { "from": null, "to": "BRB", "transition": "Fade" },
+                    { "from": null, "to": "V", "transition": "Fade" }
+                ]
+            }
+        });
+        let stopped = saved_transition_matrix(Some(&doc));
+        let s = stage();
+        s.restore_all(&doc);
+        let running = s.transition_matrix();
+        assert_eq!(stopped, running, "the same rules either way");
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].to.as_deref(), Some("BRB"));
     }
 
     #[test]
