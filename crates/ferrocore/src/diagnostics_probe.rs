@@ -180,8 +180,7 @@ mod tests {
             std::env::temp_dir().join(format!("fc-fifo-{}-{:?}", std::process::id(), std::thread::current().id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("pipe");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
         let (tx, rx) = std::sync::mpsc::channel();
         let p = fifo.clone();
         std::thread::spawn(move || {
