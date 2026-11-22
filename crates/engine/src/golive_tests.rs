@@ -278,6 +278,32 @@ async fn two_toggles_at_once_both_land() {
     .await;
 }
 
+/// Adding or removing a destination while live must never reshape the Studio's encoder: every
+/// other output, and a "Same as stream" recording, share it. No cap is applied or lifted.
+#[tokio::test]
+async fn adding_or_removing_a_destination_while_live_never_reshapes_the_encoder() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = twitch_studio_settings();
+    e.set_studio_host(studio.clone());
+    let order = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    push_main(&e, 20_000);
+    let _keep = keep_streaming(e.golive().hub.clone(), 20_000, 4_000);
+    e.set_studio_live(true);
+    e.sync_stream_cap().await;
+    let before = studio.caps.lock().unwrap().len();
+    // Kick (8,000 kbps limit) fits the 1,600 kbps stream: it joins without touching the encoder.
+    e.set_golive_destinations(order(&e, &["youtube", "kick"])).await.unwrap();
+    // And taking it away again doesn't lift or change anything either.
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    // Whatever else ticked in between, the cap the stream runs with never changed.
+    let caps = studio.caps.lock().unwrap().clone();
+    assert!(caps[before..].iter().all(|c| *c == caps[before - 1]), "the encoder's cap changed while live: {caps:?}");
+}
+
 /// A destination the running encode can't serve is refused with a plain reason and nothing
 /// changes; one that already fits joins.
 #[tokio::test]
@@ -309,6 +335,48 @@ async fn a_destination_the_running_encode_cannot_serve_is_refused() {
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Refused { code: "golive_needs_new_encode", .. }), "{err:?}");
+}
+
+/// A compliant 6,000 kbps video stream with its sound (6,160 kbps measured) may take Twitch: the
+/// sound and the packaging are not the video, and only the destination joining is judged.
+#[tokio::test]
+async fn a_compliant_stream_can_take_twitch_and_the_others_are_not_judged() {
+    let (e, _dir) = engine().await;
+    let order = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    push_main(&e, 77_000);
+    let _keep = keep_streaming(e.golive().hub.clone(), 77_000, 4_000);
+    eventually_async(|| async { e.golive().hub.stats().kbps > 5_000 }).await;
+    e.set_golive_destinations_checked(order(&e, &["youtube", "twitch"]), Default::default()).await.unwrap();
+    // Kick as well: it only has to fit itself (8,000), not be judged against Twitch's 6,000.
+    e.set_golive_destinations_checked(order(&e, &["youtube", "twitch", "kick"]), Default::default()).await.unwrap();
+}
+
+/// While a stream runs a server added by hand is added unticked (ticking it is the guarded
+/// step), and removing the last one sending asks first.
+#[tokio::test]
+async fn a_server_added_while_live_waits_to_be_ticked_and_the_last_one_cannot_be_removed() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    assert!(a.enabled, "added with no stream running: ticked, as always");
+    let list = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(list(&e, &[a.id.as_str()])).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    assert!(!b.enabled, "added while live: not ticked");
+    assert!(!e.golive_running().contains(&b.id));
+    let err = e.remove_golive_destination(&a.id).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+    e.remove_golive_destination(&b.id).await.unwrap();
 }
 
 /// Removing the last destination, and adding one the measured upload can't carry, ask first;
@@ -1544,7 +1612,13 @@ async fn light_hub_destination_checks_light_hub_rules_and_eb_is_exempt() {
     assert!(twitch.issues.is_empty(), "{:?}", twitch.issues);
 
     // Move Twitch off light onto main hub with Enhanced Broadcasting enabled -> still exempt from 6,000 kbps rule.
-    e.set_golive_light("twitch", false).await.unwrap();
+    // Off light while live puts it on the full 12,000 kbps stream: refused, as a new destination is.
+    let err = e.set_golive_light("twitch", false).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 422, code: "golive_needs_new_encode", .. }), "{err:?}");
+    // (The rest is about what the view says, so the move is made in the saved settings directly.)
+    let mut cfg = e.golive_config();
+    cfg.destinations.iter_mut().find(|d| d.id == "twitch").unwrap().light = false;
+    e.save_golive(cfg).await.unwrap();
     e.set_golive_enhanced("twitch", true).await.unwrap();
     let v = e.golive_view().await;
     let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
@@ -1618,13 +1692,14 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
     assert!(twitch.capped.is_some());
     assert!(twitch.issues.is_empty(), "capped Studio stream must not nag mid-stream: {:?}", twitch.issues);
 
-    // Switching to Kick only updates cap to 8,000 kbps.
+    // Switching to Kick while live leaves the running encode alone: the cap stays at Twitch's
+    // 6,000 kbps (it is applied again when the next stream starts).
     e.set_golive_destinations(enable_only("kick")).await.unwrap();
     let last_cap = studio.caps.lock().unwrap().last().copied().flatten();
     assert_eq!(
         last_cap,
         Some(crate::studio_host::StreamCap {
-            max_kbps: Some(8_000),
+            max_kbps: Some(6_000),
             h264_only: true,
             keyframe_secs: 2,
             no_bframes: false

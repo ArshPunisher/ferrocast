@@ -566,7 +566,15 @@ pub(crate) struct GoLive {
     /// a recording, say): the stream isn't held to it, so no badge says it is and no warning about
     /// its bitrate is held back.
     cap_failed: std::sync::atomic::AtomicBool,
+    /// Set while a destination change is applied to a running stream: the Studio's encoder is
+    /// shared by every other output (and a "Same as stream" recording), so its cap isn't touched.
+    cap_frozen: std::sync::atomic::AtomicBool,
 }
+
+/// What the sound and the packaging add to a stream's measured rate over its video (the rules' own slack).
+const AUDIO_SLACK_KBPS: u32 = 400;
+/// How far a measured keyframe gap may run over a platform's before it counts as too long.
+const KEYFRAME_SLACK_MS: u32 = 500;
 
 /// Answers to the questions a mid-stream change asks first.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -644,6 +652,7 @@ impl Default for GoLive {
             studio_video: Mutex::new(None),
             studio_live: std::sync::atomic::AtomicBool::new(false),
             cap_failed: std::sync::atomic::AtomicBool::new(false),
+            cap_frozen: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -977,6 +986,23 @@ impl Engine {
         }
     }
 
+    /// Whether a stream is running that a destination change would be applied to.
+    pub(crate) fn golive_stream_running(&self) -> bool {
+        self.golive().hub.live().borrow().on || self.golive().vhub.live().borrow().on
+    }
+
+    /// `reconcile`, for a change made while a stream runs: starts and stops only the outputs
+    /// that changed and leaves the Studio's encoder (its cap and shape) alone.
+    pub(crate) async fn reconcile_midstream(&self) {
+        let g = self.golive();
+        if !self.golive_stream_running() {
+            return self.reconcile().await;
+        }
+        g.cap_frozen.store(true, std::sync::atomic::Ordering::Release);
+        self.reconcile().await;
+        g.cap_frozen.store(false, std::sync::atomic::Ordering::Release);
+    }
+
     /// The destinations sending right now (ids).
     pub fn golive_running(&self) -> std::collections::BTreeSet<String> {
         lock(&self.golive().running).keys().cloned().collect()
@@ -1029,6 +1055,11 @@ impl Engine {
     }
 
     pub(crate) async fn sync_stream_cap(&self) {
+        if self.golive().cap_frozen.load(std::sync::atomic::Ordering::Acquire) {
+            // A destination was added or removed on a running stream: its encoder stays as it is.
+            self.send_golive_pub();
+            return;
+        }
         let Ok(host) = self.studio_host() else { return };
         let limit = self.studio_limit();
         let no_bframes = self.studio_no_bframes();
@@ -1484,7 +1515,7 @@ impl Engine {
             lock(&self.golive().failed).remove(&d.id);
             lock(&self.golive().failed_alerted).remove(&d.id);
         }
-        self.reconcile().await;
+        self.reconcile_midstream().await;
         if live {
             self.push_stream_info_to(&added);
         }
@@ -1532,47 +1563,85 @@ impl Engine {
     }
 
     /// Why `d` can't join the stream already running, or `None` when the running encode serves it
-    /// as it is. Changing the live encode would change every other output, so it is refused.
-    fn midstream_misfit(&self, next: &[DestinationConfig], d: &DestinationConfig) -> Option<String> {
+    /// as it is. Only `d` itself is judged (the others already take this stream), against the
+    /// encode actually on air. Changing that encode would change every other output, so a
+    /// destination that needs it changed is refused instead.
+    fn midstream_misfit(&self, _next: &[DestinationConfig], d: &DestinationConfig) -> Option<String> {
+        use ferrocast_golive::flv::VideoCodec;
         let g = self.golive();
+        let name = dest_name(d);
         if d.canvas == Canvas::Vertical {
             return (!g.vhub.live().borrow().on)
                 .then(|| "The vertical stream isn't running, so this destination can't join it now.".to_string());
         }
-        if !g.hub.live().borrow().on || self.wants_light_now(d) {
+        // The main stream isn't running: it starts with it, nothing to disturb.
+        if !g.hub.live().borrow().on {
             return None;
         }
+        // On the Studio's lighter stream only while that stream really runs; from OBS "light"
+        // has no lighter copy and the destination takes the full stream.
+        if self.on_light(d) {
+            return None;
+        }
+        let studio_on = g.studio_live.load(std::sync::atomic::Ordering::Acquire);
+        let cfg = *lock(&g.studio_video);
         let stats = g.hub.stats();
-        if d.url.as_deref().and_then(direct_kind) == Some("whip") {
-            let bframes = lock(&g.studio_video).is_some_and(|c| c.bframes);
-            return (bframes && !self.studio_no_bframes())
-                .then(|| "WebRTC can't carry B-frames, and this stream has them. Turning them off would change the stream every other output is sending.".to_string());
-        }
-        if d.url.as_deref().and_then(direct_kind).is_some() || self.golive_config().advanced.ignore_service_limits {
-            return None;
-        }
-        let blocked = lock(&g.blocked).clone();
-        let limit = probe::effective_limit(
-            next.iter()
-                .filter(|x| {
-                    x.enabled
-                        && x.canvas == Canvas::Main
-                        && x.url.as_deref().and_then(direct_kind).is_none()
-                        && !self.wants_light_now(x)
-                        && !blocked.contains_key(&x.id)
-                })
-                .map(|x| (x.kind, x.enhanced)),
-        )?;
-        let name = dest_name(d);
-        if stats.kbps > limit.max_kbps {
+        let direct = d.url.as_deref().and_then(direct_kind);
+        if d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main && direct.is_none() {
             return Some(format!(
-                "{name} takes at most {} kbps and this stream is sending {}. Changing the live encode would change every other output.",
-                limit.max_kbps, stats.kbps
+                "{name} with Enhanced Broadcasting starts at the beginning of a stream: it can't join this one."
             ));
         }
-        if limit.h264_only && matches!(stats.video_codec, Some(ferrocast_golive::flv::VideoCodec::Hevc)) {
+        if direct == Some("whip") {
+            if !studio_on {
+                return Some(format!(
+                    "{name} (WebRTC) is sent by the Ferrocast Studio: it can't join a stream from OBS."
+                ));
+            }
+            if cfg.is_some_and(|c| c.bframes) && !self.studio_no_bframes() {
+                return Some(format!(
+                    "{name} (WebRTC) can't carry B-frames, and this stream has them. Turning them off would change the stream every other output is sending."
+                ));
+            }
+            if matches!(stats.video_codec, Some(VideoCodec::Av1 | VideoCodec::Vp9)) {
+                return Some(format!("{name} (WebRTC) takes H.264 or HEVC and this stream is not."));
+            }
+            return None;
+        }
+        if direct.is_some() || self.golive_config().advanced.ignore_service_limits {
+            return None;
+        }
+        let limit = probe::ceiling(d.kind, d.enhanced);
+        // YouTube's own rules: no VP9.
+        if d.kind == Service::Youtube && matches!(stats.video_codec, Some(VideoCodec::Vp9)) {
+            return Some(format!("{name} doesn't take VP9, and this stream is VP9."));
+        }
+        let limit = limit?;
+        // What is on air: the Studio's configured video rate held to the cap it already has, or
+        // (from OBS) the measured rate less the sound and the packaging.
+        let on_air_kbps = if studio_on && let Some(c) = cfg {
+            c.video_kbps.min(self.studio_limit().map_or(u32::MAX, |l| l.max_kbps))
+        } else {
+            stats.kbps.saturating_sub(AUDIO_SLACK_KBPS)
+        };
+        if on_air_kbps > limit.max_kbps {
             return Some(format!(
-                "{name} takes H.264 only and this stream is HEVC. Changing the live encode would change every other output."
+                "{name} takes at most {} kbps and this stream is sending {}. Changing the live encode would change every other output.",
+                limit.max_kbps, on_air_kbps
+            ));
+        }
+        if limit.h264_only && stats.video_codec.is_some_and(|c| c != VideoCodec::H264) {
+            return Some(format!(
+                "{name} takes H.264 only and this stream is not. Changing the live encode would change every other output."
+            ));
+        }
+        if limit.keyframe_secs > 0
+            && stats.keyframe_interval_ms.is_some_and(|k| k > limit.keyframe_secs * 1000 + KEYFRAME_SLACK_MS)
+        {
+            return Some(format!(
+                "{name} wants a keyframe every {} s and this stream sends one every {} s. Changing the live encode would change every other output.",
+                limit.keyframe_secs,
+                stats.keyframe_interval_ms.unwrap_or(0) / 1000
             ));
         }
         None
@@ -1651,12 +1720,20 @@ impl Engine {
             return Ok(cfg);
         }
         d.light = on;
+        // Off while live puts it on the full stream: that must fit as a new destination does.
+        let moved = d.clone();
+        if !on && moved.enabled && self.golive_stream_running() {
+            let now: Vec<DestinationConfig> = cfg.destinations.clone();
+            if let Some(why) = self.midstream_misfit(&now, &moved) {
+                return Err(refused("golive_needs_new_encode", why, "Stop and start the stream again to change it."));
+            }
+        }
         self.save_golive(cfg.clone()).await?;
         drop(one_at_a_time);
         if let Some(r) = lock(&self.golive().running).remove(id) {
             r.stop.send_replace(true);
         }
-        self.reconcile().await;
+        self.reconcile_midstream().await;
         Ok(cfg)
     }
 
@@ -1741,7 +1818,11 @@ impl Engine {
             d.enhanced = on;
             self.save_golive(cfg.clone()).await?;
         }
-        self.sync_stream_cap().await;
+        // It takes effect the next time the Studio starts streaming: a running stream's encoder
+        // is shared by every output and isn't reshaped for it.
+        if !self.golive_stream_running() {
+            self.sync_stream_cap().await;
+        }
         Ok(cfg)
     }
 
@@ -1805,7 +1886,9 @@ impl Engine {
             kind: Service::Custom,
             name: Some(name.to_string()),
             url: Some(url),
-            enabled: true,
+            // While a stream runs it is added unticked: ticking it is the guarded step (the
+            // encode check, the upload question), and it starts at the next stream otherwise.
+            enabled: !self.golive_stream_running(),
             canvas,
             light: false,
             enhanced: false,
@@ -1813,7 +1896,7 @@ impl Engine {
         cfg.destinations.push(d.clone());
         self.save_golive(cfg).await?;
         drop(one_at_a_time);
-        self.reconcile().await;
+        self.reconcile_midstream().await;
         Ok(d)
     }
 
@@ -1951,6 +2034,19 @@ impl Engine {
         if cfg.destinations[i].kind != Service::Custom {
             return Err(EngineError::Invalid("Twitch, YouTube and Kick can be switched off, not removed.".into()));
         }
+        // The last one sending is stopped by switching it off, which asks first.
+        if cfg.destinations[i].enabled
+            && self.golive_stream_running()
+            && !cfg.destinations.iter().enumerate().any(|(j, d)| j != i && d.enabled)
+        {
+            return Err(EngineError::Refused {
+                status: 409,
+                code: "golive_last_destination",
+                message: "That's the last destination sending: removing it stops the sending.".into(),
+                hint: "Switch it off first (it asks), then remove it.".into(),
+                retry_after: None,
+            });
+        }
         cfg.destinations.remove(i);
         // Its Advanced settings go with it, so a saved set never names a missing destination
         // (nor one that backed something up).
@@ -1968,11 +2064,11 @@ impl Engine {
         let _ = self.inner.secrets.delete(&format!("{CUSTOM_KEY_PREFIX}{id}"));
         lock(&self.golive().failed).remove(id);
         lock(&self.golive().failed_alerted).remove(id);
-        self.reconcile().await;
+        self.reconcile_midstream().await;
         Ok(())
     }
 
-    async fn save_golive(&self, cfg: GoLiveConfig) -> Result<(), EngineError> {
+    pub(crate) async fn save_golive(&self, cfg: GoLiveConfig) -> Result<(), EngineError> {
         // A changed server (or any change) is tried again rather than trusting an old answer.
         lock(&self.golive().tested).clear();
         save_setting(self, CONFIG_KEY, &cfg).await?;
