@@ -1730,7 +1730,15 @@ async fn a_custom_destination_gets_the_stream_end_to_end() {
         .iter()
         .map(|d| json!({ "id": d["id"], "enabled": d["id"] != id.as_str() && d["enabled"].as_bool().unwrap() }))
         .collect();
-    assert_eq!(r.put("/api/v1/golive/destinations", json!({ "destinations": order })).await.status(), StatusCode::OK);
+    // It was the only one ticked, so taking it away asks first and changes nothing...
+    let ask = r.put("/api/v1/golive/destinations", json!({ "destinations": order.clone() })).await;
+    assert_eq!(ask.status(), StatusCode::CONFLICT);
+    assert_eq!(ask.json::<Value>().await.unwrap()["error"]["code"], "golive_last_destination");
+    // ...and confirmed, it stops at once while the stream goes on.
+    assert_eq!(
+        r.put("/api/v1/golive/destinations", json!({ "destinations": order, "confirm_last": true })).await.status(),
+        StatusCode::OK
+    );
     assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), got.recv()).await.unwrap(), Some(Got::Closed));
     // Removed: gone from the list, its key deleted.
     let gone = r

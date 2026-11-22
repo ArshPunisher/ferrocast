@@ -59,6 +59,12 @@ async fn ingest(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 #[serde(deny_unknown_fields)]
 struct OrderBody {
     destinations: Vec<OrderItem>,
+    /// Add a destination although the last upload check says it won't fit.
+    #[serde(default)]
+    confirm_upload: bool,
+    /// Stop sending to the last destination (the stream and the recording go on).
+    #[serde(default)]
+    confirm_last: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,8 +75,9 @@ struct OrderItem {
 }
 
 async fn order(State(app): State<AppState>, Body(b): Body<OrderBody>) -> ApiResult<Json<Value>> {
+    let confirm = ferrocast_engine::golive::DestinationConfirm { upload: b.confirm_upload, last: b.confirm_last };
     let order = b.destinations.into_iter().map(|d| (d.id, d.enabled)).collect();
-    Ok(Json(json!(app.engine.set_golive_destinations(order).await?)))
+    Ok(Json(json!(app.engine.set_golive_destinations_checked(order, confirm).await?)))
 }
 
 #[derive(Debug, Deserialize)]

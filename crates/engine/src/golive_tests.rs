@@ -8,7 +8,7 @@ use ferrocast_testkit::obs::{FakeObs, start as start_obs};
 use serde_json::json;
 
 use crate::golive::GoLiveConfig;
-use crate::{Engine, PasswordChange};
+use crate::{Engine, EngineError, PasswordChange};
 
 async fn engine() -> (Engine, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -139,6 +139,315 @@ async fn a_paused_destination_stays_off_until_resumed() {
     assert_eq!(until(&mut got_a, publish).await, Got::Publish("key-a".into()));
     assert!(!e.golive_view().await.protect);
     assert!(!e.golive_config().protect);
+}
+
+/// Counts the video each destination's server gets, while the stream keeps coming in.
+fn count_video(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ferrocast_testkit::rtmp::Got>,
+) -> Arc<std::sync::atomic::AtomicUsize> {
+    use ferrocast_testkit::rtmp::Got;
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = n.clone();
+    tokio::spawn(async move {
+        while let Some(g) = rx.recv().await {
+            if matches!(g, Got::Video(..)) {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+    n
+}
+
+/// Starts a stream into Go live that keeps sending (a keyframe every 4th packet).
+async fn stream_in(e: &Engine) -> tokio::task::JoinHandle<()> {
+    use ferrocast_testkit::rtmp::Obs;
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let mut obs = Obs::publish(port, "live", &key).await.unwrap();
+    tokio::spawn(async move {
+        let mut ts = 0u32;
+        loop {
+            let data: &'static [u8] =
+                if (ts / 40).is_multiple_of(4) { &[0x17, 0x01, 0, 0, 0, 0xAA] } else { &[0x27, 0x01, 0, 0, 0, 0xBB] };
+            obs.video(ts, data).await;
+            ts += 40;
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    })
+}
+
+async fn eventually_async<F: std::future::Future<Output = bool>>(mut f: impl FnMut() -> F) {
+    for _ in 0..100 {
+        if f().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("it never came true");
+}
+
+/// Adding a destination while live starts only that output, removing one stops only that one:
+/// the other keeps receiving frames, and the session record says who was on and when.
+#[tokio::test]
+async fn a_destination_added_or_removed_mid_stream_leaves_the_others_sending() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use std::sync::atomic::Ordering;
+    use tokio::time::{Duration, timeout};
+    let (e, _dir) = engine().await;
+    let (port_a, got_a) = platform("key-a").await;
+    let (port_b, mut got_b) = platform("key-b").await;
+    let a =
+        e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{port_a}/app"), "key-a", Canvas::Main).await.unwrap();
+    let b =
+        e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{port_b}/app"), "key-b", Canvas::Main).await.unwrap();
+    let only_a = |b_on: bool| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), d.id == a.id || (b_on && d.id == b.id))).collect()
+    };
+    e.set_golive_destinations(only_a(false)).await.unwrap();
+    let a_frames = count_video(got_a);
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { a_frames.load(Ordering::Relaxed) > 5 }).await;
+    assert!(timeout(Duration::from_millis(300), got_b.recv()).await.is_err(), "B is off: nothing reaches it");
+
+    // Add B while live: only B starts, and A's counter never stops.
+    let before = a_frames.load(Ordering::Relaxed);
+    e.set_golive_destinations(only_a(true)).await.unwrap();
+    loop {
+        let g = timeout(Duration::from_secs(8), got_b.recv()).await.expect("B starts").expect("open");
+        if g == Got::Publish("key-b".into()) {
+            break;
+        }
+    }
+    eventually_async(|| async { a_frames.load(Ordering::Relaxed) > before + 5 }).await;
+
+    // Remove B: B closes cleanly, A keeps going.
+    e.set_golive_destinations(only_a(false)).await.unwrap();
+    loop {
+        let g = timeout(Duration::from_secs(8), got_b.recv()).await.expect("B closes").expect("open");
+        if g == Got::Closed {
+            break;
+        }
+    }
+    let mid = a_frames.load(Ordering::Relaxed);
+    eventually_async(|| async { a_frames.load(Ordering::Relaxed) > mid + 5 }).await;
+    let v = e.golive_view().await;
+    assert!(v.live, "the stream itself never stopped");
+    // The session record: A on, B on, B off, in that order.
+    let log = e.golive().dest_log.lock().unwrap().clone();
+    let seq: Vec<(String, bool)> = log.iter().map(|ev| (ev.name.clone(), ev.on)).collect();
+    assert_eq!(seq, [("A".to_string(), true), ("B".to_string(), true), ("B".to_string(), false)], "{seq:?}");
+    assert!(log.windows(2).all(|w| w[0].at.0 <= w[1].at.0));
+}
+
+/// Two toggles at the same moment both land: the saves are one at a time and the outputs
+/// follow the final list.
+#[tokio::test]
+async fn two_toggles_at_once_both_land() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let (pc, _gc) = platform("key-c").await;
+    let mk = |n: &'static str, p: u16, k: &'static str| {
+        let e = e.clone();
+        async move { e.add_golive_destination(n, &format!("rtmp://127.0.0.1:{p}/app"), k, Canvas::Main).await.unwrap() }
+    };
+    let (a, b, c) = (mk("A", pa, "key-a").await, mk("B", pb, "key-b").await, mk("C", pc, "key-c").await);
+    let list = |on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(list(&[a.id.as_str()])).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    // B is ticked while C is ticked: each call lists everything once, as the dashboard sends it.
+    let (r1, r2) = tokio::join!(
+        e.set_golive_destinations(list(&[a.id.as_str(), b.id.as_str()])),
+        e.set_golive_destinations(list(&[a.id.as_str(), c.id.as_str()]))
+    );
+    r1.unwrap();
+    r2.unwrap();
+    let enabled: Vec<String> =
+        e.golive_config().destinations.iter().filter(|d| d.enabled).map(|d| d.id.clone()).collect();
+    // Whichever saved last decides; the outputs agree with it, and nothing is half-started.
+    eventually_async(|| async {
+        let running = e.golive_running();
+        running == enabled.iter().cloned().collect()
+    })
+    .await;
+}
+
+/// Adding or removing a destination while live must never reshape the Studio's encoder: every
+/// other output, and a "Same as stream" recording, share it. No cap is applied or lifted.
+#[tokio::test]
+async fn adding_or_removing_a_destination_while_live_never_reshapes_the_encoder() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = twitch_studio_settings();
+    e.set_studio_host(studio.clone());
+    let order = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    push_main(&e, 20_000);
+    let _keep = keep_streaming(e.golive().hub.clone(), 20_000, 4_000);
+    e.set_studio_live(true);
+    e.sync_stream_cap().await;
+    let before = studio.caps.lock().unwrap().len();
+    // Kick (8,000 kbps limit) fits the 1,600 kbps stream: it joins without touching the encoder.
+    e.set_golive_destinations(order(&e, &["youtube", "kick"])).await.unwrap();
+    // And taking it away again doesn't lift or change anything either.
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    // Whatever else ticked in between, the cap the stream runs with never changed.
+    let caps = studio.caps.lock().unwrap().clone();
+    assert!(caps[before..].iter().all(|c| *c == caps[before - 1]), "the encoder's cap changed while live: {caps:?}");
+}
+
+/// A destination the running encode can't serve is refused with a plain reason and nothing
+/// changes; one that already fits joins.
+#[tokio::test]
+async fn a_destination_the_running_encode_cannot_serve_is_refused() {
+    use crate::golive::Canvas;
+    let (e, _dir) = engine().await;
+    let order = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    // A 14,000 kbps stream is on air to YouTube: Twitch takes 6,000 at most.
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    push_main(&e, 175_000);
+    let _keep = keep_streaming(e.golive().hub.clone(), 175_000, 4_000);
+    let err =
+        e.set_golive_destinations_checked(order(&e, &["youtube", "twitch"]), Default::default()).await.unwrap_err();
+    match err {
+        EngineError::Refused { code, message, .. } => {
+            assert_eq!(code, "golive_needs_new_encode");
+            assert!(message.contains("Twitch") && message.contains("6000"), "{message}");
+        }
+        other => panic!("not refused: {other:?}"),
+    }
+    assert!(!e.golive_config().destinations.iter().any(|d| d.id == "twitch" && d.enabled), "nothing changed");
+    // A vertical destination while only the main stream runs.
+    let v = e.add_golive_destination("Shorts", "rtmp://127.0.0.1:9/app", "k", Canvas::Vertical).await.unwrap();
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    let err = e
+        .set_golive_destinations_checked(order(&e, &["youtube", v.id.as_str()]), Default::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Refused { code: "golive_needs_new_encode", .. }), "{err:?}");
+}
+
+/// A compliant 6,000 kbps video stream with its sound (6,160 kbps measured) may take Twitch: the
+/// sound and the packaging are not the video, and only the destination joining is judged.
+#[tokio::test]
+async fn a_compliant_stream_can_take_twitch_and_the_others_are_not_judged() {
+    let (e, _dir) = engine().await;
+    let order = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    push_main(&e, 77_000);
+    let _keep = keep_streaming(e.golive().hub.clone(), 77_000, 4_000);
+    eventually_async(|| async { e.golive().hub.stats().kbps > 5_000 }).await;
+    e.set_golive_destinations_checked(order(&e, &["youtube", "twitch"]), Default::default()).await.unwrap();
+    // Kick as well: it only has to fit itself (8,000), not be judged against Twitch's 6,000.
+    e.set_golive_destinations_checked(order(&e, &["youtube", "twitch", "kick"]), Default::default()).await.unwrap();
+}
+
+/// While a stream runs a server added by hand is added unticked (ticking it is the guarded
+/// step), and removing the last one sending asks first.
+#[tokio::test]
+async fn a_server_added_while_live_waits_to_be_ticked_and_the_last_one_cannot_be_removed() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    assert!(a.enabled, "added with no stream running: ticked, as always");
+    let list = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(list(&e, &[a.id.as_str()])).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    assert!(!b.enabled, "added while live: not ticked");
+    assert!(!e.golive_running().contains(&b.id));
+    let err = e.remove_golive_destination(&a.id).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+    e.remove_golive_destination(&b.id).await.unwrap();
+}
+
+/// Removing the last destination, and adding one the measured upload can't carry, ask first;
+/// confirming goes ahead and the stream itself keeps going.
+#[tokio::test]
+async fn the_last_destination_and_a_too_big_upload_ask_first() {
+    use crate::golive::{Canvas, DestinationConfirm};
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    let list = |on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(list(&[a.id.as_str()])).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    // Upload: 2 Mbps measured; one 6,000 kbps output is already more than it carries.
+    e.seed_upload_for_test(2_000);
+    let err = e
+        .set_golive_destinations_checked(list(&[a.id.as_str(), b.id.as_str()]), DestinationConfirm::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_upload_exceeded", .. }), "{err:?}");
+    assert!(!e.golive_running().contains(&b.id));
+    e.set_golive_destinations_checked(
+        list(&[a.id.as_str(), b.id.as_str()]),
+        DestinationConfirm { upload: true, last: false },
+    )
+    .await
+    .unwrap();
+    eventually_async(|| async { e.golive_running().contains(&b.id) }).await;
+    // The view's upload line already counts both.
+    let v = e.golive_view().await;
+    assert_eq!(v.upload.as_ref().map(|u| u.rows.len()), Some(2));
+    // Taking both away: the first removal is fine, the last asks.
+    e.set_golive_destinations_checked(list(&[a.id.as_str()]), DestinationConfirm::default()).await.unwrap();
+    let err = e.set_golive_destinations_checked(list(&[]), DestinationConfirm::default()).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+    assert!(e.golive_running().contains(&a.id), "still sending until confirmed");
+    e.set_golive_destinations_checked(list(&[]), DestinationConfirm { upload: false, last: true }).await.unwrap();
+    eventually_async(|| async { e.golive_running().is_empty() }).await;
+    assert!(e.golive_view().await.live, "the stream itself keeps going with nobody to send to");
+}
+
+/// A destination that gave up shows as failed and Retry starts it again, alone.
+#[tokio::test]
+async fn a_failed_destination_is_retried_on_its_own() {
+    use crate::golive::Canvas;
+    use ferrocast_golive::push::PushState;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+    let (e, _dir) = engine().await;
+    let (pa, mut ga) = platform("key-a").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    e.seed_failed_for_test(&a.id);
+    let v = e.golive_view().await;
+    let state = v.destinations.iter().find(|d| d.id == a.id).and_then(|d| d.health.clone()).map(|h| h.state);
+    assert!(matches!(state, Some(PushState::Failed { .. })), "{state:?}");
+    e.golive_resume(&a.id).await.unwrap();
+    loop {
+        let g = timeout(Duration::from_secs(8), ga.recv()).await.expect("it starts again").expect("open");
+        if matches!(g, Got::Publish(_)) {
+            break;
+        }
+    }
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
 }
 
 /// OBS's vertical canvas on the second key: only vertical destinations get it, and they stop
@@ -1303,7 +1612,13 @@ async fn light_hub_destination_checks_light_hub_rules_and_eb_is_exempt() {
     assert!(twitch.issues.is_empty(), "{:?}", twitch.issues);
 
     // Move Twitch off light onto main hub with Enhanced Broadcasting enabled -> still exempt from 6,000 kbps rule.
-    e.set_golive_light("twitch", false).await.unwrap();
+    // Off light while live puts it on the full 12,000 kbps stream: refused, as a new destination is.
+    let err = e.set_golive_light("twitch", false).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 422, code: "golive_needs_new_encode", .. }), "{err:?}");
+    // (The rest is about what the view says, so the move is made in the saved settings directly.)
+    let mut cfg = e.golive_config();
+    cfg.destinations.iter_mut().find(|d| d.id == "twitch").unwrap().light = false;
+    e.save_golive(cfg).await.unwrap();
     e.set_golive_enhanced("twitch", true).await.unwrap();
     let v = e.golive_view().await;
     let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
@@ -1377,13 +1692,14 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
     assert!(twitch.capped.is_some());
     assert!(twitch.issues.is_empty(), "capped Studio stream must not nag mid-stream: {:?}", twitch.issues);
 
-    // Switching to Kick only updates cap to 8,000 kbps.
+    // Switching to Kick while live leaves the running encode alone: the cap stays at Twitch's
+    // 6,000 kbps (it is applied again when the next stream starts).
     e.set_golive_destinations(enable_only("kick")).await.unwrap();
     let last_cap = studio.caps.lock().unwrap().last().copied().flatten();
     assert_eq!(
         last_cap,
         Some(crate::studio_host::StreamCap {
-            max_kbps: Some(8_000),
+            max_kbps: Some(6_000),
             h264_only: true,
             keyframe_secs: 2,
             no_bframes: false
@@ -1525,18 +1841,13 @@ async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
         GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "twitch")).collect::<Vec<_>>()
     };
     e.set_golive_destinations(only_twitch()).await.unwrap();
+    // The Studio can't apply it to the stream it starts (its encoder is shared with a recording).
+    *studio.cap_refused.lock().unwrap() = Some("the stream shares its encoder with the recording".into());
     e.studio_stream(true).await.unwrap();
     // 7,011 kbps arrives, and goes on arriving.
     push_main(&e, 90_000);
     let feed = keep_streaming(e.golive().hub.clone(), 90_000, 4_000);
     let twitch = |v: &crate::golive::GoLiveView| v.destinations.iter().find(|d| d.id == "twitch").cloned().unwrap();
-    let v = e.golive_view().await;
-    assert!(twitch(&v).capped.is_some(), "held: the badge says so");
-    assert!(twitch(&v).issues.is_empty(), "held: its rounding isn't nagged about");
-    // The Studio can't apply it on the stream on air.
-    *studio.cap_refused.lock().unwrap() = Some("the stream shares its encoder with the recording".into());
-    e.set_golive_destinations(only_twitch().into_iter().chain([]).collect()).await.unwrap();
-    e.sync_stream_cap().await;
     let v = e.golive_view().await;
     assert_eq!(twitch(&v).capped, None, "not claimed");
     assert_eq!(twitch(&v).issues.len(), 1, "{:?}", twitch(&v).issues);
@@ -1693,4 +2004,160 @@ async fn whip_disables_bframes_even_with_ignore_service_limits_and_shows_capped_
     let row = v.destinations.iter().find(|d| d.id == whip.id).unwrap();
     let cap = row.capped.as_ref().expect("WHIP with b_frames on must explain why B-frames are off");
     assert!(cap.summary.to_ascii_lowercase().contains("b-frames"), "{}", cap.summary);
+}
+
+#[test]
+fn only_a_recent_push_that_some_platform_took_is_given_to_a_new_destination() {
+    use ferrocast_core::stream_info::{HistoryEntry, PlatformResult, StreamInfo};
+    let ok = |ok: bool| PlatformResult {
+        platform: ferrocast_core::event::Platform::Twitch,
+        ok,
+        applied: vec![],
+        skipped: vec![],
+        error: None,
+        waiting: false,
+        category: None,
+    };
+    let entry = |at: i64, ok_: bool| HistoryEntry { info: StreamInfo::default(), at, results: vec![ok(ok_)] };
+    let now = 100 * 3_600_000;
+    assert!(crate::golive::recent_push(&entry(now - 3_600_000, true), now));
+    assert!(!crate::golive::recent_push(&entry(now - 24 * 3_600_000, true), now), "a day-old title");
+    assert!(!crate::golive::recent_push(&entry(now - 60_000, false), now), "a push nothing took");
+}
+
+/// The last destination is judged per live picture: a ticked vertical destination (whose picture
+/// isn't on air) doesn't make removing the last main one free. And with nothing sending, a
+/// platform saying the stream ended doesn't close the session record while the hub runs.
+#[tokio::test]
+async fn the_last_destination_is_per_live_canvas_and_the_record_stays_open() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let v = e.add_golive_destination("V", "rtmp://127.0.0.1:9/app", "key-v", Canvas::Vertical).await.unwrap();
+    let list = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(list(&e, &[a.id.as_str(), v.id.as_str()])).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    let err = e.set_golive_destinations_checked(list(&e, &[v.id.as_str()]), Default::default()).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+    e.set_golive_destinations_checked(
+        list(&e, &[v.id.as_str()]),
+        crate::golive::DestinationConfirm { upload: false, last: true },
+    )
+    .await
+    .unwrap();
+    // Nothing sends now, the stream goes on: the session record is told to close with the hub.
+    assert!(e.golive_stream_running());
+    assert!(e.golive_senders().is_empty());
+}
+
+/// Taking the one healthy destination away while a sibling has failed is the last one too: with
+/// only the failed one left the stream would be ended for the failure.
+#[tokio::test]
+async fn unticking_the_only_healthy_destination_beside_a_failed_one_asks() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) && e.golive_running().contains(&b.id) }).await;
+    e.seed_failed_for_test(&b.id);
+    let order: Vec<(String, bool)> =
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), d.id == b.id)).collect();
+    let err = e.set_golive_destinations_checked(order, Default::default()).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+}
+
+/// A backup waiting for its ticked main destination isn't billed as a second sender, and a
+/// problem a check found hours ago doesn't zero a destination on a stream that is running.
+#[tokio::test]
+async fn the_upload_estimate_bills_what_really_sends() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    e.seed_upload_for_test(30_000);
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    let mut cfg = e.golive_config();
+    cfg.advanced.per.entry(a.id.clone()).or_default().backup = Some(b.id.clone());
+    for d in &mut cfg.destinations {
+        d.enabled = d.id == a.id || d.id == b.id;
+    }
+    let check = e.upload_now_for_test(&cfg).expect("an estimate");
+    assert_eq!(check.rows.len(), 1, "the standby backup is not billed beside its main: {:?}", check.rows);
+}
+
+/// The cap the running encode started with stays for its whole life: removing the platform that
+/// set it (and any ordinary reconcile after) doesn't raise it, and a compatible destination
+/// is judged against what is really on air (6,000 kbps), not the configured 14,000.
+#[tokio::test]
+async fn the_running_encode_keeps_the_cap_it_started_with() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = twitch_studio_settings();
+    e.set_studio_host(studio.clone());
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    let order = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(order(&e, &["twitch", "youtube"])).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    let started = studio.caps.lock().unwrap().last().copied().flatten();
+    assert_eq!(started.and_then(|c| c.max_kbps), Some(6_000));
+    push_main(&e, 20_000);
+    let _keep = keep_streaming(e.golive().hub.clone(), 20_000, 4_000);
+    // Twitch leaves: the encoder keeps its cap, through this and an ordinary reconcile.
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    e.reconcile().await;
+    let caps = studio.caps.lock().unwrap().clone();
+    assert!(
+        caps.iter().rev().take(3).all(|c| c.and_then(|c| c.max_kbps) == Some(6_000)),
+        "the cap was raised while live: {caps:?}"
+    );
+    // Kick (8,000) fits a stream that is really 6,000: not refused for the configured 14,000.
+    e.set_golive_destinations(order(&e, &["youtube", "kick"])).await.unwrap();
+}
+
+/// Deleting the only sender of a live picture asks, even when another picture has a ticked
+/// destination; deleting one of two senders is free and its stop goes in the session log.
+#[tokio::test]
+async fn deleting_a_sender_follows_the_canvas_rule_and_its_stop_is_logged() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let v = e.add_golive_destination("V", "rtmp://127.0.0.1:9/app", "key-v", Canvas::Vertical).await.unwrap();
+    assert!(v.enabled);
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    let err = e.remove_golive_destination(&a.id).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+    // A second main sender: now A can go, and its stop is in the log under its name.
+    let list = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    e.set_golive_destinations_checked(
+        list(&e, &[a.id.as_str(), b.id.as_str(), v.id.as_str()]),
+        crate::golive::DestinationConfirm { upload: true, last: true },
+    )
+    .await
+    .unwrap();
+    eventually_async(|| async { e.golive_running().contains(&b.id) }).await;
+    e.remove_golive_destination(&a.id).await.unwrap();
+    let log = e.golive().dest_log.lock().unwrap().clone();
+    assert!(log.iter().any(|ev| ev.id == a.id && ev.name == "A" && !ev.on), "{log:?}");
 }
