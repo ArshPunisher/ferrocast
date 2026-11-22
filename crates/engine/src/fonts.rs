@@ -735,7 +735,16 @@ async fn fetch_one_google_font(
     if !url_allowed_for_google_fonts(&css_url, base, false) {
         return Err(FetchError::Offline("Blocked untrusted font catalog host.".into()));
     }
-    let resp = http.get(&css_url).send().await.map_err(|e| FetchError::Offline(e.to_string()))?;
+    let mut resp = http.get(&css_url).send().await.map_err(|e| FetchError::Offline(e.to_string()))?;
+    // A family with no bold (Bebas Neue, Anton, Bangers) answers 400 to `:wght@400;700`: ask
+    // once more for whatever weights it has.
+    if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+        let plain_url = format!("{base}/css2?family={encoded}&display=swap");
+        if !url_allowed_for_google_fonts(&plain_url, base, false) {
+            return Err(FetchError::NotFound);
+        }
+        resp = http.get(&plain_url).send().await.map_err(|e| FetchError::Offline(e.to_string()))?;
+    }
     if resp.status() == reqwest::StatusCode::NOT_FOUND || resp.status() == reqwest::StatusCode::BAD_REQUEST {
         return Err(FetchError::NotFound);
     }

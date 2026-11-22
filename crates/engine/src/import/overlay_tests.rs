@@ -373,6 +373,12 @@ async fn start_mock_google_fonts(mode: &'static str) -> MockFontServer {
                     let hdr = format!("HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n", body.len());
                     let _ = sock.write_all(hdr.as_bytes()).await;
                     let _ = sock.write_all(body).await;
+                } else if mode == "single_weight" && path.contains("wght") {
+                    // What Google answers for a family that has no bold: a 400.
+                    let body = b"Invalid selector";
+                    let hdr = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n", body.len());
+                    let _ = sock.write_all(hdr.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
                 } else if mode == "ssrf" {
                     let css = format!("@font-face {{ src: url(http://{other_addr}/steal.ttf) format('truetype'); }}");
                     let hdr =
@@ -1355,4 +1361,17 @@ fn removing_a_pack_never_follows_a_link_out_of_it() {
     assert_eq!(n, 3, "the file and the two links, not what they point at");
     assert!(!pack.exists());
     assert!(outside.join("keep.txt").exists(), "what the link pointed at is untouched");
+}
+
+// ---- Neon review M3: a family with a single weight still downloads ----------------------------
+
+#[tokio::test]
+async fn a_single_weight_family_is_asked_for_again_without_the_weights() {
+    let (e, _dir) = engine().await;
+    let mock = start_mock_google_fonts("single_weight").await;
+    e.set_google_fonts_api(&mock.base);
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let rep = import_pack(&e, build_zip(vec![("config.json", &cfg, None)]), "one.overlay").await;
+    assert_eq!(rep.fonts[0].status, FontStatus::Downloaded, "{:?}", rep.fonts[0]);
+    assert_eq!(mock.css_hits.load(Ordering::Relaxed), 2, "asked with weights, then without");
 }
