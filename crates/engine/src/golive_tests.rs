@@ -2010,3 +2010,22 @@ async fn whip_disables_bframes_even_with_ignore_service_limits_and_shows_capped_
     let cap = row.capped.as_ref().expect("WHIP with b_frames on must explain why B-frames are off");
     assert!(cap.summary.to_ascii_lowercase().contains("b-frames"), "{}", cap.summary);
 }
+
+#[test]
+fn only_a_recent_push_that_some_platform_took_is_given_to_a_new_destination() {
+    use ferrocast_core::stream_info::{HistoryEntry, PlatformResult, StreamInfo};
+    let ok = |ok: bool| PlatformResult {
+        platform: ferrocast_core::event::Platform::Twitch,
+        ok,
+        applied: vec![],
+        skipped: vec![],
+        error: None,
+        waiting: false,
+        category: None,
+    };
+    let entry = |at: i64, ok_: bool| HistoryEntry { info: StreamInfo::default(), at, results: vec![ok(ok_)] };
+    let now = 100 * 3_600_000;
+    assert!(crate::golive::recent_push(&entry(now - 3_600_000, true), now));
+    assert!(!crate::golive::recent_push(&entry(now - 24 * 3_600_000, true), now), "a day-old title");
+    assert!(!crate::golive::recent_push(&entry(now - 60_000, false), now), "a push nothing took");
+}

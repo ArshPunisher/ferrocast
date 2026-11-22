@@ -571,6 +571,14 @@ pub(crate) struct GoLive {
     cap_frozen: std::sync::atomic::AtomicBool,
 }
 
+/// The last title and category pushed count for this stream only when they were pushed lately
+/// and some platform took them; a push from weeks ago (or one that failed everywhere) would put
+/// an old title on a platform the streamer set up by hand today.
+pub(crate) fn recent_push(h: &ferrocast_core::stream_info::HistoryEntry, now_ms: i64) -> bool {
+    const HOURS_12_MS: i64 = 12 * 3_600_000;
+    now_ms.saturating_sub(h.at) < HOURS_12_MS && h.results.iter().any(|r| r.ok)
+}
+
 /// What the sound and the packaging add to a stream's measured rate over its video (the rules' own slack).
 const AUDIO_SLACK_KBPS: u32 = 400;
 /// How far a measured keyframe gap may run over a platform's before it counts as too long.
@@ -1697,8 +1705,11 @@ impl Engine {
         let engine = self.clone();
         tokio::spawn(async move {
             let Ok(saved) = engine.stream_info_saved().await else { return };
-            let Some(last) = saved.history.first() else { return };
-            let _ = engine.apply_stream_info(last.info.clone(), Some(platforms), Some("added mid-stream")).await;
+            let Some(last) = saved.history.first().filter(|h| recent_push(h, now().0)) else { return };
+            if let Err(e) = engine.apply_stream_info(last.info.clone(), Some(platforms), Some("added mid-stream")).await
+            {
+                tracing::warn!(error = %e, "couldn't give the title and category to a destination added mid-stream");
+            }
         });
     }
 
