@@ -4288,8 +4288,10 @@ impl Stage {
     pub fn replace_file(&self, m: &crate::collection::MissingFile, to: &str) -> Result<(), StudioError> {
         let set = json!({ m.key.clone(): to });
         if is_valid_transition_kind(&m.kind) {
-            if !m.source.is_empty() && self.update_named_transition(&m.source, None, None, Some(&set), None).is_ok() {
-                return Ok(());
+            if !m.source.is_empty() {
+                // By name: a transition renamed or deleted meanwhile is an error, never a
+                // silent overwrite of another transition's settings.
+                return self.update_named_transition(&m.source, None, None, Some(&set), None).map(|_| ());
             }
             return self.set_transition_settings(&m.kind, &set);
         }
@@ -4745,25 +4747,38 @@ impl Stage {
 
     /// Each transition kind's own settings.
     pub fn transition_settings(&self, kind: &str) -> Value {
+        // Named transitions are the truth once the collection has them; the old per-kind map
+        // is only the fallback for a collection that never had any.
+        let all = self.named_transitions();
+        if let Some(t) =
+            all.iter().find(|t| t.default && t.kind == kind).or_else(|| all.iter().find(|t| t.kind == kind))
+        {
+            return t.settings.clone();
+        }
         if let Some(v) = self.extra("transition_settings").get(kind)
             && v.is_object()
         {
             return v.clone();
         }
-        let all = self.named_transitions();
-        all.iter()
-            .find(|t| t.default && t.kind == kind)
-            .or_else(|| all.iter().find(|t| t.kind == kind))
-            .map(|t| t.settings.clone())
-            .unwrap_or_else(|| json!({}))
+        json!({})
     }
 
+    /// Changes only the keys sent (the rest of the kind's settings stay).
     pub fn set_transition_settings(&self, kind: &str, settings: &Value) -> Result<(), StudioError> {
+        let merge = |old: &Value| -> Value {
+            let mut out = if old.is_object() { old.clone() } else { json!({}) };
+            if let (Some(dst), Some(src)) = (out.as_object_mut(), settings.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        };
         let mut all = self.extra("transition_settings");
         if !all.is_object() {
             all = json!({});
         }
-        all[kind] = settings.clone();
+        all[kind] = merge(&all[kind]);
         self.edit(|d| {
             if !d.get("ferrocast").is_some_and(Value::is_object) {
                 d["ferrocast"] = json!({});
@@ -4774,7 +4789,7 @@ impl Stage {
                 && let Some(entry) =
                     cur.as_deref().and_then(|c| list.iter_mut().find(|t| name_of(t) == c && kind_of(t) == kind))
             {
-                entry["settings"] = settings.clone();
+                entry["settings"] = merge(&entry["settings"]);
             }
         });
         Ok(())
@@ -9386,6 +9401,59 @@ mod tests {
         ok(s.delete_named_transition("Cut"));
         assert_eq!(s.named_transitions().len(), 1);
         assert!(s.delete_named_transition("Fade").is_err(), "cannot delete last transition");
+    }
+
+    #[test]
+    fn replacing_a_missing_file_keeps_the_other_stinger_settings() {
+        let s = stage();
+        ok(s.add_named_transition(&NamedTransition {
+            name: "Intro Stinger".into(),
+            kind: "obs_stinger_transition".into(),
+            ms: 0,
+            settings: json!({ "path": "/gone/old.webm", "transition_point": 450, "transition_point_type": 0 }),
+            default: false,
+        }));
+        let m = crate::collection::MissingFile {
+            source: "Intro Stinger".into(),
+            parent: None,
+            kind: "obs_stinger_transition".into(),
+            key: "path".into(),
+            label: "Video".into(),
+            path: "/gone/old.webm".into(),
+        };
+        ok(s.replace_file(&m, "/new/stinger.webm"));
+        let t = s.named_transitions().into_iter().find(|t| t.name == "Intro Stinger").unwrap();
+        assert_eq!(t.settings["path"], "/new/stinger.webm");
+        assert_eq!(t.settings["transition_point"], 450, "other keys survive: {}", t.settings);
+        // A transition that was renamed or deleted meanwhile is an error, not a silent overwrite
+        // of the default transition's settings.
+        let before = s.named_transitions();
+        ok(s.rename_named_transition("Intro Stinger", "Renamed"));
+        assert!(s.replace_file(&m, "/other.webm").is_err());
+        let after = s.named_transitions();
+        assert_eq!(before.iter().find(|t| t.default), after.iter().find(|t| t.default));
+    }
+
+    #[test]
+    fn setting_a_kinds_settings_merges_and_the_named_transition_wins_over_the_legacy_map() {
+        let s = stage();
+        ok(s.add_named_transition(&NamedTransition {
+            name: "Wipe".into(),
+            kind: "swipe_transition".into(),
+            ms: 300,
+            settings: json!({ "direction": "left", "swipe_in": false }),
+            default: true,
+        }));
+        ok(s.set_transition_settings("swipe_transition", &json!({ "direction": "up" })));
+        let cur = s.named_transitions().into_iter().find(|t| t.default).unwrap();
+        assert_eq!(cur.settings["direction"], "up");
+        assert_eq!(cur.settings["swipe_in"], false, "keys not sent are kept: {}", cur.settings);
+        // A stale legacy map must not mask the named transition's own settings.
+        s.edit(|d| {
+            d["ferrocast"]["transition_settings"] = json!({ "swipe_transition": { "direction": "stale" } });
+        });
+        ok(s.update_named_transition("Wipe", None, None, Some(&json!({ "direction": "down" })), None));
+        assert_eq!(s.transition_settings("swipe_transition")["direction"], "down");
     }
 
     #[test]
