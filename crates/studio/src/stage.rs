@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Map, Value, json};
 
 use crate::collection::{
-    AudioInfo, BLENDS, BOUNDS, FilterInfo, ItemEdit, ItemInfo, Monitor, SCALE_FILTERS, SceneInfo, SourceUse, Transform,
-    TransitionInfo,
+    AudioInfo, BLENDS, BOUNDS, FilterInfo, ItemEdit, ItemInfo, Monitor, NamedTransition, ResolvedTransition,
+    SCALE_FILTERS, SceneInfo, SourceUse, Transform, TransitionInfo, TransitionMatrixRule,
 };
 use crate::naming::{NameVideo, file_name};
 use crate::{Canvas, RecordPlan, RecordStats, ReplayPlan, StreamSettings, StreamStats, StudioError, check_name, own};
@@ -588,6 +588,10 @@ impl Stage {
             "current_program_scene": first_scene,
             "current_transition": "Fade",
             "transition_duration": 300,
+            "transitions": [
+                { "id": "fade_transition", "name": "Fade", "duration": 300, "settings": {} },
+                { "id": "cut_transition", "name": "Cut", "duration": 0, "settings": {} },
+            ],
         });
         let s = Self {
             canvas,
@@ -620,6 +624,7 @@ impl Stage {
         }
         // Sources an older Ferrocast kept after their last scene item went (they ran unseen).
         drop_unused(&mut doc);
+        import_and_normalize_transitions(&mut doc);
         let s = Self {
             canvas,
             doc: RefCell::new(doc),
@@ -992,11 +997,15 @@ impl Stage {
 
     pub fn scenes(&self) -> Vec<SceneInfo> {
         let cur = self.current();
+        let pre = self.preview_scene();
         self.order()
             .into_iter()
             .map(|name| {
                 let items = self.scene_items(&name).map_or(0, |i| i.len());
-                SceneInfo { current: name == cur, items, name, preview: false, transition: None }
+                let preview = pre.as_deref() == Some(name.as_str());
+                let transition = self.scene_transition_of(&name).ok().flatten();
+                let transition_name = self.scene_transition_name_of(&name);
+                SceneInfo { current: name == cur, items, name, preview, transition, transition_name }
             })
             .collect()
     }
@@ -1116,6 +1125,15 @@ impl Stage {
             {
                 o.remove("ferrocast_top_layer");
             }
+            if let Some(st) = d.pointer_mut("/ferrocast/scene_transitions").and_then(Value::as_object_mut) {
+                st.remove(name);
+            }
+            if let Some(m) = d.pointer_mut("/ferrocast/transition_matrix").and_then(Value::as_array_mut) {
+                m.retain(|r| {
+                    r.get("from").and_then(Value::as_str) != Some(name)
+                        && r.get("to").and_then(Value::as_str) != Some(name)
+                });
+            }
         });
         self.set_order(&rest);
         Ok(())
@@ -1131,16 +1149,15 @@ impl Stage {
         Ok(())
     }
 
-    /// Puts a scene on air, through the Studio's transition (the engine plays it).
+    /// Puts a scene on air, through the resolved transition (the engine plays it).
     /// When the vertical canvas is enabled, its own scenes switch there instead.
     pub fn set_current(&self, name: &str) -> Result<(), StudioError> {
         if self.vertical().is_some() && self.vertical_order().iter().any(|n| n == name) {
             return self.set_vertical_current(name);
         }
         self.scene_index(name)?;
-        // The scene's own way in (its Transition Override), else the Studio's.
-        let t = self.scene_transition_of(name)?.unwrap_or_else(|| self.transition());
         let was = self.current();
+        let t = self.resolve_transition(&was, name);
         let studio_mode = self.preview_scene().is_some();
         {
             let mut d = self.doc.borrow_mut();
@@ -1153,12 +1170,12 @@ impl Stage {
         if studio_mode {
             // On air as a copy of its own (a scene picked straight for the program): edits in
             // the preview wait for the next transition.
-            return self.send_copy_on_air(name, &t.kind, u64::from(t.ms));
+            return self.send_copy_on_air_with(name, &t.kind, u64::from(t.ms), &t.settings);
         }
         if let Some(e) = self.engine.borrow().as_ref()
             && (was != name || e.is_black())
         {
-            e.go_with(name, &t.kind, u64::from(t.ms), &self.transition_settings(&t.kind))?;
+            e.go_with(name, &t.kind, u64::from(t.ms), &t.settings)?;
         }
         Ok(())
     }
@@ -1258,6 +1275,16 @@ impl Stage {
                 && let Some(v) = t.remove(name)
             {
                 t.insert(new_name.to_string(), v);
+            }
+            if let Some(m) = d.pointer_mut("/ferrocast/transition_matrix").and_then(Value::as_array_mut) {
+                for r in m.iter_mut() {
+                    if r.get("from").and_then(Value::as_str) == Some(name) {
+                        r["from"] = json!(new_name);
+                    }
+                    if r.get("to").and_then(Value::as_str) == Some(name) {
+                        r["to"] = json!(new_name);
+                    }
+                }
             }
             if d.pointer("/ferrocast/studio_mode").and_then(Value::as_str) == Some(name) {
                 d["ferrocast"]["studio_mode"] = json!(new_name);
@@ -3721,7 +3748,7 @@ impl Stage {
 
     /// Studio Mode: `scene` on air as a new copy of its layout, through a transition from the
     /// copy on air now (both are in the engine while it plays; the old one goes after).
-    fn send_copy_on_air(&self, scene: &str, kind: &str, ms: u64) -> Result<(), StudioError> {
+    fn send_copy_on_air_with(&self, scene: &str, kind: &str, ms: u64, settings: &Value) -> Result<(), StudioError> {
         let items = self.scene_items(scene)?;
         let prev = self.doc.borrow().pointer("/ferrocast/program_copy").cloned();
         let prev_private = prev.as_ref().and_then(|p| p.get("private")).and_then(Value::as_str).map(String::from);
@@ -3746,9 +3773,8 @@ impl Stage {
         }
         // The engine with both copies, the old one still on air; then the transition.
         self.refresh();
-        let settings = self.transition_settings(kind);
         if let Some(e) = self.engine.borrow().as_ref() {
-            e.go_with(private, kind, ms, &settings)?;
+            e.go_with(private, kind, ms, settings)?;
         }
         let mut d = self.doc.borrow_mut();
         d["ferrocast"]["program_on_air"] = json!(private);
@@ -3783,7 +3809,8 @@ impl Stage {
                 if t.ms > 20_000 {
                     return Err(fail("ms: a transition lasts 0 to 20000 ms."));
                 }
-                self.send_copy_on_air(&pre, &t.kind, u64::from(t.ms))?;
+                let settings = self.transition_settings(&t.kind);
+                self.send_copy_on_air_with(&pre, &t.kind, u64::from(t.ms), &settings)?;
             }
             None => self.set_current(&pre)?,
         }
@@ -4237,12 +4264,35 @@ impl Stage {
                 check(f, Some(name_of(s)));
             }
         }
+        for t in self.named_transitions() {
+            for (k, label) in [("path", "Video"), ("luma_image", "Image")] {
+                if let Some(p) = t.settings.get(k).and_then(Value::as_str)
+                    && !p.is_empty()
+                    && !Path::new(p).exists()
+                {
+                    out.push(crate::collection::MissingFile {
+                        source: t.name.clone(),
+                        parent: None,
+                        kind: t.kind.clone(),
+                        key: k.to_string(),
+                        label: label.to_string(),
+                        path: p.to_string(),
+                    });
+                }
+            }
+        }
         out
     }
 
     /// Points a missing file's setting at `to` instead.
     pub fn replace_file(&self, m: &crate::collection::MissingFile, to: &str) -> Result<(), StudioError> {
         let set = json!({ m.key.clone(): to });
+        if is_valid_transition_kind(&m.kind) {
+            if !m.source.is_empty() && self.update_named_transition(&m.source, None, None, Some(&set), None).is_ok() {
+                return Ok(());
+            }
+            return self.set_transition_settings(&m.kind, &set);
+        }
         match &m.parent {
             Some(parent) => self.update_filter(parent, &m.source, &set),
             None => self.update(&m.source, &set),
@@ -4314,6 +4364,7 @@ impl Stage {
                     name,
                     preview: false,
                     transition: None,
+                    transition_name: None,
                 })
                 .collect(),
             current,
@@ -4632,25 +4683,50 @@ impl Stage {
         Ok(())
     }
 
+    /// The named transition override applied when switching into `scene` (`Any -> scene`), if any.
+    pub fn scene_transition_name_of(&self, scene: &str) -> Option<String> {
+        let valid: std::collections::HashSet<String> = self.named_transitions().into_iter().map(|t| t.name).collect();
+        self.transition_matrix_raw()
+            .into_iter()
+            .rev()
+            .find(|r| r.from.is_none() && r.to.as_deref() == Some(scene) && valid.contains(&r.transition))
+            .map(|r| r.transition)
+    }
+
     /// A scene's own way in (OBS's Transition Override), or the Studio's (None).
     pub fn scene_transition_of(&self, scene: &str) -> Result<Option<TransitionInfo>, StudioError> {
         self.scene_index(scene)?;
+        if let Some(name) = self.scene_transition_name_of(scene)
+            && let Some(t) = self.named_transitions().into_iter().find(|t| t.name == name)
+        {
+            return Ok(Some(TransitionInfo { kind: t.kind, ms: t.ms }));
+        }
         Ok(serde_json::from_value(self.extra("scene_transitions").get(scene).cloned().unwrap_or(Value::Null)).ok())
     }
 
     pub fn set_scene_transition(&self, scene: &str, t: Option<&TransitionInfo>) -> Result<(), StudioError> {
         self.scene_index(scene)?;
-        let mut all = self.extra("scene_transitions");
-        if !all.is_object() {
-            all = json!({});
-        }
-        match t {
-            Some(t) => all[scene] = json!(t),
-            None => {
-                all.as_object_mut().map(|m| m.remove(scene));
+        self.edit(|d| {
+            if let Some(m) = d.pointer_mut("/ferrocast/transition_matrix").and_then(Value::as_array_mut) {
+                m.retain(|r| {
+                    !(r.get("from").is_none_or(Value::is_null) && r.get("to").and_then(Value::as_str) == Some(scene))
+                });
             }
-        }
-        self.set_extra("scene_transitions", all);
+            if !d.get("ferrocast").is_some_and(Value::is_object) {
+                d["ferrocast"] = json!({});
+            }
+            if !d["ferrocast"].get("scene_transitions").is_some_and(Value::is_object) {
+                d["ferrocast"]["scene_transitions"] = json!({});
+            }
+            match t {
+                Some(t) => d["ferrocast"]["scene_transitions"][scene] = json!(t),
+                None => {
+                    if let Some(m) = d["ferrocast"]["scene_transitions"].as_object_mut() {
+                        m.remove(scene);
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
@@ -4669,7 +4745,17 @@ impl Stage {
 
     /// Each transition kind's own settings.
     pub fn transition_settings(&self, kind: &str) -> Value {
-        self.extra("transition_settings").get(kind).cloned().unwrap_or_else(|| json!({}))
+        if let Some(v) = self.extra("transition_settings").get(kind)
+            && v.is_object()
+        {
+            return v.clone();
+        }
+        let all = self.named_transitions();
+        all.iter()
+            .find(|t| t.default && t.kind == kind)
+            .or_else(|| all.iter().find(|t| t.kind == kind))
+            .map(|t| t.settings.clone())
+            .unwrap_or_else(|| json!({}))
     }
 
     pub fn set_transition_settings(&self, kind: &str, settings: &Value) -> Result<(), StudioError> {
@@ -4678,7 +4764,19 @@ impl Stage {
             all = json!({});
         }
         all[kind] = settings.clone();
-        self.set_extra("transition_settings", all);
+        self.edit(|d| {
+            if !d.get("ferrocast").is_some_and(Value::is_object) {
+                d["ferrocast"] = json!({});
+            }
+            d["ferrocast"]["transition_settings"] = all;
+            let cur = d.get("current_transition").and_then(Value::as_str).map(String::from);
+            if let Some(list) = d.get_mut("transitions").and_then(Value::as_array_mut)
+                && let Some(entry) =
+                    cur.as_deref().and_then(|c| list.iter_mut().find(|t| name_of(t) == c && kind_of(t) == kind))
+            {
+                entry["settings"] = settings.clone();
+            }
+        });
         Ok(())
     }
 
@@ -5164,40 +5262,746 @@ impl Stage {
 
     // ------------------------------------------------------------------ transitions
 
-    /// The Studio's transition: its kind and length.
+    /// The Studio's default transition: its kind and length.
     pub fn transition(&self) -> TransitionInfo {
-        let d = self.doc.borrow();
-        let name = d.get("current_transition").and_then(Value::as_str).unwrap_or("Fade");
-        let kind = d
-            .get("transitions")
-            .and_then(Value::as_array)
-            .and_then(|t| t.iter().find(|t| name_of(t) == name))
-            .map(|t| kind_of(t).to_string())
-            .unwrap_or_else(|| if name == "Cut" { "cut_transition".into() } else { "fade_transition".into() });
-        let ms = d.get("transition_duration").and_then(Value::as_u64).unwrap_or(300) as u32;
-        TransitionInfo { kind, ms }
+        let all = self.named_transitions();
+        if let Some(d) = all.iter().find(|t| t.default).or_else(|| all.first()) {
+            return TransitionInfo { kind: d.kind.clone(), ms: d.ms };
+        }
+        TransitionInfo { kind: "fade_transition".into(), ms: 300 }
     }
 
     pub fn set_transition(&self, t: &TransitionInfo) -> Result<(), StudioError> {
-        let name = match t.kind.as_str() {
-            "cut_transition" => "Cut".to_string(),
-            "fade_transition" => "Fade".to_string(),
-            k => k.to_string(),
+        if !is_valid_transition_kind(&t.kind) {
+            return Err(fail(format!("Unknown transition kind \"{}\".", t.kind)));
+        }
+        let ms = if t.kind == "cut_transition" { 0 } else { t.ms.min(20_000) };
+        let cur_name =
+            self.doc.borrow().get("current_transition").and_then(Value::as_str).unwrap_or("Fade").to_string();
+        let all = self.named_transitions();
+        let target_name = if all.iter().any(|x| x.name == cur_name && x.kind == t.kind) {
+            cur_name
+        } else {
+            let canonical = match t.kind.as_str() {
+                "cut_transition" => "Cut",
+                "fade_transition" => "Fade",
+                k => k,
+            };
+            all.iter()
+                .find(|x| x.name == canonical && x.kind == t.kind)
+                .or_else(|| all.iter().find(|x| x.kind == t.kind))
+                .map_or_else(|| canonical.to_string(), |x| x.name.clone())
+        };
+        let target_name = if all.iter().any(|x| x.name == target_name && x.kind != t.kind) {
+            let mut n = 2;
+            loop {
+                let c = format!("{target_name} {n}");
+                if !all.iter().any(|x| x.name == c) {
+                    break c;
+                }
+                n += 1;
+            }
+        } else {
+            target_name
         };
         self.edit(|d| {
-            let list = d.get("transitions").and_then(Value::as_array).cloned().unwrap_or_default();
-            if !matches!(t.kind.as_str(), "cut_transition" | "fade_transition")
-                && !list.iter().any(|x| name_of(x) == name)
-            {
-                let mut l = list;
-                l.push(json!({ "id": t.kind, "name": name, "settings": {} }));
-                d["transitions"] = Value::Array(l);
+            let mut list = named_transitions_from_doc(d);
+            if let Some(existing) = list.iter_mut().find(|x| x.name == target_name) {
+                existing.kind = t.kind.clone();
+                existing.ms = ms;
+            } else {
+                list.push(NamedTransition {
+                    name: target_name.clone(),
+                    kind: t.kind.clone(),
+                    ms,
+                    settings: d
+                        .pointer(&format!("/ferrocast/transition_settings/{}", t.kind))
+                        .filter(|v| v.is_object())
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                    default: true,
+                });
             }
-            d["current_transition"] = json!(name);
-            d["transition_duration"] = json!(t.ms.min(20_000));
+            for x in &mut list {
+                x.default = x.name == target_name;
+            }
+            write_transitions_to_doc(d, &list, &target_name, ms);
         });
         Ok(())
     }
+
+    /// All saved named transitions in the collection (always at least one, with one default).
+    pub fn named_transitions(&self) -> Vec<NamedTransition> {
+        named_transitions_from_doc(&self.doc.borrow())
+    }
+
+    /// The raw stored matrix rules without filtering (for internal cleanup).
+    fn transition_matrix_raw(&self) -> Vec<TransitionMatrixRule> {
+        transition_matrix_from_doc(&self.doc.borrow())
+    }
+
+    /// The valid from-scene / to-scene matrix rules for this collection.
+    pub fn transition_matrix(&self) -> Vec<TransitionMatrixRule> {
+        let valid_tr: std::collections::HashSet<String> =
+            self.named_transitions().into_iter().map(|t| t.name).collect();
+        let valid_scenes: std::collections::HashSet<String> = self.order().into_iter().collect();
+        self.transition_matrix_raw()
+            .into_iter()
+            .filter(|r| {
+                !(r.from.is_none() && r.to.is_none())
+                    && valid_tr.contains(&r.transition)
+                    && r.from.as_ref().is_none_or(|f| valid_scenes.contains(f))
+                    && r.to.as_ref().is_none_or(|t| valid_scenes.contains(t))
+            })
+            .collect()
+    }
+
+    /// Resolves which transition plays when switching from scene `from` to scene `to`.
+    /// Precedence: exact pair (`from` -> `to`) -> `Any` -> `to` (or legacy scene override) -> `from` -> `Any` -> default.
+    pub fn resolve_transition(&self, from: &str, to: &str) -> ResolvedTransition {
+        let all = self.named_transitions();
+        let rules = self.transition_matrix();
+        let by_name = |name: &str| {
+            all.iter().find(|t| t.name == name).map(|t| ResolvedTransition {
+                name: t.name.clone(),
+                kind: t.kind.clone(),
+                ms: if t.kind == "cut_transition" { 0 } else { t.ms },
+                settings: t.settings.clone(),
+            })
+        };
+        // 1. Exact pair: from -> to.
+        if let Some(r) = rules.iter().rev().find(|r| r.from.as_deref() == Some(from) && r.to.as_deref() == Some(to))
+            && let Some(t) = by_name(&r.transition)
+        {
+            return t;
+        }
+        // 2. Destination wildcard: Any -> to (then legacy ferrocast.scene_transitions override if present).
+        if let Some(r) = rules.iter().rev().find(|r| r.from.is_none() && r.to.as_deref() == Some(to))
+            && let Some(t) = by_name(&r.transition)
+        {
+            return t;
+        }
+        if let Ok(Some(legacy)) = serde_json::from_value::<Option<TransitionInfo>>(
+            self.extra("scene_transitions").get(to).cloned().unwrap_or(Value::Null),
+        ) {
+            return ResolvedTransition {
+                name: String::new(),
+                ms: if legacy.kind == "cut_transition" { 0 } else { legacy.ms.min(20_000) },
+                settings: self.transition_settings(&legacy.kind),
+                kind: legacy.kind,
+            };
+        }
+        // 3. Source wildcard: from -> Any.
+        if let Some(r) = rules.iter().rev().find(|r| r.from.as_deref() == Some(from) && r.to.is_none())
+            && let Some(t) = by_name(&r.transition)
+        {
+            return t;
+        }
+        // 4. Default transition.
+        if let Some(d) = all.iter().find(|t| t.default).or_else(|| all.first()) {
+            return ResolvedTransition {
+                name: d.name.clone(),
+                kind: d.kind.clone(),
+                ms: if d.kind == "cut_transition" { 0 } else { d.ms },
+                settings: d.settings.clone(),
+            };
+        }
+        let d = self.transition();
+        ResolvedTransition { name: String::new(), ms: d.ms, settings: self.transition_settings(&d.kind), kind: d.kind }
+    }
+
+    pub fn add_named_transition(&self, t: &NamedTransition) -> Result<NamedTransition, StudioError> {
+        let name = t.name.trim();
+        check_name(name)?;
+        if !is_valid_transition_kind(&t.kind) {
+            return Err(fail(format!("Unknown transition kind \"{}\".", t.kind)));
+        }
+        if t.ms > 20_000 {
+            return Err(fail("ms: a transition lasts 0 to 20000 ms."));
+        }
+        if !t.settings.is_object() {
+            return Err(fail("settings: an object of OBS transition settings."));
+        }
+        let mut list = self.named_transitions();
+        if list.iter().any(|x| x.name == name) {
+            return Err(fail(format!("There's already a transition called \"{name}\".")));
+        }
+        let ms = if t.kind == "cut_transition" { 0 } else { t.ms };
+        let created = NamedTransition {
+            name: name.to_string(),
+            kind: t.kind.clone(),
+            ms,
+            settings: t.settings.clone(),
+            default: t.default,
+        };
+        list.push(created.clone());
+        let default_name = if t.default {
+            name.to_string()
+        } else {
+            list.iter().find(|x| x.default).map_or_else(|| name.to_string(), |x| x.name.clone())
+        };
+        let default_ms = list.iter().find(|x| x.name == default_name).map_or(ms, |x| x.ms);
+        for x in &mut list {
+            x.default = x.name == default_name;
+        }
+        self.edit(|d| {
+            write_transitions_to_doc(d, &list, &default_name, default_ms);
+            mark_named_transitions_v2(d);
+        });
+        Ok(list.into_iter().find(|x| x.name == name).unwrap_or(created))
+    }
+
+    pub fn update_named_transition(
+        &self,
+        name: &str,
+        kind: Option<&str>,
+        ms: Option<u32>,
+        settings: Option<&Value>,
+        default: Option<bool>,
+    ) -> Result<NamedTransition, StudioError> {
+        if let Some(k) = kind
+            && !is_valid_transition_kind(k)
+        {
+            return Err(fail(format!("Unknown transition kind \"{k}\".")));
+        }
+        if let Some(m) = ms
+            && m > 20_000
+        {
+            return Err(fail("ms: a transition lasts 0 to 20000 ms."));
+        }
+        if let Some(s) = settings
+            && !s.is_object()
+        {
+            return Err(fail("settings: an object of OBS transition settings."));
+        }
+        let mut list = self.named_transitions();
+        let Some(pos) = list.iter().position(|x| x.name == name) else {
+            return Err(fail(format!("There's no transition called \"{name}\".")));
+        };
+        let kind_changed = kind.is_some_and(|k| k != list[pos].kind);
+        if let Some(k) = kind {
+            list[pos].kind = k.to_string();
+            if k == "cut_transition" {
+                list[pos].ms = 0;
+            }
+        }
+        if let Some(m) = ms {
+            list[pos].ms = if list[pos].kind == "cut_transition" { 0 } else { m };
+        }
+        if let Some(s) = settings {
+            if kind_changed || !list[pos].settings.is_object() {
+                list[pos].settings = s.clone();
+            } else if let (Some(dst), Some(src)) = (list[pos].settings.as_object_mut(), s.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+        } else if kind_changed {
+            list[pos].settings = json!({});
+        }
+        let default_name = if default == Some(true) {
+            name.to_string()
+        } else {
+            list.iter().find(|x| x.default).map_or_else(|| name.to_string(), |x| x.name.clone())
+        };
+        for x in &mut list {
+            x.default = x.name == default_name;
+        }
+        let default_ms = list.iter().find(|x| x.name == default_name).map_or(300, |x| x.ms);
+        let updated = list[pos].clone();
+        self.edit(|d| {
+            write_transitions_to_doc(d, &list, &default_name, default_ms);
+            mark_named_transitions_v2(d);
+        });
+        Ok(updated)
+    }
+
+    pub fn rename_named_transition(&self, name: &str, new_name: &str) -> Result<NamedTransition, StudioError> {
+        let new_name = new_name.trim();
+        check_name(new_name)?;
+        let mut list = self.named_transitions();
+        let Some(pos) = list.iter().position(|x| x.name == name) else {
+            return Err(fail(format!("There's no transition called \"{name}\".")));
+        };
+        if name == new_name {
+            return Ok(list[pos].clone());
+        }
+        if list.iter().any(|x| x.name == new_name) {
+            return Err(fail(format!("There's already a transition called \"{new_name}\".")));
+        }
+        list[pos].name = new_name.to_string();
+        let updated = list[pos].clone();
+        let default_name = list.iter().find(|x| x.default).map_or_else(|| new_name.to_string(), |x| x.name.clone());
+        let default_ms = list.iter().find(|x| x.name == default_name).map_or(300, |x| x.ms);
+        self.edit(|d| {
+            write_transitions_to_doc(d, &list, &default_name, default_ms);
+            if let Some(m) = d.pointer_mut("/ferrocast/transition_matrix").and_then(Value::as_array_mut) {
+                for r in m.iter_mut() {
+                    if r.get("transition").and_then(Value::as_str) == Some(name) {
+                        r["transition"] = json!(new_name);
+                    }
+                }
+            }
+            mark_named_transitions_v2(d);
+        });
+        Ok(updated)
+    }
+
+    pub fn duplicate_named_transition(
+        &self,
+        name: &str,
+        new_name: Option<&str>,
+    ) -> Result<NamedTransition, StudioError> {
+        let mut list = self.named_transitions();
+        let Some(src) = list.iter().find(|x| x.name == name).cloned() else {
+            return Err(fail(format!("There's no transition called \"{name}\".")));
+        };
+        let picked = match new_name {
+            Some(n) => {
+                let n = n.trim();
+                check_name(n)?;
+                if list.iter().any(|x| x.name == n) {
+                    return Err(fail(format!("There's already a transition called \"{n}\".")));
+                }
+                n.to_string()
+            }
+            None => free_transition_name(&list, name)?,
+        };
+        let dup = NamedTransition { name: picked, default: false, ..src };
+        list.push(dup.clone());
+        let default_name = list.iter().find(|x| x.default).map_or_else(|| list[0].name.clone(), |x| x.name.clone());
+        let default_ms = list.iter().find(|x| x.name == default_name).map_or(300, |x| x.ms);
+        self.edit(|d| {
+            write_transitions_to_doc(d, &list, &default_name, default_ms);
+            mark_named_transitions_v2(d);
+        });
+        Ok(dup)
+    }
+
+    pub fn set_default_named_transition(&self, name: &str) -> Result<(), StudioError> {
+        let mut list = self.named_transitions();
+        if !list.iter().any(|x| x.name == name) {
+            return Err(fail(format!("There's no transition called \"{name}\".")));
+        }
+        for x in &mut list {
+            x.default = x.name == name;
+        }
+        let ms = list.iter().find(|x| x.name == name).map_or(300, |x| x.ms);
+        self.edit(|d| {
+            write_transitions_to_doc(d, &list, name, ms);
+            mark_named_transitions_v2(d);
+        });
+        Ok(())
+    }
+
+    pub fn delete_named_transition(&self, name: &str) -> Result<(), StudioError> {
+        let mut list = self.named_transitions();
+        if !list.iter().any(|x| x.name == name) {
+            return Err(fail(format!("There's no transition called \"{name}\".")));
+        }
+        if list.len() <= 1 {
+            return Err(fail("At least one transition must remain."));
+        }
+        let was_default = list.iter().any(|x| x.name == name && x.default);
+        list.retain(|x| x.name != name);
+        let default_name = if was_default {
+            list.iter().find(|x| x.name == "Fade").or_else(|| list.first()).map(|x| x.name.clone()).unwrap_or_default()
+        } else {
+            list.iter().find(|x| x.default).map_or_else(|| list[0].name.clone(), |x| x.name.clone())
+        };
+        for x in &mut list {
+            x.default = x.name == default_name;
+        }
+        let default_ms = list.iter().find(|x| x.name == default_name).map_or(300, |x| x.ms);
+        self.edit(|d| {
+            write_transitions_to_doc(d, &list, &default_name, default_ms);
+            if let Some(m) = d.pointer_mut("/ferrocast/transition_matrix").and_then(Value::as_array_mut) {
+                m.retain(|r| r.get("transition").and_then(Value::as_str) != Some(name));
+            }
+            mark_named_transitions_v2(d);
+        });
+        Ok(())
+    }
+
+    pub fn set_matrix_rule(
+        &self,
+        from: Option<&str>,
+        to: Option<&str>,
+        transition: Option<&str>,
+    ) -> Result<(), StudioError> {
+        if from.is_none() && to.is_none() {
+            return Err(fail(
+                "Pick a From scene, a To scene, or both; the default transition already covers Any to Any.",
+            ));
+        }
+        if let Some(f) = from {
+            self.scene_index(f)?;
+        }
+        if let Some(t) = to {
+            self.scene_index(t)?;
+        }
+        if let Some(tr) = transition
+            && !self.named_transitions().iter().any(|x| x.name == tr)
+        {
+            return Err(fail(format!("There's no transition called \"{tr}\".")));
+        }
+        let mut rules = self.transition_matrix();
+        rules.retain(|r| !(r.from.as_deref() == from && r.to.as_deref() == to));
+        if let Some(tr) = transition {
+            rules.push(TransitionMatrixRule {
+                from: from.map(String::from),
+                to: to.map(String::from),
+                transition: tr.to_string(),
+            });
+        }
+        self.edit(|d| {
+            if !d.get("ferrocast").is_some_and(Value::is_object) {
+                d["ferrocast"] = json!({});
+            }
+            d["ferrocast"]["transition_matrix"] = json!(rules);
+            // Any -> to in the matrix supersedes any legacy scene_transitions entry.
+            if from.is_none()
+                && let Some(scene) = to
+                && let Some(st) = d["ferrocast"].get_mut("scene_transitions").and_then(Value::as_object_mut)
+            {
+                st.remove(scene);
+            }
+            mark_named_transitions_v2(d);
+        });
+        Ok(())
+    }
+}
+
+pub fn is_valid_transition_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "fade_transition"
+            | "cut_transition"
+            | "swipe_transition"
+            | "slide_transition"
+            | "fade_to_color_transition"
+            | "wipe_transition"
+            | "obs_stinger_transition"
+            | "ferrocast_move"
+    )
+}
+
+fn guess_transition_kind(name: &str) -> &'static str {
+    if name.eq_ignore_ascii_case("cut") || name == "cut_transition" {
+        "cut_transition"
+    } else if is_valid_transition_kind(name) {
+        match name {
+            "cut_transition" => "cut_transition",
+            "swipe_transition" => "swipe_transition",
+            "slide_transition" => "slide_transition",
+            "fade_to_color_transition" => "fade_to_color_transition",
+            "wipe_transition" => "wipe_transition",
+            "obs_stinger_transition" => "obs_stinger_transition",
+            "ferrocast_move" => "ferrocast_move",
+            _ => "fade_transition",
+        }
+    } else {
+        "fade_transition"
+    }
+}
+
+fn free_transition_name(existing: &[NamedTransition], base: &str) -> Result<String, StudioError> {
+    let mut n = 2usize;
+    loop {
+        let suffix = format!(" {n}");
+        let max_stem = 100usize.saturating_sub(suffix.chars().count());
+        let stem: String = base.chars().take(max_stem).collect();
+        let candidate = format!("{stem}{suffix}");
+        if !existing.iter().any(|t| t.name == candidate) {
+            return Ok(candidate);
+        }
+        n += 1;
+        if n > 10_000 {
+            return Err(fail("Too many transitions with similar names."));
+        }
+    }
+}
+
+fn mark_named_transitions_v2(d: &mut Value) {
+    if !d.get("ferrocast").is_some_and(Value::is_object) {
+        d["ferrocast"] = json!({});
+    }
+    d["ferrocast"]["named_transitions_v2"] = json!(true);
+}
+
+fn write_transitions_to_doc(d: &mut Value, list: &[NamedTransition], default_name: &str, default_ms: u32) {
+    let arr: Vec<Value> = list
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.kind,
+                "name": t.name,
+                "duration": if t.kind == "cut_transition" { 0 } else { t.ms.min(20_000) },
+                "settings": if t.settings.is_object() { t.settings.clone() } else { json!({}) },
+            })
+        })
+        .collect();
+    d["transitions"] = Value::Array(arr);
+    d["current_transition"] = json!(default_name);
+    d["transition_duration"] = json!(default_ms.min(20_000));
+}
+
+fn named_transitions_from_doc(d: &Value) -> Vec<NamedTransition> {
+    let current = d.get("current_transition").and_then(Value::as_str).unwrap_or("Fade").trim();
+    let current = if current.is_empty() { "Fade" } else { current };
+    let current_ms = d.get("transition_duration").and_then(Value::as_u64).unwrap_or(300).min(20_000) as u32;
+    let is_v2 = d.pointer("/ferrocast/named_transitions_v2").and_then(Value::as_bool).unwrap_or(false);
+    let legacy_settings =
+        if !is_v2 { d.pointer("/ferrocast/transition_settings").and_then(Value::as_object) } else { None };
+    let mut out: Vec<NamedTransition> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let raw = d.get("transitions").and_then(Value::as_array);
+    let had_entries = raw.is_some_and(|a| !a.is_empty());
+    if let Some(arr) = raw {
+        for entry in arr {
+            let Some(raw_name) = entry.get("name").and_then(Value::as_str) else { continue };
+            let name = raw_name.trim();
+            if name.is_empty() || !seen.insert(name.to_string()) {
+                continue;
+            }
+            let raw_kind = kind_of(entry);
+            let kind = if is_valid_transition_kind(raw_kind) {
+                raw_kind.to_string()
+            } else {
+                guess_transition_kind(name).to_string()
+            };
+            let ms = if kind == "cut_transition" {
+                0
+            } else if let Some(dur) = entry.get("duration").and_then(Value::as_u64) {
+                dur.min(20_000) as u32
+            } else if name == current {
+                current_ms
+            } else {
+                300
+            };
+            let mut settings = entry.get("settings").filter(|s| s.is_object()).cloned().unwrap_or_else(|| json!({}));
+            if settings.as_object().is_some_and(|m| m.is_empty())
+                && let Some(leg) = legacy_settings.and_then(|m| m.get(&kind)).filter(|v| v.is_object())
+            {
+                settings = leg.clone();
+            }
+            out.push(NamedTransition { name: name.to_string(), kind, ms, settings, default: false });
+        }
+    }
+    if !seen.contains(current) {
+        let kind = guess_transition_kind(current).to_string();
+        let ms = if kind == "cut_transition" { 0 } else { current_ms };
+        let settings =
+            legacy_settings.and_then(|m| m.get(&kind)).filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
+        out.insert(0, NamedTransition { name: current.to_string(), kind, ms, settings, default: false });
+        seen.insert(current.to_string());
+    }
+    if !had_entries {
+        if !seen.contains("Fade") {
+            out.push(NamedTransition {
+                name: "Fade".into(),
+                kind: "fade_transition".into(),
+                ms: 300,
+                settings: legacy_settings
+                    .and_then(|m| m.get("fade_transition"))
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                default: false,
+            });
+            seen.insert("Fade".into());
+        }
+        if !seen.contains("Cut") {
+            out.push(NamedTransition {
+                name: "Cut".into(),
+                kind: "cut_transition".into(),
+                ms: 0,
+                settings: legacy_settings
+                    .and_then(|m| m.get("cut_transition"))
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+                default: false,
+            });
+        }
+    }
+    let def_idx = out.iter().position(|t| t.name == current).unwrap_or(0);
+    if let Some(d) = out.get_mut(def_idx) {
+        d.default = true;
+    }
+    out
+}
+
+fn transition_matrix_from_doc(d: &Value) -> Vec<TransitionMatrixRule> {
+    let Some(raw) = d.pointer("/ferrocast/transition_matrix").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    raw.iter()
+        .filter_map(|v| serde_json::from_value::<TransitionMatrixRule>(v.clone()).ok())
+        .map(|mut r| {
+            r.from = r.from.filter(|s| !s.trim().is_empty());
+            r.to = r.to.filter(|s| !s.trim().is_empty());
+            r
+        })
+        .filter(|r| !(r.from.is_none() && r.to.is_none()) && !r.transition.trim().is_empty())
+        .collect()
+}
+
+/// Normalizes transition data when loading a saved, OBS, or Streamlabs collection:
+/// preserves old collections unchanged while upgrading OBS `transitions` & scene `private_settings.transition`.
+fn import_and_normalize_transitions(d: &mut Value) {
+    let is_v2 = d.pointer("/ferrocast/named_transitions_v2").and_then(Value::as_bool).unwrap_or(false);
+    let mut transitions = named_transitions_from_doc(d);
+    let mut rules = transition_matrix_from_doc(d);
+    let mut imported_scene_overrides = false;
+
+    if !is_v2 {
+        // OBS stores per-scene Transition Override in `sources[i].private_settings.transition`.
+        let vert_scenes: std::collections::HashSet<String> = d
+            .pointer("/ferrocast/vertical/scene_order")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        let obs_overrides: Vec<(String, String, Option<u32>)> = d
+            .get("sources")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|s| s.get("id").and_then(Value::as_str) == Some("scene"))
+            .filter_map(|s| {
+                let sname = s.get("name").and_then(Value::as_str)?.to_string();
+                if vert_scenes.contains(&sname) {
+                    return None;
+                }
+                let ps = s.get("private_settings")?;
+                let tr = ps.get("transition").and_then(Value::as_str)?.trim();
+                if tr.is_empty() {
+                    return None;
+                }
+                let dur = ps.get("transition_duration").and_then(Value::as_u64).map(|x| x.min(20_000) as u32);
+                Some((sname, tr.to_string(), dur))
+            })
+            .collect();
+
+        for (scene_name, tr_name, dur_opt) in obs_overrides {
+            let has_matrix = rules.iter().any(|r| r.from.is_none() && r.to.as_deref() == Some(&scene_name));
+            let has_legacy =
+                d.pointer(&format!("/ferrocast/scene_transitions/{scene_name}")).is_some_and(|v| !v.is_null());
+            if has_matrix || has_legacy {
+                continue;
+            }
+            if !transitions.iter().any(|t| t.name == tr_name) {
+                let kind = guess_transition_kind(&tr_name).to_string();
+                let ms = if kind == "cut_transition" { 0 } else { dur_opt.unwrap_or(300) };
+                transitions.push(NamedTransition {
+                    name: tr_name.clone(),
+                    kind,
+                    ms,
+                    settings: json!({}),
+                    default: false,
+                });
+            }
+            let target_tr = if let Some(dur) = dur_opt
+                && let Some(base) = transitions.iter().find(|t| t.name == tr_name).cloned()
+                && base.kind != "cut_transition"
+                && base.ms != dur
+            {
+                let custom = format!("{} ({dur}ms)", base.name);
+                if !transitions.iter().any(|t| t.name == custom) {
+                    transitions.push(NamedTransition {
+                        name: custom.clone(),
+                        kind: base.kind,
+                        ms: dur,
+                        settings: base.settings,
+                        default: false,
+                    });
+                }
+                custom
+            } else {
+                tr_name
+            };
+            rules.push(TransitionMatrixRule { from: None, to: Some(scene_name), transition: target_tr });
+            imported_scene_overrides = true;
+        }
+    }
+
+    // Deduplicate rules (last wins) and keep only those referencing existing main scenes & transitions.
+    let valid_tr: std::collections::HashSet<String> = transitions.iter().map(|t| t.name.clone()).collect();
+    let vert_scenes: std::collections::HashSet<String> = d
+        .pointer("/ferrocast/vertical/scene_order")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("name").and_then(Value::as_str).map(String::from))
+        .collect();
+    let valid_scenes: std::collections::HashSet<String> = d
+        .get("sources")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|s| s.get("id").and_then(Value::as_str) == Some("scene"))
+        .filter_map(|s| s.get("name").and_then(Value::as_str).map(String::from))
+        .filter(|n| !vert_scenes.contains(n))
+        .collect();
+    let mut deduped: Vec<TransitionMatrixRule> = Vec::new();
+    for r in rules {
+        if valid_tr.contains(&r.transition)
+            && r.from.as_ref().is_none_or(|f| valid_scenes.contains(f))
+            && r.to.as_ref().is_none_or(|t| valid_scenes.contains(t))
+        {
+            deduped.retain(|x| !(x.from == r.from && x.to == r.to));
+            deduped.push(r);
+        }
+    }
+
+    let default_name = transitions
+        .iter()
+        .find(|t| t.default)
+        .or_else(|| transitions.first())
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| "Fade".into());
+    let default_ms = transitions.iter().find(|t| t.name == default_name).map_or(300, |t| t.ms);
+
+    if d.get("transitions").is_some() || imported_scene_overrides || !deduped.is_empty() || is_v2 {
+        write_transitions_to_doc(d, &transitions, &default_name, default_ms);
+    }
+    if !deduped.is_empty() || d.pointer("/ferrocast/transition_matrix").is_some() {
+        if !d.get("ferrocast").is_some_and(Value::is_object) {
+            d["ferrocast"] = json!({});
+        }
+        d["ferrocast"]["transition_matrix"] = json!(deduped);
+    }
+    if imported_scene_overrides {
+        mark_named_transitions_v2(d);
+    }
+}
+
+/// Reads named transitions and matrix rules directly from a saved collection document (when the Studio is stopped).
+pub fn saved_named_transitions(doc: Option<&Value>) -> Vec<NamedTransition> {
+    doc.map(named_transitions_from_doc).unwrap_or_else(|| {
+        vec![
+            NamedTransition {
+                name: "Fade".into(),
+                kind: "fade_transition".into(),
+                ms: 300,
+                settings: json!({}),
+                default: true,
+            },
+            NamedTransition {
+                name: "Cut".into(),
+                kind: "cut_transition".into(),
+                ms: 0,
+                settings: json!({}),
+                default: false,
+            },
+        ]
+    })
+}
+
+pub fn saved_transition_matrix(doc: Option<&Value>) -> Vec<TransitionMatrixRule> {
+    doc.map(transition_matrix_from_doc).unwrap_or_default()
 }
 
 /// A stream, recording or replay buffer our engine runs for the stage. Dropping it ends it
@@ -8526,5 +9330,239 @@ mod tests {
         let dup = vert_items.iter().find(|i| i.id != vert_red.id).unwrap();
         assert!(!dup.own_filters);
         assert_eq!(ok(s.filters(&dup.name)).len(), 2);
+    }
+
+    #[test]
+    fn named_transitions_crud_rename_duplicate_delete_and_default() {
+        let s = stage();
+        let initial = s.named_transitions();
+        assert_eq!(initial.len(), 2);
+        assert!(initial.iter().any(|t| t.name == "Fade" && t.default && t.ms == 300));
+        assert!(initial.iter().any(|t| t.name == "Cut" && !t.default && t.ms == 0));
+
+        // Add named transitions with custom settings.
+        let swipe = ok(s.add_named_transition(&NamedTransition {
+            name: "Fast Swipe".into(),
+            kind: "swipe_transition".into(),
+            ms: 250,
+            settings: json!({ "direction": "right", "swipe_in": true }),
+            default: false,
+        }));
+        assert_eq!(swipe.ms, 250);
+        assert!(!swipe.default);
+
+        // Duplicate name rejected.
+        assert!(s.add_named_transition(&NamedTransition { name: "Fast Swipe".into(), ..Default::default() }).is_err());
+
+        // Duplicate generates free copy with default=false.
+        let dup = ok(s.duplicate_named_transition("Fast Swipe", None));
+        assert_eq!(dup.name, "Fast Swipe 2");
+        assert_eq!(dup.kind, "swipe_transition");
+        assert_eq!(dup.ms, 250);
+        assert_eq!(dup.settings["direction"], "right");
+        assert!(!dup.default);
+
+        // Update settings preserves independent instances; switching kind resets old settings cleanly.
+        let edited = ok(s.update_named_transition(
+            "Fast Swipe 2",
+            None,
+            Some(450),
+            Some(&json!({ "direction": "up" })),
+            Some(true),
+        ));
+        assert_eq!(edited.ms, 450);
+        assert_eq!(edited.settings["direction"], "up");
+        assert!(edited.default);
+        assert_eq!(s.transition(), TransitionInfo { kind: "swipe_transition".into(), ms: 450 });
+        assert_eq!(
+            s.named_transitions().iter().find(|t| t.name == "Fast Swipe").unwrap().settings["direction"],
+            "right"
+        );
+
+        // Delete default promotes Fade (or first remaining) safely; deleting last fails.
+        ok(s.delete_named_transition("Fast Swipe 2"));
+        assert!(s.named_transitions().iter().any(|t| t.default));
+        ok(s.delete_named_transition("Fast Swipe"));
+        ok(s.delete_named_transition("Cut"));
+        assert_eq!(s.named_transitions().len(), 1);
+        assert!(s.delete_named_transition("Fade").is_err(), "cannot delete last transition");
+    }
+
+    #[test]
+    fn transition_matrix_precedence_and_lifecycle_cleanup_and_renames() {
+        let s = stage();
+        ok(s.add_scene("BRB"));
+        ok(s.add_scene("Game"));
+
+        ok(s.add_named_transition(&NamedTransition {
+            name: "Pair Swipe".into(),
+            kind: "swipe_transition".into(),
+            ms: 400,
+            settings: json!({ "direction": "left" }),
+            default: false,
+        }));
+        ok(s.add_named_transition(&NamedTransition {
+            name: "To Game Slide".into(),
+            kind: "slide_transition".into(),
+            ms: 500,
+            settings: json!({ "direction": "up" }),
+            default: false,
+        }));
+        ok(s.add_named_transition(&NamedTransition {
+            name: "From Main Color".into(),
+            kind: "fade_to_color_transition".into(),
+            ms: 600,
+            settings: json!({ "color": 4278190080u32 }),
+            default: false,
+        }));
+
+        ok(s.set_matrix_rule(Some("Main"), None, Some("From Main Color")));
+        ok(s.set_matrix_rule(None, Some("Game"), Some("To Game Slide")));
+        ok(s.set_matrix_rule(Some("Main"), Some("Game"), Some("Pair Swipe")));
+
+        // 1. Exact pair beats both wildcards and default.
+        let r = s.resolve_transition("Main", "Game");
+        assert_eq!((r.name.as_str(), r.kind.as_str(), r.ms), ("Pair Swipe", "swipe_transition", 400));
+
+        // 2. Any -> to beats from -> Any and default.
+        let r = s.resolve_transition("BRB", "Game");
+        assert_eq!((r.name.as_str(), r.kind.as_str(), r.ms), ("To Game Slide", "slide_transition", 500));
+
+        // 3. from -> Any beats default.
+        let r = s.resolve_transition("Main", "BRB");
+        assert_eq!((r.name.as_str(), r.kind.as_str(), r.ms), ("From Main Color", "fade_to_color_transition", 600));
+
+        // 4. Default when no rule matches.
+        let r = s.resolve_transition("BRB", "Main");
+        assert_eq!((r.name.as_str(), r.kind.as_str(), r.ms), ("Fade", "fade_transition", 300));
+
+        // Renaming transition preserves all matrix references.
+        ok(s.rename_named_transition("Pair Swipe", "Main-to-Game Swipe"));
+        let r = s.resolve_transition("Main", "Game");
+        assert_eq!(r.name, "Main-to-Game Swipe");
+
+        // Renaming scene preserves matrix references and legacy overrides.
+        ok(s.rename("Game", "Play"));
+        let r = s.resolve_transition("Main", "Play");
+        assert_eq!(r.name, "Main-to-Game Swipe");
+        let r2 = s.resolve_transition("BRB", "Play");
+        assert_eq!(r2.name, "To Game Slide");
+
+        // Deleting transition cleans up exact rule and safely falls back to Any -> Play!
+        ok(s.delete_named_transition("Main-to-Game Swipe"));
+        assert!(!s.transition_matrix().iter().any(|r| r.transition == "Main-to-Game Swipe"));
+        let fallback = s.resolve_transition("Main", "Play");
+        assert_eq!(fallback.name, "To Game Slide");
+
+        // Deleting scene cleans up all rules mentioning it without leaving dangling refs.
+        ok(s.remove_scene("Play"));
+        assert!(
+            !s.transition_matrix().iter().any(|r| r.from.as_deref() == Some("Play") || r.to.as_deref() == Some("Play"))
+        );
+    }
+
+    #[test]
+    fn switching_paths_and_obs_import_and_old_collections_work() {
+        // Old minimal collection loads unchanged with default transitions.
+        let old_doc = json!({
+            "name": "Legacy",
+            "sources": [
+                { "id": "scene", "name": "Intro", "settings": { "items": [] } },
+                { "id": "scene", "name": "Live", "settings": { "items": [] } },
+                { "id": "scene", "name": "BRB", "settings": { "items": [] } },
+            ],
+            "scene_order": [{ "name": "Intro" }, { "name": "Live" }, { "name": "BRB" }],
+            "current_scene": "Intro",
+            "current_program_scene": "Intro",
+            "current_transition": "Fade",
+            "transition_duration": 750,
+            "ferrocast": {
+                "transition_settings": { "swipe_transition": { "direction": "down" } },
+                "scene_transitions": { "BRB": { "kind": "cut_transition", "ms": 0 } }
+            }
+        });
+        let legacy = ok(Stage::load(Canvas { width: 320, height: 180, fps: 30 }, &old_doc, "Main"));
+        assert_eq!(legacy.transition(), TransitionInfo { kind: "fade_transition".into(), ms: 750 });
+        assert_eq!(legacy.resolve_transition("Intro", "Live").ms, 750);
+        assert_eq!(legacy.resolve_transition("Intro", "BRB").kind, "cut_transition");
+
+        // OBS collection with transitions array & scene private_settings transition override.
+        let obs_doc = json!({
+            "name": "OBS Export",
+            "sources": [
+                { "id": "scene", "name": "Start", "settings": { "items": [] } },
+                {
+                    "id": "scene",
+                    "name": "Stage",
+                    "settings": { "items": [] },
+                    "private_settings": { "transition": "OBS Swipe", "transition_duration": 420 }
+                }
+            ],
+            "scene_order": [{ "name": "Start" }, { "name": "Stage" }],
+            "current_scene": "Start",
+            "current_program_scene": "Start",
+            "current_transition": "OBS Fade",
+            "transition_duration": 350,
+            "transitions": [
+                { "id": "fade_transition", "name": "OBS Fade", "settings": {} },
+                { "id": "swipe_transition", "name": "OBS Swipe", "settings": { "direction": "right" } }
+            ]
+        });
+        let obs = ok(Stage::load(Canvas { width: 320, height: 180, fps: 30 }, &obs_doc, "Main"));
+        let trs = obs.named_transitions();
+        assert_eq!(trs.len(), 3, "OBS Fade + OBS Swipe + imported duration variant");
+        let ov = obs.resolve_transition("Start", "Stage");
+        assert_eq!((ov.kind.as_str(), ov.ms), ("swipe_transition", 420));
+        assert_eq!(ov.settings["direction"], "right");
+        let scene_row = obs.scenes().into_iter().find(|x| x.name == "Stage").unwrap();
+        assert_eq!(scene_row.transition, Some(TransitionInfo { kind: "swipe_transition".into(), ms: 420 }));
+        assert!(scene_row.transition_name.as_deref() == Some("OBS Swipe (420ms)"));
+
+        // Direct switch, Studio Mode TransitionNow, and T-bar release all use resolved transition.
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "One").unwrap_or_else(|e| panic!("{e}"));
+        ok(s.add_scene("Two"));
+        ok(s.add_scene("Three"));
+        ok(s.add_named_transition(&NamedTransition {
+            name: "Instant Cut".into(),
+            kind: "cut_transition".into(),
+            ms: 0,
+            settings: json!({}),
+            default: false,
+        }));
+        ok(s.set_matrix_rule(Some("One"), Some("Two"), Some("Instant Cut")));
+        if let Ok(e) = s.engine() {
+            ok(s.add_source("One", "color_source_v3", "R", &json!({ "color": 4278190335u32 }), false));
+            ok(s.add_source("Two", "color_source_v3", "B", &json!({ "color": 4294901760u32 }), false));
+            ok(s.add_source("Three", "color_source_v3", "G", &json!({ "color": 4278255360u32 }), false));
+            let mid = ((90 * 320 + 160) * 4) as usize;
+            let px = || e.engine.snapshot().map(|p| p[mid..mid + 3].to_vec()).unwrap_or_default();
+
+            // Direct switch One -> Two via Instant Cut completes in 0 ms immediately.
+            ok(s.set_current("Two"));
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            assert_eq!(px(), [0, 0, 255], "exact pair cut finished right away");
+
+            // Switch back to One, then enter Studio Mode and use TransitionNow & T-bar.
+            ok(s.set_transition(&TransitionInfo { kind: "cut_transition".into(), ms: 0 }));
+            ok(s.set_current("One"));
+            s.set_studio_mode(true);
+            ok(s.set_preview("Two"));
+            assert!(s.scenes().into_iter().find(|x| x.name == "Two").unwrap().preview);
+            ok(s.transition_now(None));
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            assert_eq!(s.current(), "Two");
+            assert_eq!(px(), [0, 0, 255], "Studio Mode transition_now resolved pair");
+
+            // T-bar release from One -> Two.
+            ok(s.set_preview("One"));
+            ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+            assert_eq!(s.current(), "One");
+            assert_eq!(s.preview_scene().as_deref(), Some("Two"));
+            let tb = ok(s.tbar(1.0, true));
+            assert!(!tb.active);
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            assert_eq!(s.current(), "Two");
+            assert_eq!(px(), [0, 0, 255], "T-bar release used resolved cut transition");
+        }
     }
 }

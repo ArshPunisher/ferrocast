@@ -288,6 +288,8 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         }));
     }
     let default_t = root.get("transitions").and_then(|t| t.get("defaultTransitionId")).and_then(Value::as_str);
+    let mut tr_names = Names::default();
+    let mut tr_by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let transitions: Vec<Value> = root
         .get("transitions")
         .and_then(|t| t.get("transitions"))
@@ -295,23 +297,38 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         .into_iter()
         .flatten()
         .map(|t| {
+            let t_name = tr_names.take(t.get("name").and_then(Value::as_str).unwrap_or("Fade"));
+            if let Some(id) = t.get("id").and_then(Value::as_str) {
+                tr_by_id.insert(id.to_string(), t_name.clone());
+            }
             json!({
                 "id": t.get("type").cloned().unwrap_or(json!("fade_transition")),
-                "name": t.get("name").cloned().unwrap_or(json!("Fade")),
+                "name": t_name,
                 "settings": t.get("settings").cloned().unwrap_or(json!({})),
                 "duration": t.get("duration").and_then(Value::as_i64).unwrap_or(300),
             })
         })
         .collect();
-    let current_t = root
+    let current_t = default_t.and_then(|id| tr_by_id.get(id).cloned()).map(Value::String).unwrap_or_else(|| json!(""));
+    let matrix: Vec<Value> = root
         .get("transitions")
-        .and_then(|t| t.get("transitions"))
+        .and_then(|t| t.get("connections"))
         .and_then(Value::as_array)
-        .and_then(|l| l.iter().find(|t| t.get("id").and_then(Value::as_str) == default_t))
-        .and_then(|t| t.get("name").cloned())
-        .unwrap_or(json!(""));
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            let tid = c.get("transitionId").and_then(Value::as_str)?;
+            let tr = tr_by_id.get(tid)?;
+            let from = c.get("fromSceneId").and_then(Value::as_str).filter(|s| !s.is_empty()).and_then(name_of);
+            let to = c.get("toSceneId").and_then(Value::as_str).filter(|s| !s.is_empty()).and_then(name_of);
+            if from.is_none() && to.is_none() {
+                return None;
+            }
+            Some(json!({ "from": from, "to": to, "transition": tr }))
+        })
+        .collect();
     let first = scene_names.first().cloned().unwrap_or_default();
-    json!({
+    let mut out = json!({
         "name": name,
         "sources": sources,
         "transitions": transitions,
@@ -319,7 +336,11 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         "current_program_scene": first,
         "current_transition": current_t,
         "scene_order": scene_names.iter().map(|n| json!({ "name": n })).collect::<Vec<_>>(),
-    })
+    });
+    if !matrix.is_empty() {
+        out["ferrocast"] = json!({ "transition_matrix": matrix });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -367,9 +388,15 @@ mod tests {
                 ] } },
                 { "id": "c2", "name": "BRB", "sceneItems": { "items": [ { "sourceId": "s2" } ] } }
             ] },
-            "transitions": { "defaultTransitionId": "t1", "transitions": [
-                { "id": "t1", "name": "Swipe", "type": "swipe_transition", "duration": 500, "settings": {} }
-            ] }
+            "transitions": {
+                "defaultTransitionId": "t1",
+                "transitions": [
+                    { "id": "t1", "name": "Swipe", "type": "swipe_transition", "duration": 500, "settings": {} }
+                ],
+                "connections": [
+                    { "fromSceneId": "c1", "toSceneId": "c2", "transitionId": "t1" }
+                ]
+            }
         })
     }
 
@@ -396,6 +423,9 @@ mod tests {
         assert_eq!(it[2]["name"], "BRB");
         assert_eq!(doc["current_transition"], "Swipe");
         assert_eq!(doc["transitions"][0]["duration"], 500);
+        assert_eq!(doc["ferrocast"]["transition_matrix"][0]["from"], "Live(1)");
+        assert_eq!(doc["ferrocast"]["transition_matrix"][0]["to"], "BRB");
+        assert_eq!(doc["ferrocast"]["transition_matrix"][0]["transition"], "Swipe");
         assert_eq!(doc["scene_order"].as_array().unwrap().len(), 2);
         if cfg!(target_os = "macos") {
             // Windows devices and captures come in as this Mac's kinds, empty.

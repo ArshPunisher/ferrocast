@@ -43,9 +43,9 @@ pub const WEB_PAGE_KIND: &str = "ferrocast_web";
 
 pub use collection::{
     AudioInfo, BOUNDS, CHANNEL_KEYS, Captions, DEINTERLACE, Face, FaceFollow, FilterInfo, FollowLook, ItemEdit,
-    ItemInfo, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, SceneInfo, SoundTap, SourceUse, StudioOptions,
-    TBarState, TapReader, Transform, TransitionInfo, VERTICAL_SIZE, VerticalInfo, WebAct, ask_captions_access,
-    captions_access, find_busy, find_faces, focus_x,
+    ItemInfo, LevelInfo, MediaAct, MediaInfo, MissingFile, Monitor, NamedTransition, ResolvedTransition, SceneInfo,
+    SoundTap, SourceUse, StudioOptions, TBarState, TapReader, Transform, TransitionInfo, TransitionMatrixRule,
+    VERTICAL_SIZE, VerticalInfo, WebAct, ask_captions_access, captions_access, find_busy, find_faces, focus_x,
 };
 pub use collection::{jpeg_data_url, png_data_url};
 pub use projector::{MultiviewLayout, MultiviewLook, ProjectorOf, Screen};
