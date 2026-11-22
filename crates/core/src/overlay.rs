@@ -296,7 +296,9 @@ pub fn is_trusted_emote_cdn(raw: &str) -> bool {
         || authority.contains('@')
         || authority.contains(':')
         || authority.contains('\\')
-        || rest[authority.len()..].starts_with('\\')
+        || !authority.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        || !rest[authority.len()..].starts_with('/')
+        || rest.len() <= authority.len() + 1
     {
         return false;
     }
@@ -649,6 +651,11 @@ mod tests {
             "data:image/svg+xml,<svg onload=alert(1)>",
             "javascript:alert(1)",
             "//cdn.7tv.app/emote/1/1x.webp",
+            "https://static\u{ad}-cdn.jtvnw.net/x.png",
+            "https://static-cdn.jtvnw.net",
+            "https://static-cdn.jtvnw.net/",
+            "https://yt3.ggpht.com?a=1",
+            "https://static-cdn.jtvnw.net#x",
         ] {
             assert!(!is_trusted_emote_cdn(bad), "expected rejected: {bad}");
         }
