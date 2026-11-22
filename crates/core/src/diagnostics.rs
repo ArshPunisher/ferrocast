@@ -1117,6 +1117,7 @@ fn collect_structural_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
     collect_url_spans(text, spans);
     collect_kv_and_json_spans(text, spans);
     collect_token_word_spans(text, spans);
+    collect_local_api_key_spans(text, spans);
     collect_email_spans(text, spans);
     for (start, end, bracketed) in find_ip_spans(text) {
         spans.push(SensitiveSpan { start, end, kind: SpanKind::Ip, bracketed });
@@ -1796,6 +1797,27 @@ fn collect_token_word_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
             spans.push(SensitiveSpan { start: offset, end: offset + len, kind: SpanKind::Secret, bracketed: false });
         }
         offset += len;
+    }
+}
+
+/// A local API key (`fc_key_` and its characters) anywhere in the text: after a colon, a slash,
+/// a bracket or a dot, as well as at the start of a word. Only the key's own span is masked.
+fn collect_local_api_key_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
+    const PREFIX: &str = "fc_key_";
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(PREFIX) {
+        let start = from + at;
+        let body = start + PREFIX.len();
+        let n = text.as_bytes()[body..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || matches!(**b, b'_' | b'-'))
+            .count();
+        // Nothing (or next to nothing) after the prefix: a mention of the format, not a key.
+        if n > 2 {
+            spans.push(SensitiveSpan { start, end: body + n, kind: SpanKind::Secret, bracketed: false });
+        }
+        from = body + n.max(1);
     }
 }
 
@@ -2482,6 +2504,30 @@ mod tests {
         let key = format!("fc_key_{}", "ab12".repeat(16));
         let out = redact_text(&format!("the request carried {key} and failed"), &[], &[]);
         assert!(!out.contains(&key) && !out.contains("fc_key_ab12"), "{out}");
+    }
+
+    #[test]
+    fn a_local_api_key_is_redacted_next_to_punctuation_and_only_the_key_is_masked() {
+        let key = format!("fc_key_{}", "ab12".repeat(16));
+        for text in [
+            format!("auth:{key} rejected"),
+            format!("key={key}&x=1"),
+            format!("Authorization:{key}"),
+            format!("(token:{key})"),
+            format!("user=ana:{key}:end"),
+            format!("a.b/{key}.json"),
+            format!("{key}"),
+            format!("FC_KEY_{}", "AB12".repeat(16)),
+        ] {
+            let out = redact_text(&text, &[], &[]);
+            assert!(!out.to_ascii_lowercase().contains("fc_key_ab12"), "{text} -> {out}");
+        }
+        // Only the key's span goes: the words around it stay.
+        let out = redact_text(&format!("route:/api/v1/status auth:{key} status:429"), &[], &[]);
+        assert!(out.contains("route:") && out.contains("status:429") && !out.contains("ab12"), "{out}");
+        // A bare mention of the prefix with nothing after it is not a key.
+        let out = redact_text("keys start with fc_key_ and a long hex", &[], &[]);
+        assert!(out.contains("fc_key_ and"), "{out}");
     }
 
     #[test]
