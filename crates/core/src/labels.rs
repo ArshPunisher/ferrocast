@@ -581,14 +581,10 @@ impl ComboTrain {
             self.warmup.clear();
             expired = true;
         }
+        // Every stale pulse goes, wherever it sits: pulses are stamped with the arrival clock but
+        // a late one can sit behind a newer one, and an expired pulse must not count.
         let w_ms = self.window_ms();
-        while let Some(front) = self.warmup.front() {
-            if now.0.saturating_sub(front.at.0) >= w_ms {
-                self.warmup.pop_front();
-            } else {
-                break;
-            }
-        }
+        self.warmup.retain(|p| now.0.saturating_sub(p.at.0) < w_ms);
         expired
     }
 
@@ -1309,5 +1305,16 @@ mod tests {
         let v = tip_train.view(Millis(25_000));
         assert!(!v.active, "reversed tip leaving < threshold events must deactivate active train");
         assert_eq!(v.warmup_count, 2);
+    }
+
+    #[test]
+    fn an_expired_pulse_behind_a_fresh_one_does_not_start_a_train() {
+        let cfg = ComboTrainConfig { window_s: 60, step_s: 15, max_s: 90, threshold: 3 };
+        let mut train = ComboTrain::new(cfg);
+        // Arrivals out of order: 50 s, then 0 s, then 70 s. At 70 s the 0 s pulse is 70 s old.
+        train.observe_at(&follow(50_000, "A"), Millis(50_000));
+        train.observe_at(&follow(0, "B"), Millis(50_000).max(Millis(0)));
+        train.observe_at(&follow(70_000, "C"), Millis(70_000));
+        assert!(!train.view(Millis(70_000)).active, "only two pulses are inside the window");
     }
 }
