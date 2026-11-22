@@ -752,59 +752,34 @@ pub fn redact_with(text: &str, known_secrets: &[&str], known_usernames: &[&str],
     if text.is_empty() {
         return String::new();
     }
-    let mask = match style {
-        RedactStyle::Report => REDACTED,
-        RedactStyle::Bullets => "•••",
-    };
-    let mask_email = match style {
-        RedactStyle::Report => REDACTED_EMAIL,
-        RedactStyle::Bullets => "•••",
-    };
-    let mask_ip = match style {
-        RedactStyle::Report => REDACTED_IP,
-        RedactStyle::Bullets => "•••",
-    };
-    let mask_user = match style {
-        RedactStyle::Report => REDACTED_USER,
-        RedactStyle::Bullets => "•••",
-    };
-
-    let mut out = text.to_string();
-
-    // 1. Explicit fixture/configured secrets (>= 4 chars, longest first so substrings don't shadow).
-    let mut secrets: Vec<&str> = known_secrets.iter().copied().filter(|s| s.len() >= 4).collect();
-    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for secret in secrets {
-        if out.contains(secret) {
-            out = out.replace(secret, mask);
+    let spans = collect_sensitive_spans(text, known_secrets, known_usernames);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for sp in spans {
+        if sp.start < cursor || sp.end > text.len() {
+            continue;
         }
+        out.push_str(&text[cursor..sp.start]);
+        let placeholder = match (style, sp.kind) {
+            (RedactStyle::Report, SpanKind::Secret) => REDACTED,
+            (RedactStyle::Report, SpanKind::Email) => REDACTED_EMAIL,
+            (RedactStyle::Report, SpanKind::Ip) => REDACTED_IP,
+            (RedactStyle::Report, SpanKind::User) => REDACTED_USER,
+            (RedactStyle::Bullets, _) => "•••",
+        };
+        if sp.bracketed {
+            out.push('[');
+            out.push_str(placeholder);
+            out.push(']');
+        } else {
+            out.push_str(placeholder);
+        }
+        cursor = sp.end;
     }
-
-    // 2. Path usernames (`/Users/<u`, `/home/<u`, `C:\Users\<u`, `C:/Users/<u`, `\\Users\<u`)
-    out = scrub_path_usernames(&out, mask_user);
-
-    // 3. Explicit known usernames on identifier/word boundaries (caught in paths, hostnames, mics).
-    let mut users: Vec<&str> = known_usernames.iter().copied().filter(|u| u.len() >= 3).collect();
-    users.sort_by_key(|u| std::cmp::Reverse(u.len()));
-    for user in users {
-        out = replace_identifier_ci(&out, user, mask_user);
-    }
-
-    // 4. URLs with userinfo (`scheme://user:pass@host`) or streaming keys (`rtmp://.../app/<key>`).
-    out = scrub_urls(&out, mask);
-
-    // 5. Structured secret key-value and JSON fields (`key=`, `token=`, `"password":"..."`, etc.).
-    out = scrub_kv_and_json_secrets(&out, mask);
-
-    // 6. Token prefixes (`Bearer `, `Basic `, `live_`, `oauth:`, JWT `eyJ...`, API prefixes) & secret words.
-    out = scrub_token_words(&out, mask);
-
-    // 7. Emails (`local@domain.tld`).
-    out = scrub_emails(&out, mask_email);
-
-    // 8. IPv4 and IPv6 literals (`192.168.1.42`, `[fe80::1]:47820`, `2001:db8::1%en0`, etc.).
-    out = scrub_ip_addresses(&out, mask_ip);
-
+    out.push_str(&text[cursor..]);
     out
 }
 
@@ -1084,63 +1059,198 @@ fn sensitive_byte_ranges(s: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn replace_identifier_ci(text: &str, needle: &str, replacement: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SpanKind {
+    Secret,
+    Email,
+    Ip,
+    User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SensitiveSpan {
+    start: usize,
+    end: usize,
+    kind: SpanKind,
+    bracketed: bool,
+}
+
+fn collect_sensitive_spans(text: &str, known_secrets: &[&str], known_usernames: &[&str]) -> Vec<SensitiveSpan> {
+    let mut spans = Vec::new();
+
+    // 1. Explicit known secrets (>= 4 chars).
+    let mut secrets: Vec<&str> = known_secrets.iter().copied().filter(|s| s.len() >= 4).collect();
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for secret in secrets {
+        for (idx, _) in text.match_indices(secret) {
+            spans.push(SensitiveSpan { start: idx, end: idx + secret.len(), kind: SpanKind::Secret, bracketed: false });
+        }
+    }
+
+    // 2. Explicit known usernames (>= 3 chars) on identifier/word boundaries.
+    let mut users: Vec<&str> = known_usernames.iter().copied().filter(|u| u.len() >= 3).collect();
+    users.sort_by_key(|u| std::cmp::Reverse(u.len()));
+    for user in users {
+        collect_identifier_ci_spans(text, user, &mut spans);
+    }
+
+    // 3. Structural collectors on raw text.
+    collect_structural_spans(text, &mut spans);
+
+    // 4. Percent-decoded pass for URL-encoded secrets/URLs/emails/paths (mapped back to raw spans).
+    if text.contains('%') {
+        collect_percent_decoded_spans(text, &mut spans);
+    }
+
+    merge_sensitive_spans(spans)
+}
+
+fn collect_structural_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
+    collect_path_username_spans(text, spans);
+    collect_pem_spans(text, spans);
+    collect_url_spans(text, spans);
+    collect_kv_and_json_spans(text, spans);
+    collect_token_word_spans(text, spans);
+    collect_email_spans(text, spans);
+    for (start, end, bracketed) in find_ip_spans(text) {
+        spans.push(SensitiveSpan { start, end, kind: SpanKind::Ip, bracketed });
+    }
+}
+
+fn merge_sensitive_spans(mut spans: Vec<SensitiveSpan>) -> Vec<SensitiveSpan> {
+    spans.retain(|s| s.start < s.end);
+    if spans.is_empty() {
+        return spans;
+    }
+    spans.sort_by(|a, b| a.start.cmp(&b.start).then_with(|| b.end.cmp(&a.end)).then_with(|| a.kind.cmp(&b.kind)));
+    let mut merged: Vec<SensitiveSpan> = Vec::with_capacity(spans.len());
+    for sp in spans {
+        if let Some(last) = merged.last_mut()
+            && sp.start < last.end
+        {
+            // Keep bracketed IP boundaries intact when absorbing an interior match.
+            if sp.end <= last.end {
+                if sp.start == last.start && sp.end == last.end && sp.kind < last.kind {
+                    last.kind = sp.kind;
+                }
+            } else {
+                last.end = sp.end;
+                if sp.kind < last.kind {
+                    last.kind = sp.kind;
+                }
+                last.bracketed = false;
+            }
+        } else {
+            merged.push(sp);
+        }
+    }
+    merged
+}
+
+fn collect_percent_decoded_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
+    let bytes = text.as_bytes();
+    let mut decoded = String::with_capacity(text.len());
+    let mut orig_ranges: Vec<(usize, usize)> = Vec::with_capacity(text.len());
+    let mut i = 0usize;
+    let mut saw_pct = false;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let (Some(&h), Some(&l)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && h.is_ascii_hexdigit()
+            && l.is_ascii_hexdigit()
+            && let Ok(val) = u8::from_str_radix(&text[i + 1..i + 3], 16)
+            && (0x20..=0x7e).contains(&val)
+        {
+            saw_pct = true;
+            decoded.push(val as char);
+            orig_ranges.push((i, i + 3));
+            i += 3;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or('\0');
+        let clen = ch.len_utf8();
+        decoded.push(ch);
+        for _ in 0..clen {
+            orig_ranges.push((i, i + clen));
+        }
+        i += clen;
+    }
+    if !saw_pct {
+        return;
+    }
+    let mut dec_spans = Vec::new();
+    collect_structural_spans(&decoded, &mut dec_spans);
+    for ds in dec_spans {
+        if ds.start < ds.end && ds.end <= orig_ranges.len() {
+            let orig_start = orig_ranges[ds.start].0;
+            let orig_end = orig_ranges[ds.end - 1].1;
+            if orig_start < orig_end {
+                spans.push(SensitiveSpan { start: orig_start, end: orig_end, kind: ds.kind, bracketed: ds.bracketed });
+            }
+        }
+    }
+}
+
+fn collect_identifier_ci_spans(text: &str, needle: &str, spans: &mut Vec<SensitiveSpan>) {
     let low_text = text.to_lowercase();
     let low_needle = needle.to_lowercase();
     if low_text.len() != text.len() || low_needle.is_empty() {
-        // Fallback if case folding changed byte length.
-        return text.replace(needle, replacement);
+        for (idx, _) in text.match_indices(needle) {
+            spans.push(SensitiveSpan { start: idx, end: idx + needle.len(), kind: SpanKind::User, bracketed: false });
+        }
+        return;
     }
     let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
+    let mut i = 0usize;
     while let Some(rel) = low_text[i..].find(&low_needle) {
         let start = i + rel;
         let end = start + needle.len();
         let left_ok = start == 0 || !is_ident_char(bytes[start - 1]);
         let right_ok = end == bytes.len() || !is_ident_char(bytes[end]) || text[end..].starts_with("'s");
-        out.push_str(&text[i..start]);
         if left_ok && right_ok {
-            out.push_str(replacement);
-        } else {
-            out.push_str(&text[start..end]);
+            spans.push(SensitiveSpan { start, end, kind: SpanKind::User, bracketed: false });
         }
         i = end;
     }
-    out.push_str(&text[i..]);
-    out
 }
 
 fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn scrub_path_usernames(text: &str, mask: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+fn collect_path_username_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
     let lower = text.to_ascii_lowercase();
     let bytes = text.as_bytes();
     let lbytes = lower.as_bytes();
-    let mut i = 0;
+    let mut i = 0usize;
     while i < bytes.len() {
         let matched = ["/users/", "/home/", "\\users\\", "/users\\", "\\users/"]
             .into_iter()
             .find(|p| lbytes[i..].starts_with(p.as_bytes()));
 
         if let Some(pref) = matched {
-            // Check preceding context: start of line/quote/space, drive `C:`, or path boundary.
             let prev_ok = i == 0
                 || bytes[i - 1] == b':'
                 || bytes[i - 1].is_ascii_whitespace()
-                || matches!(bytes[i - 1], b'"' | b'\'' | b'(' | b'[' | b'=' | b'<' | b'\\' | b'/' | b',');
+                || matches!(
+                    bytes[i - 1],
+                    b'"' | b'\'' | b'(' | b'[' | b'{' | b'=' | b'<' | b'\\' | b'/' | b',' | b';' | b'|'
+                );
             if prev_ok {
                 let u_start = i + pref.len();
                 let u_end = find_path_segment_end(text, u_start);
                 if u_end > u_start {
                     let seg = &text[u_start..u_end];
-                    // Don't double-redact an already masked segment or OS system pseudo-dirs.
-                    if !matches!(seg, "Public" | "Shared" | "Default" | "All Users" | "Default User") && seg != mask {
-                        out.push_str(&text[i..u_start]);
-                        out.push_str(mask);
+                    if !matches!(seg, "Public" | "Shared" | "Default" | "All Users" | "Default User")
+                        && seg != REDACTED_USER
+                        && seg != "•••"
+                    {
+                        spans.push(SensitiveSpan {
+                            start: u_start,
+                            end: u_end,
+                            kind: SpanKind::User,
+                            bracketed: false,
+                        });
                         i = u_end;
                         continue;
                     }
@@ -1148,18 +1258,56 @@ fn scrub_path_usernames(text: &str, mask: &str) -> String {
             }
         }
         let ch = text[i..].chars().next().unwrap_or('\0');
-        out.push(ch);
         i += ch.len_utf8();
     }
-    out
 }
 
 fn find_path_segment_end(text: &str, start: usize) -> usize {
     let mut end = start;
+    let mut spaces = 0usize;
     for (rel, ch) in text[start..].char_indices() {
+        if ch == ' ' {
+            // Allow spaces in OS folder usernames (e.g. `C:\Users\John Smith\AppData`) when bounded by a
+            // subsequent separator with no trailing space immediately before the separator.
+            if spaces < 2 && rel > 0 {
+                let next_part = &text[start + rel + 1..];
+                if let Some(sep_pos) = next_part.find(['/', '\\'])
+                    && sep_pos > 0
+                    && sep_pos <= 32
+                {
+                    let seg_tail = &next_part[..sep_pos];
+                    let has_bad = seg_tail.chars().any(|c| {
+                        matches!(
+                            c,
+                            '\t' | '\r'
+                                | '\n'
+                                | '"'
+                                | '\''
+                                | '`'
+                                | ','
+                                | ';'
+                                | ')'
+                                | ']'
+                                | '}'
+                                | '>'
+                                | '?'
+                                | '&'
+                                | '='
+                                | ':'
+                        )
+                    });
+                    if !has_bad && !seg_tail.ends_with(' ') && !next_part.starts_with(' ') {
+                        spaces += 1;
+                        end = start + rel + 1;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
         if matches!(
             ch,
-            '/' | '\\' | ' ' | '\t' | '\r' | '\n' | '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '>' | '?' | '&'
+            '/' | '\\' | '\t' | '\r' | '\n' | '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | '>' | '?' | '&' | '='
         ) {
             break;
         }
@@ -1168,99 +1316,297 @@ fn find_path_segment_end(text: &str, start: usize) -> usize {
     end
 }
 
-fn scrub_urls(text: &str, mask: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
+fn collect_pem_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
+    let upper = text.to_ascii_uppercase();
+    let mut pos = 0usize;
+    while let Some(rel) = upper[pos..].find("-----BEGIN ") {
+        let begin_start = pos + rel;
+        let Some(dash_end_rel) = upper[begin_start + 11..].find("-----") else {
+            break;
+        };
+        let header_end = begin_start + 11 + dash_end_rel + 5;
+        let header_label = &upper[begin_start + 11..begin_start + 11 + dash_end_rel];
+        if !(header_label.contains("PRIVATE KEY") || header_label.contains("SECRET KEY")) {
+            pos = header_end;
+            continue;
+        }
+        let body_start = if text[header_end..].starts_with("\r\n") {
+            header_end + 2
+        } else if text[header_end..].starts_with('\n') {
+            header_end + 1
+        } else {
+            header_end
+        };
+        if let Some(end_rel) = upper[body_start..].find("-----END ") {
+            let body_end = body_start + end_rel;
+            let trimmed_end = text[body_start..body_end].trim_end_matches(['\r', '\n']).len() + body_start;
+            if trimmed_end > body_start {
+                spans.push(SensitiveSpan {
+                    start: body_start,
+                    end: trimmed_end,
+                    kind: SpanKind::Secret,
+                    bracketed: false,
+                });
+            }
+            let after_end = upper[body_end..].find("-----").map_or(text.len(), |n| body_end + n + 5);
+            pos = after_end;
+        } else {
+            // Truncated PEM block at log tail: scrub PEM header/base64 lines until non-PEM text or EOF.
+            let mut cur = body_start;
+            let mut body_end = body_start;
+            for line in text[body_start..].split_inclusive('\n') {
+                let t = line.trim();
+                let looks_pem = t.is_empty()
+                    || t.starts_with("Proc-Type:")
+                    || t.starts_with("DEK-Info:")
+                    || t.starts_with("Version:")
+                    || t.starts_with("Comment:")
+                    || (t.len() >= 4
+                        && t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')));
+                if !looks_pem {
+                    break;
+                }
+                cur += line.len();
+                body_end = cur;
+            }
+            let trimmed_end = text[body_start..body_end].trim_end_matches(['\r', '\n']).len() + body_start;
+            if trimmed_end > body_start {
+                spans.push(SensitiveSpan {
+                    start: body_start,
+                    end: trimmed_end,
+                    kind: SpanKind::Secret,
+                    bracketed: false,
+                });
+            }
+            pos = body_end.max(body_start + 1);
+        }
+    }
+}
+
+fn collect_url_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
+    let mut i = 0usize;
     let lower = text.to_ascii_lowercase();
     while let Some(rel) = lower[i..].find("://") {
         let scheme_end = i + rel + 3;
-        out.push_str(&text[i..scheme_end]);
+        let mut scheme_start = i + rel;
+        while scheme_start > i
+            && (lower.as_bytes()[scheme_start - 1].is_ascii_alphanumeric()
+                || matches!(lower.as_bytes()[scheme_start - 1], b'+' | b'-' | b'.'))
+        {
+            scheme_start -= 1;
+        }
+        let scheme_prefix = &lower[scheme_start..scheme_end];
         let rest = &text[scheme_end..];
         let url_len = rest
             .find(|c: char| c.is_ascii_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | '<' | '`'))
             .unwrap_or(rest.len());
-        let url_body = &rest[..url_len];
-        out.push_str(&scrub_url_body(&lower[i..scheme_end], url_body, mask));
-        i = scheme_end + url_len;
-    }
-    out.push_str(&text[i..]);
-    out
-}
+        let body = &rest[..url_len];
 
-fn scrub_url_body(scheme_prefix: &str, body: &str, mask: &str) -> String {
-    let mut s = body.to_string();
-    // 1. Userinfo (`user:pass@host`) in any URL authority.
-    let auth_end = s.find(['/', '?', '#']).unwrap_or(s.len());
-    if let Some(at) = s[..auth_end].rfind('@') {
-        s = format!("{mask}{}", &s[at..]);
-    }
-    // 2. Discord / Slack webhooks.
-    let low = s.to_ascii_lowercase();
-    for marker in ["/api/webhooks/", "/services/"] {
-        if let Some(idx) = low.find(marker) {
-            let cut = idx + marker.len();
-            if let Some(id_slash) = s[cut..].find('/') {
-                let prefix_len = cut + id_slash + 1;
-                return format!("{}{mask}", &s[..prefix_len]);
+        // 1. Userinfo (`user:pass@host`) in any URL authority.
+        let auth_end = body.find(['/', '?', '#']).unwrap_or(body.len());
+        if let Some(at) = body[..auth_end].rfind('@')
+            && at > 0
+        {
+            spans.push(SensitiveSpan {
+                start: scheme_end,
+                end: scheme_end + at,
+                kind: SpanKind::Secret,
+                bracketed: false,
+            });
+        }
+
+        // 2. Discord / Slack webhooks.
+        let low_body = body.to_ascii_lowercase();
+        let mut webhook_matched = false;
+        for marker in ["/api/webhooks/", "/services/"] {
+            if let Some(idx) = low_body.find(marker) {
+                let cut = idx + marker.len();
+                if let Some(id_slash) = body[cut..].find('/') {
+                    let prefix_len = cut + id_slash + 1;
+                    if prefix_len < url_len {
+                        spans.push(SensitiveSpan {
+                            start: scheme_end + prefix_len,
+                            end: scheme_end + url_len,
+                            kind: SpanKind::Secret,
+                            bracketed: false,
+                        });
+                    }
+                    webhook_matched = true;
+                    break;
+                }
             }
         }
-    }
-    // 3. Streaming ingest URLs carry the stream key as trailing path segment.
-    let is_ingest =
-        ["rtmp://", "rtmps://", "srt://", "rist://", "whip://"].iter().any(|sch| scheme_prefix.ends_with(sch));
-    if is_ingest {
-        let path_part_end = s.find('?').unwrap_or(s.len());
-        if let Some(slash) = s[..path_part_end].rfind('/')
-            && slash > 0
-            && slash + 1 < path_part_end
-        {
-            s = format!("{}{mask}{}", &s[..slash + 1], &s[path_part_end..]);
+
+        // 3. Streaming ingest URLs (`rtmp*`, `srt*`, `rist`, `whip`) and HTTPS/HTTP WHIP/WebRTC publish endpoints.
+        if !webhook_matched {
+            let path_part_end = body.find(['?', '#']).unwrap_or(body.len());
+            let trimmed_end = body[..path_part_end].trim_end_matches('/').len();
+            let is_rtmp_or_stream =
+                ["rtmp://", "rtmps://", "rtmpt://", "rtmpe://", "rtmpte://", "srt://", "srtla://", "rist://"]
+                    .iter()
+                    .any(|sch| scheme_prefix == *sch);
+            let is_whip = scheme_prefix == "whip://";
+            if is_rtmp_or_stream || is_whip {
+                if let Some(host_slash) = body[..trimmed_end].find('/') {
+                    if let Some(key_slash_rel) = body[host_slash + 1..trimmed_end].find('/') {
+                        let key_start = host_slash + 1 + key_slash_rel + 1;
+                        if key_start < trimmed_end {
+                            spans.push(SensitiveSpan {
+                                start: scheme_end + key_start,
+                                end: scheme_end + trimmed_end,
+                                kind: SpanKind::Secret,
+                                bracketed: false,
+                            });
+                        }
+                    } else if is_whip && host_slash + 1 < trimmed_end {
+                        spans.push(SensitiveSpan {
+                            start: scheme_end + host_slash + 1,
+                            end: scheme_end + trimmed_end,
+                            kind: SpanKind::Secret,
+                            bracketed: false,
+                        });
+                    }
+                }
+            } else if scheme_prefix == "https://" || scheme_prefix == "http://" {
+                let low_path = &low_body[..trimmed_end];
+                for marker in ["/whip/", "/webrtc/publish/"] {
+                    if let Some(m_idx) = low_path.find(marker) {
+                        let key_start = m_idx + marker.len();
+                        if key_start < trimmed_end {
+                            spans.push(SensitiveSpan {
+                                start: scheme_end + key_start,
+                                end: scheme_end + trimmed_end,
+                                kind: SpanKind::Secret,
+                                bracketed: false,
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
         }
+
+        i = scheme_end + url_len.max(1);
     }
-    s
 }
 
-fn scrub_kv_and_json_secrets(text: &str, mask: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+fn find_closing_quote(inner: &str, quote: char, escaped_json: bool) -> Option<usize> {
+    let bytes = inner.as_bytes();
+    let q_byte = quote as u8;
+    let mut i = 0usize;
+    if escaped_json {
+        // Inside an escaped JSON string (`\"key\":\"val\"`), the closing delimiter is `\"` with an odd
+        // number of backslashes where `% 4 == 1` (not `\\\"` which is an escaped inner quote).
+        while i < bytes.len() {
+            if bytes[i] == q_byte {
+                let mut bs = 0usize;
+                while bs < i && bytes[i - 1 - bs] == b'\\' {
+                    bs += 1;
+                }
+                if bs % 4 == 1 {
+                    return Some(i - 1);
+                }
+                if bs == 0 {
+                    // Unescaped outer quote reached unexpectedly; stop before it.
+                    return Some(i);
+                }
+            } else if bytes[i] == b'\n' || bytes[i] == b'\r' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        return None;
+    }
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == q_byte {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn collect_kv_and_json_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
     let mut offset = 0usize;
     while offset < text.len() {
         let rest = &text[offset..];
-        let prev_alnum = offset > 0 && text.as_bytes()[offset - 1].is_ascii_alphanumeric();
+        let prev_byte = offset.checked_sub(1).map(|idx| text.as_bytes()[idx]);
         let low = rest.to_ascii_lowercase();
-        if let Some((key_name, key_len, val_delim)) = match_kv_prefix(&low, prev_alnum) {
+        if let Some((key_name, key_len, val_delim, is_json_key, is_escaped_json)) = match_kv_prefix(&low, prev_byte) {
             let after_eq = &rest[key_len..];
-            // Strip optional whitespace after `=` or `:` before value.
-            let trim_ws = after_eq.len() - after_eq.trim_start_matches([' ', '\t']).len();
+            let trim_ws = if is_json_key {
+                after_eq.len() - after_eq.trim_start_matches([' ', '\t', '\r', '\n']).len()
+            } else {
+                after_eq.len() - after_eq.trim_start_matches([' ', '\t']).len()
+            };
             let v_start = &after_eq[trim_ws..];
-            if let Some(q) = v_start.chars().next().filter(|&c| c == '"' || c == '\'') {
-                let inner = &v_start[1..];
-                let end = inner.find(q).unwrap_or(inner.len());
-                out.push_str(&rest[..key_len + trim_ws + 1]);
-                if inner[..end] == *mask || inner[..end] == *"•••" {
-                    out.push_str(&inner[..end]);
-                } else {
-                    out.push_str(mask);
+
+            if is_escaped_json && v_start.starts_with("\\\"") {
+                let inner = &v_start[2..];
+                let end = find_closing_quote(inner, '"', true).unwrap_or(inner.len());
+                let val = &inner[..end];
+                if !is_placeholder_or_benign(val) {
+                    let abs_start = offset + key_len + trim_ws + 2;
+                    spans.push(SensitiveSpan {
+                        start: abs_start,
+                        end: abs_start + end,
+                        kind: SpanKind::Secret,
+                        bracketed: false,
+                    });
                 }
-                if end < inner.len() {
-                    out.push(q);
-                    offset += key_len + trim_ws + 1 + end + 1;
-                } else {
-                    offset = text.len();
-                }
+                let advance = key_len + trim_ws + 2 + end + usize::from(inner[end..].starts_with("\\\"")) * 2;
+                offset += advance.max(1);
                 continue;
             }
+
+            if let Some(q) = v_start.chars().next().filter(|&c| c == '"' || c == '\'') {
+                let inner = &v_start[1..];
+                let end = find_closing_quote(inner, q, false).unwrap_or(inner.len());
+                let val = &inner[..end];
+                if !is_placeholder_or_benign(val) {
+                    let abs_start = offset + key_len + trim_ws + 1;
+                    spans.push(SensitiveSpan {
+                        start: abs_start,
+                        end: abs_start + end,
+                        kind: SpanKind::Secret,
+                        bracketed: false,
+                    });
+                }
+                let has_close = end < inner.len();
+                offset += key_len + trim_ws + 1 + end + usize::from(has_close);
+                continue;
+            }
+
+            // HTTP Cookie / Set-Cookie header lines hold semicolon-separated pairs up to EOL/quote.
+            if matches!(key_name, "cookie" | "set-cookie") && val_delim == ':' {
+                let end = v_start.find(|c: char| matches!(c, '\r' | '\n' | '"' | '\'')).unwrap_or(v_start.len());
+                let val = v_start[..end].trim_end();
+                if !val.is_empty() && !is_placeholder_or_benign(val) {
+                    let abs_start = offset + key_len + trim_ws;
+                    spans.push(SensitiveSpan {
+                        start: abs_start,
+                        end: abs_start + val.len(),
+                        kind: SpanKind::Secret,
+                        bracketed: false,
+                    });
+                }
+                offset += (key_len + trim_ws + end).max(1);
+                continue;
+            }
+
             let mut end = v_start
                 .find(|c: char| c.is_whitespace() || matches!(c, '&' | ',' | ';' | '"' | '\'' | ')' | '}' | ']' | '|'))
                 .unwrap_or(v_start.len());
             let first = &v_start[..end];
             if key_name == "authorization" && val_delim == ':' {
                 if first.eq_ignore_ascii_case("bearer") || first.eq_ignore_ascii_case("basic") {
-                    // Leave scheme word intact so `scrub_token_words` scrubs the following token.
-                    out.push_str(&rest[..key_len + trim_ws + end]);
-                    offset += key_len + trim_ws + end;
+                    offset += (key_len + trim_ws + end).max(1);
                     continue;
                 }
-                // Handle custom auth schemes such as `Authorization: CustomScheme rawkey123`.
                 let rem = &v_start[end..];
                 let ws2 = rem.len() - rem.trim_start_matches([' ', '\t']).len();
                 if ws2 > 0 {
@@ -1275,65 +1621,108 @@ fn scrub_kv_and_json_secrets(text: &str, mask: &str) -> String {
                     }
                 }
             }
-            out.push_str(&rest[..key_len + trim_ws]);
             let val = &v_start[..end];
-            if !val.is_empty()
-                && !matches!(val.to_ascii_lowercase().as_str(), "null" | "true" | "false" | "none")
-                && val != mask
-                && val != "•••"
-            {
-                out.push_str(mask);
-            } else if !val.is_empty() {
-                out.push_str(val);
+            if !val.is_empty() && !is_placeholder_or_benign(val) {
+                let abs_start = offset + key_len + trim_ws;
+                spans.push(SensitiveSpan {
+                    start: abs_start,
+                    end: abs_start + end,
+                    kind: SpanKind::Secret,
+                    bracketed: false,
+                });
             }
-            offset += key_len + trim_ws + end;
+            offset += (key_len + trim_ws + end).max(1);
             continue;
         }
         let ch = rest.chars().next().unwrap_or('\0');
-        out.push(ch);
         offset += ch.len_utf8();
     }
-    out
 }
 
-fn match_kv_prefix(lower: &str, prev_alnum: bool) -> Option<(&'static str, usize, char)> {
+fn is_placeholder_or_benign(val: &str) -> bool {
+    matches!(val.to_ascii_lowercase().as_str(), "null" | "true" | "false" | "none")
+        || matches!(val, REDACTED | REDACTED_USER | REDACTED_EMAIL | REDACTED_IP | "•••")
+}
+
+fn match_kv_prefix(lower: &str, prev_byte: Option<u8>) -> Option<(&'static str, usize, char, bool, bool)> {
     const KEYS: &[&str] = &[
+        "x-amz-security-token",
+        "x-amz-signature",
+        "webhook_secret",
+        "signing_secret",
+        "install_secret",
         "client_secret",
+        "code_verifier",
         "access_token",
         "refresh_token",
         "authorization",
+        "x-auth-token",
+        "x-csrf-token",
         "obsidian_key",
         "obs_password",
+        "private_key",
+        "webhook_url",
+        "oauth_code",
+        "session_id",
         "passphrase",
         "stream_key",
         "streamkey",
         "stream_id",
         "streamid",
         "id_token",
-        "webhook_url",
-        "webhook",
+        "csrf_token",
+        "set-cookie",
+        "x-api-key",
+        "auth_code",
+        "signature",
         "password",
+        "webhook",
         "api_key",
         "apikey",
+        "session",
         "passwd",
         "secret",
         "bearer",
+        "cookie",
+        "ticket",
         "token",
         "pass",
         "auth",
+        "pair",
+        "code",
+        "jwt",
+        "pwd",
         "key",
+        "sig",
     ];
+    let prev_alnum = prev_byte.is_some_and(|b| b.is_ascii_alphanumeric());
     for k in KEYS {
+        // Escaped JSON key: `\"stream_key\":`
+        if let Some(after_q) = lower.strip_prefix("\\\"")
+            && let Some(after_k) = after_q.strip_prefix(k)
+            && let Some(after_q2) = after_k.strip_prefix("\\\"")
+        {
+            let ws = after_q2.len() - after_q2.trim_start_matches([' ', '\t', '\r', '\n']).len();
+            if after_q2[ws..].starts_with(':') {
+                let total = 2 + k.len() + 2 + ws + 1;
+                let ws2 = lower[total..].len() - lower[total..].trim_start_matches([' ', '\t', '\r', '\n']).len();
+                return Some((k, total + ws2, ':', true, true));
+            }
+        }
         // Quoted JSON key: `"stream_key":`
         if let Some(after_q) = lower.strip_prefix('"')
             && let Some(after_k) = after_q.strip_prefix(k)
             && let Some(after_q2) = after_k.strip_prefix('"')
         {
-            let ws = after_q2.len() - after_q2.trim_start_matches([' ', '\t']).len();
+            // Keep `LikelyCause.code` intact in `report.json`; only redact `code` in URL queries.
+            if *k == "code" {
+                continue;
+            }
+            let ws = after_q2.len() - after_q2.trim_start_matches([' ', '\t', '\r', '\n']).len();
             if after_q2[ws..].starts_with(':') {
                 let total = 1 + k.len() + 1 + ws + 1;
-                let ws2 = lower[total..].len() - lower[total..].trim_start_matches([' ', '\t']).len();
-                return Some((k, total + ws2, ':'));
+                let ws2 = lower[total..].len() - lower[total..].trim_start_matches([' ', '\t', '\r', '\n']).len();
+                return Some((k, total + ws2, ':', true, false));
             }
         }
         // Unquoted `key=` / `key:` on a non-alphanumeric left boundary (`obs_password=` is fine; `hotkey=` is not).
@@ -1341,21 +1730,28 @@ fn match_kv_prefix(lower: &str, prev_alnum: bool) -> Option<(&'static str, usize
             && let Some(after_k) = lower.strip_prefix(k)
             && let Some(d) = after_k.chars().next().filter(|&c| c == '=' || c == ':')
         {
-            return Some((k, k.len() + 1, d));
+            if *k == "code" && !(d == '=' && matches!(prev_byte, Some(b'?' | b'&'))) {
+                continue;
+            }
+            if *k == "pair" && !(d == '=' && matches!(prev_byte, Some(b'?' | b'&' | b'#'))) {
+                continue;
+            }
+            return Some((k, k.len() + 1, d, false, false));
         }
     }
     None
 }
 
-fn scrub_token_words(text: &str, mask: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
+fn collect_token_word_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
+    let mut offset = 0usize;
     let mut expect_auth_token = false;
-    while !rest.is_empty() {
+    while offset < text.len() {
+        let rest = &text[offset..];
         let len = rest
             .find(|c: char| {
                 c.is_whitespace()
-                    || matches!(c, '"' | '\'' | '&' | '=' | ',' | ';' | '(' | ')' | '<' | '>' | '[' | ']' | '{' | '}')
+                    || (!expect_auth_token && c == '=')
+                    || matches!(c, '"' | '\'' | '&' | ',' | ';' | '(' | ')' | '<' | '>' | '[' | ']' | '{' | '}')
             })
             .unwrap_or(rest.len());
         if len == 0 {
@@ -1363,31 +1759,46 @@ fn scrub_token_words(text: &str, mask: &str) -> String {
             if !ch.is_whitespace() {
                 expect_auth_token = false;
             }
-            out.push(ch);
-            rest = &rest[ch.len_utf8()..];
+            offset += ch.len_utf8();
             continue;
         }
         let word = &rest[..len];
         let low = word.to_ascii_lowercase();
         if expect_auth_token {
-            out.push_str(mask);
+            if !is_placeholder_or_benign(word) {
+                spans.push(SensitiveSpan {
+                    start: offset,
+                    end: offset + len,
+                    kind: SpanKind::Secret,
+                    bracketed: false,
+                });
+            }
             expect_auth_token = false;
         } else if low == "bearer" || low == "basic" {
-            out.push_str(word);
             expect_auth_token = true;
         } else if is_prefixed_token(word, &low) || is_jwt(word) || looks_opaque_secret(word) {
-            out.push_str(mask);
-        } else {
-            out.push_str(word);
+            spans.push(SensitiveSpan { start: offset, end: offset + len, kind: SpanKind::Secret, bracketed: false });
         }
-        rest = &rest[len..];
+        offset += len;
     }
-    out
 }
 
 fn is_prefixed_token(word: &str, lower: &str) -> bool {
     const PREFIXES: &[&str] = &[
-        "live_", "oauth:", "sk_live_", "sk_test_", "whsec_", "ghp_", "gho_", "ghu_", "aiza", "xoxb-", "xoxp-", "fcr_",
+        "live_",
+        "oauth:",
+        "sk_live_",
+        "sk_test_",
+        "whsec_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "aiza",
+        "xoxb-",
+        "xoxp-",
+        "fcr_",
+        "fca_",
+        "age-secret-key-1",
     ];
     PREFIXES.iter().any(|p| lower.starts_with(p) && word.len() > p.len() + 2)
 }
@@ -1419,18 +1830,16 @@ fn looks_opaque_secret(w: &str) -> bool {
     (digit && lower && (upper || sep)) || (upper && lower && sep && w.len() >= 28)
 }
 
-fn scrub_emails(text: &str, mask: &str) -> String {
-    let mut out = String::with_capacity(text.len());
+fn collect_email_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
     let bytes = text.as_bytes();
-    let mut i = 0;
-    let mut last_copied = 0;
+    let mut i = 0usize;
+    let mut min_local = 0usize;
     while i < bytes.len() {
         if bytes[i] == b'@' {
             let mut local_start = i;
-            while local_start > last_copied && is_email_local(bytes[local_start - 1]) {
+            while local_start > min_local && is_email_local(bytes[local_start - 1]) {
                 local_start -= 1;
             }
-            // Strip leading punctuation like `.`
             while local_start < i && bytes[local_start] == b'.' {
                 local_start += 1;
             }
@@ -1444,17 +1853,14 @@ fn scrub_emails(text: &str, mask: &str) -> String {
             let local = &text[local_start..i];
             let dom = &text[i + 1..dom_end];
             if is_valid_email_parts(local, dom) {
-                out.push_str(&text[last_copied..local_start]);
-                out.push_str(mask);
-                last_copied = dom_end;
+                spans.push(SensitiveSpan { start: local_start, end: dom_end, kind: SpanKind::Email, bracketed: false });
+                min_local = dom_end;
                 i = dom_end;
                 continue;
             }
         }
         i += 1;
     }
-    out.push_str(&text[last_copied..]);
-    out
 }
 
 fn is_email_local(b: u8) -> bool {
@@ -1471,31 +1877,6 @@ fn is_valid_email_parts(local: &str, dom: &str) -> bool {
     }
     let Some((_, tld)) = dom.rsplit_once('.') else { return false };
     tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()) && !dom.contains("..")
-}
-
-fn scrub_ip_addresses(text: &str, mask: &str) -> String {
-    let spans = find_ip_spans(text);
-    if spans.is_empty() {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0;
-    for (start, end, bracketed) in spans {
-        if start < cursor {
-            continue;
-        }
-        out.push_str(&text[cursor..start]);
-        if bracketed {
-            out.push('[');
-            out.push_str(mask);
-            out.push(']');
-        } else {
-            out.push_str(mask);
-        }
-        cursor = end;
-    }
-    out.push_str(&text[cursor..]);
-    out
 }
 
 /// Finds `(start_byte, end_byte, is_bracketed)` of every valid IPv4/IPv6 literal (and optional
@@ -1522,6 +1903,10 @@ fn find_ip_spans(text: &str) -> Vec<(usize, usize, bool)> {
 
         if is_ip_char(bytes[i]) {
             let left_ok = i == 0 || !is_ip_boundary_blocker(bytes[i - 1]);
+            if !left_ok {
+                i += 1;
+                continue;
+            }
             let start = i;
             while i < bytes.len() && is_ip_char(bytes[i]) {
                 i += 1;
@@ -1541,17 +1926,15 @@ fn find_ip_spans(text: &str) -> Vec<(usize, usize, bool)> {
                     i = z_end;
                 }
             }
-            if !left_ok {
-                continue;
-            }
             let right_ok = end == bytes.len() || !is_ip_boundary_blocker(bytes[end]);
-            if !right_ok {
+            let candidate = &text[start..end];
+            if right_ok && let Some((ip_end_rel, _)) = parse_ip_or_ip_port(candidate) {
+                out.push((start, start + ip_end_rel, false));
                 continue;
             }
-
-            let candidate = &text[start..end];
-            if let Some((ip_end_rel, _)) = parse_ip_or_ip_port(candidate) {
-                out.push((start, start + ip_end_rel, false));
+            // If `dead:192.168.1.1` failed as one hex+ip candidate, advance just past the first `:` or `.`.
+            if let Some(sep) = candidate.find([':', '.']) {
+                i = start + sep + 1;
             }
             continue;
         }
@@ -1742,6 +2125,77 @@ mod tests {
             }
         }
         assert_eq!(redact_text("hotkey=Ctrl+P bypass=true", &[], &[]), "hotkey=Ctrl+P bypass=true");
+    }
+
+    #[test]
+    fn redacts_query_tokens_headers_escaped_json_pct_ingest_pem_ips_and_spaced_paths() {
+        let users = ["John Smith"];
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "GET /api/v1/media/m1?session=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&ticket=tkt_9988&code=oauth_cb_7766&code_verifier=pkce_ver_55",
+                &[
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                    "tkt_9988",
+                    "oauth_cb_7766",
+                    "pkce_ver_55",
+                ],
+            ),
+            (
+                "Cookie: fca_session=sess_cookie_11; csrf_token=csrf_tok_22\nSet-Cookie: sid=set_cookie_33; HttpOnly",
+                &["sess_cookie_11", "csrf_tok_22", "set_cookie_33"],
+            ),
+            (
+                "x-api-key: xak_1 x-auth-token: xat_2 x-csrf-token: xct_3 private_key=pk_4 signing_secret=ss_5 webhook_secret=whs_6 pwd=pwd_7 sig=sig_8 signature=sig_9 X-Amz-Signature=amz_10 X-Amz-Security-Token=amz_11",
+                &["xak_1", "xat_2", "xct_3", "pk_4", "ss_5", "whs_6", "pwd_7", "sig_8", "sig_9", "amz_10", "amz_11"],
+            ),
+            (
+                r#"{"body":"{\"access_token\":\"esc_tok_999\",\"password\":\"pw\\\"suffix_secret\"}"}"#,
+                &["esc_tok_999", "pw", "suffix_secret"],
+            ),
+            ("{\n  \"access_token\":\n  \"multiline_json_tok\"\n}", &["multiline_json_tok"]),
+            (
+                "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQE\nSecretPemBodyLine\n-----END PRIVATE KEY-----",
+                &["MIIEvQIBADANBgkqhkiG9w0BAQE", "SecretPemBodyLine"],
+            ),
+            (
+                "token%3Dpct_secret_11 url=rtmp%3A%2F%2Flive.twitch.tv%2Fapp%2Fpct_live_key email=pctalice%40example.com C%3A%5CUsers%5CpctWinUser%5CAppData",
+                &["pct_secret_11", "pct_live_key", "pctalice", "pctWinUser"],
+            ),
+            (
+                "srtla://ingest.example.com:5000/live/srtla_stream_key rtmpt://h.example/app/rtmpt_k1 rtmpe://h.example/app/rtmpe_k2",
+                &["srtla_stream_key", "rtmpt_k1", "rtmpe_k2"],
+            ),
+            (
+                "https://whip.example.com/whip/whip_secret_tok https://rtc.example.com/webRTC/publish/rtc_pub_tok",
+                &["whip_secret_tok", "rtc_pub_tok"],
+            ),
+            (
+                "rtmp://live.twitch.tv/app/trailing_slash_key/ rtmp://host.example/app/first_key_part/sub_part rtmp://host.example/app/my_secret_key?cb=a/b",
+                &["trailing_slash_key", "first_key_part", "sub_part", "my_secret_key"],
+            ),
+            (
+                "Authorization: Bearer abc=def Basic dXNlcjpwYXNz== fca_se_tok12345 AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
+                &["abc=def", "dXNlcjpwYXNz==", "fca_se_tok12345", "AGE-SECRET-KEY-1"],
+            ),
+            (
+                "ip:192.168.1.42 host:10.0.0.5 src:203.0.113.9 dead:192.168.1.1 tcp:203.0.113.10:1935 v6:fe80::1",
+                &["192.168.1.42", "10.0.0.5", "203.0.113.9", "192.168.1.1", "203.0.113.10", "fe80::1"],
+            ),
+            (
+                r";C:\Users\John Smith\AppData|C:\Users\Jane Doe\Videos {/Users/BracedUser/data",
+                &["John Smith", "Smith", "Jane Doe", "Doe", "BracedUser"],
+            ),
+        ];
+
+        for (raw, forbidden) in cases {
+            let red = redact_text(raw, &[], &users);
+            for secret in *forbidden {
+                assert!(!red.contains(secret), "secret {secret:?} survived in {red:?} from {raw:?}");
+            }
+        }
+
+        let safe = "2026-11-22T03:02:11Z INFO ferrocast 1.4.2 Apple M3 Max 48000 Hz status=200 code=404";
+        assert_eq!(redact_text(safe, &[], &users), safe);
     }
 
     #[test]

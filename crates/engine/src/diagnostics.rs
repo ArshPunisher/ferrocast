@@ -576,15 +576,16 @@ fn gather_redacted_logs(logs_dir: &Path, secrets: &[&str], users: &[&str]) -> (V
         let Ok(meta) = std::fs::metadata(&p) else { continue };
         let Ok(raw_bytes) = read_tail_bytes(&p, meta.len(), MAX_LOG_BYTES_PER_FILE) else { continue };
         let text = String::from_utf8_lossy(&raw_bytes);
-        let all_lines: Vec<String> = text.lines().map(strip_ansi).map(|l| redact_text(&l, secrets, users)).collect();
+        let all_lines: Vec<String> = text.lines().map(strip_ansi).collect();
         let start = all_lines.len().saturating_sub(MAX_LOG_LINES_PER_FILE);
-        let kept = &all_lines[start..];
-        for l in kept {
+        let joined = all_lines[start..].join("\n");
+        let redacted = redact_text(&joined, secrets, users);
+        for l in redacted.lines() {
             if is_error_line(l) && errors.len() < 20 {
-                errors.push(l.clone());
+                errors.push(l.to_string());
             }
         }
-        files_out.push((fname.to_string(), kept.join("\n")));
+        files_out.push((fname.to_string(), redacted));
     }
     (files_out, errors)
 }
@@ -892,5 +893,34 @@ mod tests {
         assert!(names.contains(&"logs/ferrocast.log".to_string()));
         assert!(names.contains(&"crashes/panic-note.txt".to_string()));
         assert!(names.iter().any(|n| n.starts_with("crashes/") && n.ends_with(".dmp")));
+    }
+
+    #[tokio::test]
+    async fn support_zip_redacts_multiline_pem_and_json_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("ferrocast.log"),
+            concat!(
+                "2026-11-22T03:00:00Z ERROR payload={\n",
+                "  \"access_token\":\n",
+                "    \"short_ml_tok\"\n",
+                "}\n",
+                "-----BEGIN PRIVATE KEY-----\n",
+                "MIIEvQIBADANBgkqhkiG9w0BAQE\n",
+                "PemLogSecretLineABC\n",
+                "-----END PRIVATE KEY-----\n",
+            ),
+        )
+        .unwrap();
+
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        let (_name, bytes, _report) = engine.diagnostics_zip_bytes().await.unwrap();
+        let mut arc = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut log_body = String::new();
+        arc.by_name("logs/ferrocast.log").unwrap().read_to_string(&mut log_body).unwrap();
+        assert!(!log_body.contains("short_ml_tok"), "multiline JSON leaked: {log_body}");
+        assert!(!log_body.contains("PemLogSecretLineABC"), "PEM block leaked: {log_body}");
     }
 }
