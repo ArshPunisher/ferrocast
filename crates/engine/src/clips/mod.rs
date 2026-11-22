@@ -715,14 +715,38 @@ impl Engine {
                     ));
                 }
                 let own = srt_is_exclusive(&path);
-                // Only the case changes on a disk that ignores it: one file, so a plain rename.
-                if same_file(&path, &to) {
-                    std::fs::rename(&path, &to).map_err(|e| io_refuse("Couldn't rename it", &e))?;
-                } else {
-                    move_without_replacing(&path, &to)?;
+                #[cfg(test)]
+                {
+                    let mut race = RACE_CREATE.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(i) = race.iter().position(|p| *p == to_srt) {
+                        let p = race.remove(i);
+                        let _ = std::fs::write(p, b"taken");
+                    }
                 }
-                if own && is_plain_file(&from_srt) && std::fs::symlink_metadata(&to_srt).is_err() {
-                    let _ = move_without_replacing(&from_srt, &to_srt);
+                // The captions go first, and the clip only if they did: a clip never ends up
+                // renamed with its captions left behind. If the clip then can't move, they go back.
+                let moves_srt = own && is_plain_file(&from_srt);
+                if moves_srt {
+                    move_without_replacing(&from_srt, &to_srt).map_err(|_| {
+                        refuse(
+                            409,
+                            "clip_name_taken",
+                            "Captions with that name appeared while renaming.",
+                            "Nothing was renamed. Pick another name.",
+                        )
+                    })?;
+                }
+                // Only the case changes on a disk that ignores it: one file, so a plain rename.
+                let moved = if same_file(&path, &to) {
+                    std::fs::rename(&path, &to).map_err(|e| io_refuse("Couldn't rename it", &e))
+                } else {
+                    move_without_replacing(&path, &to)
+                };
+                if let Err(e) = moved {
+                    if moves_srt {
+                        let _ = move_without_replacing(&to_srt, &from_srt);
+                    }
+                    return Err(e);
                 }
             }
             // From the file itself, not the (capped) list: a clip past the 2,000th still answers.
@@ -750,6 +774,10 @@ impl Engine {
         .map_err(|e| EngineError::Internal(e.to_string()))?
     }
 }
+
+/// For tests: files created at the moment a rename has checked its names (the race it guards).
+#[cfg(test)]
+pub(crate) static RACE_CREATE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// Renames without replacing: the new name appears only if nothing is there (a hard link then
 /// the old name removed, which fails when the name is taken).

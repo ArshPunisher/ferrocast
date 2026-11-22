@@ -581,3 +581,21 @@ async fn a_timed_out_job_stops_its_worker_before_releasing_its_place() {
     // The job only reads as finished after its worker was stopped.
     assert!(stopped.load(Ordering::SeqCst), "the job finished before its worker was stopped");
 }
+
+/// CodeRabbit: when the captions can't follow the clip, the clip is not left renamed with its
+/// captions behind: nothing moves, and it says so (the same id still works).
+#[tokio::test]
+async fn a_rename_whose_captions_cannot_follow_leaves_both_where_they_were() {
+    let (e, _data, clips) = engine().await;
+    touch(clips.path(), "a.mp4", b"video");
+    touch(clips.path(), "a.srt", b"1\n00:00:00,000 --> 00:00:01,000\nhi\n\n");
+    // Another operation takes the new captions name after the precheck.
+    RACE_CREATE.lock().unwrap().push(clips.path().join("b.srt"));
+    let r = e.rename_clip("a.mp4", "b").await;
+    assert!(r.is_err(), "{r:?}");
+    assert!(clips.path().join("a.mp4").exists(), "the clip moved without its captions");
+    assert!(clips.path().join("a.srt").exists());
+    assert!(!clips.path().join("b.mp4").exists());
+    // The same id still works.
+    assert_eq!(e.clip_captions("a.mp4").await.unwrap().len(), 1);
+}
