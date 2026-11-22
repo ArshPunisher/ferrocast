@@ -6001,8 +6001,10 @@ mod tests {
         assert_eq!((e.preview_paused(1), e.preview_paused(2)), (Some(true), Some(false)));
     }
 
-    /// A paused preview thread sleeps until woken: not a timer, and it comes back at once on
-    /// resume and on stop (a stop used to wait out the 100 ms nap).
+    /// A paused preview thread sleeps until woken: not a timer, and it comes back on resume and on
+    /// stop (a stop used to wait out a 100 ms nap). Nothing here compares a wall-clock time with
+    /// a bound a slow machine could miss: "no timer" is shown by the thread staying asleep when
+    /// its flag changes but nobody wakes it, "comes back" by it returning once woken.
     #[test]
     fn a_paused_preview_thread_sleeps_until_resumed_or_stopped() {
         let paused = Arc::new(AtomicBool::new(true));
@@ -6015,13 +6017,13 @@ mod tests {
             let _ = tx.send(());
         });
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "it waits while paused");
-        let t = Instant::now();
+        // Resumed, but not woken: a timer would bring it back by itself; a condvar does not.
         paused.store(false, Ordering::Release);
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "no timer: it sleeps until it is woken");
         wake_preview(&wake);
-        rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(t.elapsed() < Duration::from_millis(50), "resume is quick: {:?}", t.elapsed());
+        rx.recv_timeout(Duration::from_secs(10)).expect("it comes back when woken on resume");
         h.join().unwrap();
-        // Stop while paused.
+        // Stop while paused, the same way.
         paused.store(true, Ordering::Release);
         let (tx, rx) = mpsc::channel();
         let (p, st, w) = (paused.clone(), stop.clone(), wake.clone());
@@ -6029,19 +6031,24 @@ mod tests {
             wait_while_paused(&p, &st, &w);
             let _ = tx.send(());
         });
-        std::thread::sleep(Duration::from_millis(50));
-        let t = Instant::now();
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "it waits while paused");
         stop.store(true, Ordering::Release);
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "no timer: a stop is only seen when woken");
         wake_preview(&wake);
-        rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(t.elapsed() < Duration::from_millis(50), "stop is quick: {:?}", t.elapsed());
+        rx.recv_timeout(Duration::from_secs(10)).expect("it comes back when woken on stop");
         h.join().unwrap();
-        // Not paused: no waiting at all.
+        // Not paused: no waiting at all. Were it to wait, nothing would wake it and this would
+        // never return.
         paused.store(false, Ordering::Release);
         stop.store(false, Ordering::Release);
-        let t = Instant::now();
-        wait_while_paused(&paused, &stop, &wake);
-        assert!(t.elapsed() < Duration::from_millis(5));
+        let (tx, rx) = mpsc::channel();
+        let (p, st, w) = (paused.clone(), stop.clone(), wake.clone());
+        let h = std::thread::spawn(move || {
+            wait_while_paused(&p, &st, &w);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(10)).expect("an unpaused thread does not wait");
+        h.join().unwrap();
     }
 
     #[test]

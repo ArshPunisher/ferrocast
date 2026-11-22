@@ -1428,7 +1428,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let logs = dir.path().join("logs");
         let out_folder = tempfile::tempdir().unwrap();
-        let link_root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(&logs).unwrap();
 
         let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
@@ -1439,6 +1438,7 @@ mod tests {
 
         #[cfg(unix)]
         {
+            let link_root = tempfile::tempdir().unwrap();
             let link = link_root.path().join("alias-to-logs");
             std::os::unix::fs::symlink(&logs, &link).unwrap();
             assert!(matches!(engine.write_diagnostics_report(&link).await, Err(EngineError::Invalid(_))));

@@ -4,7 +4,9 @@
 //! running). The same calls as `Collection`, returning the same answers, so the app can move
 //! over call by call (ENGINE.md, step 3).
 
-use std::cell::{Cell, RefCell};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 

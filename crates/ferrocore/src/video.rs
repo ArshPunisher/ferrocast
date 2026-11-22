@@ -111,7 +111,8 @@ use std::sync::atomic::AtomicU64;
 
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(test)]
+// Held by the tests that read `dropped_frames`, which run on Unix only.
+#[cfg(all(test, unix))]
 pub(crate) static DROPPED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Frames the encoders left out since the program started: one that was behind (FFmpeg's queue
@@ -459,11 +460,11 @@ impl VideoEncoder {
     }
 }
 
-#[cfg(test)]
+// Its only test needs the VideoToolbox encoder, so the module exists on macOS alone.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn h2_vt_benchmark_with_blocking_cap_completes_each_frame_synchronously() {
         let cfg = VideoConfig {

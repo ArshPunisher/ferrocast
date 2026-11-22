@@ -3540,26 +3540,48 @@ mod tests {
 
     #[test]
     fn h2_phase1_steady_timing_excludes_flush_teardown() {
+        // Checked against the test's own timeline, not an absolute ms bound: a slow machine
+        // stretches the frames (and so the loop's number) but never the gap between them and the
+        // teardown. The steady window starts just before frame 5 is encoded and, when it is
+        // measured right, stops before the flush starts. If the flush were inside it, the window
+        // would be at least the whole teardown longer than frames-to-flush-start.
+        const TEARDOWN_MS: u64 = 500;
         let cancel = AtomicBool::new(false);
         let mut dummy = ();
+        let steady_frame_entered = std::cell::Cell::new(None::<Instant>);
+        let flush_started = std::cell::Cell::new(None::<Instant>);
         let (frame_times, avg_ms) = run_phase1_encode_loop(
             &mut dummy,
             "x264",
             15,
             5,
             &cancel,
-            |_, _| {
+            |_, i| {
+                if i == 5 {
+                    steady_frame_entered.set(Some(Instant::now()));
+                }
                 std::thread::sleep(Duration::from_millis(2));
                 Ok(())
             },
             |_| {
-                // Simulate FFmpeg process teardown + stdin EOF flush latency (300 ms).
-                std::thread::sleep(Duration::from_millis(300));
+                flush_started.set(Some(Instant::now()));
+                // Simulate FFmpeg process teardown + stdin EOF flush latency.
+                std::thread::sleep(Duration::from_millis(TEARDOWN_MS));
             },
         )
         .unwrap();
         assert_eq!(frame_times.len(), 10);
-        assert!(avg_ms < 12.0, "Phase 1 throughput_avg_ms ({avg_ms:.2} ms) was polluted by post-loop flush/teardown!");
+        let entered = steady_frame_entered.get().expect("frame 5 was encoded");
+        let flushed = flush_started.get().expect("the flush ran after the loop");
+        let frames_to_flush_ms = flushed.duration_since(entered).as_secs_f64() * 1000.0;
+        let steady_window_ms = avg_ms * 10.0;
+        // Half the teardown of room either side: the window may start a little before frame 5 is
+        // entered, but it must end before the flush, not after it.
+        assert!(
+            steady_window_ms < frames_to_flush_ms + TEARDOWN_MS as f64 / 2.0,
+            "Phase 1 steady window ({steady_window_ms:.1} ms) was polluted by post-loop flush/teardown! \
+             (frames to flush start: {frames_to_flush_ms:.1} ms, teardown {TEARDOWN_MS} ms)"
+        );
     }
 
     #[tokio::test]
