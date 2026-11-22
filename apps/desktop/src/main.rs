@@ -1224,27 +1224,35 @@ fn store_deeplink_route(uri: &str) -> String {
     format!("#/store?link={encoded}")
 }
 
-/// The last link dispatched and when: the same link reported again within a moment is one click.
+/// The links dispatched lately and when: the same link reported again within a moment is one
+/// click, even when another link was reported in between (A, B, A). Bounded and expiring.
 #[derive(Default)]
-struct RecentLink(std::sync::Mutex<Option<(String, std::time::Instant)>>);
+struct RecentLink(std::sync::Mutex<Vec<(String, std::time::Instant)>>);
 
 impl RecentLink {
     const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+    const MAX: usize = 32;
 
-    /// Whether this report is a new click (false: a repeat of the last one, or not a ferrocast link).
+    /// Whether this report is a new click (false: a repeat of one seen within the window, or not a ferrocast link).
     fn accept(&self, uri: &str, now: std::time::Instant) -> bool {
         if !is_ferrocast_deeplink(uri) {
             return false;
         }
-        let mut last = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((prev, at)) = last.as_ref()
-            && prev == uri
-            && now.saturating_duration_since(*at) < Self::WINDOW
-        {
+        let mut seen = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        seen.retain(|(_, at)| now.saturating_duration_since(*at) < Self::WINDOW);
+        if seen.iter().any(|(u, _)| u == uri) {
             return false;
         }
-        *last = Some((uri.to_string(), now));
+        if seen.len() >= Self::MAX {
+            seen.remove(0);
+        }
+        seen.push((uri.to_string(), now));
         true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 
@@ -1923,6 +1931,11 @@ mod update_tests {
             "another link is its own"
         );
         assert!(recent.accept(a, t0 + Duration::from_secs(10)), "the same link clicked later is a new click");
+        // Many distinct links never grow the record without bound.
+        for i in 0..500 {
+            assert!(recent.accept(&format!("ferrocast://store/install/x{i}"), t0 + Duration::from_secs(20)));
+        }
+        assert!(recent.len() <= RecentLink::MAX);
         // Not a ferrocast link: never accepted, never remembered.
         assert!(!recent.accept("https://evil.example/x", t0 + Duration::from_secs(20)));
     }
