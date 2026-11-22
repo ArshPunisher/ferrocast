@@ -2669,6 +2669,14 @@ impl Engine {
 
     /// Saves and applies the Studio's settings → `{ settings, restart: string | null }`.
     pub async fn studio_set_settings(&self, s: StudioSettings) -> Result<Value, EngineError> {
+        self.studio_set_settings_inner(s, false).await
+    }
+
+    pub(crate) async fn studio_set_settings_inner(
+        &self,
+        s: StudioSettings,
+        from_auto_config: bool,
+    ) -> Result<Value, EngineError> {
         self.flush_pending_startup_restore_to_host().await;
         s.check()?;
         // x264 runs through FFmpeg in Ferrocast's own engine: fetched now, so it's here by the
@@ -2679,6 +2687,9 @@ impl Engine {
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
         let saved = host.settings().await;
+        if !from_auto_config {
+            self.disarm_auto_config_if_output_changed(&saved);
+        }
         self.note_studio_settings(&saved);
         self.send_golive_pub();
         // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).

@@ -105,6 +105,15 @@ impl AppliedSummary {
             label: lbl,
         }
     }
+
+    fn matches_output_fields(&self, s: &StudioSettings) -> bool {
+        self.encoder == s.encoder
+            && self.video_encoder == s.video_encoder
+            && self.encoder_settings == s.encoder_settings
+            && self.scale == s.scale
+            && self.fps == s.fps
+            && self.video_kbps == s.video_kbps
+    }
 }
 
 /// The six output-affecting settings touched by auto-config apply/rollback (C6/H6).
@@ -2077,7 +2086,7 @@ impl Engine {
             tracing::warn!(error = %e, "couldn't persist auto-config pending journal");
         }
 
-        if let Err(e) = self.studio_set_settings(next.clone()).await {
+        if let Err(e) = self.studio_set_settings_inner(next.clone(), true).await {
             if !had_pending_before {
                 ferrocast_store::durable::remove_with_backup(&pending_path);
             }
@@ -2146,6 +2155,24 @@ impl Engine {
         Ok(view)
     }
 
+    /// Disarms any pending auto-rollback when the user manually edits one of the 6 output fields (H6).
+    pub(crate) fn disarm_auto_config_if_output_changed(&self, saved: &StudioSettings) {
+        let view = {
+            let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+            let MachineState::Applied(a) = &slot.state else {
+                return;
+            };
+            if a.summary.matches_output_fields(saved) {
+                return;
+            }
+            slot.seq = slot.seq.saturating_add(1);
+            slot.state = MachineState::Idle;
+            slot.view()
+        };
+        ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
+        self.emit_auto_config_frame(&view);
+    }
+
     /// Immediately restores the pre-apply `StudioSettings` snapshot.
     pub async fn auto_config_undo(&self) -> Result<AutoConfigView, EngineError> {
         let _op = self.studio().auto_config_op.lock().await;
@@ -2169,7 +2196,7 @@ impl Engine {
                 return Err(EngineError::Conflict("There are no applied settings to undo.".into()));
             };
             (
-                a.snapshot.clone(),
+                OutputSnapshot::from_settings(&a.snapshot),
                 a.mode,
                 a.candidates.clone(),
                 a.upload_check.clone(),
@@ -2179,7 +2206,11 @@ impl Engine {
             )
         };
 
-        self.studio_set_settings(snapshot).await?;
+        let host = self.studio_host()?;
+        let mut merged = host.settings().await;
+        snapshot.apply_to(&mut merged);
+        merged.check()?;
+        self.studio_set_settings_inner(merged, true).await?;
         ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
 
         let view = {
@@ -3602,6 +3633,72 @@ mod tests {
             tried_c,
             vec![(1920, 1080, 60, "veryfast".into()), (1920, 1080, 60, "superfast".into())],
             "when hardware already passed, sample only 2 software presets (veryfast, superfast)"
+        );
+    }
+
+    #[tokio::test]
+    async fn h6_manual_settings_change_during_countdown_preserved_and_disarms_rollback() {
+        let (engine, host, _dir) = test_engine().await;
+        {
+            let mut s = host.settings.lock().unwrap();
+            s.encoder = "software".into();
+            s.fps = 30;
+            s.video_kbps = 3500;
+            s.record_folder = Some("/old/rec".into());
+        }
+
+        // 1. Unrelated manual edit during countdown (`record_folder`) must survive Undo/rollback.
+        engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut edited = engine.studio_settings().await.unwrap();
+        edited.record_folder = Some("/new/rec".into());
+        engine.studio_set_settings(edited).await.unwrap();
+        assert_eq!(
+            engine.auto_config_status().state,
+            AutoConfigStateKind::Applied,
+            "unrelated setting change should keep Applied countdown active"
+        );
+
+        engine.auto_config_undo().await.unwrap();
+        let after_undo = engine.studio_settings().await.unwrap();
+        assert_eq!(after_undo.video_kbps, 3500);
+        assert_eq!(after_undo.encoder, "software");
+        assert_eq!(
+            after_undo.record_folder.as_deref(),
+            Some("/new/rec"),
+            "rollback must only restore the 6 output fields without clobbering unrelated edits"
+        );
+
+        // 2. Manual edit to one of the 6 output fields during countdown disarms auto-rollback.
+        engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut manual_out = engine.studio_settings().await.unwrap();
+        manual_out.video_kbps = 4500;
+        engine.studio_set_settings(manual_out).await.unwrap();
+        assert_eq!(
+            engine.auto_config_status().state,
+            AutoConfigStateKind::Idle,
+            "editing an output field manually during countdown must disarm pending rollback"
+        );
+        tokio::time::sleep(Duration::from_millis(320)).await;
+        assert_eq!(
+            host.settings.lock().unwrap().video_kbps,
+            4500,
+            "30s timeout must not overwrite user's manual output edit"
         );
     }
 }
