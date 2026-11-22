@@ -79,6 +79,8 @@ pub struct Probe {
     pub has_video: bool,
     /// Frames a second of the picture, when the line says (`59.94 fps`).
     pub fps: Option<f32>,
+    /// Where the file's timeline starts, in seconds (the line's `start:`), 0 when it doesn't say.
+    pub start_s: f64,
 }
 
 /// A file the OS wouldn't let us rename, write or read: said with a next step (never a bare 500).
@@ -477,6 +479,11 @@ pub fn parse_probe(stderr: &str) -> Probe {
         if p.duration_ms.is_none()
             && let Some(rest) = l.strip_prefix("Duration:")
         {
+            if let Some(st) =
+                rest.split("start:").nth(1).and_then(|r| r.split(',').next()).and_then(|v| v.trim().parse::<f64>().ok())
+            {
+                p.start_s = st.max(0.0);
+            }
             let t = rest.trim().split(',').next().unwrap_or("").trim();
             let parts: Vec<&str> = t.split(':').collect();
             if let [h, m, s] = parts.as_slice()
@@ -828,6 +835,23 @@ pub(crate) fn prune_thumbs(dir: &Path, keep: usize) {
     for (_, p) in all.into_iter().take(drop) {
         let _ = std::fs::remove_file(p);
     }
+}
+
+/// How long the picture runs (the video stream alone, copied to nowhere): the container's length
+/// is the longer of its picture and its sound.
+pub(crate) async fn picture_ms(ffmpeg: &Path, path: &Path) -> Option<u64> {
+    let mut cmd = jobs::hidden(ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+        .args(input_args(path))
+        .args(["-map", "0:v:0", "-c", "copy", "-f", "null", "-progress", "pipe:1", "-nostats", "-"])
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(PROBE_LIMIT * 4, cmd.output()).await.ok()?.ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok()))
+        .next_back()
+        .filter(|us| *us > 0)
+        .map(|us| (us / 1000) as u64)
 }
 
 /// ffmpeg's text about a file, read.

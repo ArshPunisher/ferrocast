@@ -97,6 +97,9 @@ pub struct Piece {
     pub has_audio: bool,
     /// Frames a second the compilation keeps (the first clip's, 24 to 60).
     pub fps: u32,
+    /// Where the clip's timeline starts (seconds): the sound is placed against it, so a sound
+    /// that starts later than the picture stays later.
+    pub start_s: f64,
 }
 
 /// The filter graph and total length (ms) of a compilation at `w`×`h`.
@@ -133,7 +136,8 @@ pub fn compile_graph(pieces: &[Piece], w: u32, h: u32, fade_s: f32, normalize: b
             // Padded and cut to the picture's length, so each sound ends where its picture does and
             // the crossfade of the two lines up (a clip whose sound is short or long would drift).
             g += &format!(
-                "[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=0:{},asetpts=PTS-STARTPTS[a{i}];",
+                "[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-{:.6}/TB,aresample=async=1:first_pts=0,apad,atrim=0:{},asetpts=PTS-STARTPTS[a{i}];",
+                p.start_s,
                 p.duration_ms as f64 / 1000.0
             );
         } else {
@@ -450,7 +454,16 @@ impl Engine {
         for (id, path) in req.clips.iter().zip(paths) {
             let stamp = super::FileStamp::of(&path)?;
             let p: Probe = probe_file(&ffmpeg, &path).await?;
-            let d = p.duration_ms.filter(|d| *d > 0 && p.has_video).ok_or_else(|| {
+            let d = p.duration_ms.filter(|d| *d > 0 && p.has_video);
+            // By the picture: a longer sound would put the fades after the picture has ended.
+            let d = match d {
+                Some(d) if p.has_audio => match super::picture_ms(&ffmpeg, &path).await {
+                    Some(pic) if pic > 0 && pic < d => Some(pic),
+                    _ => Some(d),
+                },
+                other => other,
+            };
+            let d = d.ok_or_else(|| {
                 refuse(
                     422,
                     "not_a_clip",
@@ -476,6 +489,7 @@ impl Engine {
                 duration_ms: d,
                 has_audio: p.has_audio,
                 fps: p.fps.unwrap_or(30.0).round() as u32,
+                start_s: p.start_s,
             });
         }
         // The first clip's size (even numbers, none under 16): the others are fitted inside it.

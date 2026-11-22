@@ -9,7 +9,7 @@ fn arg_strs(a: &[OsString]) -> Vec<String> {
 }
 
 fn piece(name: &str, ms: u64, audio: bool) -> Piece {
-    Piece { path: PathBuf::from(name), duration_ms: ms, has_audio: audio, fps: 30 }
+    Piece { path: PathBuf::from(name), duration_ms: ms, has_audio: audio, fps: 30, start_s: 0.0 }
 }
 
 #[test]
@@ -44,6 +44,7 @@ fn a_compilation_joins_with_a_cut_or_a_crossfade_and_one_loudness() {
     assert!(cut.contains("anullsrc") && cut.contains("[1:v]scale=1280:720"));
     // A sound is padded and cut to its picture's length, so a short or long one can't drift the fade.
     assert!(cut.contains("apad,atrim=0:4,"), "{cut}");
+    assert!(cut.contains("aresample=async=1:first_pts=0"), "{cut}");
     let (fade, total) = compile_graph(&two, 1280, 720, 0.5, true);
     assert_eq!(total, 9500);
     assert!(fade.contains("xfade=transition=fade:duration=0.5:offset=3.500") && fade.contains("acrossfade=d=0.5"));
@@ -650,4 +651,90 @@ fn a_subtitle_name_cannot_inject_a_filter() {
     }
     // A plain name is unchanged.
     assert!(arg_strs(&burn_args(Path::new("a.mp4"), "subs.srt", part)).join(" ").contains("subtitles=subs.srt:"));
+}
+
+/// CodeRabbit: a clip whose sound is longer than its picture crossfades by the picture's length.
+#[tokio::test]
+async fn a_crossfade_is_placed_by_the_picture_not_the_longer_sound() {
+    let Some(ffmpeg) = ffmpeg_here() else {
+        eprintln!("SKIPPED: no ffmpeg on this machine");
+        return;
+    };
+    let (e, _d, clips) = engine().await;
+    // 3 s of picture, 6 s of sound: the file is 6 s long.
+    let ok = std::process::Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc=size=320x240:rate=30:duration=3")
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=6"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+        .arg(clips.path().join("long-sound.mp4"))
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    make_clip(&ffmpeg, &clips.path().join("b.mp4"), 3, true, "320x240");
+    let job = e
+        .compile_clips(CompileReq {
+            clips: vec!["long-sound.mp4".into(), "b.mp4".into()],
+            crossfade_s: 1.0,
+            normalize: false,
+            name: Some("Picture".into()),
+        })
+        .await
+        .unwrap();
+    let done = finished(&e, &job.id).await;
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+    let d = e.clip_probe("Picture.mp4").await.unwrap().duration_ms.unwrap();
+    // 3 + 3 - 1 s of fade, by the pictures.
+    assert!((4600..=5400).contains(&d), "length {d}");
+}
+
+/// CodeRabbit: sound that starts later than its picture stays later (silence first), in a cut
+/// and in a crossfade, instead of both starts being moved to zero.
+#[tokio::test]
+async fn a_delayed_sound_keeps_its_delay_in_a_compilation() {
+    let Some(ffmpeg) = ffmpeg_here() else {
+        eprintln!("SKIPPED: no ffmpeg on this machine");
+        return;
+    };
+    let (e, _d, clips) = engine().await;
+    // Sound starts one second after the picture (the input is shifted, not the content).
+    let ok = std::process::Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg("testsrc=size=320x240:rate=30:duration=4")
+        .args(["-itsoffset", "1", "-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+        .arg(clips.path().join("late.mp4"))
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    make_clip(&ffmpeg, &clips.path().join("b.mp4"), 3, true, "320x240");
+    let job = e
+        .compile_clips(CompileReq {
+            clips: vec!["late.mp4".into(), "b.mp4".into()],
+            crossfade_s: 0.0,
+            normalize: false,
+            name: Some("Joined".into()),
+        })
+        .await
+        .unwrap();
+    let done = finished(&e, &job.id).await;
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+    // The first 0.8 s of the result's sound is silent.
+    let out = std::process::Command::new(&ffmpeg)
+        .args(["-hide_banner", "-nostats", "-t", "0.8", "-i"])
+        .arg(clips.path().join("Joined.mp4"))
+        // The sound as laid on the timeline: a gap before it counts as silence.
+        .args(["-vn", "-af", "aresample=async=1:first_pts=0,volumedetect", "-f", "null", "-"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr).to_string();
+    let mean: f32 = text
+        .lines()
+        .find_map(|l| l.split("mean_volume:").nth(1))
+        .and_then(|r| r.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(f32::NEG_INFINITY);
+    assert!(mean < -60.0, "the sound started at 0 instead of at 1 s (mean {mean} dB)\n{text}");
 }
