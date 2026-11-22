@@ -159,6 +159,41 @@ fn ext_of(name: &str) -> Option<&'static str> {
     EXTS.iter().copied().find(|x| *x == e)
 }
 
+/// The names of the files a recording is writing right now, from the Studio's recording stats
+/// (`file`, and `files` for per-source recordings), as the file names a clips folder shows.
+pub(crate) fn active_recording_names(stats: &serde_json::Value) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if stats.get("active").and_then(serde_json::Value::as_bool) == Some(false) {
+        return out;
+    }
+    let mut add = |v: &serde_json::Value| {
+        if let Some(name) = v.as_str().and_then(|p| Path::new(p).file_name()).and_then(|n| n.to_str()) {
+            out.insert(name.to_string());
+        }
+    };
+    if let Some(f) = stats.get("file") {
+        add(f);
+    }
+    if let Some(list) = stats.get("files").and_then(serde_json::Value::as_array) {
+        list.iter().for_each(&mut add);
+    }
+    out
+}
+
+/// A clip a recording is still writing is not a clip yet: not listed, not renamed, trashed,
+/// trimmed or sent.
+pub(crate) fn refuse_if_recording(active: &std::collections::HashSet<String>, id: &str) -> Result<(), EngineError> {
+    if active.contains(id) {
+        return Err(refuse(
+            409,
+            "clip_in_use",
+            "That clip is still being recorded.",
+            "Stop the recording first, then it is yours to trim, rename or send.",
+        ));
+    }
+    Ok(())
+}
+
 /// The clip named `id` in `root`: a plain file there, never a link.
 pub fn resolve(root: &Path, id: &str) -> Result<PathBuf, EngineError> {
     plain_name(id).map_err(|_| no_such_clip())?;
@@ -375,6 +410,7 @@ impl Engine {
     /// The clips, newest first.
     pub async fn clips(&self, query: Option<&str>) -> Result<Vec<ClipEntry>, EngineError> {
         let root = self.clips_folder().await?;
+        let active = self.recording_now().await;
         let q = query.map(String::from);
         tokio::task::spawn_blocking(move || -> Result<Vec<ClipEntry>, EngineError> {
             // A folder that isn't there yet is an empty library; one that can't be read is said.
@@ -389,7 +425,9 @@ impl Engine {
                 }
                 _ => {}
             }
-            Ok(list_in(&root, q.as_deref()))
+            let mut all = list_in(&root, q.as_deref());
+            all.retain(|c| !active.contains(&c.id));
+            Ok(all)
         })
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))?
@@ -424,7 +462,14 @@ impl Engine {
         Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(jpg)))
     }
 
+    /// The files a recording is writing now (none without the Studio or a recording).
+    pub(crate) async fn recording_now(&self) -> std::collections::HashSet<String> {
+        let Ok(host) = self.studio_host() else { return Default::default() };
+        host.record_stats().await.map(|v| active_recording_names(&v)).unwrap_or_default()
+    }
+
     pub(crate) async fn clip_path(&self, id: &str) -> Result<PathBuf, EngineError> {
+        refuse_if_recording(&self.recording_now().await, id)?;
         let root = self.clips_folder().await?;
         let id = id.to_string();
         tokio::task::spawn_blocking(move || resolve(&root, &id))

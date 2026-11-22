@@ -349,3 +349,27 @@ fn a_trash_record_keeps_the_bytes_of_a_folder_name_that_is_not_utf8() {
     let p = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/v/caf\xe9/clip.mp4"));
     assert_eq!(percent_path(p), "/v/caf%E9/clip.mp4");
 }
+
+#[test]
+fn the_files_a_recording_is_writing_are_named_from_its_stats() {
+    let stats = serde_json::json!({
+        "active": true,
+        "file": "/Users/me/Videos/Ferrocast/Stream 2026-11-22.mkv",
+        "files": ["/Users/me/Videos/Ferrocast/Cam 2026-11-22.mkv", "relative.mp4", 7],
+    });
+    let names = active_recording_names(&stats);
+    assert!(names.contains("Stream 2026-11-22.mkv"));
+    assert!(names.contains("Cam 2026-11-22.mkv"));
+    assert!(names.contains("relative.mp4"));
+    assert!(active_recording_names(&serde_json::Value::Null).is_empty());
+    // Not an active recording: no names (a stopped one's file is a clip like any other).
+    assert!(active_recording_names(&serde_json::json!({ "active": false, "file": "/x/y.mkv" })).is_empty());
+}
+
+#[test]
+fn a_clip_that_is_being_recorded_cannot_be_used() {
+    let names: std::collections::HashSet<String> = ["Live.mkv".to_string()].into();
+    let e = refuse_if_recording(&names, "Live.mkv").unwrap_err();
+    assert!(matches!(e, EngineError::Refused { status: 409, code: "clip_in_use", .. }), "{e:?}");
+    assert!(refuse_if_recording(&names, "Other.mkv").is_ok());
+}
