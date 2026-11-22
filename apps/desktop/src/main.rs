@@ -300,6 +300,7 @@ fn main() {
     // The Store package's startup task can't pass `--minimized`: it's asked instead.
     let minimized = std::env::args().any(|a| a == MINIMIZED_ARG) || store::started_at_login();
     let startup_deeplink = std::env::args().find(|a| is_ferrocast_deeplink(a));
+    let has_startup_link = startup_deeplink.is_some();
     if store::packaged() {
         tracing::info!("running from the Microsoft Store package: the Store updates it");
     }
@@ -408,7 +409,7 @@ fn main() {
             tauri::async_runtime::spawn(quit_on_signal(app.handle().clone()));
             // Started minimized (at login) with no tray, or offering/running Safe Mode: shown so
             // the prompt is never hidden in the tray.
-            if !minimized || !has_tray || show_for_safe_mode {
+            if opens_window_at_start(minimized, has_tray, show_for_safe_mode, has_startup_link) {
                 show_window(app.handle());
             }
             Ok(())
@@ -1186,6 +1187,12 @@ fn is_ferrocast_deeplink(s: &str) -> bool {
         && !s.contains('\\')
 }
 
+/// Whether the first window opens at launch. A launch at login stays in the tray, but one that
+/// carries a `ferrocast://` link is a person clicking it: the window opens to show the link.
+fn opens_window_at_start(minimized: bool, has_tray: bool, show_for_safe_mode: bool, has_link: bool) -> bool {
+    !minimized || !has_tray || show_for_safe_mode || has_link
+}
+
 fn store_deeplink_route(uri: &str) -> String {
     let mut encoded = String::with_capacity(uri.len());
     for b in uri.as_bytes() {
@@ -1416,6 +1423,18 @@ mod tests {
 
     /// The link a window is opened for stays until the window is really there, and a newer link
     /// that arrived meanwhile is never cleared by the older one's success.
+    #[test]
+    fn a_launch_with_a_link_opens_the_window_even_when_started_minimized() {
+        // Login launch, tray present, no link: stays in the tray.
+        assert!(!opens_window_at_start(true, true, false, false));
+        // The same launch carrying a ferrocast:// link: the window opens.
+        assert!(opens_window_at_start(true, true, false, true));
+        // Not minimized, no tray, or Safe Mode: opens as before.
+        assert!(opens_window_at_start(false, true, false, false));
+        assert!(opens_window_at_start(true, false, false, false));
+        assert!(opens_window_at_start(true, true, true, false));
+    }
+
     #[test]
     fn a_pending_link_is_cleared_only_after_its_window_opened_and_only_that_link() {
         let p = PendingDeepLink(std::sync::Mutex::new(Some("ferrocast://store/install/a".into())));
