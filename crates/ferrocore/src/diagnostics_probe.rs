@@ -68,9 +68,10 @@ pub fn probe_gpu() -> GpuProbe {
     }
 }
 
-/// Enumerates connected OS audio inputs and outputs along with default & supported sample rates.
+/// Enumerates connected OS audio inputs and outputs along with default & supported sample rates,
+/// or returns `None` when device enumeration is unsupported on this OS target.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub fn probe_audio_devices() -> Vec<AudioDeviceProbe> {
+pub fn probe_audio_devices() -> Option<Vec<AudioDeviceProbe>> {
     use cpal::traits::{DeviceTrait, HostTrait};
 
     const COMMON_RATES: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
@@ -137,12 +138,12 @@ pub fn probe_audio_devices() -> Vec<AudioDeviceProbe> {
         }
     }
 
-    devices
+    Some(devices)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn probe_audio_devices() -> Vec<AudioDeviceProbe> {
-    Vec::new()
+pub fn probe_audio_devices() -> Option<Vec<AudioDeviceProbe>> {
+    None
 }
 
 /// Opens a regular file at `path` without following a symlink on the final path component.

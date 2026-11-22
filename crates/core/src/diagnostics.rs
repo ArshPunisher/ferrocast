@@ -103,11 +103,23 @@ pub struct AudioDeviceInfo {
     pub channels: Option<u16>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioSummary {
     pub studio_sample_rate_hz: u32,
     pub monitoring_device: Option<String>,
     pub devices: Vec<AudioDeviceInfo>,
+    #[serde(default = "yes_true")]
+    pub enumeration_supported: bool,
+}
+
+impl Default for AudioSummary {
+    fn default() -> Self {
+        Self { studio_sample_rate_hz: 0, monitoring_device: None, devices: Vec::new(), enumeration_supported: true }
+    }
+}
+
+fn yes_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -522,7 +534,7 @@ fn check_encoder_and_audio_causes(input: &DiagnosticInput, out: &mut Vec<LikelyC
         }
     }
 
-    if !input.audio.devices.iter().any(|d| d.kind == "input") {
+    if input.audio.enumeration_supported && !input.audio.devices.iter().any(|d| d.kind == "input") {
         out.push(LikelyCause {
             severity: CauseSeverity::Info,
             code: "no_audio_input".into(),
@@ -647,7 +659,9 @@ pub fn format_summary_txt(report: &SupportReport, secrets: &[&str], usernames: &
         report.audio.studio_sample_rate_hz,
         report.audio.monitoring_device.as_deref().unwrap_or("default")
     );
-    if report.audio.devices.is_empty() {
+    if !report.audio.enumeration_supported {
+        let _ = writeln!(s, "Audio devices: enumeration not supported on this OS");
+    } else if report.audio.devices.is_empty() {
         let _ = writeln!(s, "Audio devices: none reported");
     } else {
         for d in &report.audio.devices {
@@ -1990,6 +2004,7 @@ mod tests {
             audio: AudioSummary {
                 studio_sample_rate_hz: 48_000,
                 monitoring_device: Some("Studio Headphones".into()),
+                enumeration_supported: true,
                 devices: vec![
                     AudioDeviceInfo {
                         kind: "input".into(),
@@ -2415,5 +2430,26 @@ mod tests {
         ] {
             assert!(!json.contains(forbidden), "field leaked {forbidden:?} into SupportReport: {json}");
         }
+    }
+
+    #[test]
+    fn unsupported_audio_enumeration_does_not_flag_no_audio_input() {
+        let mut inp = healthy_input();
+        inp.audio.devices.clear();
+        inp.audio.enumeration_supported = false;
+        let report = build_support_report(inp, &[], &[]);
+        assert!(
+            !report.likely_causes.iter().any(|c| c.code == "no_audio_input"),
+            "unexpected no_audio_input on unsupported OS: {:?}",
+            report.likely_causes
+        );
+        let summary = format_summary_txt(&report, &[], &[]);
+        assert!(summary.contains("enumeration not supported"));
+
+        let mut supported_empty = healthy_input();
+        supported_empty.audio.devices.clear();
+        supported_empty.audio.enumeration_supported = true;
+        let supported_report = build_support_report(supported_empty, &[], &[]);
+        assert!(supported_report.likely_causes.iter().any(|c| c.code == "no_audio_input"));
     }
 }

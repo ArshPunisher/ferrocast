@@ -22,6 +22,18 @@ const MAX_CRASH_FILES: usize = 5;
 const MAX_TEXT_CRASH_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_BINARY_DUMP_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TOTAL_CRASH_ZIP_BYTES: u64 = 16 * 1024 * 1024;
+const HARDWARE_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+pub(crate) struct CachedHardwareProbe {
+    os: OsVersionInfo,
+    gpu_base: GpuInfo,
+    audio_enumeration_supported: bool,
+    audio_devices: Vec<AudioDeviceInfo>,
+    cached_at: std::time::Instant,
+}
+
+pub(crate) type HardwareProbeCache = std::sync::Arc<std::sync::Mutex<Option<CachedHardwareProbe>>>;
 
 #[derive(Debug, Default)]
 pub(crate) struct ActiveStreamHealth {
@@ -373,10 +385,12 @@ impl Engine {
         let u_owned = known_usernames.clone();
         let studio_for_probe = studio.clone();
         let data_for_probe = data_dir.clone();
+        let probe_cache = self.inner.hardware_probe_cache.clone();
 
         let (
             os,
             gpu,
+            audio_enumeration_supported,
             audio_devices,
             disk_free_mb,
             known_secrets,
@@ -390,37 +404,66 @@ impl Engine {
             let s_refs: Vec<&str> = known_secrets.iter().map(String::as_str).collect();
             let u_refs: Vec<&str> = u_owned.iter().map(String::as_str).collect();
 
-            let os = OsVersionInfo {
-                name: sysinfo::System::name().unwrap_or_else(|| std::env::consts::OS.into()),
-                version: sysinfo::System::os_version().unwrap_or_default(),
-                long_version: sysinfo::System::long_os_version().unwrap_or_default(),
-                kernel_version: sysinfo::System::kernel_version().unwrap_or_default(),
+            let cached_hw = {
+                let guard = probe_cache.lock().unwrap_or_else(|p| p.into_inner());
+                guard.as_ref().filter(|c| c.cached_at.elapsed() < HARDWARE_PROBE_TTL).cloned()
+            };
+            let (os, gpu_base, audio_enumeration_supported, audio_devices) = if let Some(hit) = cached_hw {
+                (hit.os, hit.gpu_base, hit.audio_enumeration_supported, hit.audio_devices)
+            } else {
+                let os = OsVersionInfo {
+                    name: sysinfo::System::name().unwrap_or_else(|| std::env::consts::OS.into()),
+                    version: sysinfo::System::os_version().unwrap_or_default(),
+                    long_version: sysinfo::System::long_os_version().unwrap_or_default(),
+                    kernel_version: sysinfo::System::kernel_version().unwrap_or_default(),
+                };
+
+                let probe_gpu = ferrocore::diagnostics_probe::probe_gpu();
+                let gpu_base = GpuInfo {
+                    name: probe_gpu.name,
+                    backend: probe_gpu.backend,
+                    device_type: probe_gpu.device_type,
+                    driver: probe_gpu.driver,
+                    driver_info: probe_gpu.driver_info,
+                    is_software: probe_gpu.is_software,
+                    active_renderer: None,
+                };
+
+                let (audio_enumeration_supported, audio_devices) =
+                    match ferrocore::diagnostics_probe::probe_audio_devices() {
+                        Some(list) => (
+                            true,
+                            list.into_iter()
+                                .map(|d| AudioDeviceInfo {
+                                    kind: d.kind,
+                                    name: d.name,
+                                    is_default: d.is_default,
+                                    sample_rate_hz: d.sample_rate_hz,
+                                    supported_sample_rates_hz: d.supported_sample_rates_hz,
+                                    channels: d.channels,
+                                })
+                                .collect(),
+                        ),
+                        None => (false, Vec::new()),
+                    };
+
+                let mut guard = probe_cache.lock().unwrap_or_else(|p| p.into_inner());
+                *guard = Some(CachedHardwareProbe {
+                    os: os.clone(),
+                    gpu_base: gpu_base.clone(),
+                    audio_enumeration_supported,
+                    audio_devices: audio_devices.clone(),
+                    cached_at: std::time::Instant::now(),
+                });
+                (os, gpu_base, audio_enumeration_supported, audio_devices)
             };
 
-            let probe_gpu = ferrocore::diagnostics_probe::probe_gpu();
             let gpu = GpuInfo {
-                name: probe_gpu.name,
-                backend: probe_gpu.backend,
-                device_type: probe_gpu.device_type,
-                driver: probe_gpu.driver,
-                driver_info: probe_gpu.driver_info,
-                is_software: probe_gpu.is_software,
                 active_renderer: studio_for_probe
                     .as_ref()
                     .and_then(|v| v.get("renderer").and_then(Value::as_str).map(String::from)),
+                ..gpu_base
             };
-
-            let audio_devices: Vec<AudioDeviceInfo> = ferrocore::diagnostics_probe::probe_audio_devices()
-                .into_iter()
-                .map(|d| AudioDeviceInfo {
-                    kind: d.kind,
-                    name: d.name,
-                    is_default: d.is_default,
-                    sample_rate_hz: d.sample_rate_hz,
-                    supported_sample_rates_hz: d.supported_sample_rates_hz,
-                    channels: d.channels,
-                })
-                .collect();
 
             let disk_free_mb = free_disk_mb(&data_for_probe);
             let (logs_included, logs, recent_errors) =
@@ -431,6 +474,7 @@ impl Engine {
             (
                 os,
                 gpu,
+                audio_enumeration_supported,
                 audio_devices,
                 disk_free_mb,
                 known_secrets,
@@ -464,7 +508,12 @@ impl Engine {
             gpu,
             encoders,
             configured_encoder_id: selected_encoder,
-            audio: AudioSummary { studio_sample_rate_hz, monitoring_device, devices: audio_devices },
+            audio: AudioSummary {
+                studio_sample_rate_hz,
+                monitoring_device,
+                devices: audio_devices,
+                enumeration_supported: audio_enumeration_supported,
+            },
             last_streams,
             crashes: crash_meta,
             connectors,
@@ -633,13 +682,44 @@ fn build_encoders_list(studio: Option<&Value>, selected: Option<&str>) -> Vec<En
 }
 
 fn free_disk_mb(path: &Path) -> Option<u64> {
+    let resolved = resolve_disk_lookup_path(path);
     let disks = sysinfo::Disks::new_with_refreshed_list();
     let best = disks
         .list()
         .iter()
-        .filter(|d| path.starts_with(d.mount_point()))
+        .filter(|d| resolved.starts_with(normalize_disk_path(d.mount_point())))
         .max_by_key(|d| d.mount_point().as_os_str().len());
     best.map(|d| d.available_space() / (1024 * 1024))
+}
+
+fn resolve_disk_lookup_path(path: &Path) -> PathBuf {
+    let canon = std::fs::canonicalize(path).ok().or_else(|| {
+        let parent = path.parent()?;
+        let name = path.file_name()?;
+        std::fs::canonicalize(parent).ok().map(|p| p.join(name))
+    });
+    let abs = canon.unwrap_or_else(|| {
+        if path.is_relative() {
+            std::env::current_dir().map(|cwd| cwd.join(path)).unwrap_or_else(|_| path.to_path_buf())
+        } else {
+            path.to_path_buf()
+        }
+    });
+    normalize_disk_path(&abs)
+}
+
+fn normalize_disk_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn gather_redacted_logs(
@@ -1324,5 +1404,69 @@ mod tests {
 
         let report = engine.diagnostics_preview().await.unwrap();
         assert!(report.likely_causes.iter().any(|c| c.code == "crash_dumps_present"));
+    }
+
+    #[test]
+    fn free_disk_mb_resolves_relative_and_symlink_paths() {
+        // Relative "." does not start_with("/") without canonicalization/cwd resolution.
+        assert!(free_disk_mb(std::path::Path::new(".")).is_some(), "relative path must resolve to mount point");
+
+        #[cfg(unix)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let real_dir = root.path().join("real");
+            let link_dir = root.path().join("alias");
+            std::fs::create_dir_all(&real_dir).unwrap();
+            std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+            assert!(free_disk_mb(&link_dir).is_some(), "symlink path must resolve to mount point");
+        }
+    }
+
+    #[tokio::test]
+    async fn gather_diagnostics_reuses_cached_hardware_probe_within_ttl_and_refreshes_on_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+
+        // Seed fresh cache with a synthetic sentinel OS/GPU/audio probe; gather_diagnostics must
+        // return the cached hardware snapshot without re-probing OS/wgpu/cpal while still
+        // populating fresh disk_free_mb.
+        {
+            let mut guard = engine.inner.hardware_probe_cache.lock().unwrap_or_else(|p| p.into_inner());
+            *guard = Some(CachedHardwareProbe {
+                os: OsVersionInfo {
+                    name: "CachedSentinelOS".into(),
+                    version: "99".into(),
+                    long_version: "CachedSentinelOS 99".into(),
+                    kernel_version: "k99".into(),
+                },
+                gpu_base: GpuInfo {
+                    name: "CachedSentinelGPU".into(),
+                    backend: "Metal".into(),
+                    device_type: "IntegratedGpu".into(),
+                    driver: "drv".into(),
+                    driver_info: "info".into(),
+                    is_software: false,
+                    active_renderer: None,
+                },
+                audio_enumeration_supported: false,
+                audio_devices: Vec::new(),
+                cached_at: std::time::Instant::now(),
+            });
+        }
+
+        let (hit_input, ..) = engine.gather_diagnostics(false).await.unwrap();
+        assert_eq!(hit_input.os.name, "CachedSentinelOS");
+        assert_eq!(hit_input.gpu.name, "CachedSentinelGPU");
+        assert!(!hit_input.audio.enumeration_supported);
+        assert!(hit_input.disk_free_mb.is_some());
+
+        // Expire the cache beyond HARDWARE_PROBE_TTL and verify it re-probes real OS metadata.
+        {
+            let mut guard = engine.inner.hardware_probe_cache.lock().unwrap_or_else(|p| p.into_inner());
+            guard.as_mut().unwrap().cached_at = std::time::Instant::now() - std::time::Duration::from_secs(31);
+        }
+
+        let (refreshed_input, ..) = engine.gather_diagnostics(false).await.unwrap();
+        assert_ne!(refreshed_input.os.name, "CachedSentinelOS");
     }
 }

@@ -218,6 +218,8 @@ struct Inner {
     stream_health: Mutex<diagnostics::ActiveStreamHealth>,
     /// Serializes support diagnostics bundle creation so concurrent requests don't spike I/O/CPU.
     diagnostics_busy: tokio::sync::Mutex<()>,
+    /// Short-lived cache of slow OS/GPU/audio hardware enumeration for repeated diagnostics calls.
+    hardware_probe_cache: diagnostics::HardwareProbeCache,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -373,6 +375,7 @@ impl Engine {
                 labels: Mutex::new(Default::default()),
                 stream_health: Mutex::new(Default::default()),
                 diagnostics_busy: tokio::sync::Mutex::new(()),
+                hardware_probe_cache: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));
