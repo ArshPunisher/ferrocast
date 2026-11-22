@@ -83,6 +83,7 @@ mod tests {
             frame_ms: 8.2,
             destinations: vec![],
             issues: vec![],
+            destination_log: Vec::new(),
         }
     }
 
