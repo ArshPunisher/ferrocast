@@ -229,21 +229,24 @@ fn custom_parts(rule: &Value) -> std::collections::BTreeMap<String, Value> {
 /// stored (a rule round-tripped unchanged, or a new look with none, is fine).
 fn custom_code_change(engine: &Engine, rel: &str, body: &[u8]) -> bool {
     let Ok(new) = serde_json::from_slice::<Value>(body) else { return false };
-    let id = rel.strip_prefix("/alert-rules/").map(str::to_string);
+    rule_custom_changed(engine, rel.strip_prefix("/alert-rules/"), &new)
+}
+
+/// Whether `new` (a rule being saved, `id` the stored one it replaces) adds or changes custom
+/// HTML or fields: the same rule for a paired phone and for an API key.
+pub(crate) fn rule_custom_changed(engine: &Engine, id: Option<&str>, new: &Value) -> bool {
     let stored = id
         .and_then(|id| engine.rules().into_iter().find(|r| r.id == id))
         .map(|r| custom_parts(&json!(r)))
         .unwrap_or_default();
     let none = json!([false, "", []]);
-    custom_parts(&new).into_iter().any(|(id, part)| part != *stored.get(&id).unwrap_or(&none))
+    custom_parts(new).into_iter().any(|(id, part)| part != *stored.get(&id).unwrap_or(&none))
 }
 
 fn lan_change(engine: &Engine, body: &[u8]) -> bool {
     let Ok(v) = serde_json::from_slice::<Value>(body) else { return false };
-    match v.get("lan_access") {
-        None => false,
-        Some(want) => json!(engine.settings()).get("lan_access") != Some(want),
-    }
+    let now = json!(engine.settings());
+    ["lan_access", "api_keys_over_lan"].iter().any(|f| v.get(f).is_some_and(|want| now.get(f) != Some(want)))
 }
 
 /// The handler for `Engine::set_remote_handler`.

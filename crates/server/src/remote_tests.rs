@@ -326,6 +326,7 @@ async fn handler() -> (crate::remote::Handler, tempfile::TempDir) {
         engine: engine.clone(),
         sessions: Arc::new(auth::Sessions::new()),
         guard: auth::Guard { port: 47999, lan: false, dev_origins: vec![] },
+        api_limiter: crate::rate_limit::ApiKeyRateLimiter::default(),
     };
     (crate::remote::Handler::new(router(state), engine, 47999), dir)
 }

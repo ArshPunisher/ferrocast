@@ -42,6 +42,7 @@ sysinfo = { version = "0.37", default-features = false, features = ["disk", "sys
 # features: no plugins, SSH keys, armor or async.
 age = { version = "0.12", default-features = false }
 sha2 = "0.11"
+subtle = "2"
 # The plugin catalog's signature (minisign, as `cargo tauri signer` makes it).
 minisign-verify = "0.3"
 flate2 = "1"

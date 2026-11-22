@@ -35,7 +35,10 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode};
 
-use crate::studio_host::{AudioChange, FilterEdit, ItemEdit, StudioAct};
+use crate::studio_host::{
+    AudioChange, FilterEdit, HOTKEY_ACTIONS, ItemEdit, ItemTransform, MediaAct, Monitor, NewSource, ShelfAct,
+    StudioAct, TRANSITION_KINDS,
+};
 use crate::{Engine, EngineError};
 
 const SAVE_KEY: &str = "obsws";
@@ -64,10 +67,19 @@ const SUBPROTOCOL: &str = "obswebsocket.json";
 const MAX_BATCH: usize = 100;
 
 // Event subscription bits (EventSubscription).
+#[allow(dead_code)]
+const SUB_GENERAL: u64 = 1 << 0;
+#[allow(dead_code)]
+const SUB_CONFIG: u64 = 1 << 1;
 const SUB_SCENES: u64 = 1 << 2;
 const SUB_INPUTS: u64 = 1 << 3;
+const SUB_TRANSITIONS: u64 = 1 << 4;
+#[allow(dead_code)]
+const SUB_FILTERS: u64 = 1 << 5;
 const SUB_OUTPUTS: u64 = 1 << 6;
 const SUB_SCENE_ITEMS: u64 = 1 << 7;
+#[allow(dead_code)]
+const SUB_MEDIA_INPUTS: u64 = 1 << 8;
 const SUB_UI: u64 = 1 << 10;
 /// Everything but the high-volume events (obs-websocket's `All`).
 const SUB_ALL: u64 = (1 << 11) - 1;
@@ -310,28 +322,270 @@ fn obs_error(e: EngineError) -> Fail {
     }
 }
 
+fn bounds_to_obs(b: &str) -> &'static str {
+    match b {
+        "stretch" => "OBS_BOUNDS_STRETCH",
+        "fit" => "OBS_BOUNDS_SCALE_INNER",
+        "fill" => "OBS_BOUNDS_SCALE_OUTER",
+        "width" => "OBS_BOUNDS_SCALE_TO_WIDTH",
+        "height" => "OBS_BOUNDS_SCALE_TO_HEIGHT",
+        "max" => "OBS_BOUNDS_MAX_ONLY",
+        _ => "OBS_BOUNDS_NONE",
+    }
+}
+
+fn obs_to_bounds(s: &str) -> Result<&'static str, Fail> {
+    match s {
+        "OBS_BOUNDS_NONE" | "none" => Ok("none"),
+        "OBS_BOUNDS_STRETCH" | "stretch" => Ok("stretch"),
+        "OBS_BOUNDS_SCALE_INNER" | "fit" => Ok("fit"),
+        "OBS_BOUNDS_SCALE_OUTER" | "fill" => Ok("fill"),
+        "OBS_BOUNDS_SCALE_TO_WIDTH" | "width" => Ok("width"),
+        "OBS_BOUNDS_SCALE_TO_HEIGHT" | "height" => Ok("height"),
+        "OBS_BOUNDS_MAX_ONLY" | "max" => Ok("max"),
+        _ => Err(fail(ST_OUT_OF_RANGE, "Unknown `boundsType` value.")),
+    }
+}
+
+fn monitor_to_obs(m: &str) -> &'static str {
+    match m {
+        "only_me" => "OBS_MONITORING_TYPE_MONITOR_ONLY",
+        "me_and_stream" => "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT",
+        _ => "OBS_MONITORING_TYPE_NONE",
+    }
+}
+
+fn obs_to_monitor(s: &str) -> Result<Monitor, Fail> {
+    match s {
+        "OBS_MONITORING_TYPE_NONE" => Ok(Monitor::Off),
+        "OBS_MONITORING_TYPE_MONITOR_ONLY" => Ok(Monitor::OnlyMe),
+        "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT" => Ok(Monitor::MeAndStream),
+        _ => Err(fail(ST_BAD_TYPE, "Invalid `monitorType`.")),
+    }
+}
+
+fn media_state_to_obs(s: &str) -> &'static str {
+    match s {
+        "playing" => "OBS_MEDIA_STATE_PLAYING",
+        "paused" => "OBS_MEDIA_STATE_PAUSED",
+        "stopped" => "OBS_MEDIA_STATE_STOPPED",
+        "ended" => "OBS_MEDIA_STATE_ENDED",
+        "opening" => "OBS_MEDIA_STATE_OPENING",
+        "buffering" => "OBS_MEDIA_STATE_BUFFERING",
+        "error" => "OBS_MEDIA_STATE_ERROR",
+        _ => "OBS_MEDIA_STATE_NONE",
+    }
+}
+
+fn obs_to_media_act(s: &str) -> Result<MediaAct, Fail> {
+    match s {
+        "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY" => Ok(MediaAct::Play),
+        "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE" => Ok(MediaAct::Pause),
+        "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PLAY_PAUSE" => Ok(MediaAct::PlayPause),
+        "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_STOP" => Ok(MediaAct::Stop),
+        "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_RESTART" => Ok(MediaAct::Restart),
+        "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_NEXT" => Ok(MediaAct::Next),
+        "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PREVIOUS" => Ok(MediaAct::Previous),
+        _ => Err(fail(ST_OUT_OF_RANGE, "Unsupported `mediaAction`.")),
+    }
+}
+
+fn tracks_to_obs(v: &Value) -> Value {
+    let list: Vec<u64> = v.as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+    let mut obj = serde_json::Map::new();
+    for track in 1..=6u64 {
+        obj.insert(track.to_string(), Value::Bool(list.contains(&track)));
+    }
+    Value::Object(obj)
+}
+
+fn obs_to_tracks(v: &Value) -> Result<Vec<u8>, Fail> {
+    let Some(obj) = v.as_object() else {
+        return Err(fail(ST_BAD_TYPE, "`inputAudioTracks` must be an object mapping track numbers to booleans."));
+    };
+    let mut out = Vec::new();
+    for track in 1..=6u8 {
+        if let Some(val) = obj.get(&track.to_string()) {
+            let on = val.as_bool().ok_or_else(|| fail(ST_BAD_TYPE, "Track values must be booleans."))?;
+            if on {
+                out.push(track);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn transform_to_obs(t: &ItemTransform) -> Value {
+    let w = if t.width == 0 { 1920.0 } else { f64::from(t.width) };
+    let h = if t.height == 0 { 1080.0 } else { f64::from(t.height) };
+    json!({
+        "alignment": t.alignment,
+        "boundsAlignment": t.bounds_alignment,
+        "boundsHeight": t.bounds_height,
+        "boundsType": bounds_to_obs(&t.bounds),
+        "boundsWidth": t.bounds_width,
+        "cropBottom": t.crop_bottom,
+        "cropLeft": t.crop_left,
+        "cropRight": t.crop_right,
+        "cropTop": t.crop_top,
+        "height": h * f64::from(t.scale_y.abs()),
+        "positionX": t.x,
+        "positionY": t.y,
+        "rotation": t.rotation,
+        "scaleX": t.scale_x,
+        "scaleY": t.scale_y,
+        "sourceHeight": h,
+        "sourceWidth": w,
+        "width": w * f64::from(t.scale_x.abs()),
+    })
+}
+
+fn patch_transform(t: &mut ItemTransform, d: &Value) -> Result<(), Fail> {
+    let f32_opt = |k: &str| -> Result<Option<f32>, Fail> {
+        match d.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => {
+                v.as_f64().map(|n| Some(n as f32)).ok_or_else(|| fail(ST_BAD_TYPE, format!("`{k}` must be a number.")))
+            }
+        }
+    };
+    let u32_opt = |k: &str| -> Result<Option<u32>, Fail> {
+        match d.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .map(Some)
+                .ok_or_else(|| fail(ST_BAD_TYPE, format!("`{k}` must be a non-negative integer."))),
+        }
+    };
+    let i32_opt = |k: &str| -> Result<Option<i32>, Fail> {
+        match d.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_i64()
+                .and_then(|n| i32::try_from(n).ok())
+                .map(Some)
+                .ok_or_else(|| fail(ST_BAD_TYPE, format!("`{k}` must be an integer."))),
+        }
+    };
+    if let Some(v) = f32_opt("positionX")? {
+        t.x = v;
+    }
+    if let Some(v) = f32_opt("positionY")? {
+        t.y = v;
+    }
+    if let Some(v) = f32_opt("rotation")? {
+        t.rotation = v;
+    }
+    if let Some(v) = f32_opt("scaleX")? {
+        t.scale_x = v;
+    }
+    if let Some(v) = f32_opt("scaleY")? {
+        t.scale_y = v;
+    }
+    if let Some(v) = u32_opt("alignment")? {
+        t.alignment = v;
+    }
+    if let Some(v) = u32_opt("boundsAlignment")? {
+        t.bounds_alignment = v;
+    }
+    if let Some(v) = f32_opt("boundsWidth")? {
+        t.bounds_width = v;
+    }
+    if let Some(v) = f32_opt("boundsHeight")? {
+        t.bounds_height = v;
+    }
+    if let Some(v) = i32_opt("cropLeft")? {
+        t.crop_left = v;
+    }
+    if let Some(v) = i32_opt("cropTop")? {
+        t.crop_top = v;
+    }
+    if let Some(v) = i32_opt("cropRight")? {
+        t.crop_right = v;
+    }
+    if let Some(v) = i32_opt("cropBottom")? {
+        t.crop_bottom = v;
+    }
+    if let Some(v) = d.get("boundsType").filter(|v| !v.is_null()) {
+        let s = v.as_str().ok_or_else(|| fail(ST_BAD_TYPE, "`boundsType` must be a string."))?;
+        t.bounds = obs_to_bounds(s)?.to_string();
+    }
+    Ok(())
+}
+
+fn transition_parts(scenes_doc: &Value) -> (String, u32) {
+    let t = &scenes_doc["transition"];
+    let kind = t["kind"].as_str().unwrap_or("fade_transition").to_string();
+    let ms = t["ms"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(300);
+    (kind, ms)
+}
+
 /// The requests answered (what `GetVersion` lists).
 const REQUESTS: &[&str] = &[
     "GetVersion",
     "GetStats",
+    "GetHotkeyList",
+    // Scenes
     "GetSceneList",
     "GetCurrentProgramScene",
     "SetCurrentProgramScene",
     "GetCurrentPreviewScene",
     "SetCurrentPreviewScene",
+    "CreateScene",
+    "RemoveScene",
+    // Studio Mode & Transitions
     "GetStudioModeEnabled",
     "SetStudioModeEnabled",
     "TriggerStudioModeTransition",
+    "GetTransitionKindList",
+    "GetCurrentSceneTransition",
+    "SetCurrentSceneTransition",
+    "SetCurrentSceneTransitionDuration",
+    "SetCurrentSceneTransitionSettings",
+    "SetTBarPosition",
+    // Scene Collections & Profiles
+    "GetSceneCollectionList",
+    "SetCurrentSceneCollection",
+    "CreateSceneCollection",
+    "GetProfileList",
+    "SetCurrentProfile",
+    // Inputs & Audio
+    "GetInputKindList",
     "GetInputList",
+    "GetInputSettings",
+    "SetInputSettings",
+    "CreateInput",
+    "SetInputName",
     "GetInputMute",
     "SetInputMute",
     "ToggleInputMute",
     "GetInputVolume",
     "SetInputVolume",
+    "GetInputAudioMonitorType",
+    "SetInputAudioMonitorType",
+    "GetInputAudioSyncOffset",
+    "SetInputAudioSyncOffset",
+    "GetInputAudioBalance",
+    "SetInputAudioBalance",
+    "GetInputAudioTracks",
+    "SetInputAudioTracks",
+    // Scene Items
     "GetSceneItemList",
     "GetSceneItemId",
+    "CreateSceneItem",
+    "RemoveSceneItem",
+    "DuplicateSceneItem",
+    "GetSceneItemTransform",
+    "SetSceneItemTransform",
     "GetSceneItemEnabled",
     "SetSceneItemEnabled",
+    "GetSceneItemLocked",
+    "SetSceneItemLocked",
+    "GetSceneItemIndex",
+    "SetSceneItemIndex",
+    // Stream / Record / Replay / Virtual Camera
     "GetStreamStatus",
     "StartStream",
     "StopStream",
@@ -343,6 +597,8 @@ const REQUESTS: &[&str] = &[
     "PauseRecord",
     "ResumeRecord",
     "ToggleRecordPause",
+    "SplitRecordFile",
+    "CreateRecordChapter",
     "GetReplayBufferStatus",
     "StartReplayBuffer",
     "StopReplayBuffer",
@@ -353,8 +609,20 @@ const REQUESTS: &[&str] = &[
     "StartVirtualCam",
     "StopVirtualCam",
     "ToggleVirtualCam",
+    // Filters
     "GetSourceFilterList",
+    "GetSourceFilter",
+    "CreateSourceFilter",
+    "RemoveSourceFilter",
     "SetSourceFilterEnabled",
+    "SetSourceFilterSettings",
+    "SetSourceFilterIndex",
+    // Media Inputs & Screenshots
+    "GetMediaInputStatus",
+    "TriggerMediaInputAction",
+    "SetMediaInputCursor",
+    "GetSourceScreenshot",
+    "SaveSourceScreenshot",
 ];
 
 impl Engine {
@@ -936,6 +1204,718 @@ impl Engine {
             .ok_or_else(|| fail(ST_NOT_FOUND, "No scene item was found by that id."))
     }
 
+    async fn ows_transition_request(&self, kind: &str, d: &Value) -> Result<Value, Fail> {
+        match kind {
+            "GetTransitionKindList" => Ok(json!({ "transitionKinds": TRANSITION_KINDS })),
+            "GetCurrentSceneTransition" => {
+                let s = self.ows_scenes().await?;
+                let (tk, ms) = transition_parts(&s);
+                let settings = self
+                    .studio_act(StudioAct::TransitionSettings { kind: tk.clone() })
+                    .await
+                    .unwrap_or_else(|_| json!({}));
+                Ok(json!({
+                    "transitionName": tk,
+                    "transitionUuid": uuid_of(&tk),
+                    "transitionKind": tk,
+                    "transitionDuration": ms,
+                    "transitionConfigurable": tk != "cut_transition",
+                    "transitionSettings": settings,
+                }))
+            }
+            "SetCurrentSceneTransition" => {
+                let tk = d
+                    .get("transitionName")
+                    .or_else(|| d.get("transitionKind"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| fail(ST_MISSING_FIELD, "Your request needs `transitionName`."))?
+                    .to_string();
+                let (_, ms) = transition_parts(&self.ows_scenes().await?);
+                self.studio_act(StudioAct::SetTransition { kind: tk, ms }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "SetCurrentSceneTransitionDuration" => {
+                let ms_raw = num_field(d, "transitionDuration")?;
+                if !ms_raw.is_finite() || !(0.0..=20_000.0).contains(&ms_raw) {
+                    return Err(fail(ST_OUT_OF_RANGE, "`transitionDuration` must be from 0 to 20000 ms."));
+                }
+                let (tk, _) = transition_parts(&self.ows_scenes().await?);
+                self.studio_act(StudioAct::SetTransition { kind: tk, ms: ms_raw.round() as u32 })
+                    .await
+                    .map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "SetCurrentSceneTransitionSettings" => {
+                let settings = field(d, "transitionSettings")?.clone();
+                if !settings.is_object() {
+                    return Err(fail(ST_BAD_TYPE, "`transitionSettings` must be an object."));
+                }
+                let (tk, _) = transition_parts(&self.ows_scenes().await?);
+                self.studio_act(StudioAct::SetTransitionSettings { kind: tk, settings }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "SetTBarPosition" => {
+                let pos = num_field(d, "position")?;
+                if !pos.is_finite() || !(0.0..=1.0).contains(&pos) {
+                    return Err(fail(ST_OUT_OF_RANGE, "`position` must be between 0.0 and 1.0."));
+                }
+                let release = d.get("release").and_then(Value::as_bool).unwrap_or(false);
+                self.studio_act(StudioAct::TBar { at: pos as f32, release }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
+        }
+    }
+
+    async fn ows_shelf_request(&self, kind: &str, d: &Value) -> Result<Value, Fail> {
+        let shelf_kind = if kind.contains("Profile") { "profiles" } else { "collections" };
+        match kind {
+            "GetSceneCollectionList" | "GetProfileList" => {
+                let v = self.studio_shelf(shelf_kind, ShelfAct::List).await.map_err(obs_error)?;
+                let current_id = v["current"].as_str().unwrap_or_default();
+                let mut current_name = current_id.to_string();
+                let mut names = Vec::new();
+                for entry in v["list"].as_array().into_iter().flatten() {
+                    if let Some(name) = entry["name"].as_str() {
+                        if entry["id"].as_str() == Some(current_id) {
+                            current_name = name.to_string();
+                        }
+                        names.push(name.to_string());
+                    }
+                }
+                if shelf_kind == "collections" {
+                    Ok(json!({ "currentSceneCollectionName": current_name, "sceneCollections": names }))
+                } else {
+                    Ok(json!({ "currentProfileName": current_name, "profiles": names }))
+                }
+            }
+            "SetCurrentSceneCollection" | "SetCurrentProfile" => {
+                let key = if shelf_kind == "collections" { "sceneCollectionName" } else { "profileName" };
+                let want = str_field(d, key)?;
+                let v = self.studio_shelf(shelf_kind, ShelfAct::List).await.map_err(obs_error)?;
+                let id = v["list"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|e| e["name"].as_str() == Some(want) || e["id"].as_str() == Some(want))
+                    .and_then(|e| e["id"].as_str())
+                    .map(String::from)
+                    .ok_or_else(|| fail(ST_NOT_FOUND, "No entry was found by that name."))?;
+                self.studio_shelf(shelf_kind, ShelfAct::Switch { id }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "CreateSceneCollection" => {
+                let name = str_field(d, "sceneCollectionName")?.trim().to_string();
+                self.studio_shelf("collections", ShelfAct::New { name, copy: false }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
+        }
+    }
+
+    async fn ows_input_request(&self, kind: &str, d: &Value) -> Result<Value, Fail> {
+        match kind {
+            "GetInputKindList" => {
+                let v = self.studio_kinds().await.map_err(obs_error)?;
+                let mut list: Vec<String> = v["inputs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|k| k["id"].as_str().or_else(|| k.as_str()).map(String::from))
+                    .collect();
+                list.sort();
+                list.dedup();
+                Ok(json!({ "inputKinds": list }))
+            }
+            "GetInputList" => {
+                let v = self.studio_act(StudioAct::Sources).await.map_err(obs_error)?;
+                let want = d.get("inputKind").and_then(Value::as_str);
+                let list: Vec<Value> = v
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| want.is_none_or(|k| s["kind"].as_str() == Some(k)))
+                    .filter_map(|s| {
+                        let n = s["name"].as_str()?;
+                        Some(json!({ "inputName": n, "inputUuid": uuid_of(n),
+                            "inputKind": s["kind"], "unversionedInputKind": s["kind"] }))
+                    })
+                    .collect();
+                Ok(json!({ "inputs": list }))
+            }
+            "GetInputSettings" => {
+                let name = self.ows_input_name(d).await?;
+                let sources = self.studio_act(StudioAct::Sources).await.map_err(obs_error)?;
+                let input_kind = sources
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|s| s["name"].as_str() == Some(name.as_str()))
+                    .and_then(|s| s["kind"].as_str())
+                    .map(String::from)
+                    .ok_or_else(|| fail(ST_NOT_FOUND, "No input was found by that name."))?;
+                let settings = self.studio_act(StudioAct::Settings { name }).await.map_err(obs_error)?;
+                // Keys, passwords, tokens and URL credentials never leave over obs-websocket.
+                Ok(json!({ "inputSettings": redact_source_settings(&settings), "inputKind": input_kind }))
+            }
+            "SetInputSettings" => {
+                let name = self.ows_input_name(d).await?;
+                let settings = field(d, "inputSettings")?.clone();
+                if !settings.is_object() {
+                    return Err(fail(ST_BAD_TYPE, "`inputSettings` must be an object."));
+                }
+                if let Some(why) = source_settings_problem(&settings) {
+                    return Err(fail(ST_OUT_OF_RANGE, &why));
+                }
+                let overlay = d.get("overlay").and_then(Value::as_bool).unwrap_or(true);
+                let final_settings = if overlay {
+                    settings
+                } else {
+                    let cur = self.studio_act(StudioAct::Settings { name: name.clone() }).await.map_err(obs_error)?;
+                    let mut merged = serde_json::Map::new();
+                    if let Some(obj) = cur.as_object() {
+                        for k in obj.keys() {
+                            merged.insert(k.clone(), Value::Null);
+                        }
+                    }
+                    if let Some(obj) = settings.as_object() {
+                        for (k, v) in obj {
+                            merged.insert(k.clone(), v.clone());
+                        }
+                    }
+                    Value::Object(merged)
+                };
+                self.studio_act(StudioAct::Update { name, settings: final_settings }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "CreateInput" => {
+                let scene = self.ows_scene_name(d).await?;
+                let name = str_field(d, "inputName")?.to_string();
+                let input_kind = str_field(d, "inputKind")?.to_string();
+                let settings = d.get("inputSettings").cloned().unwrap_or_else(|| json!({}));
+                if let Some(why) = source_settings_problem(&settings) {
+                    return Err(fail(ST_OUT_OF_RANGE, &why));
+                }
+                let enabled = d.get("sceneItemEnabled").and_then(Value::as_bool).unwrap_or(true);
+                let added = self
+                    .studio_act(StudioAct::AddSource {
+                        scene: scene.clone(),
+                        source: NewSource { kind: input_kind, name: name.clone(), settings },
+                        fit: true,
+                    })
+                    .await
+                    .map_err(obs_error)?;
+                let id = added["id"].as_i64().unwrap_or(0);
+                if !enabled && id != 0 {
+                    self.studio_act(StudioAct::EditItem { scene, id, edit: ItemEdit::Hide })
+                        .await
+                        .map_err(obs_error)?;
+                }
+                Ok(json!({ "inputUuid": uuid_of(&name), "sceneItemId": id }))
+            }
+            "SetInputName" => {
+                let name = self.ows_input_name(d).await?;
+                let new_name = str_field(d, "newInputName")?.to_string();
+                self.studio_act(StudioAct::Rename { name, new_name }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetInputMute" => {
+                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
+                Ok(json!({ "inputMuted": row["muted"].as_bool().unwrap_or(false) }))
+            }
+            "SetInputMute" | "ToggleInputMute" => {
+                let name = self.ows_input_name(d).await?;
+                let row = self.ows_audio(&name).await?;
+                let now = row["muted"].as_bool().unwrap_or(false);
+                let muted = if kind == "SetInputMute" { bool_field(d, "inputMuted")? } else { !now };
+                let change = AudioChange { muted: Some(muted), ..Default::default() };
+                self.studio_act(StudioAct::SetAudio { name, change }).await.map_err(obs_error)?;
+                Ok(if kind == "ToggleInputMute" { json!({ "inputMuted": muted }) } else { Value::Null })
+            }
+            "GetInputVolume" => {
+                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
+                let db = row["volume_db"].as_f64().unwrap_or(0.0);
+                Ok(json!({ "inputVolumeMul": mul_of(db), "inputVolumeDb": db }))
+            }
+            "SetInputVolume" => {
+                let name = self.ows_input_name(d).await?;
+                let db = if d.get("inputVolumeDb").is_some_and(|v| !v.is_null()) {
+                    let db = num_field(d, "inputVolumeDb")?;
+                    if !(-100.0..=26.0).contains(&db) {
+                        return Err(fail(ST_OUT_OF_RANGE, "`inputVolumeDb` must be from -100 to 26."));
+                    }
+                    db
+                } else {
+                    let mul = num_field(d, "inputVolumeMul")?;
+                    if !(0.0..=20.0).contains(&mul) {
+                        return Err(fail(ST_OUT_OF_RANGE, "`inputVolumeMul` must be from 0 to 20."));
+                    }
+                    db_of(mul)
+                };
+                self.ows_audio(&name).await?;
+                let change = AudioChange { volume_db: Some(db as f32), ..Default::default() };
+                self.studio_act(StudioAct::SetAudio { name, change }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetInputAudioMonitorType" => {
+                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
+                let m = row["monitor"].as_str().unwrap_or("off");
+                Ok(json!({ "monitorType": monitor_to_obs(m) }))
+            }
+            "SetInputAudioMonitorType" => {
+                let name = self.ows_input_name(d).await?;
+                let monitor = obs_to_monitor(str_field(d, "monitorType")?)?;
+                self.ows_audio(&name).await?;
+                let change = AudioChange { monitor: Some(monitor), ..Default::default() };
+                self.studio_act(StudioAct::SetAudio { name, change }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetInputAudioSyncOffset" => {
+                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
+                let sync_ms = row["sync_ms"].as_i64().unwrap_or(0);
+                // obs-websocket 5.5.4: milliseconds, both ways.
+                Ok(json!({ "inputAudioSyncOffset": sync_ms }))
+            }
+            "SetInputAudioSyncOffset" => {
+                let name = self.ows_input_name(d).await?;
+                let ms = field(d, "inputAudioSyncOffset")?
+                    .as_i64()
+                    .ok_or_else(|| fail(ST_BAD_TYPE, "`inputAudioSyncOffset` must be an integer (milliseconds)."))?;
+                if !(-950..=20_000).contains(&ms) {
+                    return Err(fail(ST_OUT_OF_RANGE, "`inputAudioSyncOffset` must be from -950 to 20000 ms."));
+                }
+                self.ows_audio(&name).await?;
+                let change = AudioChange { sync_ms: Some(ms), ..Default::default() };
+                self.studio_act(StudioAct::SetAudio { name, change }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetInputAudioBalance" => {
+                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
+                Ok(json!({ "inputAudioBalance": row["balance"].as_f64().unwrap_or(0.5) }))
+            }
+            "SetInputAudioBalance" => {
+                let name = self.ows_input_name(d).await?;
+                let balance = num_field(d, "inputAudioBalance")?;
+                if !balance.is_finite() || !(0.0..=1.0).contains(&balance) {
+                    return Err(fail(ST_OUT_OF_RANGE, "`inputAudioBalance` must be from 0.0 to 1.0."));
+                }
+                self.ows_audio(&name).await?;
+                let change = AudioChange { balance: Some(balance as f32), ..Default::default() };
+                self.studio_act(StudioAct::SetAudio { name, change }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetInputAudioTracks" => {
+                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
+                Ok(json!({ "inputAudioTracks": tracks_to_obs(&row["tracks"]) }))
+            }
+            "SetInputAudioTracks" => {
+                let name = self.ows_input_name(d).await?;
+                let tracks = obs_to_tracks(field(d, "inputAudioTracks")?)?;
+                self.ows_audio(&name).await?;
+                let change = AudioChange { tracks: Some(tracks), ..Default::default() };
+                self.studio_act(StudioAct::SetAudio { name, change }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
+        }
+    }
+
+    async fn ows_item_request(&self, kind: &str, d: &Value) -> Result<Value, Fail> {
+        let scene = self.ows_scene_name(d).await?;
+        match kind {
+            "GetSceneItemList" => {
+                let items = self.ows_items(&scene).await?;
+                let n = items.len();
+                let list: Vec<Value> = items
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pos, i)| {
+                        let name = i["name"].as_str()?;
+                        Some(json!({
+                            "sceneItemId": i["id"], "sceneItemIndex": n - 1 - pos,
+                            "sourceName": name, "sourceUuid": uuid_of(name),
+                            "sourceType": if i["group"].as_bool() == Some(true) { "OBS_SOURCE_TYPE_SCENE" } else { "OBS_SOURCE_TYPE_INPUT" },
+                            "inputKind": i["kind"], "isGroup": i["group"].as_bool().unwrap_or(false),
+                            "sceneItemLocked": i["locked"].as_bool().unwrap_or(false),
+                            "sceneItemEnabled": i["visible"].as_bool().unwrap_or(true),
+                        }))
+                    })
+                    .collect();
+                Ok(json!({ "sceneItems": list }))
+            }
+            "GetSceneItemId" => {
+                let source = self.ows_source_name(d).await?;
+                // OBS counts matches from the bottom of the scene up: 0 (the default) is the first, N skips N,
+                // and -1 is the last (the top one). The list here is top first.
+                let offset = match d.get("searchOffset") {
+                    None | Some(Value::Null) => 0,
+                    Some(v) => v.as_i64().ok_or_else(|| fail(ST_BAD_TYPE, "`searchOffset` must be a number."))?,
+                };
+                if offset < -1 {
+                    return Err(fail(ST_OUT_OF_RANGE, "`searchOffset` must be -1 or more."));
+                }
+                let items = self.ows_items(&scene).await?;
+                let mut matches = items
+                    .iter()
+                    .flat_map(|i| std::iter::once(i).chain(i["children"].as_array().into_iter().flatten()))
+                    .filter(|i| i["name"].as_str() == Some(source.as_str()))
+                    .collect::<Vec<_>>();
+                matches.reverse();
+                let found = if offset == -1 { matches.last().copied() } else { matches.get(offset as usize).copied() };
+                found
+                    .map(|i| json!({ "sceneItemId": i["id"] }))
+                    .ok_or_else(|| fail(ST_NOT_FOUND, "No scene items were found in the specified scene by that name."))
+            }
+            "CreateSceneItem" => {
+                let name = self.ows_source_name(d).await?;
+                let enabled = d.get("sceneItemEnabled").and_then(Value::as_bool).unwrap_or(true);
+                let added =
+                    self.studio_act(StudioAct::AddExisting { scene: scene.clone(), name }).await.map_err(obs_error)?;
+                let id = added["id"].as_i64().unwrap_or(0);
+                if !enabled && id != 0 {
+                    self.studio_act(StudioAct::EditItem { scene, id, edit: ItemEdit::Hide })
+                        .await
+                        .map_err(obs_error)?;
+                }
+                Ok(json!({ "sceneItemId": id }))
+            }
+            "RemoveSceneItem" => {
+                let id = Self::ows_item_id(d)?;
+                self.ows_find_item(&scene, id).await?;
+                self.studio_act(StudioAct::EditItem { scene, id, edit: ItemEdit::Remove }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "DuplicateSceneItem" => {
+                let id = Self::ows_item_id(d)?;
+                let item = self.ows_find_item(&scene, id).await?;
+                let dst = if d.get("destinationSceneName").is_some() || d.get("destinationSceneUuid").is_some() {
+                    let sub = json!({
+                        "sceneName": d.get("destinationSceneName").cloned().unwrap_or(Value::Null),
+                        "sceneUuid": d.get("destinationSceneUuid").cloned().unwrap_or(Value::Null),
+                    });
+                    self.ows_scene_name(&sub).await?
+                } else {
+                    scene.clone()
+                };
+                if dst == scene {
+                    let v = self
+                        .studio_act(StudioAct::EditItem { scene, id, edit: ItemEdit::Duplicate })
+                        .await
+                        .map_err(obs_error)?;
+                    let new_id = v["id"].as_i64().unwrap_or(id);
+                    Ok(json!({ "sceneItemId": new_id }))
+                } else {
+                    // The copy keeps what this item has: its transform and crop, and whether it shows.
+                    let name = item["name"].as_str().unwrap_or_default().to_string();
+                    let t =
+                        self.studio_act(StudioAct::Transform { scene: scene.clone(), id }).await.map_err(obs_error)?;
+                    let transform: ItemTransform = serde_json::from_value(t)
+                        .map_err(|_| fail(ST_FAILED, "Could not read the item's transform."))?;
+                    let v = self
+                        .studio_act(StudioAct::AddExisting { scene: dst.clone(), name })
+                        .await
+                        .map_err(obs_error)?;
+                    let new_id = v["id"].as_i64().unwrap_or(0);
+                    if new_id != 0 {
+                        self.studio_act(StudioAct::SetTransform { scene: dst.clone(), id: new_id, transform })
+                            .await
+                            .map_err(obs_error)?;
+                        if item["visible"].as_bool() == Some(false) {
+                            self.studio_act(StudioAct::EditItem { scene: dst, id: new_id, edit: ItemEdit::Hide })
+                                .await
+                                .map_err(obs_error)?;
+                        }
+                    }
+                    Ok(json!({ "sceneItemId": new_id }))
+                }
+            }
+            "GetSceneItemTransform" => {
+                let id = Self::ows_item_id(d)?;
+                let v = self.studio_act(StudioAct::Transform { scene, id }).await.map_err(obs_error)?;
+                let t: ItemTransform =
+                    serde_json::from_value(v).map_err(|_| fail(ST_FAILED, "Could not read item transform."))?;
+                Ok(json!({ "sceneItemTransform": transform_to_obs(&t) }))
+            }
+            "SetSceneItemTransform" => {
+                let id = Self::ows_item_id(d)?;
+                let patch = field(d, "sceneItemTransform")?;
+                if !patch.is_object() {
+                    return Err(fail(ST_BAD_TYPE, "`sceneItemTransform` must be an object."));
+                }
+                let v = self.studio_act(StudioAct::Transform { scene: scene.clone(), id }).await.map_err(obs_error)?;
+                let mut t: ItemTransform =
+                    serde_json::from_value(v).map_err(|_| fail(ST_FAILED, "Could not read current item transform."))?;
+                patch_transform(&mut t, patch)?;
+                t.validate().map_err(obs_error)?;
+                self.studio_act(StudioAct::SetTransform { scene, id, transform: t }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetSceneItemEnabled" => {
+                let item = self.ows_find_item(&scene, Self::ows_item_id(d)?).await?;
+                Ok(json!({ "sceneItemEnabled": item["visible"].as_bool().unwrap_or(true) }))
+            }
+            "SetSceneItemEnabled" => {
+                let id = Self::ows_item_id(d)?;
+                let on = bool_field(d, "sceneItemEnabled")?;
+                self.ows_find_item(&scene, id).await?;
+                let edit = if on { ItemEdit::Show } else { ItemEdit::Hide };
+                self.studio_act(StudioAct::EditItem { scene, id, edit }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetSceneItemLocked" => {
+                let item = self.ows_find_item(&scene, Self::ows_item_id(d)?).await?;
+                Ok(json!({ "sceneItemLocked": item["locked"].as_bool().unwrap_or(false) }))
+            }
+            "SetSceneItemLocked" => {
+                let id = Self::ows_item_id(d)?;
+                let on = bool_field(d, "sceneItemLocked")?;
+                self.ows_find_item(&scene, id).await?;
+                let edit = if on { ItemEdit::Lock } else { ItemEdit::Unlock };
+                self.studio_act(StudioAct::EditItem { scene, id, edit }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetSceneItemIndex" => {
+                let id = Self::ows_item_id(d)?;
+                let items = self.ows_items(&scene).await?;
+                let n = items.len();
+                let pos = items
+                    .iter()
+                    .position(|i| i["id"].as_i64() == Some(id))
+                    .ok_or_else(|| fail(ST_NOT_FOUND, "No scene item was found by that id."))?;
+                Ok(json!({ "sceneItemIndex": n - 1 - pos }))
+            }
+            "SetSceneItemIndex" => {
+                let id = Self::ows_item_id(d)?;
+                let idx_raw = field(d, "sceneItemIndex")?
+                    .as_u64()
+                    .ok_or_else(|| fail(ST_BAD_TYPE, "`sceneItemIndex` must be a non-negative integer."))?;
+                let items = self.ows_items(&scene).await?;
+                let n = items.len();
+                let idx =
+                    usize::try_from(idx_raw).map_err(|_| fail(ST_OUT_OF_RANGE, "`sceneItemIndex` out of range."))?;
+                if idx >= n {
+                    return Err(fail(ST_OUT_OF_RANGE, "`sceneItemIndex` exceeds scene item count."));
+                }
+                if !items.iter().any(|i| i["id"].as_i64() == Some(id)) {
+                    return Err(fail(ST_NOT_FOUND, "No scene item was found by that id."));
+                }
+                let to = n - 1 - idx;
+                self.studio_act(StudioAct::ItemOrder { scene, id, to }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
+        }
+    }
+
+    async fn ows_filter_request(&self, kind: &str, d: &Value) -> Result<Value, Fail> {
+        let name = self.ows_source_name(d).await?;
+        match kind {
+            "GetSourceFilterList" => {
+                let v = self.studio_act(StudioAct::Filters { name, item: None }).await.map_err(obs_error)?;
+                let list: Vec<Value> = v
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        json!({
+                            "filterEnabled": f["enabled"].as_bool().unwrap_or(false),
+                            "filterIndex": i,
+                            "filterKind": f["kind"],
+                            "filterName": f["name"],
+                            "filterSettings": {},
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "filters": list }))
+            }
+            "GetSourceFilter" => {
+                let filter = str_field(d, "filterName")?.to_string();
+                let v =
+                    self.studio_act(StudioAct::Filters { name: name.clone(), item: None }).await.map_err(obs_error)?;
+                let (idx, info) = v
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .find(|(_, f)| f["name"].as_str() == Some(filter.as_str()))
+                    .ok_or_else(|| fail(ST_NOT_FOUND, "No filter was found by that name."))?;
+                let settings = self
+                    .studio_act(StudioAct::FilterSettings { name, filter: filter.clone(), item: None })
+                    .await
+                    .unwrap_or_else(|_| json!({}));
+                Ok(json!({
+                    "filterEnabled": info["enabled"].as_bool().unwrap_or(false),
+                    "filterIndex": idx,
+                    "filterKind": info["kind"],
+                    "filterName": filter,
+                    "filterSettings": settings,
+                }))
+            }
+            "CreateSourceFilter" => {
+                let filter = str_field(d, "filterName")?.to_string();
+                let filter_kind = str_field(d, "filterKind")?.to_string();
+                let settings = d.get("filterSettings").cloned().unwrap_or_else(|| json!({}));
+                self.studio_act(StudioAct::AddFilter {
+                    name,
+                    filter: NewSource { kind: filter_kind, name: filter, settings },
+                    item: None,
+                })
+                .await
+                .map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "RemoveSourceFilter" => {
+                let filter = str_field(d, "filterName")?.to_string();
+                self.studio_act(StudioAct::RemoveFilter { name, filter, item: None }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "SetSourceFilterEnabled" => {
+                let filter = str_field(d, "filterName")?.to_string();
+                let on = bool_field(d, "filterEnabled")?;
+                let list =
+                    self.studio_act(StudioAct::Filters { name: name.clone(), item: None }).await.map_err(obs_error)?;
+                if !list.as_array().is_some_and(|l| l.iter().any(|f| f["name"].as_str() == Some(filter.as_str()))) {
+                    return Err(fail(ST_NOT_FOUND, "No filter was found by that name."));
+                }
+                let edit = if on { FilterEdit::Enable } else { FilterEdit::Disable };
+                self.studio_act(StudioAct::EditFilter { name, filter, edit, item: None }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "SetSourceFilterSettings" => {
+                let filter = str_field(d, "filterName")?.to_string();
+                let settings = field(d, "filterSettings")?.clone();
+                if !settings.is_object() {
+                    return Err(fail(ST_BAD_TYPE, "`filterSettings` must be an object."));
+                }
+                self.studio_act(StudioAct::UpdateFilter { name, filter, settings, item: None })
+                    .await
+                    .map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "SetSourceFilterIndex" => {
+                let filter = str_field(d, "filterName")?.to_string();
+                let target_raw = field(d, "filterIndex")?
+                    .as_u64()
+                    .ok_or_else(|| fail(ST_BAD_TYPE, "`filterIndex` must be a non-negative integer."))?;
+                let list =
+                    self.studio_act(StudioAct::Filters { name: name.clone(), item: None }).await.map_err(obs_error)?;
+                let arr = list.as_array().map(Vec::as_slice).unwrap_or_default();
+                let target =
+                    usize::try_from(target_raw).map_err(|_| fail(ST_OUT_OF_RANGE, "`filterIndex` out of range."))?;
+                if target >= arr.len() {
+                    return Err(fail(ST_OUT_OF_RANGE, "`filterIndex` exceeds filter count."));
+                }
+                let Some(mut cur) = arr.iter().position(|f| f["name"].as_str() == Some(filter.as_str())) else {
+                    return Err(fail(ST_NOT_FOUND, "No filter was found by that name."));
+                };
+                if cur != target {
+                    if target == 0 {
+                        self.studio_act(StudioAct::EditFilter { name, filter, edit: FilterEdit::Top, item: None })
+                            .await
+                            .map_err(obs_error)?;
+                    } else if target + 1 == arr.len() {
+                        self.studio_act(StudioAct::EditFilter { name, filter, edit: FilterEdit::Bottom, item: None })
+                            .await
+                            .map_err(obs_error)?;
+                    } else {
+                        while cur < target {
+                            self.studio_act(StudioAct::EditFilter {
+                                name: name.clone(),
+                                filter: filter.clone(),
+                                edit: FilterEdit::Down,
+                                item: None,
+                            })
+                            .await
+                            .map_err(obs_error)?;
+                            cur += 1;
+                        }
+                        while cur > target {
+                            self.studio_act(StudioAct::EditFilter {
+                                name: name.clone(),
+                                filter: filter.clone(),
+                                edit: FilterEdit::Up,
+                                item: None,
+                            })
+                            .await
+                            .map_err(obs_error)?;
+                            cur -= 1;
+                        }
+                    }
+                }
+                Ok(Value::Null)
+            }
+            _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
+        }
+    }
+
+    async fn ows_media_or_shot_request(&self, kind: &str, d: &Value) -> Result<Value, Fail> {
+        match kind {
+            "GetMediaInputStatus" => {
+                let name = self.ows_input_name(d).await?;
+                let v =
+                    self.studio_act(StudioAct::Media { name, what: None, seek_ms: None }).await.map_err(obs_error)?;
+                let st = v["state"].as_str().unwrap_or("none");
+                Ok(json!({
+                    "mediaState": media_state_to_obs(st),
+                    "mediaDuration": v["duration_ms"],
+                    "mediaCursor": v["time_ms"],
+                }))
+            }
+            "TriggerMediaInputAction" => {
+                let name = self.ows_input_name(d).await?;
+                let act = obs_to_media_act(str_field(d, "mediaAction")?)?;
+                self.studio_act(StudioAct::Media { name, what: Some(act), seek_ms: None }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "SetMediaInputCursor" => {
+                let name = self.ows_input_name(d).await?;
+                let cursor = field(d, "mediaCursor")?
+                    .as_i64()
+                    .ok_or_else(|| fail(ST_BAD_TYPE, "`mediaCursor` must be an integer."))?;
+                if cursor < 0 {
+                    return Err(fail(ST_OUT_OF_RANGE, "`mediaCursor` must be >= 0."));
+                }
+                self.studio_act(StudioAct::Media { name, what: None, seek_ms: Some(cursor) })
+                    .await
+                    .map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "GetSourceScreenshot" => {
+                let name = self.ows_source_name(d).await?;
+                let fmt = str_field(d, "imageFormat")?;
+                if !fmt.eq_ignore_ascii_case("png") {
+                    return Err(fail(ST_OUT_OF_RANGE, "Only PNG screenshots (`png`) are supported."));
+                }
+                let width = d
+                    .get("imageWidth")
+                    .and_then(Value::as_u64)
+                    .and_then(|w| u32::try_from(w).ok())
+                    .unwrap_or(640)
+                    .clamp(64, 640);
+                let v = self
+                    .studio_act(StudioAct::SourcePicture { name, width, filters: true, item: None })
+                    .await
+                    .map_err(obs_error)?;
+                Ok(json!({ "imageData": v["image"] }))
+            }
+            "SaveSourceScreenshot" => {
+                self.ows_source_name(d).await?;
+                str_field(d, "imageFormat")?;
+                str_field(d, "imageFilePath")?;
+                // A client doesn't get to choose where the PC writes a file (an API key could write
+                // anywhere the app can): said as it is, not answered with a success and no file there.
+                // The Studio's own screenshot goes to the recordings folder; GetSourceScreenshot returns
+                // the picture itself.
+                Err(fail(
+                    ST_FAILED,
+                    "Saving to a path chosen in `imageFilePath` isn't supported. Use GetSourceScreenshot to get the picture.",
+                ))
+            }
+            _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
+        }
+    }
+
     async fn ows_stream_stoppable(&self) -> Result<bool, Fail> {
         let stats = self.ows_stats().await?;
         if stats["stream"]["active"].as_bool() == Some(true) {
@@ -1021,22 +2001,23 @@ impl Engine {
                 "platformDescription": format!("Ferrocast on {}", std::env::consts::OS),
             })),
             "GetStats" => {
-                let s = self.ows_stats().await?;
-                let e = &s["engine"];
+                let stats = self.ows_stats().await?;
+                let e = &stats["engine"];
                 Ok(json!({
                     "cpuUsage": e["cpu"].as_f64().unwrap_or(0.0),
                     "memoryUsage": e["memory_mb"].as_f64().unwrap_or(0.0),
-                    "availableDiskSpace": s["disk_free_mb"].as_f64().unwrap_or(0.0),
+                    "availableDiskSpace": stats["disk_free_mb"].as_f64().unwrap_or(0.0),
                     "activeFps": e["fps"].as_f64().unwrap_or(0.0),
                     "averageFrameRenderTime": e["frame_ms"].as_f64().unwrap_or(0.0),
                     "renderSkippedFrames": e["lagged"].as_u64().unwrap_or(0),
                     "renderTotalFrames": e["frames"].as_u64().unwrap_or(0),
-                    "outputSkippedFrames": s["stream"]["dropped"].as_u64().unwrap_or(0),
-                    "outputTotalFrames": s["stream"]["frames"].as_u64().unwrap_or(0),
+                    "outputSkippedFrames": stats["stream"]["dropped"].as_u64().unwrap_or(0),
+                    "outputTotalFrames": stats["stream"]["frames"].as_u64().unwrap_or(0),
                     "webSocketSessionIncomingMessages": 0,
                     "webSocketSessionOutgoingMessages": 0,
                 }))
             }
+            "GetHotkeyList" => Ok(json!({ "hotkeys": HOTKEY_ACTIONS })),
             // ---- scenes ----
             "GetSceneList" => {
                 let s = self.ows_scenes().await?;
@@ -1071,6 +2052,23 @@ impl Engine {
                 self.studio_act(StudioAct::SetCurrent { scene }).await.map_err(obs_error)?;
                 Ok(Value::Null)
             }
+            "CreateScene" => {
+                let name = str_field(d, "sceneName")?.trim().to_string();
+                let scenes = self.ows_scenes().await?;
+                if scenes["scenes"].as_array().into_iter().flatten().any(|x| x["name"].as_str() == Some(name.as_str()))
+                {
+                    return Err(fail(ST_FAILED, "A scene with that name already exists."));
+                }
+                self.studio_act(StudioAct::AddScene { name: name.clone(), vertical: false })
+                    .await
+                    .map_err(obs_error)?;
+                Ok(json!({ "sceneUuid": uuid_of(&name) }))
+            }
+            "RemoveScene" => {
+                let scene = self.ows_scene_name(d).await?;
+                self.studio_act(StudioAct::RemoveScene { scene }).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
             "GetStudioModeEnabled" => {
                 let s = self.ows_scenes().await?;
                 Ok(json!({ "studioModeEnabled": !s["preview"].is_null() }))
@@ -1103,108 +2101,53 @@ impl Engine {
                 self.studio_act(StudioAct::TransitionNow { quick: None }).await.map_err(obs_error)?;
                 Ok(Value::Null)
             }
-            // ---- inputs ----
-            "GetInputList" => {
-                let v = self.studio_act(StudioAct::Sources).await.map_err(obs_error)?;
-                let want = d.get("inputKind").and_then(Value::as_str);
-                let list: Vec<Value> = v
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|s| want.is_none_or(|k| s["kind"].as_str() == Some(k)))
-                    .filter_map(|s| {
-                        let n = s["name"].as_str()?;
-                        Some(json!({ "inputName": n, "inputUuid": uuid_of(n),
-                            "inputKind": s["kind"], "unversionedInputKind": s["kind"] }))
-                    })
-                    .collect();
-                Ok(json!({ "inputs": list }))
-            }
-            "GetInputMute" => {
-                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
-                Ok(json!({ "inputMuted": row["muted"].as_bool().unwrap_or(false) }))
-            }
-            "SetInputMute" | "ToggleInputMute" => {
-                let name = self.ows_input_name(d).await?;
-                let row = self.ows_audio(&name).await?;
-                let now = row["muted"].as_bool().unwrap_or(false);
-                let muted = if kind == "SetInputMute" { bool_field(d, "inputMuted")? } else { !now };
-                let change = AudioChange { muted: Some(muted), ..Default::default() };
-                self.studio_act(StudioAct::SetAudio { name, change }).await.map_err(obs_error)?;
-                Ok(if kind == "ToggleInputMute" { json!({ "inputMuted": muted }) } else { Value::Null })
-            }
-            "GetInputVolume" => {
-                let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
-                let db = row["volume_db"].as_f64().unwrap_or(0.0);
-                Ok(json!({ "inputVolumeMul": mul_of(db), "inputVolumeDb": db }))
-            }
-            "SetInputVolume" => {
-                let name = self.ows_input_name(d).await?;
-                let db = if d.get("inputVolumeDb").is_some_and(|v| !v.is_null()) {
-                    let db = num_field(d, "inputVolumeDb")?;
-                    if !(-100.0..=26.0).contains(&db) {
-                        return Err(fail(ST_OUT_OF_RANGE, "`inputVolumeDb` must be from -100 to 26."));
-                    }
-                    db
-                } else {
-                    let mul = num_field(d, "inputVolumeMul")?;
-                    if !(0.0..=20.0).contains(&mul) {
-                        return Err(fail(ST_OUT_OF_RANGE, "`inputVolumeMul` must be from 0 to 20."));
-                    }
-                    db_of(mul)
-                };
-                self.ows_audio(&name).await?;
-                let change = AudioChange { volume_db: Some(db as f32), ..Default::default() };
-                self.studio_act(StudioAct::SetAudio { name, change }).await.map_err(obs_error)?;
-                Ok(Value::Null)
-            }
+            // ---- transitions & T-bar ----
+            "GetTransitionKindList"
+            | "GetCurrentSceneTransition"
+            | "SetCurrentSceneTransition"
+            | "SetCurrentSceneTransitionDuration"
+            | "SetCurrentSceneTransitionSettings"
+            | "SetTBarPosition" => self.ows_transition_request(kind, d).await,
+            // ---- scene collections & profiles ----
+            "GetSceneCollectionList"
+            | "SetCurrentSceneCollection"
+            | "CreateSceneCollection"
+            | "GetProfileList"
+            | "SetCurrentProfile" => self.ows_shelf_request(kind, d).await,
+            // ---- inputs & audio ----
+            "GetInputKindList"
+            | "GetInputList"
+            | "GetInputSettings"
+            | "SetInputSettings"
+            | "CreateInput"
+            | "SetInputName"
+            | "GetInputMute"
+            | "SetInputMute"
+            | "ToggleInputMute"
+            | "GetInputVolume"
+            | "SetInputVolume"
+            | "GetInputAudioMonitorType"
+            | "SetInputAudioMonitorType"
+            | "GetInputAudioSyncOffset"
+            | "SetInputAudioSyncOffset"
+            | "GetInputAudioBalance"
+            | "SetInputAudioBalance"
+            | "GetInputAudioTracks"
+            | "SetInputAudioTracks" => self.ows_input_request(kind, d).await,
             // ---- scene items ----
-            "GetSceneItemList" => {
-                let scene = self.ows_scene_name(d).await?;
-                let items = self.ows_items(&scene).await?;
-                let n = items.len();
-                let list: Vec<Value> = items
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(pos, i)| {
-                        let name = i["name"].as_str()?;
-                        Some(json!({
-                            "sceneItemId": i["id"], "sceneItemIndex": n - 1 - pos,
-                            "sourceName": name, "sourceUuid": uuid_of(name),
-                            "sourceType": if i["group"].as_bool() == Some(true) { "OBS_SOURCE_TYPE_SCENE" } else { "OBS_SOURCE_TYPE_INPUT" },
-                            "inputKind": i["kind"], "isGroup": i["group"].as_bool().unwrap_or(false),
-                            "sceneItemLocked": i["locked"].as_bool().unwrap_or(false),
-                            "sceneItemEnabled": i["visible"].as_bool().unwrap_or(true),
-                        }))
-                    })
-                    .collect();
-                Ok(json!({ "sceneItems": list }))
-            }
-            "GetSceneItemId" => {
-                let scene = self.ows_scene_name(d).await?;
-                let source = self.ows_source_name(d).await?;
-                let items = self.ows_items(&scene).await?;
-                items
-                    .iter()
-                    .flat_map(|i| std::iter::once(i).chain(i["children"].as_array().into_iter().flatten()))
-                    .find(|i| i["name"].as_str() == Some(source.as_str()))
-                    .map(|i| json!({ "sceneItemId": i["id"] }))
-                    .ok_or_else(|| fail(ST_NOT_FOUND, "No scene items were found in the specified scene by that name."))
-            }
-            "GetSceneItemEnabled" => {
-                let scene = self.ows_scene_name(d).await?;
-                let item = self.ows_find_item(&scene, Self::ows_item_id(d)?).await?;
-                Ok(json!({ "sceneItemEnabled": item["visible"].as_bool().unwrap_or(true) }))
-            }
-            "SetSceneItemEnabled" => {
-                let scene = self.ows_scene_name(d).await?;
-                let id = Self::ows_item_id(d)?;
-                let on = bool_field(d, "sceneItemEnabled")?;
-                self.ows_find_item(&scene, id).await?;
-                let edit = if on { ItemEdit::Show } else { ItemEdit::Hide };
-                self.studio_act(StudioAct::EditItem { scene, id, edit }).await.map_err(obs_error)?;
-                Ok(Value::Null)
-            }
+            "GetSceneItemList"
+            | "GetSceneItemId"
+            | "CreateSceneItem"
+            | "RemoveSceneItem"
+            | "DuplicateSceneItem"
+            | "GetSceneItemTransform"
+            | "SetSceneItemTransform"
+            | "GetSceneItemEnabled"
+            | "SetSceneItemEnabled"
+            | "GetSceneItemLocked"
+            | "SetSceneItemLocked"
+            | "GetSceneItemIndex"
+            | "SetSceneItemIndex" => self.ows_item_request(kind, d).await,
             // ---- stream ----
             "GetStreamStatus" => {
                 let s = self.ows_stats().await?;
@@ -1262,6 +2205,21 @@ impl Engine {
                 self.studio_record_pause(want).await.map_err(obs_error)?;
                 Ok(if kind == "ToggleRecordPause" { json!({ "outputPaused": want }) } else { Value::Null })
             }
+            "SplitRecordFile" => {
+                if self.ows_stats().await?["record"]["active"].as_bool() != Some(true) {
+                    return Err(fail(ST_NOT_RUNNING, "The record output is not running."));
+                }
+                self.studio_record_split().await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
+            "CreateRecordChapter" => {
+                if self.ows_stats().await?["record"]["active"].as_bool() != Some(true) {
+                    return Err(fail(ST_NOT_RUNNING, "The record output is not running."));
+                }
+                let chapter = d.get("chapterName").and_then(Value::as_str).unwrap_or_default().to_string();
+                self.studio_record_chapter(chapter).await.map_err(obs_error)?;
+                Ok(Value::Null)
+            }
             // ---- replay buffer ----
             "GetReplayBufferStatus" => {
                 let s = self.ows_stats().await?;
@@ -1293,34 +2251,19 @@ impl Engine {
             "StopVirtualCam" => self.ows_set_output("virtualcam", false).await,
             "ToggleVirtualCam" => self.ows_toggle_output("virtualcam").await,
             // ---- filters ----
-            "GetSourceFilterList" => {
-                let name = self.ows_source_name(d).await?;
-                let v = self.studio_act(StudioAct::Filters { name, item: None }).await.map_err(obs_error)?;
-                let list: Vec<Value> = v
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .enumerate()
-                    .map(|(i, f)| {
-                        json!({ "filterEnabled": f["enabled"].as_bool().unwrap_or(false), "filterIndex": i,
-                        "filterKind": f["kind"], "filterName": f["name"], "filterSettings": {} })
-                    })
-                    .collect();
-                Ok(json!({ "filters": list }))
-            }
-            "SetSourceFilterEnabled" => {
-                let name = self.ows_source_name(d).await?;
-                let filter = str_field(d, "filterName")?.to_string();
-                let on = bool_field(d, "filterEnabled")?;
-                let list =
-                    self.studio_act(StudioAct::Filters { name: name.clone(), item: None }).await.map_err(obs_error)?;
-                if !list.as_array().is_some_and(|l| l.iter().any(|f| f["name"].as_str() == Some(filter.as_str()))) {
-                    return Err(fail(ST_NOT_FOUND, "No filter was found by that name."));
-                }
-                let edit = if on { FilterEdit::Enable } else { FilterEdit::Disable };
-                self.studio_act(StudioAct::EditFilter { name, filter, edit, item: None }).await.map_err(obs_error)?;
-                Ok(Value::Null)
-            }
+            "GetSourceFilterList"
+            | "GetSourceFilter"
+            | "CreateSourceFilter"
+            | "RemoveSourceFilter"
+            | "SetSourceFilterEnabled"
+            | "SetSourceFilterSettings"
+            | "SetSourceFilterIndex" => self.ows_filter_request(kind, d).await,
+            // ---- media & screenshots ----
+            "GetMediaInputStatus"
+            | "TriggerMediaInputAction"
+            | "SetMediaInputCursor"
+            | "GetSourceScreenshot"
+            | "SaveSourceScreenshot" => self.ows_media_or_shot_request(kind, d).await,
             _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
         }
     }
@@ -1362,6 +2305,16 @@ impl Engine {
                 program,
                 studio_mode: preview.is_some(),
                 preview,
+                scenes: raw["scenes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect(),
+                transition: (
+                    raw["transition"]["kind"].as_str().unwrap_or_default().to_string(),
+                    raw["transition"]["ms"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
+                ),
                 stream: raw["stream"].as_bool().unwrap_or(false) && self.golive_main_failed().is_none(),
                 record: raw["record"]["active"].as_bool().unwrap_or(false),
                 record_paused: raw["record"]["paused"].as_bool().unwrap_or(false),
@@ -1389,6 +2342,7 @@ impl Engine {
                 {
                     if let Some(id) = i["id"].as_i64() {
                         snap.items.insert((scene.to_string(), id), i["visible"].as_bool().unwrap_or(true));
+                        snap.item_locks.insert((scene.to_string(), id), i["locked"].as_bool().unwrap_or(false));
                     }
                 }
             }
@@ -1402,6 +2356,13 @@ impl Engine {
             program: program.clone(),
             studio_mode: preview.is_some(),
             preview: preview.clone(),
+            scenes: scenes["scenes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s["name"].as_str().map(String::from))
+                .collect(),
+            transition: transition_parts(&scenes),
             stream: stats["stream"]["active"].as_bool().unwrap_or(false),
             record: stats["record"]["active"].as_bool().unwrap_or(false),
             record_paused: stats["record"]["paused"].as_bool().unwrap_or(false),
@@ -1428,6 +2389,7 @@ impl Engine {
                 {
                     if let Some(id) = i["id"].as_i64() {
                         snap.items.insert((program.clone(), id), i["visible"].as_bool().unwrap_or(true));
+                        snap.item_locks.insert((program.clone(), id), i["locked"].as_bool().unwrap_or(false));
                     }
                 }
             }
@@ -1441,12 +2403,34 @@ fn ows_mutates(kind: &str) -> bool {
         kind,
         "SetCurrentProgramScene"
             | "SetCurrentPreviewScene"
+            | "CreateScene"
+            | "RemoveScene"
             | "SetStudioModeEnabled"
             | "TriggerStudioModeTransition"
+            | "SetCurrentSceneTransition"
+            | "SetCurrentSceneTransitionDuration"
+            | "SetCurrentSceneTransitionSettings"
+            | "SetTBarPosition"
+            | "SetCurrentSceneCollection"
+            | "CreateSceneCollection"
+            | "SetCurrentProfile"
+            | "SetInputSettings"
+            | "CreateInput"
+            | "SetInputName"
             | "SetInputMute"
             | "ToggleInputMute"
             | "SetInputVolume"
+            | "SetInputAudioMonitorType"
+            | "SetInputAudioSyncOffset"
+            | "SetInputAudioBalance"
+            | "SetInputAudioTracks"
+            | "CreateSceneItem"
+            | "RemoveSceneItem"
+            | "DuplicateSceneItem"
+            | "SetSceneItemTransform"
             | "SetSceneItemEnabled"
+            | "SetSceneItemLocked"
+            | "SetSceneItemIndex"
             | "StartStream"
             | "StopStream"
             | "ToggleStream"
@@ -1456,6 +2440,8 @@ fn ows_mutates(kind: &str) -> bool {
             | "PauseRecord"
             | "ResumeRecord"
             | "ToggleRecordPause"
+            | "SplitRecordFile"
+            | "CreateRecordChapter"
             | "StartReplayBuffer"
             | "StopReplayBuffer"
             | "ToggleReplayBuffer"
@@ -1463,7 +2449,13 @@ fn ows_mutates(kind: &str) -> bool {
             | "StartVirtualCam"
             | "StopVirtualCam"
             | "ToggleVirtualCam"
+            | "CreateSourceFilter"
+            | "RemoveSourceFilter"
             | "SetSourceFilterEnabled"
+            | "SetSourceFilterSettings"
+            | "SetSourceFilterIndex"
+            | "TriggerMediaInputAction"
+            | "SetMediaInputCursor"
     )
 }
 
@@ -1472,6 +2464,8 @@ fn ows_mutates(kind: &str) -> bool {
 struct Snap {
     program: String,
     preview: Option<String>,
+    scenes: Vec<String>,
+    transition: (String, u32),
     studio_mode: bool,
     stream: bool,
     record: bool,
@@ -1484,6 +2478,8 @@ struct Snap {
     inputs: BTreeMap<String, (bool, f64)>,
     /// (scene, item id) → shown, for program and Studio Mode preview scenes.
     items: BTreeMap<(String, i64), bool>,
+    /// (scene, item id) → locked.
+    item_locks: BTreeMap<(String, i64), bool>,
 }
 
 fn event(bit: u64, kind: &str, data: Value) -> (u64, String) {
@@ -1541,6 +2537,59 @@ fn diff(was: &Snap, is: &Snap) -> Vec<(u64, String)> {
             ));
         }
     }
+    for ((scene, id), locked) in &is.item_locks {
+        if was.item_locks.get(&(scene.clone(), *id)).is_some_and(|w| w != locked) {
+            out.push(event(
+                SUB_SCENE_ITEMS,
+                "SceneItemLockStateChanged",
+                json!({ "sceneName": scene, "sceneUuid": uuid_of(scene), "sceneItemId": id, "sceneItemLocked": locked }),
+            ));
+        }
+    }
+    if !was.scenes.is_empty() && !is.scenes.is_empty() && was.scenes != is.scenes {
+        for s in &is.scenes {
+            if !was.scenes.contains(s) {
+                out.push(event(
+                    SUB_SCENES,
+                    "SceneCreated",
+                    json!({ "sceneName": s, "sceneUuid": uuid_of(s), "isGroup": false }),
+                ));
+            }
+        }
+        for s in &was.scenes {
+            if !is.scenes.contains(s) {
+                out.push(event(
+                    SUB_SCENES,
+                    "SceneRemoved",
+                    json!({ "sceneName": s, "sceneUuid": uuid_of(s), "isGroup": false }),
+                ));
+            }
+        }
+        let scenes_list: Vec<Value> = is
+            .scenes
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, n)| json!({ "sceneIndex": i, "sceneName": n, "sceneUuid": uuid_of(n) }))
+            .collect();
+        out.push(event(SUB_SCENES, "SceneListChanged", json!({ "scenes": scenes_list })));
+    }
+    if !was.transition.0.is_empty() && !is.transition.0.is_empty() {
+        if was.transition.0 != is.transition.0 {
+            out.push(event(
+                SUB_TRANSITIONS,
+                "CurrentSceneTransitionChanged",
+                json!({ "transitionName": is.transition.0, "transitionUuid": uuid_of(&is.transition.0) }),
+            ));
+        }
+        if was.transition.1 != is.transition.1 {
+            out.push(event(
+                SUB_TRANSITIONS,
+                "CurrentSceneTransitionDurationChanged",
+                json!({ "transitionDuration": is.transition.1 }),
+            ));
+        }
+    }
     if was.stream != is.stream {
         out.push(output_event("StreamStateChanged", is.stream, json!({})));
     }
@@ -1587,6 +2636,93 @@ async fn close(ws: &mut Ws, code: u16, why: &str) {
     let _ = tokio::time::timeout(Duration::from_secs(2), ws.close(Some(frame))).await;
 }
 
+/// A source's settings as an obs-websocket client may read them: keys, passwords, tokens and
+/// the credentials or secret path parts of a URL are replaced (the same settings stay whole for
+/// the owner in the dashboard).
+fn redact_source_settings(v: &Value) -> Value {
+    const SECRET_KEY_PARTS: &[&str] = &["key", "password", "passwd", "secret", "token", "auth", "credential", "bearer"];
+    fn secret_key(k: &str) -> bool {
+        let k = k.to_ascii_lowercase();
+        SECRET_KEY_PARTS.iter().any(|p| k.contains(p))
+    }
+    fn scrub_text(s: &str) -> String {
+        let mut out = s.to_string();
+        // user:password@ in a URL.
+        if let Some(i) = out.find("://") {
+            let rest = &out[i + 3..];
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            if let Some(at) = rest[..end].rfind('@') {
+                out = format!("{}://{}", &out[..i], &rest[at + 1..]);
+            }
+        }
+        // ?token=…&… : the query's values go.
+        if let Some(q) = out.find('?') {
+            let (head, query) = out.split_at(q);
+            let kept: Vec<String> = query[1..]
+                .split('&')
+                .map(|p| match p.split_once('=') {
+                    Some((k, _)) if secret_key(k) => format!("{k}=***"),
+                    _ => p.to_string(),
+                })
+                .collect();
+            out = format!("{head}?{}", kept.join("&"));
+        }
+        // Overlay and invite links carry their secret in the path (…/o/<token>/…).
+        for marker in ["/o/", "/guest/", "/join/", "/invite/"] {
+            if let Some(i) = out.find(marker) {
+                let start = i + marker.len();
+                let end = out[start..].find(['/', '?', '#']).map_or(out.len(), |e| start + e);
+                out.replace_range(start..end, "***");
+            }
+        }
+        // rtmp://host/app/<key>: the last path part of a stream address.
+        if (out.starts_with("rtmp://") || out.starts_with("rtmps://"))
+            && out.matches('/').count() >= 4
+            && let Some(i) = out.rfind('/')
+        {
+            out.replace_range(i + 1.., "***");
+        }
+        out
+    }
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        if secret_key(k) && !v.is_object() && !v.is_array() {
+                            json!("***")
+                        } else {
+                            redact_source_settings(v)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(redact_source_settings).collect()),
+        Value::String(s) => Value::String(scrub_text(s)),
+        other => other.clone(),
+    }
+}
+
+/// Why settings for a new or changed source are refused over obs-websocket: a local file read
+/// through a URL or a text file switch (a picture of it could be read back with a screenshot).
+fn source_settings_problem(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(m) => {
+            if m.get("read_from_file").and_then(Value::as_bool) == Some(true) {
+                return Some("Reading a text source from a file isn't allowed from obs-websocket.".into());
+            }
+            m.values().find_map(source_settings_problem)
+        }
+        Value::Array(a) => a.iter().find_map(source_settings_problem),
+        Value::String(s) if s.trim_start().to_ascii_lowercase().starts_with("file:") => {
+            Some("file: addresses aren't allowed in a source's settings from obs-websocket.".into())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,6 +2737,36 @@ mod tests {
         // A client that knows the password gets the same answer as the server's.
         assert_eq!(client_auth(&a, &salt, "chal"), answer(&secret, "chal"));
         assert_ne!(client_auth("wrong", &salt, "chal"), answer(&secret, "chal"));
+    }
+
+    #[test]
+    fn input_settings_never_show_keys_passwords_tokens_or_credentials_in_urls() {
+        let v = json!({
+            "url": "https://u:pw@example.com/a?token=abc&x=1",
+            "stream_key": "live_123",
+            "password": "p",
+            "nested": { "api_key": "k", "auth_header": "Bearer zzz", "text": "hello" },
+            "overlay": "http://127.0.0.1:47820/o/abcdef123456/alerts",
+            "list": ["rtmp://h/app/KEY123", { "secret": "s" }],
+            "width": 1280
+        });
+        let out = redact_source_settings(&v).to_string();
+        for leaked in
+            ["u:pw", "token=abc", "live_123", "\"p\"", "\"k\"", "Bearer zzz", "abcdef123456", "KEY123", "\"s\""]
+        {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        // What isn't secret is kept.
+        assert!(out.contains("hello") && out.contains("1280") && out.contains("example.com"), "{out}");
+    }
+
+    #[test]
+    fn a_source_cannot_be_pointed_at_local_files_through_obs_websocket() {
+        assert!(source_settings_problem(&json!({ "url": "file:///etc/passwd" })).is_some());
+        assert!(source_settings_problem(&json!({ "a": { "b": "FILE:///x" } })).is_some());
+        assert!(source_settings_problem(&json!({ "read_from_file": true, "file": "/etc/hosts" })).is_some());
+        assert!(source_settings_problem(&json!({ "url": "https://example.com", "width": 100 })).is_none());
+        assert!(source_settings_problem(&json!({ "text": "hello", "read_from_file": false })).is_none());
     }
 
     #[test]
@@ -1673,9 +2839,27 @@ mod tests {
         preview: Option<String>,
         mic: (bool, f64),
         aux: (bool, f64),
+        mic_monitor: Monitor,
+        mic_sync_ms: i64,
+        mic_balance: f32,
+        mic_tracks: Vec<u8>,
         cam_visible: bool,
+        cam_locked: bool,
         preview_cam_visible: bool,
+        cam_transform: ItemTransform,
         filter_on: bool,
+        filters: Vec<(String, String, bool, Value)>,
+        transition: (String, u32),
+        transition_settings: Value,
+        tbar: f32,
+        input_settings: BTreeMap<String, Value>,
+        media_state: (String, i64, i64),
+        splits: usize,
+        chapters: Vec<String>,
+        collections: (String, Vec<(String, String)>),
+        profiles: (String, Vec<(String, String)>),
+        items_game: Vec<(i64, String, String, bool, bool)>,
+        next_item_id: i64,
         stream: bool,
         stream_secs: f64,
         record: bool,
@@ -1686,6 +2870,10 @@ mod tests {
         extra_scenes: Vec<String>,
         stats_calls: usize,
         acts: Vec<&'static str>,
+        /// Every SetTransform: (scene, item).
+        set_transforms: Vec<(String, i64)>,
+        /// Screenshots the Studio was asked to take.
+        shots: usize,
         drain: Option<(f64, f64)>,
         discarded: bool,
         slow_act_once: Option<Arc<tokio::sync::Notify>>,
@@ -1701,9 +2889,50 @@ mod tests {
                 preview: None,
                 mic: (false, 0.0),
                 aux: (false, -3.0),
+                mic_monitor: Monitor::Off,
+                mic_sync_ms: 0,
+                mic_balance: 0.5,
+                mic_tracks: vec![1, 2],
                 cam_visible: true,
+                cam_locked: false,
                 preview_cam_visible: true,
+                cam_transform: ItemTransform {
+                    x: 100.0,
+                    y: 50.0,
+                    rotation: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    alignment: 5,
+                    bounds: "none".into(),
+                    bounds_alignment: 0,
+                    bounds_width: 0.0,
+                    bounds_height: 0.0,
+                    crop_left: 0,
+                    crop_top: 0,
+                    crop_right: 0,
+                    crop_bottom: 0,
+                    width: 1920,
+                    height: 1080,
+                },
                 filter_on: true,
+                filters: vec![("Blur".into(), "blur".into(), true, json!({ "radius": 5 }))],
+                transition: ("fade_transition".into(), 300),
+                transition_settings: json!({}),
+                tbar: 0.0,
+                input_settings: BTreeMap::from([("Cam".into(), json!({ "device": "FaceTime HD" }))]),
+                media_state: ("playing".into(), 1200, 60000),
+                splits: 0,
+                chapters: Vec::new(),
+                collections: ("col-1".into(), vec![("col-1".into(), "Main".into()), ("col-2".into(), "IRL".into())]),
+                profiles: (
+                    "prof-1".into(),
+                    vec![("prof-1".into(), "1080p60".into()), ("prof-2".into(), "720p30".into())],
+                ),
+                items_game: vec![
+                    (7, "Cam".into(), "av_capture_input".into(), true, false),
+                    (8, "Logo".into(), "image_source".into(), true, false),
+                ],
+                next_item_id: 20,
                 stream: false,
                 stream_secs: 0.0,
                 record: false,
@@ -1714,6 +2943,8 @@ mod tests {
                 extra_scenes: Vec::new(),
                 stats_calls: 0,
                 acts: Vec::new(),
+                set_transforms: Vec::new(),
+                shots: 0,
                 drain: None,
                 discarded: false,
                 slow_act_once: None,
@@ -1745,7 +2976,17 @@ mod tests {
             Ok(StudioStatus::default())
         }
         async fn kinds(&self) -> Result<Value, String> {
-            Ok(json!({}))
+            Ok(json!({
+                "inputs": [
+                    { "id": "av_capture_input", "name": "Camera" },
+                    { "id": "image_source", "name": "Image" },
+                    { "id": "ffmpeg_source", "name": "Media Source" },
+                ],
+                "filters": [],
+                "transitions": [],
+                "encoders": [],
+                "outputs": [],
+            }))
         }
         async fn options(&self, _k: String) -> Result<Value, String> {
             Ok(json!([]))
@@ -1786,17 +3027,20 @@ mod tests {
         }
         async fn obsws_snapshot(&self) -> Option<Result<Value, String>> {
             Some(Ok(self.with(|s| {
+                let mut scenes = vec!["Game".to_string(), "BRB".to_string()];
+                scenes.extend(s.extra_scenes.iter().cloned());
                 let mut scene_items = Vec::new();
                 let program_items = if s.current == "BRB" {
                     json!([
-                        { "id": 7, "name": "Cam", "visible": s.cam_visible, "children": [] },
-                        { "id": 19, "name": "CamPreview", "visible": s.preview_cam_visible, "children": [] },
+                        { "id": 7, "name": "Cam", "visible": s.cam_visible, "locked": s.cam_locked, "children": [] },
+                        { "id": 19, "name": "CamPreview", "visible": s.preview_cam_visible, "locked": false, "children": [] },
                     ])
                 } else {
-                    json!([
-                        { "id": 7, "name": "Cam", "visible": s.cam_visible, "children": [] },
-                        { "id": 8, "name": "Logo", "visible": true, "children": [] },
-                    ])
+                    json!(s.items_game.iter().map(|(id, name, _, vis, locked)| {
+                        let visible = if *id == 7 { s.cam_visible } else { *vis };
+                        let lck = if *id == 7 { s.cam_locked } else { *locked };
+                        json!({ "id": id, "name": name, "visible": visible, "locked": lck, "children": [] })
+                    }).collect::<Vec<_>>())
                 };
                 scene_items.push(json!({ "scene": s.current, "items": program_items }));
                 if let Some(p) = &s.preview
@@ -1804,17 +3048,19 @@ mod tests {
                 {
                     let prev_items = if p == "BRB" {
                         json!([
-                            { "id": 7, "name": "Cam", "visible": s.cam_visible, "children": [] },
-                            { "id": 19, "name": "CamPreview", "visible": s.preview_cam_visible, "children": [] },
+                            { "id": 7, "name": "Cam", "visible": s.cam_visible, "locked": s.cam_locked, "children": [] },
+                            { "id": 19, "name": "CamPreview", "visible": s.preview_cam_visible, "locked": false, "children": [] },
                         ])
                     } else {
-                        json!([{ "id": 7, "name": "Cam", "visible": s.cam_visible, "children": [] }])
+                        json!([{ "id": 7, "name": "Cam", "visible": s.cam_visible, "locked": s.cam_locked, "children": [] }])
                     };
                     scene_items.push(json!({ "scene": p, "items": prev_items }));
                 }
                 json!({
                     "program": s.current,
                     "preview": s.preview,
+                    "scenes": scenes,
+                    "transition": { "kind": s.transition.0, "ms": s.transition.1 },
                     "stream": s.stream,
                     "record": { "active": s.record, "paused": s.paused, "file": "/r/a.mkv" },
                     "replay": { "active": s.replay, "last": s.replay_last },
@@ -1850,6 +3096,14 @@ mod tests {
             self.with(|s| s.paused = on);
             Ok(())
         }
+        async fn record_split(&self) -> Result<(), String> {
+            self.with(|s| s.splits += 1);
+            Ok(())
+        }
+        async fn record_chapter(&self, name: String) -> Result<(), String> {
+            self.with(|s| s.chapters.push(name));
+            Ok(())
+        }
         async fn replay(&self, on: bool) -> Result<Value, String> {
             self.with(|s| s.replay = on);
             Ok(json!({}))
@@ -1861,6 +3115,28 @@ mod tests {
         async fn virtual_camera(&self, on: bool, _s: Option<String>) -> Result<Value, String> {
             self.with(|s| s.vcam = on);
             Ok(json!({}))
+        }
+        async fn shelf(&self, kind: String, act: ShelfAct) -> Result<Value, String> {
+            self.with(|s| {
+                let target = if kind == "profiles" { &mut s.profiles } else { &mut s.collections };
+                Ok(match act {
+                    ShelfAct::List => json!({
+                        "current": target.0,
+                        "list": target.1.iter().map(|(id, name)| json!({ "id": id, "name": name })).collect::<Vec<_>>(),
+                    }),
+                    ShelfAct::New { name, .. } => {
+                        let id = format!("{kind}-{}", target.1.len() + 1);
+                        target.1.push((id.clone(), name));
+                        target.0 = id.clone();
+                        json!({ "id": id })
+                    }
+                    ShelfAct::Switch { id } => {
+                        target.0 = id;
+                        Value::Null
+                    }
+                    _ => Value::Null,
+                })
+            })
         }
         async fn act(&self, act: StudioAct) -> Result<Value, String> {
             let slow = self.with(|s| s.slow_act_once.take());
@@ -1886,9 +3162,32 @@ mod tests {
                             scenes.push(json!({ "name": name }));
                         }
                         json!({
-                            "scenes": scenes, "current": s.current,
+                            "scenes": scenes,
+                            "current": s.current,
                             "preview": s.preview,
+                            "transition": { "kind": s.transition.0, "ms": s.transition.1 },
                         })
+                    }
+                    StudioAct::AddScene { name, .. } => {
+                        s.extra_scenes.push(name);
+                        Value::Null
+                    }
+                    StudioAct::RemoveScene { scene } => {
+                        s.extra_scenes.retain(|n| n != &scene);
+                        Value::Null
+                    }
+                    StudioAct::SetTransition { kind, ms } => {
+                        s.transition = (kind, ms);
+                        Value::Null
+                    }
+                    StudioAct::TransitionSettings { .. } => s.transition_settings.clone(),
+                    StudioAct::SetTransitionSettings { settings, .. } => {
+                        s.transition_settings = settings;
+                        Value::Null
+                    }
+                    StudioAct::TBar { at, release } => {
+                        s.tbar = if release { 0.0 } else { at };
+                        json!({ "active": !release, "at": s.tbar })
                     }
                     StudioAct::SetCurrent { scene } => {
                         s.current = scene;
@@ -1912,17 +3211,86 @@ mod tests {
                         if scene == "BRB" {
                             json!([{ "id": 19, "name": "CamPreview", "kind": "av_capture_input", "visible": s.preview_cam_visible, "locked": false, "group": false, "children": [] }])
                         } else {
-                            json!([
-                                { "id": 7, "name": "Cam", "kind": "av_capture_input", "visible": s.cam_visible, "locked": false, "group": false, "children": [] },
-                                { "id": 8, "name": "Logo", "kind": "image_source", "visible": true, "locked": false, "group": false, "children": [] },
-                            ])
+                            json!(s.items_game.iter().map(|(id, name, kind, vis, locked)| {
+                                let visible = if *id == 7 { s.cam_visible } else { *vis };
+                                let lck = if *id == 7 { s.cam_locked } else { *locked };
+                                json!({ "id": id, "name": name, "kind": kind, "visible": visible, "locked": lck, "group": false, "children": [] })
+                            }).collect::<Vec<_>>())
                         }
                     }
+                    StudioAct::AddSource { source, .. } => {
+                        let id = s.next_item_id;
+                        s.next_item_id += 1;
+                        s.input_settings.insert(source.name.clone(), source.settings.clone());
+                        s.items_game.insert(0, (id, source.name, source.kind, true, false));
+                        json!({ "id": id })
+                    }
+                    StudioAct::AddExisting { name, .. } => {
+                        let id = s.next_item_id;
+                        s.next_item_id += 1;
+                        s.items_game.insert(0, (id, name, "av_capture_input".into(), true, false));
+                        json!({ "id": id })
+                    }
                     StudioAct::EditItem { id, edit, .. } => {
-                        if id == 19 {
-                            s.preview_cam_visible = matches!(edit, ItemEdit::Show);
-                        } else {
-                            s.cam_visible = matches!(edit, ItemEdit::Show);
+                        match edit {
+                            ItemEdit::Show | ItemEdit::Hide => {
+                                let on = matches!(edit, ItemEdit::Show);
+                                if id == 19 {
+                                    s.preview_cam_visible = on;
+                                } else {
+                                    if id == 7 { s.cam_visible = on; }
+                                    if let Some(item) = s.items_game.iter_mut().find(|i| i.0 == id) {
+                                        item.3 = on;
+                                    }
+                                }
+                            }
+                            ItemEdit::Lock | ItemEdit::Unlock => {
+                                let locked = matches!(edit, ItemEdit::Lock);
+                                if id == 7 { s.cam_locked = locked; }
+                                if let Some(item) = s.items_game.iter_mut().find(|i| i.0 == id) {
+                                    item.4 = locked;
+                                }
+                            }
+                            ItemEdit::Remove => {
+                                s.items_game.retain(|i| i.0 != id);
+                            }
+                            ItemEdit::Duplicate => {
+                                let new_id = s.next_item_id;
+                                s.next_item_id += 1;
+                                if let Some((_, name, kind, vis, locked)) = s.items_game.iter().find(|i| i.0 == id).cloned() {
+                                    s.items_game.insert(0, (new_id, name, kind, vis, locked));
+                                }
+                                return Ok(json!({ "id": new_id }));
+                            }
+                            _ => {}
+                        }
+                        Value::Null
+                    }
+                    StudioAct::ItemOrder { id, to, .. } => {
+                        if let Some(pos) = s.items_game.iter().position(|i| i.0 == id) {
+                            let item = s.items_game.remove(pos);
+                            let idx = to.min(s.items_game.len());
+                            s.items_game.insert(idx, item);
+                        }
+                        Value::Null
+                    }
+                    StudioAct::Transform { .. } => serde_json::to_value(&s.cam_transform).unwrap_or(Value::Null),
+                    StudioAct::SetTransform { scene, id, transform } => {
+                        s.set_transforms.push((scene, id));
+                        s.cam_transform = transform;
+                        Value::Null
+                    }
+                    StudioAct::Settings { name } => s.input_settings.get(&name).cloned().unwrap_or_else(|| json!({})),
+                    StudioAct::Update { name, settings } => {
+                        s.input_settings.insert(name, settings);
+                        Value::Null
+                    }
+                    StudioAct::Rename { name, new_name } => {
+                        if let Some(v) = s.input_settings.remove(&name) {
+                            s.input_settings.insert(new_name.clone(), v);
+                        }
+                        for item in &mut s.items_game {
+                            if item.1 == name { item.1 = new_name.clone(); }
                         }
                         Value::Null
                     }
@@ -1934,29 +3302,113 @@ mod tests {
                         }
                     }
                     StudioAct::AudioByName { name } => match name.as_str() {
-                        "Mic" => json!({ "name": "Mic", "muted": s.mic.0, "volume_db": s.mic.1 }),
+                        "Mic" => json!({
+                            "name": "Mic",
+                            "muted": s.mic.0,
+                            "volume_db": s.mic.1,
+                            "monitor": s.mic_monitor,
+                            "sync_ms": s.mic_sync_ms,
+                            "balance": s.mic_balance,
+                            "tracks": s.mic_tracks,
+                        }),
                         "Aux" => json!({ "name": "Aux", "muted": s.aux.0, "volume_db": s.aux.1 }),
                         other => return Err(format!("There's no source called \"{other}\".")),
                     },
                     StudioAct::SetAudio { name, change } => {
-                        let target = if name == "Aux" { &mut s.aux } else { &mut s.mic };
+                        let is_aux = name == "Aux";
+                        let target = if is_aux { &mut s.aux } else { &mut s.mic };
                         if let Some(m) = change.muted {
                             target.0 = m;
                         }
                         if let Some(v) = change.volume_db {
                             target.1 = f64::from(v);
                         }
+                        if !is_aux {
+                            if let Some(mon) = change.monitor { s.mic_monitor = mon; }
+                            if let Some(sync) = change.sync_ms { s.mic_sync_ms = sync; }
+                            if let Some(bal) = change.balance { s.mic_balance = bal; }
+                            if let Some(tr) = change.tracks { s.mic_tracks = tr; }
+                        }
                         Value::Null
                     }
-                    StudioAct::Sources => json!([
-                        { "name": "Mic", "kind": "coreaudio_input_capture", "scenes": ["Game"] },
-                        { "name": "Cam", "kind": "av_capture_input", "scenes": ["Game"] },
-                        { "name": "Aux", "kind": "coreaudio_input_capture", "scenes": [] },
-                    ]),
-                    StudioAct::Filters { .. } => json!([{ "name": "Blur", "kind": "blur", "enabled": s.filter_on }]),
-                    StudioAct::EditFilter { edit, .. } => {
-                        s.filter_on = matches!(edit, FilterEdit::Enable);
+                    StudioAct::Sources => {
+                        let mut out = vec![
+                            json!({ "name": "Mic", "kind": "coreaudio_input_capture", "scenes": ["Game"] }),
+                            json!({ "name": "Cam", "kind": "av_capture_input", "scenes": ["Game"] }),
+                            json!({ "name": "Aux", "kind": "coreaudio_input_capture", "scenes": [] }),
+                        ];
+                        for name in s.input_settings.keys() {
+                            if !matches!(name.as_str(), "Mic" | "Cam" | "Aux") {
+                                out.push(json!({ "name": name, "kind": "image_source", "scenes": ["Game"] }));
+                            }
+                        }
+                        json!(out)
+                    }
+                    StudioAct::Filters { .. } => json!(s.filters.iter().map(|(n, k, on, _)| {
+                        json!({ "name": n, "kind": k, "enabled": on })
+                    }).collect::<Vec<_>>()),
+                    StudioAct::FilterSettings { filter, .. } => s
+                        .filters
+                        .iter()
+                        .find(|f| f.0 == filter)
+                        .map(|f| f.3.clone())
+                        .unwrap_or_else(|| json!({})),
+                    StudioAct::AddFilter { filter, .. } => {
+                        s.filters.push((filter.name, filter.kind, true, filter.settings));
                         Value::Null
+                    }
+                    StudioAct::RemoveFilter { filter, .. } => {
+                        s.filters.retain(|f| f.0 != filter);
+                        Value::Null
+                    }
+                    StudioAct::UpdateFilter { filter, settings, .. } => {
+                        if let Some(f) = s.filters.iter_mut().find(|f| f.0 == filter) {
+                            f.3 = settings;
+                        }
+                        Value::Null
+                    }
+                    StudioAct::EditFilter { filter, edit, .. } => {
+                        if let Some(pos) = s.filters.iter().position(|f| f.0 == filter) {
+                            match edit {
+                                FilterEdit::Enable | FilterEdit::Disable => {
+                                    let on = matches!(edit, FilterEdit::Enable);
+                                    s.filters[pos].2 = on;
+                                    if filter == "Blur" { s.filter_on = on; }
+                                }
+                                FilterEdit::Top => {
+                                    let f = s.filters.remove(pos);
+                                    s.filters.insert(0, f);
+                                }
+                                FilterEdit::Bottom => {
+                                    let f = s.filters.remove(pos);
+                                    s.filters.push(f);
+                                }
+                                FilterEdit::Up if pos > 0 => s.filters.swap(pos, pos - 1),
+                                FilterEdit::Down if pos + 1 < s.filters.len() => s.filters.swap(pos, pos + 1),
+                                _ => {}
+                            }
+                        }
+                        Value::Null
+                    }
+                    StudioAct::Media { what, seek_ms, .. } => {
+                        if let Some(ms) = seek_ms {
+                            s.media_state.1 = ms;
+                        }
+                        if let Some(act) = what {
+                            s.media_state.0 = match act {
+                                MediaAct::Play => "playing".into(),
+                                MediaAct::Pause => "paused".into(),
+                                MediaAct::Stop => "stopped".into(),
+                                MediaAct::Restart => { s.media_state.1 = 0; "playing".into() }
+                                _ => "playing".into(),
+                            };
+                        }
+                        json!({ "state": s.media_state.0, "time_ms": s.media_state.1, "duration_ms": s.media_state.2 })
+                    }
+                    StudioAct::SourcePicture { .. } => json!({ "image": "data:image/png;base64,iVBORw0KGgo=", "width": 1920, "height": 1080 }),
+                    StudioAct::Screenshot { .. } => {
+                        s.shots += 1;
+                        json!({ "file": "/r/shot.png" })
                     }
                     _ => Value::Null,
                 })
@@ -2239,7 +3691,7 @@ mod tests {
         assert_eq!(c.event("CurrentProgramSceneChanged").await["sceneName"], "Game");
 
         // Requests this doesn't have: the protocol's "unknown request type", not a crash.
-        let unknown = c.req("CreateScene", json!({ "sceneName": "X" })).await;
+        let unknown = c.req("NotARealObsWsRequest", json!({})).await;
         assert_eq!(
             (unknown["requestStatus"]["result"].clone(), unknown["requestStatus"]["code"].clone()),
             (json!(false), json!(204))
@@ -2264,6 +3716,53 @@ mod tests {
         drop(c);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(e.obsws_view().await.clients, 0);
+    }
+
+    #[tokio::test]
+    async fn a_source_used_twice_is_found_by_its_offset_and_copies_keep_what_they_were() {
+        let (_e, fake, port, pw, _dir) = on().await;
+        let mut c = Client::open(port).await.unwrap();
+        c.identify(&pw, None).await;
+        // Cam (id 7) is used a second time, on top of the first.
+        let dup = c.req("DuplicateSceneItem", json!({ "sceneName": "Game", "sceneItemId": 7 })).await;
+        let top = dup["responseData"]["sceneItemId"].as_i64().unwrap();
+        let find = |offset: Option<i64>| {
+            let mut d = json!({ "sceneName": "Game", "sourceName": "Cam" });
+            if let Some(o) = offset {
+                d["searchOffset"] = json!(o);
+            }
+            d
+        };
+        // OBS searches from the bottom: no offset is the first, 1 skips one, -1 is the last (top).
+        assert_eq!(c.req("GetSceneItemId", find(None)).await["responseData"]["sceneItemId"], 7);
+        assert_eq!(c.req("GetSceneItemId", find(Some(0))).await["responseData"]["sceneItemId"], 7);
+        assert_eq!(c.req("GetSceneItemId", find(Some(1))).await["responseData"]["sceneItemId"], top);
+        assert_eq!(c.req("GetSceneItemId", find(Some(-1))).await["responseData"]["sceneItemId"], top);
+        assert_eq!(c.req("GetSceneItemId", find(Some(2))).await["requestStatus"]["code"], 600);
+        assert_eq!(c.req("GetSceneItemId", find(Some(-2))).await["requestStatus"]["code"], 402);
+        assert_eq!(c.req("GetSceneItemId", find(Some(1))).await["requestStatus"]["result"], true);
+        assert_eq!(
+            c.req("GetSceneItemId", json!({ "sceneName": "Game", "sourceName": "Cam", "searchOffset": "x" })).await["requestStatus"]
+                ["code"],
+            401
+        );
+
+        // A copy into another scene keeps the item's transform and whether it shows.
+        c.req("SetSceneItemEnabled", json!({ "sceneName": "Game", "sceneItemId": 7, "sceneItemEnabled": false })).await;
+        fake.with(|s| s.set_transforms.clear());
+        let to = c
+            .req("DuplicateSceneItem", json!({ "sceneName": "Game", "sceneItemId": 7, "destinationSceneName": "BRB" }))
+            .await;
+        let new_id = to["responseData"]["sceneItemId"].as_i64().unwrap();
+        assert_eq!(
+            fake.with(|s| s.set_transforms.clone()),
+            vec![("BRB".to_string(), new_id)],
+            "transform and crop copied"
+        );
+        assert!(
+            !fake.with(|s| s.items_game.iter().find(|i| i.0 == new_id).map(|i| i.3).unwrap()),
+            "hidden stays hidden"
+        );
     }
 
     #[tokio::test]
@@ -2606,5 +4105,239 @@ mod tests {
         }
         let map_len = e.inner.obsws.fails.lock().unwrap().len();
         assert!(map_len <= 1024, "fails IP table must be capped, got {map_len}");
+    }
+
+    #[tokio::test]
+    async fn extended_p3_developer_platform_requests_and_events() {
+        let (_e, fake, port, pw, _dir) = on().await;
+        let mut c = Client::open(port).await.unwrap();
+        c.identify(&pw, None).await;
+
+        // Scenes create / duplicate guard / remove + events
+        let created = c.req("CreateScene", json!({ "sceneName": "Outro" })).await;
+        assert_eq!(created["requestStatus"]["result"], true);
+        assert!(created["responseData"]["sceneUuid"].is_string());
+        assert_eq!(c.event("SceneCreated").await["sceneName"], "Outro");
+        assert_eq!(c.req("CreateScene", json!({ "sceneName": "Outro" })).await["requestStatus"]["code"], 702);
+        assert_eq!(c.req("RemoveScene", json!({ "sceneName": "Outro" })).await["requestStatus"]["result"], true);
+        assert_eq!(c.event("SceneRemoved").await["sceneName"], "Outro");
+
+        // Transitions & T-bar
+        assert!(
+            c.req("GetTransitionKindList", json!({})).await["responseData"]["transitionKinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "fade_transition")
+        );
+        assert_eq!(c.req("GetCurrentSceneTransition", json!({})).await["responseData"]["transitionDuration"], 300);
+        assert_eq!(
+            c.req("SetCurrentSceneTransition", json!({ "transitionName": "swipe_transition" })).await["requestStatus"]
+                ["result"],
+            true
+        );
+        assert_eq!(c.event("CurrentSceneTransitionChanged").await["transitionName"], "swipe_transition");
+        assert_eq!(
+            c.req("SetCurrentSceneTransitionDuration", json!({ "transitionDuration": 650 })).await["requestStatus"]["result"],
+            true
+        );
+        assert_eq!(c.event("CurrentSceneTransitionDurationChanged").await["transitionDuration"], 650);
+        assert_eq!(
+            c.req("SetCurrentSceneTransitionSettings", json!({ "transitionSettings": { "direction": "left" } })).await
+                ["requestStatus"]["result"],
+            true
+        );
+        assert_eq!(
+            c.req("SetTBarPosition", json!({ "position": 0.45, "release": false })).await["requestStatus"]["result"],
+            true
+        );
+        assert!((fake.with(|s| s.tbar) - 0.45).abs() < 1e-4);
+        assert_eq!(c.req("SetTBarPosition", json!({ "position": 2.0 })).await["requestStatus"]["code"], 402);
+
+        // Collections, profiles & hotkeys
+        let cols = c.req("GetSceneCollectionList", json!({})).await;
+        assert_eq!(cols["responseData"]["currentSceneCollectionName"], "Main");
+        c.req("CreateSceneCollection", json!({ "sceneCollectionName": "Podcast" })).await;
+        c.req("SetCurrentSceneCollection", json!({ "sceneCollectionName": "IRL" })).await;
+        assert_eq!(
+            c.req("GetSceneCollectionList", json!({})).await["responseData"]["currentSceneCollectionName"],
+            "IRL"
+        );
+        c.req("SetCurrentProfile", json!({ "profileName": "720p30" })).await;
+        assert_eq!(c.req("GetProfileList", json!({})).await["responseData"]["currentProfileName"], "720p30");
+        assert!(
+            c.req("GetHotkeyList", json!({})).await["responseData"]["hotkeys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|h| h == "go_live")
+        );
+
+        // Scene item transform, lock, index, create, duplicate, remove
+        let tf = c.req("GetSceneItemTransform", json!({ "sceneName": "Game", "sceneItemId": 7 })).await;
+        assert_eq!(tf["responseData"]["sceneItemTransform"]["positionX"], 100.0);
+        assert_eq!(
+            c.req(
+                "SetSceneItemTransform",
+                json!({ "sceneName": "Game", "sceneItemId": 7, "sceneItemTransform": { "positionX": 220.0, "boundsType": "OBS_BOUNDS_SCALE_INNER" } })
+            )
+            .await["requestStatus"]["result"],
+            true
+        );
+        assert_eq!(fake.with(|s| s.cam_transform.x), 220.0);
+        assert_eq!(fake.with(|s| s.cam_transform.bounds.clone()), "fit");
+        c.req("SetSceneItemLocked", json!({ "sceneName": "Game", "sceneItemId": 7, "sceneItemLocked": true })).await;
+        assert_eq!(c.event("SceneItemLockStateChanged").await["sceneItemLocked"], true);
+        assert_eq!(
+            c.req("GetSceneItemLocked", json!({ "sceneName": "Game", "sceneItemId": 7 })).await["responseData"]["sceneItemLocked"],
+            true
+        );
+        c.req("SetSceneItemIndex", json!({ "sceneName": "Game", "sceneItemId": 7, "sceneItemIndex": 0 })).await;
+        assert_eq!(
+            c.req("GetSceneItemIndex", json!({ "sceneName": "Game", "sceneItemId": 7 })).await["responseData"]["sceneItemIndex"],
+            0
+        );
+        let dup = c.req("DuplicateSceneItem", json!({ "sceneName": "Game", "sceneItemId": 7 })).await;
+        let dup_id = dup["responseData"]["sceneItemId"].as_i64().unwrap();
+        assert_ne!(dup_id, 7);
+        assert_eq!(
+            c.req("RemoveSceneItem", json!({ "sceneName": "Game", "sceneItemId": dup_id })).await["requestStatus"]["result"],
+            true
+        );
+
+        // Inputs, settings, audio monitor/sync/balance/tracks
+        assert!(
+            c.req("GetInputKindList", json!({})).await["responseData"]["inputKinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k == "av_capture_input")
+        );
+        let ci = c
+            .req(
+                "CreateInput",
+                json!({ "sceneName": "Game", "inputName": "Banner", "inputKind": "image_source", "inputSettings": { "file": "/a.png" }, "sceneItemEnabled": false }),
+            )
+            .await;
+        assert_eq!(ci["requestStatus"]["result"], true);
+        let banner_id = ci["responseData"]["sceneItemId"].as_i64().unwrap();
+        assert_eq!(
+            c.req("GetInputSettings", json!({ "inputName": "Banner" })).await["responseData"]["inputSettings"]["file"],
+            "/a.png"
+        );
+        c.req("SetInputSettings", json!({ "inputName": "Banner", "inputSettings": { "file": "/b.png" } })).await;
+        c.req("SetInputName", json!({ "inputName": "Banner", "newInputName": "LogoBanner" })).await;
+        c.req("RemoveSceneItem", json!({ "sceneName": "Game", "sceneItemId": banner_id })).await;
+
+        c.req(
+            "SetInputAudioMonitorType",
+            json!({ "inputName": "Mic", "monitorType": "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT" }),
+        )
+        .await;
+        assert_eq!(
+            c.req("GetInputAudioMonitorType", json!({ "inputName": "Mic" })).await["responseData"]["monitorType"],
+            "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT"
+        );
+        // obs-websocket 5.5.4 speaks milliseconds both ways.
+        c.req("SetInputAudioSyncOffset", json!({ "inputName": "Mic", "inputAudioSyncOffset": 250 })).await;
+        assert_eq!(fake.with(|s| s.mic_sync_ms), 250, "the Studio's own offset is the milliseconds sent");
+        assert_eq!(
+            c.req("GetInputAudioSyncOffset", json!({ "inputName": "Mic" })).await["responseData"]["inputAudioSyncOffset"],
+            250
+        );
+        for bad in [20_001, -951] {
+            assert_eq!(
+                c.req("SetInputAudioSyncOffset", json!({ "inputName": "Mic", "inputAudioSyncOffset": bad })).await["requestStatus"]
+                    ["code"],
+                402
+            );
+        }
+        c.req("SetInputAudioBalance", json!({ "inputName": "Mic", "inputAudioBalance": 0.75 })).await;
+        assert_eq!(
+            c.req("GetInputAudioBalance", json!({ "inputName": "Mic" })).await["responseData"]["inputAudioBalance"],
+            0.75
+        );
+        c.req(
+            "SetInputAudioTracks",
+            json!({ "inputName": "Mic", "inputAudioTracks": { "1": true, "2": false, "3": true } }),
+        )
+        .await;
+        assert_eq!(
+            c.req("GetInputAudioTracks", json!({ "inputName": "Mic" })).await["responseData"]["inputAudioTracks"]["3"],
+            true
+        );
+
+        // Filters CRUD & index
+        c.req("CreateSourceFilter", json!({ "sourceName": "Cam", "filterName": "Color", "filterKind": "color_filter", "filterSettings": { "gamma": 1.2 } })).await;
+        assert_eq!(
+            c.req("GetSourceFilter", json!({ "sourceName": "Cam", "filterName": "Color" })).await["responseData"]["filterSettings"]
+                ["gamma"],
+            1.2
+        );
+        c.req(
+            "SetSourceFilterSettings",
+            json!({ "sourceName": "Cam", "filterName": "Color", "filterSettings": { "gamma": 1.5 } }),
+        )
+        .await;
+        c.req("SetSourceFilterIndex", json!({ "sourceName": "Cam", "filterName": "Color", "filterIndex": 0 })).await;
+        assert_eq!(
+            c.req("GetSourceFilter", json!({ "sourceName": "Cam", "filterName": "Color" })).await["responseData"]["filterIndex"],
+            0
+        );
+        assert_eq!(
+            c.req("RemoveSourceFilter", json!({ "sourceName": "Cam", "filterName": "Color" })).await["requestStatus"]["result"],
+            true
+        );
+
+        // Media, screenshots & recording split/chapters
+        assert_eq!(
+            c.req("GetMediaInputStatus", json!({ "inputName": "Cam" })).await["responseData"]["mediaState"],
+            "OBS_MEDIA_STATE_PLAYING"
+        );
+        c.req(
+            "TriggerMediaInputAction",
+            json!({ "inputName": "Cam", "mediaAction": "OBS_WEBSOCKET_MEDIA_INPUT_ACTION_PAUSE" }),
+        )
+        .await;
+        c.req("SetMediaInputCursor", json!({ "inputName": "Cam", "mediaCursor": 5000 })).await;
+        let ms = c.req("GetMediaInputStatus", json!({ "inputName": "Cam" })).await;
+        assert_eq!(
+            (ms["responseData"]["mediaState"].clone(), ms["responseData"]["mediaCursor"].clone()),
+            (json!("OBS_MEDIA_STATE_PAUSED"), json!(5000))
+        );
+        assert!(
+            c.req("GetSourceScreenshot", json!({ "sourceName": "Cam", "imageFormat": "png" })).await["responseData"]["imageData"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        // A file path from a client is never written to: said, not pretended.
+        let saved = c
+            .req(
+                "SaveSourceScreenshot",
+                json!({ "sourceName": "Cam", "imageFormat": "png", "imageFilePath": "/tmp/x.png" }),
+            )
+            .await;
+        assert_eq!(
+            (saved["requestStatus"]["result"].clone(), saved["requestStatus"]["code"].clone()),
+            (json!(false), json!(702))
+        );
+        assert!(saved["requestStatus"]["comment"].as_str().unwrap().contains("imageFilePath"), "{saved}");
+        assert_eq!(fake.with(|s| s.shots), 0, "nothing was saved anywhere");
+        assert_eq!(
+            c.req("SaveSourceScreenshot", json!({ "sourceName": "Cam", "imageFormat": "png" })).await["requestStatus"]
+                ["code"],
+            300,
+            "the path is a required field"
+        );
+
+        assert_eq!(c.req("SplitRecordFile", json!({})).await["requestStatus"]["code"], 501);
+        c.req("StartRecord", json!({})).await;
+        assert_eq!(c.req("SplitRecordFile", json!({})).await["requestStatus"]["result"], true);
+        assert_eq!(
+            c.req("CreateRecordChapter", json!({ "chapterName": "Boss Fight" })).await["requestStatus"]["result"],
+            true
+        );
+        assert_eq!(fake.with(|s| (s.splits, s.chapters.clone())), (1, vec!["Boss Fight".to_string()]));
     }
 }
