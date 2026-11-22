@@ -9,7 +9,7 @@ fn arg_strs(a: &[OsString]) -> Vec<String> {
 }
 
 fn piece(name: &str, ms: u64, audio: bool) -> Piece {
-    Piece { path: PathBuf::from(name), duration_ms: ms, has_audio: audio }
+    Piece { path: PathBuf::from(name), duration_ms: ms, has_audio: audio, fps: 30 }
 }
 
 #[test]
@@ -555,4 +555,30 @@ fn the_burn_works_in_a_private_folder_made_new() {
     let p = a.path().to_path_buf();
     drop(a);
     assert!(!p.exists(), "the folder outlived its owner");
+}
+
+/// Background encodes leave room for a live stream, and a 60 fps clip stays 60 fps.
+#[test]
+fn encodes_are_capped_to_two_threads_and_keep_the_clips_frame_rate() {
+    let part = Path::new("o.part");
+    let has_threads = |a: &[OsString]| {
+        let s = arg_strs(a);
+        s.windows(2).any(|w| w[0] == "-threads" && w[1] == "2")
+    };
+    assert!(has_threads(&trim_args(Path::new("a.mp4"), 0, 1000, true, part)), "precise trim");
+    assert!(has_threads(&burn_args(Path::new("a.mp4"), "subs.srt", part)), "burn");
+    let mut p60 = piece("a.mp4", 5000, true);
+    p60.fps = 60;
+    let (args, _) = compile_args(&[p60.clone(), piece("b.mp4", 5000, true)], 1280, 720, 0.5, false, part);
+    assert!(has_threads(&args), "compile");
+    let graph = arg_strs(&args).join(" ");
+    assert!(graph.contains("fps=60") && !graph.contains("fps=30"), "{graph}");
+    let (args30, _) =
+        compile_args(&[piece("a.mp4", 5000, true), piece("b.mp4", 5000, true)], 1280, 720, 0.5, false, part);
+    assert!(arg_strs(&args30).join(" ").contains("fps=30"));
+    // The probe reads the rate.
+    let p = crate::clips::parse_probe(
+        "  Stream #0:0: Video: h264, yuv420p, 1920x1080 [SAR 1:1 DAR 16:9], 59.94 fps, 60 tbr, 90k tbn",
+    );
+    assert_eq!(p.fps.map(|f| f.round() as u32), Some(60));
 }

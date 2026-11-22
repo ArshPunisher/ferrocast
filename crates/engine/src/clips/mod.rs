@@ -70,13 +70,15 @@ pub struct ClipsOverview {
 }
 
 /// What ffmpeg says about a file.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Probe {
     pub duration_ms: Option<u64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub has_audio: bool,
     pub has_video: bool,
+    /// Frames a second of the picture, when the line says (`59.94 fps`).
+    pub fps: Option<f32>,
 }
 
 /// A file the OS wouldn't let us rename, write or read: said with a next step (never a bare 500).
@@ -377,6 +379,14 @@ pub fn parse_probe(stderr: &str) -> Probe {
         } else if l.contains("Video:") && l.contains("Stream #") && !l.contains("attached pic") {
             p.has_video = true;
             // "…, 1920x1080 [SAR 1:1 DAR 16:9], 30 fps…": the first WxH.
+            let parts: Vec<&str> = l.split([' ', ',']).filter(|t| !t.is_empty()).collect();
+            if let Some(at) = parts.iter().position(|t| *t == "fps")
+                && at > 0
+                && let Ok(f) = parts[at - 1].parse::<f32>()
+                && f > 0.0
+            {
+                p.fps = Some(f);
+            }
             for tok in l.split([' ', ',']) {
                 if let Some((w, h)) = tok.split_once('x')
                     && let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>())

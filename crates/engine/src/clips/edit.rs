@@ -78,7 +78,7 @@ pub fn trim_args(input: &Path, start_ms: u64, len_ms: u64, precise: bool, part: 
     if precise {
         a.extend(os(&[
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a",
-            "192k",
+            "192k", "-threads", "2",
         ]));
     } else {
         // The first picture and every sound: other streams (subtitles, data) don't go into an .mp4.
@@ -95,15 +95,18 @@ pub struct Piece {
     pub path: PathBuf,
     pub duration_ms: u64,
     pub has_audio: bool,
+    /// Frames a second the compilation keeps (the first clip's, 24 to 60).
+    pub fps: u32,
 }
 
 /// The filter graph and total length (ms) of a compilation at `w`×`h`.
 pub fn compile_graph(pieces: &[Piece], w: u32, h: u32, fade_s: f32, normalize: bool) -> (String, u64) {
     let n = pieces.len();
+    let fps = pieces.first().map_or(30, |p| p.fps.clamp(24, 60));
     let mut g = String::new();
     for (i, p) in pieces.iter().enumerate() {
         g += &format!(
-            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v{i}];"
+            "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p,setpts=PTS-STARTPTS[v{i}];"
         );
         if p.has_audio {
             // Padded and cut to the picture's length, so each sound ends where its picture does and
@@ -169,6 +172,8 @@ pub fn compile_args(
     args.extend(os(&["-filter_complex"]));
     args.push(graph.into());
     args.extend(os(&["-map", v, "-map", a]));
+    // Two threads: a background encode mustn't starve a live stream of CPU.
+    args.extend(os(&["-threads", "2"]));
     args.extend(os(&[
         "-c:v",
         "libx264",
@@ -294,6 +299,7 @@ pub fn burn_args(input: &Path, subs: &str, part: &Path) -> Vec<OsString> {
     let style = "FontName=Helvetica,Fontsize=18,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=24";
     a.push("-vf".into());
     a.push(format!("subtitles={subs}:force_style='{style}'").into());
+    a.extend(os(&["-threads", "2"]));
     a.extend(os(&[
         "-c:v",
         "libx264",
@@ -405,7 +411,12 @@ impl Engine {
             if size.is_none() {
                 size = p.width.zip(p.height);
             }
-            pieces.push(Piece { path, duration_ms: d, has_audio: p.has_audio });
+            pieces.push(Piece {
+                path,
+                duration_ms: d,
+                has_audio: p.has_audio,
+                fps: p.fps.unwrap_or(30.0).round() as u32,
+            });
         }
         // The first clip's size (even numbers, none under 16): the others are fitted inside it.
         let (w, h) = size.map(|(w, h)| (w.clamp(16, 7680) & !1, h.clamp(16, 4320) & !1)).unwrap_or((1920, 1080));
