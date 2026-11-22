@@ -599,7 +599,8 @@ impl Engine {
                     if let Some(m) = st.session.tips.iter_mut().find(|m| m.currency == money.currency) {
                         m.minor = m.minor.saturating_sub(money.minor).max(0);
                     }
-                    st.session.credits.reverse_tip(original.platform, actor, money)
+                    // Only a live payment was ever credited (backfills are not).
+                    original.origin == Origin::Live && st.session.credits.reverse_tip(original.platform, actor, money)
                 } else {
                     false
                 }

@@ -273,15 +273,15 @@ impl Credits {
 
 pub fn build_credits(events: &[Event], started_at: Option<Millis>) -> Credits {
     let mut credits = Credits::new(started_at);
-    let reversed: std::collections::HashSet<&str> = events
+    let reversed: std::collections::HashSet<(Platform, &str)> = events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::Reversal { original_source_id, .. } => Some(original_source_id.as_str()),
+            EventKind::Reversal { original_source_id, .. } => Some((e.platform, original_source_id.as_str())),
             _ => None,
         })
         .collect();
     for event in events {
-        if event.source_id.as_deref().is_some_and(|s| reversed.contains(s)) {
+        if event.source_id.as_deref().is_some_and(|s| reversed.contains(&(event.platform, s))) {
             continue;
         }
         if let Some(start) = started_at
@@ -549,6 +549,21 @@ mod tests {
         assert!(live.reverse_tip(Platform::Tips, &a, &Money::new(500, "INR")));
         assert!(live.tippers.iter().all(|t| t.name != "Scammer"), "a zeroed donor leaves the credits");
         assert!(!live.reverse_tip(Platform::Tips, &a, &Money::new(500, "INR")), "nothing left to take back");
+    }
+
+    #[test]
+    fn a_reversal_only_removes_the_payment_on_its_own_platform() {
+        let mut twitch_follow_same_id =
+            ev(Platform::Twitch, 5, EventKind::Follow { actor: actor(Platform::Twitch, "SameId", Roles::empty()) });
+        twitch_follow_same_id.source_id = Some("pay-1".into());
+        let reversal = ev(
+            Platform::Tips,
+            20,
+            EventKind::Reversal { original_source_id: "pay-1".into(), reason: crate::event::ReversalReason::Refund },
+        );
+        let built = build_credits(&[twitch_follow_same_id, tip("pay-1", "Refunded", 100), reversal], None);
+        assert_eq!(built.followers.len(), 1, "the Twitch follow with the same id stays");
+        assert!(built.tippers.is_empty());
     }
 
     #[test]
