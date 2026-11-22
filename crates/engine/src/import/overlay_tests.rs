@@ -1318,3 +1318,41 @@ fn entries_that_collide_or_aren_t_plain_files_are_refused() {
         );
     }
 }
+
+// ---- Neon review M2: a failed copy leaves nothing behind; removing never follows links --------
+
+fn asset(rel: &str, bytes: &[u8]) -> crate::import::overlay_parse::UnpackedAsset {
+    crate::import::overlay_parse::UnpackedAsset {
+        rel_path: rel.into(),
+        bytes: bytes.to_vec(),
+        kind: crate::import::overlay_parse::EntryKind::Image,
+    }
+}
+
+#[test]
+fn a_copy_that_fails_halfway_removes_what_it_wrote() {
+    let dir = tempfile::tempdir().unwrap();
+    let pack = dir.path().join("studio").join("packs").join("p1");
+    // `a` is written as a file, then `a/b` can't be (its folder is a file).
+    let res = copy_pack_assets(&pack, vec![asset("assets/ok.png", b"1"), asset("a", b"2"), asset("a/b", b"3")]);
+    assert!(res.is_err());
+    assert!(!pack.exists(), "the half-written pack folder is gone");
+}
+
+#[cfg(unix)]
+#[test]
+fn removing_a_pack_never_follows_a_link_out_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.txt"), b"mine").unwrap();
+    let pack = dir.path().join("pack");
+    std::fs::create_dir_all(pack.join("sub")).unwrap();
+    std::fs::write(pack.join("sub").join("f.png"), b"x").unwrap();
+    std::os::unix::fs::symlink(&outside, pack.join("loop")).unwrap();
+    std::os::unix::fs::symlink(&pack, pack.join("sub").join("up")).unwrap();
+    let n = count_and_remove_dir(&pack);
+    assert_eq!(n, 3, "the file and the two links, not what they point at");
+    assert!(!pack.exists());
+    assert!(outside.join("keep.txt").exists(), "what the link pointed at is untouched");
+}

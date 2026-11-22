@@ -184,21 +184,58 @@ fn sanitize_pack_dest(pack_dir: &Path, rel_path: &str) -> Option<PathBuf> {
     if p.starts_with(pack_dir) { Some(p) } else { None }
 }
 
+/// Writes a pack's files under `pack_dir`; on any failure what was written is removed, so a
+/// failed import leaves no half-made folder behind. Returns each file's path, and the count and
+/// size of the media.
+fn copy_pack_assets(
+    pack_dir: &Path,
+    assets: Vec<super::overlay_parse::UnpackedAsset>,
+) -> Result<(Vec<String>, usize, u64), EngineError> {
+    let copy = || -> Result<(Vec<String>, usize, u64), EngineError> {
+        let mut out_paths = Vec::with_capacity(assets.len());
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        for asset in &assets {
+            let Some(dest) = sanitize_pack_dest(pack_dir, &asset.rel_path) else {
+                return Err(EngineError::Internal("Rejected unsafe destination path.".into()));
+            };
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| EngineError::Internal(format!("Couldn't prepare pack folder: {e}")))?;
+            }
+            std::fs::write(&dest, &asset.bytes)
+                .map_err(|e| EngineError::Internal(format!("Couldn't copy media \"{}\": {e}", asset.rel_path)))?;
+            if asset.kind.is_media() {
+                count += 1;
+                bytes += asset.bytes.len() as u64;
+            }
+            out_paths.push(dest.display().to_string());
+        }
+        Ok((out_paths, count, bytes))
+    };
+    let res = copy();
+    if res.is_err() {
+        let _ = count_and_remove_dir(pack_dir);
+    }
+    res
+}
+
+/// Removes `dir` and says how many files were in it. Links are counted and removed as links:
+/// what they point at is never walked into or deleted.
 fn count_and_remove_dir(dir: &Path) -> usize {
     fn walk_count(p: &Path) -> usize {
         let Ok(rd) = std::fs::read_dir(p) else { return 0 };
         let mut n = 0;
         for entry in rd.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                n += walk_count(&path);
-            } else {
-                n += 1;
+            // `file_type` doesn't follow a link, so a link to a folder is one file, not a folder.
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => n += walk_count(&entry.path()),
+                _ => n += 1,
             }
         }
         n
     }
-    if !dir.is_dir() {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
         return 0;
     }
     let files = walk_count(dir);
@@ -294,31 +331,9 @@ impl Engine {
         let assets = std::mem::take(&mut parsed.assets);
         let pack_dir_for_copy = pack_dir.clone();
         let (asset_paths, media_copied, media_bytes) =
-            tokio::task::spawn_blocking(move || -> Result<(Vec<String>, usize, u64), EngineError> {
-                let mut out_paths = Vec::with_capacity(assets.len());
-                let mut count = 0usize;
-                let mut bytes = 0u64;
-                for asset in assets {
-                    let Some(dest) = sanitize_pack_dest(&pack_dir_for_copy, &asset.rel_path) else {
-                        return Err(EngineError::Internal("Rejected unsafe destination path.".into()));
-                    };
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| EngineError::Internal(format!("Couldn't prepare pack folder: {e}")))?;
-                    }
-                    std::fs::write(&dest, &asset.bytes).map_err(|e| {
-                        EngineError::Internal(format!("Couldn't copy media \"{}\": {e}", asset.rel_path))
-                    })?;
-                    if asset.kind.is_media() {
-                        count += 1;
-                        bytes += asset.bytes.len() as u64;
-                    }
-                    out_paths.push(dest.display().to_string());
-                }
-                Ok((out_paths, count, bytes))
-            })
-            .await
-            .map_err(|e| EngineError::Internal(e.to_string()))??;
+            tokio::task::spawn_blocking(move || copy_pack_assets(&pack_dir_for_copy, assets))
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))??;
 
         // 2. Resolve & install missing fonts solely from Google Fonts into `<data>/fonts/`.
         let installed = tokio::task::spawn_blocking(ferrocore::fonts::installed_system_font_families)
