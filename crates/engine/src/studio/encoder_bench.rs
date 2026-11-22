@@ -331,6 +331,7 @@ struct AppliedInner {
     snapshot: StudioSettings,
     summary: AppliedSummary,
     confirmed: bool,
+    rolling_back: bool,
     applied_mono: Instant,
     confirm_deadline: Instant,
     watch_window: Duration,
@@ -1998,6 +1999,9 @@ impl Engine {
             return Err(EngineError::Invalid("encoder: hardware or software.".into()));
         }
 
+        self.flush_pending_startup_restore_to_host().await;
+        let _op = self.studio().auto_config_op.lock().await;
+
         let (mode, picked, candidates, upload_check, duration_ms, timing, existing_unconfirmed_snap) = {
             self.ensure_no_benchmark_running()?;
             let slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
@@ -2103,6 +2107,7 @@ impl Engine {
                 snapshot,
                 summary,
                 confirmed: false,
+                rolling_back: false,
                 applied_mono: now_t,
                 confirm_deadline: now_t + timing.confirm_timeout,
                 watch_window: timing.watch_window,
@@ -2138,6 +2143,9 @@ impl Engine {
         let MachineState::Applied(a) = &mut slot.state else {
             return Err(EngineError::Conflict("There are no newly applied settings waiting to be kept.".into()));
         };
+        if a.rolling_back {
+            return Err(EngineError::Conflict("Settings rollback is already in progress.".into()));
+        }
         let was_offered = a.rollback_offered;
         a.confirmed = true;
         a.pending_offer = None;
@@ -2186,15 +2194,22 @@ impl Engine {
         reason: String,
     ) -> Result<AutoConfigView, EngineError> {
         let (snapshot, mode, candidates, upload_check, picked, duration_ms, restored) = {
-            let slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+            let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(id) = expected_watch_id
                 && slot.seq != id
             {
                 return Err(EngineError::Conflict("Rollback generation changed.".into()));
             }
-            let MachineState::Applied(a) = &slot.state else {
+            let MachineState::Applied(a) = &mut slot.state else {
                 return Err(EngineError::Conflict("There are no applied settings to undo.".into()));
             };
+            if trigger == RollbackTrigger::Timeout && a.confirmed {
+                return Err(EngineError::Conflict("Settings were already confirmed by Keep.".into()));
+            }
+            if a.rolling_back {
+                return Err(EngineError::Conflict("Rollback already in progress.".into()));
+            }
+            a.rolling_back = true;
             (
                 OutputSnapshot::from_settings(&a.snapshot),
                 a.mode,
@@ -2206,11 +2221,32 @@ impl Engine {
             )
         };
 
-        let host = self.studio_host()?;
+        let clear_rolling_back = || {
+            let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+            if expected_watch_id.is_none_or(|id| slot.seq == id)
+                && let MachineState::Applied(a) = &mut slot.state
+            {
+                a.rolling_back = false;
+            }
+        };
+
+        let host = match self.studio_host() {
+            Ok(h) => h,
+            Err(e) => {
+                clear_rolling_back();
+                return Err(e);
+            }
+        };
         let mut merged = host.settings().await;
         snapshot.apply_to(&mut merged);
-        merged.check()?;
-        self.studio_set_settings_inner(merged, true).await?;
+        if let Err(e) = merged.check() {
+            clear_rolling_back();
+            return Err(e);
+        }
+        if let Err(e) = self.studio_set_settings_inner(merged, true).await {
+            clear_rolling_back();
+            return Err(e);
+        }
         ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
 
         let view = {
@@ -2514,6 +2550,7 @@ impl Engine {
                     return;
                 }
                 LoopStep::TimeoutOffline => {
+                    let _op = self.studio().auto_config_op.lock().await;
                     if let Err(e) = self
                         .rollback_now(
                             Some(watch_id),
@@ -2522,6 +2559,9 @@ impl Engine {
                         )
                         .await
                     {
+                        if self.auto_config_status().confirmed {
+                            continue;
+                        }
                         tracing::warn!(error = %e, "auto-config timeout rollback failed");
                     }
                     return;
@@ -3700,5 +3740,72 @@ mod tests {
             4500,
             "30s timeout must not overwrite user's manual output edit"
         );
+    }
+
+    #[tokio::test]
+    async fn h7_second_apply_and_timeout_vs_keep_race_stay_consistent() {
+        let (engine, host, _dir) = test_engine().await;
+        {
+            let mut s = host.settings.lock().unwrap();
+            s.encoder = "software".into();
+            s.fps = 30;
+            s.video_kbps = 3500;
+        }
+
+        // 1. Second unconfirmed apply while already Applied must preserve original 3500 snapshot.
+        engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(7200),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine.auto_config_undo().await.unwrap();
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 3500);
+
+        // 2. Race Keep against an in-flight Timeout rollback paused inside `host.settings()`.
+        engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6400),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *host.settings_barrier.lock().unwrap() = Some(barrier.clone());
+
+        // Let the confirm_timeout (180 ms in fast_test) expire so TimeoutOffline enters `host.settings()`.
+        tokio::time::sleep(Duration::from_millis(240)).await;
+
+        let keep_res = engine.auto_config_keep();
+        *host.settings_barrier.lock().unwrap() = None;
+        barrier.wait().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let st = engine.auto_config_status();
+        if keep_res.is_ok() {
+            assert_ne!(
+                st.state,
+                AutoConfigStateKind::RolledBack,
+                "Keep succeeded so Timeout must not roll back or report RolledBack"
+            );
+            assert_eq!(host.settings.lock().unwrap().video_kbps, 6400);
+        } else {
+            assert_eq!(st.state, AutoConfigStateKind::RolledBack);
+            assert_eq!(host.settings.lock().unwrap().video_kbps, 3500);
+        }
     }
 }

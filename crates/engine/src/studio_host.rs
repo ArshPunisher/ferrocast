@@ -2677,7 +2677,9 @@ impl Engine {
         s: StudioSettings,
         from_auto_config: bool,
     ) -> Result<Value, EngineError> {
-        self.flush_pending_startup_restore_to_host().await;
+        if !from_auto_config {
+            self.flush_pending_startup_restore_to_host().await;
+        }
         s.check()?;
         // x264 runs through FFmpeg in Ferrocast's own engine: fetched now, so it's here by the
         // time Record or Go live is pressed.
