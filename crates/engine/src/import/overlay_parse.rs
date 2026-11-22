@@ -15,6 +15,34 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use zip::ZipArchive;
 
+/// The kinds that are the same on every computer: transitions, pictures, video files, colours,
+/// slideshows, scenes and groups. (Windows and Linux used to give an empty kind for these, so a
+/// pack's transition came in with no kind at all.)
+#[cfg_attr(target_os = "macos", allow(dead_code))] // the macOS table names these itself
+fn portable_kind(kind: &str) -> &'static str {
+    match kind {
+        "fade_transition" => "fade_transition",
+        "cut_transition" => "cut_transition",
+        "swipe_transition" => "swipe_transition",
+        "slide_transition" => "slide_transition",
+        "fade_to_color_transition" => "fade_to_color_transition",
+        "wipe_transition" => "wipe_transition",
+        "stinger_transition" | "obs_stinger_transition" => "obs_stinger_transition",
+        "image_source" => "image_source",
+        "ffmpeg_source" => "ffmpeg_source",
+        "color_source" | "color_source_v3" => "color_source_v3",
+        "slideshow" => "slideshow",
+        "scene" => "scene",
+        "group" => "group",
+        _ => "",
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn portable_kind_for_tests(kind: &str) -> &'static str {
+    portable_kind(kind)
+}
+
 /// Converts Streamlabs / cross-platform OBS source and filter kinds to native kinds on this OS.
 fn for_this_computer(kind: &str) -> (&'static str, bool) {
     #[cfg(target_os = "macos")]
@@ -63,7 +91,7 @@ fn for_this_computer(kind: &str) -> (&'static str, bool) {
             ("text_gdiplus", true)
         }
         "browser_source" | "ferrocast_web" => ("browser_source", true),
-        _ => ("", false),
+        _ => (portable_kind(kind), false),
     };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     return match kind {
@@ -73,7 +101,7 @@ fn for_this_computer(kind: &str) -> (&'static str, bool) {
             ("text_ft2_source_v2", true)
         }
         "browser_source" | "ferrocast_web" => ("browser_source", true),
-        _ => ("", false),
+        _ => (portable_kind(kind), false),
     };
 }
 
@@ -1413,7 +1441,8 @@ fn parse_streamlabs_root(
     if let Some(tr) = root.pointer("/data/transition/data").and_then(Value::as_object) {
         let t_type = tr.get("type").and_then(Value::as_str).unwrap_or("fade_transition");
         let dur = tr.get("duration").and_then(Value::as_i64).unwrap_or(300).clamp(50, 10_000);
-        let (obs_tr, _) = for_this_computer(t_type);
+        let (mapped_tr, _) = for_this_computer(t_type);
+        let obs_tr = if mapped_tr.is_empty() { "fade_transition" } else { mapped_tr };
         let mut settings = tr.get("settings").and_then(Value::as_object).cloned().unwrap_or_default();
         if let Some(raw_stinger) =
             tr.get("path").and_then(Value::as_str).or_else(|| settings.get("path").and_then(Value::as_str))

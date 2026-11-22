@@ -1375,3 +1375,22 @@ async fn a_single_weight_family_is_asked_for_again_without_the_weights() {
     assert_eq!(rep.fonts[0].status, FontStatus::Downloaded, "{:?}", rep.fonts[0]);
     assert_eq!(mock.css_hits.load(Ordering::Relaxed), 2, "asked with weights, then without");
 }
+
+// ---- Neon review M7: kinds that are the same everywhere aren't lost on Windows and Linux ------
+
+#[test]
+fn kinds_that_are_the_same_on_every_computer_have_a_name() {
+    use crate::import::overlay_parse::portable_kind_for_tests as portable;
+    for (from, to) in [
+        ("fade_transition", "fade_transition"),
+        ("stinger_transition", "obs_stinger_transition"),
+        ("obs_stinger_transition", "obs_stinger_transition"),
+        ("image_source", "image_source"),
+        ("ffmpeg_source", "ffmpeg_source"),
+        ("color_source", "color_source_v3"),
+        ("slideshow", "slideshow"),
+    ] {
+        assert_eq!(portable(from), to, "{from}");
+    }
+    assert_eq!(portable("something_else"), "");
+}
