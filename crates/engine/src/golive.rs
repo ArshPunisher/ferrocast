@@ -526,7 +526,7 @@ pub(crate) struct GoLive {
     /// The last stream's measured rate, for planning the next one (0: none yet).
     last_kbps: std::sync::atomic::AtomicU32,
     /// One upload check or OBS change at a time.
-    busy: tokio::sync::Mutex<()>,
+    pub(crate) busy: tokio::sync::Mutex<()>,
     /// One start/stop pass at a time, so a destination is never started twice.
     reconciling: tokio::sync::Mutex<()>,
     /// Upload protection's state: what's paused and until when.
