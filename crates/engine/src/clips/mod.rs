@@ -241,6 +241,32 @@ pub(crate) fn refuse_if_recording(active: &std::collections::HashSet<String>, id
     Ok(())
 }
 
+/// The paths a recording reports it is writing (as reported: the file identity decides, not the string).
+pub(crate) fn active_recording_files(stats: &serde_json::Value) -> Vec<PathBuf> {
+    if stats.get("active").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(f) = stats.get("file").and_then(serde_json::Value::as_str) {
+        out.push(PathBuf::from(f));
+    }
+    if let Some(list) = stats.get("files").and_then(serde_json::Value::as_array) {
+        out.extend(list.iter().filter_map(serde_json::Value::as_str).map(PathBuf::from));
+    }
+    out
+}
+
+/// The same refusal for a clip that is a file a recording is writing, whatever name it is spelled with.
+pub(crate) fn refuse_if_recording_file(active: &[PathBuf], path: &Path) -> Result<(), EngineError> {
+    if active.iter().any(|a| same_file(a, path)) {
+        return refuse_if_recording(
+            &std::iter::once(path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect(),
+            &path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
 /// The clip named `id` in `root`: a plain file there, never a link.
 pub fn resolve(root: &Path, id: &str) -> Result<PathBuf, EngineError> {
     plain_name(id).map_err(|_| no_such_clip())?;
@@ -535,6 +561,12 @@ impl Engine {
         Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(jpg)))
     }
 
+    /// The paths a recording is writing now (none without the Studio or a recording).
+    pub(crate) async fn recording_files_now(&self) -> Vec<PathBuf> {
+        let Ok(host) = self.studio_host() else { return Vec::new() };
+        host.record_stats().await.map(|v| active_recording_files(&v)).unwrap_or_default()
+    }
+
     /// The files a recording is writing now (none without the Studio or a recording).
     pub(crate) async fn recording_now(&self) -> std::collections::HashSet<String> {
         let Ok(host) = self.studio_host() else { return Default::default() };
@@ -545,9 +577,14 @@ impl Engine {
         refuse_if_recording(&self.recording_now().await, id)?;
         let root = self.clips_folder().await?;
         let id = id.to_string();
-        tokio::task::spawn_blocking(move || resolve(&root, &id))
-            .await
-            .map_err(|e| EngineError::Internal(e.to_string()))?
+        let files = self.recording_files_now().await;
+        tokio::task::spawn_blocking(move || {
+            let path = resolve(&root, &id)?;
+            refuse_if_recording_file(&files, &path)?;
+            Ok(path)
+        })
+        .await
+        .map_err(|e| EngineError::Internal(e.to_string()))?
     }
 
     pub(crate) fn clips_ffmpeg(&self) -> Result<PathBuf, EngineError> {

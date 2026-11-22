@@ -506,3 +506,19 @@ async fn a_hard_linked_caption_file_is_refused_not_read() {
     let r = e.clip_captions("a.mp4").await;
     assert!(matches!(r, Err(EngineError::Refused { code: "bad_captions", .. })), "{r:?}");
 }
+
+/// CodeRabbit: an active recording is matched by the file it is, not by the string of its name
+/// (on a case-insensitive disk `live.mkv` and `Live.mkv` are one file).
+#[test]
+fn an_active_recording_is_found_by_file_identity_not_by_spelling() {
+    let dir = tempfile::tempdir().unwrap();
+    touch(dir.path(), "Live.mkv", b"x");
+    touch(dir.path(), "Other.mkv", b"y");
+    // The recording reports its path another way round (a `./` in it): same file, other string.
+    let active = vec![dir.path().join(".").join("Live.mkv")];
+    let e = refuse_if_recording_file(&active, &dir.path().join("Live.mkv")).unwrap_err();
+    assert!(matches!(e, EngineError::Refused { status: 409, code: "clip_in_use", .. }), "{e:?}");
+    assert!(refuse_if_recording_file(&active, &dir.path().join("Other.mkv")).is_ok());
+    // A recording file that isn't there yet matches nothing.
+    assert!(refuse_if_recording_file(&[dir.path().join("Nope.mkv")], &dir.path().join("Other.mkv")).is_ok());
+}
