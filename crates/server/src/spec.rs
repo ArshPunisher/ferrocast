@@ -2141,7 +2141,7 @@ fn store_schemas() -> Map<String, Value> {
     m.insert("StoreUndoRequest".into(), json!({
         "type": "object",
         "description": "Leave `token` out to undo the latest action. A `token` that is there (even null or empty) must be the latest's own: 400 `store_undo_bad_token` if it is not text, 404 `store_undo_unknown`, 409 `store_undo_out_of_order`; 409 `store_undo_conflict` when the user's own default look was edited since a removal put it back.",
-        "properties": { "token": { "type": "string" } }
+        "properties": { "token": { "type": "string", "minLength": 1 } }
     }));
     m.insert("StoreLinkRequest".into(), json!({
         "type": "object",
