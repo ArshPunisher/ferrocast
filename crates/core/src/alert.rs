@@ -762,11 +762,58 @@ fn check_custom_html(name: &str, html: &str, custom_keys: &HashSet<String>) -> R
             let close = (i..chars.len()).find(|&j| lower[j..].starts_with(&['<', '/', 's', 't', 'y', 'l', 'e']));
             let end = close.unwrap_or(chars.len());
             let css: String = chars[i..end].iter().collect();
+            // A `<` in a style's text: inside <svg> the browser reads it as a tag (a picture or a
+            // frame), which this checker took for CSS text. CSS needs none.
+            if css.contains('<') {
+                return Err(html_err(name, "can't put a < inside <style>"));
+            }
             check_css(&format!("variation '{name}' <style>"), &css).map_err(RuleError::CustomCss)?;
             i = end;
         }
     }
     flush_text(&mut text)
+}
+
+/// Checks custom HTML against p2e sandbox rules (no scripts, active tags, handlers or external URLs).
+pub fn check_custom_alert_html(name: &str, html: &str, custom_keys: &HashSet<String>) -> Result<(), RuleError> {
+    check_custom_html(name, html, custom_keys)
+}
+
+/// Checks one variation (timings, CSS, custom fields, template tokens, and p2e custom HTML).
+pub fn validate_variation(v: &Variation) -> Result<(), RuleError> {
+    if v.volume > 100 {
+        return Err(RuleError::Volume(v.name.clone()));
+    }
+    if !(MIN_DURATION_MS..=MAX_DURATION_MS).contains(&v.duration_ms) {
+        return Err(RuleError::Duration(v.name.clone()));
+    }
+    if v.weight > MAX_WEIGHT {
+        return Err(RuleError::Weight(v.name.clone()));
+    }
+    if v.anim.in_ms > MAX_IN_MS {
+        return Err(anim_err(&v.name, format!("entrance timing must be 0 to {MAX_IN_MS} ms")));
+    }
+    if v.anim.out_ms > MAX_OUT_MS {
+        return Err(anim_err(&v.name, format!("exit timing must be 0 to {MAX_OUT_MS} ms")));
+    }
+    if v.anim.text_delay_ms > MAX_TEXT_DELAY_MS {
+        return Err(anim_err(&v.name, format!("text delay must be 0 to {MAX_TEXT_DELAY_MS} ms")));
+    }
+    if v.anim.in_ms.saturating_add(v.anim.out_ms) >= v.duration_ms {
+        return Err(anim_err(&v.name, "entrance plus exit must be shorter than total alert duration"));
+    }
+    if v.anim.text_delay_ms >= v.duration_ms {
+        return Err(anim_err(&v.name, "text effect delay must start before the alert ends"));
+    }
+    if v.html.len() > MAX_CUSTOM_HTML_BYTES || v.html.chars().count() > MAX_CUSTOM_HTML {
+        return Err(RuleError::CustomHtmlTooLong { name: v.name.clone() });
+    }
+    check_css(&format!("variation '{}'.css", v.name), &v.css).map_err(RuleError::CustomCss)?;
+    let custom_keys = validate_custom_fields(&v.name, &v.fields, &v.field_values)?;
+    for src in [&v.title, &v.body] {
+        validate_template_tokens(&v.name, src, &custom_keys)?;
+    }
+    check_custom_html(&v.name, &v.html, &custom_keys)
 }
 
 impl AlertRule {
@@ -785,39 +832,7 @@ impl AlertRule {
             return Err(RuleError::NoDefault);
         }
         for v in &self.variations {
-            if v.volume > 100 {
-                return Err(RuleError::Volume(v.name.clone()));
-            }
-            if !(MIN_DURATION_MS..=MAX_DURATION_MS).contains(&v.duration_ms) {
-                return Err(RuleError::Duration(v.name.clone()));
-            }
-            if v.weight > MAX_WEIGHT {
-                return Err(RuleError::Weight(v.name.clone()));
-            }
-            if v.anim.in_ms > MAX_IN_MS {
-                return Err(anim_err(&v.name, format!("entrance timing must be 0 to {MAX_IN_MS} ms")));
-            }
-            if v.anim.out_ms > MAX_OUT_MS {
-                return Err(anim_err(&v.name, format!("exit timing must be 0 to {MAX_OUT_MS} ms")));
-            }
-            if v.anim.text_delay_ms > MAX_TEXT_DELAY_MS {
-                return Err(anim_err(&v.name, format!("text delay must be 0 to {MAX_TEXT_DELAY_MS} ms")));
-            }
-            if v.anim.in_ms.saturating_add(v.anim.out_ms) >= v.duration_ms {
-                return Err(anim_err(&v.name, "entrance plus exit must be shorter than total alert duration"));
-            }
-            if v.anim.text_delay_ms >= v.duration_ms {
-                return Err(anim_err(&v.name, "text effect delay must start before the alert ends"));
-            }
-            if v.html.len() > MAX_CUSTOM_HTML_BYTES || v.html.chars().count() > MAX_CUSTOM_HTML {
-                return Err(RuleError::CustomHtmlTooLong { name: v.name.clone() });
-            }
-            check_css(&format!("variation '{}'.css", v.name), &v.css).map_err(RuleError::CustomCss)?;
-            let custom_keys = validate_custom_fields(&v.name, &v.fields, &v.field_values)?;
-            for src in [&v.title, &v.body] {
-                validate_template_tokens(&v.name, src, &custom_keys)?;
-            }
-            check_custom_html(&v.name, &v.html, &custom_keys)?;
+            validate_variation(v)?;
         }
         Ok(())
     }
@@ -1464,6 +1479,9 @@ mod tests {
             "<div style=\"background:url(https://evil.example/a.png)\">x</div>",
             "<style>@import url(https://evil.example/a.css);</style>",
             "<style>.a{background:u\\72l(https://evil.example/a.png)}</style>",
+            // Inside <svg> the browser parses <style> as markup, not as text: a tag in it is a tag.
+            "<svg><style><img src=\"https://cdn.discordapp.com/x.png\"></style></svg>",
+            "<svg><style><iframe src=\"https://evil.example\"></iframe></style></svg>",
         ] {
             let r = custom_rule(bad);
             assert!(

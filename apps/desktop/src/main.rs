@@ -299,11 +299,20 @@ fn main() {
     crash::test_crash_if_asked();
     // The Store package's startup task can't pass `--minimized`: it's asked instead.
     let minimized = std::env::args().any(|a| a == MINIMIZED_ARG) || store::started_at_login();
+    let startup_deeplink = std::env::args().find(|a| is_ferrocast_deeplink(a));
+    let has_startup_link = startup_deeplink.is_some();
     if store::packaged() {
         tracing::info!("running from the Microsoft Store package: the Store updates it");
     }
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
+        .manage(PendingDeepLink(std::sync::Mutex::new(startup_deeplink)))
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(uri) = args.iter().find(|a| is_ferrocast_deeplink(a)) {
+                dispatch_deeplink(app, uri);
+            } else {
+                show_window(app);
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().args([MINIMIZED_ARG]).build())
@@ -400,7 +409,7 @@ fn main() {
             tauri::async_runtime::spawn(quit_on_signal(app.handle().clone()));
             // Started minimized (at login) with no tray, or offering/running Safe Mode: shown so
             // the prompt is never hidden in the tray.
-            if !minimized || !has_tray || show_for_safe_mode {
+            if opens_window_at_start(minimized, has_tray, show_for_safe_mode, has_startup_link) {
                 show_window(app.handle());
             }
             Ok(())
@@ -455,6 +464,14 @@ fn main() {
         // macOS: clicking the Dock icon of a running app brings back the hidden window.
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        RunEvent::Opened { urls } => {
+            if let Some(uri) = urls.iter().map(|u| u.as_str()).find(|u| is_ferrocast_deeplink(u)) {
+                dispatch_deeplink(app, uri);
+            } else {
+                show_window(app);
+            }
+        }
         RunEvent::Exit => {
             tracing::info!("Ferrocast quitting");
             let running = app.try_state::<Running>();
@@ -1140,6 +1157,71 @@ fn forward_drop(window: &tauri::Window, drop: &tauri::DragDropEvent) {
 }
 
 /// Shows the main window, creating it if it was never opened.
+struct PendingDeepLink(std::sync::Mutex<Option<String>>);
+
+impl PendingDeepLink {
+    /// The link waiting, left in place.
+    fn peek(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Clears the link, but only if it is still `used`: one that arrived since stays for its own turn.
+    fn clear_if(&self, used: &str) -> bool {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_deref() == Some(used) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn is_ferrocast_deeplink(s: &str) -> bool {
+    let lower = s.get(..11).map(str::to_ascii_lowercase);
+    lower.as_deref() == Some("ferrocast:/")
+        && s.get(11..12) == Some("/")
+        && s.len() <= 512
+        && s.is_ascii()
+        && !s.chars().any(char::is_control)
+        && !s.contains('\\')
+}
+
+/// Whether the first window opens at launch. A launch at login stays in the tray, but one that
+/// carries a `ferrocast://` link is a person clicking it: the window opens to show the link.
+fn opens_window_at_start(minimized: bool, has_tray: bool, show_for_safe_mode: bool, has_link: bool) -> bool {
+    !minimized || !has_tray || show_for_safe_mode || has_link
+}
+
+fn store_deeplink_route(uri: &str) -> String {
+    let mut encoded = String::with_capacity(uri.len());
+    for b in uri.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(*b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("#/store?link={encoded}")
+}
+
+fn dispatch_deeplink(app: &AppHandle, uri: &str) {
+    if !is_ferrocast_deeplink(uri) {
+        return;
+    }
+    if let Some(pending) = app.try_state::<PendingDeepLink>() {
+        *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(uri.to_string());
+    }
+    show_window(app);
+    if let Some(w) = app.get_webview_window("main") {
+        let detail = serde_json::json!({ "uri": uri });
+        let _ = w.eval(format!("window.dispatchEvent(new CustomEvent('ferrocast:deeplink', {{ detail: {detail} }}))"));
+        if let Some(pending) = app.try_state::<PendingDeepLink>() {
+            *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+}
+
 pub(crate) fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
@@ -1150,11 +1232,16 @@ pub(crate) fn show_window(app: &AppHandle) {
     let Some(running) = app.try_state::<Running>() else {
         return;
     };
+    // Read, not taken: it is cleared below only once the window is really there.
+    let pending_uri = app.try_state::<PendingDeepLink>().and_then(|p| p.peek());
+    let pending_route = pending_uri.as_deref().map(store_deeplink_route);
     // Dev builds only: FERROCAST_DEBUG_ROUTE (e.g. #/studio/golive) opens there, for testing.
     #[cfg(debug_assertions)]
-    let route = std::env::var("FERROCAST_DEBUG_ROUTE").ok().filter(|r| r.starts_with("#/")).unwrap_or_default();
+    let route = pending_route
+        .or_else(|| std::env::var("FERROCAST_DEBUG_ROUTE").ok().filter(|r| r.starts_with("#/")))
+        .unwrap_or_default();
     #[cfg(not(debug_assertions))]
-    let route = String::new();
+    let route = pending_route.unwrap_or_default();
     let Ok(url) = format!("{}/app/{route}", running.base).parse() else {
         return;
     };
@@ -1186,8 +1273,14 @@ pub(crate) fn show_window(app: &AppHandle) {
             tauri::webview::NewWindowResponse::Deny
         })
         .build();
-    if let Err(e) = built {
-        tracing::error!(error = %e, "couldn't open the window");
+    match built {
+        Ok(_) => {
+            if let (Some(used), Some(pending)) = (&pending_uri, app.try_state::<PendingDeepLink>()) {
+                pending.clear_if(used);
+            }
+        }
+        // The link stays: the next time the window is asked for it opens where the link said.
+        Err(e) => tracing::error!(error = %e, "couldn't open the window"),
     }
 }
 
@@ -1327,6 +1420,36 @@ mod tests {
     use super::*;
 
     const BASE: &str = "http://127.0.0.1:7878";
+
+    /// The link a window is opened for stays until the window is really there, and a newer link
+    /// that arrived meanwhile is never cleared by the older one's success.
+    #[test]
+    fn a_launch_with_a_link_opens_the_window_even_when_started_minimized() {
+        // Login launch, tray present, no link: stays in the tray.
+        assert!(!opens_window_at_start(true, true, false, false));
+        // The same launch carrying a ferrocast:// link: the window opens.
+        assert!(opens_window_at_start(true, true, false, true));
+        // Not minimized, no tray, or Safe Mode: opens as before.
+        assert!(opens_window_at_start(false, true, false, false));
+        assert!(opens_window_at_start(true, false, false, false));
+        assert!(opens_window_at_start(true, true, true, false));
+    }
+
+    #[test]
+    fn a_pending_link_is_cleared_only_after_its_window_opened_and_only_that_link() {
+        let p = PendingDeepLink(std::sync::Mutex::new(Some("ferrocast://store/install/a".into())));
+        // Reading it for the route leaves it: if the window fails to build, the next try has it.
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/a"));
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/a"));
+        // A newer link arrives while the window is being built: the older one's success keeps it.
+        *p.0.lock().unwrap() = Some("ferrocast://store/install/b".into());
+        assert!(!p.clear_if("ferrocast://store/install/a"));
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/b"));
+        // The one that was used is cleared.
+        assert!(p.clear_if("ferrocast://store/install/b"));
+        assert_eq!(p.peek(), None);
+        assert!(!p.clear_if("ferrocast://store/install/b"), "nothing left to clear");
+    }
 
     fn nav(u: &str) -> (bool, bool) {
         navigation(&u.parse().unwrap(), BASE)
@@ -1735,5 +1858,17 @@ mod update_tests {
         assert!(cur_len <= cap, "active log exceeded cap: {cur_len} > {cap}");
         assert!(bak_len <= cap, "backup log exceeded cap: {bak_len} > {cap}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deeplinks_validate_strictly_and_route_to_store() {
+        assert!(is_ferrocast_deeplink("ferrocast://store/install/aurora-pulse"));
+        assert!(!is_ferrocast_deeplink("https://evil.com/store/install/x"));
+        assert!(!is_ferrocast_deeplink("ferrocast://store/install/x\\y"));
+        assert!(!is_ferrocast_deeplink("ferrocast://store/install/x\ny"));
+        assert_eq!(
+            store_deeplink_route("ferrocast://store/install/aurora-pulse"),
+            "#/store?link=ferrocast%3A%2F%2Fstore%2Finstall%2Faurora-pulse"
+        );
     }
 }

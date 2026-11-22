@@ -132,6 +132,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.
     ("*", "/diagnostics"),
     ("*", "/diagnostics/**"),
+    // Community Theme Store packages and installs stay on the PC only.
+    ("*", "/store"),
+    ("*", "/store/**"),
 ];
 
 /// The dashboard API's routes with a variable part, for the audit log's action names:

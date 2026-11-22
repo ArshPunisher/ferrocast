@@ -341,4 +341,6 @@ mod scope_tests;
 #[cfg(test)]
 mod spec_tests;
 #[cfg(test)]
+mod store_tests;
+#[cfg(test)]
 mod tests;

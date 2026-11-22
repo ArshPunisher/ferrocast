@@ -307,6 +307,42 @@ type AlertDesignView = { design_id: string; variation_id: string; event_key: Eve
 
 Designs are in `.ferropack` exports (`designs`); a pack can't bring in a built-in or branded design, or one that fails these checks (it's skipped). Media used by a design can't be deleted (409 `in_use` names the design).
 
+### Community Theme Store (R37)
+Signed community catalog (minisign-verified JSON + `.sig` before parsing) of community themes, alerts, widgets, overlay bundles, and safe plugins (`effect`, `logic`, `panel`). Install counts and ratings are read-only metadata from the catalog; no usage telemetry is ever sent. All install/update/uninstall/undo mutations are PC-only (forbidden on paired phones).
+
+```ts
+type StoreCategory = "theme" | "alert" | "widget" | "overlay" | "plugin"
+type StorePackageFormat = "ferrodesign" | "ferroalert" | "ferroplugin"
+type StoreCreator = { id: string; name: string; handle: string; bio: string; verified: boolean;
+                      links: { website?: string | null; twitch?: string | null; youtube?: string | null; github?: string | null } }
+type StorePackage = { format: StorePackageFormat; url: string; sha256: string; size: number }
+type StoreAsset = { name: string; role: "preview" | "media"; url: string; sha256: string; size: number; mime: string }
+type StoreStats = { installs: number; rating_avg: number; rating_count: number }
+type StorePreview = { palette: [string, string, string]; style: StyleTag; motion: MotionTag;
+                      headline?: string; subline?: string; layers_hint?: number; design?: Design; custom_alert?: StoreCustomAlertPreview }
+type StoreItem = { id: string; kind: StoreCategory; title: string; summary: string; version: string; creator_id: string;
+                   tags: string[]; license: string; sandboxed: boolean; plugin_kind?: "effect" | "logic" | "panel" | null;
+                   plugin_actions?: string[]; alert_events?: EventKey[]; featured?: boolean; created_at: number; updated_at: number;
+                   package: StorePackage; assets: StoreAsset[]; stats: StoreStats; preview: StorePreview;
+                   installed_version?: string | null; update_available?: boolean }
+type StoreInstalledItem = { item_id: string; kind: StoreCategory; format: StorePackageFormat; title: string; version: string;
+                            creator_id: string; creator_name: string; installed_at: number; updated_at: number;
+                            package_sha256: string; design_ids: string[]; rule_ids: string[]; plugin_id: string | null;
+                            can_undo: boolean; undo_token: string | null; latest_version?: string | null; update_available?: boolean }
+type StoreUndoSummary = { token: string; action: "install" | "update" | "uninstall"; item_id: string; item_title: string; created_at: number }
+```
+
+| Method | Path | Body → Response |
+|---|---|---|
+| GET | `/api/v1/store/catalog?fresh=true` | Verifies minisign `.sig` + size caps (2 MB list, 4 KB sig) and validates every creator/item → `{ version: 1, generated_at, fetched_at, stale, creators, items, installed, last_undo, warnings }`. Stale/bad catalog keeps installed items intact (`GET /store/installed` still succeeds). Errors: 503 `catalog_not_open`, 413 `store_catalog_too_large`, 502 `store_bad_signature`, 422 `store_catalog_invalid`, 502 `store_unreachable` |
+| GET | `/api/v1/store/installed` | → `{ installed: StoreInstalledItem[], last_undo: StoreUndoSummary | null }`. Works offline / when catalog fails |
+| GET | `/api/v1/store/assets/{item_id}/{name}` | Fetches companion/preview asset from verified catalog entry, verifies exact byte length & SHA-256 (`502 store_asset_tampered` on mismatch) → raw bytes |
+| POST | `/api/v1/store/install` | `{ id }` → 201 `{ action: "install", installed, designs, undo }`. Fetches package (max 100 MB `.ferrodesign`, 512 KB `.ferroalert`, 2 MB `.ferroplugin`), checks SHA-256 & exact byte size before unpack, validates `.ferrodesign` / p2e custom-HTML rules (`validate_custom_alert_html` + `check_css`) / plugin sandbox |
+| POST | `/api/v1/store/update` | `{ id }` → `{ action: "update", installed, designs, undo }`. Snapshots previous installed items for one-click undo. 404 `not_found`, 409 `store_up_to_date` |
+| POST | `/api/v1/store/uninstall` | `{ id }` → `{ action: "uninstall", installed: null, designs: [], undo }`. Snapshots installed item & removes cleanly (works offline even if catalog fails). 404 `not_found` |
+| POST | `/api/v1/store/undo` | `{ token? }` → `{ reverted_action, item_id, item_title, installed }`. One-click undo of the **latest** install, update or uninstall. Leave `token` out to ask for the latest; a token that is there must be text and the latest's own: empty, null or not text is `400 store_undo_bad_token`, unknown `404 store_undo_unknown`, an older one `409 store_undo_out_of_order`, a removal whose put-back default look was edited since `409 store_undo_conflict` (nothing is changed and the token stays), none left `404 store_nothing_to_undo`. Undo reverses only what the action changed (alert variations it added or took out are reversed in the rule as it is now, so later edits stay; the active alert is restored only if nothing was picked since); if a step can't be put back it answers `500 store_undo_incomplete` and the same token still works. An install or uninstall that fails part way takes back what it did (`install`: `422 store_alert_no_target` when the pack's events have no rule here, `409 store_alert_default_taken` when another Store item already supplies that alert's default look (remove it first), `500 store_install_partial` / `store_uninstall_partial` if even that couldn't finish); the install record and its undo are written in one commit. Removing an alert pack gives back the user's own default look it displaced; an update that no longer takes a rule the earlier version was in leaves that rule the same way, and one whose new version has no default gives the rule the displaced look back |
+| POST | `/api/v1/store/resolve-link` | `{ uri }` → `{ uri, action: "install" \| "view", item, creator, installed, update_available, safety_notes, requires_confirmation: true }`. Validates `ferrocast://store/install/<id>` / `ferrocast://install/<id>` / `ferrocast://store/item/<id>` strictly and **never installs** |
+
 ### Goals
 `Goal = { id, title, kind: "follows" | "subs" | "tips" | "bits" | "custom", target: number, currency: string | null, starts_at, ends_at: number | null, current: number }`
 GET/POST `/api/v1/goals`, PUT/DELETE `/api/v1/goals/{id}`, POST `/api/v1/goals/{id}/adjust { delta }`.

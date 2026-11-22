@@ -51,6 +51,11 @@ base64 = "0.23"
 # Logic plugins: WebAssembly run in a sandbox with a time (fuel) and memory budget (plugins.rs).
 wasmi = { version = "2.0.0", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"] }
 
+[features]
+# Lets tests in other crates point the Store and plugin catalogs at a local fixture and key.
+# Never on in a release build: it is only named by dev-dependencies.
+test-catalog = []
+
 [dev-dependencies]
 tempfile = "3"
 ferrocast-testkit.workspace = true
