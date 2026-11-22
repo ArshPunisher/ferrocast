@@ -96,6 +96,7 @@ pub struct Stage {
     /// Set while an edit's engine update is done by the caller itself (a moved source goes
     /// straight to the engine's item, not through opening the whole collection again).
     quiet: std::cell::Cell<bool>,
+    reloads: std::cell::Cell<usize>,
     /// Keys held down (push to show, hide, filter on or off): how the engine sees an item or a
     /// filter while they are down. Never in `doc`, so never saved, never in an undo snapshot or
     /// an export, and gone with this stage (a crash or quit shows the collection as it was).
@@ -597,6 +598,7 @@ impl Stage {
             canvas,
             doc: RefCell::new(doc),
             quiet: std::cell::Cell::new(false),
+            reloads: std::cell::Cell::new(0),
             holds: RefCell::default(),
             monitor_device: RefCell::new(None),
             true_peak: std::cell::Cell::new(false),
@@ -629,6 +631,7 @@ impl Stage {
             canvas,
             doc: RefCell::new(doc),
             quiet: std::cell::Cell::new(false),
+            reloads: std::cell::Cell::new(0),
             holds: RefCell::default(),
             monitor_device: RefCell::new(None),
             true_peak: std::cell::Cell::new(false),
@@ -732,11 +735,28 @@ impl Stage {
     }
 
     /// Changes the document, then the engine shows it.
+    /// A change to the collection's document that the scene graph doesn't read (transitions and
+    /// the matrix): nothing is reloaded, so an edit made while a transition plays can't pop the
+    /// outgoing scene's sources off the screen.
+    fn edit_meta<T>(&self, f: impl FnOnce(&mut Value) -> T) -> T {
+        let out = f(&mut self.doc.borrow_mut());
+        if !self.quiet.get() {
+            self.sync_pages();
+        }
+        out
+    }
+
+    /// How many times the whole scene graph was reloaded for an edit (for tests).
+    pub fn graph_reloads(&self) -> usize {
+        self.reloads.get()
+    }
+
     fn edit<T>(&self, f: impl FnOnce(&mut Value) -> T) -> T {
         let out = f(&mut self.doc.borrow_mut());
         if self.quiet.get() {
             return out;
         }
+        self.reloads.set(self.reloads.get() + 1);
         if let Some(e) = self.engine.borrow().as_ref() {
             self.live(|d| e.reopen(d));
         }
@@ -3700,11 +3720,37 @@ impl Stage {
     /// running).
     pub fn restore_all(&self, snapshot: &Value) {
         let on_air = self.current();
+        // Studio Mode's live state: what the preview holds and the copy on air. Undo changes the
+        // scenes, not what's on air, so these stay as they are now.
+        let live: Vec<(&str, Value)> = ["studio_mode", "program_copy", "program_on_air", "program_prev"]
+            .iter()
+            .filter_map(|k| self.doc.borrow().pointer(&format!("/ferrocast/{k}")).map(|v| (*k, v.clone())))
+            .collect();
+        let studio_on = self.preview_scene().is_some();
+        let current_scene = self.doc.borrow().get("current_scene").cloned();
         self.edit(|d| {
             *d = snapshot.clone();
-            // Undo changes the scenes, not what's on air.
-            if d.get("sources").and_then(Value::as_array).is_some_and(|l| l.iter().any(|s| name_of(s) == on_air)) {
+            let has = |d: &Value, n: &str| {
+                d.get("sources").and_then(Value::as_array).is_some_and(|l| l.iter().any(|s| name_of(s) == n))
+            };
+            if has(d, &on_air) {
                 d["current_program_scene"] = json!(on_air);
+            }
+            if studio_on {
+                if !d.get("ferrocast").is_some_and(Value::is_object) {
+                    d["ferrocast"] = json!({});
+                }
+                if let Some(f) = d["ferrocast"].as_object_mut() {
+                    for k in ["studio_mode", "program_copy", "program_on_air", "program_prev"] {
+                        f.remove(k);
+                    }
+                    for (k, v) in &live {
+                        f.insert((*k).to_string(), v.clone());
+                    }
+                }
+                if let Some(c) = current_scene.as_ref().filter(|c| c.as_str().is_some_and(|n| has(d, n))) {
+                    d["current_scene"] = c.clone();
+                }
             }
         });
     }
@@ -4708,7 +4754,7 @@ impl Stage {
 
     pub fn set_scene_transition(&self, scene: &str, t: Option<&TransitionInfo>) -> Result<(), StudioError> {
         self.scene_index(scene)?;
-        self.edit(|d| {
+        self.edit_meta(|d| {
             if let Some(m) = d.pointer_mut("/ferrocast/transition_matrix").and_then(Value::as_array_mut) {
                 m.retain(|r| {
                     !(r.get("from").is_none_or(Value::is_null) && r.get("to").and_then(Value::as_str) == Some(scene))
@@ -4779,7 +4825,7 @@ impl Stage {
             all = json!({});
         }
         all[kind] = merge(&all[kind]);
-        self.edit(|d| {
+        self.edit_meta(|d| {
             if !d.get("ferrocast").is_some_and(Value::is_object) {
                 d["ferrocast"] = json!({});
             }
@@ -5319,7 +5365,7 @@ impl Stage {
         } else {
             target_name
         };
-        self.edit(|d| {
+        self.edit_meta(|d| {
             let mut list = named_transitions_from_doc(d);
             if let Some(existing) = list.iter_mut().find(|x| x.name == target_name) {
                 existing.kind = t.kind.clone();
@@ -5459,7 +5505,7 @@ impl Stage {
         for x in &mut list {
             x.default = x.name == default_name;
         }
-        self.edit(|d| {
+        self.edit_meta(|d| {
             write_transitions_to_doc(d, &list, &default_name, default_ms);
             mark_named_transitions_v2(d);
         });
@@ -5524,7 +5570,7 @@ impl Stage {
         }
         let default_ms = list.iter().find(|x| x.name == default_name).map_or(300, |x| x.ms);
         let updated = list[pos].clone();
-        self.edit(|d| {
+        self.edit_meta(|d| {
             write_transitions_to_doc(d, &list, &default_name, default_ms);
             mark_named_transitions_v2(d);
         });
@@ -5548,7 +5594,7 @@ impl Stage {
         let updated = list[pos].clone();
         let default_name = list.iter().find(|x| x.default).map_or_else(|| new_name.to_string(), |x| x.name.clone());
         let default_ms = list.iter().find(|x| x.name == default_name).map_or(300, |x| x.ms);
-        self.edit(|d| {
+        self.edit_meta(|d| {
             write_transitions_to_doc(d, &list, &default_name, default_ms);
             if let Some(m) = d.pointer_mut("/ferrocast/transition_matrix").and_then(Value::as_array_mut) {
                 for r in m.iter_mut() {
@@ -5586,7 +5632,7 @@ impl Stage {
         list.push(dup.clone());
         let default_name = list.iter().find(|x| x.default).map_or_else(|| list[0].name.clone(), |x| x.name.clone());
         let default_ms = list.iter().find(|x| x.name == default_name).map_or(300, |x| x.ms);
-        self.edit(|d| {
+        self.edit_meta(|d| {
             write_transitions_to_doc(d, &list, &default_name, default_ms);
             mark_named_transitions_v2(d);
         });
@@ -5602,7 +5648,7 @@ impl Stage {
             x.default = x.name == name;
         }
         let ms = list.iter().find(|x| x.name == name).map_or(300, |x| x.ms);
-        self.edit(|d| {
+        self.edit_meta(|d| {
             write_transitions_to_doc(d, &list, name, ms);
             mark_named_transitions_v2(d);
         });
@@ -5628,7 +5674,7 @@ impl Stage {
             x.default = x.name == default_name;
         }
         let default_ms = list.iter().find(|x| x.name == default_name).map_or(300, |x| x.ms);
-        self.edit(|d| {
+        self.edit_meta(|d| {
             write_transitions_to_doc(d, &list, &default_name, default_ms);
             if let Some(m) = d.pointer_mut("/ferrocast/transition_matrix").and_then(Value::as_array_mut) {
                 m.retain(|r| r.get("transition").and_then(Value::as_str) != Some(name));
@@ -5669,7 +5715,7 @@ impl Stage {
                 transition: tr.to_string(),
             });
         }
-        self.edit(|d| {
+        self.edit_meta(|d| {
             if !d.get("ferrocast").is_some_and(Value::is_object) {
                 d["ferrocast"] = json!({});
             }
@@ -9515,6 +9561,38 @@ mod tests {
         assert!(rules.iter().any(|r| r.to.as_deref() == Some("BRB ~ 5m")));
         // Exeldro's Move Transition is one Ferrocast renders: not downgraded to Fade.
         assert_eq!(list.iter().find(|t| t.name == "Mover").unwrap().kind, "ferrocast_move");
+    }
+
+    #[test]
+    fn undo_in_studio_mode_keeps_what_is_on_air_and_transition_edits_leave_the_graph_alone() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "A").unwrap_or_else(|e| panic!("{e}"));
+        ok(s.add_scene("B"));
+        s.set_studio_mode(true);
+        let snap = s.snapshot();
+        // Transition to B: B is on air now, A in the preview.
+        ok(s.set_preview("B"));
+        ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        assert_eq!(s.current(), "B");
+        let on_air = s.snapshot().pointer("/ferrocast/program_copy/scene").cloned();
+        let preview = s.snapshot().pointer("/ferrocast/studio_mode").cloned();
+        // Undoing an old edit (the snapshot from before the switch) must not put A back on air.
+        s.restore_all(&snap);
+        assert_eq!(s.current(), "B");
+        assert_eq!(s.snapshot().pointer("/ferrocast/program_copy/scene").cloned(), on_air, "on-air copy kept");
+        assert_eq!(s.snapshot().pointer("/ferrocast/studio_mode").cloned(), preview, "preview kept");
+
+        // Transition and matrix edits are document-only: the scene graph is not reloaded.
+        let before = s.graph_reloads();
+        ok(s.add_named_transition(&NamedTransition {
+            name: "Slow".into(),
+            kind: "fade_transition".into(),
+            ms: 2000,
+            settings: json!({}),
+            default: false,
+        }));
+        ok(s.update_named_transition("Slow", None, Some(2500), None, None));
+        ok(s.set_matrix_rule(Some("A"), Some("B"), Some("Slow")));
+        assert_eq!(s.graph_reloads(), before, "a transition edit must not reload the graph mid-transition");
     }
 
     #[test]
