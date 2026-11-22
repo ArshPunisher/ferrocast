@@ -1,2 +1,6 @@
-# The catalog test files are signed byte for byte: never change their line endings.
-crates/engine/testdata/catalog/** -text
+# Text files are LF in every checkout, Windows included. The tests and the app compare bytes:
+# the sandbox bootstrap script is pinned by its hash (and embedded in the app), the route
+# snapshots are compared as text, and the Community Store's catalogs are signed byte for byte.
+* text=auto eol=lf
+# Signed and pinned test data is never rewritten, whatever the checkout settings.
+crates/engine/testdata/** -text
