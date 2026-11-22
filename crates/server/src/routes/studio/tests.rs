@@ -1361,3 +1361,135 @@ async fn import_preview_routes_validate_and_forward() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[derive(Debug, Default)]
+struct BenchRouteHost {
+    live: std::sync::atomic::AtomicBool,
+    settings: std::sync::Mutex<ferrocast_engine::studio_host::StudioSettings>,
+}
+
+#[async_trait]
+impl ferrocast_engine::studio_host::StudioHost for BenchRouteHost {
+    async fn status(&self) -> ferrocast_engine::studio_host::StudioStatus {
+        ferrocast_engine::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+    }
+    async fn start(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn kinds(&self) -> Result<Value, String> {
+        Ok(json!({ "encoders": [] }))
+    }
+    async fn options(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn defaults(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn act(&self, _act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
+        self.settings.lock().unwrap().clone()
+    }
+    async fn set_settings(&self, s: ferrocast_engine::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        *self.settings.lock().unwrap() = s;
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<Value, String> {
+        Ok(json!({
+            "engine": { "cpu": 10.0, "fps": 60, "frame_ms": 2.0, "lagged": 0, "skipped": 0, "frames": 600, "memory_mb": 100 },
+            "canvas": { "width": 1920, "height": 1080, "fps": 60 },
+            "stream": { "active": self.live.load(std::sync::atomic::Ordering::Relaxed), "dropped": 0, "reconnecting": false, "bytes": 0, "frames": 0, "error": null },
+            "record": { "active": false }
+        }))
+    }
+    async fn record(&self, _on: bool) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<Value, String> {
+        Ok(json!({ "devices": [] }))
+    }
+    async fn stream_start(
+        &self,
+        _server: String,
+        _key: String,
+        _tracks: Vec<(u32, u32, u32)>,
+    ) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<Value, String> {
+        if self.live.load(std::sync::atomic::Ordering::Relaxed) {
+            Ok(json!({ "active": true }))
+        } else {
+            Ok(Value::Null)
+        }
+    }
+    async fn obs_collections(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+}
+
+#[tokio::test]
+async fn auto_config_benchmark_and_rollback_routes_enforce_guards_and_state_machine() {
+    let r = start().await;
+    let host = Arc::new(BenchRouteHost::default());
+    host.settings.lock().unwrap().video_kbps = 3200;
+    r.engine.set_studio_host(host.clone());
+    r.engine.set_auto_config_timing_for_test(ferrocast_engine::studio::encoder_bench::BenchTiming::fast_test());
+
+    let (s, v) = body(r.get("/studio/engine/auto-config").await).await;
+    assert_eq!((s, v["state"].as_str()), (StatusCode::OK, Some("idle")));
+
+    assert_eq!(
+        r.post("/studio/engine/auto-config/benchmark", json!({ "mode": "bad" })).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.post("/studio/engine/auto-config/benchmark", json!({ "fps_preference": 45 })).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Refuses 409 when live.
+    host.live.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (s, v) = body(
+        r.post(
+            "/studio/engine/auto-config/benchmark",
+            json!({ "mode": "stream", "fps_preference": 60, "include_upload": false }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!((s, v["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("studio_busy")));
+    host.live.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // Apply -> Keep / Undo HTTP lifecycle.
+    let (s, v) = body(
+        r.post("/studio/engine/auto-config/apply", json!({ "encoder": "hardware", "fps": 60, "video_kbps": 6000 }))
+            .await,
+    )
+    .await;
+    assert_eq!((s, v["state"].as_str()), (StatusCode::OK, Some("applied")), "{v}");
+    assert_eq!(host.settings.lock().unwrap().video_kbps, 6000);
+
+    let (s, v) = body(r.post("/studio/engine/auto-config/undo", json!({})).await).await;
+    assert_eq!((s, v["state"].as_str()), (StatusCode::OK, Some("rolled_back")), "{v}");
+    assert_eq!(host.settings.lock().unwrap().video_kbps, 3200);
+
+    // Keep when nothing is applied -> 409 conflict.
+    assert_eq!(r.post("/studio/engine/auto-config/keep", json!({})).await.status(), StatusCode::CONFLICT);
+}

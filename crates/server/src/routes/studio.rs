@@ -159,6 +159,12 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/audio-care", get(audio_care).put(set_audio_care))
         .route("/studio/engine/privacy", get(privacy).put(set_privacy))
         .route("/studio/engine/settings", get(engine_settings).put(engine_set_settings))
+        .route("/studio/engine/auto-config", get(engine_auto_config))
+        .route("/studio/engine/auto-config/benchmark", post(engine_auto_config_benchmark))
+        .route("/studio/engine/auto-config/cancel", post(engine_auto_config_cancel))
+        .route("/studio/engine/auto-config/apply", post(engine_auto_config_apply))
+        .route("/studio/engine/auto-config/keep", post(engine_auto_config_keep))
+        .route("/studio/engine/auto-config/undo", post(engine_auto_config_undo))
         .route("/studio/engine/stats", get(engine_stats))
         .route("/studio/engine/record", post(engine_record))
         .route("/studio/engine/record/pause", post(engine_record_pause))
@@ -1598,6 +1604,36 @@ async fn engine_set_settings(
 
 async fn engine_stats(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_stats().await?))
+}
+
+async fn engine_auto_config(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_status())))
+}
+
+async fn engine_auto_config_benchmark(
+    State(app): State<AppState>,
+    OptionalBody(b): OptionalBody<ferrocast_engine::studio::encoder_bench::BenchmarkReq>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_benchmark(b).await?)))
+}
+
+async fn engine_auto_config_cancel(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_cancel())))
+}
+
+async fn engine_auto_config_apply(
+    State(app): State<AppState>,
+    OptionalBody(b): OptionalBody<ferrocast_engine::studio::encoder_bench::ApplyReq>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_apply(b).await?)))
+}
+
+async fn engine_auto_config_keep(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_keep()?)))
+}
+
+async fn engine_auto_config_undo(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.auto_config_undo().await?)))
 }
 
 #[derive(Deserialize)]
