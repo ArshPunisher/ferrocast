@@ -36,6 +36,9 @@ pub struct SceneInfo {
     pub preview: bool,
     /// Its own way in, instead of the Studio's (OBS's "Transition Override").
     pub transition: Option<TransitionInfo>,
+    /// Named transition override applied to this scene (`Any -> scene`), if set via a named rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_name: Option<String>,
 }
 
 /// A source in a scene, top first. A group lists its own items.
@@ -315,6 +318,48 @@ pub struct TransitionInfo {
     /// `fade_transition`, `cut_transition`, `swipe_transition`…
     pub kind: String,
     pub ms: u32,
+}
+
+/// A saved transition configuration (name, kind, duration, OBS settings, and whether it is the default).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamedTransition {
+    pub name: String,
+    pub kind: String,
+    pub ms: u32,
+    pub settings: serde_json::Value,
+    pub default: bool,
+}
+
+impl Default for NamedTransition {
+    fn default() -> Self {
+        Self {
+            name: "Fade".into(),
+            kind: "fade_transition".into(),
+            ms: 300,
+            settings: serde_json::json!({}),
+            default: false,
+        }
+    }
+}
+
+/// A rule in the from-scene / to-scene transition matrix.
+/// `from == None` matches Any -> `to`; `to == None` matches `from` -> Any.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransitionMatrixRule {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub transition: String,
+}
+
+/// The transition chosen for a specific switch (`from` -> `to`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedTransition {
+    pub name: String,
+    pub kind: String,
+    pub ms: u32,
+    pub settings: serde_json::Value,
 }
 
 /// How Studio Mode sends the preview on air (OBS's options under the Transition button).

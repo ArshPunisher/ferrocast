@@ -967,7 +967,11 @@ mod tests {
         let (engine, _dir) = test_engine(host.clone()).await;
 
         run(&engine, "scene:Tall", true).await.unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(host.take_acts(), vec![StudioAct::SetCurrent { scene: "Tall".into() }]);
+        run(&engine, "transition", true).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            host.take_acts(),
+            vec![StudioAct::SetCurrent { scene: "Tall".into() }, StudioAct::TransitionNow { quick: None }]
+        );
         engine.shutdown();
     }
 }
