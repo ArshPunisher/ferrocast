@@ -250,6 +250,11 @@ pub(crate) fn uploads() -> Router<AppState> {
         )
         .merge(
             Router::new()
+                .route("/studio/engine/library/collections/overlay/preview", post(studio::engine_overlay_preview))
+                .layer(axum::extract::DefaultBodyLimit::max(ferrocast_engine::import::overlay_parse::MAX_OVERLAY_BODY)),
+        )
+        .merge(
+            Router::new()
                 .route("/plugins", post(plugins::install))
                 .layer(axum::extract::DefaultBodyLimit::max(plugins::MAX_PLUGIN_BODY)),
         )

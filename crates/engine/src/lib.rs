@@ -25,6 +25,7 @@ mod dispatcher;
 mod error;
 mod ferro_account;
 pub mod ffmpeg_get;
+pub mod fonts;
 mod giveaways;
 pub mod golive;
 mod guests;
@@ -168,8 +169,10 @@ struct Inner {
     restart_update: Notify,
     /// The import preview that can be applied, and one import step at a time.
     import: Mutex<import::Slot>,
+    overlay_import: import::overlay::OverlayPreviewSlot,
     import_busy: tokio::sync::Mutex<()>,
     streamelements_api: RwLock<String>,
+    google_fonts_api: RwLock<String>,
     /// Wakes the OBS connection task when its settings change.
     obs_wake: Notify,
     /// Where OBS's own settings are looked for.
@@ -283,6 +286,7 @@ impl Engine {
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))??;
         let store = Arc::new(store);
+        ferrocore::fonts::set_extra_fonts_dir(data_dir.join("fonts"));
 
         let loaded = {
             let s = store.clone();
@@ -338,8 +342,10 @@ impl Engine {
                 check_update: Notify::new(),
                 restart_update: Notify::new(),
                 import: Mutex::new(None),
+                overlay_import: Mutex::new(Vec::new()),
                 import_busy: tokio::sync::Mutex::new(()),
                 streamelements_api: RwLock::new(import::streamelements::DEFAULT_API.into()),
+                google_fonts_api: RwLock::new(fonts::DEFAULT_GOOGLE_FONTS_API.into()),
                 obs_wake: Notify::new(),
                 // Tests never read (or connect to) the developer's real OBS: `start` sets the real places.
                 obs_paths: RwLock::new(Vec::new()),

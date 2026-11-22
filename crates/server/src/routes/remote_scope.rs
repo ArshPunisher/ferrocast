@@ -355,6 +355,9 @@ mod tests {
             ("POST", "/studio/engine/start"),
             ("PUT", "/studio/engine/preview"),
             ("GET", "/studio/engine/kinds/color_source/options"),
+            ("POST", "/studio/engine/library/collections/overlay/preview"),
+            ("POST", "/studio/engine/library/collections/overlay/import"),
+            ("POST", "/studio/engine/library/collections/overlay/undo"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }
