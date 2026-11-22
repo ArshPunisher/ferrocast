@@ -295,35 +295,7 @@ impl Engine {
                 }
             }
 
-            let stem = filename.strip_suffix(".zip").unwrap_or(&filename);
-            let mut n = 1usize;
-            loop {
-                let cand_name = if n == 1 { filename.clone() } else { format!("{stem}-{n}.zip") };
-                let cand = canonical.join(&cand_name);
-                match std::fs::hard_link(&tmp, &cand) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        break Ok((cand_name, cand));
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        n += 1;
-                    }
-                    Err(_) => {
-                        if !cand.exists() {
-                            std::fs::rename(&tmp, &cand)?;
-                            break Ok((cand_name, cand));
-                        }
-                        n += 1;
-                    }
-                }
-                if n > 1000 {
-                    let _ = std::fs::remove_file(&tmp);
-                    break Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "too many existing diagnostics archives",
-                    ));
-                }
-            }
+            publish_no_replace(&tmp, &canonical, &filename, &|from, to| std::fs::hard_link(from, to))
         })
         .await
         .map_err(|e| EngineError::Unavailable(e.to_string()))?
@@ -969,6 +941,51 @@ fn zip_err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Unavailable(format!("Couldn't build support zip archive: {e}"))
 }
 
+/// Puts the finished `tmp` file into `dir` as `filename` (or `name-2.zip`, `name-3.zip`...) without
+/// ever replacing a file that is already there, and removes `tmp` whatever happens. `link` makes
+/// a hard link (atomic, and it refuses an existing name); where that isn't possible the file is
+/// created with `create_new` (also refuses an existing name) and copied into.
+fn publish_no_replace(
+    tmp: &Path,
+    dir: &Path,
+    filename: &str,
+    link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<(String, PathBuf)> {
+    struct RemoveTmp<'a>(&'a Path);
+    impl Drop for RemoveTmp<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+    let _cleanup = RemoveTmp(tmp);
+    let stem = filename.strip_suffix(".zip").unwrap_or(filename);
+    for n in 1..=1000usize {
+        let cand_name = if n == 1 { filename.to_string() } else { format!("{stem}-{n}.zip") };
+        let cand = dir.join(&cand_name);
+        match link(tmp, &cand) {
+            Ok(()) => return Ok((cand_name, cand)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => {
+                // No hard links here (some shares, FAT): create the name exclusively and copy.
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+                    Ok(mut out) => {
+                        let copied = std::fs::File::open(tmp).and_then(|mut src| std::io::copy(&mut src, &mut out));
+                        if let Err(e) = copied {
+                            drop(out);
+                            let _ = std::fs::remove_file(&cand);
+                            return Err(e);
+                        }
+                        return Ok((cand_name, cand));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "too many existing diagnostics archives"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -1467,5 +1484,25 @@ mod tests {
 
         let (refreshed_input, ..) = engine.gather_diagnostics(false).await.unwrap();
         assert_ne!(refreshed_input.os.name, "CachedSentinelOS");
+    }
+
+    #[test]
+    fn publishing_never_replaces_an_existing_archive_even_without_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("report.zip"), b"first export").unwrap();
+        let tmp = dir.path().join(".report.zip.1.part");
+        std::fs::write(&tmp, b"second export").unwrap();
+        let no_links = |_: &Path, _: &Path| Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no links"));
+        let (name, path) = publish_no_replace(&tmp, dir.path(), "report.zip", &no_links).unwrap();
+        assert_eq!(name, "report-2.zip");
+        assert_eq!(std::fs::read(dir.path().join("report.zip")).unwrap(), b"first export");
+        assert_eq!(std::fs::read(path).unwrap(), b"second export");
+        assert!(!tmp.exists(), "the part file is removed");
+        // A failure also leaves no part file behind.
+        let tmp2 = dir.path().join(".x.part");
+        std::fs::write(&tmp2, b"x").unwrap();
+        let missing = dir.path().join("nope");
+        assert!(publish_no_replace(&tmp2, &missing, "a.zip", &no_links).is_err());
+        assert!(!tmp2.exists());
     }
 }
