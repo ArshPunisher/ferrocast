@@ -63,8 +63,10 @@ impl PressedKeys {
     }
 
     /// The shortcuts were replaced or let go: nothing is down any more.
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
+    /// Every action that had a key down, forgotten: they are to be let go by the caller (a key
+    /// held while the shortcuts were replaced would never be seen coming up).
+    pub(crate) fn clear(&mut self) -> Vec<String> {
+        self.0.drain().map(|(a, _)| a).collect()
     }
 }
 
@@ -186,7 +188,10 @@ pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> 
     let mut map = state.keys.lock().unwrap_or_else(|p| p.into_inner());
     // Shortcuts about to be replaced can't report a key let go any more: nothing stays held.
     let _ = state.queue.send((RELEASE_HOLDS.to_string(), false));
-    state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    let held = state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    for action in held.into_iter().filter(|a| !push_hold::is_push_hold(a)) {
+        let _ = state.queue.send((action, false));
+    }
     for (sc, _) in map.drain() {
         let _ = app.global_shortcut().unregister(sc);
     }
@@ -218,7 +223,10 @@ pub(crate) fn capture(app: &AppHandle, on: bool) {
             tracing::info!("the shortcuts are let go while a shortcut field waits for a key");
             // A key held now would never be seen coming up.
             let _ = state.queue.send((RELEASE_HOLDS.to_string(), false));
-            state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            let held = state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            for action in held.into_iter().filter(|a| !push_hold::is_push_hold(a)) {
+                let _ = state.queue.send((action, false));
+            }
             let _ = app.global_shortcut().unregister_all();
             watch_capture(app.clone());
         }
@@ -529,7 +537,7 @@ mod tests {
         let a = "push_show:Main\nCam";
         assert!(k.up(a, "F8"), "nothing down: it ends");
         assert!(k.down(a, "F8"));
-        k.clear();
+        assert_eq!(k.clear(), vec![a.to_string()], "the action that was down is handed back to be let go");
         assert!(k.down(a, "F9"), "after the shortcuts were replaced it starts again");
     }
 

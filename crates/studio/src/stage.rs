@@ -2885,9 +2885,13 @@ impl Stage {
         let (store, _) = self.resolve_filter_store(target, None, None)?;
         have.extend(self.names_on_source(&store, true)?);
         let rename_unique = |f: &mut Value, have: &mut Vec<String>| {
-            let mut n = name_of(f).to_string();
-            while have.contains(&n) {
-                n.push_str(" 2");
+            let base = name_of(f).to_string();
+            let mut n = base.clone();
+            let mut k = 2;
+            while have.contains(&n) && k < 10_000 {
+                // Numbered like a source's name, and never past the length a name may have.
+                n = numbered(&base, k);
+                k += 1;
             }
             have.push(n.clone());
             f["name"] = json!(n);
@@ -3066,7 +3070,7 @@ impl Stage {
             let new = renamed(&old).unwrap_or_else(|| old.clone());
             c["name"] = json!(new);
             c["uuid"] = json!(fresh_ids[si]);
-            if kind_of(&c) == "ferrocast_clone" {
+            if matches!(kind_of(&c), "ferrocast_clone" | "source-clone") {
                 let target = c.pointer("/settings/clone").and_then(Value::as_str).unwrap_or("").to_string();
                 if let Some(n) = renamed(&target) {
                     c["settings"]["clone"] = json!(n);
@@ -3075,6 +3079,12 @@ impl Stage {
                         "\"{old}\" shows \"{target}\", which isn't in this collection: paste that source first."
                     )));
                 }
+            }
+            // A Sound bars source listens to another source: the copy listens to the pasted one.
+            if kind_of(&c) == "ferrocast_visualizer"
+                && let Some(n) = c.pointer("/settings/source").and_then(Value::as_str).and_then(renamed)
+            {
+                c["settings"]["source"] = json!(n);
             }
             if let Some(fs) = c.get_mut("filters").and_then(Value::as_array_mut) {
                 self.fix_pasted_filters(fs, &new, &renamed, &mut notes);
@@ -3160,7 +3170,11 @@ impl Stage {
             if let Some(n) = renamed(&side) {
                 f["settings"]["sidechain_source"] = json!(n);
             } else if self.source(&side).is_err()
-                && !self.sources_list().iter().any(|s| s["uuid"].as_str() == Some(&side))
+                && !self
+                    .sources_list()
+                    .iter()
+                    .chain(self.channels_list().iter())
+                    .any(|s| s["uuid"].as_str().is_some_and(|u| u.eq_ignore_ascii_case(&side)) || name_of(s) == side)
             {
                 f["settings"]["sidechain_source"] = json!("none");
                 notes.push(format!(
@@ -6793,6 +6807,32 @@ mod tests {
         let b = stage();
         b.restore_all(&on_disk);
         assert_eq!(visible_in(&live_doc(&b), "Main", red.id), Some(false));
+    }
+
+    #[test]
+    fn pasted_filter_names_stay_within_the_name_limit_and_sidechains_see_global_channels() {
+        let a = stage();
+        let long = "f".repeat(100);
+        ok(a.add_source("Main", "color_source_v3", "Mic", &json!({}), false));
+        ok(a.add_filter("Mic", "gain_filter", &long, &json!({})));
+        let clip = ok(a.copy_filters("Mic", None));
+        ok(a.paste_filter_values("Mic", None, &clip));
+        assert!(ok(a.filters("Mic")).iter().all(|f| f.name.chars().count() <= 100), "names fit");
+        assert_eq!(ok(a.filters("Mic")).len(), 2);
+    }
+
+    #[test]
+    fn a_sound_bars_source_listens_to_the_pasted_copy_and_a_source_clone_is_remapped() {
+        let (a, b) = (stage(), stage());
+        let red = color(&a, "Red");
+        let bars = ok(a.add_source("Main", "ferrocast_visualizer", "Bars", &json!({ "source": "Red" }), false));
+        let blue = color(&a, "Blue");
+        let g = ok(a.group_together("Main", &[red.id, bars.id, blue.id], "Pair"));
+        let clip = ok(a.copy_source("Main", g.id));
+        color(&b, "Red"); // a name taken: the pasted one becomes "Red 2"
+        ok(b.paste_source("Main", &clip));
+        let src = |n: &str| b.sources_list().into_iter().find(|s| name_of(s) == n);
+        assert_eq!(src("Bars").and_then(|s| s.pointer("/settings/source").cloned()), Some(json!("Red 2")));
     }
 
     #[test]

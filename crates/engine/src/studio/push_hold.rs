@@ -168,6 +168,8 @@ impl Holds {
     pub(crate) fn release_all(&mut self) -> Vec<(Target, bool)> {
         let out = self.by_target.drain().map(|(t, (was, _))| (t, was)).collect();
         self.by_action.clear();
+        // Restores waiting for the collection that was left are for nothing in the new one.
+        self.pending.clear();
         self.epoch += 1;
         out
     }
@@ -737,6 +739,15 @@ mod tests {
         assert_eq!(host.enabled("Cam", "Glow"), Some(false));
         e.studio_push_hold("push_filter_off:Cam\nGlow", false).await.unwrap();
         assert_eq!(host.enabled("Cam", "Glow"), Some(true));
+    }
+
+    #[test]
+    fn restores_pending_for_a_left_collection_are_dropped_by_the_switch() {
+        let mut h = Holds::default();
+        h.keep_pending(item("Main", 1), false);
+        assert!(!h.take_pending_is_empty());
+        let _ = h.release_all();
+        assert!(h.take_pending_is_empty(), "they belong to the collection that was left");
     }
 
     #[test]

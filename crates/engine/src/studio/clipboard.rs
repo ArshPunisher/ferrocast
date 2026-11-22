@@ -41,7 +41,17 @@ fn wrong(holds: &str, wanted: &str) -> EngineError {
 }
 
 /// A source copied as plain data: its first source's name and how many sources it carries.
+/// The most a copy may weigh (a paste is sent again to the Studio).
+pub(crate) const MAX_CLIP_BYTES: usize = 8 * 1024 * 1024;
+
+fn too_big(v: &Value) -> bool {
+    v.to_string().len() > MAX_CLIP_BYTES
+}
+
 pub(crate) fn source_clip(value: Value, from: &str) -> Result<Clip, EngineError> {
+    if too_big(&value) {
+        return Err(EngineError::Invalid("That copy is too big to keep: copy a smaller group.".into()));
+    }
     let sources = value.get("sources").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
     let name = value.pointer("/sources/0/name").and_then(Value::as_str).map(str::to_string);
     match (sources, name) {
@@ -51,6 +61,9 @@ pub(crate) fn source_clip(value: Value, from: &str) -> Result<Clip, EngineError>
 }
 
 pub(crate) fn filter_clip(value: Value) -> Result<Clip, EngineError> {
+    if too_big(&value) {
+        return Err(EngineError::Invalid("Those filters are too big to keep as a copy.".into()));
+    }
     let count = value.get("filters").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
     let from = value.get("from").and_then(Value::as_str).unwrap_or("").to_string();
     if count == 0 {
@@ -127,6 +140,14 @@ mod tests {
         assert!(source_clip(json!({}), "Main").is_err());
         let c = source_clip(json!({ "item": {}, "sources": [{ "name": "Cam" }, { "name": "Mic" }] }), "Main").unwrap();
         assert_eq!(c.summary(), json!({ "kind": "source", "name": "Cam", "from": "Main", "count": 2 }));
+    }
+
+    #[test]
+    fn a_copy_over_the_size_limit_is_refused_and_leaves_the_clipboard_alone() {
+        let big = json!({ "item": {}, "sources": [{ "name": "A", "blob": "x".repeat(MAX_CLIP_BYTES) }] });
+        assert!(matches!(source_clip(big, "Main"), Err(EngineError::Invalid(m)) if m.contains("too big")));
+        let big = json!({ "filters": [{ "name": "F", "blob": "x".repeat(MAX_CLIP_BYTES) }], "from": "Mic" });
+        assert!(filter_clip(big).is_err());
     }
 
     #[test]
