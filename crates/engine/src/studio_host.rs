@@ -92,8 +92,9 @@ pub struct PreviewRect {
     pub shade: Option<f64>,
 }
 
-/// At most this many holes (menus, panels) at once.
-pub const PREVIEW_HOLES: usize = 16;
+/// At most this many holes at once: menus and panels, and while editing the guide lines, the box
+/// round several picked sources and its handles (a dozen on their own).
+pub const PREVIEW_HOLES: usize = 64;
 
 impl PreviewRect {
     /// `bg` as libobs wants a display's colour (0xAABBGGRR).
@@ -1089,12 +1090,13 @@ impl Default for StudioSettings {
             multiview_layout: "top".into(),
             multiview_labels: true,
             multiview_safe_areas: false,
-            // OBS's defaults.
+            // On, 10 pixels, and everything it can line up with (OBS's own default is the canvas's
+            // edges only): the preview draws a guide line for each thing a source snaps to.
             snapping: true,
             snap_px: 10,
             snap_screen: true,
-            snap_sources: false,
-            snap_center: false,
+            snap_sources: true,
+            snap_center: true,
             confirm_go_live: false,
             confirm_end_stream: true,
             confirm_stop_record: false,
@@ -1481,6 +1483,42 @@ pub struct ItemTarget {
     pub id: i64,
 }
 
+/// The most boxes one `SetItemBoxes` takes.
+pub const MAX_BOXES: usize = 500;
+
+/// One item's box in a batch (`SetItemBoxes`): its first corner and its sides, canvas pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct ItemBoxIn {
+    pub id: i64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Why several boxes are sent: a move or resize (a drag, the arrow keys), or one click of Align or
+/// Space out, which are named steps of their own in the undo list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoxReason {
+    #[default]
+    Move,
+    Align,
+    Distribute,
+}
+
+/// A box a preview edit sends: numbers on the canvas, sides of at least a pixel.
+fn check_box(x: f32, y: f32, w: f32, h: f32) -> Result<(), EngineError> {
+    const MAX: f32 = 100_000.0;
+    if ![x, y, w, h].iter().all(|v| v.is_finite() && v.abs() <= MAX) {
+        return Err(EngineError::Invalid("x, y, w, h: numbers from -100000 to 100000.".into()));
+    }
+    if w < 1.0 || h < 1.0 {
+        return Err(EngineError::Invalid("w, h: at least 1 pixel.".into()));
+    }
+    Ok(())
+}
+
 /// One thing to do to the scene collection. The routes build these; [`StudioAct::check`]
 /// refuses bad input before the host sees it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1772,6 +1810,19 @@ pub enum StudioAct {
         h: f32,
         #[serde(default)]
         save: bool,
+    },
+    /// Moves and sizes several items at once, each as `SetItemBox` does: aligning, spacing out, or
+    /// moving and resizing a group of picked items, as one undo step → the items, in the order
+    /// given. All of them or none. `save` at the end of a drag.
+    SetItemBoxes {
+        scene: String,
+        items: Vec<ItemBoxIn>,
+        #[serde(default)]
+        save: bool,
+        /// `align` or `distribute` for one click of those buttons (their own undo step, named
+        /// for it); missing: a move.
+        #[serde(default)]
+        reason: BoxReason,
     },
     /// Crops an item from the preview (Alt-drag on a handle): left, top, right, bottom in the
     /// source's own pixels, keeping what's left where it is on screen → the item. `save` at the
@@ -2201,16 +2252,22 @@ impl StudioAct {
                 }
                 Ok(())
             }
-            A::SetItemBox { scene, x, y, w, h, .. } => {
+            A::SetItemBoxes { scene, items, .. } => {
                 check_source_name(scene)?;
-                const MAX: f32 = 100_000.0;
-                if ![*x, *y, *w, *h].iter().all(|v| v.is_finite() && v.abs() <= MAX) {
-                    return Err(EngineError::Invalid("x, y, w, h: numbers from -100000 to 100000.".into()));
+                if items.is_empty() || items.len() > MAX_BOXES {
+                    return Err(EngineError::Invalid(format!("items: 1 to {MAX_BOXES} boxes.")));
                 }
-                if *w < 1.0 || *h < 1.0 {
-                    return Err(EngineError::Invalid("w, h: at least 1 pixel.".into()));
+                for (n, b) in items.iter().enumerate() {
+                    if items[..n].iter().any(|o| o.id == b.id) {
+                        return Err(EngineError::Invalid(format!("items: item {} twice.", b.id)));
+                    }
+                    check_box(b.x, b.y, b.w, b.h)?;
                 }
                 Ok(())
+            }
+            A::SetItemBox { scene, x, y, w, h, .. } => {
+                check_source_name(scene)?;
+                check_box(*x, *y, *w, *h)
             }
             A::Transform { scene, .. } => check_source_name(scene),
             A::Undo | A::Redo | A::History | A::StudioMode { .. } | A::SetStudioOptions { .. } => Ok(()),
@@ -2353,8 +2410,10 @@ impl StudioAct {
     /// It changes the collection (the host saves it after).
     pub fn changes(&self) -> bool {
         use StudioAct as A;
-        if let A::SetItemBox { save: last, .. } | A::SetItemCrop { save: last, .. } | A::TBar { release: last, .. } =
-            self
+        if let A::SetItemBox { save: last, .. }
+        | A::SetItemBoxes { save: last, .. }
+        | A::SetItemCrop { save: last, .. }
+        | A::TBar { release: last, .. } = self
         {
             return *last;
         }
@@ -3330,6 +3389,16 @@ pub(crate) fn failed(message: String) -> EngineError {
     if message.starts_with("There's no source") {
         return refused(404, "studio_no_source", message, "Refresh the list of sources.");
     }
+    // An item id that isn't in the scene (a box, a crop, a batch): like the other item routes.
+    // Its exact shape (`"Scene" has no item 9.`), so a scene or source named "has no item" doesn't
+    // read as one.
+    if message.starts_with('"') && message.contains("\" has no item ") && !message.starts_with("There's no") {
+        return refused(404, "studio_no_source", message, "Refresh the list of sources.");
+    }
+    // Several boxes at once: a group and one of its own sources can't be in one request.
+    if message.contains("can't be moved together") {
+        return EngineError::Invalid(message);
+    }
     if message.starts_with("There's no scene called") {
         return refused(404, "studio_no_scene", message, "Refresh the list of scenes.");
     }
@@ -4211,6 +4280,53 @@ mod tests {
         assert!(gl.check().is_ok());
     }
 
+    /// A new profile snaps a moved source to the canvas's edges and middle and to other sources'
+    /// edges and middles, 10 pixels near (the guide lines in the preview show what it caught).
+    #[test]
+    fn the_preview_snaps_to_everything_by_default() {
+        let s = StudioSettings::default();
+        assert!(s.snapping && s.snap_screen && s.snap_center && s.snap_sources);
+        assert_eq!(s.snap_px, 10);
+    }
+
+    /// The preview's holes: the box round several picked sources alone is a dozen, with a few
+    /// guide lines and a menu that is more than the old 16 (Neon: the app answered 400 and kept
+    /// painting the old holes).
+    #[test]
+    fn an_item_that_is_not_in_the_scene_is_a_404_like_the_other_item_routes() {
+        let e = failed("\"Main\" has no item 999.".into());
+        assert!(matches!(&e, EngineError::Refused { status: 404, code: "studio_no_source", .. }), "{e:?}");
+        // A scene called that is still a missing scene.
+        let e = failed("There's no scene called \"has no item\".".into());
+        assert!(matches!(&e, EngineError::Refused { status: 404, code: "studio_no_scene", .. }), "{e:?}");
+    }
+
+    #[test]
+    fn a_group_with_its_own_source_in_one_batch_is_a_400() {
+        let e = failed("a group and a source inside it can't be moved together.".into());
+        assert!(matches!(&e, EngineError::Invalid(m) if m.contains("together")), "{e:?}");
+    }
+
+    #[test]
+    fn the_preview_takes_enough_holes_for_the_edit_guides() {
+        let rect = |n: usize| PreviewRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+            vh: 0.0,
+            canvas: None,
+            bg: None,
+            stripe: None,
+            holes: vec![PreviewHole { x: 0.0, y: 0.0, w: 4.0, h: 4.0, r: 0.0 }; n],
+            opacity: None,
+            shade: None,
+        };
+        assert!(rect(20).validate().is_ok());
+        assert!(rect(PREVIEW_HOLES).validate().is_ok());
+        assert!(rect(PREVIEW_HOLES + 1).validate().is_err());
+    }
+
     #[test]
     fn x264_and_lossless_need_ffmpeg() {
         let s = StudioSettings::default();
@@ -4361,6 +4477,32 @@ mod tests {
         ] {
             assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
         }
+        // Several boxes at once: one act, checked as a whole.
+        let one = |id, x| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 };
+        let many = |items: Vec<ItemBoxIn>, save| StudioAct::SetItemBoxes {
+            scene: "Main".into(),
+            items,
+            save,
+            reason: BoxReason::default(),
+        };
+        assert!(!many(vec![one(3, 0.0)], false).changes());
+        assert!(many(vec![one(3, 0.0)], true).changes());
+        e.studio_act(many(vec![one(3, 1.0), one(4, 2.0)], true)).await.unwrap();
+        for bad in [
+            many(vec![], true),
+            many((0..=MAX_BOXES as i64).map(|i| one(i, 0.0)).collect(), true),
+            many(vec![one(3, 0.0), one(3, 5.0)], true),
+            many(vec![one(3, f32::NAN)], true),
+            many(vec![ItemBoxIn { w: 0.5, ..one(3, 0.0) }], true),
+            StudioAct::SetItemBoxes {
+                scene: String::new(),
+                items: vec![one(3, 0.0)],
+                save: true,
+                reason: BoxReason::default(),
+            },
+        ] {
+            assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
         let pick =
             StudioAct::Select { scene: Some("Main".into()), id: Some(3), frames: false, also: vec![4], guides: false };
         assert!(!pick.changes());
@@ -4377,7 +4519,7 @@ mod tests {
         e.studio_act(StudioAct::Select { scene: None, id: None, frames: false, also: vec![], guides: false })
             .await
             .unwrap();
-        assert_eq!(fake.acts.lock().unwrap().len(), 4);
+        assert_eq!(fake.acts.lock().unwrap().len(), 5);
 
         // OBS's filter strings become dialog filters; "any file" is left to the dialog.
         let f = FilePick {

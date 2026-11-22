@@ -1531,6 +1531,64 @@ fn every_widget_kind_has_a_default_that_passes_its_own_checks() {
         let (w, h) = widget_default_size_for_tests(kind);
         assert!(w > 0 && h > 0, "{kind:?}");
         let cfg = widget_default_config_for_tests(kind);
-        ferrocast_core::overlay::validate_widget_config(kind, &cfg).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        // As a whole overlay, through the same checks saving one goes through (a label needs a
+        // source: a default without one was dropped silently on import).
+        let overlay = ferrocast_core::overlay::Overlay {
+            id: String::new(),
+            name: "t".into(),
+            token: String::new(),
+            width: 1920,
+            height: 1080,
+            widgets: vec![ferrocast_core::overlay::Widget::new("w1", kind, (0, 0, w, h), cfg)],
+            updated_at: 0,
+            design: None,
+        };
+        overlay.validate().unwrap_or_else(|e| panic!("{kind:?}: {e:?}"));
     }
+}
+
+#[test]
+fn imported_stream_labels_get_the_label_source_their_kind_means() {
+    let png = make_tiny_png();
+    let label = |id: &str, ty: &str| {
+        json!({
+            "id": id, "name": id, "sceneNodeType": "item", "x": 0.1, "y": 0.9,
+            "scaleX": 1.0 / 1920.0, "scaleY": 1.0 / 1080.0, "visible": true, "locked": false,
+            "content": { "nodeType": "StreamlabelNode", "data": { "labelType": ty, "textSource": { "nodeType": "TextNode", "data": { "settings": {} } } } }
+        })
+    };
+    let cfg = streamlabs_sample_json(vec![
+        label("l1", "most_recent_follower"),
+        label("l2", "session_follower_count"),
+        label("l3", "most_recent_donator"),
+        label("l4", "total_subscriber_count"),
+        label("l5", "something_odd"),
+    ]);
+    let cfg = serde_json::to_vec(&cfg).unwrap();
+    let zip = build_zip(vec![
+        ("config.json", &cfg, None),
+        ("assets/frame.png", &png, None),
+        ("assets/loop.webm", TINY_WEBM, None),
+        ("assets/stinger.webm", TINY_WEBM, None),
+    ]);
+    let p = parse_overlay_zip(&zip, "labels.overlay").unwrap();
+    let labels: Vec<&ferrocast_core::overlay::Widget> =
+        p.scene_overlays.iter().flat_map(|o| o.widgets.iter()).filter(|w| w.kind == WidgetKind::Label).collect();
+    assert!(labels.len() >= 5, "{}", labels.len());
+    let sources: Vec<String> = labels.iter().map(|w| w.config["source"].as_str().unwrap_or("").to_string()).collect();
+    for want in ["latest_follower", "session_follows", "latest_tip", "alltime_subs"] {
+        assert!(sources.iter().any(|s| s == want), "{want} in {sources:?}");
+    }
+    for w in &labels {
+        ferrocast_core::overlay::validate_label(&w.config).unwrap_or_else(|e| panic!("{e}: {:?}", w.config));
+        let t = w.config["template"].as_str().unwrap_or("");
+        assert!(t.contains("{value}") && !t.contains("recent_"), "the new template words: {t}");
+    }
+}
+
+#[test]
+fn an_overlay_that_could_not_be_made_is_said_in_the_import_report() {
+    use crate::import::overlay::overlay_not_made_note;
+    let note = overlay_not_made_note("BRB", "config.source: pick a label source.");
+    assert!(note.contains("BRB") && note.contains("pick a label source"), "{note}");
 }

@@ -1709,6 +1709,10 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         }
         A::SetItemFilterScope { scene, id, own } => v(to_json!(c.set_item_filter_scope(&scene, id, own)?)),
         A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
+        A::SetItemBoxes { scene, items, .. } => {
+            let boxes: Vec<_> = items.iter().map(|b| (b.id, b.x, b.y, b.w, b.h)).collect();
+            v(to_json!(c.set_item_boxes(&scene, &boxes)?))
+        }
         A::SetItemCrop { scene, id, crop, .. } => v(to_json!(c.set_item_crop(&scene, id, crop)?)),
         A::Transform { scene, id } => v(to_json!(c.transform(&scene, id)?)),
         A::TransitionSettings { kind } => Ok(c.transition_settings(&kind)),
