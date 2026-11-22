@@ -300,12 +300,18 @@ fn main() {
     // The Store package's startup task can't pass `--minimized`: it's asked instead.
     let minimized = std::env::args().any(|a| a == MINIMIZED_ARG) || store::started_at_login();
     let startup_deeplink = std::env::args().find(|a| is_ferrocast_deeplink(a));
+    let recent_link = RecentLink::default();
+    if let Some(l) = &startup_deeplink {
+        // The launch is the first report: the OS reporting the same link again is not a second click.
+        recent_link.accept(l, std::time::Instant::now());
+    }
     let has_startup_link = startup_deeplink.is_some();
     if store::packaged() {
         tracing::info!("running from the Microsoft Store package: the Store updates it");
     }
     let app = tauri::Builder::default()
         .manage(PendingDeepLink(std::sync::Mutex::new(startup_deeplink)))
+        .manage(recent_link)
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(uri) = args.iter().find(|a| is_ferrocast_deeplink(a)) {
                 dispatch_deeplink(app, uri);
@@ -313,6 +319,10 @@ fn main() {
                 show_window(app);
             }
         }))
+        // Registers ferrocast:// with the OS (macOS Info.plist, the Windows registry, Linux
+        // .desktop and MIME); the links themselves come through the command line (single instance)
+        // and macOS's opened-URL event, both handled below.
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().args([MINIMIZED_ARG]).build())
@@ -341,6 +351,15 @@ fn main() {
                 .build(),
         )
         .setup(move |app| {
+            // An install that didn't go through the installer (an AppImage, a portable copy)
+            // registers the scheme itself; the Store package and the bundles already have it.
+            #[cfg(any(windows, target_os = "linux"))]
+            if !store::packaged() {
+                use tauri_plugin_deep_link::DeepLinkExt as _;
+                if let Err(e) = app.deep_link().register_all() {
+                    tracing::warn!(error = %e, "couldn't register the ferrocast:// scheme");
+                }
+            }
             let started = tauri::async_runtime::block_on(start(&dir, safe_mode));
             let running = match started {
                 Ok(r) => r,
@@ -1205,8 +1224,37 @@ fn store_deeplink_route(uri: &str) -> String {
     format!("#/store?link={encoded}")
 }
 
+/// The last link dispatched and when: the same link reported again within a moment is one click.
+#[derive(Default)]
+struct RecentLink(std::sync::Mutex<Option<(String, std::time::Instant)>>);
+
+impl RecentLink {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Whether this report is a new click (false: a repeat of the last one, or not a ferrocast link).
+    fn accept(&self, uri: &str, now: std::time::Instant) -> bool {
+        if !is_ferrocast_deeplink(uri) {
+            return false;
+        }
+        let mut last = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((prev, at)) = last.as_ref()
+            && prev == uri
+            && now.saturating_duration_since(*at) < Self::WINDOW
+        {
+            return false;
+        }
+        *last = Some((uri.to_string(), now));
+        true
+    }
+}
+
 fn dispatch_deeplink(app: &AppHandle, uri: &str) {
     if !is_ferrocast_deeplink(uri) {
+        return;
+    }
+    if let Some(recent) = app.try_state::<RecentLink>()
+        && !recent.accept(uri, std::time::Instant::now())
+    {
         return;
     }
     if let Some(pending) = app.try_state::<PendingDeepLink>() {
@@ -1858,6 +1906,52 @@ mod update_tests {
         assert!(cur_len <= cap, "active log exceeded cap: {cur_len} > {cap}");
         assert!(bak_len <= cap, "backup log exceeded cap: {bak_len} > {cap}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One click must reach the dashboard once, even when the OS and the app both report it (the
+    /// launch's command line and the opened-URL event, or the single-instance relay).
+    #[test]
+    fn the_same_link_reported_twice_in_a_moment_is_dispatched_once() {
+        use std::time::{Duration, Instant};
+        let recent = RecentLink::default();
+        let t0 = Instant::now();
+        let a = "ferrocast://store/install/aurora-pulse";
+        assert!(recent.accept(a, t0), "the first report goes through");
+        assert!(!recent.accept(a, t0 + Duration::from_millis(400)), "the same link again at once is the same click");
+        assert!(
+            recent.accept("ferrocast://store/install/other", t0 + Duration::from_millis(500)),
+            "another link is its own"
+        );
+        assert!(recent.accept(a, t0 + Duration::from_secs(10)), "the same link clicked later is a new click");
+        // Not a ferrocast link: never accepted, never remembered.
+        assert!(!recent.accept("https://evil.example/x", t0 + Duration::from_secs(20)));
+    }
+
+    /// A link that launched the app (cold start) is kept until the window can show it, then the
+    /// same link reported again by the OS does not open the confirmation a second time.
+    #[test]
+    fn a_launch_link_is_pending_once_and_not_repeated_by_the_os() {
+        use std::time::{Duration, Instant};
+        let uri = "ferrocast://store/install/aurora-pulse";
+        let pending = PendingDeepLink(std::sync::Mutex::new(Some(uri.to_string())));
+        let recent = RecentLink::default();
+        let t0 = Instant::now();
+        // The launch itself counts as the first report.
+        assert!(recent.accept(uri, t0));
+        assert_eq!(pending.peek().as_deref(), Some(uri));
+        // macOS then reports the same link as an opened URL: swallowed.
+        assert!(!recent.accept(uri, t0 + Duration::from_millis(250)));
+        assert!(pending.clear_if(uri));
+        assert!(pending.peek().is_none());
+    }
+
+    /// The scheme's registration is in the app's own config, so the bundles carry it.
+    #[test]
+    fn the_ferrocast_scheme_is_registered_in_the_bundle_config() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json is JSON");
+        let schemes = &conf["plugins"]["deep-link"]["desktop"]["schemes"];
+        assert_eq!(schemes, &serde_json::json!(["ferrocast"]), "{conf}");
     }
 
     #[test]
