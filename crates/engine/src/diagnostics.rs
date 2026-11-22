@@ -241,6 +241,7 @@ impl Engine {
 
     /// Writes the redacted support report zip into `folder`.
     pub async fn write_diagnostics_report(&self, folder: &Path) -> Result<WrittenReport, EngineError> {
+        let data_dir = self.inner.data_dir.clone();
         let canonical = tokio::task::spawn_blocking({
             let f = folder.to_path_buf();
             move || -> Result<PathBuf, EngineError> {
@@ -253,28 +254,71 @@ impl Engine {
                 if !f.is_dir() {
                     return Err(EngineError::Invalid("Pick a folder, not a file.".into()));
                 }
-                Ok(f)
+                let canonical_folder = std::fs::canonicalize(&f)
+                    .map_err(|_| EngineError::Invalid("Couldn't resolve that folder.".into()))?;
+                let canonical_data = std::fs::canonicalize(&data_dir).unwrap_or(data_dir);
+                if canonical_folder.starts_with(&canonical_data) {
+                    return Err(EngineError::Invalid("Pick a folder outside Ferrocast's data folder.".into()));
+                }
+                Ok(canonical_folder)
             }
         })
         .await
         .map_err(|e| EngineError::Unavailable(e.to_string()))??;
 
         let (filename, bytes, report) = self.diagnostics_zip_bytes().await?;
-        let dest = canonical.join(&filename);
         let size_bytes = u64::try_from(bytes.len()).unwrap_or(0);
-        let out_path = dest.clone();
 
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let tmp = out_path.with_extension("zip.part");
-            std::fs::write(&tmp, &bytes)?;
-            std::fs::rename(&tmp, &out_path)?;
-            Ok(())
+        let (actual_filename, dest) = tokio::task::spawn_blocking(move || -> std::io::Result<(String, PathBuf)> {
+            use std::io::Write;
+            let mut rnd = [0u8; 8];
+            let _ = getrandom::fill(&mut rnd);
+            let rnd_hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+            let tmp = canonical.join(format!(".{filename}.{rnd_hex}.part"));
+            {
+                let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+                if let Err(e) = f.write_all(&bytes).and_then(|()| f.flush()) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
+
+            let stem = filename.strip_suffix(".zip").unwrap_or(&filename);
+            let mut n = 1usize;
+            let result = loop {
+                let cand_name = if n == 1 { filename.clone() } else { format!("{stem}-{n}.zip") };
+                let cand = canonical.join(&cand_name);
+                match std::fs::hard_link(&tmp, &cand) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        break Ok((cand_name, cand));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        n += 1;
+                    }
+                    Err(_) => {
+                        if !cand.exists() {
+                            std::fs::rename(&tmp, &cand)?;
+                            break Ok((cand_name, cand));
+                        }
+                        n += 1;
+                    }
+                }
+                if n > 1000 {
+                    let _ = std::fs::remove_file(&tmp);
+                    break Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "too many existing diagnostics archives",
+                    ));
+                }
+            };
+            result
         })
         .await
         .map_err(|e| EngineError::Unavailable(e.to_string()))?
         .map_err(|e| EngineError::Unavailable(format!("Couldn't save the support archive here: {e}")))?;
 
-        Ok(WrittenReport { path: dest.display().to_string(), filename, size_bytes, report })
+        Ok(WrittenReport { path: dest.display().to_string(), filename: actual_filename, size_bytes, report })
     }
 
     async fn gather_diagnostics(
@@ -1196,5 +1240,36 @@ mod tests {
         let tailed_str = String::from_utf8_lossy(&tailed);
         assert!(!tailed_str.contains("line1"), "old line should be dropped on seek: {tailed_str}");
         assert!(tailed_str.contains("line3_end"), "tail missing: {tailed_str}");
+    }
+
+    #[tokio::test]
+    async fn write_diagnostics_report_rejects_data_dir_and_disambiguates_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let out_folder = tempfile::tempdir().unwrap();
+        let link_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+
+        // Data dir itself and subdirectories inside data_dir must be rejected.
+        assert!(matches!(engine.write_diagnostics_report(dir.path()).await, Err(EngineError::Invalid(_))));
+        assert!(matches!(engine.write_diagnostics_report(&logs).await, Err(EngineError::Invalid(_))));
+
+        #[cfg(unix)]
+        {
+            let link = link_root.path().join("alias-to-logs");
+            std::os::unix::fs::symlink(&logs, &link).unwrap();
+            assert!(matches!(engine.write_diagnostics_report(&link).await, Err(EngineError::Invalid(_))));
+        }
+
+        // Sequential same-second exports must never overwrite earlier files.
+        let first = engine.write_diagnostics_report(out_folder.path()).await.unwrap();
+        let first_bytes = std::fs::read(&first.path).unwrap();
+        let second = engine.write_diagnostics_report(out_folder.path()).await.unwrap();
+        assert_ne!(first.path, second.path, "collision overwrote earlier archive");
+        assert!(std::path::Path::new(&first.path).is_file());
+        assert!(std::path::Path::new(&second.path).is_file());
+        assert_eq!(std::fs::read(&first.path).unwrap(), first_bytes);
     }
 }

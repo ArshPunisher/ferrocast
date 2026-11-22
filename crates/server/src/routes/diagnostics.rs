@@ -1,7 +1,9 @@
 //! Support diagnostics endpoints: preview likely causes + export redacted zip archive (`#7`).
 
+use std::net::{IpAddr, SocketAddr};
+
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, Extension, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use ferrocast_engine::studio_host::FilePick;
@@ -9,11 +11,39 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::extract::Body;
+use crate::remote::RemotePrincipal;
+
+fn ensure_local_loopback(
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    remote: Option<Extension<RemotePrincipal>>,
+) -> ApiResult<()> {
+    if remote.is_some() {
+        return Err(ApiError::forbidden(
+            "Support diagnostics are only available directly on this computer, not over remote access.",
+        ));
+    }
+    let Some(Extension(ConnectInfo(addr))) = connect else {
+        return Err(ApiError::forbidden("Support diagnostics require a direct local connection."));
+    };
+    let is_loopback = match addr.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    };
+    if !is_loopback {
+        return Err(ApiError::forbidden("Support diagnostics are only available from this computer, not over LAN."));
+    }
+    Ok(())
+}
 
 /// `GET /api/v1/diagnostics/preview` -> redacted [`ferrocast_core::diagnostics::SupportReport`].
-pub async fn preview(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+pub async fn preview(
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    remote: Option<Extension<RemotePrincipal>>,
+    State(app): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    ensure_local_loopback(connect, remote)?;
     let report = app.engine.diagnostics_preview().await?;
     Ok(Json(json!(report)))
 }
@@ -27,7 +57,13 @@ pub struct ReportRequest {
 }
 
 /// `POST /api/v1/diagnostics/report` `{ folder? }` -> writes redacted zip into picked folder.
-pub async fn write_report(State(app): State<AppState>, Body(b): Body<ReportRequest>) -> ApiResult<Json<Value>> {
+pub async fn write_report(
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    remote: Option<Extension<RemotePrincipal>>,
+    State(app): State<AppState>,
+    Body(b): Body<ReportRequest>,
+) -> ApiResult<Json<Value>> {
+    ensure_local_loopback(connect, remote)?;
     let folder = match b.folder.map(|f| f.trim().to_string()).filter(|f| !f.is_empty()) {
         Some(f) => f,
         None => {
@@ -59,7 +95,12 @@ pub async fn write_report(State(app): State<AppState>, Body(b): Body<ReportReque
 }
 
 /// `POST /api/v1/diagnostics/report.zip` -> streams the redacted support zip directly for browsers.
-pub async fn download_zip(State(app): State<AppState>) -> ApiResult<impl IntoResponse> {
+pub async fn download_zip(
+    connect: Option<Extension<ConnectInfo<SocketAddr>>>,
+    remote: Option<Extension<RemotePrincipal>>,
+    State(app): State<AppState>,
+) -> ApiResult<impl IntoResponse> {
+    ensure_local_loopback(connect, remote)?;
     let (filename, bytes, _) = app.engine.diagnostics_zip_bytes().await?;
     let disp = format!("attachment; filename=\"{filename}\"");
     Ok((
