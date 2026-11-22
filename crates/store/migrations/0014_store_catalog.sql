@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS store_installs (
     design_ids     TEXT NOT NULL,
     rule_ids       TEXT NOT NULL,
     plugin_id      TEXT,
+    -- The user's own default alert looks a pack displaced, so removing the pack gives them back.
+    displaced_defaults TEXT NOT NULL DEFAULT '[]',
     installed_at   INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL
 );

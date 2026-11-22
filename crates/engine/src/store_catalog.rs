@@ -16,7 +16,8 @@ use ferrocast_core::alert::{ALERT_KINDS, Variation, default_rules, validate_vari
 use ferrocast_core::design::{Design, EventKey, MotionTag, StyleTag};
 use ferrocast_core::layer::is_color;
 use ferrocast_store::repo::store_catalog::{
-    PluginSnapshot, StoreInstallRecord, StoreUndoEntry, StoreUndoSnapshot, StoreUndoSummary,
+    DisplacedDefault, PluginSnapshot, RuleChange, StoreInstallRecord, StoreUndoEntry, StoreUndoSnapshot,
+    StoreUndoSummary,
 };
 use ferrocast_store::{designfile, repo};
 use serde::{Deserialize, Serialize};
@@ -910,21 +911,47 @@ fn installed_view(
     }
 }
 
-fn merge_variations(existing: &[Variation], item_id: &str, incoming: &[Variation]) -> Vec<Variation> {
+/// What putting a pack's variations into a rule does.
+struct Merged {
+    variations: Vec<Variation>,
+    /// Taken out: the pack's own earlier variations (an update) and the user's default if the
+    /// pack brings one.
+    removed: Vec<Variation>,
+    /// The user's own default look that was taken out (not one of the pack's).
+    displaced: Option<Variation>,
+    /// The ids the pack's variations have in the rule.
+    added: Vec<String>,
+}
+
+fn merge_pack(existing: &[Variation], item_id: &str, incoming: &[Variation]) -> Merged {
     let prefix = format!("store:{item_id}:");
+    let mut removed: Vec<Variation> = existing.iter().filter(|v| v.id.starts_with(&prefix)).cloned().collect();
     let mut out: Vec<Variation> = existing.iter().filter(|v| !v.id.starts_with(&prefix)).cloned().collect();
-    // If the incoming pack supplies a default variation (condition: None), demote or replace
-    // cleanly so the rule keeps exactly one default variation.
-    let has_default = incoming.iter().any(|v| v.condition.is_none());
-    if has_default {
+    // If the incoming pack supplies a default variation (condition: None), it takes the rule's
+    // default place: the one there goes (and is kept, so removing the pack gives it back).
+    let mut displaced = None;
+    if incoming.iter().any(|v| v.condition.is_none()) {
+        displaced = out.iter().find(|v| v.condition.is_none()).cloned();
         out.retain(|v| v.condition.is_some());
+        removed.extend(displaced.clone());
     }
+    let mut added = Vec::new();
     for v in incoming {
         let mut tagged = v.clone();
         tagged.id = format!("{prefix}{}", v.id);
+        added.push(tagged.id.clone());
         out.push(tagged);
     }
-    out
+    Merged { variations: out, removed, displaced, added }
+}
+
+/// What an install changes, as it changes it.
+struct Applied {
+    snap: StoreUndoSnapshot,
+    displaced: Vec<DisplacedDefault>,
+    designs: Vec<Design>,
+    rule_ids: Vec<String>,
+    plugin_id: Option<String>,
 }
 
 /// Why a downloaded plugin package isn't the one the catalog lists: its own id differs.
@@ -1205,94 +1232,86 @@ impl Engine {
         })
     }
 
-    async fn install_verified_item(
+    /// What a package changes, as it goes: every change is written down in `snap` the moment it
+    /// is made, so a failure part way (or a failed commit) can be taken back exactly.
+    async fn apply_item(
         &self,
         item: &StoreItemRaw,
-        creator: &StoreCreator,
-        src: &Source,
+        pkg_bytes: &[u8],
         existing: Option<&StoreInstallRecord>,
         action: &str,
-    ) -> Result<StoreMutationResult, EngineError> {
-        // 1. Download & SHA-256 verify the package BEFORE mutating any state.
-        let max_pkg = max_package_size(item.package.format) as usize;
-        let pkg_bytes = self
-            .fetch_verified_file(src, &item.package.url, item.package.size, &item.package.sha256, max_pkg, &item.title)
-            .await?;
-        // Preview assets aren't installed: each is fetched and fingerprint-checked when shown
-        // (`store_asset`), so an install doesn't download them.
-
-        // 2. Snapshot current state for one-click undo.
-        let mut prev_designs = Vec::new();
-        let mut prev_active_alert = None;
-        let mut prev_rules = Vec::new();
-        let mut prev_plugin = None;
-        if let Some(old) = existing {
-            prev_active_alert = self.active_alert_design().await?;
-            for did in &old.design_ids {
-                if let Ok(d) = self.design(did).await {
-                    prev_designs.push(d);
-                }
-            }
-            if !old.rule_ids.is_empty() {
-                prev_rules = self.rules().into_iter().filter(|r| old.rule_ids.contains(&r.id)).collect();
-            }
-            if let Some(pid) = &old.plugin_id {
-                let pinfo = self.plugins().await.into_iter().find(|p| &p.id == pid);
-                let zip_b64 = snapshot_plugin_zip(&self.plugins_dir(), pid)?.unwrap_or_default();
-                if let Some(p) = pinfo
-                    && !zip_b64.is_empty()
-                {
-                    prev_plugin = Some(PluginSnapshot { id: p.id, zip_b64, on: p.on });
-                }
-            }
-        }
-
-        // 3. Validate and apply payload according to package format.
-        let mut created_designs: Vec<Design> = Vec::new();
-        let mut affected_rule_ids: Vec<String> = Vec::new();
-        let mut installed_plugin_id: Option<String> = None;
-
+        applied: &mut Applied,
+    ) -> Result<(), EngineError> {
         match item.package.format {
             StorePackageFormat::Ferrodesign => {
                 let tmp = self.store().dir().join("tmp");
                 let _ = std::fs::create_dir_all(&tmp);
                 let path = tmp.join(format!("store-{}.ferrodesign", ferrocast_store::new_id()));
-                std::fs::write(&path, &pkg_bytes).map_err(|e| EngineError::Internal(e.to_string()))?;
+                std::fs::write(&path, pkg_bytes).map_err(|e| EngineError::Internal(e.to_string()))?;
                 let res = self.import_design_file(&path).await;
                 let _ = std::fs::remove_file(&path);
                 let report = res?;
-                created_designs = report.designs;
+                applied.snap.created_design_ids = report.designs.iter().map(|d| d.id.clone()).collect();
+                applied.designs = report.designs;
             }
             StorePackageFormat::Ferroalert => {
-                let bundle = check_alert_bundle(&pkg_bytes)?;
-                // Build rule targets before mutating anything; initialize defaults if store has none.
-                let mut current_rules = self.rules();
-                if current_rules.is_empty() {
-                    current_rules = default_rules();
-                }
-                let target_kinds: Vec<&'static str> = bundle.events.iter().map(|e| event_key_str(*e)).collect();
-                let mut next_rules = Vec::new();
-                for kind_name in target_kinds {
-                    if let Some(mut r) = current_rules.iter().find(|r| r.kinds.iter().any(|k| k == kind_name)).cloned()
-                    {
-                        if !prev_rules.iter().any(|p| p.id == r.id) {
-                            prev_rules.push(r.clone());
-                        }
-                        r.variations = merge_variations(&r.variations, &item.id, &bundle.variations);
-                        r.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
-                        affected_rule_ids.push(r.id.clone());
-                        next_rules.push(r);
+                let bundle = check_alert_bundle(pkg_bytes)?;
+                // Plan every rule before changing one: the packs's variations go into each rule that
+                // takes its events, and nothing is touched if there is no such rule.
+                let (mut current_rules, from_defaults) = match self.rules() {
+                    r if r.is_empty() => (default_rules(), true),
+                    r => (r, false),
+                };
+                let mut plan: Vec<(ferrocast_core::alert::AlertRule, RuleChange)> = Vec::new();
+                for kind_name in bundle.events.iter().map(|e| event_key_str(*e)) {
+                    let Some(rule) = current_rules.iter_mut().find(|r| r.kinds.iter().any(|k| k == kind_name)) else {
+                        continue;
+                    };
+                    if plan.iter().any(|(r, _)| r.id == rule.id) {
+                        continue;
                     }
+                    let carried = existing.and_then(|o| o.displaced.iter().find(|d| d.rule_id == rule.id));
+                    let merged = merge_pack(&rule.variations, &item.id, &bundle.variations);
+                    let mut next = rule.clone();
+                    next.variations = merged.variations;
+                    next.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
+                    // The user's own default, taken out by this pack's: kept with the install (the
+                    // one displaced first stays across updates, which find the pack's own there).
+                    if let Some(v) = merged.displaced
+                        && carried.is_none()
+                    {
+                        applied.displaced.push(DisplacedDefault { rule_id: rule.id.clone(), variation: v });
+                    }
+                    plan.push((
+                        next,
+                        RuleChange {
+                            rule_id: rule.id.clone(),
+                            removed: merged.removed,
+                            added: merged.added,
+                            created: from_defaults,
+                        },
+                    ));
                 }
-                for r in next_rules {
-                    self.save_rule(r).await?;
+                if plan.is_empty() {
+                    let wanted: Vec<&str> = bundle.events.iter().map(|e| event_key_str(*e)).collect();
+                    return Err(refused(
+                        422,
+                        "store_alert_no_target",
+                        format!("You have no alert for {} for this pack to go into.", wanted.join(", ")),
+                        "Add that alert in Alerts first, then install the pack. Nothing was changed.",
+                    ));
+                }
+                for (rule, change) in plan {
+                    self.save_rule(rule.clone()).await?;
+                    applied.rule_ids.push(rule.id);
+                    applied.snap.rule_changes.push(change);
                 }
             }
             StorePackageFormat::Ferroplugin => {
                 let tmp = self.store().dir().join("tmp");
                 let _ = std::fs::create_dir_all(&tmp);
                 let path = tmp.join(format!("store-{}.zip", ferrocast_store::new_id()));
-                std::fs::write(&path, &pkg_bytes).map_err(|e| EngineError::Internal(e.to_string()))?;
+                std::fs::write(&path, pkg_bytes).map_err(|e| EngineError::Internal(e.to_string()))?;
                 let res = async {
                     let (manifest, _) = read_plugin_zip(&path)?;
                     if item.plugin_kind.as_deref() != Some(manifest.kind.as_str()) {
@@ -1331,65 +1350,265 @@ impl Engine {
                 }
                 .await;
                 let _ = std::fs::remove_file(&path);
-                installed_plugin_id = Some(res?);
+                let id = res?;
+                applied.snap.created_plugin_id = Some(id.clone());
+                applied.plugin_id = Some(id);
             }
         }
 
-        // On update of a design package, remove old version's design IDs cleanly after new import succeeded.
+        // On update of a design package, the old version's designs go once the new ones are in.
         if action == "update"
             && let Some(old) = existing
         {
             for did in &old.design_ids {
                 if self.active_alert_design().await?.as_deref() == Some(did.as_str()) {
-                    let _ = self.set_active_alert_design(None).await;
+                    self.set_active_alert_design(None).await?;
+                    applied.snap.cleared_active_alert = Some(did.clone());
                 }
-                let did_owned = did.clone();
-                let _ = self.db(move |s| repo::designs::delete(s, &did_owned)).await;
+                self.delete_design_row(did).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a design row; one that is already gone is fine (a retry may have removed it).
+    async fn delete_design_row(&self, id: &str) -> Result<(), EngineError> {
+        let id = id.to_string();
+        match self.db(move |s| repo::designs::delete(s, &id)).await {
+            Err(EngineError::Store(ferrocast_store::StoreError::NotFound(_))) => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Puts back what a Store action changed, using only what the action itself recorded:
+    /// the designs and plugin it made go, the ones it removed come back, the alert variations it
+    /// added or took out are reversed in the rule as it is now (a later edit stays), the active
+    /// alert is restored only if nothing was picked since, and the install row is as it was.
+    /// Every step is tried and may be repeated; the first failure is reported after the rest ran.
+    async fn restore_snapshot(&self, item_id: &str, snap: &StoreUndoSnapshot) -> Result<(), EngineError> {
+        let mut first_error: Option<EngineError> = None;
+        let mut note = |r: Result<(), EngineError>| {
+            if let Err(e) = r {
+                tracing::warn!(error = %e, item = item_id, "a Store restore step failed");
+                first_error.get_or_insert(e);
+            }
+        };
+        for did in &snap.created_design_ids {
+            let r = async {
+                if self.active_alert_design().await?.as_deref() == Some(did.as_str()) {
+                    self.set_active_alert_design(None).await?;
+                }
+                self.delete_design_row(did).await
+            }
+            .await;
+            note(r);
+        }
+        for d in &snap.prev_designs {
+            // Already back (an earlier try got this far): nothing to do.
+            if self.design(&d.id).await.is_ok() {
+                continue;
+            }
+            let d = d.clone();
+            note(self.db(move |s| repo::designs::insert(s, &d)).await.map(|_| ()));
+        }
+        if let Some(id) = &snap.cleared_active_alert {
+            let r = async {
+                if self.active_alert_design().await?.is_none() && self.design(id).await.is_ok() {
+                    self.set_active_alert_design(Some(id)).await?;
+                }
+                Ok(())
+            }
+            .await;
+            note(r);
+        }
+        note(self.reverse_rule_changes(&snap.rule_changes).await);
+        // The plugin the action installed goes unless it replaced one that comes back.
+        if let Some(pid) = &snap.created_plugin_id
+            && snap.prev_plugin.as_ref().is_none_or(|p| &p.id != pid)
+        {
+            let r = match self.remove_plugin(pid).await {
+                Err(EngineError::NotFound(_)) => Ok(()),
+                other => other,
+            };
+            note(r);
+        }
+        if let Some(p) = &snap.prev_plugin {
+            let r = async {
+                let zip_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&p.zip_b64)
+                    .map_err(|e| EngineError::Internal(e.to_string()))?;
+                let tmp = self.store().dir().join("tmp");
+                let _ = std::fs::create_dir_all(&tmp);
+                let path = tmp.join(format!("store-undo-{}.zip", ferrocast_store::new_id()));
+                std::fs::write(&path, &zip_bytes).map_err(|e| EngineError::Internal(e.to_string()))?;
+                let res = self.install_plugin(&path).await;
+                let _ = std::fs::remove_file(&path);
+                res?;
+                if !p.on {
+                    self.set_plugin_on(&p.id, false).await?;
+                }
+                Ok(())
+            }
+            .await;
+            note(r);
+        }
+        let row = match &snap.prev_install {
+            Some(prev) => {
+                let prev = prev.clone();
+                self.db(move |s| repo::store_catalog::upsert_install(s, &prev)).await.map(|_| ())
+            }
+            None => {
+                let id = item_id.to_string();
+                match self.db(move |s| repo::store_catalog::delete_install(s, &id)).await {
+                    Err(EngineError::Store(ferrocast_store::StoreError::NotFound(_))) => Ok(()),
+                    other => other,
+                }
+            }
+        };
+        note(row);
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// The inverse of what a Store action did to alert rules, applied to each rule as it is now.
+    async fn reverse_rule_changes(&self, changes: &[RuleChange]) -> Result<(), EngineError> {
+        let mut first_error: Option<EngineError> = None;
+        for c in changes {
+            let Some(mut rule) = self.rules().into_iter().find(|r| r.id == c.rule_id) else {
+                // The person deleted the rule since: there is nothing of ours left in it.
+                continue;
+            };
+            let before = rule.variations.clone();
+            rule.variations.retain(|v| !c.added.contains(&v.id));
+            for v in &c.removed {
+                if rule.variations.iter().any(|x| x.id == v.id) {
+                    continue;
+                }
+                // A rule keeps one default: a taken-out default comes back only if none took its place.
+                if v.condition.is_none() {
+                    if rule.variations.iter().any(|x| x.condition.is_none()) {
+                        continue;
+                    }
+                    rule.variations.insert(0, v.clone());
+                } else {
+                    rule.variations.push(v.clone());
+                }
+            }
+            // A rule the Store made (there were none) that is back to the single look it made goes too.
+            let r = if c.created
+                && rule.variations.len() == 1
+                && rule.variations.iter().all(|v| v.id.ends_with("-default"))
+            {
+                self.delete_rule(&rule.id).await
+            } else if rule.variations != before {
+                self.save_rule(rule).await.map(|_| ())
+            } else {
+                Ok(())
+            };
+            if let Err(e) = r {
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    async fn install_verified_item(
+        &self,
+        item: &StoreItemRaw,
+        creator: &StoreCreator,
+        src: &Source,
+        existing: Option<&StoreInstallRecord>,
+        action: &str,
+    ) -> Result<StoreMutationResult, EngineError> {
+        // 1. Download & SHA-256 verify the package BEFORE mutating any state.
+        let max_pkg = max_package_size(item.package.format) as usize;
+        let pkg_bytes = self
+            .fetch_verified_file(src, &item.package.url, item.package.size, &item.package.sha256, max_pkg, &item.title)
+            .await?;
+        // Preview assets aren't installed: each is fetched and fingerprint-checked when shown
+        // (`store_asset`), so an install doesn't download them.
+
+        // 2. What an update will replace, kept for one-click undo.
+        let mut applied = Applied {
+            snap: StoreUndoSnapshot {
+                prev_install: existing.cloned(),
+                created_design_ids: Vec::new(),
+                prev_designs: Vec::new(),
+                cleared_active_alert: None,
+                rule_changes: Vec::new(),
+                created_plugin_id: None,
+                prev_plugin: None,
+            },
+            displaced: existing.map(|o| o.displaced.clone()).unwrap_or_default(),
+            designs: Vec::new(),
+            rule_ids: Vec::new(),
+            plugin_id: None,
+        };
+        if let Some(old) = existing {
+            for did in &old.design_ids {
+                if let Ok(d) = self.design(did).await {
+                    applied.snap.prev_designs.push(d);
+                }
+            }
+            if let Some(pid) = &old.plugin_id {
+                let pinfo = self.plugins().await.into_iter().find(|p| &p.id == pid);
+                let zip_b64 = snapshot_plugin_zip(&self.plugins_dir(), pid)?.unwrap_or_default();
+                if let Some(p) = pinfo
+                    && !zip_b64.is_empty()
+                {
+                    applied.snap.prev_plugin = Some(PluginSnapshot { id: p.id, zip_b64, on: p.on });
+                }
             }
         }
 
-        let created_design_ids: Vec<String> = created_designs.iter().map(|d| d.id.clone()).collect();
-        let rec = StoreInstallRecord {
-            item_id: item.id.clone(),
-            kind: item.kind.key().into(),
-            format: item.package.format.key().into(),
-            title: item.title.clone(),
-            version: item.version.clone(),
-            creator_id: item.creator_id.clone(),
-            creator_name: creator.name.clone(),
-            package_sha256: item.package.sha256.clone(),
-            design_ids: created_design_ids.clone(),
-            rule_ids: affected_rule_ids.clone(),
-            plugin_id: installed_plugin_id.clone(),
-            installed_at: existing.map_or_else(|| now().0, |e| e.installed_at),
-            updated_at: now().0,
+        // 3. Apply it. A failure anywhere from here (a step, or writing the record) takes back
+        // exactly what was done, so a retry starts from the state it found.
+        let outcome = async {
+            self.apply_item(item, &pkg_bytes, existing, action, &mut applied).await?;
+            let rec = StoreInstallRecord {
+                item_id: item.id.clone(),
+                kind: item.kind.key().into(),
+                format: item.package.format.key().into(),
+                title: item.title.clone(),
+                version: item.version.clone(),
+                creator_id: item.creator_id.clone(),
+                creator_name: creator.name.clone(),
+                package_sha256: item.package.sha256.clone(),
+                design_ids: applied.designs.iter().map(|d| d.id.clone()).collect(),
+                rule_ids: applied.rule_ids.clone(),
+                plugin_id: applied.plugin_id.clone(),
+                installed_at: existing.map_or_else(|| now().0, |e| e.installed_at),
+                updated_at: now().0,
+                displaced: applied.displaced.clone(),
+            };
+            let undo_entry = StoreUndoEntry {
+                token: ferrocast_store::new_id(),
+                action: action.into(),
+                item_id: item.id.clone(),
+                item_title: item.title.clone(),
+                snapshot: applied.snap.clone(),
+                created_at: now().0,
+            };
+            // The record and the undo are one commit: no installed item without its undo.
+            self.db(move |s| repo::store_catalog::commit_install(s, &rec, &undo_entry)).await
+        }
+        .await;
+        let (saved, undo) = match outcome {
+            Ok(x) => x,
+            Err(e) => {
+                if let Err(again) = self.restore_snapshot(&item.id, &applied.snap).await {
+                    tracing::error!(error = %again, item = %item.id, "a failed Store install couldn't be fully taken back");
+                    return Err(refused(
+                        500,
+                        "store_install_partial",
+                        format!("{} couldn't be installed ({e}), and some of it couldn't be taken back.", item.title),
+                        "Open Store, Installed to see what is there, then try Uninstall or Install again.",
+                    ));
+                }
+                return Err(e);
+            }
         };
-        let saved = self
-            .db({
-                let rec = rec.clone();
-                move |s| repo::store_catalog::upsert_install(s, &rec)
-            })
-            .await?;
-
-        let undo_entry = StoreUndoEntry {
-            token: ferrocast_store::new_id(),
-            action: action.into(),
-            item_id: item.id.clone(),
-            item_title: item.title.clone(),
-            snapshot: StoreUndoSnapshot {
-                prev_install: existing.cloned(),
-                created_design_ids,
-                prev_designs,
-                prev_active_alert,
-                prev_rules,
-                created_plugin_id: installed_plugin_id,
-                prev_plugin,
-            },
-            created_at: now().0,
-        };
-        let undo = self.db(move |s| repo::store_catalog::save_undo(s, &undo_entry)).await?;
         let installed = Some(installed_view(&saved, Some(std::slice::from_ref(item)), Some(&undo)));
-        Ok(StoreMutationResult { action: action.into(), installed, designs: created_designs, undo })
+        Ok(StoreMutationResult { action: action.into(), installed, designs: applied.designs, undo })
     }
 
     /// `POST /api/v1/store/install` `{ id }`
@@ -1467,6 +1686,9 @@ impl Engine {
     }
 
     /// `POST /api/v1/store/uninstall` `{ id }` — works cleanly even without catalog access.
+    /// It either removes everything and says so, or leaves things as they were and says why: each
+    /// step that fails takes back the steps before it, and the install record is removed last,
+    /// together with the undo entry, so a retry always finds the item still installed.
     pub async fn uninstall_store_item(&self, id: &str) -> Result<StoreMutationResult, EngineError> {
         let _one_at_a_time = STORE_WRITE.lock().await;
         let existing = self
@@ -1478,142 +1700,175 @@ impl Engine {
             .ok_or_else(|| {
                 refused(404, "store_item_not_found", "That store item isn't installed.", "Reload Installed items.")
             })?;
+        let mut snap = StoreUndoSnapshot {
+            prev_install: Some(existing.clone()),
+            created_design_ids: Vec::new(),
+            prev_designs: Vec::new(),
+            cleared_active_alert: None,
+            rule_changes: Vec::new(),
+            created_plugin_id: None,
+            prev_plugin: None,
+        };
+        let done = self.remove_item_parts(&existing, &mut snap).await;
+        let undo = match done {
+            Ok(()) => {
+                let entry = StoreUndoEntry {
+                    token: ferrocast_store::new_id(),
+                    action: "uninstall".into(),
+                    item_id: existing.item_id.clone(),
+                    item_title: existing.title.clone(),
+                    snapshot: snap.clone(),
+                    created_at: now().0,
+                };
+                let item_id = existing.item_id.clone();
+                self.db(move |s| repo::store_catalog::commit_removal(s, &item_id, &entry)).await
+            }
+            Err(e) => Err(e),
+        };
+        match undo {
+            Ok(undo) => {
+                Ok(StoreMutationResult { action: "uninstall".into(), installed: None, designs: Vec::new(), undo })
+            }
+            Err(e) => {
+                // Back to how it was, so "Uninstall" can simply be pressed again.
+                if let Err(again) = self.restore_snapshot(&existing.item_id, &snap).await {
+                    tracing::error!(error = %again, item = %existing.item_id, "a failed Store uninstall couldn't be fully taken back");
+                    return Err(refused(
+                        500,
+                        "store_uninstall_partial",
+                        format!("{} couldn't be removed ({e}), and some of it couldn't be put back.", existing.title),
+                        "It is still listed under Installed. Try Uninstall again.",
+                    ));
+                }
+                Err(refused(
+                    500,
+                    "store_uninstall_failed",
+                    format!("{} couldn't be removed: {e}", existing.title),
+                    "Nothing was changed. Try Uninstall again.",
+                ))
+            }
+        }
+    }
 
-        let prev_active_alert = self.active_alert_design().await?;
-        let mut prev_designs = Vec::new();
+    /// Takes an installed item's parts away, writing each into `snap` as it goes.
+    async fn remove_item_parts(
+        &self,
+        existing: &StoreInstallRecord,
+        snap: &mut StoreUndoSnapshot,
+    ) -> Result<(), EngineError> {
+        let active = self.active_alert_design().await?;
         for did in &existing.design_ids {
             if let Ok(d) = self.design(did).await {
-                prev_designs.push(d);
+                snap.prev_designs.push(d);
             }
-            if prev_active_alert.as_ref() == Some(did) {
-                let _ = self.set_active_alert_design(None).await;
-            }
-            let did_owned = did.clone();
-            let _ = self.db(move |s| repo::designs::delete(s, &did_owned)).await;
         }
-
-        let mut prev_rules = Vec::new();
-        if !existing.rule_ids.is_empty() {
-            let current = self.rules();
-            let prefix = format!("store:{}:", existing.item_id);
-            for mut r in current {
-                if !existing.rule_ids.contains(&r.id) {
-                    continue;
-                }
-                prev_rules.push(r.clone());
-                let before = r.variations.len();
-                r.variations.retain(|v| !v.id.starts_with(&prefix));
-                if r.variations.len() != before {
-                    if !r.variations.iter().any(|v| v.condition.is_none()) {
-                        // Fall back cleanly to the built-in default look for this rule's primary kind.
+        for did in &existing.design_ids {
+            if active.as_deref() == Some(did.as_str()) && self.active_alert_design().await?.is_some() {
+                self.set_active_alert_design(None).await?;
+                snap.cleared_active_alert = Some(did.clone());
+            }
+            self.delete_design_row(did).await?;
+        }
+        let prefix = format!("store:{}:", existing.item_id);
+        for rule_id in &existing.rule_ids {
+            let Some(mut r) = self.rules().into_iter().find(|r| &r.id == rule_id) else { continue };
+            let taken: Vec<Variation> = r.variations.iter().filter(|v| v.id.starts_with(&prefix)).cloned().collect();
+            if taken.is_empty() {
+                continue;
+            }
+            r.variations.retain(|v| !v.id.starts_with(&prefix));
+            let mut change = RuleChange { rule_id: r.id.clone(), removed: taken, added: Vec::new(), created: false };
+            if !r.variations.iter().any(|v| v.condition.is_none()) {
+                // The look the pack took the place of goes back; with none kept, the built-in default.
+                let back = existing
+                    .displaced
+                    .iter()
+                    .find(|d| d.rule_id == r.id)
+                    .map(|d| d.variation.clone())
+                    .or_else(|| {
                         let kind = r.kinds.first().map(String::as_str).unwrap_or("follow");
-                        let fallback = default_rules()
+                        default_rules()
                             .into_iter()
                             .find(|d| d.kinds.iter().any(|k| k == kind))
                             .and_then(|d| d.variations.into_iter().next())
-                            .unwrap_or_else(|| Variation::new("default", "{name}"));
-                        r.variations.insert(0, fallback);
-                    }
-                    let _ = self.save_rule(r).await;
+                    })
+                    .unwrap_or_else(|| Variation::new("default", "{name}"));
+                if !r.variations.iter().any(|v| v.id == back.id) {
+                    change.added.push(back.id.clone());
+                    r.variations.insert(0, back);
                 }
             }
+            self.save_rule(r).await?;
+            snap.rule_changes.push(change);
         }
-
-        let mut prev_plugin = None;
         if let Some(pid) = &existing.plugin_id {
             let pinfo = self.plugins().await.into_iter().find(|p| &p.id == pid);
             if let Some(zip_b64) = snapshot_plugin_zip(&self.plugins_dir(), pid)?
                 && let Some(p) = pinfo
             {
-                prev_plugin = Some(PluginSnapshot { id: p.id, zip_b64, on: p.on });
+                snap.prev_plugin = Some(PluginSnapshot { id: p.id, zip_b64, on: p.on });
             }
-            let _ = self.remove_plugin(pid).await;
+            match self.remove_plugin(pid).await {
+                Ok(()) | Err(EngineError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
-
-        let id_owned = existing.item_id.clone();
-        self.db(move |s| repo::store_catalog::delete_install(s, &id_owned)).await?;
-
-        let undo_entry = StoreUndoEntry {
-            token: ferrocast_store::new_id(),
-            action: "uninstall".into(),
-            item_id: existing.item_id.clone(),
-            item_title: existing.title.clone(),
-            snapshot: StoreUndoSnapshot {
-                prev_install: Some(existing.clone()),
-                created_design_ids: Vec::new(),
-                prev_designs,
-                prev_active_alert,
-                prev_rules,
-                created_plugin_id: None,
-                prev_plugin,
-            },
-            created_at: now().0,
-        };
-        let undo = self.db(move |s| repo::store_catalog::save_undo(s, &undo_entry)).await?;
-        Ok(StoreMutationResult { action: "uninstall".into(), installed: None, designs: Vec::new(), undo })
+        Ok(())
     }
 
-    /// `POST /api/v1/store/undo` `{ token? }` — one-click undo for install, update, or uninstall.
+    /// `POST /api/v1/store/undo` `{ token? }` — one-click undo of the latest install, update or
+    /// uninstall. No token is "the latest"; a token that is empty, unknown or not the latest is
+    /// refused (undoing an older one under a newer one would put back a state that no longer exists).
     pub async fn undo_store_action(&self, token: Option<&str>) -> Result<StoreUndoResult, EngineError> {
-        let tok = token.map(str::to_string);
         let _one_at_a_time = STORE_WRITE.lock().await;
-        // The entry stays until everything is put back: a failed undo can be tried again.
-        let entry = self.db(move |s| repo::store_catalog::peek_undo(s, tok.as_deref())).await?;
-        let snap = &entry.snapshot;
-
-        // Remove newly created designs from the undone install/update.
-        for did in &snap.created_design_ids {
-            if self.active_alert_design().await?.as_deref() == Some(did.as_str()) {
-                let _ = self.set_active_alert_design(None).await;
-            }
-            let did_owned = did.clone();
-            let _ = self.db(move |s| repo::designs::delete(s, &did_owned)).await;
+        if token.is_some_and(|t| t.trim().is_empty()) {
+            return Err(refused(
+                400,
+                "store_undo_bad_token",
+                "The undo token is empty.",
+                "Leave the token out to undo the latest action, or send the one it gave.",
+            ));
         }
-        // Restore previously snapshotted designs (for undo update or undo uninstall).
-        for d in &snap.prev_designs {
-            let d = d.clone();
-            let _ = self.db(move |s| repo::designs::insert(s, &d)).await;
-        }
-        if snap.prev_active_alert.is_some() {
-            let _ = self.set_active_alert_design(snap.prev_active_alert.as_deref()).await;
-        }
-        // Restore snapshotted alert rules.
-        for r in &snap.prev_rules {
-            self.save_rule(r.clone()).await?;
-        }
-        // Revert or restore plugins.
-        if let Some(pid) = &snap.created_plugin_id
-            && snap.prev_plugin.as_ref().is_none_or(|p| &p.id != pid)
+        let latest = self.db(repo::store_catalog::latest_undo).await?.ok_or_else(|| {
+            refused(
+                404,
+                "store_nothing_to_undo",
+                "There is nothing to undo.",
+                "Undo is kept for the last few Store actions.",
+            )
+        })?;
+        if let Some(t) = token
+            && t != latest.token
         {
-            let _ = self.remove_plugin(pid).await;
+            let tok = t.to_string();
+            let known = self.db(move |s| repo::store_catalog::peek_undo(s, Some(&tok))).await.is_ok();
+            return Err(if known {
+                refused(
+                    409,
+                    "store_undo_out_of_order",
+                    "That isn't the latest Store action, so it can't be undone first.",
+                    "Undo the latest one, then this one.",
+                )
+            } else {
+                refused(
+                    404,
+                    "store_undo_unknown",
+                    "That undo isn't there any more.",
+                    "Undo is kept for the last few Store actions.",
+                )
+            });
         }
-        if let Some(p) = &snap.prev_plugin {
-            let zip_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&p.zip_b64)
-                .map_err(|e| EngineError::Internal(e.to_string()))?;
-            let tmp = self.store().dir().join("tmp");
-            let _ = std::fs::create_dir_all(&tmp);
-            let path = tmp.join(format!("store-undo-{}.zip", ferrocast_store::new_id()));
-            std::fs::write(&path, &zip_bytes).map_err(|e| EngineError::Internal(e.to_string()))?;
-            let res = self.install_plugin(&path).await;
-            let _ = std::fs::remove_file(&path);
-            let _ = res?;
-            if !p.on {
-                let _ = self.set_plugin_on(&p.id, false).await;
-            }
-        }
-        // Restore or remove store_installs row.
-        match &snap.prev_install {
-            Some(prev) => {
-                let prev = prev.clone();
-                let _ = self.db(move |s| repo::store_catalog::upsert_install(s, &prev)).await?;
-            }
-            None => {
-                let id_owned = entry.item_id.clone();
-                let _ = self.db(move |s| repo::store_catalog::delete_install(s, &id_owned)).await;
-            }
-        }
-        // Everything is back: only now is the undo entry used up.
+        // The entry stays until everything is put back: a failed undo can be tried again.
+        let tok = latest.token.clone();
+        let entry = self.db(move |s| repo::store_catalog::peek_undo(s, Some(&tok))).await?;
+        self.restore_snapshot(&entry.item_id, &entry.snapshot).await.map_err(|e| {
+            refused(
+                500,
+                "store_undo_incomplete",
+                format!("Undo couldn't put everything back: {e}"),
+                "Nothing is lost: the undo is still there. Try it again.",
+            )
+        })?;
         let used = entry.token.clone();
         self.db(move |s| repo::store_catalog::drop_undo(s, &used)).await?;
         let after = self.store_installed().await?;
@@ -2126,5 +2381,222 @@ mod tests {
         let preview = engine.resolve_store_link("ferrocast://store/install/foundry-goal-widget").await.unwrap();
         assert!(preview.requires_confirmation);
         assert!(preview.installed.is_none());
+    }
+
+    // ---- Store actions restore exactly the prior state and touch only what they changed ----
+
+    async fn fixture() -> (Engine, Arc<StdMutex<MockFixtureState>>, tempfile::TempDir) {
+        let state = Arc::new(StdMutex::new(MockFixtureState::default()));
+        let port = spawn_fixture_server(state.clone()).await;
+        let (engine, dir, _studio, _chat) = crate::automation::tests::engine().await;
+        set_source(Source { url: format!("http://127.0.0.1:{port}/catalog.json"), key: TEST_KEY.into(), local: true });
+        (engine, state, dir)
+    }
+
+    fn follow_rule(engine: &Engine) -> ferrocast_core::alert::AlertRule {
+        engine.rules().into_iter().find(|r| r.kinds.contains(&"follow".to_string())).expect("a follow rule")
+    }
+
+    /// The person's own follow look, saved before the pack comes.
+    async fn my_own_follow_look(engine: &Engine) -> Variation {
+        let mut rule = default_rules().into_iter().find(|r| r.kinds.contains(&"follow".to_string())).unwrap();
+        rule.variations[0].title = "{name} joined MY crew!".into();
+        rule.variations[0].volume = 33;
+        let mine = rule.variations[0].clone();
+        engine.save_rule(rule).await.unwrap();
+        mine
+    }
+
+    /// Breaks or mends a table so a step of a Store action fails, whatever the step is.
+    async fn table(engine: &Engine, name: &'static str, broken: bool) {
+        let sql = if broken {
+            format!("ALTER TABLE {name} RENAME TO {name}_away")
+        } else {
+            format!("ALTER TABLE {name}_away RENAME TO {name}")
+        };
+        engine.db(move |s| s.write(|tx| Ok(tx.execute_batch(&sql)?))).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_an_alert_pack_gives_back_the_look_it_displaced() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _state, _dir) = fixture().await;
+        let mine = my_own_follow_look(&engine).await;
+        let installed = engine.install_store_item("arcade-ticker-alert").await.unwrap();
+        let rule = follow_rule(&engine);
+        assert!(rule.variations.iter().any(|v| v.id.starts_with("store:arcade-ticker-alert:")));
+        assert!(!rule.variations.iter().any(|v| v.id == mine.id), "the pack took the default place");
+        // The look is kept with the install, not only in the undo (which the next action replaces).
+        assert_eq!(installed.installed.as_ref().unwrap().rule_ids.len(), 1);
+        engine.install_store_item("foundry-goal-widget").await.unwrap();
+        engine.uninstall_store_item("arcade-ticker-alert").await.unwrap();
+        let back = follow_rule(&engine);
+        assert!(!back.variations.iter().any(|v| v.id.starts_with("store:")), "nothing of the pack is left");
+        let default: Vec<_> = back.variations.iter().filter(|v| v.condition.is_none()).collect();
+        assert_eq!(default.len(), 1, "one default");
+        assert_eq!(default[0], &mine, "the person's own title, sound and volume, not a built-in one");
+    }
+
+    #[tokio::test]
+    async fn undo_reverses_only_what_the_store_changed_so_later_edits_stay() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _state, _dir) = fixture().await;
+        let mine = my_own_follow_look(&engine).await;
+        let installed = engine.install_store_item("arcade-ticker-alert").await.unwrap();
+        // After the install the person adds a look of their own and edits another setting.
+        let mut rule = follow_rule(&engine);
+        let mut extra = Variation::new("my-big-follow", "BIG {name}");
+        extra.condition = Some(ferrocast_core::alert::Condition::TierAtLeast { tier: 2 });
+        rule.variations.push(extra.clone());
+        rule.name = "My follows".into();
+        engine.save_rule(rule).await.unwrap();
+        engine.undo_store_action(Some(&installed.undo.token)).await.unwrap();
+        let after = follow_rule(&engine);
+        assert_eq!(after.name, "My follows", "an edit made after the install is not overwritten");
+        assert!(after.variations.iter().any(|v| v.id == "my-big-follow"), "the look added since stays");
+        assert!(!after.variations.iter().any(|v| v.id.starts_with("store:")), "the pack's variations are gone");
+        assert_eq!(after.variations.iter().find(|v| v.condition.is_none()), Some(&mine), "the default is back");
+    }
+
+    #[tokio::test]
+    async fn a_failed_uninstall_is_not_a_success_and_can_be_pressed_again() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _state, _dir) = fixture().await;
+        let mine = my_own_follow_look(&engine).await;
+        engine.install_store_item("arcade-ticker-alert").await.unwrap();
+        // The rules can't be saved: the cleanup of the pack's variations fails.
+        table(&engine, "alert_rules", true).await;
+        let failed = engine.uninstall_store_item("arcade-ticker-alert").await;
+        table(&engine, "alert_rules", false).await;
+        assert!(failed.is_err(), "{failed:?}");
+        // Still installed, with its undo untouched, and the rule as it was.
+        let still = engine.store_installed().await.unwrap();
+        assert!(
+            still.installed.iter().any(|i| i.item_id == "arcade-ticker-alert"),
+            "the record stays: nothing is lost"
+        );
+        assert!(follow_rule(&engine).variations.iter().any(|v| v.id.starts_with("store:arcade-ticker-alert:")));
+        // Mended, the same press finishes the job.
+        engine.uninstall_store_item("arcade-ticker-alert").await.unwrap();
+        assert!(engine.store_installed().await.unwrap().installed.is_empty());
+        assert_eq!(follow_rule(&engine).variations.iter().find(|v| v.condition.is_none()), Some(&mine));
+    }
+
+    #[tokio::test]
+    async fn an_undo_that_cannot_finish_stays_available_and_finishes_on_retry() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _state, _dir) = fixture().await;
+        engine.install_store_item("aurora-pulse").await.unwrap();
+        let un = engine.uninstall_store_item("aurora-pulse").await.unwrap();
+        assert!(engine.designs(None).await.unwrap().is_empty());
+        // The designs can't be written back.
+        table(&engine, "designs", true).await;
+        let failed = engine.undo_store_action(Some(&un.undo.token)).await;
+        table(&engine, "designs", false).await;
+        assert!(matches!(failed, Err(EngineError::Refused { code: "store_undo_incomplete", .. })), "{failed:?}");
+        // Not reported as done, and the same token is still good.
+        assert!(engine.designs(None).await.unwrap().is_empty());
+        let done = engine.undo_store_action(Some(&un.undo.token)).await.unwrap();
+        assert_eq!(done.reverted_action, "uninstall");
+        assert_eq!(engine.designs(None).await.unwrap().len(), 2, "both designs are back");
+        // The next press is the one before it (the install), as a stack.
+        let before = engine.undo_store_action(None).await.unwrap();
+        assert_eq!(before.reverted_action, "install");
+        assert!(engine.designs(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_install_that_fails_after_the_package_was_applied_is_taken_back() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _state, _dir) = fixture().await;
+        // The record and its undo are written together: with no place for undos, that fails.
+        table(&engine, "store_undo", true).await;
+        let failed = engine.install_store_item("aurora-pulse").await;
+        table(&engine, "store_undo", false).await;
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(engine.designs(None).await.unwrap().is_empty(), "the designs it made were taken back");
+        assert!(engine.store_installed().await.unwrap().installed.is_empty(), "no record of a half install");
+        // So a retry is a plain install, not "already installed", and has its undo.
+        let again = engine.install_store_item("aurora-pulse").await.unwrap();
+        assert_eq!(engine.designs(None).await.unwrap().len(), 2);
+        assert!(again.installed.unwrap().can_undo);
+        // The same for an alert pack: its variations don't stay in the rule.
+        let mine = my_own_follow_look(&engine).await;
+        table(&engine, "store_undo", true).await;
+        let failed = engine.install_store_item("arcade-ticker-alert").await;
+        table(&engine, "store_undo", false).await;
+        assert!(failed.is_err());
+        let rule = follow_rule(&engine);
+        assert!(!rule.variations.iter().any(|v| v.id.starts_with("store:")));
+        assert_eq!(rule.variations.iter().find(|v| v.condition.is_none()), Some(&mine));
+    }
+
+    #[tokio::test]
+    async fn undo_tokens_are_the_latest_or_refused_never_the_latest_by_default() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _state, _dir) = fixture().await;
+        assert!(
+            matches!(engine.undo_store_action(None).await, Err(EngineError::Refused { status: 404, .. })),
+            "nothing yet"
+        );
+        let first = engine.install_store_item("aurora-pulse").await.unwrap();
+        let second = engine.install_store_item("foundry-goal-widget").await.unwrap();
+        // Empty or blank: refused, not "undo the latest".
+        for bad in ["", "   "] {
+            let r = engine.undo_store_action(Some(bad)).await;
+            assert!(
+                matches!(r, Err(EngineError::Refused { status: 400, code: "store_undo_bad_token", .. })),
+                "{bad:?}: {r:?}"
+            );
+        }
+        // Unknown: refused.
+        let r = engine.undo_store_action(Some("nope")).await;
+        assert!(matches!(r, Err(EngineError::Refused { status: 404, code: "store_undo_unknown", .. })), "{r:?}");
+        // Older than the latest: refused, and nothing changed.
+        let r = engine.undo_store_action(Some(&first.undo.token)).await;
+        assert!(matches!(r, Err(EngineError::Refused { status: 409, code: "store_undo_out_of_order", .. })), "{r:?}");
+        assert_eq!(engine.store_installed().await.unwrap().installed.len(), 2);
+        // The latest by its token, then the one before.
+        engine.undo_store_action(Some(&second.undo.token)).await.unwrap();
+        assert_eq!(engine.store_installed().await.unwrap().installed.len(), 1);
+        // Leaving the token out is the way to ask for the latest.
+        let r = engine.undo_store_action(None).await.unwrap();
+        assert_eq!(r.item_id, "aurora-pulse");
+        assert!(engine.designs(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_alert_pack_with_no_rule_to_go_into_is_refused_not_recorded() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _state, _dir) = fixture().await;
+        // Only a tip rule: the pack is for follows.
+        for r in engine.rules() {
+            engine.delete_rule(&r.id).await.unwrap();
+        }
+        let tip = default_rules().into_iter().find(|r| r.kinds.contains(&"tip".to_string())).unwrap();
+        engine.save_rule(tip).await.unwrap();
+        let r = engine.install_store_item("arcade-ticker-alert").await;
+        assert!(matches!(r, Err(EngineError::Refused { status: 422, code: "store_alert_no_target", .. })), "{r:?}");
+        assert!(engine.store_installed().await.unwrap().installed.is_empty(), "nothing is shown as installed");
+        assert!(engine.rules().iter().all(|r| !r.variations.iter().any(|v| v.id.starts_with("store:"))));
+        assert!(engine.db(repo::store_catalog::latest_undo).await.unwrap().is_none(), "and no undo for nothing");
+    }
+
+    #[test]
+    fn an_update_finds_the_packs_own_default_in_the_slot_not_the_users() {
+        let mine = Variation::new("default", "mine");
+        let theirs = {
+            let mut v = Variation::new("pack-default", "pack");
+            v.condition = None;
+            v
+        };
+        let first = merge_pack(std::slice::from_ref(&mine), "p", std::slice::from_ref(&theirs));
+        assert_eq!(first.displaced.as_ref(), Some(&mine));
+        assert_eq!(first.added, vec!["store:p:pack-default".to_string()]);
+        // Again (an update): the default there is the pack's own, so nothing of the user's is "displaced".
+        let again = merge_pack(&first.variations, "p", std::slice::from_ref(&theirs));
+        assert!(again.displaced.is_none(), "the user's look stays recorded from the first install");
+        assert_eq!(again.removed.len(), 1, "the pack's own earlier variation is what comes out");
+        assert_eq!(again.variations.iter().filter(|v| v.condition.is_none()).count(), 1);
     }
 }

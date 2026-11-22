@@ -1,6 +1,6 @@
 //! Installed Community Store items and persistent one-click undo snapshots (R37).
 
-use ferrocast_core::alert::AlertRule;
+use ferrocast_core::alert::Variation;
 use ferrocast_core::design::Design;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -10,8 +10,16 @@ use crate::{Store, now_ms};
 
 const MAX_UNDO_ENTRIES: i64 = 20;
 
+/// A default alert look of the user's that an alert pack took the place of (a rule has one
+/// default). Kept with the install, across updates, so removing the pack gives it back.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplacedDefault {
+    pub rule_id: String,
+    pub variation: Variation,
+}
+
 /// Locally installed Community Store package metadata (never carries telemetry).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoreInstallRecord {
     pub item_id: String,
     pub kind: String,
@@ -26,6 +34,24 @@ pub struct StoreInstallRecord {
     pub plugin_id: Option<String>,
     pub installed_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub displaced: Vec<DisplacedDefault>,
+}
+
+/// What one Store action did to one alert rule: the variations it took out and the ids of the
+/// ones it put in. Undo applies the inverse to the rule as it is now, so anything the person
+/// changed since stays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleChange {
+    pub rule_id: String,
+    #[serde(default)]
+    pub removed: Vec<Variation>,
+    #[serde(default)]
+    pub added: Vec<String>,
+    /// The rule itself was made by this action (the person had none): it goes once it is back to
+    /// the look it was made with.
+    #[serde(default)]
+    pub created: bool,
 }
 
 /// Snapshot of plugin zip bytes + active toggle before a store change.
@@ -42,8 +68,12 @@ pub struct StoreUndoSnapshot {
     pub prev_install: Option<StoreInstallRecord>,
     pub created_design_ids: Vec<String>,
     pub prev_designs: Vec<Design>,
-    pub prev_active_alert: Option<String>,
-    pub prev_rules: Vec<AlertRule>,
+    /// The design that was the active alert when this action removed it (so it was cleared).
+    /// Undo puts it back only if nothing else has been picked since.
+    #[serde(default)]
+    pub cleared_active_alert: Option<String>,
+    #[serde(default)]
+    pub rule_changes: Vec<RuleChange>,
     pub created_plugin_id: Option<String>,
     pub prev_plugin: Option<PluginSnapshot>,
 }
@@ -98,6 +128,7 @@ fn read_install_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoreInstallRec
         plugin_id: row.get(10)?,
         installed_at: row.get(11)?,
         updated_at: row.get(12)?,
+        displaced: super::from_json(13, row.get::<_, String>(13)?)?,
     })
 }
 
@@ -105,7 +136,7 @@ pub fn list_installs(store: &Store) -> Result<Vec<StoreInstallRecord>> {
     store.read(|c| {
         let mut st = c.prepare(
             "SELECT item_id, kind, format, title, version, creator_id, creator_name, package_sha256,
-                    design_ids, rule_ids, plugin_id, installed_at, updated_at
+                    design_ids, rule_ids, plugin_id, installed_at, updated_at, displaced_defaults
              FROM store_installs ORDER BY updated_at DESC, item_id",
         )?;
         Ok(st.query_map([], read_install_row)?.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -116,7 +147,7 @@ pub fn get_install(store: &Store, item_id: &str) -> Result<Option<StoreInstallRe
     store.read(|c| {
         Ok(c.query_row(
             "SELECT item_id, kind, format, title, version, creator_id, creator_name, package_sha256,
-                    design_ids, rule_ids, plugin_id, installed_at, updated_at
+                    design_ids, rule_ids, plugin_id, installed_at, updated_at, displaced_defaults
              FROM store_installs WHERE item_id = ?1",
             [item_id],
             read_install_row,
@@ -125,54 +156,95 @@ pub fn get_install(store: &Store, item_id: &str) -> Result<Option<StoreInstallRe
     })
 }
 
-pub fn upsert_install(store: &Store, rec: &StoreInstallRecord) -> Result<StoreInstallRecord> {
+fn stamped(rec: &StoreInstallRecord) -> StoreInstallRecord {
     let mut saved = rec.clone();
     let now = now_ms();
     if saved.installed_at == 0 {
         saved.installed_at = now;
     }
     saved.updated_at = now.max(saved.updated_at);
+    saved
+}
+
+fn upsert_install_tx(tx: &rusqlite::Transaction<'_>, saved: &StoreInstallRecord) -> Result<()> {
     let design_json = serde_json::to_string(&saved.design_ids)?;
     let rule_json = serde_json::to_string(&saved.rule_ids)?;
-    store.write(|tx| {
-        tx.execute(
-            "INSERT INTO store_installs
-             (item_id, kind, format, title, version, creator_id, creator_name, package_sha256,
-              design_ids, rule_ids, plugin_id, installed_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-             ON CONFLICT(item_id) DO UPDATE SET
-               kind = excluded.kind,
-               format = excluded.format,
-               title = excluded.title,
-               version = excluded.version,
-               creator_id = excluded.creator_id,
-               creator_name = excluded.creator_name,
-               package_sha256 = excluded.package_sha256,
-               design_ids = excluded.design_ids,
-               rule_ids = excluded.rule_ids,
-               plugin_id = excluded.plugin_id,
-               updated_at = excluded.updated_at",
-            params![
-                saved.item_id,
-                saved.kind,
-                saved.format,
-                saved.title,
-                saved.version,
-                saved.creator_id,
-                saved.creator_name,
-                saved.package_sha256,
-                design_json,
-                rule_json,
-                saved.plugin_id,
-                saved.installed_at,
-                saved.updated_at,
-            ],
-        )?;
-        Ok(())
-    })?;
+    let displaced_json = serde_json::to_string(&saved.displaced)?;
+    tx.execute(
+        "INSERT INTO store_installs
+         (item_id, kind, format, title, version, creator_id, creator_name, package_sha256,
+          design_ids, rule_ids, plugin_id, installed_at, updated_at, displaced_defaults)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(item_id) DO UPDATE SET
+           kind = excluded.kind,
+           format = excluded.format,
+           title = excluded.title,
+           version = excluded.version,
+           creator_id = excluded.creator_id,
+           creator_name = excluded.creator_name,
+           package_sha256 = excluded.package_sha256,
+           design_ids = excluded.design_ids,
+           rule_ids = excluded.rule_ids,
+           plugin_id = excluded.plugin_id,
+           displaced_defaults = excluded.displaced_defaults,
+           updated_at = excluded.updated_at",
+        params![
+            saved.item_id,
+            saved.kind,
+            saved.format,
+            saved.title,
+            saved.version,
+            saved.creator_id,
+            saved.creator_name,
+            saved.package_sha256,
+            design_json,
+            rule_json,
+            saved.plugin_id,
+            saved.installed_at,
+            saved.updated_at,
+            displaced_json,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_install(store: &Store, rec: &StoreInstallRecord) -> Result<StoreInstallRecord> {
+    let saved = stamped(rec);
+    store.write(|tx| upsert_install_tx(tx, &saved))?;
     // The row keeps the time of the first install (the conflict clause leaves `installed_at`
     // alone): answer with what is stored, not with what was sent.
     Ok(get_install(store, &saved.item_id)?.unwrap_or(saved))
+}
+
+/// The install record and its undo entry in one transaction: either both are there or neither,
+/// so a failure can't leave an installed item with no undo, or an undo for nothing.
+pub fn commit_install(
+    store: &Store,
+    rec: &StoreInstallRecord,
+    undo: &StoreUndoEntry,
+) -> Result<(StoreInstallRecord, StoreUndoSummary)> {
+    let saved = stamped(rec);
+    let entry = stamped_undo(undo);
+    store.write(|tx| {
+        upsert_install_tx(tx, &saved)?;
+        save_undo_tx(tx, &entry)?;
+        Ok(())
+    })?;
+    let kept = get_install(store, &saved.item_id)?.unwrap_or(saved);
+    Ok((kept, entry.summary()))
+}
+
+/// Removes an install record and writes its undo entry in one transaction.
+pub fn commit_removal(store: &Store, item_id: &str, undo: &StoreUndoEntry) -> Result<StoreUndoSummary> {
+    let entry = stamped_undo(undo);
+    store.write(|tx| {
+        let n = tx.execute("DELETE FROM store_installs WHERE item_id = ?1", [item_id])?;
+        if n == 0 {
+            return Err(StoreError::NotFound("installed store item"));
+        }
+        save_undo_tx(tx, &entry)
+    })?;
+    Ok(entry.summary())
 }
 
 pub fn delete_install(store: &Store, item_id: &str) -> Result<()> {
@@ -180,33 +252,39 @@ pub fn delete_install(store: &Store, item_id: &str) -> Result<()> {
     if n == 0 { Err(StoreError::NotFound("installed store item")) } else { Ok(()) }
 }
 
-pub fn save_undo(store: &Store, entry: &StoreUndoEntry) -> Result<StoreUndoSummary> {
+fn stamped_undo(entry: &StoreUndoEntry) -> StoreUndoEntry {
     let mut saved = entry.clone();
-    let now = now_ms();
     if saved.created_at == 0 {
-        saved.created_at = now;
+        saved.created_at = now_ms();
     }
+    saved
+}
+
+fn save_undo_tx(tx: &rusqlite::Transaction<'_>, saved: &StoreUndoEntry) -> Result<()> {
     let snapshot_json = serde_json::to_string(&saved.snapshot)?;
-    store.write(|tx| {
-        tx.execute(
-            "INSERT INTO store_undo(token, action, item_id, item_title, snapshot_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(token) DO UPDATE SET
-               action = excluded.action,
-               item_id = excluded.item_id,
-               item_title = excluded.item_title,
-               snapshot_json = excluded.snapshot_json,
-               created_at = excluded.created_at",
-            params![saved.token, saved.action, saved.item_id, saved.item_title, snapshot_json, saved.created_at],
-        )?;
-        tx.execute(
-            "DELETE FROM store_undo WHERE token NOT IN (
-               SELECT token FROM store_undo ORDER BY created_at DESC, rowid DESC LIMIT ?1
-             )",
-            [MAX_UNDO_ENTRIES],
-        )?;
-        Ok(())
-    })?;
+    tx.execute(
+        "INSERT INTO store_undo(token, action, item_id, item_title, snapshot_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(token) DO UPDATE SET
+           action = excluded.action,
+           item_id = excluded.item_id,
+           item_title = excluded.item_title,
+           snapshot_json = excluded.snapshot_json,
+           created_at = excluded.created_at",
+        params![saved.token, saved.action, saved.item_id, saved.item_title, snapshot_json, saved.created_at],
+    )?;
+    tx.execute(
+        "DELETE FROM store_undo WHERE token NOT IN (
+           SELECT token FROM store_undo ORDER BY created_at DESC, rowid DESC LIMIT ?1
+         )",
+        [MAX_UNDO_ENTRIES],
+    )?;
+    Ok(())
+}
+
+pub fn save_undo(store: &Store, entry: &StoreUndoEntry) -> Result<StoreUndoSummary> {
+    let saved = stamped_undo(entry);
+    store.write(|tx| save_undo_tx(tx, &saved))?;
     Ok(saved.summary())
 }
 
@@ -296,6 +374,7 @@ mod tests {
             plugin_id: None,
             installed_at: 1000,
             updated_at: 1000,
+            displaced: vec![],
         }
     }
 
@@ -312,8 +391,8 @@ mod tests {
                 prev_install: None,
                 created_design_ids: vec![],
                 prev_designs: vec![],
-                prev_active_alert: None,
-                prev_rules: vec![],
+                cleared_active_alert: None,
+                rule_changes: vec![],
                 created_plugin_id: None,
                 prev_plugin: None,
             },
@@ -352,6 +431,60 @@ mod tests {
     }
 
     #[test]
+    fn an_install_and_its_undo_are_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut undo = StoreUndoEntry {
+            token: "u1".into(),
+            action: "install".into(),
+            item_id: "aurora-pulse".into(),
+            item_title: "Aurora Pulse".into(),
+            snapshot: StoreUndoSnapshot {
+                prev_install: None,
+                created_design_ids: vec!["d1".into()],
+                prev_designs: vec![],
+                cleared_active_alert: None,
+                rule_changes: vec![],
+                created_plugin_id: None,
+                prev_plugin: None,
+            },
+            created_at: 5,
+        };
+        let (saved, summary) = commit_install(&store, &sample_install(), &undo).unwrap();
+        assert_eq!((saved.item_id.as_str(), summary.token.as_str()), ("aurora-pulse", "u1"));
+        assert_eq!(list_installs(&store).unwrap().len(), 1);
+        assert_eq!(latest_undo(&store).unwrap().unwrap().token, "u1");
+        // A failure in the second half takes the first back: an undo that can't be written (here,
+        // a snapshot that can't be stored) leaves no install behind.
+        let mut other = sample_install();
+        other.item_id = "second".into();
+        undo.token = "u2".into();
+        store.write(|tx| Ok(tx.execute_batch("DROP TABLE store_undo")?)).unwrap();
+        assert!(commit_install(&store, &other, &undo).is_err());
+        assert!(get_install(&store, "second").unwrap().is_none(), "the install went with the failed undo");
+        assert_eq!(get_install(&store, "aurora-pulse").unwrap().unwrap().version, "1.0.0");
+    }
+
+    #[test]
+    fn displaced_defaults_and_rule_changes_survive_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut rec = sample_install();
+        let v = Variation::new("default", "{name} followed!");
+        rec.displaced = vec![DisplacedDefault { rule_id: "r-follow".into(), variation: v.clone() }];
+        upsert_install(&store, &rec).unwrap();
+        assert_eq!(get_install(&store, "aurora-pulse").unwrap().unwrap().displaced[0].variation, v);
+        // An update that doesn't send any keeps nothing by accident: what is sent is what is stored.
+        rec.displaced.clear();
+        upsert_install(&store, &rec).unwrap();
+        assert!(get_install(&store, "aurora-pulse").unwrap().unwrap().displaced.is_empty());
+        // An old snapshot with the fields this build doesn't have still reads.
+        let old = r#"{"prev_install":null,"created_design_ids":[],"prev_designs":[],"prev_active_alert":"x","prev_rules":[],"created_plugin_id":null,"prev_plugin":null}"#;
+        let snap: StoreUndoSnapshot = serde_json::from_str(old).unwrap();
+        assert!(snap.rule_changes.is_empty() && snap.cleared_active_alert.is_none());
+    }
+
+    #[test]
     fn install_and_undo_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
@@ -371,8 +504,8 @@ mod tests {
                 prev_install: Some(saved),
                 created_design_ids: vec!["d1".into()],
                 prev_designs: vec![],
-                prev_active_alert: None,
-                prev_rules: vec![],
+                cleared_active_alert: None,
+                rule_changes: vec![],
                 created_plugin_id: None,
                 prev_plugin: None,
             },
