@@ -582,3 +582,27 @@ fn encodes_are_capped_to_two_threads_and_keep_the_clips_frame_rate() {
     );
     assert_eq!(p.fps.map(|f| f.round() as u32), Some(60));
 }
+
+/// A pile of waiting jobs is refused past a small number: each waiting upload holds an open file
+/// and a task, and the queue could otherwise grow for hours behind a long compile.
+#[tokio::test]
+async fn the_job_queue_has_a_limit() {
+    let data = tempfile::tempdir().unwrap();
+    let e = Engine::start_with_memory_secrets(data.path()).await.unwrap();
+    let mut jobs = Vec::new();
+    for n in 0..crate::clips::jobs::MAX_ACTIVE_JOBS {
+        jobs.push(e.start_clip_job(JobKind::Trim, format!("wait {n}"), |ctx| async move {
+            ctx.cancel.wait().await;
+            Err(crate::clips::jobs::cancelled())
+        }));
+    }
+    assert!(jobs.iter().all(|j| j.state != JobState::Failed));
+    let over = e.start_clip_job(JobKind::Trim, "one too many".into(), |_ctx| async move { Ok(Made { output: None }) });
+    assert_eq!(over.state, JobState::Failed, "{over:?}");
+    assert!(over.error.as_ref().is_some_and(|x| x.message.contains("waiting")), "{over:?}");
+    // Cancelling frees room again.
+    e.cancel_clip_job(&jobs[0].id).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let again = e.start_clip_job(JobKind::Trim, "now fine".into(), |_ctx| async move { Ok(Made { output: None }) });
+    assert_ne!(again.state, JobState::Failed, "{again:?}");
+}

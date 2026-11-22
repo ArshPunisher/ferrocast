@@ -19,6 +19,9 @@ use crate::{Engine, EngineError, now};
 const JOB_LIMIT: Duration = Duration::from_secs(4 * 3600);
 /// Finished jobs kept for the list.
 const KEEP: usize = 50;
+/// Jobs waiting or running at once. Each waiting upload holds an open file and a task, and a
+/// queue behind a long compile could otherwise grow without end.
+pub(crate) const MAX_ACTIVE_JOBS: usize = 20;
 
 /// ffmpeg with no console window of its own on Windows.
 pub(crate) fn hidden(ffmpeg: &Path) -> Command {
@@ -172,6 +175,16 @@ impl Jobs {
         }
     }
 
+    /// Jobs waiting or running.
+    fn active(&self) -> usize {
+        self.recs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|r| matches!(r.view.state, JobState::Queued | JobState::Running))
+            .count()
+    }
+
     fn add(&self, kind: JobKind, label: String) -> (JobView, Arc<Cancel>) {
         let id = format!("job-{}", self.next.fetch_add(1, Ordering::SeqCst) + 1);
         let cancel = Arc::new(Cancel::default());
@@ -266,8 +279,24 @@ impl Engine {
         Fut: std::future::Future<Output = Result<Made, EngineError>> + Send + 'static,
     {
         let jobs = &self.studio().clips.jobs;
-        let (view, cancel) = jobs.add(kind, label);
+        let waiting = jobs.active();
+        let (mut view, cancel) = jobs.add(kind, label);
         let id = view.id.clone();
+        if waiting >= MAX_ACTIVE_JOBS {
+            // Not started: a full queue says so at once (and holds nothing: no file, no task).
+            let err = JobError {
+                message: format!("There are already {MAX_ACTIVE_JOBS} jobs waiting."),
+                hint: "Wait for some to finish, or cancel the ones you don't need.".into(),
+            };
+            jobs.update(&id, |v| {
+                v.state = JobState::Failed;
+                v.finished = Some(now().0);
+                v.error = Some(err.clone());
+            });
+            view.state = JobState::Failed;
+            view.error = Some(err);
+            return view;
+        }
         let engine = self.clone();
         let ctx = JobCtx { engine: engine.clone(), cancel: cancel.clone(), id: id.clone() };
         tokio::spawn(async move {
