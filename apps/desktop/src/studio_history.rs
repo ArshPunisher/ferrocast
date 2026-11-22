@@ -202,6 +202,27 @@ impl History {
             StudioAct::SetSceneTransition { scene, .. } => {
                 Some(fresh(format!("Change transition of {scene}"), None, false))
             }
+            StudioAct::AddNamedTransition { transition } => {
+                Some(fresh(format!("Add transition {}", transition.name), None, false))
+            }
+            StudioAct::UpdateNamedTransition { name, .. } => {
+                let key = ("named_transition", name.clone(), 0);
+                if self.joins(&key) {
+                    return Some(joined(false));
+                }
+                Some(fresh(format!("Change transition {name}"), Some(key), false))
+            }
+            StudioAct::RenameNamedTransition { name, new_name } if name != new_name => {
+                Some(fresh(format!("Rename transition {name}"), None, false))
+            }
+            StudioAct::DuplicateNamedTransition { name, .. } => {
+                Some(fresh(format!("Duplicate transition {name}"), None, false))
+            }
+            StudioAct::DeleteNamedTransition { name } => Some(fresh(format!("Remove transition {name}"), None, false)),
+            StudioAct::SetDefaultNamedTransition { name } => {
+                Some(fresh(format!("Set default transition {name}"), None, false))
+            }
+            StudioAct::SetTransitionMatrixRule { .. } => Some(fresh("Change transition matrix".into(), None, false)),
             StudioAct::Update { name, .. } => {
                 let key = ("settings", name.clone(), 0);
                 if self.joins(&key) {
@@ -558,5 +579,56 @@ mod tests {
         // Redo scope + add restores them.
         assert_eq!(h.redo(&c), Ok(Some("Use own filters for Card".into())));
         assert!(c.items("Vertical").unwrap()[0].own_filters);
+    }
+
+    #[test]
+    fn named_transition_and_matrix_edits_undo_and_redo() {
+        let c = stage();
+        c.add_scene("BRB").unwrap();
+        let mut h = History::default();
+        let step = |h: &mut History, act: StudioAct, run: &dyn Fn() -> Result<(), String>| {
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} is an undo step"));
+            h.after(&c, b, &run().map(|_| Value::Null));
+        };
+        step(
+            &mut h,
+            StudioAct::AddNamedTransition {
+                transition: ferrocast_engine::studio_host::NamedTransitionInput {
+                    name: "Fast Cut".into(),
+                    kind: "cut_transition".into(),
+                    ms: 0,
+                    settings: serde_json::json!({}),
+                    default: false,
+                },
+            },
+            &|| {
+                c.add_named_transition(&ferrocast_studio::NamedTransition {
+                    name: "Fast Cut".into(),
+                    kind: "cut_transition".into(),
+                    ms: 0,
+                    settings: serde_json::json!({}),
+                    default: false,
+                })
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            },
+        );
+        step(
+            &mut h,
+            StudioAct::SetTransitionMatrixRule {
+                from: Some("Main".into()),
+                to: Some("BRB".into()),
+                transition: Some("Fast Cut".into()),
+            },
+            &|| c.set_matrix_rule(Some("Main"), Some("BRB"), Some("Fast Cut")).map_err(|e| e.to_string()),
+        );
+        assert_eq!(c.resolve_transition("Main", "BRB").name, "Fast Cut");
+        assert_eq!(h.undo(&c), Ok(Some("Change transition matrix".into())));
+        assert_eq!(c.resolve_transition("Main", "BRB").name, "Fade");
+        assert_eq!(h.undo(&c), Ok(Some("Add transition Fast Cut".into())));
+        assert!(!c.named_transitions().iter().any(|t| t.name == "Fast Cut"));
+        assert_eq!(h.redo(&c), Ok(Some("Add transition Fast Cut".into())));
+        assert_eq!(h.redo(&c), Ok(Some("Change transition matrix".into())));
+        assert_eq!(c.resolve_transition("Main", "BRB").name, "Fast Cut");
     }
 }

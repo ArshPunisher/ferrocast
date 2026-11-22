@@ -1361,3 +1361,65 @@ async fn import_preview_routes_validate_and_forward() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn named_transition_and_matrix_routes_validate_and_forward() {
+    let r = start().await;
+    // Without desktop app: clean 422 studio_unavailable.
+    assert_eq!(
+        code(r.post("/studio/engine/transitions", json!({ "name": "Cut", "kind": "cut_transition", "ms": 0 })).await)
+            .await,
+        (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into())
+    );
+    let host = Arc::new(PausedHost::default());
+    r.engine.set_studio_host(host.clone());
+
+    // Invalid inputs rejected with 400 before reaching host.
+    for (res, msg) in [
+        (
+            r.post("/studio/engine/transitions", json!({ "name": " ", "kind": "fade_transition", "ms": 300 })).await,
+            "empty name",
+        ),
+        (r.post("/studio/engine/transitions", json!({ "name": "Bad", "kind": "laser", "ms": 300 })).await, "bad kind"),
+        (r.put("/studio/engine/transitions/Fade", json!({ "ms": 99999 })).await, "bad ms"),
+        (
+            r.put("/studio/engine/transition-matrix", json!({ "from": null, "to": null, "transition": "Fade" })).await,
+            "any->any",
+        ),
+    ] {
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{msg}");
+    }
+    assert!(host.acts.lock().unwrap().is_empty());
+
+    // Valid CRUD & matrix routes forward exact StudioAct values.
+    assert_eq!(
+        r.post(
+            "/studio/engine/transitions",
+            json!({ "name": "Swipe Fast", "kind": "swipe_transition", "ms": 250, "settings": { "direction": "left" } })
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(r.put("/studio/engine/transitions/Swipe%20Fast", json!({ "ms": 400 })).await.status(), StatusCode::OK);
+    assert_eq!(
+        r.post("/studio/engine/transitions/Swipe%20Fast/rename", json!({ "name": "Quick Swipe" })).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.post("/studio/engine/transitions/Quick%20Swipe/duplicate", json!({})).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        r.put("/studio/engine/transitions/Quick%20Swipe/default", json!({})).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        r.put("/studio/engine/transition-matrix", json!({ "from": "Main", "to": "BRB", "transition": "Quick Swipe" }))
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r.delete("/studio/engine/transitions/Quick%20Swipe%202").await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(host.acts.lock().unwrap().len(), 7);
+}

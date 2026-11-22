@@ -631,8 +631,8 @@ pub struct ItemTransform {
     pub height: u32,
 }
 
-/// The transitions the Studio offers (OBS's own kinds).
-pub const TRANSITION_KINDS: [&str; 7] = [
+/// The transitions the Studio offers (OBS's own kinds + Ferrocast's Move).
+pub const TRANSITION_KINDS: [&str; 8] = [
     "fade_transition",
     "cut_transition",
     "swipe_transition",
@@ -640,6 +640,7 @@ pub const TRANSITION_KINDS: [&str; 7] = [
     "fade_to_color_transition",
     "wipe_transition",
     "obs_stinger_transition",
+    "ferrocast_move",
 ];
 
 /// The kinds of bounding box, as OBS orders them.
@@ -1354,6 +1355,39 @@ pub struct SceneTransition {
     pub ms: u32,
 }
 
+/// Input to create a saved named transition.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NamedTransitionInput {
+    pub name: String,
+    pub kind: String,
+    pub ms: u32,
+    pub settings: Value,
+    pub default: bool,
+}
+
+impl Default for NamedTransitionInput {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: "fade_transition".into(),
+            ms: 300,
+            settings: serde_json::json!({}),
+            default: false,
+        }
+    }
+}
+
+/// Fields to update on an existing named transition.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NamedTransitionPatch {
+    pub kind: Option<String>,
+    pub ms: Option<u32>,
+    pub settings: Option<Value>,
+    pub default: Option<bool>,
+}
+
 /// Something to do with a Web page source (`POST …/sources/{name}/web` `{ "do": "reload" }`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1489,6 +1523,40 @@ pub enum StudioAct {
     SetSceneTransition {
         scene: String,
         transition: Option<SceneTransition>,
+    },
+    /// Adds a saved named transition → `NamedTransition`.
+    AddNamedTransition {
+        transition: NamedTransitionInput,
+    },
+    /// Updates kind, duration, settings, or default status on a named transition → `NamedTransition`.
+    UpdateNamedTransition {
+        name: String,
+        patch: NamedTransitionPatch,
+    },
+    /// Renames a named transition, keeping default and matrix references → `NamedTransition`.
+    RenameNamedTransition {
+        name: String,
+        new_name: String,
+    },
+    /// Duplicates a named transition (`new_name` optional) → `NamedTransition`.
+    DuplicateNamedTransition {
+        name: String,
+        #[serde(default)]
+        new_name: Option<String>,
+    },
+    /// Deletes a named transition (cleans up matrix references, promotes default if needed).
+    DeleteNamedTransition {
+        name: String,
+    },
+    /// Sets the default named transition.
+    SetDefaultNamedTransition {
+        name: String,
+    },
+    /// Sets or clears a rule in the from-scene / to-scene transition matrix.
+    SetTransitionMatrixRule {
+        from: Option<String>,
+        to: Option<String>,
+        transition: Option<String>,
     },
     /// A scene's sources, top first.
     Items {
@@ -1954,14 +2022,67 @@ impl StudioAct {
             A::SetSceneTransition { scene, transition } => {
                 check_source_name(scene)?;
                 if let Some(t) = transition {
-                    if !TRANSITION_KINDS.contains(&t.kind.as_str()) {
-                        return Err(EngineError::Invalid(
-                            "kind: fade, cut, swipe, slide, fade to colour, wipe or stinger transition.".into(),
-                        ));
+                    check_transition(t)?;
+                }
+                Ok(())
+            }
+            A::AddNamedTransition { transition } => {
+                check_source_name(&transition.name)?;
+                if !TRANSITION_KINDS.contains(&transition.kind.as_str()) {
+                    return Err(EngineError::Invalid("kind: one of the Studio's transitions.".into()));
+                }
+                if transition.ms > 20_000 {
+                    return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
+                }
+                if !transition.settings.is_object() {
+                    return Err(EngineError::Invalid("settings: an object of OBS transition settings.".into()));
+                }
+                check_settings(&transition.settings)
+            }
+            A::UpdateNamedTransition { name, patch } => {
+                check_source_name(name)?;
+                if let Some(kind) = &patch.kind
+                    && !TRANSITION_KINDS.contains(&kind.as_str())
+                {
+                    return Err(EngineError::Invalid("kind: one of the Studio's transitions.".into()));
+                }
+                if let Some(ms) = patch.ms
+                    && ms > 20_000
+                {
+                    return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
+                }
+                if let Some(settings) = &patch.settings {
+                    if !settings.is_object() {
+                        return Err(EngineError::Invalid("settings: an object of OBS transition settings.".into()));
                     }
-                    if t.ms > 20_000 {
-                        return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
-                    }
+                    check_settings(settings)?;
+                }
+                Ok(())
+            }
+            A::RenameNamedTransition { name, new_name } => {
+                check_source_name(name)?;
+                check_source_name(new_name)
+            }
+            A::DuplicateNamedTransition { name, new_name } => {
+                check_source_name(name)?;
+                if let Some(n) = new_name {
+                    check_source_name(n)?;
+                }
+                Ok(())
+            }
+            A::DeleteNamedTransition { name } | A::SetDefaultNamedTransition { name } => check_source_name(name),
+            A::SetTransitionMatrixRule { from, to, transition } => {
+                if from.is_none() && to.is_none() {
+                    return Err(EngineError::Invalid("from, to: pick a From scene, a To scene, or both.".into()));
+                }
+                if let Some(f) = from {
+                    check_source_name(f)?;
+                }
+                if let Some(t) = to {
+                    check_source_name(t)?;
+                }
+                if let Some(tr) = transition {
+                    check_source_name(tr)?;
                 }
                 Ok(())
             }
@@ -3177,6 +3298,15 @@ pub(crate) fn failed(message: String) -> EngineError {
     }
     if message.starts_with("There's no filter called") {
         return refused(404, "studio_no_filter", message, "Refresh the list of filters.");
+    }
+    if message.starts_with("There's no transition called") {
+        return refused(404, "studio_no_transition", message, "Refresh the list of transitions.");
+    }
+    if message.contains("already a transition called") {
+        return refused(409, "studio_name_taken", message, "Pick another transition name.");
+    }
+    if message.starts_with("At least one transition must remain") {
+        return refused(409, "studio_last_transition", message, "Keep at least one transition in the collection.");
     }
     // A collection's own name is in these messages: it must not decide the answer ("in use now").
     if message.contains("is damaged and can't be read") && message.contains("scene collection") {
@@ -4625,5 +4755,87 @@ mod tests {
         let mut bad_pic_name =
             StudioAct::SourcePicture { name: "a\nb".into(), width: 256, filters: true, item: Some(tgt) };
         assert!(matches!(bad_pic_name.check(), Err(EngineError::Invalid(_))));
+    }
+
+    #[test]
+    fn named_transition_and_matrix_acts_validate_and_map_errors() {
+        let mut good = [
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput {
+                    name: "Quick Fade".into(),
+                    kind: "fade_transition".into(),
+                    ms: 200,
+                    settings: serde_json::json!({}),
+                    default: false,
+                },
+            },
+            StudioAct::UpdateNamedTransition {
+                name: "Quick Fade".into(),
+                patch: NamedTransitionPatch {
+                    kind: Some("ferrocast_move".into()),
+                    ms: Some(400),
+                    settings: Some(serde_json::json!({})),
+                    default: Some(true),
+                },
+            },
+            StudioAct::RenameNamedTransition { name: "Quick Fade".into(), new_name: "Slow Move".into() },
+            StudioAct::DuplicateNamedTransition { name: "Slow Move".into(), new_name: None },
+            StudioAct::DeleteNamedTransition { name: "Slow Move 2".into() },
+            StudioAct::SetDefaultNamedTransition { name: "Fade".into() },
+            StudioAct::SetTransitionMatrixRule {
+                from: Some("Main".into()),
+                to: None,
+                transition: Some("Slow Move".into()),
+            },
+        ];
+        for a in &mut good {
+            assert!(a.check().is_ok(), "{a:?}");
+            assert!(a.changes(), "{a:?}");
+        }
+
+        let mut bad = [
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput { name: " ".into(), ..Default::default() },
+            },
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput {
+                    name: "BadKind".into(),
+                    kind: "explode".into(),
+                    ..Default::default()
+                },
+            },
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput { name: "TooLong".into(), ms: 20_001, ..Default::default() },
+            },
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput {
+                    name: "BadSettings".into(),
+                    settings: serde_json::json!(42),
+                    ..Default::default()
+                },
+            },
+            StudioAct::SetTransitionMatrixRule { from: None, to: None, transition: Some("Fade".into()) },
+            StudioAct::SetTransitionMatrixRule {
+                from: Some("".into()),
+                to: Some("Main".into()),
+                transition: Some("Fade".into()),
+            },
+        ];
+        for b in &mut bad {
+            assert!(matches!(b.check(), Err(EngineError::Invalid(_))), "{b:?}");
+        }
+
+        assert!(matches!(
+            failed("There's no transition called \"Gone\".".into()),
+            EngineError::Refused { status: 404, code: "studio_no_transition", .. }
+        ));
+        assert!(matches!(
+            failed("There's already a transition called \"Fade\".".into()),
+            EngineError::Refused { status: 409, code: "studio_name_taken", .. }
+        ));
+        assert!(matches!(
+            failed("At least one transition must remain.".into()),
+            EngineError::Refused { status: 409, code: "studio_last_transition", .. }
+        ));
     }
 }
