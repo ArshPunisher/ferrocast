@@ -247,6 +247,9 @@ struct StoreItemRaw {
     pub sandboxed: bool,
     #[serde(default)]
     pub plugin_kind: Option<String>,
+    /// The id the plugin's own manifest must carry (a Store plugin item names it).
+    #[serde(default)]
+    pub plugin_id: Option<String>,
     #[serde(default)]
     pub plugin_actions: Vec<String>,
     #[serde(default)]
@@ -499,6 +502,10 @@ fn validate_item_raw(
         let pk = item.plugin_kind.as_deref().unwrap_or("");
         if !matches!(pk, "effect" | "logic" | "panel") {
             return Err(format!("plugin_kind \"{pk}\": must be effect, logic or panel"));
+        }
+        match item.plugin_id.as_deref() {
+            Some(id) if crate::plugins::good_id(id) => {}
+            _ => return Err("plugin_id: the plugin's own id (like dev.you.name) is required".into()),
         }
         if pk == "effect" && !item.plugin_actions.is_empty() {
             return Err("plugin_actions: effect shaders cannot request actions".into());
@@ -866,6 +873,12 @@ fn merge_variations(existing: &[Variation], item_id: &str, incoming: &[Variation
     out
 }
 
+/// Why a downloaded plugin package isn't the one the catalog lists: its own id differs.
+fn plugin_identity_problem(expected: &str, manifest_id: &str) -> Option<String> {
+    (!crate::plugins::good_id(manifest_id) || manifest_id != expected)
+        .then(|| format!("The plugin's own id ({manifest_id}) isn't the one the catalog lists ({expected})."))
+}
+
 // ------------------------------------------------------------------------------- Engine API
 
 impl Engine {
@@ -1211,6 +1224,21 @@ impl Engine {
                             "store_asset_tampered",
                             "The downloaded plugin asked for permissions that weren't listed in the catalog.",
                             "Nothing was installed.",
+                        ));
+                    }
+                    let expected = item.plugin_id.as_deref().unwrap_or_default();
+                    if let Some(why) = plugin_identity_problem(expected, &manifest.id) {
+                        return Err(refused(502, "store_asset_tampered", why, "Nothing was installed."));
+                    }
+                    // The Store never overwrites a plugin it didn't install: the user's own copy
+                    // stays as it is (and an Undo can't delete it).
+                    let owned = existing.and_then(|o| o.plugin_id.as_deref()) == Some(manifest.id.as_str());
+                    if !owned && self.plugins().await.iter().any(|p| p.id == manifest.id) {
+                        return Err(refused(
+                            409,
+                            "store_plugin_exists",
+                            format!("A plugin with the id {} is already installed.", manifest.id),
+                            "Remove it first in Plugins if you want the Store's copy. Nothing was changed.",
                         ));
                     }
                     let info = self.install_plugin(&path).await?;
@@ -1681,6 +1709,37 @@ mod tests {
             st.sig = CATALOG_V2_SIG.into();
         }
         engine.store_catalog(true).await.unwrap();
+    }
+
+    /// A Store plugin whose id is already installed by the user is refused and left exactly as it
+    /// was: the Store never overwrites it, and an Undo never removes it.
+    #[tokio::test]
+    async fn a_store_plugin_never_overwrites_a_plugin_the_user_already_has() {
+        let _lock = TEST_GUARD.lock().await;
+        let state = Arc::new(StdMutex::new(MockFixtureState::default()));
+        let port = spawn_fixture_server(state.clone()).await;
+        let (engine, dir, _studio, _chat) = crate::automation::tests::engine().await;
+        set_source(Source { url: format!("http://127.0.0.1:{port}/catalog.json"), key: TEST_KEY.into(), local: true });
+        // The user's own install of the same plugin id (the package is the catalog's, but it came
+        // from outside the Store).
+        let zip = dir.path().join("mine.zip");
+        std::fs::write(&zip, PKG_PLUGIN).unwrap();
+        engine.install_plugin(&zip).await.unwrap();
+        let before = snapshot_plugin_zip(&engine.plugins_dir(), "dev.kira.softvignette").unwrap();
+        assert!(before.is_some());
+        let r = engine.install_store_item("soft-dimmer-shader").await;
+        assert!(matches!(r, Err(EngineError::Refused { status: 409, code: "store_plugin_exists", .. })), "{r:?}");
+        let after = snapshot_plugin_zip(&engine.plugins_dir(), "dev.kira.softvignette").unwrap();
+        assert_eq!(before, after, "the user's plugin changed");
+        assert!(engine.store_installed().await.unwrap().installed.is_empty());
+    }
+
+    /// The package's own id must be the one the catalog lists for the item.
+    #[test]
+    fn a_plugin_package_must_carry_the_id_the_catalog_lists() {
+        assert!(plugin_identity_problem("dev.kira.softvignette", "dev.kira.softvignette").is_none());
+        assert!(plugin_identity_problem("dev.kira.softvignette", "dev.evil.other").is_some());
+        assert!(plugin_identity_problem("dev.kira.softvignette", "../escape").is_some());
     }
 
     #[tokio::test]

@@ -463,6 +463,7 @@
       "license": "GPL-3.0-only",
       "sandboxed": true,
       "plugin_kind": "effect",
+      "plugin_id": "dev.kira.softvignette",
       "plugin_actions": [],
       "created_at": 1793940000000,
       "updated_at": 1794000000000,
