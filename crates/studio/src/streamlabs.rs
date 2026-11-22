@@ -27,14 +27,16 @@ pub fn scenes_dir() -> Option<PathBuf> {
 }
 
 /// A Streamlabs collection file: its root says so.
-fn is_streamlabs(doc: &Value) -> bool {
+pub(crate) fn is_streamlabs(doc: &Value) -> bool {
     doc.get("nodeType").and_then(Value::as_str) == Some("RootNode")
 }
 
 /// Collection names, from `manifest.json` (`collections: [{ id, name }]`).
 fn names(dir: &Path) -> Map<String, Value> {
     let Some(doc) =
-        std::fs::read(dir.join("manifest.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        crate::import_preview::read_plain_file(&dir.join("manifest.json"), crate::import_preview::MAX_MANIFEST_BYTES)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
     else {
         return Map::new();
     };
@@ -65,7 +67,9 @@ pub fn list(dir: &Path) -> Vec<ObsCollection> {
             if id == "manifest" || !valid_id(&id) {
                 return None;
             }
-            let doc: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            let bytes =
+                crate::import_preview::read_plain_file(&path, crate::import_preview::MAX_COLLECTION_BYTES).ok()?;
+            let doc: Value = serde_json::from_slice(&bytes).ok()?;
             if !is_streamlabs(&doc) {
                 return None;
             }
@@ -82,10 +86,24 @@ pub fn read(dir: &Path, id: &str) -> Result<Value, StudioError> {
     if !valid_id(id) || id == "manifest" {
         return Err(StudioError::Failed("That isn't one of Streamlabs' scene collections.".into()));
     }
-    let bytes = std::fs::read(dir.join(format!("{id}.json")))
-        .map_err(|_| StudioError::Failed("That Streamlabs scene collection isn't there any more.".into()))?;
-    let doc: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| StudioError::Failed(format!("The Streamlabs scene collection didn't read ({e}).")))?;
+    let bytes = crate::import_preview::read_plain_file(
+        &dir.join(format!("{id}.json")),
+        crate::import_preview::MAX_COLLECTION_BYTES,
+    )
+    .map_err(|e| {
+        StudioError::Failed(match e {
+            crate::import_preview::ReadFail::TooBig => {
+                "That Streamlabs scene collection is too large to import.".into()
+            }
+            crate::import_preview::ReadFail::Missing => "That Streamlabs scene collection isn't there any more.".into(),
+        })
+    })?;
+    let doc: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        StudioError::Failed(
+            "That Streamlabs scene collection is damaged and can't be read. Open it in Streamlabs to check it, or start fresh."
+                .into(),
+        )
+    })?;
     if !is_streamlabs(&doc) {
         return Err(StudioError::Failed("That file isn't a Streamlabs scene collection.".into()));
     }
@@ -93,16 +111,31 @@ pub fn read(dir: &Path, id: &str) -> Result<Value, StudioError> {
     Ok(to_obs(&doc, &name))
 }
 
-/// A name not taken yet in `taken`: "Name", else "Name(1)", "Name(2)"… (as OBS does).
-fn free_name(taken: &[Value], name: &str) -> String {
-    let used = |n: &str| taken.iter().any(|s| s.get("name").and_then(Value::as_str) == Some(n));
-    let mut out = name.to_string();
-    let mut n = 1;
-    while used(&out) {
-        out = format!("{name}({n})");
-        n += 1;
+/// The names used so far, and for each wanted name where to start counting.
+#[derive(Default)]
+struct Names {
+    used: std::collections::HashSet<String>,
+    next: std::collections::HashMap<String, u32>,
+}
+
+impl Names {
+    /// A name not taken yet: "Name", else "Name(1)", "Name(2)"… (as OBS does). Thousands of
+    /// sources with one name stay quick: each wanted name remembers its last number.
+    fn take(&mut self, name: &str) -> String {
+        let mut out = name.to_string();
+        if self.used.contains(&out) {
+            let n = self.next.entry(name.to_string()).or_insert(1);
+            loop {
+                out = format!("{name}({n})");
+                *n += 1;
+                if !self.used.contains(&out) {
+                    break;
+                }
+            }
+        }
+        self.used.insert(out.clone());
+        out
     }
-    out
 }
 
 /// Streamlabs' filters keep their kind in `type`; OBS's in `id`.
@@ -124,7 +157,7 @@ fn filters(v: &Value) -> Value {
 
 /// Streamlabs' one Screen Capture (game, display or window, picked in `capture_source_list`)
 /// as the OBS kind it stands for.
-fn screen_capture(settings: &mut Map<String, Value>) -> &'static str {
+pub(crate) fn screen_capture(settings: &mut Map<String, Value>) -> &'static str {
     let list = settings.get("capture_source_list").and_then(Value::as_str).unwrap_or("").to_string();
     let kind = list.split(':').next().unwrap_or("");
     let out = match kind {
@@ -175,7 +208,8 @@ pub fn for_this_computer(kind: &str) -> (&str, bool) {
 pub fn to_obs(root: &Value, name: &str) -> Value {
     let mut sources: Vec<Value> = Vec::new();
     // Streamlabs' id → the name it has here (items point at sources by id).
-    let mut by_id: Vec<(String, String)> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut names = Names::default();
     for s in items(root, "sources") {
         let mut settings = s.get("settings").and_then(Value::as_object).cloned().unwrap_or_default();
         let mut kind = s.get("type").and_then(Value::as_str).unwrap_or("").to_string();
@@ -183,7 +217,7 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
             kind = screen_capture(&mut settings).to_string();
         }
         let (here, keep) = for_this_computer(&kind);
-        let out_name = free_name(&sources, s.get("name").and_then(Value::as_str).unwrap_or("Source"));
+        let out_name = names.take(s.get("name").and_then(Value::as_str).unwrap_or("Source"));
         let sync = s
             .get("syncOffset")
             .map(|o| {
@@ -192,7 +226,7 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
             })
             .unwrap_or(0.0) as i64;
         if let Some(id) = s.get("id").and_then(Value::as_str) {
-            by_id.push((id.to_string(), out_name.clone()));
+            by_id.entry(id.to_string()).or_insert_with(|| out_name.clone());
         }
         sources.push(json!({
             "id": here,
@@ -210,16 +244,13 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
     // Scenes are sources too, and items may point at a scene (a nested scene).
     let mut scene_names = Vec::new();
     for sc in &scenes {
-        let n = free_name(&sources, sc.get("name").and_then(Value::as_str).unwrap_or("Scene"));
+        let n = names.take(sc.get("name").and_then(Value::as_str).unwrap_or("Scene"));
         if let Some(id) = sc.get("id").and_then(Value::as_str) {
-            by_id.push((id.to_string(), n.clone()));
+            by_id.entry(id.to_string()).or_insert_with(|| n.clone());
         }
-        // Held as a placeholder so the next scene's name sees it taken.
-        sources.push(json!({ "name": n }));
         scene_names.push(n);
     }
-    sources.truncate(sources.len() - scenes.len());
-    let name_of = |id: &str| by_id.iter().find(|(i, _)| i == id).map(|(_, n)| n.clone());
+    let name_of = |id: &str| by_id.get(id).cloned();
     for (sc, n) in scenes.iter().zip(&scene_names) {
         let list: Vec<Value> = items(sc, "sceneItems")
             .iter()
@@ -293,6 +324,23 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thousands_of_sources_with_one_name_convert_quickly_and_keep_obs_names() {
+        let n = 30_000;
+        let sources: Vec<Value> = (0..n)
+            .map(|i| json!({ "id": format!("s{i}"), "name": "A", "type": "color_source", "settings": {} }))
+            .collect();
+        let root = json!({ "nodeType": "RootNode", "sources": { "items": sources }, "scenes": { "items": [] } });
+        let started = std::time::Instant::now();
+        let out = to_obs(&root, "Big");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        let names: Vec<&str> = out["sources"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(names.len(), n);
+        assert_eq!(&names[..3], ["A", "A(1)", "A(2)"]);
+        let unique: std::collections::HashSet<&&str> = names.iter().collect();
+        assert_eq!(unique.len(), n, "every name is its own");
+    }
+
     use super::*;
 
     fn sample() -> Value {

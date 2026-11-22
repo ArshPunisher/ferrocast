@@ -210,6 +210,7 @@ impl Engine {
         }
         let c = self.connector(platform).ok_or(ConnectorError::NotConnected(platform))?;
         c.timeout(user_id, seconds, reason).await?;
+        self.clear_highlight_if_user_id(platform, user_id);
         self.count_timeout(platform, user_id).await;
         Ok(())
     }
@@ -307,7 +308,10 @@ impl Engine {
         for (p, uid) in targets {
             match self.connector(p) {
                 Some(c) => match c.ban(&uid, reason.as_deref()).await {
-                    Ok(()) => out.ok.push(p),
+                    Ok(()) => {
+                        self.clear_highlight_if_user_id(p, &uid);
+                        out.ok.push(p);
+                    }
                     Err(e) => out.failed.push(Failure { platform: p, reason: e.to_string() }),
                 },
                 None => out.failed.push(Failure { platform: p, reason: format!("{p} isn't connected") }),

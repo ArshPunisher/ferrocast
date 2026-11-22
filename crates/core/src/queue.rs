@@ -74,6 +74,9 @@ pub struct AlertQueue {
     waiting: VecDeque<Waiting>,
     playing: Option<Playing>,
     paused: bool,
+    /// Alerts play without their sound or speech (the dashboard's "Mute alerts").
+    #[serde(default)]
+    muted: bool,
     /// Earliest time the next alert may start (gap after the previous one).
     next_at: Millis,
 }
@@ -85,8 +88,29 @@ impl AlertQueue {
 
     /// Adds an alert. Higher priority goes first; equal priority keeps arrival order.
     pub fn enqueue(&mut self, alert: RenderedAlert, priority: i32, now: Millis) -> Vec<Action> {
+        self.enqueue_with(alert, priority, false, now)
+    }
+
+    /// Like [`enqueue`](Self::enqueue). With `interrupt`, an alert that is playing ends now
+    /// (a `Hide`, no gap) and this one goes to the front and shows at once. While paused it
+    /// just waits, and in the gap between two alerts it still goes first.
+    pub fn enqueue_with(&mut self, alert: RenderedAlert, priority: i32, interrupt: bool, now: Millis) -> Vec<Action> {
         if self.contains(&alert.alert_id) {
             return Vec::new();
+        }
+        if interrupt && !self.paused {
+            let mut actions = Vec::new();
+            if let Some(p) = &self.playing {
+                actions.push(Action::Hide { alert_id: p.alert.alert_id.clone() });
+                self.finish(now);
+            }
+            // Playing or between two alerts, it goes first and skips the gap.
+            self.next_at = now;
+            self.waiting.push_front(Waiting { alert, priority, enqueued_at: now });
+            actions.extend(self.tick(now));
+            // The new alert is already playing, so the cap only folds waiting ones.
+            actions.extend(self.enforce_cap());
+            return actions;
         }
         let pos = self.waiting.iter().position(|w| w.priority < priority).unwrap_or(self.waiting.len());
         self.waiting.insert(pos, Waiting { alert, priority, enqueued_at: now });
@@ -119,6 +143,18 @@ impl AlertQueue {
             actions.push(Action::Folded { alert_ids: stale });
         }
         if let Some(next) = self.waiting.pop_front() {
+            let mut next = next;
+            if self.muted {
+                next.alert.sound = None;
+                next.alert.tts_text = None;
+                next.alert.tts_audio = None;
+                // A design brings its own sound and, if on, synthesised impact hits.
+                if let Some(d) = &mut next.alert.design {
+                    d.look.sound.media_ref = None;
+                    d.look.sound.volume = 0;
+                    d.look.motion.impact_sounds = false;
+                }
+            }
             let deadline = Millis(now.0 + i64::from(next.alert.duration_ms) + self.tuning.ack_grace_ms);
             actions.push(Action::Show { alert: Box::new(next.alert.clone()) });
             self.playing = Some(Playing { alert: next.alert, started_at: now, deadline, acknowledged: false });
@@ -164,6 +200,15 @@ impl AlertQueue {
 
     pub fn pause(&mut self) {
         self.paused = true;
+    }
+
+    /// Mutes or unmutes the sound and speech of alerts that start from now on.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted
     }
 
     pub fn resume(&mut self, now: Millis) -> Vec<Action> {
@@ -246,14 +291,13 @@ impl AlertQueue {
         self.next_at = Millis(now.0 + self.tuning.gap_ms);
     }
 
+    /// Folds the oldest alerts of the lowest priority past the cap.
     fn enforce_cap(&mut self) -> Vec<Action> {
         let mut folded = Vec::new();
         while self.waiting.len() > self.tuning.max_waiting.max(1) {
-            // The back holds the lowest priority, newest last; fold the oldest of those.
             let lowest = self.waiting.iter().map(|w| w.priority).min().unwrap_or(0);
-            if let Some(idx) = self.waiting.iter().position(|w| w.priority == lowest)
-                && let Some(w) = self.waiting.remove(idx)
-            {
+            let Some(idx) = self.waiting.iter().position(|w| w.priority == lowest) else { break };
+            if let Some(w) = self.waiting.remove(idx) {
                 folded.push(w.alert.alert_id);
             }
         }
@@ -421,5 +465,190 @@ mod tests {
         let json = serde_json::to_string(&q).unwrap();
         let back: AlertQueue = serde_json::from_str(&json).unwrap();
         assert_eq!(q, back);
+    }
+
+    fn hidden(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Hide { alert_id } => Some(alert_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn interrupt_ends_the_playing_alert_and_shows_at_once() {
+        let mut q = q();
+        q.enqueue(alert("a", 5_000), 0, Millis(0));
+        q.enqueue(alert("w", 5_000), 0, Millis(1));
+        let acts = q.enqueue_with(alert("i", 5_000), 0, true, Millis(100));
+        assert_eq!(hidden(&acts), vec!["a"]);
+        assert_eq!(shown(&acts), vec!["i"], "no gap, no waiting");
+        assert_eq!(q.playing().unwrap().alert.alert_id, "i");
+        let order: Vec<_> = q.waiting().map(|w| w.alert.alert_id.clone()).collect();
+        assert_eq!(order, vec!["w"], "the one already waiting keeps its place");
+    }
+
+    #[test]
+    fn interrupt_with_nothing_playing_is_a_normal_enqueue() {
+        let mut q = q();
+        let acts = q.enqueue_with(alert("i", 1_000), 0, true, Millis(0));
+        assert!(hidden(&acts).is_empty());
+        assert_eq!(shown(&acts), vec!["i"]);
+    }
+
+    #[test]
+    fn interrupt_while_paused_just_waits() {
+        let mut q = q();
+        q.enqueue(alert("a", 5_000), 0, Millis(0));
+        q.pause();
+        let acts = q.enqueue_with(alert("i", 1_000), 0, true, Millis(10));
+        assert!(acts.is_empty());
+        assert_eq!(q.playing().unwrap().alert.alert_id, "a");
+        assert_eq!(q.waiting().count(), 1);
+    }
+
+    #[test]
+    fn a_non_interrupting_alert_never_ends_the_playing_one() {
+        let mut q = q();
+        q.enqueue(alert("a", 5_000), 0, Millis(0));
+        let acts = q.enqueue_with(alert("b", 5_000), 9, false, Millis(10));
+        assert!(acts.is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_interrupting_alert_changes_nothing() {
+        let mut q = q();
+        q.enqueue(alert("a", 5_000), 0, Millis(0));
+        assert!(q.enqueue_with(alert("a", 5_000), 0, true, Millis(10)).is_empty());
+        assert_eq!(q.playing().unwrap().alert.alert_id, "a");
+    }
+
+    #[test]
+    fn two_interrupts_in_a_row_each_replace_the_last() {
+        let mut q = q();
+        q.enqueue(alert("a", 5_000), 0, Millis(0));
+        q.enqueue_with(alert("i1", 5_000), 0, true, Millis(10));
+        let acts = q.enqueue_with(alert("i2", 5_000), 0, true, Millis(20));
+        assert_eq!((hidden(&acts), shown(&acts)), (vec!["i1".into()], vec!["i2".into()]));
+    }
+
+    #[test]
+    fn mute_strips_sound_and_speech_when_the_alert_starts() {
+        let mut q = q();
+        q.set_muted(true);
+        let mut a = alert("a", 1_000);
+        a.sound = Some("builtin:chime".into());
+        a.tts_text = Some("hi".into());
+        a.tts_audio = Some("m1".into());
+        let acts = q.enqueue(a, 0, Millis(0));
+        let Action::Show { alert } = &acts[0] else { panic!("no show") };
+        assert_eq!((&alert.sound, &alert.tts_text, &alert.tts_audio), (&None, &None, &None));
+        assert_eq!(q.playing().unwrap().alert.sound, None);
+    }
+
+    #[test]
+    fn unmuting_lets_the_next_alert_have_its_sound() {
+        let mut q = q();
+        q.set_muted(true);
+        q.set_muted(false);
+        let mut a = alert("a", 1_000);
+        a.sound = Some("builtin:chime".into());
+        let acts = q.enqueue(a, 0, Millis(0));
+        let Action::Show { alert } = &acts[0] else { panic!("no show") };
+        assert_eq!(alert.sound.as_deref(), Some("builtin:chime"));
+    }
+
+    #[test]
+    fn pause_and_mute_survive_a_round_trip_and_old_saves_load() {
+        let mut q = q();
+        q.pause();
+        q.set_muted(true);
+        let back: AlertQueue = serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
+        assert!(back.is_paused() && back.is_muted());
+        // A queue saved before mute existed has no `muted` key.
+        let mut v = serde_json::to_value(&q).unwrap();
+        v.as_object_mut().unwrap().remove("muted");
+        let old: AlertQueue = serde_json::from_value(v).unwrap();
+        assert!(old.is_paused() && !old.is_muted());
+    }
+
+    #[test]
+    fn an_interrupting_alert_is_never_folded_by_the_cap() {
+        let mut q =
+            AlertQueue::new(QueueTuning { ack_grace_ms: 1_000, gap_ms: 100, stale_after_ms: 0, max_waiting: 2 });
+        q.enqueue(alert("p", 5_000), 0, Millis(0));
+        q.enqueue(alert("w1", 5_000), 5, Millis(1));
+        q.enqueue(alert("w2", 5_000), 5, Millis(2));
+        // Full, and the interrupting alert has the lowest priority of all.
+        let acts = q.enqueue_with(alert("i", 5_000), -1, true, Millis(10));
+        assert_eq!(shown(&acts), vec!["i"]);
+        assert_eq!(q.playing().unwrap().alert.alert_id, "i");
+        assert!(q.waiting().count() <= 2);
+    }
+
+    #[test]
+    fn a_cap_of_one_with_only_the_kept_alert_cannot_loop() {
+        let mut q =
+            AlertQueue::new(QueueTuning { ack_grace_ms: 1_000, gap_ms: 100, stale_after_ms: 0, max_waiting: 1 });
+        q.enqueue(alert("p", 5_000), 0, Millis(0));
+        let acts = q.enqueue_with(alert("i", 5_000), 0, true, Millis(10));
+        assert_eq!(shown(&acts), vec!["i"]);
+    }
+
+    /// A muted alert with an alert design still carried the design's own sound and impact hits.
+    #[test]
+    fn mute_also_silences_the_designs_sound_and_impact_hits() {
+        use crate::design::{BuiltinSound, DesignContent, EventKey, Sound, pick, render_onto, tests::alert_design};
+        let e = any_sample("tip", Millis(0)).unwrap();
+        let rules = default_rules();
+        let (rule, var) = select(&rules, &e).unwrap();
+        let mut a = render("d1", rule, var, &e);
+        let mut d = alert_design("dz");
+        if let DesignContent::Alert(c) = &mut d.content {
+            let l = &mut c.events.get_mut(&EventKey::Tip).unwrap().variations[0].look;
+            l.sound = Sound { media_ref: Some("01hzsound".into()), builtin: BuiltinSound::Coin, volume: 55 };
+            l.motion.impact_sounds = true;
+        }
+        let (key, v) = pick(&d, &e).unwrap();
+        render_onto(&mut a, &d, key, v, &e);
+        assert!(a.design.as_ref().unwrap().look.motion.impact_sounds, "set up with sound");
+        let mut q = q();
+        q.set_muted(true);
+        let acts = q.enqueue(a, 0, Millis(0));
+        let Action::Show { alert } = &acts[0] else { panic!("no show") };
+        let look = &alert.design.as_ref().unwrap().look;
+        assert_eq!((look.sound.media_ref.as_deref(), look.sound.volume, look.motion.impact_sounds), (None, 0, false));
+        assert_eq!(
+            q.playing().unwrap().alert.design.as_ref().unwrap().look.sound.volume,
+            0,
+            "what is kept is silent too"
+        );
+    }
+
+    /// Between two alerts (the gap) nothing plays, but an interrupting alert still goes first.
+    #[test]
+    fn interrupt_jumps_ahead_during_the_gap() {
+        let mut q = q();
+        q.enqueue(alert("a", 1_000), 0, Millis(0));
+        q.enqueue(alert("w", 1_000), 0, Millis(1));
+        q.ack("a", AckPhase::Finished, Millis(1_000));
+        assert!(q.playing().is_none(), "in the gap");
+        let acts = q.enqueue_with(alert("i", 1_000), 0, true, Millis(1_010));
+        assert_eq!(shown(&acts), vec!["i"], "no waiting for the gap, no queueing behind w");
+        assert!(hidden(&acts).is_empty(), "nothing was playing to hide");
+        let order: Vec<_> = q.waiting().map(|w| w.alert.alert_id.clone()).collect();
+        assert_eq!(order, vec!["w"]);
+    }
+
+    #[test]
+    fn interrupt_while_paused_in_the_gap_still_just_waits() {
+        let mut q = q();
+        q.enqueue(alert("a", 1_000), 0, Millis(0));
+        q.ack("a", AckPhase::Finished, Millis(1_000));
+        q.pause();
+        assert!(q.enqueue_with(alert("i", 1_000), 0, true, Millis(1_010)).is_empty());
+        assert_eq!(q.waiting().count(), 1);
     }
 }

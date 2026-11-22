@@ -266,6 +266,14 @@ pub async fn queue_pause(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.queue_pause().await))
 }
 
+pub async fn queue_mute(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.queue_set_muted(true).await))
+}
+
+pub async fn queue_unmute(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.queue_set_muted(false).await))
+}
+
 pub async fn queue_resume(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.queue_resume().await))
 }

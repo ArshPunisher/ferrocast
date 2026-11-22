@@ -62,6 +62,7 @@ pub mod studio;
 pub mod studio_host;
 mod timers;
 mod updates;
+mod widgets;
 pub use updates::{
     AvailableUpdate, CHECK_WAIT, CURRENT_VERSION, DOWNLOAD_URL, InstallPhase, InstallState, UpdateProblem, UpdateView,
     update_channel,
@@ -149,6 +150,7 @@ struct Inner {
     points_cooldown: Mutex<loyalty::PointsCooldowns>,
     poll: Mutex<polls::PollSlot>,
     giveaway: tokio::sync::Mutex<giveaways::GiveawaySlot>,
+    highlight: Mutex<widgets::HighlightSlot>,
     /// When the last welcome went out (they're spaced out during raids).
     last_welcome: Mutex<Option<ferrocast_core::event::Millis>>,
     discord_posts: Mutex<discord::LastPosts>,
@@ -328,6 +330,7 @@ impl Engine {
                 points_cooldown: Mutex::new(Default::default()),
                 poll: Mutex::new(Default::default()),
                 giveaway: tokio::sync::Mutex::new(Default::default()),
+                highlight: Mutex::new(Default::default()),
                 last_welcome: Mutex::new(None),
                 discord_posts: Mutex::new(Default::default()),
                 discord_pro: Mutex::new(Default::default()),
@@ -541,6 +544,7 @@ impl Engine {
             return;
         }
         self.remember_hidden(platform, id);
+        self.clear_highlight_if_message(platform, id);
         let engine = self.clone();
         let sid = id.to_string();
         tokio::spawn(async move {
@@ -552,6 +556,7 @@ impl Engine {
 
     /// Hides a person's recent chat (banned or messages cleared).
     pub(crate) fn hide_user(&self, platform: Platform, actor_id: &str) {
+        self.clear_highlight_if_user_id(platform, actor_id);
         let engine = self.clone();
         let aid = actor_id.to_string();
         let since = now().0 - 24 * 3_600_000;

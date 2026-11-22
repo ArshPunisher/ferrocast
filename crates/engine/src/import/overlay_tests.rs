@@ -1510,3 +1510,27 @@ fn a_capture_or_audio_source_comes_in_without_saying_which_window_or_device() {
         );
     }
 }
+
+#[test]
+fn every_widget_kind_has_a_default_that_passes_its_own_checks() {
+    use crate::import::overlay_parse::{widget_default_config_for_tests, widget_default_size_for_tests};
+    for kind in [
+        WidgetKind::Alerts,
+        WidgetKind::Chat,
+        WidgetKind::Events,
+        WidgetKind::Goal,
+        WidgetKind::Label,
+        WidgetKind::Viewers,
+        WidgetKind::Poll,
+        WidgetKind::Giveaway,
+        WidgetKind::EndCredits,
+        WidgetKind::EmoteWall,
+        WidgetKind::ChatHighlight,
+        WidgetKind::Layer,
+    ] {
+        let (w, h) = widget_default_size_for_tests(kind);
+        assert!(w > 0 && h > 0, "{kind:?}");
+        let cfg = widget_default_config_for_tests(kind);
+        ferrocast_core::overlay::validate_widget_config(kind, &cfg).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+    }
+}

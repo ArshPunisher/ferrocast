@@ -153,6 +153,55 @@ async fn a_panel_is_a_page_of_its_own() {
     assert_eq!(none.status(), StatusCode::NOT_FOUND);
 }
 
+/// Custom alert sandbox page sets strict CSP (no connect-src, sandbox allow-scripts, no allow-same-origin).
+#[tokio::test]
+async fn alert_sandbox_page_enforces_strict_csp() {
+    let s = start().await;
+    let page = s.client.get(format!("{}/alert-sandbox", s.base)).send().await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let csp = page.headers().get("content-security-policy").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    for want in [
+        "default-src 'none'",
+        "connect-src 'none'",
+        "form-action 'none'",
+        "base-uri 'none'",
+        "frame-ancestors 'self'",
+        "sandbox allow-scripts",
+    ] {
+        assert!(csp.contains(want), "{want} in {csp}");
+    }
+    assert!(!csp.contains("allow-same-origin"), "must never allow-same-origin: {csp}");
+    assert!(!csp.contains("img-src *"), "must restrict asset hosts: {csp}");
+    assert_eq!(page.headers().get("x-content-type-options").and_then(|v| v.to_str().ok()), Some("nosniff"));
+    assert_eq!(page.headers().get("referrer-policy").and_then(|v| v.to_str().ok()), Some("no-referrer"));
+}
+
+/// Only the bootstrap may run in the custom alert frame: a per-response nonce, never
+/// 'unsafe-inline' for scripts, so an inline handler in a saved template is inert.
+#[tokio::test]
+async fn alert_sandbox_only_runs_its_own_bootstrap() {
+    let s = start().await;
+    let get = || async {
+        let page = s.client.get(format!("{}/alert-sandbox?origin=http://127.0.0.1:1", s.base)).send().await.unwrap();
+        let csp = page.headers().get("content-security-policy").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        (csp, page.text().await.unwrap())
+    };
+    let (csp, html) = get().await;
+    let script_src = csp.split(';').map(str::trim).find(|d| d.starts_with("script-src")).unwrap_or("");
+    assert!(!script_src.contains("unsafe-inline"), "scripts: {script_src}");
+    assert!(!csp.contains("media-src"), "no sound from the frame: {csp}");
+    let nonce = script_src.split("'nonce-").nth(1).and_then(|r| r.split('\'').next()).unwrap_or("");
+    assert!(nonce.len() >= 16, "a nonce: {script_src}");
+    assert!(html.contains(&format!("<script nonce=\"{nonce}\">")), "the script carries it");
+    assert_eq!(html.matches("<script").count(), 1, "one script only");
+    for defence in ["BANNED_TAGS", "DOMParser", "PARENT"] {
+        assert!(html.contains(defence), "the sanitising bootstrap is served: {defence}");
+    }
+    assert!(!html.contains("createContextualFragment"));
+    let (csp2, _) = get().await;
+    assert_ne!(csp, csp2, "a fresh nonce for every load");
+}
+
 /// The catalog before the owner's key is in the app: closed, said plainly (503 with a hint), and
 /// nothing can be installed from it.
 #[tokio::test]

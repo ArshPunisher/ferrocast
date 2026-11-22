@@ -6,6 +6,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::event::{Actor, Content, Event, EventKind, Millis, Platform};
+use crate::layer::{Check, is_color, is_font_family};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WidgetKind {
@@ -19,6 +22,12 @@ pub enum WidgetKind {
     Poll,
     /// A giveaway: how to enter, then the winner.
     Giveaway,
+    /// Scrolling credits roll at stream end.
+    EndCredits,
+    /// Floating/bouncing chat emotes bursting across the screen.
+    EmoteWall,
+    /// One pinned chat message shown until dismissed or timed out.
+    ChatHighlight,
     /// A static piece of the scene: image, text, shape, frame, webcam frame or the brand
     /// mark of a built-in design (`config.type`).
     Layer,
@@ -168,9 +177,13 @@ impl Overlay {
             if w.kind == WidgetKind::Layer {
                 crate::layer::validate(&w.config)
                     .map_err(|message| OverlayError::Layer { id: w.id.clone(), message })?;
-            } else if let Some(style) = w.config.get("style") {
-                crate::layer::validate_widget_style(style)
+            } else {
+                validate_widget_config(w.kind, &w.config)
                     .map_err(|message| OverlayError::Style { id: w.id.clone(), message })?;
+                if let Some(style) = w.config.get("style") {
+                    crate::layer::validate_widget_style(style)
+                        .map_err(|message| OverlayError::Style { id: w.id.clone(), message })?;
+                }
             }
         }
         if let Some(d) = &self.design
@@ -195,6 +208,15 @@ impl Overlay {
 
     pub fn wants_alerts(&self) -> bool {
         self.widgets.iter().any(|w| w.kind == WidgetKind::Alerts)
+    }
+
+    pub fn wants_emotes(&self) -> bool {
+        self.widgets.iter().any(|w| w.kind == WidgetKind::EmoteWall)
+    }
+
+    /// Live `chat_message` and moderation frames go to both Chat and Emote Wall widgets.
+    pub fn wants_chat_events(&self) -> bool {
+        self.wants_chat() || self.wants_emotes()
     }
 
     /// Whether a layer here moves or plays with the music (a motion background, the music
@@ -242,6 +264,242 @@ pub fn preset_widgets(preset: Preset) -> Vec<Widget> {
         Preset::ChatOnly => vec![Widget { x: 40, y: 40, w: 520, h: 1000, ..chat }],
         Preset::Blank => vec![],
     }
+}
+
+/// Hostnames Ferrocast already uses for Twitch, Kick, YouTube, 7TV, BTTV, and FFZ emotes.
+pub const EMOTE_CDN_HOSTS: &[&str] = &[
+    "static-cdn.jtvnw.net",
+    "files.kick.com",
+    "images.kick.com",
+    "cdn.7tv.app",
+    "cdn.betterttv.net",
+    "cdn.frankerfacez.com",
+    "yt3.ggpht.com",
+];
+
+pub const CREDITS_SECTIONS: &[&str] = &["followers", "subs", "gifters", "tippers", "raiders", "mods"];
+pub const EMOTE_WALL_PHYSICS: &[&str] = &["bounce", "rain", "fountain"];
+pub const WIDGET_THEMES: &[&str] = &["molten", "daylight", "arcade", "minimal", "sticker"];
+pub const EMOTE_WALL_MAX_CAP: u64 = 120;
+
+/// Accepts only `https://` URLs with no userinfo/port/backslash/whitespace/control characters and
+/// an exact hostname match in [`EMOTE_CDN_HOSTS`].
+pub fn is_trusted_emote_cdn(raw: &str) -> bool {
+    if raw.len() > 512 || raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    let Some(rest) = raw.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains(':')
+        || authority.contains('\\')
+        || !authority.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        || !rest[authority.len()..].starts_with('/')
+        || rest.len() <= authority.len() + 1
+    {
+        return false;
+    }
+    let host = authority.to_ascii_lowercase();
+    EMOTE_CDN_HOSTS.contains(&host.as_str())
+}
+
+/// A pinned chat message displayed in a `chat_highlight` overlay widget until dismissed or timed out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatHighlight {
+    pub id: String,
+    pub event_id: String,
+    pub source_id: Option<String>,
+    pub platform: Platform,
+    pub actor: Actor,
+    pub content: Content,
+    pub is_action: bool,
+    pub pinned_at: Millis,
+    pub expires_at: Option<Millis>,
+}
+
+impl ChatHighlight {
+    pub fn from_event(id: String, event: &Event, pinned_at: Millis, expires_at: Option<Millis>) -> Option<Self> {
+        let EventKind::ChatMessage { actor, content, is_action, .. } = &event.kind else {
+            return None;
+        };
+        Some(Self {
+            id,
+            event_id: event.id.clone(),
+            source_id: event.source_id.clone(),
+            platform: event.platform,
+            actor: actor.clone(),
+            content: content.clone(),
+            is_action: *is_action,
+            pinned_at,
+            expires_at,
+        })
+    }
+}
+
+fn check_theme(obj: &serde_json::Map<String, Value>) -> Check {
+    if let Some(theme) = obj.get("theme").filter(|v| !v.is_null()) {
+        let s = theme.as_str().ok_or_else(|| "config.theme: must be text.".to_string())?;
+        if !WIDGET_THEMES.contains(&s) {
+            return Err("config.theme: choose molten, daylight, arcade, minimal or sticker.".into());
+        }
+    }
+    Ok(())
+}
+
+fn check_optional_color(obj: &serde_json::Map<String, Value>, key: &str) -> Check {
+    if let Some(v) = obj.get(key).filter(|v| !v.is_null()) {
+        let s = v.as_str().ok_or_else(|| format!("config.{key}: must be a hex colour like #eef0f5."))?;
+        if !s.is_empty() && !is_color(s) {
+            return Err(format!("config.{key}: use a hex colour like #eef0f5 or clear it for the theme default."));
+        }
+    }
+    Ok(())
+}
+
+fn check_optional_bool(obj: &serde_json::Map<String, Value>, key: &str) -> Check {
+    if let Some(v) = obj.get(key)
+        && !v.is_null()
+        && !v.is_boolean()
+    {
+        return Err(format!("config.{key}: must be true or false."));
+    }
+    Ok(())
+}
+
+/// Validates widget `config` for interactive widget kinds (`end_credits`, `emote_wall`,
+/// `chat_highlight`). Existing widget kinds keep backward-compatible validation here.
+pub fn validate_widget_config(kind: WidgetKind, config: &Value) -> Check {
+    if !matches!(kind, WidgetKind::EndCredits | WidgetKind::EmoteWall | WidgetKind::ChatHighlight) {
+        return Ok(());
+    }
+    let obj = config.as_object().ok_or_else(|| "config: must be an object.".to_string())?;
+    check_theme(obj)?;
+    match kind {
+        WidgetKind::EndCredits => {
+            if let Some(title) = obj.get("title").filter(|v| !v.is_null()) {
+                let t = title.as_str().ok_or_else(|| "config.title: must be text.".to_string())?;
+                if t.chars().count() > 80 || t.chars().any(char::is_control) {
+                    return Err("config.title: keep the heading on one line up to 80 characters.".into());
+                }
+            }
+            if let Some(sections) = obj.get("sections") {
+                let arr =
+                    sections.as_array().ok_or_else(|| "config.sections: must be a list of sections.".to_string())?;
+                if arr.is_empty() || arr.len() > CREDITS_SECTIONS.len() {
+                    return Err("config.sections: choose 1 to 6 credits sections.".into());
+                }
+                let mut seen = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let s = item.as_str().ok_or_else(|| "config.sections: each section must be text.".to_string())?;
+                    if !CREDITS_SECTIONS.contains(&s) {
+                        return Err(format!("config.sections: unknown section '{s}'."));
+                    }
+                    if seen.contains(&s) {
+                        return Err(format!("config.sections: '{s}' is listed twice."));
+                    }
+                    seen.push(s);
+                }
+            }
+            if let Some(speed) = obj.get("speed") {
+                let n = speed
+                    .as_f64()
+                    .filter(|n| n.is_finite())
+                    .ok_or_else(|| "config.speed: scroll speed must be a number from 20 to 300.".to_string())?;
+                if !(20.0..=300.0).contains(&n) {
+                    return Err("config.speed: scroll speed must be between 20 and 300.".into());
+                }
+            }
+            if let Some(font) = obj.get("font").filter(|v| !v.is_null()) {
+                let f = font.as_str().ok_or_else(|| "config.font: must be a font name.".to_string())?;
+                if !is_font_family(f) {
+                    return Err("config.font: choose one of the built-in fonts or \"system\".".into());
+                }
+            }
+            check_optional_color(obj, "text_color")?;
+            check_optional_color(obj, "accent_color")?;
+            check_optional_color(obj, "background")?;
+            check_optional_bool(obj, "loop")?;
+        }
+        WidgetKind::EmoteWall => {
+            if let Some(platforms) = obj.get("platforms") {
+                let arr =
+                    platforms.as_array().ok_or_else(|| "config.platforms: must be a list of platforms.".to_string())?;
+                if arr.len() > 3 {
+                    return Err("config.platforms: choose from twitch, youtube and kick.".into());
+                }
+                let mut seen = Vec::with_capacity(arr.len());
+                for item in arr {
+                    let p = item.as_str().ok_or_else(|| "config.platforms: each platform must be text.".to_string())?;
+                    if !matches!(p, "twitch" | "youtube" | "kick") {
+                        return Err("config.platforms: choose from twitch, youtube and kick.".into());
+                    }
+                    if seen.contains(&p) {
+                        return Err(format!("config.platforms: '{p}' is listed twice."));
+                    }
+                    seen.push(p);
+                }
+            }
+            if let Some(max) = obj.get("max_emotes") {
+                let n = max
+                    .as_u64()
+                    .ok_or_else(|| "config.max_emotes: must be a whole number from 5 to 120.".to_string())?;
+                if !(5..=EMOTE_WALL_MAX_CAP).contains(&n) {
+                    return Err("config.max_emotes: must be a whole number from 5 to 120.".into());
+                }
+            }
+            if let Some(size) = obj.get("size") {
+                let n = size
+                    .as_u64()
+                    .ok_or_else(|| "config.size: must be a whole number from 24 to 128 px.".to_string())?;
+                if !(24..=128).contains(&n) {
+                    return Err("config.size: must be between 24 and 128 px.".into());
+                }
+            }
+            if let Some(lifetime) = obj.get("lifetime_s") {
+                let n = lifetime
+                    .as_f64()
+                    .filter(|n| n.is_finite())
+                    .ok_or_else(|| "config.lifetime_s: must be a number from 1 to 20 seconds.".to_string())?;
+                if !(1.0..=20.0).contains(&n) {
+                    return Err("config.lifetime_s: must be between 1 and 20 seconds.".into());
+                }
+            }
+            if let Some(physics) = obj.get("physics") {
+                let p =
+                    physics.as_str().ok_or_else(|| "config.physics: must be bounce, rain or fountain.".to_string())?;
+                if !EMOTE_WALL_PHYSICS.contains(&p) {
+                    return Err("config.physics: choose bounce, rain or fountain.".into());
+                }
+            }
+        }
+        WidgetKind::ChatHighlight => {
+            if let Some(dur) = obj.get("duration_s").filter(|v| !v.is_null()) {
+                let n = dur.as_u64().ok_or_else(|| {
+                    "config.duration_s: leave empty to stay until dismissed, or pick 5 to 3600 seconds.".to_string()
+                })?;
+                if !(5..=3600).contains(&n) {
+                    return Err(
+                        "config.duration_s: leave empty to stay until dismissed, or pick 5 to 3600 seconds.".into()
+                    );
+                }
+            }
+            if let Some(size) = obj.get("font_size") {
+                let n = size
+                    .as_u64()
+                    .ok_or_else(|| "config.font_size: must be a whole number from 14 to 48 px.".to_string())?;
+                if !(14..=48).contains(&n) {
+                    return Err("config.font_size: must be between 14 and 48 px.".into());
+                }
+            }
+            check_optional_bool(obj, "show_badges")?;
+            check_optional_bool(obj, "show_platform")?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -299,5 +557,107 @@ mod tests {
         let many: Vec<Widget> =
             (0..41).map(|i| Widget::new(&i.to_string(), WidgetKind::Label, (0, 0, 10, 10), json!({}))).collect();
         assert!(matches!(overlay(many).validate(), Err(OverlayError::TooManyWidgets(_))));
+    }
+
+    #[test]
+    fn validates_new_interactive_widget_configs_and_caps() {
+        let ok_credits = Widget::new(
+            "ec",
+            WidgetKind::EndCredits,
+            (100, 100, 800, 700),
+            json!({
+                "theme": "molten",
+                "title": "Thanks for watching",
+                "sections": ["followers", "subs", "gifters", "tippers", "raiders", "mods"],
+                "speed": 60,
+                "font": "system",
+                "text_color": "#eef0f5",
+                "accent_color": "#ffb347",
+                "background": null,
+                "loop": true
+            }),
+        );
+        overlay(vec![ok_credits.clone()]).validate().unwrap();
+
+        let mut bad_credits = ok_credits.clone();
+        bad_credits.config["speed"] = json!(500);
+        assert!(matches!(overlay(vec![bad_credits]).validate(), Err(OverlayError::Style { .. })));
+
+        let mut bad_color = ok_credits.clone();
+        bad_color.config["text_color"] = json!("javascript:alert(1)");
+        assert!(matches!(overlay(vec![bad_color]).validate(), Err(OverlayError::Style { .. })));
+
+        let mut bad_font = ok_credits.clone();
+        bad_font.config["font"] = json!("Comic Sans; background: url(x)");
+        assert!(matches!(overlay(vec![bad_font]).validate(), Err(OverlayError::Style { .. })));
+
+        let mut bad_sections = ok_credits;
+        bad_sections.config["sections"] = json!([]);
+        assert!(matches!(overlay(vec![bad_sections]).validate(), Err(OverlayError::Style { .. })));
+
+        let ok_emotes = Widget::new(
+            "ew",
+            WidgetKind::EmoteWall,
+            (0, 0, 1920, 1080),
+            json!({ "theme": "molten", "platforms": ["twitch", "kick"], "max_emotes": 60, "size": 56, "lifetime_s": 6, "physics": "fountain" }),
+        );
+        overlay(vec![ok_emotes.clone()]).validate().unwrap();
+        assert!(overlay(vec![ok_emotes.clone()]).wants_emotes());
+        assert!(overlay(vec![ok_emotes.clone()]).wants_chat_events());
+        assert!(!overlay(vec![ok_emotes.clone()]).wants_chat());
+
+        let mut bad_cap = ok_emotes.clone();
+        bad_cap.config["max_emotes"] = json!(999);
+        assert!(matches!(overlay(vec![bad_cap]).validate(), Err(OverlayError::Style { .. })));
+
+        let mut bad_physics = ok_emotes;
+        bad_physics.config["physics"] = json!("explode");
+        assert!(matches!(overlay(vec![bad_physics]).validate(), Err(OverlayError::Style { .. })));
+
+        let ok_highlight = Widget::new(
+            "ch",
+            WidgetKind::ChatHighlight,
+            (40, 800, 620, 220),
+            json!({ "theme": "arcade", "duration_s": 30, "font_size": 24, "show_badges": true, "show_platform": true }),
+        );
+        overlay(vec![ok_highlight.clone()]).validate().unwrap();
+
+        let mut bad_hl = ok_highlight;
+        bad_hl.config["duration_s"] = json!(2);
+        assert!(matches!(overlay(vec![bad_hl]).validate(), Err(OverlayError::Style { .. })));
+    }
+
+    #[test]
+    fn emote_cdn_allowlist_blocks_hostile_urls() {
+        for ok in [
+            "https://static-cdn.jtvnw.net/emoticons/v2/25/static/dark/2.0",
+            "https://files.kick.com/emotes/4148074/fullsize",
+            "https://images.kick.com/emotes/1/fullsize",
+            "https://cdn.7tv.app/emote/01F6N/2x.webp",
+            "https://cdn.betterttv.net/emote/abc/2x",
+            "https://cdn.frankerfacez.com/emote/123/2",
+            "https://yt3.ggpht.com/abc=w48-h48-c-k-nd",
+        ] {
+            assert!(is_trusted_emote_cdn(ok), "expected trusted: {ok}");
+        }
+        for bad in [
+            "http://static-cdn.jtvnw.net/emoticons/v2/25/static/dark/2.0",
+            "https://static-cdn.jtvnw.net.evil.com/x.png",
+            "https://evil.com/@static-cdn.jtvnw.net/x.png",
+            "https://user@static-cdn.jtvnw.net/x.png",
+            "https://static-cdn.jtvnw.net:8443/x.png",
+            "https://evil.com\\@static-cdn.jtvnw.net/x.png",
+            "https://evil.com/https://static-cdn.jtvnw.net/x.png",
+            "data:image/svg+xml,<svg onload=alert(1)>",
+            "javascript:alert(1)",
+            "//cdn.7tv.app/emote/1/1x.webp",
+            "https://static\u{ad}-cdn.jtvnw.net/x.png",
+            "https://static-cdn.jtvnw.net",
+            "https://static-cdn.jtvnw.net/",
+            "https://yt3.ggpht.com?a=1",
+            "https://static-cdn.jtvnw.net#x",
+        ] {
+            assert!(!is_trusted_emote_cdn(bad), "expected rejected: {bad}");
+        }
     }
 }

@@ -813,6 +813,16 @@ fn map_streamlabel_template(label_type: &str) -> (&'static str, String) {
     ("Stream label", tpl.to_string())
 }
 
+#[cfg(test)]
+pub(crate) fn widget_default_size_for_tests(kind: WidgetKind) -> (i32, i32) {
+    widget_default_size(kind)
+}
+
+#[cfg(test)]
+pub(crate) fn widget_default_config_for_tests(kind: WidgetKind) -> Value {
+    widget_default_config(kind, None, None)
+}
+
 fn widget_default_size(kind: WidgetKind) -> (i32, i32) {
     match kind {
         WidgetKind::Alerts => (800, 420),
@@ -823,6 +833,9 @@ fn widget_default_size(kind: WidgetKind) -> (i32, i32) {
         WidgetKind::Viewers => (260, 72),
         WidgetKind::Poll => (480, 340),
         WidgetKind::Giveaway => (520, 420),
+        WidgetKind::EndCredits => (800, 700),
+        WidgetKind::EmoteWall => (1920, 1080),
+        WidgetKind::ChatHighlight => (620, 220),
         WidgetKind::Layer => (400, 200),
     }
 }
@@ -873,6 +886,13 @@ fn widget_default_config(kind: WidgetKind, label_text: Option<&str>, font_family
         WidgetKind::Viewers => json!({ "theme": "molten" }),
         WidgetKind::Poll => json!({ "theme": "molten" }),
         WidgetKind::Giveaway => json!({ "theme": "molten" }),
+        // No pack from Streamlabs or OWN3D maps to these (they are Ferrocast's own widgets), so
+        // these are only here for a complete match: the defaults pass `validate_widget_config`.
+        WidgetKind::EndCredits => json!({ "theme": "molten", "title": "Thanks for watching", "speed": 60 }),
+        WidgetKind::EmoteWall => json!({ "theme": "molten", "max_emotes": 60, "size": 56, "lifetime_s": 6 }),
+        WidgetKind::ChatHighlight => {
+            json!({ "theme": "molten", "duration_s": 30, "font_size": 24, "show_badges": true, "show_platform": true })
+        }
         WidgetKind::Layer => json!({ "type": "text", "text": label_text.unwrap_or("") }),
     };
     if kind != WidgetKind::Layer

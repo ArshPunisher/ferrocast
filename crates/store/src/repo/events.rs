@@ -115,6 +115,35 @@ pub fn get(store: &Store, id: &str) -> Result<Option<Event>> {
     Ok(recent(store, Some(seq + 1), 1, &[])?.into_iter().next().map(|(_, e)| e))
 }
 
+/// Fetches a non-hidden chat message by its Ferrocast event id (for pinning in Chat Highlight).
+pub fn get_visible_chat(store: &Store, id: &str) -> Result<Option<Event>> {
+    store.read(|c| {
+        let mut st = c.prepare(
+            "SELECT seq, id, platform, source_id, origin, occurred_at, received_at, data FROM events
+             WHERE id = ?1 AND kind = 'chat_message' AND hidden = 0 LIMIT 1",
+        )?;
+        st.query_row([id], |r| {
+            let seq: i64 = r.get(0)?;
+            let platform: String = r.get(2)?;
+            let origin: String = r.get(4)?;
+            Ok(Event {
+                id: r.get(1)?,
+                seq: u64::try_from(seq).unwrap_or(0),
+                platform: super::from_json(2, format!("\"{platform}\""))?,
+                channel: None,
+                source_id: r.get(3)?,
+                occurred_at: ferrocast_core::event::Millis(r.get(5)?),
+                received_at: ferrocast_core::event::Millis(r.get(6)?),
+                origin: super::from_json(4, format!("\"{origin}\""))?,
+                kind: super::from_json(7, r.get(7)?)?,
+                raw: None,
+            })
+        })
+        .optional()
+        .map_err(Into::into)
+    })
+}
+
 /// Marks a message hidden (filtered, deleted by a mod, from a banned account) so it never
 /// returns in overlay snapshots, even after a restart. Returns whether a row changed.
 pub fn hide(store: &Store, platform: Platform, source_id: &str) -> Result<bool> {

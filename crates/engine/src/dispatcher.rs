@@ -34,6 +34,8 @@ pub(crate) async fn run(engine: Engine) {
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueView {
     pub paused: bool,
+    /// Alerts play without sound or speech.
+    pub muted: bool,
     pub playing: Option<PlayingView>,
     pub waiting: Vec<WaitingView>,
 }
@@ -54,6 +56,7 @@ pub struct WaitingView {
 fn view(q: &AlertQueue) -> QueueView {
     QueueView {
         paused: q.is_paused(),
+        muted: q.is_muted(),
         playing: q.playing().map(|p| PlayingView { alert: p.alert.clone(), started_at: p.started_at.0 }),
         waiting: q
             .waiting()
@@ -152,10 +155,20 @@ impl Engine {
         v
     }
 
-    pub(crate) async fn enqueue_alert(&self, alert: RenderedAlert, priority: i32) {
-        let speak = alert.tts_text.clone().map(|t| (alert.alert_id.clone(), t));
-        self.queue_op(move |q, t| q.enqueue(alert, priority, t)).await;
+    pub(crate) async fn enqueue_alert(&self, alert: RenderedAlert, priority: i32, interrupt: bool) {
+        let mut speak = alert.tts_text.clone().map(|t| (alert.alert_id.clone(), t));
+        let mut muted = false;
+        self.queue_op(|q, t| {
+            muted = q.is_muted();
+            q.enqueue_with(alert, priority, interrupt, t)
+        })
+        .await;
         self.inner.queue_changed.notify_one();
+        // Muted: nothing is read aloud, so nothing is synthesised (no Pro quota, no voice) and
+        // no viewer's words are held against the streamer's voice commands.
+        if muted {
+            speak = None;
+        }
         if let Some((alert_id, text)) = speak {
             // Read aloud: what it says can't be taken for the streamer's voice command.
             crate::studio::voice_commands::reading_aloud(&text, crate::now().0);
@@ -204,6 +217,15 @@ impl Engine {
     pub async fn queue_pause(&self) -> QueueView {
         self.queue_op(|q, _| {
             q.pause();
+            vec![]
+        })
+        .await
+    }
+
+    /// Mutes or unmutes alert sound and speech (kept across restarts).
+    pub async fn queue_set_muted(&self, muted: bool) -> QueueView {
+        self.queue_op(move |q, _| {
+            q.set_muted(muted);
             vec![]
         })
         .await
@@ -277,6 +299,8 @@ mod tts_cleanup_tests {
             tts_text: Some("hi".into()),
             tts_audio: tts_media,
             test: false,
+            anim: None,
+            custom: None,
             design: None,
         }
     }
@@ -311,5 +335,29 @@ mod tts_cleanup_tests {
         // Clear waiting -> remaining waiting alerts' TTS deleted immediately.
         engine.queue_clear().await;
         assert!(repo::media::list(&store).unwrap().is_empty(), "cleared alerts' TTS deleted");
+    }
+
+    #[tokio::test]
+    async fn a_muted_alert_reads_nothing_aloud_and_blocks_no_voice_command() {
+        use crate::studio::voice_commands::{Command, from_a_viewer};
+        let dir = tempfile::tempdir().unwrap();
+        let secrets: Arc<dyn ferrocast_secrets::Secrets> = Arc::new(ferrocast_secrets::MemorySecrets::default());
+        let engine = Engine::start_with_secrets(dir.path(), secrets).await.unwrap();
+        let now = crate::now().0;
+        let mut quiet = sample_alert("m1", None);
+        quiet.tts_text = Some("switch to zetamute".into());
+        engine.queue_set_muted(true).await;
+        engine.enqueue_alert(quiet, 0, false).await;
+        let scenes = vec!["Zetamute".to_string(), "Zetaloud".to_string()];
+        assert!(
+            !from_a_viewer(&Command::Scene("Zetamute".into()), &scenes, now),
+            "muted: the message was never read, so it holds nothing"
+        );
+        // Not muted: the line is read, so a command inside it must not be taken as the streamer's.
+        engine.queue_set_muted(false).await;
+        let mut loud = sample_alert("m2", None);
+        loud.tts_text = Some("switch to zetaloud".into());
+        engine.enqueue_alert(loud, 0, false).await;
+        assert!(from_a_viewer(&Command::Scene("Zetaloud".into()), &scenes, now));
     }
 }

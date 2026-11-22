@@ -53,6 +53,12 @@ pub(crate) fn routes() -> Router<AppState> {
         )
         .route("/studio/engine/preview/selection", put(engine_select))
         .route("/studio/engine/preview/cursor", put(engine_cursor))
+        .route("/studio/engine/preview/pause", get(engine_preview_paused).put(engine_set_preview_paused))
+        .route("/studio/engine/clipboard", get(engine_clipboard).delete(engine_clipboard_clear))
+        .route("/studio/engine/clipboard/source", post(engine_copy_source))
+        .route("/studio/engine/clipboard/filters", post(engine_copy_filters))
+        .route("/studio/engine/clipboard/paste/source", post(engine_paste_source))
+        .route("/studio/engine/clipboard/paste/filters", post(engine_paste_filters_clip))
         .route("/studio/engine/studio-mode", put(engine_studio_mode))
         .route("/studio/engine/studio-mode/preview", put(engine_set_preview))
         .route("/studio/engine/studio-mode/transition", post(engine_transition_now))
@@ -139,8 +145,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/vst/plugins", get(engine_vst_plugins))
         .route("/studio/engine/sources/{name}/filters/{filter}/vst", get(engine_vst_status).post(engine_vst_act))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
+        .route("/studio/engine/obs-collections/preview", post(engine_preview_obs))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/streamlabs-collections", get(engine_streamlabs_collections))
+        .route("/studio/engine/streamlabs-collections/preview", post(engine_preview_streamlabs))
         .route("/studio/engine/streamlabs-collections/import", post(engine_import_streamlabs))
         .route("/studio/engine/sources/{name}/filters/{filter}/edit", post(engine_edit_filter))
         .route(
@@ -452,6 +460,27 @@ struct CursorBody {
 async fn engine_cursor(State(app): State<AppState>, Body(b): Body<CursorBody>) -> ApiResult<StatusCode> {
     app.engine.studio_preview_cursor(b.cursor).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct PausedBody {
+    paused: bool,
+}
+
+/// `GET /studio/engine/preview/pause` → `{ paused }`: performance mode, whether the preview is paused.
+async fn engine_preview_paused(State(app): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    let paused = app.engine.studio_preview_paused().await?;
+    Ok(Json(serde_json::json!({ "paused": paused })))
+}
+
+/// `PUT /studio/engine/preview/pause` `{ paused }` → `{ paused }`: pauses or resumes drawing the
+/// preview (performance mode). The stream and recording are never touched.
+async fn engine_set_preview_paused(
+    State(app): State<AppState>,
+    Body(b): Body<PausedBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let paused = app.engine.studio_set_preview_paused(b.paused).await?;
+    Ok(Json(serde_json::json!({ "paused": paused })))
 }
 
 #[derive(Deserialize)]
@@ -1288,6 +1317,54 @@ async fn engine_remove_item_filter(
     act_done(&app, StudioAct::RemoveFilter { name: String::new(), filter, item: Some(ItemTarget { scene, id }) }).await
 }
 
+/// `GET /studio/engine/clipboard` → what is copied (`{ kind, name, from, count }`); 404
+/// `clipboard_empty` when nothing is.
+async fn engine_clipboard(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_clipboard()?))
+}
+
+async fn engine_clipboard_clear(State(app): State<AppState>) -> StatusCode {
+    app.engine.studio_clipboard_clear();
+    StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct CopySourceBody {
+    scene: String,
+    id: i64,
+}
+
+async fn engine_copy_source(State(app): State<AppState>, Body(b): Body<CopySourceBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_copy_source(b.scene, b.id).await?))
+}
+
+#[derive(Deserialize)]
+struct ClipFiltersBody {
+    name: String,
+    #[serde(default)]
+    item: Option<ItemTarget>,
+}
+
+async fn engine_copy_filters(State(app): State<AppState>, Body(b): Body<ClipFiltersBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_copy_filters(b.name, b.item).await?))
+}
+
+#[derive(Deserialize)]
+struct PasteSourceBody {
+    scene: String,
+}
+
+async fn engine_paste_source(State(app): State<AppState>, Body(b): Body<PasteSourceBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_paste_source(b.scene).await?))
+}
+
+async fn engine_paste_filters_clip(
+    State(app): State<AppState>,
+    Body(b): Body<ClipFiltersBody>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_paste_filters(b.name, b.item).await?))
+}
+
 #[derive(Deserialize)]
 struct FromBody {
     #[serde(default)]
@@ -1305,12 +1382,20 @@ struct IdBody {
     id: String,
 }
 
+async fn engine_preview_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_preview_obs(&b.id).await?))
+}
+
 async fn engine_import_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_import_obs(&b.id).await?))
 }
 
 async fn engine_streamlabs_collections(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_streamlabs_collections().await?))
+}
+
+async fn engine_preview_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_preview_streamlabs(&b.id).await?))
 }
 
 async fn engine_import_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {

@@ -266,6 +266,7 @@ pub struct Bus {
 pub fn queue_view(q: &AlertQueue) -> Value {
     json!({
         "paused": q.is_paused(),
+        "muted": q.is_muted(),
         "playing": q.playing().map(|p| json!({ "alert": p.alert, "started_at": p.started_at.0 })),
         "waiting": q.waiting().map(|w| json!({ "alert": w.alert, "priority": w.priority, "enqueued_at": w.enqueued_at.0 })).collect::<Vec<_>>(),
     })
@@ -483,5 +484,23 @@ impl Buses {
             s.cache = None;
             s.goals = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_view_tests {
+    use super::*;
+
+    /// The dashboard's `Queue` type needs `muted` (a cloud queue is never muted today, but the
+    /// shape must match `GET /api/v1/queue`).
+    #[test]
+    fn the_queue_view_carries_paused_and_muted() {
+        let mut q = AlertQueue::default();
+        let v = queue_view(&q);
+        assert_eq!((v["paused"].as_bool(), v["muted"].as_bool()), (Some(false), Some(false)));
+        q.pause();
+        q.set_muted(true);
+        let v = queue_view(&q);
+        assert_eq!((v["paused"].as_bool(), v["muted"].as_bool()), (Some(true), Some(true)));
     }
 }

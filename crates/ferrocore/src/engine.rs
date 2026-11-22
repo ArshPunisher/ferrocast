@@ -198,6 +198,100 @@ impl Feed {
     }
 }
 
+/// Who a picture is drawn for. The stream and the recording can differ by item (`Show`); the
+/// editor's own views (the preview, snapshots, the multiview) show everything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Audience {
+    /// Every item, whatever it is shown for.
+    #[default]
+    Everyone,
+    /// The stream's picture: items shown on the stream (or both).
+    Stream,
+    /// The recording's picture (and the replay buffer's clips): items shown in the recording
+    /// (or both).
+    Recording,
+}
+
+/// Where an item is shown: on the stream, in the recording, or both (the default, and what a
+/// collection from before this had).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Show {
+    #[default]
+    Both,
+    /// Only on the stream: a chat box or alerts a clean recording leaves out.
+    Stream,
+    /// Only in the recording: a camera the stream doesn't carry.
+    Recording,
+}
+
+impl Show {
+    /// Whether a picture drawn for `audience` carries the item.
+    pub fn shown_to(self, audience: Audience) -> bool {
+        matches!(
+            (self, audience),
+            (Self::Both, _)
+                | (_, Audience::Everyone)
+                | (Self::Stream, Audience::Stream)
+                | (Self::Recording, Audience::Recording)
+        )
+    }
+
+    /// "both", "stream" or "recording" (what is saved and sent); anything else is both.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "stream" => Self::Stream,
+            "recording" => Self::Recording,
+            _ => Self::Both,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Stream => "stream",
+            Self::Recording => "recording",
+        }
+    }
+}
+
+/// What an output is for: a stream's picture, or a recording's (a replay buffer's clips are
+/// recordings).
+pub fn audience_of(kind: &OutputKind) -> Audience {
+    match kind {
+        OutputKind::Stream(_) => Audience::Stream,
+        OutputKind::Record(_) | OutputKind::Replay { .. } => Audience::Recording,
+    }
+}
+
+/// What differs between the pictures one canvas can take: whether its scenes hold a visible item
+/// for the stream only, and one for the recording only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Sides {
+    stream_only: bool,
+    recording_only: bool,
+}
+
+/// The canvas as the frame loop draws it, as a key two outputs share when they take the same
+/// picture, so it is drawn once:
+/// - what a canvas carries besides its picture (which sound tracks, their names, the extra
+///   qualities, which are drawn from this one) is no part of it;
+/// - an audience sees what the editor's views see unless the other side has items of its own:
+///   with none for the recording only, the stream's picture is every item's; with none for the
+///   stream only, the recording's is. Nothing flagged: all three are one picture.
+fn view(canvas: &Canvas, sides: Sides) -> Canvas {
+    let mut c = canvas.clone();
+    c.track = 0;
+    c.more_tracks.clear();
+    c.track_names.clear();
+    c.video_tracks.clear();
+    c.audience = match c.audience {
+        Audience::Stream if !sides.recording_only => Audience::Everyone,
+        Audience::Recording if !sides.stream_only => Audience::Everyone,
+        other => other,
+    };
+    c
+}
+
 /// A source in a scene: which, where, and how.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneItem {
@@ -219,6 +313,9 @@ pub struct SceneItem {
     pub item_id: i64,
     /// `effects` are this item's own list (an override), not its source's filters.
     pub own_effects: bool,
+    /// Whether the stream, the recording or both show it. On a group, that covers the group's
+    /// children as a whole (a child keeps its own flag inside a group that is shown).
+    pub show: Show,
 }
 
 impl SceneItem {
@@ -236,6 +333,7 @@ impl SceneItem {
             group: None,
             item_id: 0,
             own_effects: false,
+            show: Show::Both,
         }
     }
 }
@@ -380,6 +478,9 @@ pub struct Canvas {
     /// More video qualities a stream sends as Enhanced RTMP tracks 1… (Twitch Enhanced
     /// Broadcasting): each width, height and kbps, drawn from the same picture scaled down.
     pub video_tracks: Vec<(u32, u32, u32)>,
+    /// Whose picture it is: an output takes it from what it is (`start_output_with`). Matters
+    /// only while an item is shown just on the stream or just in the recording.
+    pub audience: Audience,
 }
 
 impl Canvas {
@@ -395,6 +496,7 @@ impl Canvas {
             more_tracks: Vec::new(),
             track_names: Vec::new(),
             video_tracks: Vec::new(),
+            audience: Audience::Everyone,
         }
     }
 
@@ -1121,6 +1223,9 @@ struct Preview {
     size: (u32, u32),
     /// Every scene in boxes instead (a multiview projector).
     multiview: Option<Multiview>,
+    /// Performance mode: nothing is composed or drawn for this view until it is let go. Never
+    /// touches an output: streams and recordings draw their own frames.
+    paused: bool,
 }
 
 /// One box of a multiview: a scene (None: what's on air) stretched into `area` (the
@@ -1154,6 +1259,26 @@ struct PreviewThread {
     surface: Arc<Mutex<crate::preview::PreviewSurface>>,
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+    /// Performance mode for this thread, readable without the engine's state lock.
+    paused: Arc<AtomicBool>,
+    /// Wakes the thread from its wait while paused (resume or stop).
+    wake: Arc<(Mutex<()>, Condvar)>,
+}
+
+/// Blocks while `paused` (and not `stop`): no timer, no lock on the engine state, no wakeups
+/// until `wake` is notified. Returns at once when it isn't paused.
+fn wait_while_paused(paused: &AtomicBool, stop: &AtomicBool, wake: &(Mutex<()>, Condvar)) {
+    let mut guard = wake.0.lock().unwrap_or_else(|e| e.into_inner());
+    while paused.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+        guard = wake.1.wait(guard).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Wakes a preview thread waiting in [`wait_while_paused`]. The lock is taken first so a
+/// notification can't slip in between the thread's check and its wait.
+fn wake_preview(wake: &(Mutex<()>, Condvar)) {
+    drop(wake.0.lock().unwrap_or_else(|e| e.into_inner()));
+    wake.1.notify_all();
 }
 
 /// Maximum time `Engine::drop` waits for the watchdog thread (which may be blocked in a slow OS
@@ -2636,6 +2761,8 @@ impl Engine {
         }
         let id = st.next_output;
         st.next_output += 1;
+        // A stream draws what the stream shows, a recording what the recording shows.
+        let canvas = Canvas { audience: audience_of(&kind), ..canvas };
         st.outputs.push((id, pipe, kind, canvas));
         sync_heard(&mut st, &self.audio.cmd_sender());
         self.show(&st);
@@ -2760,18 +2887,23 @@ impl Engine {
         // SAFETY: passed on from the caller's promise.
         let surface = unsafe { self.gpu.preview_surface(ns_view, width, height) }?;
         let id = self.next_preview.fetch_add(1, Ordering::Relaxed);
-        self.lock().previews.insert(id, Preview { look: Default::default(), scene, size, multiview: None });
+        self.lock()
+            .previews
+            .insert(id, Preview { look: Default::default(), scene, size, multiview: None, paused: false });
         let surface = Arc::new(Mutex::new(surface));
         let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
         let thread = {
             let (state, gpu, surface, stop) = (self.state.clone(), self.gpu.clone(), surface.clone(), stop.clone());
+            let (paused, wake) = (paused.clone(), wake.clone());
             let every = Duration::from_secs(1) / self.config.fps.max(1);
             std::thread::Builder::new()
                 .name("ferrocast-preview".into())
-                .spawn(move || preview_loop(id, &state, &gpu, &surface, &stop, every))
+                .spawn(move || preview_loop(id, &state, &gpu, &surface, &stop, &(paused, wake), every))
                 .map_err(|e| AvError::Source(format!("the preview's thread didn't start ({e})")))?
         };
-        self.preview_threads().insert(id, PreviewThread { surface, stop, thread });
+        self.preview_threads().insert(id, PreviewThread { surface, stop, thread, paused, wake });
         Ok(id)
     }
 
@@ -2784,6 +2916,7 @@ impl Engine {
         let running = self.preview_threads().remove(&id);
         if let Some(p) = running {
             p.stop.store(true, Ordering::Release);
+            wake_preview(&p.wake);
             let _ = p.thread.join();
         }
         self.lock().previews.remove(&id);
@@ -2794,6 +2927,24 @@ impl Engine {
         if let Some(p) = self.preview_threads().get(&id) {
             self.gpu.resize_preview(&mut p.surface.lock().unwrap_or_else(|e| e.into_inner()), width, height);
         }
+    }
+
+    /// Performance mode: a paused preview composes and draws nothing (its view keeps the last
+    /// picture, or is hidden by the host) until `paused` is false again. The outputs (stream,
+    /// recording, replay, virtual camera) are never touched. An unknown id changes nothing.
+    pub fn set_preview_paused(&self, id: u64, paused: bool) {
+        if let Some(p) = self.lock().previews.get_mut(&id) {
+            p.paused = paused;
+        }
+        if let Some(t) = self.preview_threads().get(&id) {
+            t.paused.store(paused, Ordering::Release);
+            wake_preview(&t.wake);
+        }
+    }
+
+    /// Whether a preview is paused (None: no such preview).
+    pub fn preview_paused(&self, id: u64) -> Option<bool> {
+        self.lock().previews.get(&id).map(|p| p.paused)
     }
 
     /// How a preview looks round and over the picture (outlines, where the canvas sits…).
@@ -2889,13 +3040,16 @@ impl Engine {
         let mut st = self.lock();
         // Frames drawn before the join go to the recording alone: the stream starts after them.
         deliver(&mut st, &self.gpu, true, &self.recycle_tx);
-        let (_, pipe, kind, _) =
+        let (_, pipe, kind, canvas) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
         if !matches!(kind, OutputKind::Record(_)) {
             return Err(AvError::Source("only a recording can take a stream on".into()));
         }
         pipe.begin_stream()?;
         *kind = OutputKind::Stream(send);
+        // One picture goes to both while they share: the stream's, so an item shown only in the
+        // recording never reaches the stream (the frames drawn before are delivered above).
+        canvas.audience = Audience::Stream;
         let ticket = st.sleep_ticket();
         drop(st);
         self.sync_sleep(ticket);
@@ -2906,11 +3060,14 @@ impl Engine {
     /// kept): the stream ended while a recording sharing its encode goes on.
     pub fn stream_off(&self, id: u64) -> Result<(), AvError> {
         let mut st = self.lock();
-        let (_, pipe, kind, _) =
+        // Frames drawn for the stream's picture go out first: the recording's picture is another.
+        deliver(&mut st, &self.gpu, true, &self.recycle_tx);
+        let (_, pipe, kind, canvas) =
             st.outputs.iter_mut().find(|(i, ..)| *i == id).ok_or_else(|| AvError::Source("no such output".into()))?;
         // The stream always leaves (a recording that failed, say on a full disk, mustn't keep
         // it: the next Go live would find a stream there; CodeRabbit).
         *kind = OutputKind::Record(PathBuf::new());
+        canvas.audience = Audience::Recording;
         let no_rec = !pipe.recording();
         let ticket = st.sleep_ticket();
         drop(st);
@@ -3159,7 +3316,7 @@ impl Engine {
                 return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
             }
             send_pending(&mut st, &self.gpu);
-            build(&st, self.config.width, self.config.height, Some(name), now_ns())
+            build(&st, self.config.width, self.config.height, Some(name), now_ns(), Audience::Everyone)
         };
         self.gpu.render(&scene)
     }
@@ -3173,7 +3330,7 @@ impl Engine {
                 return Err(AvError::Source(format!("there's no scene called \"{name}\"")));
             }
             send_pending(&mut st, &self.gpu);
-            build(&st, canvas.0.max(1), canvas.1.max(1), Some(name), now_ns())
+            build(&st, canvas.0.max(1), canvas.1.max(1), Some(name), now_ns(), Audience::Everyone)
         };
         self.gpu.render(&scaled(scene, size.0.max(1), size.1.max(1), Filter::Bicubic))
     }
@@ -3253,7 +3410,7 @@ impl Engine {
             );
             one.filter = Filter::Bilinear;
             one.effects = effects;
-            item_of(&st, &one, 0, (w, h))?
+            item_of(&st, &one, 0, (w, h), Audience::Everyone)?
         };
         self.gpu.render(&Scene { width: w, height: h, items: vec![item] }).ok()
     }
@@ -3262,7 +3419,7 @@ impl Engine {
     pub fn snapshot(&self) -> Result<Vec<u8>, AvError> {
         let frame = {
             let st = self.lock();
-            what_to_draw(&st, self.config.width, self.config.height, None, now_ns())
+            what_to_draw(&st, self.config.width, self.config.height, None, now_ns(), Audience::Everyone)
         };
         match frame {
             Draw::Scene(s) => self.gpu.render(&s),
@@ -3347,16 +3504,28 @@ fn preview_loop(
     gpu: &Compositor,
     surface: &Mutex<crate::preview::PreviewSurface>,
     stop: &AtomicBool,
+    pause: &(Arc<AtomicBool>, Arc<(Mutex<()>, Condvar)>),
     every: Duration,
 ) {
+    let (paused_flag, wake) = (&*pause.0, &*pause.1);
     while !stop.load(Ordering::Acquire) {
+        // Paused: asleep until resumed or stopped. No timer and no look at the engine's state,
+        // so it never competes with the outputs for that lock.
+        wait_while_paused(paused_flag, stop, wake);
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let started = Instant::now();
+        let paused;
         let next = {
             let st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.previews.get(&id).map(|p| {
+            let found = st.previews.get(&id);
+            // Paused: nothing is composed (no scene walk, no GPU pass) until it is let go.
+            paused = found.is_some_and(|p| p.paused);
+            found.filter(|p| !p.paused).map(|p| {
                 let draw = match &p.multiview {
                     Some(mv) => Draw::Scene(multiview_scene(&st, mv, now_ns())),
-                    None => what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns()),
+                    None => what_to_draw(&st, p.size.0, p.size.1, p.scene.as_deref(), now_ns(), Audience::Everyone),
                 };
                 // The outlines from the same items, at the same moment, as the picture: drawn
                 // together they can't drift apart while a source is dragged (as OBS draws its
@@ -3379,9 +3548,18 @@ fn preview_loop(
                 tracing::warn!("the preview couldn't be drawn: {e}");
             }
         }
-        std::thread::sleep(every.saturating_sub(started.elapsed()));
+        std::thread::sleep(preview_wait(paused, every, started.elapsed()));
     }
 }
+
+/// How long a preview's thread waits before looking again: the rest of the frame, or (paused)
+/// a slow look for the moment it is let go, so a paused view costs next to nothing.
+fn preview_wait(paused: bool, every: Duration, spent: Duration) -> Duration {
+    if paused { PAUSED_LOOK.max(every).saturating_sub(spent) } else { every.saturating_sub(spent) }
+}
+
+/// How often a paused preview checks whether it should draw again.
+const PAUSED_LOOK: Duration = Duration::from_millis(100);
 
 /// The preview's outlines (canvas pixels) for `m`, from the engine's own items at `ts`: every
 /// shown source of `m.scene` in its colour, then the picked ones with handles on top.
@@ -3468,11 +3646,11 @@ const STINGER: u64 = u64::MAX - 1;
 
 /// A canvas's frame: its own scene, or what's on air (mid-transition, perhaps), with the top
 /// layer over it.
-fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u64) -> Draw {
+fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u64, aud: Audience) -> Draw {
     if let Some(name) = scene {
-        return Draw::Scene(build(st, width, height, Some(name), ts));
+        return Draw::Scene(build(st, width, height, Some(name), ts, aud));
     }
-    let mut draw = on_air_draw(st, width, height, ts);
+    let mut draw = on_air_draw(st, width, height, ts, aud);
     // The top layer over both sides of a transition, so it stays still through it; never
     // over itself.
     if let Some(top) = st.top.as_deref()
@@ -3480,7 +3658,7 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
     {
         let mut over = SceneItem::new(0, Placement::default());
         over.scene = Some(top.to_string());
-        let item = || item_of(st, &over, ts, (width, height));
+        let item = || item_of(st, &over, ts, (width, height), aud);
         match &mut draw {
             Draw::Scene(s) => s.items.extend(item()),
             Draw::Moving(t) => {
@@ -3492,12 +3670,50 @@ fn what_to_draw(st: &State, width: u32, height: u32, scene: Option<&str>, ts: u6
     draw
 }
 
+/// What `canvas`'s own scenes hold: the scene it shows, or what is on air (with a transition's
+/// other side, the stinger's and the top layer) for one that follows the program; a visible item for
+/// the stream only or the recording only, in them and in the scenes and groups nested in them
+/// (a hidden group or scene shows nothing). One canvas's flags never reach another's picture.
+fn sides(st: &State, canvas: &Canvas) -> Sides {
+    fn walk(st: &State, scene: &str, depth: u32, out: &mut Sides) {
+        let Some(items) = st.scenes.get(scene) else { return };
+        for i in items.iter().filter(|i| i.visible) {
+            match i.show {
+                Show::Stream => out.stream_only = true,
+                Show::Recording => out.recording_only = true,
+                Show::Both => {}
+            }
+            if let Some(inner) = i.scene.as_deref()
+                && depth < MAX_NESTING
+            {
+                walk(st, inner, depth + 1, out);
+            }
+        }
+    }
+    let mut roots: Vec<&str> = Vec::new();
+    match canvas.scene.as_deref() {
+        Some(name) => roots.push(name),
+        None => {
+            roots.extend(st.on_air.as_deref());
+            roots.extend(st.top.as_deref());
+            roots.extend(st.moving.as_ref().map(|(from, ..)| from.as_str()));
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            roots.extend(st.stinger.as_ref().map(|(from, ..)| from.as_str()));
+        }
+    }
+    let mut out = Sides::default();
+    for r in roots {
+        walk(st, r, 0, &mut out);
+    }
+    out
+}
+
 /// What's on air: one scene, or two mid-transition.
-fn on_air_draw(st: &State, width: u32, height: u32, ts: u64) -> Draw {
+fn on_air_draw(st: &State, width: u32, height: u32, ts: u64, aud: Audience) -> Draw {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     if let Some((from, _, cut, _)) = &st.stinger {
         let under = if ts < *cut { Some(from.as_str()) } else { st.on_air.as_deref() };
-        let mut s = build(st, width, height, under, ts);
+        let mut s = build(st, width, height, under, ts, aud);
         // Over everything, stretched to the canvas.
         let over = SceneItem::new(
             STINGER,
@@ -3508,25 +3724,25 @@ fn on_air_draw(st: &State, width: u32, height: u32, ts: u64) -> Draw {
                 ..Default::default()
             },
         );
-        s.items.extend(item_of(st, &over, 0, (width, height)));
+        s.items.extend(item_of(st, &over, 0, (width, height), aud));
         return Draw::Scene(s);
     }
     match &st.moving {
         Some((from, TransitionKind::Move, start, dur)) if ts < start + dur => {
             let t = crate::cubic_ease_in_out(ts.saturating_sub(*start) as f32 / *dur as f32);
-            Draw::Scene(moved(st, width, height, from, st.on_air.as_deref().unwrap_or_default(), t, ts))
+            Draw::Scene(moved(st, (width, height), from, st.on_air.as_deref().unwrap_or_default(), t, ts, aud))
         }
         Some((from, kind, start, dur)) if ts < start + dur => {
             let t = ts.saturating_sub(*start) as f32 / *dur as f32;
-            let to = build(st, width, height, st.on_air.as_deref(), ts);
+            let to = build(st, width, height, st.on_air.as_deref(), ts, aud);
             Draw::Moving(Box::new(Transition {
                 kind: kind.clone(),
                 t,
-                from: build(st, width, height, Some(from), ts),
+                from: build(st, width, height, Some(from), ts, aud),
                 to,
             }))
         }
-        _ => Draw::Scene(build(st, width, height, st.on_air.as_deref(), ts)),
+        _ => Draw::Scene(build(st, width, height, st.on_air.as_deref(), ts, aud)),
     }
 }
 
@@ -3558,7 +3774,7 @@ fn multiview_scene(st: &State, mv: &Multiview, ts: u64) -> Scene {
     for (b, label) in &mv.boxes {
         let (x, y, w, h) = b.area;
         let name = b.scene.as_deref().or(st.on_air.as_deref());
-        items.push(at(Content::Scene(build(st, mv.canvas.0, mv.canvas.1, name, ts)), b.area));
+        items.push(at(Content::Scene(build(st, mv.canvas.0, mv.canvas.1, name, ts, Audience::Everyone)), b.area));
         let frame = match b.live {
             Some(live) if b.scene.is_some() && b.scene.as_deref() == st.on_air.as_deref() => live,
             _ => b.frame,
@@ -3770,7 +3986,7 @@ fn seen(st: &State) -> (std::collections::HashSet<u64>, HashMap<u64, (u32, bool)
     // A frame tap's scene too (the virtual camera showing one source alone), or its sources'
     // new pictures would wait and it would look frozen.
     roots.extend(st.taps.iter().filter_map(|(_, c, _)| c.scene.as_deref()));
-    for p in st.previews.values() {
+    for p in st.previews.values().filter(|p| !p.paused) {
         roots.extend(p.scene.as_deref());
         if let Some(mv) = &p.multiview {
             roots.extend(mv.boxes.iter().filter_map(|(b, _)| b.scene.as_deref()));
@@ -3805,21 +4021,54 @@ fn send_pending(st: &mut State, gpu: &Compositor) {
 }
 
 /// An item as the compositor takes it, `ms` into its scene; None without a picture yet.
-fn item_of(st: &State, it: &SceneItem, ms: u64, canvas: (u32, u32)) -> Option<Item> {
-    item_at(st, it, ms, 0, canvas)
+fn item_of(st: &State, it: &SceneItem, ms: u64, canvas: (u32, u32), aud: Audience) -> Option<Item> {
+    item_at(st, it, ms, 0, canvas, aud)
 }
 
 /// Scenes inside scenes go at most this deep (a scene showing itself stops there).
 const MAX_NESTING: u32 = 8;
 
-fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32)) -> Option<Item> {
+/// Whether scene `name` holds something that `aud` doesn't see: a visible item for the other
+/// side, or a visible container (that this audience does see) whose own contents are all for the
+/// other side. It tells a container emptied by the audience from one that was empty to begin with.
+fn emptied_by(st: &State, name: &str, depth: u32, aud: Audience) -> bool {
+    let Some(items) = st.scenes.get(name) else { return false };
+    items.iter().filter(|i| i.visible).any(|i| {
+        !i.show.shown_to(aud)
+            || i.scene.as_deref().is_some_and(|inner| {
+                depth < MAX_NESTING
+                    && emptied_by(st, inner, depth + 1, aud)
+                    && !holds_anything_for(st, inner, depth + 1, aud)
+            })
+    })
+}
+
+/// Whether scene `name` has any visible item that `aud` sees (and, in a container, anything in it).
+fn holds_anything_for(st: &State, name: &str, depth: u32, aud: Audience) -> bool {
+    let Some(items) = st.scenes.get(name) else { return false };
+    items.iter().filter(|i| i.visible && i.show.shown_to(aud)).any(|i| match i.scene.as_deref() {
+        Some(inner) if depth < MAX_NESTING => holds_anything_for(st, inner, depth + 1, aud),
+        Some(_) => false,
+        None => true,
+    })
+}
+
+fn item_at(st: &State, it: &SceneItem, ms: u64, depth: u32, canvas: (u32, u32), aud: Audience) -> Option<Item> {
     let (placement, opacity) = animated(it, ms);
     let content = match &it.scene {
         Some(name) if depth < MAX_NESTING => {
             let scene = st.scenes.get(name)?;
             // Its items keep the time of the scene showing it (as OBS: a nested scene plays along).
-            let items =
-                scene.iter().filter(|i| i.visible).filter_map(|i| item_at(st, i, ms, depth + 1, canvas)).collect();
+            let items = scene
+                .iter()
+                .filter(|i| i.visible && i.show.shown_to(aud))
+                .filter_map(|i| item_at(st, i, ms, depth + 1, canvas, aud))
+                .collect::<Vec<_>>();
+            // Everything in it is for the other audience: it draws nothing (its own filters would
+            // otherwise paint an empty box into this picture), however many containers deep.
+            if items.is_empty() && emptied_by(st, name, depth, aud) {
+                return None;
+            }
             match it.group {
                 // An empty group is 0×0: nothing to draw, and drawing it would fail the whole
                 // frame (owner, 11 Nov: the canvas stayed blank once a group was added).
@@ -3872,13 +4121,18 @@ fn scene_ms(st: &State, name: &str, ts: u64) -> u64 {
 }
 
 /// A scene as the compositor takes it at `ts` (sources without a picture yet are left out).
-fn build(st: &State, width: u32, height: u32, name: Option<&str>, ts: u64) -> Scene {
+fn build(st: &State, width: u32, height: u32, name: Option<&str>, ts: u64, aud: Audience) -> Scene {
     let mut items = Vec::new();
     if let Some(name) = name
         && let Some(scene) = st.scenes.get(name)
     {
         let ms = scene_ms(st, name, ts);
-        items.extend(scene.iter().filter(|i| i.visible).filter_map(|it| item_of(st, it, ms, (width, height))));
+        items.extend(
+            scene
+                .iter()
+                .filter(|i| i.visible && i.show.shown_to(aud))
+                .filter_map(|it| item_of(st, it, ms, (width, height), aud)),
+        );
     }
     Scene { width, height, items }
 }
@@ -3886,25 +4140,26 @@ fn build(st: &State, width: u32, height: u32, name: Option<&str>, ts: u64) -> Sc
 /// The Move transition `t` of the way (eased): a source in both scenes glides from its old
 /// place to its new one; one only in the old scene fades out underneath, one only in the new
 /// fades in.
-fn moved(st: &State, width: u32, height: u32, from: &str, to: &str, t: f32, ts: u64) -> Scene {
+fn moved(st: &State, canvas: (u32, u32), from: &str, to: &str, t: f32, ts: u64, aud: Audience) -> Scene {
     let (empty, empty2) = (Vec::new(), Vec::new());
     let a = st.scenes.get(from).unwrap_or(&empty);
     let b = st.scenes.get(to).unwrap_or(&empty2);
     let (ma, mb) = (scene_ms(st, from, ts), scene_ms(st, to, ts));
     let lerp = |x: f32, y: f32| x + (y - x) * t;
-    let canvas = (width, height);
+    let (width, height) = canvas;
     // The same thing in both scenes: one source, or one nested scene.
     let same = |x: &SceneItem, y: &SceneItem| x.source == y.source && x.scene == y.scene;
     let mut items = Vec::new();
-    for old in a.iter().filter(|i| i.visible && !b.iter().any(|n| n.visible && same(n, i))) {
-        if let Some(mut it) = item_of(st, old, ma, canvas) {
+    let shows = |i: &SceneItem| i.visible && i.show.shown_to(aud);
+    for old in a.iter().filter(|i| shows(i) && !b.iter().any(|n| shows(n) && same(n, i))) {
+        if let Some(mut it) = item_of(st, old, ma, canvas, aud) {
             it.opacity *= 1.0 - t;
             items.push(it);
         }
     }
-    for new in b.iter().filter(|i| i.visible) {
-        let Some(mut it) = item_of(st, new, mb, canvas) else { continue };
-        match a.iter().find(|o| o.visible && same(o, new)).and_then(|o| item_of(st, o, ma, canvas)) {
+    for new in b.iter().filter(|i| shows(i)) {
+        let Some(mut it) = item_of(st, new, mb, canvas, aud) else { continue };
+        match a.iter().find(|o| shows(o) && same(o, new)).and_then(|o| item_of(st, o, ma, canvas, aud)) {
             Some(o) => {
                 let (p, q) = (o.placement, it.placement);
                 it.placement.x = lerp(p.x, q.x);
@@ -4856,6 +5111,8 @@ struct InFlight {
     outputs: Vec<u64>,
     taps: Vec<u64>,
     drawn: Vec<(Canvas, Result<PendingNv12, String>)>,
+    /// What differed for each output's and tap's canvas when this frame was drawn (`view`).
+    sides: Vec<(u64, Sides)>,
 }
 
 /// Hands the frames that came back to their outputs and taps, oldest first: those ready, and
@@ -4938,7 +5195,8 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             break;
         }
         let Some(e) = st.in_flight.pop_front() else { break };
-        let InFlight { ts, blocks, outputs, taps, drawn } = e;
+        let InFlight { ts, blocks, outputs, taps, drawn, sides } = e;
+        let sides_of = |id: u64| sides.iter().find(|(i, _)| *i == id).map_or(Sides::default(), |s| s.1);
         // A frame the card drew into a pooled surface stays one (no copy): the encoders share it,
         // and a tap that needs host bytes makes them once.
         let drawn: Vec<(Canvas, Result<crate::Drawn, String>)> = drawn
@@ -4971,7 +5229,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                 continue;
             }
             let mut tags = Vec::new();
-            if let Some((_, frame)) = drawn.iter().find(|(c, _)| c == canvas) {
+            if let Some((_, frame)) = drawn.iter().find(|(c, _)| *c == view(canvas, sides_of(*id))) {
                 match frame {
                     Ok(f) => {
                         let w = canvas.width as usize;
@@ -4985,7 +5243,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                     Err(e) => failed = Some(e.clone()),
                 }
                 for (i, &(w, h, _)) in canvas.video_tracks.iter().enumerate() {
-                    let c = canvas.track(w, h);
+                    let c = view(&canvas.track(w, h), sides_of(*id));
                     if let Some((_, Ok(f))) = drawn.iter().find(|(d, _)| *d == c) {
                         let s = w as usize;
                         let t0 = Instant::now();
@@ -5036,7 +5294,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             if !taps.contains(id) {
                 continue;
             }
-            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| c == canvas)
+            if let Some((_, Ok(f))) = drawn.iter().find(|(c, _)| *c == view(canvas, sides_of(*id)))
                 && let Some(host) = f.host()
             {
                 sink(host, ts);
@@ -5435,13 +5693,25 @@ fn frame(
         // back while the next frames are drawn (`deliver`): waiting for it here stalled the loop
         // whenever a game kept the card busy (owner, 15 Nov: 35 of 60 fps, 46% skipped).
         let index = st.stats.frames;
+        // The stream and the recording are one picture, drawn once, unless an item that shows on
+        // that canvas differs between them; then each is drawn for its own audience.
+        let all: Vec<(u64, Canvas, Sides)> = st
+            .outputs
+            .iter()
+            .map(|(id, .., c)| (*id, c))
+            .chain(st.taps.iter().map(|(id, c, _)| (*id, c)))
+            .map(|(id, c)| (id, c.clone(), sides(&st, c)))
+            .collect();
+        let sides_of = |id: u64| all.iter().find(|(i, ..)| *i == id).map_or(Sides::default(), |s| s.2);
         let mut drawn: Vec<(Canvas, Result<PendingNv12, String>)> = Vec::new();
-        for canvas in st.outputs.iter().map(|(.., c)| c).chain(st.taps.iter().map(|(_, c, _)| c)) {
+        for (_, canvas, side) in &all {
+            let canvas = &view(canvas, *side);
             if !index.is_multiple_of(u64::from(canvas.every)) || drawn.iter().any(|(c, _)| c == canvas) {
                 continue;
             }
             let (w, h) = canvas.scaled_from.map_or((canvas.width, canvas.height), |(w, h, _)| (w, h));
-            let draw = match (what_to_draw(&st, w, h, canvas.scene.as_deref(), ts), canvas.scaled_from) {
+            let draw = match (what_to_draw(&st, w, h, canvas.scene.as_deref(), ts, canvas.audience), canvas.scaled_from)
+            {
                 (d, None) => d,
                 (Draw::Scene(s), Some((.., f))) => Draw::Scene(scaled(s, canvas.width, canvas.height, f)),
                 (Draw::Moving(mut t), Some((.., f))) => {
@@ -5458,18 +5728,18 @@ fn frame(
         }
         // Each extra quality's picture (Twitch Enhanced Broadcasting), drawn once like the rest.
         let mut extra = Vec::new();
-        for (.., canvas) in &st.outputs {
+        for (id, _, _, canvas) in &st.outputs {
             if !index.is_multiple_of(u64::from(canvas.every)) {
                 continue;
             }
             for &(w, h, _) in &canvas.video_tracks {
-                let c = canvas.track(w, h);
+                let c = view(&canvas.track(w, h), sides_of(*id));
                 if drawn.iter().chain(extra.iter()).any(|(d, _)| *d == c) {
                     continue;
                 }
                 let (bw, bh) = c.scaled_from.map_or((w, h), |(bw, bh, _)| (bw, bh));
                 let f = c.scaled_from.map_or(Filter::Bicubic, |(.., f)| f);
-                let frame = match what_to_draw(&st, bw, bh, c.scene.as_deref(), ts) {
+                let frame = match what_to_draw(&st, bw, bh, c.scene.as_deref(), ts, c.audience) {
                     Draw::Scene(s) => gpu.begin_nv12(&scaled(s, w, h, f)),
                     Draw::Moving(mut t) => {
                         t.from = scaled(t.from, w, h, f);
@@ -5495,6 +5765,7 @@ fn frame(
             outputs: st.outputs.iter().map(|(id, ..)| *id).collect(),
             taps: st.taps.iter().map(|(id, ..)| *id).collect(),
             drawn,
+            sides: all.iter().map(|(id, _, side)| (*id, *side)).collect(),
         };
         st.in_flight.push_back(entry);
     } else {
@@ -5697,6 +5968,129 @@ mod tests {
         assert!(video.len() as u64 + slack >= drawn_before_stop.min(45), "{} of {drawn_before_stop}", video.len());
         assert!(video.windows(2).all(|w| w[0] <= w[1]), "in time order: {video:?}");
         assert!(audio > 20, "sound came too: {audio}");
+    }
+
+    fn some_preview() -> Preview {
+        Preview { look: Default::default(), scene: None, size: (640, 360), multiview: None, paused: false }
+    }
+
+    #[test]
+    fn a_preview_can_be_paused_and_let_go_and_an_unknown_one_changes_nothing() {
+        let Some(e) = engine() else { return };
+        e.lock().previews.insert(7, some_preview());
+        assert_eq!(e.preview_paused(7), Some(false));
+        e.set_preview_paused(7, true);
+        assert_eq!(e.preview_paused(7), Some(true));
+        // Twice is the same as once.
+        e.set_preview_paused(7, true);
+        assert_eq!(e.preview_paused(7), Some(true));
+        e.set_preview_paused(7, false);
+        assert_eq!(e.preview_paused(7), Some(false));
+        // No such preview: nothing made up, nothing panics.
+        e.set_preview_paused(99, true);
+        assert_eq!(e.preview_paused(99), None);
+        assert!(!e.lock().previews.contains_key(&99));
+    }
+
+    #[test]
+    fn pausing_one_preview_leaves_the_others_drawing() {
+        let Some(e) = engine() else { return };
+        e.lock().previews.insert(1, some_preview());
+        e.lock().previews.insert(2, some_preview());
+        e.set_preview_paused(1, true);
+        assert_eq!((e.preview_paused(1), e.preview_paused(2)), (Some(true), Some(false)));
+    }
+
+    /// A paused preview thread sleeps until woken: not a timer, and it comes back at once on
+    /// resume and on stop (a stop used to wait out the 100 ms nap).
+    #[test]
+    fn a_paused_preview_thread_sleeps_until_resumed_or_stopped() {
+        let paused = Arc::new(AtomicBool::new(true));
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
+        let (tx, rx) = mpsc::channel();
+        let (p, st, w) = (paused.clone(), stop.clone(), wake.clone());
+        let h = std::thread::spawn(move || {
+            wait_while_paused(&p, &st, &w);
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "it waits while paused");
+        let t = Instant::now();
+        paused.store(false, Ordering::Release);
+        wake_preview(&wake);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(t.elapsed() < Duration::from_millis(50), "resume is quick: {:?}", t.elapsed());
+        h.join().unwrap();
+        // Stop while paused.
+        paused.store(true, Ordering::Release);
+        let (tx, rx) = mpsc::channel();
+        let (p, st, w) = (paused.clone(), stop.clone(), wake.clone());
+        let h = std::thread::spawn(move || {
+            wait_while_paused(&p, &st, &w);
+            let _ = tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        stop.store(true, Ordering::Release);
+        wake_preview(&wake);
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(t.elapsed() < Duration::from_millis(50), "stop is quick: {:?}", t.elapsed());
+        h.join().unwrap();
+        // Not paused: no waiting at all.
+        paused.store(false, Ordering::Release);
+        stop.store(false, Ordering::Release);
+        let t = Instant::now();
+        wait_while_paused(&paused, &stop, &wake);
+        assert!(t.elapsed() < Duration::from_millis(5));
+    }
+
+    #[test]
+    fn a_paused_preview_waits_long_and_a_drawing_one_waits_for_its_frame() {
+        let frame = Duration::from_millis(33);
+        assert_eq!(preview_wait(false, frame, Duration::from_millis(10)), Duration::from_millis(23));
+        // Late: no wait at all.
+        assert_eq!(preview_wait(false, frame, Duration::from_millis(50)), Duration::ZERO);
+        // Paused: a slow look, not the frame rate.
+        assert_eq!(preview_wait(true, frame, Duration::ZERO), PAUSED_LOOK);
+        // A slower frame rate than the look keeps its own pace.
+        assert_eq!(preview_wait(true, Duration::from_millis(500), Duration::ZERO), Duration::from_millis(500));
+    }
+
+    /// Performance mode never pauses an output: a stream keeps getting its pictures and sound
+    /// while every preview is paused, and again after they are let go.
+    #[test]
+    fn a_paused_preview_never_stops_the_stream_or_recording() {
+        if !encodes_here() {
+            return;
+        }
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [10, 200, 30, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        e.lock().previews.insert(1, some_preview());
+        let video: Arc<Mutex<u32>> = Arc::default();
+        let audio: Arc<Mutex<u32>> = Arc::default();
+        let sink = {
+            let (video, audio) = (video.clone(), audio.clone());
+            move |t: Tag| match t {
+                Tag::Video { .. } => *video.lock().unwrap_or_else(|p| p.into_inner()) += 1,
+                Tag::Audio { .. } => *audio.lock().unwrap_or_else(|p| p.into_inner()) += 1,
+            }
+        };
+        let out = e.start_output(OutputKind::Stream(Box::new(sink))).unwrap_or_else(|x| panic!("{x}"));
+        let count = |m: &Arc<Mutex<u32>>| *m.lock().unwrap_or_else(|p| p.into_inner());
+        std::thread::sleep(Duration::from_millis(600));
+        e.set_preview_paused(1, true);
+        let (v0, a0) = (count(&video), count(&audio));
+        std::thread::sleep(Duration::from_millis(1200));
+        let (v1, a1) = (count(&video), count(&audio));
+        assert!(v1 >= v0 + 10, "pictures kept going while paused: {v0} then {v1}");
+        assert!(a1 > a0, "sound kept going while paused: {a0} then {a1}");
+        e.set_preview_paused(1, false);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(count(&video) > v1, "and after");
+        e.stop_output(out).unwrap_or_else(|x| panic!("{x}"));
     }
 
     /// Optimize while live: a stream's picture goes from the canvas at full rate to a smaller
@@ -6648,6 +7042,306 @@ mod tests {
         assert!(e.tap_frames(Canvas { scene: Some("Nope".into()), ..Canvas::main(e.config) }, sink(&got)).is_err());
     }
 
+    /// Each item is for the stream, the recording or both; the editing views show everything.
+    #[test]
+    fn show_decides_who_sees_an_item() {
+        for (show, stream, recording) in
+            [(Show::Both, true, true), (Show::Stream, true, false), (Show::Recording, false, true)]
+        {
+            assert_eq!(show.shown_to(Audience::Stream), stream, "{show:?} on the stream");
+            assert_eq!(show.shown_to(Audience::Recording), recording, "{show:?} in the recording");
+            assert!(show.shown_to(Audience::Everyone), "{show:?} in the editor's views");
+        }
+        for (name, show) in [("both", Show::Both), ("stream", Show::Stream), ("recording", Show::Recording)] {
+            assert_eq!(Show::from_name(name), show);
+            assert_eq!(show.name(), name);
+        }
+        // Anything else is both: a collection from before this, or a typo, shows as it always did.
+        assert_eq!(Show::from_name(""), Show::Both);
+        assert_eq!(Show::from_name("Stream "), Show::Both);
+        assert_eq!(Show::default(), Show::Both);
+    }
+
+    /// What an output is for follows what it is: the stream's picture, or the recording's (the
+    /// replay buffer's clips are recordings).
+    #[test]
+    fn an_output_is_for_the_stream_or_the_recording() {
+        assert_eq!(audience_of(&OutputKind::Stream(Box::new(|_| {}))), Audience::Stream);
+        assert_eq!(audience_of(&OutputKind::Record(PathBuf::new())), Audience::Recording);
+        assert_eq!(audience_of(&OutputKind::Replay { seconds: 30, mb: 0 }), Audience::Recording);
+    }
+
+    /// While no item differs the stream and the recording are one picture, drawn once; once one
+    /// does they are two. What a canvas carries besides its picture (sound tracks, their names,
+    /// the extra qualities) is no part of what is drawn.
+    #[test]
+    fn nothing_is_drawn_twice_while_no_item_differs() {
+        let main = Canvas::main(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() });
+        let for_ = |audience| Canvas { audience, ..main.clone() };
+        let (stream, recording, everyone) =
+            (for_(Audience::Stream), for_(Audience::Recording), for_(Audience::Everyone));
+        let none = Sides::default();
+        assert_eq!(view(&stream, none), view(&recording, none));
+        assert_eq!(view(&stream, none), view(&everyone, none));
+        let both = Sides { stream_only: true, recording_only: true };
+        assert_ne!(view(&stream, both), view(&recording, both));
+        assert_ne!(view(&stream, both), view(&everyone, both), "the editor's views keep every item");
+        // Nothing else of a canvas is touched.
+        let sized = Canvas { width: 320, height: 180, every: 2, ..stream.clone() };
+        let v = view(&sized, none);
+        assert_eq!((v.width, v.height, v.every), (320, 180, 2));
+        // A recording as the Studio makes it: named sound tracks, more of them; a stream with a
+        // VOD track and more qualities. The same picture all the same.
+        let rec = Canvas {
+            audience: Audience::Recording,
+            track: 1,
+            more_tracks: vec![2, 3],
+            track_names: vec!["Game".into(), String::new()],
+            ..main.clone()
+        };
+        let live = Canvas {
+            audience: Audience::Stream,
+            video_tracks: vec![(1280, 720, 3000)],
+            more_tracks: vec![1],
+            ..main.clone()
+        };
+        assert_eq!(view(&rec, none), view(&live, none), "one drawing, whatever sound each carries");
+        // A different size, rate or scene is a different picture.
+        let other = Canvas { scene: Some("Other".into()), ..rec.clone() };
+        assert_ne!(view(&other, none), view(&live, none));
+    }
+
+    /// Only the side that differs is drawn apart: with items for the stream only, the stream sees
+    /// what the editor does, and only the recording needs its own picture (and the reverse).
+    #[test]
+    fn only_the_side_that_differs_is_drawn_apart() {
+        let main = Canvas::main(EngineConfig { width: 640, height: 360, fps: 30, ..Default::default() });
+        let for_ = |audience| Canvas { audience, ..main.clone() };
+        let (stream, recording, everyone) =
+            (for_(Audience::Stream), for_(Audience::Recording), for_(Audience::Everyone));
+        let stream_only = Sides { stream_only: true, recording_only: false };
+        // Stream-only items: the stream and the editor's views are the same picture.
+        assert_eq!(view(&stream, stream_only), view(&everyone, stream_only));
+        assert_ne!(view(&recording, stream_only), view(&everyone, stream_only));
+        let recording_only = Sides { stream_only: false, recording_only: true };
+        assert_eq!(view(&recording, recording_only), view(&everyone, recording_only));
+        assert_ne!(view(&stream, recording_only), view(&everyone, recording_only));
+    }
+
+    /// A flagged item counts only on the canvas whose scenes hold it: one in the vertical picture's
+    /// scene never splits the wide picture, and the reverse.
+    #[test]
+    fn a_flag_counts_only_on_the_canvas_that_shows_it() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 64, height: 36, rgba: [255, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let mut flagged = SceneItem::new(1, Placement::default());
+        flagged.show = Show::Recording;
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.set_scene("Tall", vec![flagged.clone()]);
+        assert!(e.go("Main").is_ok());
+        let wide = Canvas::main(e.config);
+        let tall = Canvas { scene: Some("Tall".into()), ..Canvas::main(e.config) };
+        {
+            let st = e.lock();
+            assert_eq!(sides(&st, &wide), Sides::default(), "the wide picture has nothing flagged");
+            assert_eq!(sides(&st, &tall), Sides { stream_only: false, recording_only: true });
+        }
+        // A flagged item in a group, in a nested scene, counts too; a hidden one, or a hidden group, doesn't.
+        let mut group = SceneItem::new(0, Placement::default());
+        group.scene = Some("Inner".into());
+        group.group = Some((64, 36));
+        e.set_scene("Inner", vec![SceneItem { show: Show::Stream, ..SceneItem::new(1, Placement::default()) }]);
+        e.set_scene("Main", vec![group.clone()]);
+        assert_eq!(sides(&e.lock(), &wide), Sides { stream_only: true, recording_only: false });
+        group.visible = false;
+        e.set_scene("Main", vec![group]);
+        assert_eq!(sides(&e.lock(), &wide), Sides::default(), "a hidden group shows nothing");
+    }
+
+    /// The leaf pictures a built scene draws (a group's, inside it).
+    fn leaves(items: &[Item]) -> usize {
+        items
+            .iter()
+            .map(|i| match &i.content {
+                Content::Group { items, .. } => leaves(items),
+                Content::Scene(s) => leaves(&s.items),
+                _ => 1,
+            })
+            .sum()
+    }
+
+    /// A flag on a group covers the group as a whole, and a child keeps its own inside it.
+    #[test]
+    fn a_flag_on_a_group_covers_its_children() {
+        let Some(e) = engine() else { return };
+        for id in [1, 2, 3] {
+            e.set_source(id, SourceKind::Color { width: 160, height: 90, rgba: [255, 0, 0, 255] })
+                .unwrap_or_else(|x| panic!("{x}"));
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !(1..=3).all(|id| e.lock().sources.get(&id).is_some_and(|s| s.size.is_some())) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let shown = |show: Show, child: Show| {
+            let mut a = SceneItem::new(1, Placement::default());
+            let mut b = SceneItem::new(2, Placement::default());
+            b.show = child;
+            a.show = Show::Both;
+            e.set_scene("Inner", vec![a, b]);
+            let mut group = SceneItem::new(0, Placement::default());
+            group.scene = Some("Inner".into());
+            group.group = Some((640, 360));
+            group.show = show;
+            let mut other = SceneItem::new(3, Placement::default());
+            other.show = Show::Stream;
+            e.set_scene("Main", vec![group, other]);
+            let st = e.lock();
+            let n = |audience| leaves(&build(&st, 640, 360, Some("Main"), 0, audience).items);
+            (n(Audience::Stream), n(Audience::Recording), n(Audience::Everyone))
+        };
+        // A plain group: its children as they are (the second only in the recording), and the
+        // stream-only item beside it.
+        assert_eq!(shown(Show::Both, Show::Recording), (2, 2, 3));
+        // A recording-only group is gone from the stream whole, children and all.
+        assert_eq!(shown(Show::Recording, Show::Both), (1, 2, 3));
+        // A stream-only group is gone from the recording whole; the stream-only item with it.
+        assert_eq!(shown(Show::Stream, Show::Both), (3, 0, 3));
+        // Nothing flagged: everyone sees everything (the item beside it is still stream-only).
+        assert_eq!(shown(Show::Both, Show::Both), (3, 2, 3));
+    }
+
+    /// A group none of whose sources is for this audience draws nothing (its own filters would
+    /// paint an empty box into a clean recording).
+    #[test]
+    fn a_group_with_nothing_for_an_audience_draws_nothing() {
+        let Some(e) = engine() else { return };
+        for id in [1, 2] {
+            e.set_source(id, SourceKind::Color { width: 64, height: 36, rgba: [255, 0, 0, 255] })
+                .unwrap_or_else(|x| panic!("{x}"));
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !(1..=2).all(|id| e.lock().sources.get(&id).is_some_and(|s| s.size.is_some())) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let only_stream = |id| SceneItem { show: Show::Stream, ..SceneItem::new(id, Placement::default()) };
+        e.set_scene("Inner", vec![only_stream(1), only_stream(2)]);
+        let mut group = SceneItem::new(0, Placement::default());
+        group.scene = Some("Inner".into());
+        group.group = Some((400, 600));
+        e.set_scene("Main", vec![group]);
+        let st = e.lock();
+        let count = |a| build(&st, 640, 360, Some("Main"), 0, a).items.len();
+        assert_eq!(count(Audience::Stream), 1, "the stream shows the group");
+        assert_eq!(count(Audience::Everyone), 1);
+        assert_eq!(count(Audience::Recording), 0, "the recording has nothing from it, not an empty box");
+        // Several containers deep: Main > Outer > Inner > a source for the stream only. The recording
+        // sees none of the three, not an empty Outer.
+        drop(st);
+        let mut inner = SceneItem::new(0, Placement::default());
+        inner.scene = Some("Leaf".into());
+        inner.group = Some((200, 200));
+        e.set_scene("Leaf", vec![only_stream(1)]);
+        e.set_scene("Middle", vec![inner]);
+        let mut outer = SceneItem::new(0, Placement::default());
+        outer.scene = Some("Middle".into());
+        outer.group = Some((300, 300));
+        e.set_scene("Main", vec![outer]);
+        {
+            let st = e.lock();
+            let count = |a| build(&st, 640, 360, Some("Main"), 0, a).items.len();
+            assert_eq!(count(Audience::Stream), 1);
+            assert_eq!(count(Audience::Recording), 0, "no empty box left by the outer group");
+        }
+        // A group that was empty to begin with is as it was.
+        e.set_scene(
+            "Main",
+            vec![{
+                let mut g = SceneItem::new(0, Placement::default());
+                g.scene = Some("Inner".into());
+                g.group = Some((400, 600));
+                g
+            }],
+        );
+        e.set_scene("Inner", vec![]);
+        assert_eq!(build(&e.lock(), 640, 360, Some("Main"), 0, Audience::Recording).items.len(), 1);
+    }
+
+    /// The picture at the middle of the canvas, as the stream's, the recording's and the editor's
+    /// views draw it: the luma of a white backdrop (high) or a black box over it (low).
+    fn middle_luma(e: &Engine, audience: Audience) -> u8 {
+        let got = Arc::new(Mutex::new(None::<u8>));
+        let sink = got.clone();
+        let (w, h) = (e.config.width as usize, e.config.height as usize);
+        let tap = e
+            .tap_frames(
+                Canvas { audience, ..Canvas::main(e.config) },
+                Box::new(move |f: &Nv12, _| {
+                    sink.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(f.y[h / 2 * w + w / 2]);
+                }),
+            )
+            .unwrap_or_else(|x| panic!("{x}"));
+        let until = Instant::now() + Duration::from_secs(5);
+        while got.lock().unwrap_or_else(|p| p.into_inner()).is_none() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        e.stop_tap(tap);
+        let luma = *got.lock().unwrap_or_else(|p| p.into_inner());
+        luma.expect("a picture drew")
+    }
+
+    /// The point of it: a box shown only in the recording is in the recording's picture and not
+    /// the stream's, and the reverse.
+    #[test]
+    fn the_recording_lacks_a_stream_only_item_and_the_stream_lacks_a_recording_only_one() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_source(2, SourceKind::Color { width: 160, height: 90, rgba: [0, 0, 0, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let scene = |show: Show| {
+            let mut boxed = SceneItem::new(2, Placement { x: 240.0, y: 135.0, ..Placement::default() });
+            boxed.show = show;
+            e.set_scene("Main", vec![SceneItem::new(1, Placement::default()), boxed]);
+            assert!(e.go("Main").is_ok());
+        };
+        let (white, black) = (|l: u8| l > 200, |l: u8| l < 40);
+        scene(Show::Recording);
+        assert!(white(middle_luma(&e, Audience::Stream)), "the stream has no box");
+        assert!(black(middle_luma(&e, Audience::Recording)), "the recording has it");
+        assert!(black(middle_luma(&e, Audience::Everyone)), "the editor shows it");
+        scene(Show::Stream);
+        assert!(black(middle_luma(&e, Audience::Stream)), "the stream has the box");
+        assert!(white(middle_luma(&e, Audience::Recording)), "the recording has none");
+        assert!(black(middle_luma(&e, Audience::Everyone)));
+        scene(Show::Both);
+        assert!(black(middle_luma(&e, Audience::Stream)) && black(middle_luma(&e, Audience::Recording)));
+    }
+
+    /// A stream and a recording started on the engine take their pictures by what they are.
+    #[test]
+    fn outputs_are_started_for_what_they_are() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [255, 255, 255, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        assert!(e.go("Main").is_ok());
+        let dir = std::env::temp_dir().join(format!("ferrocast-audience-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|x| panic!("{x}"));
+        let rec = e.start_output(OutputKind::Record(dir.join("a.mp4")));
+        let stream = e.start_output(OutputKind::Stream(Box::new(|_| {})));
+        let both = rec.is_ok() && stream.is_ok();
+        let audiences: Vec<Audience> = e.lock().outputs.iter().map(|(.., c)| c.audience).collect();
+        for id in [rec, stream].into_iter().flatten() {
+            let _ = e.stop_output(id);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // Where an encoder isn't there (a CI box) nothing started: nothing to check.
+        if both {
+            assert_eq!(audiences, [Audience::Recording, Audience::Stream]);
+        }
+    }
+
     /// Broadcast timing: 29.97 and 59.94 (and 23.976) as fractions, and the frame times that go with them.
     #[test]
     fn broadcast_timing_is_a_thousandth_slower() {
@@ -7543,6 +8237,26 @@ mod tests {
         assert_ne!(left, Some(0), "an empty file was left at {}", file.display());
         let _ = std::fs::remove_file(&file);
         e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+    }
+
+    /// An output a stream is on draws what the stream shows (a recording-only item must never
+    /// reach the stream through a shared encode); when the stream leaves, the recording goes on
+    /// with what the recording shows.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_shared_output_follows_whether_a_stream_is_on_it() {
+        let Some(e) = engine() else { return };
+        shared_scene(&e);
+        let file = std::env::temp_dir().join(format!("ferrocore-audience-{}.mp4", std::process::id()));
+        let id = e.start_output(OutputKind::Record(file.clone())).unwrap_or_else(|x| panic!("{x}"));
+        let audience = |e: &Engine| e.lock().outputs.iter().find(|o| o.0 == id).map(|o| o.3.audience);
+        assert_eq!(audience(&e), Some(Audience::Recording));
+        e.stream_on(id, sink_into(&Sent::default())).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(audience(&e), Some(Audience::Stream), "a stream on it: the stream's picture");
+        e.stream_off(id).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(audience(&e), Some(Audience::Recording), "the recording goes on with its own");
+        e.stop_output(id).unwrap_or_else(|x| panic!("{x}"));
+        let _ = std::fs::remove_file(file);
     }
 
     /// A stream joins a running recording's encode: it opens with the codec headers and a

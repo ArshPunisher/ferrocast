@@ -99,6 +99,7 @@ fn verb(e: &Edit) -> &'static str {
         | Edit::ScaleBilinear
         | Edit::ScaleLanczos
         | Edit::ScaleArea => "Change scaling of",
+        Edit::StreamAndRecording | Edit::StreamOnly | Edit::RecordingOnly => "Set stream or recording for",
     }
 }
 
@@ -170,6 +171,18 @@ impl History {
                 Some(fresh(format!("Ungroup {}", item_name(c, scene, *id)?), None, false))
             }
             StudioAct::PasteCopy { name, .. } => Some(fresh(format!("Paste a copy of {name}"), None, false)),
+            StudioAct::PasteSource { clip, .. } => {
+                let name = clip.pointer("/sources/0/name").and_then(|n| n.as_str()).unwrap_or("source");
+                Some(fresh(format!("Paste {name}"), None, false))
+            }
+            StudioAct::PasteFilterClip { name, item, clip } => {
+                let from = clip.get("from").and_then(|n| n.as_str()).unwrap_or("a source");
+                let to = match item {
+                    Some(it) => item_name(c, &it.scene, it.id).unwrap_or_else(|| it.scene.clone()),
+                    None => name.clone(),
+                };
+                Some(fresh(format!("Paste filters from {from} to {to}"), None, false))
+            }
             StudioAct::AddExisting { name, .. } => Some(fresh(format!("Add {name}"), None, false)),
             StudioAct::SetItemTransition { scene, id, show, .. } => {
                 let what = if *show { "Show" } else { "Hide" };
@@ -436,6 +449,40 @@ mod tests {
         assert_eq!(h.undo(&c), Ok(Some("Hide Box".into())));
         assert_eq!(h.undo(&c), Ok(Some("Move Box into Pair".into())));
         assert!(c.items("Main").unwrap_or_default().iter().any(|i| i.name == "Box"), "out of the group again");
+    }
+
+    /// Where an item is shown is an undo step like any other edit, and comes back with Redo.
+    #[test]
+    fn choosing_stream_or_recording_for_an_item_undoes_and_redoes() {
+        use ferrocast_engine::studio_host::ItemEdit;
+        let c = stage();
+        let mut h = History::default();
+        let it = c
+            .add_source("Main", "color_source_v3", "Chat", &serde_json::json!({ "width": 64, "height": 36 }), false)
+            .unwrap();
+        let show = |c: &Collection| c.items("Main").unwrap()[0].show.clone();
+        for edit in [ItemEdit::StreamOnly, ItemEdit::RecordingOnly] {
+            let act = StudioAct::EditItem { scene: "Main".into(), id: it.id, edit };
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} is an undo step"));
+            let r = c.edit_item(
+                "Main",
+                it.id,
+                match edit {
+                    ItemEdit::StreamOnly => ferrocast_studio::ItemEdit::StreamOnly,
+                    _ => ferrocast_studio::ItemEdit::RecordingOnly,
+                },
+            );
+            h.after(&c, b, &r.map(|()| Value::Null).map_err(|e| e.to_string()));
+        }
+        assert_eq!(show(&c), "recording");
+        assert_eq!(h.list().0, ["Set stream or recording for Chat", "Set stream or recording for Chat"]);
+        assert_eq!(h.undo(&c), Ok(Some("Set stream or recording for Chat".into())));
+        assert_eq!(show(&c), "stream");
+        assert_eq!(h.undo(&c), Ok(Some("Set stream or recording for Chat".into())));
+        assert_eq!(show(&c), "both");
+        assert!(!c.has_selective_items());
+        assert_eq!(h.redo(&c), Ok(Some("Set stream or recording for Chat".into())));
+        assert_eq!(show(&c), "stream");
     }
 
     #[test]

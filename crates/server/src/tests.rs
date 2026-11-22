@@ -1789,3 +1789,300 @@ async fn chat_shows_this_stream_not_the_last_one() {
     let ids: Vec<&str> = chat.as_array().unwrap().iter().filter_map(|e| e["source_id"].as_str()).collect();
     assert_eq!(ids, ["just now"]);
 }
+
+#[tokio::test]
+async fn preview_socket_hides_real_credits_and_the_pinned_message() {
+    use ferrocast_core::event::{Actor, Content, Event, EventKind, Millis, Platform};
+    let r = start().await;
+    let o: Value = r.post("/api/v1/overlays", json!({ "name": "Priv", "preset": "blank" })).await.json().await.unwrap();
+    let mut edit = o.clone();
+    edit["widgets"] = json!([
+        { "id": "ec", "kind": "end_credits", "x": 0, "y": 0, "w": 800, "h": 600, "config": {} },
+        { "id": "hl", "kind": "chat_highlight", "x": 0, "y": 700, "w": 800, "h": 200, "config": {} }
+    ]);
+    let url = o["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    assert_eq!(r.put(&format!("/api/v1/overlays/{}", o["id"].as_str().unwrap()), edit).await.status(), StatusCode::OK);
+    let t0 = ferrocast_engine::now().0;
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("pv-f".into()),
+            Millis(t0 - 2000),
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "RealFollower") },
+        ))
+        .await;
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("pv-m".into()),
+            Millis(t0 - 1000),
+            EventKind::ChatMessage {
+                actor: Actor::named(Platform::Twitch, "RealChatter"),
+                content: Content::plain("secret pinned words"),
+                reply_to: None,
+                is_action: false,
+            },
+        ))
+        .await;
+    let chat: Value = r.get("/api/v1/chat?limit=5").await.json().await.unwrap();
+    let id = chat.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(r.post("/api/v1/chat/highlight", json!({ "event_id": id })).await.status(), StatusCode::OK);
+
+    let (mut real, _) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
+    let real_snap = next_json(&mut real).await;
+    assert!(real_snap.to_string().contains("RealFollower"), "the real overlay sees the roster: {real_snap}");
+    let (mut test, _) = tokio_tungstenite::connect_async(format!("{url}?test")).await.unwrap();
+    let snap = next_json(&mut test).await;
+    let text = snap.to_string();
+    for secret in ["RealFollower", "RealChatter", "secret pinned words"] {
+        assert!(!text.contains(secret), "a ?test preview must not carry {secret}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn new_widget_configs_validate_and_isolate_overlay_socket_feeds() {
+    use ferrocast_core::event::{Actor, Content, Event, EventKind, Platform};
+    use reqwest::Method;
+    let r = start().await;
+
+    // 1. Auth required on /credits and /chat/highlight.
+    for (m, p) in [
+        (Method::GET, "/api/v1/credits"),
+        (Method::GET, "/api/v1/chat/highlight"),
+        (Method::POST, "/api/v1/chat/highlight"),
+        (Method::DELETE, "/api/v1/chat/highlight"),
+    ] {
+        assert_eq!(error_code(r.anonymous(m, p).await).await.0, StatusCode::UNAUTHORIZED, "{p}");
+    }
+    assert_eq!(r.get("/api/v1/chat/highlight").await.json::<Value>().await.unwrap(), Value::Null);
+
+    // 2. Overlay widget validation rejects invalid speeds, physics, sections, and caps.
+    let base_overlay: Value =
+        r.post("/api/v1/overlays", json!({ "name": "TestNew", "preset": "blank" })).await.json().await.unwrap();
+    let oid = base_overlay["id"].as_str().unwrap().to_string();
+    let mut bad_ew = base_overlay.clone();
+    bad_ew["widgets"] = json!([
+        { "id": "ew", "kind": "emote_wall", "x": 0, "y": 0, "w": 800, "h": 600, "config": { "max_emotes": 500, "physics": "bounce" } }
+    ]);
+    assert_eq!(r.put(&format!("/api/v1/overlays/{oid}"), bad_ew).await.status(), StatusCode::BAD_REQUEST);
+
+    let mut bad_ec = base_overlay.clone();
+    bad_ec["widgets"] = json!([
+        { "id": "ec", "kind": "end_credits", "x": 0, "y": 0, "w": 800, "h": 600, "config": { "sections": ["followers"], "speed": 999 } }
+    ]);
+    assert_eq!(r.put(&format!("/api/v1/overlays/{oid}"), bad_ec).await.status(), StatusCode::BAD_REQUEST);
+
+    // 3. Create overlays tailored to each new widget + a baseline chat_only overlay.
+    let hl_ov: Value =
+        r.post("/api/v1/overlays", json!({ "name": "HL", "preset": "blank" })).await.json().await.unwrap();
+    let mut hl_edit = hl_ov.clone();
+    hl_edit["widgets"] = json!([
+        { "id": "hl", "kind": "chat_highlight", "x": 40, "y": 800, "w": 620, "h": 220, "config": { "theme": "molten", "duration_s": null, "font_size": 24, "show_badges": true, "show_platform": true } }
+    ]);
+    assert_eq!(
+        r.put(&format!("/api/v1/overlays/{}", hl_ov["id"].as_str().unwrap()), hl_edit).await.status(),
+        StatusCode::OK
+    );
+
+    let ec_ov: Value =
+        r.post("/api/v1/overlays", json!({ "name": "EC", "preset": "blank" })).await.json().await.unwrap();
+    let mut ec_edit = ec_ov.clone();
+    ec_edit["widgets"] = json!([
+        { "id": "ec", "kind": "end_credits", "x": 100, "y": 100, "w": 800, "h": 700, "config": { "theme": "molten", "sections": ["followers", "mods"], "speed": 60, "font": "system", "loop": true } }
+    ]);
+    assert_eq!(
+        r.put(&format!("/api/v1/overlays/{}", ec_ov["id"].as_str().unwrap()), ec_edit).await.status(),
+        StatusCode::OK
+    );
+
+    let ew_ov: Value =
+        r.post("/api/v1/overlays", json!({ "name": "EW", "preset": "blank" })).await.json().await.unwrap();
+    let mut ew_edit = ew_ov.clone();
+    ew_edit["widgets"] = json!([
+        { "id": "ew", "kind": "emote_wall", "x": 0, "y": 0, "w": 1920, "h": 1080, "config": { "theme": "molten", "platforms": [], "max_emotes": 40, "size": 56, "lifetime_s": 6, "physics": "rain" } }
+    ]);
+    assert_eq!(
+        r.put(&format!("/api/v1/overlays/{}", ew_ov["id"].as_str().unwrap()), ew_edit).await.status(),
+        StatusCode::OK
+    );
+
+    let chat_only: Value =
+        r.post("/api/v1/overlays", json!({ "name": "Plain", "preset": "chat_only" })).await.json().await.unwrap();
+
+    // Seed an earlier chat message BEFORE opening emote_wall socket (must NOT backfill emote wall snapshot).
+    let t0 = ferrocast_engine::now().0;
+    let mut old_msg = Event::live(
+        Platform::Twitch,
+        Some("m-old".into()),
+        ferrocast_core::event::Millis(t0 - 1000),
+        EventKind::ChatMessage {
+            actor: Actor::named(Platform::Twitch, "OldChatter"),
+            content: Content::plain("hello earlier"),
+            reply_to: None,
+            is_action: false,
+        },
+    );
+    old_msg.id = "ev-old".into();
+    r.engine.ingest(old_msg).await;
+    let chat_log: Value = r.get("/api/v1/chat?limit=10").await.json().await.unwrap();
+    let old_id = chat_log.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+
+    let open = |o: &Value| o["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    let (mut ws_hl, _) = tokio_tungstenite::connect_async(open(&hl_ov)).await.unwrap();
+    let (mut ws_ec, _) = tokio_tungstenite::connect_async(open(&ec_ov)).await.unwrap();
+    let (mut ws_ew, _) = tokio_tungstenite::connect_async(open(&ew_ov)).await.unwrap();
+    let (mut ws_chat, _) = tokio_tungstenite::connect_async(open(&chat_only)).await.unwrap();
+
+    let snap_hl: Value = serde_json::from_str(ws_hl.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let snap_ec: Value = serde_json::from_str(ws_ec.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let snap_ew: Value = serde_json::from_str(ws_ew.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let snap_chat: Value = serde_json::from_str(ws_chat.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+
+    assert!(snap_hl["data"]["state"]["chat_highlight"].is_null());
+    assert!(snap_ec["data"]["state"]["credits"].is_object());
+    assert!(snap_chat["data"]["state"]["credits"].is_null());
+    assert_eq!(snap_ew["data"]["state"]["chat"].as_array().unwrap().len(), 0, "emote_wall needs no chat backfill");
+
+    // 4. Pin highlight validation + live state push strictly to ChatHighlight overlay.
+    let bad_pin = r.post("/api/v1/chat/highlight", json!({ "event_id": 123 })).await;
+    assert_eq!(bad_pin.status(), StatusCode::BAD_REQUEST);
+    let bad_dur = r.post("/api/v1/chat/highlight", json!({ "event_id": old_id, "duration_s": 2 })).await;
+    assert_eq!(bad_dur.status(), StatusCode::BAD_REQUEST);
+    let missing_pin = r.post("/api/v1/chat/highlight", json!({ "event_id": "nope" })).await;
+    assert_eq!(error_code(missing_pin).await, (StatusCode::NOT_FOUND, "highlight_not_found".into()));
+
+    let pin_res = r.post("/api/v1/chat/highlight", json!({ "event_id": old_id, "duration_s": 45 })).await;
+    assert_eq!(pin_res.status(), StatusCode::OK);
+    let pinned: Value = pin_res.json().await.unwrap();
+    assert_eq!(pinned["event_id"], old_id);
+
+    let hl_frame: Value = serde_json::from_str(ws_hl.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(hl_frame["type"], "state");
+    assert_eq!(hl_frame["data"]["chat_highlight"]["content"]["text"], "hello earlier");
+
+    // Emote wall + EndCredits + ChatOnly should NOT receive the chat_highlight frame!
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(120), ws_ew.next()).await.is_err());
+
+    // 5. Dismiss highlight -> sends null to ChatHighlight overlay.
+    let del = r.client.delete(format!("{}/api/v1/chat/highlight", r.base)).bearer_auth(&r.token).send().await.unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    let clear_frame: Value = serde_json::from_str(ws_hl.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(clear_frame["type"], "state");
+    assert!(clear_frame["data"]["chat_highlight"].is_null());
+
+    // 6. Live follow + live emote chat -> EndCredits gets credits frame, EmoteWall gets live chat event.
+    let follow_ev = Event::live(
+        Platform::Twitch,
+        Some("f-live".into()),
+        ferrocast_core::event::Millis(t0 + 10),
+        EventKind::Follow { actor: Actor::named(Platform::Twitch, "CreditFollower") },
+    );
+    r.engine.ingest(follow_ev).await;
+    let ec_frame: Value = serde_json::from_str(ws_ec.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(ec_frame["type"], "state");
+    assert_eq!(ec_frame["data"]["credits"]["followers"][0]["name"], "CreditFollower");
+    let cr_http: Value = r.get("/api/v1/credits").await.json().await.unwrap();
+    assert_eq!(cr_http["followers"][0]["name"], "CreditFollower");
+
+    let mut emote_msg = Event::live(
+        Platform::Twitch,
+        Some("m-em".into()),
+        ferrocast_core::event::Millis(t0 + 20),
+        EventKind::ChatMessage {
+            actor: Actor::named(Platform::Twitch, "EmoteChatter"),
+            content: Content {
+                text: "Kappa".into(),
+                fragments: vec![ferrocast_core::event::Fragment::Emote {
+                    provider: ferrocast_core::event::EmoteProvider::Native,
+                    id: "25".into(),
+                    name: "Kappa".into(),
+                    url: "https://static-cdn.jtvnw.net/emoticons/v2/25/static/dark/2.0".into(),
+                    zero_width: false,
+                }],
+            },
+            reply_to: None,
+            is_action: false,
+        },
+    );
+    emote_msg.id = "ev-em-1".into();
+    r.engine.ingest(emote_msg).await;
+    let ew_frame: Value = serde_json::from_str(ws_ew.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(ew_frame["type"], "event");
+    assert_eq!(ew_frame["data"]["kind"]["content"]["fragments"][0]["name"], "Kappa");
+}
+
+#[tokio::test]
+async fn queue_controls_pause_mute_skip_and_their_state() {
+    let r = start().await;
+    let q: Value = r.get("/api/v1/queue").await.json().await.unwrap();
+    assert_eq!((q["paused"].as_bool(), q["muted"].as_bool()), (Some(false), Some(false)), "{q}");
+    for (path, key, want) in [
+        ("/api/v1/queue/pause", "paused", true),
+        ("/api/v1/queue/mute", "muted", true),
+        ("/api/v1/queue/unmute", "muted", false),
+        ("/api/v1/queue/resume", "paused", false),
+    ] {
+        let res = r.post(path, json!({})).await;
+        assert_eq!(res.status(), StatusCode::OK, "{path}");
+        let q: Value = res.json().await.unwrap();
+        assert_eq!(q[key].as_bool(), Some(want), "{path}: {q}");
+    }
+    // Idempotent, and skipping with nothing playing is fine.
+    assert_eq!(r.post("/api/v1/queue/mute", json!({})).await.status(), StatusCode::OK);
+    let q: Value = r.post("/api/v1/queue/mute", json!({})).await.json().await.unwrap();
+    assert_eq!(q["muted"], true);
+    assert_eq!(r.post("/api/v1/queue/skip", json!({})).await.status(), StatusCode::OK);
+    // Without the session token every one is refused.
+    for p in ["/api/v1/queue/mute", "/api/v1/queue/unmute", "/api/v1/queue/skip"] {
+        assert_eq!(r.anonymous(reqwest::Method::POST, p).await.status(), StatusCode::UNAUTHORIZED, "{p}");
+    }
+    assert_eq!(r.get("/api/v1/queue/mute").await.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn alert_rules_take_weight_and_interrupt_and_refuse_bad_weights() {
+    let r = start().await;
+    let rules: Value = r.get("/api/v1/alert-rules").await.json().await.unwrap();
+    let mut rule = rules[0].clone();
+    assert!(rule["variations"][0]["weight"].is_number() && rule["interrupt"] == false, "{rule}");
+    rule["interrupt"] = json!(true);
+    rule["variations"][0]["weight"] = json!(7);
+    let id = rule["id"].as_str().unwrap().to_string();
+    let res = r.put(&format!("/api/v1/alert-rules/{id}"), rule.clone()).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let back: Value = res.json().await.unwrap();
+    assert_eq!((back["interrupt"].as_bool(), back["variations"][0]["weight"].as_u64()), (Some(true), Some(7)));
+    rule["variations"][0]["weight"] = json!(1001);
+    let res = r.put(&format!("/api/v1/alert-rules/{id}"), rule).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let e: Value = res.json().await.unwrap();
+    assert!(e.to_string().contains("weight"), "{e}");
+}
+
+#[tokio::test]
+async fn creating_a_rule_checks_weight_and_interrupt_too() {
+    let r = start().await;
+    let rules: Value = r.get("/api/v1/alert-rules").await.json().await.unwrap();
+    let mut base = rules[0].clone();
+    base["id"] = json!("mine");
+    base["name"] = json!("Mine");
+    for (what, edit) in
+        [("over the limit", json!(1001)), ("negative", json!(-1)), ("fractional", json!(1.5)), ("text", json!("heavy"))]
+    {
+        let mut rule = base.clone();
+        rule["variations"][0]["weight"] = edit;
+        let res = r.post("/api/v1/alert-rules", rule).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{what}");
+    }
+    let mut rule = base.clone();
+    rule["interrupt"] = json!("yes");
+    assert_eq!(
+        r.post("/api/v1/alert-rules", rule).await.status(),
+        StatusCode::BAD_REQUEST,
+        "interrupt must be a boolean"
+    );
+    let mut ok = base.clone();
+    ok["variations"][0]["weight"] = json!(1000);
+    ok["interrupt"] = json!(true);
+    assert_eq!(r.post("/api/v1/alert-rules", ok).await.status(), StatusCode::CREATED);
+}
