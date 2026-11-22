@@ -303,7 +303,10 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         .into_iter()
         .flatten()
         .map(|t| {
-            let t_name = tr_names.take(t.get("name").and_then(Value::as_str).unwrap_or("Fade"));
+            // Transition names are limited to 100 characters (every later edit checks it), and
+            // "(n)" may be added: keep room for it.
+            let wanted: String = t.get("name").and_then(Value::as_str).unwrap_or("Fade").chars().take(90).collect();
+            let t_name = tr_names.take(&wanted);
             if let Some(id) = t.get("id").and_then(Value::as_str) {
                 tr_by_id.insert(id.to_string(), t_name.clone());
             }
@@ -412,6 +415,21 @@ mod tests {
                 ]
             }
         })
+    }
+
+    #[test]
+    fn long_transition_names_stay_editable() {
+        let mut v = sample();
+        let long = "L".repeat(150);
+        v["transitions"]["transitions"] = json!([
+            { "id": "t1", "name": long, "type": "swipe_transition", "duration": 500, "settings": {} },
+            { "id": "t2", "name": "L".repeat(150), "type": "fade_transition", "duration": 300, "settings": {} }
+        ]);
+        let doc = to_obs(&v, "Main");
+        for t in doc["transitions"].as_array().unwrap() {
+            assert!(t["name"].as_str().unwrap().chars().count() <= 100);
+        }
+        assert_ne!(doc["transitions"][0]["name"], doc["transitions"][1]["name"]);
     }
 
     #[test]

@@ -5779,7 +5779,11 @@ fn named_transitions_from_doc(d: &Value) -> Vec<NamedTransition> {
             if name.is_empty() || !seen.insert(name.to_string()) {
                 continue;
             }
-            let raw_kind = kind_of(entry);
+            let raw_kind = match kind_of(entry) {
+                // OBS's Move Transition (Exeldro): the one Ferrocast draws itself.
+                "move_transition" => "ferrocast_move",
+                k => k,
+            };
             let kind = if is_valid_transition_kind(raw_kind) {
                 raw_kind.to_string()
             } else {
@@ -5902,8 +5906,10 @@ fn import_and_normalize_transitions(d: &mut Value) {
 
         for (scene_name, tr_name, dur_opt) in obs_overrides {
             let has_matrix = rules.iter().any(|r| r.from.is_none() && r.to.as_deref() == Some(&scene_name));
-            let has_legacy =
-                d.pointer(&format!("/ferrocast/scene_transitions/{scene_name}")).is_some_and(|v| !v.is_null());
+            let has_legacy = d
+                .pointer("/ferrocast/scene_transitions")
+                .and_then(|v| v.get(scene_name.as_str()))
+                .is_some_and(|v| !v.is_null());
             if has_matrix || has_legacy {
                 continue;
             }
@@ -5923,7 +5929,10 @@ fn import_and_normalize_transitions(d: &mut Value) {
                 && base.kind != "cut_transition"
                 && base.ms != dur
             {
-                let custom = format!("{} ({dur}ms)", base.name);
+                // Kept inside the 100-character limit every later edit checks.
+                let suffix = format!(" ({dur}ms)");
+                let stem: String = base.name.chars().take(100usize.saturating_sub(suffix.chars().count())).collect();
+                let custom = format!("{stem}{suffix}");
                 if !transitions.iter().any(|t| t.name == custom) {
                     transitions.push(NamedTransition {
                         name: custom.clone(),
@@ -9474,6 +9483,38 @@ mod tests {
         });
         ok(s.update_named_transition("Wipe", None, None, Some(&json!({ "direction": "down" })), None));
         assert_eq!(s.transition_settings("swipe_transition")["direction"], "down");
+    }
+
+    #[test]
+    fn imported_scene_overrides_cope_with_odd_scene_names_and_long_transition_names() {
+        let long = "S".repeat(95);
+        let mut d = json!({
+            "sources": [
+                { "id": "scene", "name": "Main / Camera", "private_settings": { "transition": "Swipe", "transition_duration": 700 } },
+                { "id": "scene", "name": "BRB ~ 5m", "private_settings": { "transition": long.clone(), "transition_duration": 900 } },
+                { "id": "scene", "name": "Plain", "private_settings": {} }
+            ],
+            "scene_order": [{ "name": "Main / Camera" }, { "name": "BRB ~ 5m" }, { "name": "Plain" }],
+            "transitions": [
+                { "id": "swipe_transition", "name": "Swipe", "settings": {} },
+                { "id": "move_transition", "name": "Mover", "settings": {} }
+            ],
+            "ferrocast": { "scene_transitions": { "Main / Camera": { "kind": "fade_transition", "ms": 100 } } }
+        });
+        import_and_normalize_transitions(&mut d);
+        let rules = transition_matrix_from_doc(&d);
+        // The legacy override on a scene with "/" in its name is found, so no rule replaces it.
+        assert!(!rules.iter().any(|r| r.to.as_deref() == Some("Main / Camera")), "{rules:?}");
+        // The generated "(900ms)" copy of a 95-character name still fits the 100-character limit.
+        let list = named_transitions_from_doc(&d);
+        assert!(
+            list.iter().all(|t| t.name.chars().count() <= 100),
+            "{:?}",
+            list.iter().map(|t| t.name.len()).collect::<Vec<_>>()
+        );
+        assert!(rules.iter().any(|r| r.to.as_deref() == Some("BRB ~ 5m")));
+        // Exeldro's Move Transition is one Ferrocast renders: not downgraded to Fade.
+        assert_eq!(list.iter().find(|t| t.name == "Mover").unwrap().kind, "ferrocast_move");
     }
 
     #[test]
