@@ -6015,8 +6015,28 @@ pub fn saved_named_transitions(doc: Option<&Value>) -> Vec<NamedTransition> {
     })
 }
 
+/// The matrix rules of a saved collection, without the ones naming a scene or transition that
+/// is no longer there (the same filter a running Studio applies).
 pub fn saved_transition_matrix(doc: Option<&Value>) -> Vec<TransitionMatrixRule> {
-    doc.map(transition_matrix_from_doc).unwrap_or_default()
+    let Some(d) = doc else { return Vec::new() };
+    let valid_tr: std::collections::HashSet<String> =
+        named_transitions_from_doc(d).into_iter().map(|t| t.name).collect();
+    let valid_scenes: std::collections::HashSet<&str> = d
+        .get("scene_order")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("name").and_then(Value::as_str))
+        .collect();
+    transition_matrix_from_doc(d)
+        .into_iter()
+        .filter(|r| {
+            !(r.from.is_none() && r.to.is_none())
+                && valid_tr.contains(&r.transition)
+                && r.from.as_deref().is_none_or(|f| valid_scenes.contains(f))
+                && r.to.as_deref().is_none_or(|t| valid_scenes.contains(t))
+        })
+        .collect()
 }
 
 /// A stream, recording or replay buffer our engine runs for the stage. Dropping it ends it

@@ -646,7 +646,12 @@ fn saved_scenes(doc: Option<&Value>) -> Value {
     json!({
         "scenes": scenes,
         "current": doc.and_then(|d| d.get("current_scene")).and_then(Value::as_str).unwrap_or(""),
-        "transition": null,
+        // What a switch would use: the default named transition (the dashboard reads it).
+        "transition": named_transitions
+            .iter()
+            .find(|t| t.default)
+            .or(named_transitions.first())
+            .map_or(json!({ "kind": "fade_transition", "ms": 300 }), |t| json!({ "kind": t.kind, "ms": t.ms })),
         "named_transitions": named_transitions,
         "transition_matrix": transition_matrix,
         "preview": null,
@@ -4637,6 +4642,34 @@ mod saved_scene_tests {
         // No file, or one without scenes: an empty list, never an error.
         assert_eq!(saved_scenes(None)["scenes"], json!([]));
         assert_eq!(saved_scenes(Some(&json!({ "scene_order": "nope" })))["scenes"], json!([]));
+    }
+
+    #[test]
+    fn a_stopped_studio_still_answers_with_a_transition_and_only_valid_matrix_rules() {
+        // No file: the dashboard still gets a transition object, never null.
+        let v = saved_scenes(None);
+        assert_eq!(v["transition"]["kind"], "fade_transition");
+        assert_eq!(v["transition"]["ms"], 300);
+        // A collection whose matrix names a deleted scene and a missing transition.
+        let doc = json!({
+            "current_scene": "Main",
+            "scene_order": [{ "name": "Main" }, { "name": "BRB" }],
+            "transitions": [{ "id": "swipe_transition", "name": "Wipe", "settings": {} }],
+            "current_transition": "Wipe",
+            "transition_duration": 450,
+            "ferrocast": {
+                "named_transitions_v2": true,
+                "transition_matrix": [
+                    { "from": null, "to": "BRB", "transition": "Wipe" },
+                    { "from": "Gone", "to": "BRB", "transition": "Wipe" },
+                    { "from": "Main", "to": "BRB", "transition": "Nope" }
+                ]
+            }
+        });
+        let v = saved_scenes(Some(&doc));
+        let rules = v["transition_matrix"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "dangling rules are dropped: {rules:?}");
+        assert_eq!(v["transition"]["kind"], "swipe_transition");
     }
 }
 
