@@ -4696,6 +4696,12 @@ mod saved_scene_tests {
         // A collection whose matrix names a deleted scene and a missing transition.
         let doc = json!({
             "current_scene": "Main",
+            // The scenes as a real collection has them: in `sources` too (a running Studio and a
+            // stopped one read the same scenes).
+            "sources": [
+                { "id": "scene", "name": "Main", "settings": { "items": [] } },
+                { "id": "scene", "name": "BRB", "settings": { "items": [] } }
+            ],
             "scene_order": [{ "name": "Main" }, { "name": "BRB" }],
             "transitions": [{ "id": "swipe_transition", "name": "Wipe", "settings": {} }],
             "current_transition": "Wipe",
