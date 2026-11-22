@@ -304,6 +304,11 @@ pub const KEY_NEVER_ALLOWED: &[Rule] = &[
 
 const KEY_COMMON_READ: &[Rule] = &[("GET", "/status"), ("GET", "/openapi.json"), ("GET", "/asyncapi.json")];
 
+// Each scope is an exact allowlist: no `**`, one line per route. A route nobody listed here is
+// refused (`scope_tests.rs` keeps one snapshot per scope of every route it reaches).
+
+/// Reading only: what is on the stream and in chat, never a key, a token, a path or a picture
+/// of the screen.
 pub const READ_ONLY_ALLOWED: &[Rule] = &[
     ("GET", "/live"),
     ("GET", "/themes"),
@@ -313,12 +318,9 @@ pub const READ_ONLY_ALLOWED: &[Rule] = &[
     ("GET", "/recap/summary"),
     ("GET", "/credits"),
     ("GET", "/insights/supporters"),
-    ("GET", "/overlays"),
-    ("GET", "/overlays/*"),
     ("GET", "/designs"),
     ("GET", "/designs/active-alert"),
     ("GET", "/designs/*"),
-    ("GET", "/designs/*/obs"),
     ("GET", "/alert-rules"),
     ("GET", "/queue"),
     ("GET", "/events"),
@@ -346,22 +348,18 @@ pub const READ_ONLY_ALLOWED: &[Rule] = &[
     ("GET", "/tts"),
     ("GET", "/tts/pending"),
     ("GET", "/tts/voices"),
-    ("GET", "/tts/cloud"),
-    ("GET", "/media"),
-    ("GET", "/media/*"),
     ("GET", "/music"),
-    ("GET", "/obs"),
-    ("GET", "/obs/theme"),
     ("GET", "/obs/scenes"),
     ("GET", "/obs/inputs"),
     ("GET", "/obs/stream"),
     ("GET", "/obs/health"),
-    ("GET", "/obs/switcher"),
     ("GET", "/golive"),
     ("GET", "/golive/picture"),
     ("GET", "/studio/engine"),
-    ("GET", "/studio/engine/**"),
-    ("GET", "/speech/models"),
+    ("GET", "/studio/engine/scenes"),
+    ("GET", "/studio/engine/sources"),
+    ("GET", "/studio/engine/stats"),
+    ("GET", "/studio/engine/stream"),
     ("GET", "/transcript"),
     ("GET", "/counters"),
     ("GET", "/quotes"),
@@ -378,10 +376,10 @@ pub const READ_ONLY_ALLOWED: &[Rule] = &[
     ("GET", "/moments/markers"),
     ("GET", "/moments/markers/export"),
     ("GET", "/automations"),
-    ("GET", "/settings"),
-    ("GET", "/backups"),
 ];
 
+/// Chat and moderation: posting, the viewers' lists and the rules that answer them. Never the
+/// stream, a key or the PC.
 pub const CHAT_ALLOWED: &[Rule] = &[
     ("GET", "/live"),
     ("GET", "/chat"),
@@ -441,8 +439,6 @@ pub const CHAT_ALLOWED: &[Rule] = &[
     ("PUT", "/tts"),
     ("GET", "/tts/pending"),
     ("GET", "/tts/voices"),
-    ("GET", "/tts/cloud"),
-    ("PUT", "/tts/cloud"),
     ("POST", "/tts/preview"),
     ("POST", "/tts/*/approve"),
     ("POST", "/tts/*/reject"),
@@ -459,6 +455,9 @@ pub const CHAT_ALLOWED: &[Rule] = &[
     ("PUT", "/modules"),
 ];
 
+/// Alerts, goals and the overlays they show on. Custom alert HTML and fields stay on the PC
+/// (the handler refuses them for a key), putting an overlay into OBS needs `studio_control`,
+/// and media is read, never deleted.
 pub const ALERTS_ALLOWED: &[Rule] = &[
     ("GET", "/live"),
     ("GET", "/overlays"),
@@ -467,7 +466,6 @@ pub const ALERTS_ALLOWED: &[Rule] = &[
     ("PUT", "/overlays/*"),
     ("DELETE", "/overlays/*"),
     ("POST", "/overlays/*/regenerate-url"),
-    ("POST", "/overlays/*/add-to-obs"),
     ("POST", "/overlays/*/follow-design"),
     ("GET", "/designs"),
     ("POST", "/designs"),
@@ -496,18 +494,44 @@ pub const ALERTS_ALLOWED: &[Rule] = &[
     ("POST", "/goals/*/adjust"),
     ("GET", "/media"),
     ("GET", "/media/*"),
-    ("DELETE", "/media/*"),
 ];
 
+/// Running the show: scenes, the mixer, recording, replay, markers. Not the stream (that is
+/// `go_live`), not automations (they can post to chat), not the Studio's settings or files.
 pub const STUDIO_CONTROL_ALLOWED: &[Rule] = &[
     ("GET", "/live"),
     ("GET", "/studio/engine"),
-    ("*", "/studio/engine/**"),
-    ("GET", "/obs"),
-    ("GET", "/obs/theme"),
-    ("DELETE", "/obs/theme"),
-    ("GET", "/designs/*/obs"),
-    ("POST", "/designs/*/obs"),
+    ("GET", "/studio/engine/scenes"),
+    ("GET", "/studio/engine/sources"),
+    ("GET", "/studio/engine/stats"),
+    ("GET", "/studio/engine/scenes/*/items"),
+    ("GET", "/studio/engine/scenes/*/audio"),
+    ("GET", "/studio/engine/sources/*/status"),
+    ("GET", "/studio/engine/sources/*/media"),
+    ("POST", "/studio/engine/scenes/*/current"),
+    ("PUT", "/studio/engine/scenes/*/items/*/transform"),
+    ("PUT", "/studio/engine/scenes/*/items/*/box"),
+    ("PUT", "/studio/engine/scenes/*/items/*/crop"),
+    ("PUT", "/studio/engine/scenes/*/items/*/order"),
+    ("PUT", "/studio/engine/sources/*/audio"),
+    ("POST", "/studio/engine/sources/*/media"),
+    ("POST", "/studio/engine/black"),
+    ("PUT", "/studio/engine/transition"),
+    ("PUT", "/studio/engine/studio-mode"),
+    ("PUT", "/studio/engine/studio-mode/preview"),
+    ("POST", "/studio/engine/studio-mode/swap"),
+    ("POST", "/studio/engine/studio-mode/transition"),
+    ("PUT", "/studio/engine/studio-mode/tbar"),
+    ("POST", "/studio/engine/record"),
+    ("POST", "/studio/engine/record/pause"),
+    ("POST", "/studio/engine/record/split"),
+    ("POST", "/studio/engine/record/chapter"),
+    ("POST", "/studio/engine/replay"),
+    ("POST", "/studio/engine/replay/save"),
+    ("POST", "/studio/engine/virtualcam"),
+    ("POST", "/studio/engine/live-alerts/silence"),
+    ("POST", "/studio/engine/undo"),
+    ("POST", "/studio/engine/redo"),
     ("GET", "/obs/scenes"),
     ("GET", "/obs/inputs"),
     ("POST", "/obs/scene"),
@@ -515,10 +539,7 @@ pub const STUDIO_CONTROL_ALLOWED: &[Rule] = &[
     ("POST", "/obs/input/mute"),
     ("POST", "/obs/replay/save"),
     ("POST", "/obs/brb"),
-    ("GET", "/obs/stream"),
-    ("POST", "/obs/stream"),
-    ("GET", "/obs/health"),
-    ("POST", "/obs/health"),
+    ("POST", "/overlays/*/add-to-obs"),
     ("GET", "/music"),
     ("PUT", "/music"),
     ("GET", "/moments/config"),
@@ -530,24 +551,19 @@ pub const STUDIO_CONTROL_ALLOWED: &[Rule] = &[
     ("POST", "/moments/markers"),
     ("GET", "/moments/markers/export"),
     ("DELETE", "/moments/markers/*"),
-    ("GET", "/automations"),
-    ("PUT", "/automations"),
-    ("POST", "/automations/*/run"),
     ("GET", "/show"),
     ("GET", "/show/preflight"),
     ("GET", "/show/alerts"),
     ("POST", "/show/live-scene"),
-    ("POST", "/show/countdown/*"),
-    ("POST", "/show/preflight/fix"),
 ];
 
+/// Starting and ending the stream, its titles and its health. Never a stream key or where
+/// the stream goes: the per-platform servers, pointing OBS, the ffmpeg download stay on the PC.
 pub const GO_LIVE_ALLOWED: &[Rule] = &[
     ("GET", "/live"),
     ("GET", "/golive"),
     ("PUT", "/golive/destinations"),
     ("POST", "/golive/destinations/*/test"),
-    ("PUT", "/golive/destinations/*/light"),
-    ("PUT", "/golive/destinations/*/enhanced"),
     ("POST", "/golive/upload-check"),
     ("PUT", "/golive/protection"),
     ("PUT", "/golive/aitum"),
@@ -577,8 +593,13 @@ pub const GO_LIVE_ALLOWED: &[Rule] = &[
     ("POST", "/obs/stream"),
     ("GET", "/obs/health"),
     ("POST", "/obs/health"),
+    ("GET", "/studio/engine/stream"),
+    ("POST", "/studio/engine/stream"),
+    ("GET", "/studio/engine/stats"),
 ];
 
+/// Settings and backups of settings. A change to LAN access, to API keys over LAN and to the
+/// obs-websocket password stays on the PC (the handler refuses them for a key).
 pub const SETTINGS_ALLOWED: &[Rule] = &[
     ("GET", "/settings"),
     ("PUT", "/settings"),

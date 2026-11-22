@@ -150,10 +150,10 @@ async fn scope_enforcement_matrix_across_all_route_groups() {
         Case { method: "GET", path: "/themes", body: None, expected: [A, F, F, F, F, A, A] },
         Case { method: "GET", path: "/events", body: None, expected: [A, F, A, F, F, F, A] },
         Case { method: "GET", path: "/chat", body: None, expected: [A, A, F, F, F, F, A] },
-        Case { method: "GET", path: "/overlays", body: None, expected: [A, F, A, F, F, F, A] },
+        Case { method: "GET", path: "/overlays", body: None, expected: [F, F, A, F, F, F, A] },
         Case { method: "GET", path: "/obs/scenes", body: None, expected: [A, F, F, A, F, F, A] },
         Case { method: "GET", path: "/golive", body: None, expected: [A, F, F, F, A, F, A] },
-        Case { method: "GET", path: "/settings", body: None, expected: [A, F, F, F, F, A, A] },
+        Case { method: "GET", path: "/settings", body: None, expected: [F, F, F, F, F, A, A] },
         // Chat writes
         Case {
             method: "POST",
@@ -497,5 +497,66 @@ async fn live_websocket_filters_frames_by_api_key_scope() {
     }
     assert_eq!(seen_types, vec!["hello", "status"]);
 
+    rig.engine.shutdown();
+}
+
+/// Custom alert HTML and fields are code-like content: PC only, for an alerts key as for a phone.
+#[tokio::test]
+async fn an_alerts_key_cannot_add_or_change_custom_alert_code() {
+    let rig = Rig::start().await;
+    let (_, tok) = rig.create_key("alerts", &[ApiKeyScope::Alerts]).await;
+    let rules: Value =
+        rig.client.get(rig.url("/alert-rules")).bearer_auth(&tok).send().await.unwrap().json().await.unwrap();
+    let mut rule = rules[0].clone();
+    let id = rule["id"].as_str().unwrap().to_string();
+    // Tuning a rule is fine.
+    rule["variations"][0]["volume"] = json!(55);
+    assert_eq!(
+        rig.call(reqwest::Method::PUT, &format!("/alert-rules/{id}"), &tok, Some(rule.clone())).await,
+        StatusCode::OK
+    );
+    for (k, v) in [("custom_enabled", json!(true)), ("html", json!("<p>x</p>"))] {
+        let mut bad = rule.clone();
+        bad["variations"][0][k] = v;
+        assert_eq!(
+            rig.call(reqwest::Method::PUT, &format!("/alert-rules/{id}"), &tok, Some(bad)).await,
+            StatusCode::FORBIDDEN,
+            "{k}"
+        );
+    }
+    let mut create = rule.clone();
+    create["id"] = json!("");
+    create["variations"][0]["html"] = json!("<p>x</p>");
+    assert_eq!(rig.call(reqwest::Method::POST, "/alert-rules", &tok, Some(create)).await, StatusCode::FORBIDDEN);
+}
+
+/// Revoking a key closes the sockets it has open at once, and an expired one is closed when it
+/// expires: a key that is off must not keep receiving the stream.
+#[tokio::test]
+async fn revoking_a_key_closes_its_open_live_sockets_at_once() {
+    let rig = Rig::start().await;
+    let ws_base = rig.base.replacen("http://", "ws://", 1);
+    let (id, tok) = rig.create_key("Chat", &[ApiKeyScope::Chat]).await;
+    let mut req = format!("{ws_base}/api/v1/live").into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {tok}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    // hello and status first.
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+    }
+    let res =
+        rig.client.delete(rig.url(&format!("/api-keys/{id}"))).bearer_auth(&rig.session_token).send().await.unwrap();
+    assert!(res.status().is_success(), "{}", res.status());
+    // The socket closes (a close frame or the end of the stream) within a moment, not never.
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => break,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the revoked key's socket is still open");
     rig.engine.shutdown();
 }

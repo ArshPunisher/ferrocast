@@ -1252,8 +1252,7 @@
           "Automations"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
+          "read_only"
         ]
       },
       "put": {
@@ -1321,9 +1320,8 @@
         "tags": [
           "Automations"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/automations/{id}/run": {
@@ -1402,9 +1400,8 @@
         "tags": [
           "Automations"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/autoreplies": {
@@ -1943,7 +1940,6 @@
           "Settings & Backups"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "settings"
         ]
       },
@@ -3948,10 +3944,8 @@
         "tags": [
           "Alerts & Overlays"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_designs__id__obs",
@@ -4028,9 +4022,8 @@
         "tags": [
           "Alerts & Overlays"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/designs/{id}/use": {
@@ -6174,9 +6167,8 @@
         "tags": [
           "Go Live"
         ],
-        "x-ferrocast-scopes": [
-          "go_live"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/golive/destinations/{id}/light": {
@@ -6255,9 +6247,8 @@
         "tags": [
           "Go Live"
         ],
-        "x-ferrocast-scopes": [
-          "go_live"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/golive/destinations/{id}/test": {
@@ -8146,7 +8137,6 @@
           "Designs & Media"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "alerts"
         ]
       },
@@ -8276,9 +8266,8 @@
         "tags": [
           "Designs & Media"
         ],
-        "x-ferrocast-scopes": [
-          "alerts"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "get": {
         "operationId": "get_media__id_",
@@ -8347,7 +8336,6 @@
           "Designs & Media"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "alerts"
         ]
       }
@@ -10249,10 +10237,8 @@
         "tags": [
           "OBS"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_obs",
@@ -10582,7 +10568,6 @@
         ],
         "x-ferrocast-scopes": [
           "read_only",
-          "studio_control",
           "go_live"
         ]
       },
@@ -10652,7 +10637,6 @@
           "OBS"
         ],
         "x-ferrocast-scopes": [
-          "studio_control",
           "go_live"
         ]
       }
@@ -11129,7 +11113,6 @@
         ],
         "x-ferrocast-scopes": [
           "read_only",
-          "studio_control",
           "go_live"
         ]
       },
@@ -11199,7 +11182,6 @@
           "OBS"
         ],
         "x-ferrocast-scopes": [
-          "studio_control",
           "go_live"
         ]
       }
@@ -11262,7 +11244,6 @@
           "OBS"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "settings"
         ]
       },
@@ -11383,9 +11364,8 @@
         "tags": [
           "OBS"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "get": {
         "operationId": "get_obs_theme",
@@ -11443,10 +11423,8 @@
         "tags": [
           "OBS"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/openapi.json": {
@@ -11574,7 +11552,6 @@
           "Alerts & Overlays"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "alerts"
         ]
       },
@@ -11776,7 +11753,6 @@
           "Alerts & Overlays"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "alerts"
         ]
       },
@@ -11937,7 +11913,7 @@
           "Alerts & Overlays"
         ],
         "x-ferrocast-scopes": [
-          "alerts"
+          "studio_control"
         ]
       }
     },
@@ -17829,7 +17805,6 @@
           "Settings & Backups"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "settings"
         ]
       },
@@ -18302,7 +18277,6 @@
           "Moments & Show"
         ],
         "x-ferrocast-scopes": [
-          "studio_control",
           "go_live"
         ]
       }
@@ -18374,7 +18348,6 @@
           "Moments & Show"
         ],
         "x-ferrocast-scopes": [
-          "studio_control",
           "go_live"
         ]
       }
@@ -18653,7 +18626,6 @@
           "Moments & Show"
         ],
         "x-ferrocast-scopes": [
-          "studio_control",
           "go_live"
         ]
       }
@@ -18787,9 +18759,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/speech/models/{id}": {
@@ -19649,10 +19620,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/audio-care": {
@@ -19712,10 +19681,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_audio_care",
@@ -19782,9 +19749,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/black": {
@@ -19915,10 +19881,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_captions",
@@ -19985,9 +19949,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/channels/{channel}": {
@@ -20047,9 +20010,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_channels__channel_",
@@ -20126,9 +20088,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/clipboard": {
@@ -20178,9 +20139,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "get": {
         "operationId": "get_studio_engine_clipboard",
@@ -20238,10 +20198,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/clipboard/filters": {
@@ -20310,9 +20268,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/clipboard/paste/filters": {
@@ -20381,9 +20338,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/clipboard/paste/source": {
@@ -20452,9 +20408,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/clipboard/source": {
@@ -20523,9 +20478,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/encode-budget": {
@@ -20585,10 +20539,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_studio_engine_encode_budget",
@@ -20655,9 +20607,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/encoders/{id}/options": {
@@ -20736,9 +20687,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/history": {
@@ -20798,10 +20748,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/keys/capture": {
@@ -20931,10 +20879,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/kinds/{id}/defaults": {
@@ -21004,10 +20950,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/kinds/{id}/options": {
@@ -21077,10 +21021,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/levels": {
@@ -21149,9 +21091,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/library/collections/overlay/import": {
@@ -21431,10 +21372,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_studio_engine_library__kind_",
@@ -21511,9 +21450,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/library/{kind}/current": {
@@ -21592,9 +21530,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/library/{kind}/import": {
@@ -21742,9 +21679,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/library/{kind}/{id}/export": {
@@ -21910,9 +21846,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/live-alerts/silence": {
@@ -22373,10 +22308,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/ndi": {
@@ -22445,9 +22378,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/obs-collections": {
@@ -22787,9 +22719,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/preview/cursor": {
@@ -22858,9 +22789,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/preview/pause": {
@@ -22920,10 +22850,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_preview_pause",
@@ -22990,9 +22918,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/preview/selection": {
@@ -23061,9 +22988,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/privacy": {
@@ -23123,10 +23049,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_privacy",
@@ -23193,9 +23117,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/projectors": {
@@ -23245,9 +23168,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_studio_engine_projectors",
@@ -23314,9 +23236,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/quick-transitions": {
@@ -23385,9 +23306,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/record": {
@@ -24155,9 +24075,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}": {
@@ -24217,9 +24136,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/audio": {
@@ -24290,7 +24208,6 @@
           "Studio Engine"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "studio_control"
         ]
       }
@@ -24452,9 +24369,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items": {
@@ -24525,7 +24441,6 @@
           "Studio Engine"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "studio_control"
         ]
       },
@@ -24604,9 +24519,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/boxes": {
@@ -24685,9 +24599,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/box": {
@@ -24953,9 +24866,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/filters": {
@@ -25033,10 +24945,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_studio_engine_scenes__scene__items__id__filters",
@@ -25121,9 +25031,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/filters/scope": {
@@ -25210,9 +25119,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/filters/{filter}": {
@@ -25288,9 +25196,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/edit": {
@@ -25385,9 +25292,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/options": {
@@ -25473,10 +25379,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/settings": {
@@ -25562,10 +25466,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_scenes__scene__items__id__filters__filter__settings",
@@ -25658,9 +25560,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/group": {
@@ -25747,9 +25648,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/order": {
@@ -25925,9 +25825,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/picture": {
@@ -26005,10 +25904,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/transform": {
@@ -26086,10 +25983,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_scenes__scene__items__id__transform",
@@ -26263,9 +26158,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/ungroup": {
@@ -26352,9 +26246,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/move": {
@@ -26433,9 +26326,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/thumbnail": {
@@ -26505,10 +26397,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/scenes/{scene}/transition": {
@@ -26587,9 +26477,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/screen-access": {
@@ -26649,10 +26538,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/screen-access/fix": {
@@ -26782,10 +26669,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/screens/{id}/still": {
@@ -26855,10 +26740,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/settings": {
@@ -27210,9 +27093,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/filters": {
@@ -27282,10 +27164,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_studio_engine_sources__name__filters",
@@ -27362,9 +27242,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/filters/{filter}": {
@@ -27432,9 +27311,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/filters/{filter}/edit": {
@@ -27521,9 +27399,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/filters/{filter}/options": {
@@ -27601,10 +27478,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/filters/{filter}/settings": {
@@ -27682,10 +27557,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_sources__name__filters__filter__settings",
@@ -27770,9 +27643,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/filters/{filter}/vst": {
@@ -27850,10 +27722,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_studio_engine_sources__name__filters__filter__vst",
@@ -27938,9 +27808,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/media": {
@@ -28011,7 +27880,6 @@
           "Studio Engine"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "studio_control"
         ]
       },
@@ -28162,10 +28030,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/paste-filters": {
@@ -28244,9 +28110,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/picture": {
@@ -28316,10 +28181,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/record": {
@@ -28398,9 +28261,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/rename": {
@@ -28479,9 +28341,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/screenshot": {
@@ -28560,9 +28421,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/settings": {
@@ -28632,10 +28492,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_sources__name__settings",
@@ -28712,9 +28570,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources/{name}/status": {
@@ -28785,7 +28642,6 @@
           "Studio Engine"
         ],
         "x-ferrocast-scopes": [
-          "read_only",
           "studio_control"
         ]
       }
@@ -28866,9 +28722,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/start": {
@@ -28937,9 +28792,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/stats": {
@@ -29001,7 +28855,8 @@
         ],
         "x-ferrocast-scopes": [
           "read_only",
-          "studio_control"
+          "studio_control",
+          "go_live"
         ]
       }
     },
@@ -29062,10 +28917,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/stop": {
@@ -29134,9 +28987,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/stream": {
@@ -29198,7 +29050,7 @@
         ],
         "x-ferrocast-scopes": [
           "read_only",
-          "studio_control"
+          "go_live"
         ]
       },
       "post": {
@@ -29267,7 +29119,7 @@
           "Studio Engine"
         ],
         "x-ferrocast-scopes": [
-          "studio_control"
+          "go_live"
         ]
       }
     },
@@ -29609,9 +29461,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/studio-mode/preview": {
@@ -29964,9 +29815,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/transition": {
@@ -30106,9 +29956,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/transitions": {
@@ -30177,9 +30026,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/transitions/{kind}/settings": {
@@ -30249,10 +30097,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_transitions__kind__settings",
@@ -30329,9 +30175,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/transitions/{name}": {
@@ -30391,9 +30236,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_transitions__name_",
@@ -30470,9 +30314,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/transitions/{name}/default": {
@@ -30551,9 +30394,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/transitions/{name}/duplicate": {
@@ -30632,9 +30474,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/transitions/{name}/rename": {
@@ -30713,9 +30554,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/undo": {
@@ -30836,9 +30676,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_studio_engine_vertical",
@@ -30905,9 +30744,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/vertical/follow": {
@@ -30967,10 +30805,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_vertical_follow",
@@ -31037,9 +30873,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/virtualcam": {
@@ -31170,10 +31005,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "post": {
         "operationId": "post_studio_engine_virtualcam_setup",
@@ -31240,9 +31073,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/vst/plugins": {
@@ -31302,10 +31134,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/web-window": {
@@ -33162,10 +32992,8 @@
         "tags": [
           "Bot & Widgets"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "chat"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_tts_cloud",
@@ -33232,9 +33060,8 @@
         "tags": [
           "Bot & Widgets"
         ],
-        "x-ferrocast-scopes": [
-          "chat"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/tts/pending": {

@@ -211,7 +211,26 @@ pub async fn rules(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.rules()))
 }
 
-pub async fn create_rule(State(app): State<AppState>, Body(mut r): Body<AlertRule>) -> ApiResult<impl IntoResponse> {
+/// Custom alert HTML and fields are code-like content: PC only, for an API key as for a phone.
+fn refuse_custom_code(
+    app: &AppState,
+    api_key: &Option<axum::Extension<super::api_keys::ApiKeyPrincipal>>,
+    stored_id: Option<&str>,
+    rule: &AlertRule,
+) -> ApiResult<()> {
+    if api_key.is_some() && crate::remote::rule_custom_changed(&app.engine, stored_id, &json!(rule)) {
+        return Err(ApiError::forbidden("Custom alert code can only be added or changed on the PC itself.")
+            .hint("Everything else about an alert works with an API key."));
+    }
+    Ok(())
+}
+
+pub async fn create_rule(
+    State(app): State<AppState>,
+    api_key: Option<axum::Extension<super::api_keys::ApiKeyPrincipal>>,
+    Body(mut r): Body<AlertRule>,
+) -> ApiResult<impl IntoResponse> {
+    refuse_custom_code(&app, &api_key, None, &r)?;
     if r.id.trim().is_empty() {
         r.id = ferrocast_store::new_id();
     }
@@ -223,12 +242,14 @@ pub async fn create_rule(State(app): State<AppState>, Body(mut r): Body<AlertRul
 
 pub async fn update_rule(
     State(app): State<AppState>,
+    api_key: Option<axum::Extension<super::api_keys::ApiKeyPrincipal>>,
     Path(id): Path<String>,
     Body(mut r): Body<AlertRule>,
 ) -> ApiResult<Json<Value>> {
     if !app.engine.rules().iter().any(|x| x.id == id) {
         return Err(ApiError::not_found("alert rule"));
     }
+    refuse_custom_code(&app, &api_key, Some(&id), &r)?;
     r.id = id;
     Ok(Json(json!(app.engine.save_rule(r).await?)))
 }
