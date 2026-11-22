@@ -305,7 +305,10 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         .map(|t| {
             // Transition names are limited to 100 characters (every later edit checks it), and
             // "(n)" may be added: keep room for it.
-            let wanted: String = t.get("name").and_then(Value::as_str).unwrap_or("Fade").chars().take(90).collect();
+            // Trimmed first (the Studio trims every name, so "Swipe " and "Swipe" would become one),
+            // and never blank.
+            let named = t.get("name").and_then(Value::as_str).unwrap_or("Fade").trim();
+            let wanted: String = if named.is_empty() { "Transition".into() } else { named.chars().take(90).collect() };
             let t_name = tr_names.take(&wanted);
             if let Some(id) = t.get("id").and_then(Value::as_str) {
                 tr_by_id.insert(id.to_string(), t_name.clone());
@@ -319,31 +322,33 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         })
         .collect();
     let current_t = default_t.and_then(|id| tr_by_id.get(id).cloned()).map(Value::String).unwrap_or_else(|| json!(""));
-    let matrix: Vec<Value> = root
-        .get("transitions")
-        .and_then(|t| t.get("connections"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|c| {
-            let tid = c.get("transitionId").and_then(Value::as_str)?;
-            let tr = tr_by_id.get(tid)?;
-            // "ALL" (or nothing) is a wildcard; any other id must be a scene that came across.
-            // A scene deleted in Streamlabs leaves a dead rule: dropped, not turned into "any".
-            let end = |key: &str| -> Option<Option<String>> {
-                match c.get(key).and_then(Value::as_str) {
-                    None => Some(None),
-                    Some(s) if s.is_empty() || s.eq_ignore_ascii_case("all") => Some(None),
-                    Some(id) => scene_ids.get(id).cloned().map(Some),
-                }
-            };
-            let (from, to) = (end("fromSceneId")?, end("toSceneId")?);
-            if from.is_none() && to.is_none() {
-                return None;
+    // Streamlabs saves connections in order and plays the first that matches a pair: only that
+    // one is kept (the Studio's own matrix is last-wins, so two for one pair would flip it).
+    let mut matrix: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<(Option<String>, Option<String>)> = std::collections::HashSet::new();
+    for c in root.get("transitions").and_then(|t| t.get("connections")).and_then(Value::as_array).into_iter().flatten()
+    {
+        let Some(tid) = c.get("transitionId").and_then(Value::as_str) else { continue };
+        let Some(tr) = tr_by_id.get(tid) else { continue };
+        // "ALL" (or no end at all) is a wildcard; any other id must be a scene that came across.
+        // A scene deleted in Streamlabs leaves a dead rule: dropped, not turned into "any". An end
+        // of another type (a number) is malformed: dropped too, never a wildcard.
+        let end = |key: &str| -> Option<Option<String>> {
+            match c.get(key) {
+                None | Some(Value::Null) => Some(None),
+                Some(Value::String(s)) if s.is_empty() || s.eq_ignore_ascii_case("all") => Some(None),
+                Some(Value::String(id)) => scene_ids.get(id.as_str()).cloned().map(Some),
+                Some(_) => None,
             }
-            Some(json!({ "from": from, "to": to, "transition": tr }))
-        })
-        .collect();
+        };
+        let (Some(from), Some(to)) = (end("fromSceneId"), end("toSceneId")) else { continue };
+        if from.is_none() && to.is_none() {
+            continue;
+        }
+        if seen.insert((from.clone(), to.clone())) {
+            matrix.push(json!({ "from": from, "to": to, "transition": tr }));
+        }
+    }
     let first = scene_names.first().cloned().unwrap_or_default();
     let mut out = json!({
         "name": name,
@@ -430,6 +435,68 @@ mod tests {
             assert!(t["name"].as_str().unwrap().chars().count() <= 100);
         }
         assert_ne!(doc["transitions"][0]["name"], doc["transitions"][1]["name"]);
+    }
+
+    #[test]
+    fn transition_names_are_trimmed_before_they_are_made_unique() {
+        let mut v = sample();
+        v["transitions"]["defaultTransitionId"] = json!("t2");
+        v["transitions"]["transitions"] = json!([
+            { "id": "t1", "name": "Swipe", "type": "swipe_transition", "duration": 500, "settings": {} },
+            { "id": "t2", "name": "Swipe ", "type": "fade_transition", "duration": 300, "settings": {} },
+            { "id": "t3", "name": "   ", "type": "cut_transition", "duration": 0, "settings": {} }
+        ]);
+        v["transitions"]["connections"] = json!([{ "fromSceneId": "c1", "toSceneId": "c2", "transitionId": "t2" }]);
+        let doc = to_obs(&v, "Main");
+        let names: Vec<&str> =
+            doc["transitions"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.iter().all(|n| n.trim() == *n && !n.is_empty()), "{names:?}");
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        // The rule and the default point at the Fade one, whatever name it ended up with.
+        let fade = doc["transitions"][1]["name"].clone();
+        assert_eq!(doc["ferrocast"]["transition_matrix"][0]["transition"], fade);
+        assert_eq!(doc["current_transition"], fade);
+    }
+
+    #[test]
+    fn the_first_connection_for_a_pair_is_the_one_streamlabs_plays() {
+        let mut v = sample();
+        v["transitions"]["transitions"] = json!([
+            { "id": "t1", "name": "Swipe", "type": "swipe_transition", "duration": 500, "settings": {} },
+            { "id": "t2", "name": "Cut", "type": "cut_transition", "duration": 0, "settings": {} }
+        ]);
+        v["transitions"]["connections"] = json!([
+            { "fromSceneId": "c1", "toSceneId": "c2", "transitionId": "t2" },
+            { "fromSceneId": "c1", "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": "ALL", "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": "ALL", "toSceneId": "c2", "transitionId": "t2" }
+        ]);
+        let doc = to_obs(&v, "Main");
+        let rules = doc["ferrocast"]["transition_matrix"].as_array().unwrap();
+        assert_eq!(rules.len(), 2, "one per pair: {rules:?}");
+        assert_eq!(rules[0]["transition"], "Cut");
+        assert_eq!(rules[1]["transition"], "Swipe");
+        // A first rule that can't be kept (a scene that is gone) doesn't hold the pair.
+        v["transitions"]["connections"] = json!([
+            { "fromSceneId": "gone_scene", "toSceneId": "c2", "transitionId": "t2" },
+            { "fromSceneId": "gone_scene", "toSceneId": "c2", "transitionId": "t1" }
+        ]);
+        assert!(to_obs(&v, "Main").get("ferrocast").is_none());
+    }
+
+    #[test]
+    fn a_connection_end_of_the_wrong_type_is_not_a_wildcard() {
+        let mut v = sample();
+        v["transitions"]["connections"] = json!([
+            { "fromSceneId": 7, "toSceneId": "c2", "transitionId": "t1" },
+            { "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": null, "toSceneId": "c1", "transitionId": "t1" }
+        ]);
+        let doc = to_obs(&v, "Main");
+        let rules = doc["ferrocast"]["transition_matrix"].as_array().unwrap();
+        // Only the two with the end absent or null: Any -> BRB and Any -> the first scene.
+        assert_eq!(rules.len(), 2, "{rules:?}");
     }
 
     #[test]
