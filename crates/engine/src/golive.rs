@@ -482,6 +482,10 @@ pub struct DestinationView {
     pub health: Option<Health>,
     /// Why this destination can't start (no account, a missing permission), in words.
     pub blocked: Option<String>,
+    /// A server and key pasted from X, Instagram or Facebook (`x`, `instagram`, `facebook`): the
+    /// dashboard names and marks it. Left out when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<String>,
     /// Its rules broken by the stream OBS is sending (kept in sync with `issues` for older clients).
     pub rules: Vec<String>,
     /// Structured rules broken by the active stream (Contract C-2).
@@ -1238,6 +1242,7 @@ impl Engine {
                         .or_else(|| paused.get(&d.id).cloned())
                         .or_else(|| failed.get(&d.id).cloned()),
                     blocked: blocked.get(&d.id).cloned(),
+                    brand: d.brand.clone(),
                     rules,
                     issues,
                     capped,

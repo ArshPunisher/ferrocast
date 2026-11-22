@@ -2195,4 +2195,12 @@ async fn a_pasted_key_for_x_instagram_or_facebook_is_a_branded_custom_server() {
     let plain =
         e.add_golive_destination("Mine", "rtmp://127.0.0.1:9/app", "k", crate::golive::Canvas::Main).await.unwrap();
     assert_eq!(plain.brand, None);
+    // The dashboard's view carries the brand (so it can name and mark the server), and leaves the
+    // field out when there is none.
+    let view = serde_json::to_value(e.golive_view().await).unwrap();
+    let rows = view["destinations"].as_array().unwrap();
+    let brand_of = |id: &str| rows.iter().find(|r| r["id"] == id).map(|r| r.get("brand").cloned());
+    assert_eq!(brand_of(&plain.id), Some(None), "no brand, no field");
+    assert!(rows.iter().any(|r| r["brand"] == "facebook"), "{rows:?}");
+    assert!(rows.iter().any(|r| r["brand"] == "instagram"));
 }
