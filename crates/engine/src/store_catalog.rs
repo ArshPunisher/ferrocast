@@ -417,9 +417,8 @@ fn check_plain_text(field: &str, s: &str, max: usize, allow_empty: bool) -> Resu
 }
 
 fn check_version(field: &str, v: &str) -> Result<(), String> {
-    let ok = (1..=32).contains(&v.len())
-        && v.starts_with(|c: char| c.is_ascii_digit())
-        && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'));
+    // The one grammar the update comparison reads: a version admitted here is always comparable.
+    let ok = (1..=32).contains(&v.len()) && crate::plugin_catalog::readable_version(v);
     if ok { Ok(()) } else { Err(format!("{field}: bad version \"{v}\"")) }
 }
 
@@ -1904,6 +1903,18 @@ mod tests {
         assert!(!asset_matches_mime("text/html", b"<html>"), "a type nobody serves");
         assert!(asset_matches_mime("image/gif", b"GIF89a\x01\x00"));
         assert!(asset_matches_mime("audio/ogg", b"OggS\x00"));
+    }
+
+    /// What the catalog may call a version is exactly what the update comparison can read: a
+    /// version that passed admission but can't be compared would hide every later update.
+    #[test]
+    fn a_store_version_is_one_the_update_comparison_can_read() {
+        assert!(check_version("version", "2.1.0").is_ok() && check_version("version", "1.0.0-beta.2").is_ok());
+        for bad in ["2oops", "1.0.0-", "1..2", "9a", "1.0.0-a b"] {
+            assert!(check_version("version", bad).is_err(), "{bad}");
+            assert!(check_version("uri.v", bad).is_err(), "{bad}");
+        }
+        assert!(check_version("version", &"1".repeat(33)).is_err(), "still at most 32 characters");
     }
 
     #[test]

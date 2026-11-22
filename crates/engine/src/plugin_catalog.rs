@@ -216,21 +216,10 @@ pub fn entries(list: &[u8], src: &Source) -> Result<Vec<Entry>, String> {
 /// never "newer": a garbled or replayed one is not offered as an update.
 pub fn newer(new: &str, old: &str) -> bool {
     use std::cmp::Ordering;
-    fn parse(v: &str) -> Option<(Vec<u64>, Vec<String>)> {
-        let v = v.split('+').next().unwrap_or(v);
-        let (core, pre) = match v.split_once('-') {
-            Some((c, p)) => (c, Some(p)),
-            None => (v, None),
-        };
-        let nums: Option<Vec<u64>> = core.split('.').map(|p| p.parse::<u64>().ok()).collect();
-        let nums = nums.filter(|n| !n.is_empty())?;
-        let pre = pre.map(|p| p.split('.').map(str::to_string).collect()).unwrap_or_default();
-        Some((nums, pre))
-    }
-    let (Some((a, ap)), Some((b, bp))) = (parse(new), parse(old)) else { return false };
+    let (Some((a, ap)), Some((b, bp))) = (parse_version(new), parse_version(old)) else { return false };
     let len = a.len().max(b.len());
     for i in 0..len {
-        match a.get(i).unwrap_or(&0).cmp(b.get(i).unwrap_or(&0)) {
+        match cmp_digits(a.get(i).map_or("0", String::as_str), b.get(i).map_or("0", String::as_str)) {
             Ordering::Equal => {}
             o => return o == Ordering::Greater,
         }
@@ -241,11 +230,11 @@ pub fn newer(new: &str, old: &str) -> bool {
         (false, true) => false,
         (false, false) => {
             for (x, y) in ap.iter().zip(bp.iter()) {
-                let o = match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(x), Ok(y)) => x.cmp(&y),
-                    (Ok(_), Err(_)) => Ordering::Less,
-                    (Err(_), Ok(_)) => Ordering::Greater,
-                    (Err(_), Err(_)) => x.cmp(y),
+                let o = match (is_digits(x), is_digits(y)) {
+                    (true, true) => cmp_digits(x, y),
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => x.cmp(y),
                 };
                 if o != Ordering::Equal {
                     return o == Ordering::Greater;
@@ -254,6 +243,53 @@ pub fn newer(new: &str, old: &str) -> bool {
             ap.len() > bp.len()
         }
     }
+}
+
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Two decimal numbers of any length: by length once leading zeros are gone, then digit by digit.
+fn cmp_digits(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.trim_start_matches('0'), b.trim_start_matches('0'));
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+/// A version as `newer` reads it: its numbers, and its prerelease identifiers (build metadata is
+/// checked and left out). One grammar for everything that takes a version: dotted numbers, then
+/// an optional `-prerelease` of dotted `[0-9A-Za-z-]` identifiers, then an optional `+build`.
+fn parse_version(v: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let (rest, build) = match v.split_once('+') {
+        Some((r, b)) => (r, Some(b)),
+        None => (v, None),
+    };
+    if let Some(b) = build
+        && (b.is_empty()
+            || !b.split('.').all(|id| !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')))
+    {
+        return None;
+    }
+    let (core, pre) = match rest.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (rest, None),
+    };
+    let nums: Vec<String> = core.split('.').map(str::to_string).collect();
+    if nums.is_empty() || !nums.iter().all(|n| is_digits(n)) {
+        return None;
+    }
+    let pre: Vec<String> = match pre {
+        Some(p) => p.split('.').map(str::to_string).collect(),
+        None => Vec::new(),
+    };
+    if pre.iter().any(|id| id.is_empty() || !id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')) {
+        return None;
+    }
+    Some((nums, pre))
+}
+
+/// Whether a version is one `newer` can compare (the Store admits no other).
+pub fn readable_version(v: &str) -> bool {
+    parse_version(v).is_some()
 }
 
 /// A client that follows redirects only to the allowed hosts, over https (or the tests' local
@@ -521,6 +557,30 @@ mod tests {
         assert!(!newer("garbage", "1.0.0"), "what can't be read is not offered as an update");
         assert!(newer("1.0.1+build5", "1.0.0"));
         assert!(!newer("1.0.0+build9", "1.0.0"), "build metadata doesn't order versions");
+    }
+
+    #[test]
+    fn numbers_of_any_length_compare_as_numbers() {
+        // Past u64: still numbers, by length and then digit by digit.
+        assert!(newer("1.0.0-100000000000000000000", "1.0.0-99999999999999999999"));
+        assert!(!newer("1.0.0-99999999999999999999", "1.0.0-100000000000000000000"));
+        assert!(!newer("1.0.0-100000000000000000000", "1.0.0-100000000000000000000"));
+        assert!(newer("1.0.0-100000000000000000001", "1.0.0-100000000000000000000"));
+        assert!(newer("1.0.100000000000000000000", "1.0.99999999999999999999"), "core parts too");
+        assert!(newer("1.0.0-alpha", "1.0.0-100000000000000000000"), "words follow numbers");
+    }
+
+    #[test]
+    fn a_version_is_readable_or_not_by_the_one_grammar() {
+        for ok in ["1", "1.0", "1.2.3", "10.20.30", "1.0.0-alpha.1", "1.0.0-0.3.7", "1.0.0+build.5", "1.0.0-rc-1+b"] {
+            assert!(readable_version(ok), "{ok}");
+        }
+        for bad in
+            ["", "2oops", "1.0.0-", "1..0", ".1", "1.0.", "v1.0", "1.0.0-a..b", "1.0.0+", "1.0.0 beta", "1.0.0-\u{e9}"]
+        {
+            assert!(!readable_version(bad), "{bad:?}");
+            assert!(!newer(bad, "0.0.1") && !newer("9.9.9", bad), "{bad:?} orders nothing");
+        }
     }
 
     /// Browse and install from a catalog served here: the list checked, the file checked, a
