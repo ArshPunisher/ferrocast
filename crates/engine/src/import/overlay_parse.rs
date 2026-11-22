@@ -288,14 +288,25 @@ pub fn sanitize_archive_path(raw: &str) -> Result<String, EngineError> {
     if raw.is_empty() || raw.contains('\\') || raw.starts_with('/') || raw.chars().any(char::is_control) {
         return Err(bad(format!("The theme pack contains an unsafe path \"{raw}\".")));
     }
-    let bytes = raw.as_bytes();
-    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+    // `:` is a drive on Windows (`C:`) and an alternate data stream after a name (`bg.png:evil`).
+    if raw.contains(':') {
         return Err(bad(format!("The theme pack contains an unsafe path \"{raw}\".")));
     }
     let trimmed = raw.trim_end_matches('/');
     let mut clean_parts = Vec::new();
     for seg in trimmed.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(bad(format!("The theme pack contains an unsafe path \"{raw}\".")));
+        }
+        // Windows drops a trailing dot or space (two names become one) and keeps device names
+        // (`CON`, `NUL`, `COM1`) for the device, with or without an extension.
+        let stem = seg.split('.').next().unwrap_or(seg).to_ascii_uppercase();
+        let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.len() == 4
+                && stem.as_bytes()[3].is_ascii_digit()
+                && stem.as_bytes()[3] != b'0');
+        if seg.ends_with('.') || seg.ends_with(' ') || seg.starts_with(' ') || device {
             return Err(bad(format!("The theme pack contains an unsafe path \"{raw}\".")));
         }
         clean_parts.push(seg);
@@ -401,7 +412,8 @@ fn extract_zip(zip_bytes: &[u8]) -> Result<ExtractedZip, EngineError> {
                 )
             })?
             .to_string();
-        if entry.unix_mode().is_some_and(|m| (m & 0o170000) == 0o120000) {
+        // Only plain files and folders: not a link, a pipe, a device or a socket.
+        if entry.unix_mode().is_some_and(|m| !matches!(m & 0o170000, 0 | 0o100000 | 0o040000)) {
             return Err(refused(
                 415,
                 "unsafe_overlay_file",
@@ -411,16 +423,20 @@ fn extract_zip(zip_bytes: &[u8]) -> Result<ExtractedZip, EngineError> {
         }
         if raw_name.ends_with('/') {
             // Still verify parent path has no zip-slip segments.
-            if raw_name != "/" {
-                let _ = sanitize_archive_path(&raw_name)?;
-            }
+            let _ = sanitize_archive_path(&raw_name)?;
             continue;
         }
         let clean_path = sanitize_archive_path(&raw_name)?;
         if is_os_metadata_entry(&clean_path) {
             continue;
         }
-        if !seen_paths.insert(clean_path.to_ascii_lowercase()) {
+        // Case-folded beyond ASCII (`É`/`é` are one file on macOS and Windows), and a name can't
+        // be both a file and a folder (`a.png` and `a.png/b.png`).
+        let folded = clean_path.to_lowercase();
+        let clash = !seen_paths.insert(folded.clone())
+            || folded.match_indices('/').any(|(i, _)| seen_paths.contains(&folded[..i]))
+            || seen_paths.iter().any(|p| p.len() > folded.len() && p.starts_with(&format!("{folded}/")));
+        if clash {
             return Err(refused(
                 415,
                 "unsafe_overlay_file",

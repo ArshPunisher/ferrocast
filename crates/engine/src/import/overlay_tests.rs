@@ -1255,3 +1255,66 @@ async fn a_bad_name_leaves_the_preview_to_try_again() {
         .unwrap();
     assert_eq!(ok.name, "Good name");
 }
+
+// ---- Neon review M1: names a pack may not use on Windows or macOS -----------------------------
+
+#[test]
+fn paths_that_mean_something_else_on_windows_or_macos_are_refused() {
+    use crate::import::overlay_parse::sanitize_archive_path;
+    for bad in [
+        "assets/bg.png:evil",
+        "assets/CON.png",
+        "assets/nul",
+        "assets/Aux.json",
+        "assets/COM1.ttf",
+        "assets/lpt9.png",
+        "assets/bg.png.",
+        "assets/bg.png ",
+        "assets/ hidden.png",
+        "assets/dir./x.png",
+    ] {
+        assert!(sanitize_archive_path(bad).is_err(), "{bad} should be refused");
+    }
+    for ok in ["assets/bg.png", "assets/console.png", "assets/com10.png", "fonts/My Font.ttf", "assets/a.b.png"] {
+        assert_eq!(sanitize_archive_path(ok).unwrap(), ok);
+    }
+}
+
+#[test]
+fn entries_that_collide_or_aren_t_plain_files_are_refused() {
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let png = make_tiny_png();
+    let refused_with = |entries: Vec<(&str, &[u8], Option<u32>)>| {
+        matches!(
+            parse_overlay_zip(&build_zip(entries), "x.overlay"),
+            Err(EngineError::Refused { code: "unsafe_overlay_file", .. })
+        )
+    };
+    // A file and a folder with the same name.
+    assert!(refused_with(vec![
+        ("config.json", &cfg, None),
+        ("assets/a.png", &png, None),
+        ("assets/a.png/b.png", &png, None)
+    ]));
+    // The same name in two cases beyond ASCII (one file on macOS and Windows).
+    assert!(refused_with(vec![
+        ("config.json", &cfg, None),
+        ("assets/\u{c9}.png", &png, None),
+        ("assets/\u{e9}.png", &png, None)
+    ]));
+    // A pipe (FIFO), a device or a socket: the zip writer only writes plain modes, so the last
+    // entry's mode is changed in the central directory afterwards.
+    for kind in [0o010000u32, 0o020000, 0o140000] {
+        let mut zip = build_zip(vec![("config.json", &cfg, None), ("assets/p.png", &png, None)]);
+        let at = zip.windows(4).rposition(|w| w == b"PK\x01\x02").expect("a central directory entry");
+        let attrs = ((kind | 0o644) << 16).to_le_bytes();
+        zip[at + 38..at + 42].copy_from_slice(&attrs);
+        assert!(
+            matches!(
+                parse_overlay_zip(&zip, "x.overlay"),
+                Err(EngineError::Refused { code: "unsafe_overlay_file", .. })
+            ),
+            "mode {kind:o}"
+        );
+    }
+}
