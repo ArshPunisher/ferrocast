@@ -746,11 +746,14 @@ impl CaptionsSet {
 }
 
 /// How to transcribe: the model's file, the language ("auto", "en"…), English or not.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Transcribe {
     pub model: std::path::PathBuf,
     pub language: String,
     pub translate: bool,
+    /// Turns true when whoever asked has gone (a cancelled job): the transcription stops at its next
+    /// step instead of running to the end of the recording on the CPU.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A stretch of speech: when (ms from the start) and what.

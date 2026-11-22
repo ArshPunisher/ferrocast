@@ -253,15 +253,37 @@ pub(crate) fn render_srt_for_burn(cues: &[Cue]) -> String {
 }
 
 /// A folder only this user can open, made new with a random name, removed when dropped.
-pub(crate) fn private_work_dir() -> std::io::Result<tempfile::TempDir> {
-    let mut b = tempfile::Builder::new();
-    b.prefix("ferrocast-burn-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        b.permissions(std::fs::Permissions::from_mode(0o700));
+pub(crate) struct WorkDir(PathBuf);
+
+impl WorkDir {
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
     }
-    b.tempdir()
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+pub(crate) fn private_work_dir() -> std::io::Result<WorkDir> {
+    for _ in 0..50 {
+        let path =
+            std::env::temp_dir().join(format!("ferrocast-burn-{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..)));
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        match b.create(&path) {
+            Ok(()) => return Ok(WorkDir(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free working folder name"))
 }
 
 /// Cues a person edited, checked: how many, how long, ordered times, no stray control characters.
@@ -570,7 +592,7 @@ impl Engine {
 
 /// Writes `bytes` to a file of its own beside `target` (made new, so it can't be a link someone
 /// left, and two saves never share one) and renames it over `target`.
-fn write_new_then_rename(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_new_then_rename(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);

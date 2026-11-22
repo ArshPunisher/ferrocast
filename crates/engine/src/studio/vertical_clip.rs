@@ -329,8 +329,9 @@ impl Engine {
     /// Writes "<clip>.srt" (never over one already there) → its path, when anything was said.
     pub(crate) async fn clip_subtitles(&self, ffmpeg: &Path, clip: &Path) -> Option<PathBuf> {
         let out = srt_path(clip);
-        if out.exists() {
-            return Some(out);
+        // A name that is taken (even by a link) is not written over.
+        if std::fs::symlink_metadata(&out).is_ok() {
+            return std::fs::symlink_metadata(&out).ok().filter(|m| m.file_type().is_file()).map(|_| out);
         }
         // The better model when it's here, else the fast one.
         let Some(model) = self.speech_model_path("small").or_else(|| self.speech_model_path("base")) else {
@@ -347,7 +348,10 @@ impl Engine {
         };
         let sound: Vec<f32> =
             sound.as_chunks::<4>().0.iter().take(16_000 * MAX_AUDIO_SECONDS).map(|b| f32::from_le_bytes(*b)).collect();
-        let how = Transcribe { model, language: "auto".into(), translate: false };
+        // Cancelled (this future dropped) means the transcription stops, not that it runs on.
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _stop_when_gone = CancelOnDrop(cancel.clone());
+        let how = Transcribe { model, language: "auto".into(), translate: false, cancel };
         let said = match self.studio_host() {
             Ok(h) => h.transcribe(sound, how).await,
             Err(e) => Err(e.to_string()),
@@ -363,15 +367,31 @@ impl Engine {
             tracing::info!("no clip subtitles: nothing was said");
             return None;
         }
-        let part = out.with_extension("srt.part");
-        if tokio::fs::write(&part, text).await.is_ok() && tokio::fs::rename(&part, &out).await.is_ok() {
+        if publish_srt(&out, &text) {
             tracing::info!(file = %out.display(), "clip subtitles written");
             Some(out)
         } else {
-            let _ = tokio::fs::remove_file(&part).await;
             None
         }
     }
+}
+
+/// Sets the flag when dropped: the transcription asked for is no longer wanted.
+pub(crate) struct CancelOnDrop(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Writes subtitles beside a clip: into a file made new (so a link left at a predictable name
+/// isn't followed) renamed over nothing (an existing file, or a link, is left alone).
+pub(crate) fn publish_srt(out: &Path, text: &str) -> bool {
+    if std::fs::symlink_metadata(out).is_ok() {
+        return false;
+    }
+    crate::clips::edit::write_new_then_rename(out, text.as_bytes()).is_ok()
 }
 
 /// Makes "<clip> vertical.mp4" (never over one already there), with `subs` burned in when
@@ -428,6 +448,36 @@ async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>, fill: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dropping the asker stops the transcription it started.
+    #[test]
+    fn a_dropped_asker_stops_the_transcription() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = CancelOnDrop(flag.clone());
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        drop(guard);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Subtitles are never written through a link left at their name or their temporary name.
+    #[cfg(unix)]
+    #[test]
+    fn subtitles_are_never_written_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        // A link where the finished file would go: not followed, not replaced.
+        let out = dir.path().join("a.srt");
+        std::os::unix::fs::symlink(&victim, &out).unwrap();
+        assert!(!publish_srt(&out, "1\n00:00:00,000 --> 00:00:01,000\nhi\n\n"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        // A link at the old predictable temporary name: left alone too.
+        let out2 = dir.path().join("b.srt");
+        std::os::unix::fs::symlink(&victim, dir.path().join("b.srt.part")).unwrap();
+        assert!(publish_srt(&out2, "text"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(&out2).unwrap(), "text");
+    }
 
     /// Every ffmpeg run on a clip reads only files, as the one container its extension names.
     #[test]
