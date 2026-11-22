@@ -761,6 +761,12 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/studio/engine/auto-config"),
+            ("POST", "/studio/engine/auto-config/benchmark"),
+            ("POST", "/studio/engine/auto-config/cancel"),
+            ("POST", "/studio/engine/auto-config/apply"),
+            ("POST", "/studio/engine/auto-config/keep"),
+            ("POST", "/studio/engine/auto-config/undo"),
         ] {
             assert!(!allowed(Role::Mod, m, p), "{m} {p}");
         }
@@ -862,6 +868,12 @@ mod tests {
             ("POST", "/studio/engine/library/collections/overlay/preview"),
             ("POST", "/studio/engine/library/collections/overlay/import"),
             ("POST", "/studio/engine/library/collections/overlay/undo"),
+            ("GET", "/studio/engine/auto-config"),
+            ("POST", "/studio/engine/auto-config/benchmark"),
+            ("POST", "/studio/engine/auto-config/cancel"),
+            ("POST", "/studio/engine/auto-config/apply"),
+            ("POST", "/studio/engine/auto-config/keep"),
+            ("POST", "/studio/engine/auto-config/undo"),
             ("GET", "/diagnostics"),
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
@@ -908,6 +920,8 @@ mod tests {
         assert!(live_frame_allowed(Role::Mod, r#"{"v":1,"type":"notice","data":{"key":"panic"}}"#));
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"notice","data":{"key":"account:twitch"}}"#));
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"queue","data":{}}"#));
+        assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"auto_config","data":{}}"#));
+        assert!(live_frame_allowed(Role::Owner, r#"{"v":1,"type":"auto_config","data":{}}"#));
         // The Ferrocast account (an email) never leaves the PC, not even to the owner's phone.
         assert!(!live_frame_allowed(Role::Owner, r#"{"v":1,"type":"account","data":{"state":"signed_in"}}"#));
         assert!(!live_frame_allowed(Role::Mod, r#"{"v":1,"type":"account","data":{}}"#));
