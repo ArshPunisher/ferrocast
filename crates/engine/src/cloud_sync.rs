@@ -414,7 +414,7 @@ impl Engine {
                 let Ok(d) = serde_json::from_value::<Design>(mine.clone()) else { return };
                 let mut copy = d.clone().into_user(
                     ferrocast_store::new_id(),
-                    Origin { kind: OriginKind::Duplicate, from: Some(d.name.clone()) },
+                    Origin { kind: OriginKind::Duplicate, from: Some(d.name.clone()), source: None },
                     now().0,
                 );
                 copy.name =

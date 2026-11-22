@@ -102,6 +102,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ImportReport {
     pub designs: Vec<Design>,
+    /// The ids among `designs` that replaced an installed design in place (same id kept).
+    pub updated: Vec<String>,
     pub media_files: usize,
     pub notes: Vec<String>,
 }
@@ -260,6 +262,14 @@ fn read_json<R: Read + Seek>(zip: &mut zip::ZipArchive<R>, name: &str) -> Result
 
 /// Reads and checks a design file, then adds its designs (and media) as the streamer's own.
 pub fn import(store: &Store, path: &Path) -> Result<ImportReport> {
+    import_into(store, path, &[])
+}
+
+/// Like `import`, but a design in the file that matches one of `existing` replaces it in place
+/// (same id, same creation time), so everything that points at it keeps pointing at it. A
+/// design matches by its id inside the file, or (installs from before that was kept) by kind and
+/// name. The rest are added as new designs.
+pub fn import_into(store: &Store, path: &Path, existing: &[Design]) -> Result<ImportReport> {
     let size = std::fs::metadata(path)?.len();
     if size > MAX_FILE {
         return Err(too_big_file().into());
@@ -347,7 +357,7 @@ pub fn import(store: &Store, path: &Path) -> Result<ImportReport> {
     // Unpack and check every media file before anything is saved.
     let staging = store.dir().join("tmp").join(format!("design-{}", new_id()));
     std::fs::create_dir_all(&staging)?;
-    let result = stage_and_save(store, &mut zip, &staging, &manifest, designs, &media_names);
+    let result = stage_and_save(store, &mut zip, &staging, &manifest, designs, &media_names, existing);
     let _ = std::fs::remove_dir_all(&staging);
     result
 }
@@ -363,6 +373,7 @@ fn stage_and_save<R: Read + Seek>(
     manifest: &Manifest,
     designs: Vec<Design>,
     media_names: &[(String, String)],
+    existing: &[Design],
 ) -> Result<ImportReport> {
     let mut staged: Vec<(String, std::path::PathBuf)> = Vec::new();
     for (name, sha) in media_names {
@@ -425,11 +436,30 @@ fn stage_and_save<R: Read + Seek>(
     }
     let now = now_ms();
     let from = Some(manifest.name.chars().take(120).collect::<String>());
-    let new_ids: BTreeMap<String, String> = designs.iter().map(|d| (d.id.clone(), new_id())).collect();
+    // Which installed design each design in the file replaces (each is replaced once).
+    let mut taken: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut replaces: BTreeMap<String, String> = BTreeMap::new();
+    for d in &designs {
+        let by_source = existing
+            .iter()
+            .find(|e| !taken.contains(e.id.as_str()) && e.origin.source.as_deref() == Some(d.id.as_str()));
+        let legacy = || {
+            existing.iter().find(|e| {
+                !taken.contains(e.id.as_str()) && e.origin.source.is_none() && e.kind() == d.kind() && e.name == d.name
+            })
+        };
+        if let Some(e) = by_source.or_else(legacy) {
+            taken.insert(e.id.as_str());
+            replaces.insert(d.id.clone(), e.id.clone());
+        }
+    }
+    let new_ids: BTreeMap<String, String> =
+        designs.iter().map(|d| (d.id.clone(), replaces.get(&d.id).cloned().unwrap_or_else(new_id))).collect();
     let mut out = Vec::new();
     for d in designs {
         let id = new_ids.get(&d.id).cloned().unwrap_or_else(new_id);
-        let mut mine = d.into_user(id, Origin { kind: OriginKind::Import, from: from.clone() }, now);
+        let source = Some(d.id.clone());
+        let mut mine = d.into_user(id, Origin { kind: OriginKind::Import, from: from.clone(), source }, now);
         mine.remap_media(&remap);
         if let DesignContent::Theme(t) = &mut mine.content
             && let Some(a) = &t.alert_design
@@ -445,13 +475,21 @@ fn stage_and_save<R: Read + Seek>(
         }
         out.push(mine);
     }
+    let mut updated = Vec::new();
     for d in &out {
-        repo::designs::insert(store, d)?;
+        if existing.iter().any(|e| e.id == d.id) {
+            repo::designs::update(store, d)?;
+            updated.push(d.id.clone());
+        } else {
+            repo::designs::insert(store, d)?;
+        }
     }
     if manifest.files.is_empty() && media_files == 0 {
         notes.push("No pictures or sounds came with it: it uses the art built into Ferrocast.".into());
     }
-    Ok(ImportReport { designs: out, media_files, notes })
+    // What was saved, as saved (an update keeps the first import's creation time and origin).
+    let out: Vec<Design> = out.into_iter().map(|d| repo::designs::get(store, &d.id).unwrap_or(d)).collect();
+    Ok(ImportReport { designs: out, updated, media_files, notes })
 }
 
 #[cfg(test)]

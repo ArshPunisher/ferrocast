@@ -144,7 +144,7 @@ impl Engine {
             OriginKind::BuiltIn | OriginKind::Import => OriginKind::Scratch,
         };
         let from = d.origin.from.as_deref().map(|f| short(f, 120));
-        let mine = d.into_user(ferrocast_store::new_id(), Origin { kind, from }, now().0);
+        let mine = d.into_user(ferrocast_store::new_id(), Origin { kind, from, source: None }, now().0);
         let saved = mine.clone();
         self.db(move |s| repo::designs::insert(s, &saved)).await.map_err(|e| match e {
             EngineError::Store(s) => store_err(s),
@@ -238,7 +238,7 @@ impl Engine {
                 None => None,
             };
         }
-        let origin = Origin { kind: OriginKind::Duplicate, from: Some(short(&source.name, 120)) };
+        let origin = Origin { kind: OriginKind::Duplicate, from: Some(short(&source.name, 120)), source: None };
         let mine = copy.into_user(ferrocast_store::new_id(), origin, now().0);
         let saved = mine.clone();
         self.db(move |s| repo::designs::insert(s, &saved)).await.map_err(|e| match e {
@@ -453,15 +453,40 @@ impl Engine {
 
     /// Imports a `.ferrodesign` as new designs of the streamer's own.
     pub async fn import_design_file(&self, path: &Path) -> Result<designfile::ImportReport, EngineError> {
+        self.import_design_file_over(path, Vec::new()).await
+    }
+
+    /// Imports a `.ferrodesign`; a design in it that matches one of `existing` replaces it in
+    /// place (the id stays), and what points at it is refreshed (the alert design in use, and
+    /// overlays that follow it).
+    pub(crate) async fn import_design_file_over(
+        &self,
+        path: &Path,
+        existing: Vec<ferrocast_core::design::Design>,
+    ) -> Result<designfile::ImportReport, EngineError> {
         let p = path.to_path_buf();
         let store = self.store();
-        tokio::task::spawn_blocking(move || designfile::import(&store, &p))
+        let report = tokio::task::spawn_blocking(move || designfile::import_into(&store, &p, &existing))
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?
             .map_err(|e| match e {
                 designfile::Error::File(f) => design_file_error(f),
                 designfile::Error::Store(s) => EngineError::from(s),
-            })
+            })?;
+        self.refresh_after_replace(&report.designs, &report.updated).await;
+        Ok(report)
+    }
+
+    /// After designs were replaced in place: the alert design in use and the overlays that follow
+    /// them take the new content.
+    pub(crate) async fn refresh_after_replace(&self, designs: &[Design], ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        self.refresh_active_design().await;
+        for d in designs.iter().filter(|d| ids.contains(&d.id)) {
+            self.refresh_following(d).await;
+        }
     }
 
     /// Designs that use a library file (so deleting it can say where it's used).

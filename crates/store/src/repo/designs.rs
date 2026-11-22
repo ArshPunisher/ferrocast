@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(list(&s).unwrap().iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), ["b", "a"], "newest first");
         let mut edited = get(&s, "a").unwrap();
         edited.name = "  Renamed  ".into();
-        edited.origin = Origin { kind: OriginKind::Import, from: Some("forged".into()) };
+        edited.origin = Origin { kind: OriginKind::Import, from: Some("forged".into()), source: None };
         edited.created_at = 999;
         edited.pro = true;
         let saved = update(&s, &edited).unwrap();

@@ -93,6 +93,10 @@ pub struct Origin {
     /// What it was made from: the template's name, the file's name.
     #[serde(default)]
     pub from: Option<String>,
+    /// An imported design's id inside its file: stays the same across versions of a Store
+    /// package, so an update finds the design it replaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// One design. `kind` and `content` travel side by side (`{ "kind": "alert", "content": … }`).
@@ -1419,7 +1423,7 @@ pub(crate) mod tests {
             pro: false,
             built_in: false,
             branded: false,
-            origin: Origin { kind: OriginKind::Scratch, from: None },
+            origin: Origin { kind: OriginKind::Scratch, from: None, source: None },
             content: DesignContent::Alert(AlertContent { events }),
             created_at: 0,
             updated_at: 0,
@@ -1574,7 +1578,11 @@ pub(crate) mod tests {
         d.built_in = true;
         d.branded = true;
         d.pro = true;
-        let mine = d.into_user("01abc".into(), Origin { kind: OriginKind::Duplicate, from: Some("Molten".into()) }, 7);
+        let mine = d.into_user(
+            "01abc".into(),
+            Origin { kind: OriginKind::Duplicate, from: Some("Molten".into()), source: None },
+            7,
+        );
         assert!(!mine.built_in && !mine.branded && !mine.pro);
         assert_eq!(mine.created_at, 7);
         mine.validate().unwrap();
@@ -1740,7 +1748,7 @@ pub(crate) mod tests {
             pro: false,
             built_in: true,
             branded: true,
-            origin: Origin { kind: OriginKind::BuiltIn, from: None },
+            origin: Origin { kind: OriginKind::BuiltIn, from: None, source: None },
             content: DesignContent::Theme(ThemeContent {
                 scenes: SCENE_KEYS.iter().map(|k| scene(k, "Starting soon")).collect(),
                 alert_design: Some("builtin.molten".into()),
@@ -1754,7 +1762,8 @@ pub(crate) mod tests {
     fn a_copy_of_a_built_in_theme_loses_its_mark_layers() {
         let t = theme();
         assert!(t.has_brand_layer());
-        let mine = t.clone().into_user("mine".into(), Origin { kind: OriginKind::Duplicate, from: None }, 0);
+        let mine =
+            t.clone().into_user("mine".into(), Origin { kind: OriginKind::Duplicate, from: None, source: None }, 0);
         assert!(!mine.has_brand_layer());
         mine.validate().unwrap();
         let mut sneaky = t;
