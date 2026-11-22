@@ -213,75 +213,26 @@ async fn the_connector_posts_comments_to_the_live_video_and_schedules_without_go
 }
 
 /// The sign-in: a state mismatch is refused, and the secret never appears in the address.
-#[tokio::test]
-async fn the_sign_in_flow_checks_state_and_trades_the_code_for_pages() {
-    let token_calls = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
-    let tc = token_calls.clone();
-    let app = axum::Router::new()
-        .route(
-            "/oauth/access_token",
-            post(move |axum::extract::RawQuery(q): axum::extract::RawQuery, body: String| {
-                let tc = tc.clone();
-                async move {
-                    tc.lock().unwrap().push((q.unwrap_or_default(), body.clone()));
-                    Json(json!({ "access_token": if body.contains("fb_exchange_token") { "LONG" } else { "SHORT" } }))
-                }
-            }),
-        )
-        .route("/me", get(|| async { Json(json!({ "id": "u9", "name": "Dev Person" })) }))
-        .route(
-            "/me/accounts",
-            get(|| async { Json(json!({ "data": [ { "id": "p1", "name": "My Page", "access_token": "PAGE-T", "picture": { "data": { "url": "https://x/p.png" } } } ] })) }),
-        );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    let ep = Endpoints {
-        authorize: "https://www.facebook.com/dialog/oauth".into(),
-        graph: format!("http://127.0.0.1:{port}"),
-    };
-    let creds = oauth::AppCredentials { app_id: "APP".into(), app_secret: "APP-SECRET".into() };
-
-    // 1. A callback with the wrong state is refused.
-    let pending = oauth::begin(&ep, &creds).await.unwrap();
-    assert!(pending.url.contains("client_id=APP") && pending.url.contains("pages_manage_posts"));
-    assert!(!pending.url.contains("APP-SECRET"), "the secret is never in the address");
-    let redirect = url::Url::parse(&pending.url)
-        .unwrap()
-        .query_pairs()
-        .find(|(k, _)| k == "redirect_uri")
-        .map(|(_, v)| v.into_owned())
-        .unwrap();
-    let http = http_client();
-    let t = tokio::spawn({
-        let (ep, creds, http) = (ep.clone(), creds.clone(), http.clone());
-        async move { oauth::finish(&http, &ep, &creds, pending, std::time::Duration::from_secs(5)).await }
-    });
-    let _ = reqwest::get(format!("{redirect}?state=wrong&code=abc")).await;
-    assert!(matches!(t.await.unwrap(), Err(FacebookError::SignIn(m)) if m.contains("state")));
-
-    // 2. The right state trades the code, then the long-lived token, then lists the Pages.
-    let pending = oauth::begin(&ep, &creds).await.unwrap();
-    let url = url::Url::parse(&pending.url).unwrap();
-    let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.into_owned()).unwrap();
-    let redirect = url.query_pairs().find(|(k, _)| k == "redirect_uri").map(|(_, v)| v.into_owned()).unwrap();
-    let t = tokio::spawn({
-        let (ep, creds, http) = (ep.clone(), creds.clone(), http.clone());
-        async move { oauth::finish(&http, &ep, &creds, pending, std::time::Duration::from_secs(5)).await }
-    });
-    let _ = reqwest::get(format!("{redirect}?state={state}&code=thecode")).await;
-    let grant = t.await.unwrap().unwrap();
-    assert_eq!(grant.user_name, "Dev Person");
-    assert_eq!(grant.pages.len(), 1);
-    assert_eq!(grant.pages[0].access_token, "PAGE-T");
-    let calls = token_calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
-    assert!(calls[0].1.contains("code=thecode") && calls[1].1.contains("fb_exchange_token=SHORT"), "{calls:?}");
-    // The secret travelled in the body, never in the query.
-    assert!(
-        calls.iter().all(|(q, b)| !q.contains("APP-SECRET") && b.contains("client_secret=APP-SECRET")),
-        "{calls:?}"
-    );
+#[test]
+fn the_relays_hand_over_is_read_and_a_page_without_a_token_is_left_out() {
+    let g = UserGrant::from_relay(&json!({
+        "user": { "id": "u1", "name": "Dev Person" },
+        "pages": [
+            { "id": "p1", "name": "My Page", "access_token": "T1", "avatar_url": "https://x/p.png" },
+            { "id": "p2", "name": "No token" },
+            { "id": "", "access_token": "T3" },
+            { "id": "p4", "access_token": "T4", "avatar_url": "javascript:alert(1)" }
+        ]
+    }))
+    .unwrap();
+    assert_eq!((g.user_id.as_str(), g.user_name.as_str()), ("u1", "Dev Person"));
+    assert_eq!(g.pages.len(), 2);
+    assert_eq!(g.pages[0].avatar_url.as_deref(), Some("https://x/p.png"));
+    assert_eq!(g.pages[1].id, "p4");
+    assert_eq!(g.pages[1].avatar_url, None, "only an https picture is kept");
+    for bad in [json!(null), json!({ "pages": [] }), json!({ "user": { "id": "u" }, "pages": "x" })] {
+        assert!(UserGrant::from_relay(&bad).is_none(), "{bad}");
+    }
 }
 
 #[tokio::test]

@@ -45,8 +45,6 @@ pub(crate) const TWITCH_TOKENS: &str = "twitch-tokens";
 pub(crate) const YOUTUBE_TOKENS: &str = "youtube-tokens";
 /// The Page Facebook acts as (its id and access token), in the secret store.
 pub(crate) const FACEBOOK_PAGE: &str = "facebook-page";
-/// How long the browser sign-in for Facebook may take.
-const FACEBOOK_SIGN_IN: Duration = Duration::from_secs(300);
 /// How long the browser sign-in for YouTube may take.
 const YOUTUBE_SIGN_IN: Duration = Duration::from_secs(300);
 
@@ -63,9 +61,8 @@ pub struct PlatformApps {
     pub relay_url: Option<String>,
     /// Kick's public API (tests point it at a fake).
     pub kick_api: String,
-    /// The owner's Facebook app (id and secret): none until it is registered, and then Connect
-    /// works. Registering it is not something the app can do.
-    pub facebook: Option<ferrocast_facebook::AppCredentials>,
+    /// Facebook's Graph API (tests point it at a fake). Signing in to Facebook goes through the
+    /// relay, which holds the Meta app secret: there is none here (R-46).
     pub facebook_endpoints: ferrocast_facebook::Endpoints,
 }
 
@@ -94,13 +91,6 @@ impl PlatformApps {
             relay_url: pick("FERROCAST_RELAY_URL", option_env!("FERROCAST_RELAY_URL"))
                 .map(|u| u.trim_end_matches('/').to_string()),
             kick_api: "https://api.kick.com".into(),
-            facebook: match (
-                pick("FERROCAST_FACEBOOK_APP_ID", option_env!("FERROCAST_FACEBOOK_APP_ID")),
-                pick("FERROCAST_FACEBOOK_APP_SECRET", option_env!("FERROCAST_FACEBOOK_APP_SECRET")),
-            ) {
-                (Some(app_id), Some(app_secret)) => Some(ferrocast_facebook::AppCredentials { app_id, app_secret }),
-                _ => None,
-            },
             facebook_endpoints: ferrocast_facebook::Endpoints::default(),
         }
     }
@@ -407,41 +397,30 @@ impl Engine {
         Ok(())
     }
 
-    /// Facebook sign-in (a Page): the system browser, a one-time loopback redirect. Needs the
-    /// owner's Facebook app (`FERROCAST_FACEBOOK_APP_ID` and `..._APP_SECRET`).
+    /// Facebook sign-in (a Page) through the relay, like Kick's: the relay asks Meta with the app
+    /// secret (which only it holds) and hands the Pages to this install over its link, where
+    /// [`Engine::finish_facebook`] takes the first one. Here the browser is opened on Meta's page.
     async fn connect_facebook(&self) -> Result<ConnectFlow, EngineError> {
-        let app = self.apps().facebook.clone().ok_or_else(|| {
-            EngineError::Unavailable(
-                "This build of Ferrocast has no Facebook app set up, so it can't sign in to Facebook.".into(),
-            )
-        })?;
-        let ep = self.apps().facebook_endpoints.clone();
-        let pending =
-            ferrocast_facebook::oauth::begin(&ep, &app).await.map_err(|e| EngineError::Unavailable(e.to_string()))?;
-        let url = pending.url.clone();
-        let engine = self.clone();
-        tokio::spawn(async move {
-            let http = ferrocast_facebook::http_client();
-            match ferrocast_facebook::oauth::finish(&http, &ep, &app, pending, FACEBOOK_SIGN_IN).await {
-                Ok(grant) => {
-                    if let Err(e) = engine.finish_facebook(grant).await {
-                        engine.notice_detail(
-                            "account:facebook",
-                            NoticeLevel::Error,
-                            "Facebook sign-in didn't finish",
-                            &e.to_string(),
-                        );
-                    }
-                }
-                Err(e) => engine.notice_detail(
-                    "account:facebook",
-                    NoticeLevel::Warn,
-                    "Facebook sign-in failed",
-                    &e.to_string(),
-                ),
-            }
-        });
-        Ok(ConnectFlow::Browser { url })
+        let url = self.relay_url()?;
+        let auth = self.relay_auth().await?;
+        self.ensure_relay_link();
+        let res = self
+            .relay_http()
+            .post(format!("{url}/v1/facebook/oauth"))
+            .bearer_auth(&auth)
+            .send()
+            .await
+            .map_err(|e| EngineError::Unavailable(format!("Couldn't reach the Ferrocast relay: {e}")))?;
+        let v: serde_json::Value = res.json().await.map_err(|e| EngineError::Unavailable(e.to_string()))?;
+        match v["url"].as_str() {
+            Some(u) => Ok(ConnectFlow::Browser { url: u.to_string() }),
+            None => Err(EngineError::Unavailable(
+                v.pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("The relay couldn't start Facebook sign-in.")
+                    .to_string(),
+            )),
+        }
     }
 
     /// The Page that was signed in to (the first one the person manages) becomes the account.

@@ -41,6 +41,7 @@ impl Default for Timing {
 
 /// The comment ids already sent for this live video, oldest forgotten first once there are
 /// `cap` of them (it would grow for the whole length of a long stream otherwise).
+#[derive(Debug)]
 pub struct SeenIds {
     set: HashSet<String>,
     order: VecDeque<String>,

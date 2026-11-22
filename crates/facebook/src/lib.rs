@@ -13,7 +13,7 @@ use std::time::Duration;
 
 pub use connector::FacebookConnector;
 pub use graph::{Comment, Graph, LiveVideo, Page};
-pub use oauth::{AppCredentials, UserGrant};
+pub use oauth::UserGrant;
 
 /// What Ferrocast asks for: the Pages the person manages, going live and scheduling on one, and
 /// reading and answering the comments on it.
@@ -26,19 +26,15 @@ pub const SCOPES: &[&str] = &[
     "publish_video",
 ];
 
-/// Where Facebook's sign-in and Graph API are (tests point both at a fake).
+/// Where Facebook's Graph API is (tests point it at a fake). Signing in is the relay's job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoints {
-    pub authorize: String,
     pub graph: String,
 }
 
 impl Default for Endpoints {
     fn default() -> Self {
-        Endpoints {
-            authorize: "https://www.facebook.com/v21.0/dialog/oauth".into(),
-            graph: "https://graph.facebook.com/v21.0".into(),
-        }
+        Endpoints { graph: "https://graph.facebook.com/v21.0".into() }
     }
 }
 
