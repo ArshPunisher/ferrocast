@@ -2533,3 +2533,22 @@ async fn a_401_on_the_question_refreshes_the_sign_in_and_the_upload_goes_on() {
     assert_eq!(id, "vid-new");
     assert!(log.lock().unwrap().token_hits >= 1, "the sign-in wasn't refreshed");
 }
+
+/// CodeRabbit: the final answer is cut off AND the first question about where it stands fails
+/// (a 503): the question is asked again, not given up, and the video's id comes back without
+/// sending the media a second time.
+#[tokio::test]
+async fn a_cut_off_final_answer_keeps_asking_when_the_first_question_fails() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        l.cut_final = true;
+        l.status_fail = 2;
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    let l = log.lock().unwrap();
+    assert_eq!(l.pieces, 1, "the media was sent once: {:?}", l.ranges);
+    assert_eq!(l.ranges.iter().filter(|r| r.starts_with("bytes */")).count(), 3, "{:?}", l.ranges);
+}

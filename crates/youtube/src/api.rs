@@ -878,10 +878,29 @@ impl Api {
                         Ok(b) => b,
                         // The last piece was taken but its answer was cut off: YouTube repeats the
                         // answer to a status question, so the video is not lost track of.
-                        Err(e) => match self.upload_status(&session, &token, total).await {
-                            UploadStatus::Done(id) => return Ok(id),
-                            _ => return Err(YoutubeError::from_reqwest(e)),
-                        },
+                        Err(e) => {
+                            // Asked again (a bounded few times, with a pause), not once: the
+                            // question can fail too, and the media is not sent a second time.
+                            let mut cut = YoutubeError::from_reqwest(e);
+                            for ask in 0..=UPLOAD_RETRIES {
+                                match self.upload_status(&session, &token, total).await {
+                                    UploadStatus::Done(id) => return Ok(id),
+                                    UploadStatus::Unauthorized => match self.refresh_after_401(&token).await {
+                                        Ok(t) => token = t,
+                                        Err(e) => {
+                                            cut = e;
+                                            break;
+                                        }
+                                    },
+                                    UploadStatus::Gone => break,
+                                    UploadStatus::Resume(_) | UploadStatus::Transient => {}
+                                }
+                                if ask < UPLOAD_RETRIES {
+                                    tokio::time::sleep(upload_backoff(ask + 1)).await;
+                                }
+                            }
+                            return Err(if matches!(cut, YoutubeError::SignInNeeded) { cut } else { lost_touch() });
+                        }
                     };
                     return body
                         .get("id")
