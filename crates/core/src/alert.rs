@@ -762,6 +762,11 @@ fn check_custom_html(name: &str, html: &str, custom_keys: &HashSet<String>) -> R
             let close = (i..chars.len()).find(|&j| lower[j..].starts_with(&['<', '/', 's', 't', 'y', 'l', 'e']));
             let end = close.unwrap_or(chars.len());
             let css: String = chars[i..end].iter().collect();
+            // A `<` in a style's text: inside <svg> the browser reads it as a tag (a picture or a
+            // frame), which this checker took for CSS text. CSS needs none.
+            if css.contains('<') {
+                return Err(html_err(name, "can't put a < inside <style>"));
+            }
             check_css(&format!("variation '{name}' <style>"), &css).map_err(RuleError::CustomCss)?;
             i = end;
         }
@@ -1474,6 +1479,9 @@ mod tests {
             "<div style=\"background:url(https://evil.example/a.png)\">x</div>",
             "<style>@import url(https://evil.example/a.css);</style>",
             "<style>.a{background:u\\72l(https://evil.example/a.png)}</style>",
+            // Inside <svg> the browser parses <style> as markup, not as text: a tag in it is a tag.
+            "<svg><style><img src=\"https://cdn.discordapp.com/x.png\"></style></svg>",
+            "<svg><style><iframe src=\"https://evil.example\"></iframe></style></svg>",
         ] {
             let r = custom_rule(bad);
             assert!(
