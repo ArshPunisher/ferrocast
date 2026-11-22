@@ -1458,6 +1458,17 @@ pub struct ItemBoxIn {
     pub h: f32,
 }
 
+/// Why several boxes are sent: a move or resize (a drag, the arrow keys), or one click of Align or
+/// Space out, which are named steps of their own in the undo list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoxReason {
+    #[default]
+    Move,
+    Align,
+    Distribute,
+}
+
 /// A box a preview edit sends: numbers on the canvas, sides of at least a pixel.
 fn check_box(x: f32, y: f32, w: f32, h: f32) -> Result<(), EngineError> {
     const MAX: f32 = 100_000.0;
@@ -1736,6 +1747,10 @@ pub enum StudioAct {
         items: Vec<ItemBoxIn>,
         #[serde(default)]
         save: bool,
+        /// `align` or `distribute` for one click of those buttons (their own undo step, named
+        /// for it); missing: a move.
+        #[serde(default)]
+        reason: BoxReason,
     },
     /// Crops an item from the preview (Alt-drag on a handle): left, top, right, bottom in the
     /// source's own pixels, keeping what's left where it is on screen → the item. `save` at the
@@ -4282,7 +4297,12 @@ mod tests {
         }
         // Several boxes at once: one act, checked as a whole.
         let one = |id, x| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 };
-        let many = |items: Vec<ItemBoxIn>, save| StudioAct::SetItemBoxes { scene: "Main".into(), items, save };
+        let many = |items: Vec<ItemBoxIn>, save| StudioAct::SetItemBoxes {
+            scene: "Main".into(),
+            items,
+            save,
+            reason: BoxReason::default(),
+        };
         assert!(!many(vec![one(3, 0.0)], false).changes());
         assert!(many(vec![one(3, 0.0)], true).changes());
         e.studio_act(many(vec![one(3, 1.0), one(4, 2.0)], true)).await.unwrap();
@@ -4292,7 +4312,12 @@ mod tests {
             many(vec![one(3, 0.0), one(3, 5.0)], true),
             many(vec![one(3, f32::NAN)], true),
             many(vec![ItemBoxIn { w: 0.5, ..one(3, 0.0) }], true),
-            StudioAct::SetItemBoxes { scene: String::new(), items: vec![one(3, 0.0)], save: true },
+            StudioAct::SetItemBoxes {
+                scene: String::new(),
+                items: vec![one(3, 0.0)],
+                save: true,
+                reason: BoxReason::default(),
+            },
         ] {
             assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
         }

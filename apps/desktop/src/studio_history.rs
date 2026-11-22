@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use ferrocast_engine::studio_host::{ItemEdit as Edit, StudioAct};
+use ferrocast_engine::studio_host::{BoxReason, ItemEdit as Edit, StudioAct};
 use ferrocast_studio::stage::Stage as Collection;
 use serde_json::Value;
 
@@ -152,22 +152,29 @@ impl History {
                 }
                 Some(fresh(format!("Move {}", item_name(c, scene, *id)?), Some(key), !*save))
             }
-            StudioAct::SetItemBoxes { scene, items, save } => {
+            StudioAct::SetItemBoxes { scene, items, save, reason } => {
                 // The same ids in any order are the same drag.
                 let mut ids: Vec<i64> = items.iter().map(|b| b.id).collect();
                 ids.sort_unstable();
                 // The whole sorted list is the key: two sets that happen to hash alike are two drags.
-                let key = ("boxes", format!("{scene}\u{1}{ids:?}"), 0);
-                if self
-                    .undo
-                    .last()
-                    .is_some_and(|s| s.key.as_ref() == Some(&key) && (s.live() || s.at.elapsed() < NUDGES))
+                // Align and Space out are one click each: their own step, named for what they do,
+                // never joined to a drag before them or an arrow key after them.
+                let key = ("boxes", format!("{scene}\u{1}{ids:?}\u{1}{reason:?}"), 0);
+                let one_shot = *reason != BoxReason::Move;
+                if !one_shot
+                    && self
+                        .undo
+                        .last()
+                        .is_some_and(|s| s.key.as_ref() == Some(&key) && (s.live() || s.at.elapsed() < NUDGES))
                 {
                     return Some(Before { open: !*save, ..joined(*save) });
                 }
-                let label = match ids.as_slice() {
-                    [one] => format!("Move {}", item_name(c, scene, *one)?),
-                    many => format!("Move {} sources", many.len()),
+                let n = ids.len();
+                let label = match (reason, ids.as_slice()) {
+                    (BoxReason::Align, _) => format!("Align {n} sources"),
+                    (BoxReason::Distribute, _) => format!("Space out {n} sources"),
+                    (BoxReason::Move, [one]) => format!("Move {}", item_name(c, scene, *one)?),
+                    (BoxReason::Move, _) => format!("Move {n} sources"),
                 };
                 Some(fresh(label, Some(key), !*save))
             }
@@ -467,7 +474,7 @@ mod tests {
         let x_of = |id| c.transform("Main", id).map(|t| t.x).ok();
         let run = |h: &mut History, ids: &[i64], x: f32, save: bool| {
             let items: Vec<ItemBoxIn> = ids.iter().map(|&id| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 }).collect();
-            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save };
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
             let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
             let boxes: Vec<_> = ids.iter().map(|&id| (id, x, 0.0, 10.0, 10.0)).collect();
             let out: Result<Value, String> =
@@ -502,7 +509,7 @@ mod tests {
                 ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
                 ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
             ];
-            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save };
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
             let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
             let out: Result<Value, String> = c
                 .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
@@ -527,6 +534,40 @@ mod tests {
         assert!(h.undo.last().is_some_and(|s| !s.open), "the save closes it");
     }
 
+    /// Align and Space out are steps of their own, named for what they do, even right after a
+    /// drag or another align of the same sources (Neon #6: they merged into "Move 2 sources").
+    #[test]
+    fn align_and_space_out_are_their_own_named_undo_steps() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in ["A", "B"] {
+            c.add_source("Main", "color_source_v3", n, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, x: f32, save: bool, reason: BoxReason| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, 50.0, true, BoxReason::Move); // a drag, saved
+        go(&mut h, 60.0, true, BoxReason::Align); // within a second: still its own step
+        go(&mut h, 70.0, true, BoxReason::Distribute);
+        go(&mut h, 71.0, true, BoxReason::Move); // an arrow key after them: not folded into them
+        let labels: Vec<String> = h.list().0.iter().map(|s| s.to_string()).collect();
+        assert_eq!(labels.len(), 4, "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("Align 2 sources")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("Space out 2 sources")), "{labels:?}");
+    }
+
     /// A drag that never saved (the pointer was lost, the page closed) leaves its step open; a
     /// move of the same sources long after must not fold into it (Undo would go back that far).
     #[test]
@@ -543,7 +584,7 @@ mod tests {
                 ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
                 ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
             ];
-            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save };
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
             let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
             let out: Result<Value, String> = c
                 .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
@@ -579,7 +620,7 @@ mod tests {
         }
         let go = |h: &mut History, ids: [i64; 2], x: f32| {
             let items: Vec<ItemBoxIn> = ids.iter().map(|&id| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 }).collect();
-            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save: true };
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save: true, reason: Default::default() };
             let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
             let boxes: Vec<_> = ids.iter().map(|&id| (id, x, 0.0, 10.0, 10.0)).collect();
             let out: Result<Value, String> =

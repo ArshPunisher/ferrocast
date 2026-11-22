@@ -710,16 +710,18 @@ struct BoxesBody {
     items: Vec<ferrocast_engine::studio_host::ItemBoxIn>,
     #[serde(default)]
     save: bool,
+    #[serde(default)]
+    reason: ferrocast_engine::studio_host::BoxReason,
 }
 
-/// `PUT …/items/boxes` `{ items: [{ id, x, y, w, h }], save? }`: several items moved and sized at
+/// `PUT …/items/boxes` `{ items: [{ id, x, y, w, h }], save?, reason? }`: several items moved and sized at
 /// once (aligned, spaced out, a group of picked ones moved or resized) as one step → the items.
 async fn engine_item_boxes(
     State(app): State<AppState>,
     Path(scene): Path<String>,
     Body(b): Body<BoxesBody>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::SetItemBoxes { scene, items: b.items, save: b.save }).await
+    act(&app, StudioAct::SetItemBoxes { scene, items: b.items, save: b.save, reason: b.reason }).await
 }
 
 #[derive(Deserialize)]
