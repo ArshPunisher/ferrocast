@@ -80,6 +80,7 @@ async fn every_clips_route_needs_the_session() {
         ("GET", "/clips/jobs"),
         ("GET", "/clips/a.mp4"),
         ("GET", "/clips/a.mp4/thumbnail"),
+        ("GET", "/clips/a.mp4/file"),
         ("GET", "/clips/a.mp4/captions"),
         ("GET", "/clips/a.mp4/captions.srt"),
         ("PUT", "/clips/a.mp4"),
@@ -208,4 +209,43 @@ async fn jobs_start_with_202_and_bad_requests_start_none() {
     assert_eq!((s, c.as_str()), (StatusCode::NOT_FOUND, "job_not_found"));
     let (s, c, _) = error(r.delete("/clips/jobs/job-9").await).await;
     assert_eq!((s, c.as_str()), (StatusCode::NOT_FOUND, "job_not_found"));
+}
+
+#[tokio::test]
+async fn a_clip_plays_with_ranges_and_only_by_its_plain_name() {
+    let r = start().await;
+    std::fs::write(r.clips.path().join("a.mp4"), b"0123456789").unwrap();
+    let res = r.get("/clips/a.mp4/file").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "video/mp4");
+    assert_eq!(res.headers()["accept-ranges"], "bytes");
+    assert_eq!(res.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(res.bytes().await.unwrap().as_ref(), b"0123456789");
+    let part = r
+        .client
+        .get(format!("{}/api/v1/clips/a.mp4/file", r.base))
+        .bearer_auth(&r.token)
+        .header("range", "bytes=2-4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(part.headers()["content-range"], "bytes 2-4/10");
+    assert_eq!(part.bytes().await.unwrap().as_ref(), b"234");
+    // The session may ride in the address for a <video>; without any, 401.
+    let q = r.client.get(format!("{}/api/v1/clips/a.mp4/file?session={}", r.base, r.token)).send().await.unwrap();
+    assert_eq!(q.status(), StatusCode::OK);
+    let none = r.client.get(format!("{}/api/v1/clips/a.mp4/file", r.base)).send().await.unwrap();
+    assert_eq!(none.status(), StatusCode::UNAUTHORIZED);
+    // Not by a path, and not a link.
+    let (s, c, _) = error(r.get("/clips/..%2Fa.mp4/file").await).await;
+    assert!(s == StatusCode::NOT_FOUND || s == StatusCode::BAD_REQUEST, "{s} {c}");
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("s.mp4"), b"secret").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("s.mp4"), r.clips.path().join("link.mp4")).unwrap();
+        let (s, c, _) = error(r.get("/clips/link.mp4/file").await).await;
+        assert_eq!((s, c.as_str()), (StatusCode::NOT_FOUND, "clip_not_found"));
+    }
 }

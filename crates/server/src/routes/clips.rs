@@ -6,7 +6,7 @@
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use ferrocast_engine::clips::edit::{CompileReq, Cue, TrimReq};
@@ -27,6 +27,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/clips/jobs/{id}/cancel", post(cancel_job))
         .route("/clips/{id}", get(probe).put(rename).delete(remove))
         .route("/clips/{id}/thumbnail", get(thumbnail))
+        .route("/clips/{id}/file", get(file))
         .route("/clips/{id}/trim", post(trim))
         .route("/clips/{id}/captions", get(captions).put(save_captions).post(make_captions))
         .route("/clips/{id}/captions.srt", get(captions_srt))
@@ -53,6 +54,19 @@ async fn probe(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult
 /// `GET /clips/{id}/thumbnail` → `{ image }` (a JPEG data URL; needs FFmpeg).
 async fn thumbnail(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "image": app.engine.clip_thumbnail_image(&id).await? })))
+}
+
+/// `GET /clips/{id}/file` (the session may ride as `?session=` so a `<video>` can load it): the
+/// clip itself, with `Range` so it seeks. The name is checked like every other call's.
+async fn file(State(app): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+    let (path, mime) = match app.engine.clip_file(&id).await {
+        Ok(x) => x,
+        Err(e) => return crate::error::ApiError::from(e).into_response(),
+    };
+    match tokio::fs::File::open(&path).await {
+        Ok(f) => crate::assets::range_response(f, mime, &headers).await,
+        Err(_) => crate::error::ApiError::from(ferrocast_engine::clips::no_such_clip()).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

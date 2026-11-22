@@ -237,9 +237,15 @@ async fn media_response(app: &AppState, id: &str, headers: &HeaderMap) -> Respon
         .hint("Upload it again from the media library.")
         .into_response();
     }
-    let Ok(mut file) = tokio::fs::File::open(&path).await else {
+    let Ok(file) = tokio::fs::File::open(&path).await else {
         return ApiError::not_found("file").into_response();
     };
+    range_response(file, &media.mime, headers).await
+}
+
+/// An open file as a response, honouring one `Range` (a video seeks), sent only as media:
+/// `nosniff` and a sandboxing CSP, since it shares the dashboard's origin.
+pub(crate) async fn range_response(mut file: tokio::fs::File, mime: &str, headers: &HeaderMap) -> Response {
     // The size on disk, not the stored one: a wrong Content-Length breaks the response.
     let len = match file.metadata().await {
         Ok(m) => m.len(),
@@ -247,7 +253,7 @@ async fn media_response(app: &AppState, id: &str, headers: &HeaderMap) -> Respon
     };
     let range = headers.get(header::RANGE).and_then(|r| r.to_str().ok()).and_then(|r| parse_range(r, len));
     let mut builder = Response::builder()
-        .header(header::CONTENT_TYPE, media.mime.as_str())
+        .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CACHE_CONTROL, "private, max-age=3600")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")

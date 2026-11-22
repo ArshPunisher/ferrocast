@@ -83,7 +83,7 @@ fn refuse(status: u16, code: &'static str, message: impl Into<String>, hint: &st
     EngineError::Refused { status, code, message: message.into(), hint: hint.into(), retry_after: None }
 }
 
-pub(crate) fn no_such_clip() -> EngineError {
+pub fn no_such_clip() -> EngineError {
     refuse(
         404,
         "clip_not_found",
@@ -313,6 +313,18 @@ impl Engine {
             youtube_connected: self.connector(ferrocast_core::event::Platform::Youtube).is_some(),
             clips: self.clips(query).await?,
         })
+    }
+
+    /// The file of a clip, for playing it in the dashboard (the name is checked like any other)
+    /// → its path and the media type to send it as.
+    pub async fn clip_file(&self, id: &str) -> Result<(PathBuf, &'static str), EngineError> {
+        let path = self.clip_path(id).await?;
+        let mime = match ext_of(id) {
+            Some("mov") => "video/quicktime",
+            Some("mkv") => "video/x-matroska",
+            _ => "video/mp4",
+        };
+        Ok((path, mime))
     }
 
     /// A clip's picture as a data URL (what the dashboard shows in a tile).
