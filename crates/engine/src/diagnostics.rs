@@ -64,6 +64,23 @@ impl Engine {
         self.db(move |s| repo::stream_health::record(s, record)).await
     }
 
+    /// Notes a destination turned on or off while the stream runs, in Go live's own log and in
+    /// the open health record, so the session record says which were live and when.
+    pub(crate) fn note_destination(&self, id: &str, name: &str, on: bool) {
+        let ev = ferrocast_core::diagnostics::DestinationEvent { id: id.into(), name: name.into(), at: now(), on };
+        {
+            let mut log = self.golive().dest_log.lock().unwrap_or_else(|p| p.into_inner());
+            if log.len() >= 200 {
+                log.remove(0);
+            }
+            log.push(ev.clone());
+        }
+        let mut g = self.inner.stream_health.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(rec) = g.active.as_mut() {
+            rec.destination_log.push(ev);
+        }
+    }
+
     pub(crate) async fn health_stream_started(&self, at: Millis, platform: Platform) {
         let studio = match self.studio_host() {
             Ok(h) => h.diagnostics_studio().await,
@@ -107,6 +124,7 @@ impl Engine {
                 frame_ms: 0.0,
                 destinations: vec![],
                 issues: vec![],
+                destination_log: self.golive().dest_log.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             });
             if !rec.platforms.contains(&platform) {
                 rec.platforms.push(platform);
@@ -129,6 +147,8 @@ impl Engine {
             let to_save = r.clone();
             let _ = self.db(move |s| repo::stream_health::record(s, to_save)).await;
         }
+        // The next stream starts its own list.
+        self.golive().dest_log.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
 
     async fn populate_live_metrics(&self, r: &mut StreamHealthRecord) {
@@ -1033,6 +1053,7 @@ mod tests {
         // Populate a failing recent stream health record
         engine
             .record_stream_health(StreamHealthRecord {
+                destination_log: Vec::new(),
                 id: "stream-bad-1".into(),
                 started_at: Millis(1_700_000_000_000),
                 ended_at: Some(Millis(1_700_000_600_000)),

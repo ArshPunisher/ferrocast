@@ -136,6 +136,16 @@ pub struct DestinationHealthSnapshot {
     pub last_error: Option<String>,
 }
 
+/// A destination turned on or off while the stream ran (or at its start).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationEvent {
+    pub id: String,
+    pub name: String,
+    pub at: Millis,
+    /// `true` = it started sending, `false` = it stopped.
+    pub on: bool,
+}
+
 /// Health snapshot of one live stream (up to the most recent 5 stored locally).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StreamHealthRecord {
@@ -160,6 +170,9 @@ pub struct StreamHealthRecord {
     pub frame_ms: f64,
     pub destinations: Vec<DestinationHealthSnapshot>,
     pub issues: Vec<String>,
+    /// Which destinations were on, and when they were turned on or off (older records: none).
+    #[serde(default)]
+    pub destination_log: Vec<DestinationEvent>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2380,6 +2393,7 @@ mod tests {
                 last_error: None,
             }],
             issues: vec!["drop".into()],
+            destination_log: Vec::new(),
         });
         let report = build_support_report(stream_issues, &[], &["arshramgarhia"]);
         let codes: Vec<_> = report.likely_causes.iter().map(|c| c.code.as_str()).collect();
@@ -2432,6 +2446,7 @@ mod tests {
             frame_ms: 16.0,
             destinations: Vec::new(),
             issues: vec!["auth Bearer issue_bearer_tok_44 from 198.51.100.88".into()],
+            destination_log: Vec::new(),
         });
 
         let report = build_support_report(inp, &["opaqueReportSecret"], &["leakUser99"]);
