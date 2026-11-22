@@ -724,6 +724,8 @@ fn select_bench_encoders(is_macos: bool, live_ff_hw: Option<&str>, has_libx264: 
 
 /// Dynamic canvas-shaped NV12 frame set: composited with `ferrocore::Compositor` when GPU is
 /// available, or CPU-synthesized moving gradients/patterns in headless environments.
+const BENCH_WORKLOAD_FRAMES: u32 = 24;
+
 struct BenchFrames {
     y_stride: usize,
     uv_stride: usize,
@@ -732,13 +734,12 @@ struct BenchFrames {
 
 impl BenchFrames {
     fn build(compositor: Option<&Compositor>, width: u32, height: u32, cancel: &AtomicBool) -> Result<Self, StepAbort> {
-        const COUNT: u32 = 8;
         if let Some(c) = compositor
-            && let Ok(rendered) = render_compositor_frames(c, width, height, COUNT, cancel)
+            && let Ok(rendered) = render_compositor_frames(c, width, height, BENCH_WORKLOAD_FRAMES, cancel)
         {
             return Ok(rendered);
         }
-        synthetic_nv12_frames(width, height, COUNT as usize, cancel)
+        synthetic_nv12_frames(width, height, BENCH_WORKLOAD_FRAMES as usize, cancel)
     }
 
     fn frame(&self, idx: usize) -> Frame<'_> {
@@ -907,49 +908,6 @@ pub fn parse_macos_gpu_pct(out: &str) -> Option<f64> {
     None
 }
 
-/// Parses `top -l 2 -n 0 -F -R` stdout for total macOS CPU load % (`user + sys`), taking the final sample.
-pub fn parse_macos_top_cpu_pct(out: &str) -> Option<f64> {
-    let mut latest = None;
-    for line in out.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("CPU usage:") {
-            let mut user = None;
-            let mut sys = None;
-            let mut idle = None;
-            for seg in rest.split(',') {
-                let s = seg.trim();
-                let num = s.split('%').next().and_then(|v| v.trim().parse::<f64>().ok());
-                if s.contains("user") {
-                    user = num;
-                } else if s.contains("sys") {
-                    sys = num;
-                } else if s.contains("idle") {
-                    idle = num;
-                }
-            }
-            if let (Some(u), Some(s)) = (user, sys) {
-                latest = Some((u + s).clamp(0.0, 100.0));
-            } else if let Some(i) = idle {
-                latest = Some((100.0 - i).clamp(0.0, 100.0));
-            }
-        }
-    }
-    latest
-}
-
-#[cfg(target_os = "linux")]
-fn read_proc_stat_totals() -> Option<(u64, u64)> {
-    let text = std::fs::read_to_string("/proc/stat").ok()?;
-    let line = text.lines().next()?.strip_prefix("cpu ")?;
-    let vals: Vec<u64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
-    if vals.len() < 4 {
-        return None;
-    }
-    let idle = vals[3] + vals.get(4).copied().unwrap_or(0);
-    let total: u64 = vals.iter().sum();
-    Some((total.saturating_sub(idle), total))
-}
-
 fn read_os_gpu_pct() -> Option<f64> {
     #[cfg(target_os = "macos")]
     {
@@ -979,32 +937,19 @@ fn read_os_gpu_pct() -> Option<f64> {
     None
 }
 
-fn read_os_cpu_pct() -> Option<f64> {
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("/usr/bin/top").args(["-l", "2", "-n", "0", "-F", "-R"]).output().ok()?;
-        if out.status.success() {
-            return parse_macos_top_cpu_pct(&String::from_utf8_lossy(&out.stdout));
-        }
-    }
-    None
-}
-
 struct LoadMonitor {
     host_cpu_supported: bool,
     rt: Option<tokio::runtime::Handle>,
-    #[cfg(target_os = "linux")]
-    prev_proc: Option<(u64, u64)>,
+    sys: sysinfo::System,
+    last_cpu_at: Instant,
+    last_cpu: Option<f64>,
 }
 
 impl LoadMonitor {
     fn new(host_cpu_supported: bool, rt: Option<tokio::runtime::Handle>) -> Self {
-        Self {
-            host_cpu_supported,
-            rt,
-            #[cfg(target_os = "linux")]
-            prev_proc: read_proc_stat_totals(),
-        }
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_usage();
+        Self { host_cpu_supported, rt, sys, last_cpu_at: Instant::now(), last_cpu: None }
     }
 
     fn sample(&mut self, engine: &Engine) -> (Option<f64>, Option<f64>) {
@@ -1017,28 +962,26 @@ impl LoadMonitor {
                 return (c, g.or_else(read_os_gpu_pct));
             }
         }
-        #[cfg(target_os = "linux")]
-        let cpu = if let (Some((b0, t0)), Some((b1, t1))) = (self.prev_proc, read_proc_stat_totals()) {
-            self.prev_proc = Some((b1, t1));
-            let dt = t1.saturating_sub(t0);
-            if dt > 0 { Some(((b1.saturating_sub(b0)) as f64 / dt as f64) * 100.0) } else { None }
-        } else {
-            None
-        };
-        #[cfg(not(target_os = "linux"))]
-        let cpu = read_os_cpu_pct();
-
-        (cpu, read_os_gpu_pct())
+        if self.last_cpu_at.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {
+            self.sys.refresh_cpu_usage();
+            self.last_cpu_at = Instant::now();
+            self.last_cpu = Some(f64::from(self.sys.global_cpu_usage()).clamp(0.0, 100.0));
+        }
+        (self.last_cpu, read_os_gpu_pct())
     }
 }
 
 type LoadSample = (Instant, Option<f64>, Option<f64>);
 type LoadSampleLog = Arc<std::sync::Mutex<Vec<LoadSample>>>;
 
-/// Samples OS CPU and GPU load on a helper thread so the encoder pacing loop never stalls on `top` or `ioreg`.
+/// Samples OS CPU and GPU load via `sysinfo` on a helper thread so the encoder pacing loop never
+/// stalls on subprocesses or `ioreg`. Joins the thread deterministically on `Drop`.
 struct BackgroundLoadSampler {
     stop: Arc<AtomicBool>,
     samples: LoadSampleLog,
+    handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    worker_done: Arc<AtomicBool>,
 }
 
 impl BackgroundLoadSampler {
@@ -1050,38 +993,61 @@ impl BackgroundLoadSampler {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker_done = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
         let samples_t = samples.clone();
-        let _ = std::thread::Builder::new().name("auto-config-load".into()).spawn(move || {
-            if let Some(g0) = read_os_gpu_pct() {
-                samples_t.lock().unwrap_or_else(|p| p.into_inner()).push((Instant::now(), None, Some(g0)));
-            }
-            let mut mon = LoadMonitor::new(host_cpu_supported, rt);
-            while !stop_t.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
-                let (c, g) = mon.sample(&engine);
-                if stop_t.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                if c.is_some() || g.is_some() {
-                    let mut guard = samples_t.lock().unwrap_or_else(|p| p.into_inner());
-                    guard.push((Instant::now(), c, g));
-                    if guard.len() > 256 {
-                        let excess = guard.len() - 256;
-                        guard.drain(..excess);
+        let done_t = worker_done.clone();
+        let handle = std::thread::Builder::new()
+            .name("auto-config-load".into())
+            .spawn(move || {
+                struct MarkDone(Arc<AtomicBool>);
+                impl Drop for MarkDone {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::Release);
                     }
                 }
-                for _ in 0..4 {
+                let _mark_done = MarkDone(done_t);
+                let mut mon = LoadMonitor::new(host_cpu_supported, rt);
+                if let Some(g0) = read_os_gpu_pct() {
+                    samples_t.lock().unwrap_or_else(|p| p.into_inner()).push((Instant::now(), None, Some(g0)));
+                }
+                while !stop_t.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                    for _ in 0..4 {
+                        if stop_t.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    let (c, g) = mon.sample(&engine);
                     if stop_t.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    if c.is_some() || g.is_some() {
+                        let mut guard = samples_t.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.push((Instant::now(), c, g));
+                        if guard.len() > 256 {
+                            let excess = guard.len() - 256;
+                            guard.drain(..excess);
+                        }
+                    }
                 }
-            }
-        });
-        Self { stop, samples }
+            })
+            .ok();
+        if handle.is_none() {
+            worker_done.store(true, Ordering::Release);
+        }
+        Self {
+            stop,
+            samples,
+            handle,
+            #[cfg(test)]
+            worker_done,
+        }
     }
 
-    fn window_or_latest(&self, from: Instant, to: Instant) -> (Option<f64>, Option<f64>) {
+    /// Averages ONLY samples captured strictly inside `[from, to]` so earlier candidates never
+    /// bleed stale readings into later candidates (H3).
+    fn window_sample(&self, from: Instant, to: Instant) -> (Option<f64>, Option<f64>) {
         let guard = self.samples.lock().unwrap_or_else(|p| p.into_inner());
         let mut cpus = Vec::new();
         let mut gpus = Vec::new();
@@ -1095,16 +1061,6 @@ impl BackgroundLoadSampler {
                 }
             }
         }
-        if cpus.is_empty()
-            && let Some(c) = guard.iter().rev().find_map(|s| s.1)
-        {
-            cpus.push(c);
-        }
-        if gpus.is_empty()
-            && let Some(g) = guard.iter().rev().find_map(|s| s.2)
-        {
-            gpus.push(g);
-        }
         let avg = |xs: &[f64]| (!xs.is_empty()).then(|| xs.iter().sum::<f64>() / xs.len() as f64);
         (avg(&cpus), avg(&gpus))
     }
@@ -1112,7 +1068,10 @@ impl BackgroundLoadSampler {
 
 impl Drop for BackgroundLoadSampler {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -1321,7 +1280,7 @@ fn run_candidate_step(
     let encode_ms_p95 = percentile_sorted(&frame_times_ms, 0.95).max(encode_ms_avg);
     let encode_ms_max = frame_times_ms.last().copied().unwrap_or(encode_ms_avg).max(encode_ms_p95);
     let achieved_rt_fps = (f64::from(sent_rt) / rt_elapsed).min(1000.0 / encode_ms_avg);
-    let (cpu_pct, gpu_pct) = sampler.window_or_latest(rt_start, rt_end);
+    let (cpu_pct, gpu_pct) = sampler.window_sample(rt_start, rt_end);
 
     Ok(evaluate_candidate(CandidateMeasurement {
         encoder_backend: cand.backend.clone(),
@@ -2669,16 +2628,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_macos_ioreg_gpu_and_top_cpu() {
+    fn parses_macos_ioreg_gpu_pct() {
         let sample_ioreg = r#"+-o AGXAccelerator <class AGXAccelerator> { "PerformanceStatistics" = {"Device Utilization %"=34,"Renderer Utilization %"=29} }"#;
         assert_eq!(parse_macos_gpu_pct(sample_ioreg), Some(34.0));
-        let sample_top = "CPU usage: 18.42% user, 9.18% sys, 72.40% idle\nSharedLibs: 100M";
-        let cpu = parse_macos_top_cpu_pct(sample_top).unwrap();
-        assert!((cpu - 27.6).abs() < 0.01);
-        let sample_top_two =
-            "CPU usage: 100.0% user, 0.0% sys, 0.0% idle\nPhysMem: 10G\nCPU usage: 14.20% user, 6.80% sys, 79.00% idle";
-        let cpu2 = parse_macos_top_cpu_pct(sample_top_two).unwrap();
-        assert!((cpu2 - 21.0).abs() < 0.01);
+        const { assert!(BENCH_WORKLOAD_FRAMES >= 24) };
     }
 
     #[tokio::test]
@@ -3442,5 +3395,28 @@ mod tests {
         .unwrap();
         assert_eq!(frame_times.len(), 10);
         assert!(avg_ms < 12.0, "Phase 1 throughput_avg_ms ({avg_ms:.2} ms) was polluted by post-loop flush/teardown!");
+    }
+
+    #[tokio::test]
+    async fn h3_sampler_excludes_stale_samples_outside_window_and_joins_thread_on_drop() {
+        let t_old = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let from = Instant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let to = Instant::now();
+
+        let (engine, _host, _dir) = test_engine().await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sampler = BackgroundLoadSampler::start(false, Some(tokio::runtime::Handle::current()), engine, cancel);
+        assert!(sampler.handle.is_some(), "sampler must hold worker JoinHandle for Drop join");
+        sampler.samples.lock().unwrap().push((t_old, Some(88.0), Some(77.0)));
+        let (cpu, gpu) = sampler.window_sample(from, to);
+        assert!(
+            cpu.is_none() && gpu.is_none(),
+            "stale pre-window sample must never bleed into another candidate's window: got ({cpu:?}, {gpu:?})"
+        );
+        let done_flag = sampler.worker_done.clone();
+        drop(sampler);
+        assert!(done_flag.load(Ordering::Acquire), "Drop must join the BackgroundLoadSampler worker thread");
     }
 }

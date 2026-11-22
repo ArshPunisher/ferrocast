@@ -36,15 +36,22 @@ pub fn usage() -> (f64, u64) {
 
 /// Overall CPU usage across the entire machine (`0..=100` %), for auto-config benchmarking.
 pub fn machine_cpu_pct() -> f64 {
-    static SYS: Mutex<Option<sysinfo::System>> = Mutex::new(None);
+    static SYS: Mutex<Option<(sysinfo::System, std::time::Instant, f64)>> = Mutex::new(None);
     let mut guard = SYS.lock().unwrap_or_else(|e| e.into_inner());
-    let sys = guard.get_or_insert_with(|| {
+    let entry = guard.get_or_insert_with(|| {
         let mut s = sysinfo::System::new();
         s.refresh_cpu_usage();
-        s
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        s.refresh_cpu_usage();
+        let pct = f64::from(s.global_cpu_usage()).clamp(0.0, 100.0);
+        (s, std::time::Instant::now(), pct)
     });
-    sys.refresh_cpu_usage();
-    f64::from(sys.global_cpu_usage()).clamp(0.0, 100.0)
+    if entry.1.elapsed() >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {
+        entry.0.refresh_cpu_usage();
+        entry.1 = std::time::Instant::now();
+        entry.2 = f64::from(entry.0.global_cpu_usage()).clamp(0.0, 100.0);
+    }
+    entry.2
 }
 
 #[cfg(test)]
@@ -56,6 +63,12 @@ mod tests {
         assert!(free_disk_mb(&std::env::temp_dir()) > 0, "the temp folder's disk has room");
         let (_, mb) = usage();
         assert!(mb > 0, "this process uses some memory");
+    }
+
+    #[test]
+    fn h3_machine_cpu_pct_first_call_samples_real_delta() {
+        let cpu = machine_cpu_pct();
+        assert!(cpu > 0.0 && cpu <= 100.0, "cold first call to machine_cpu_pct() returned {cpu} (0 ms refresh bug)");
     }
 }
 
