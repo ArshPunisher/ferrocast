@@ -583,13 +583,19 @@ struct DiscoveredEncoder {
     preset: Option<String>,
 }
 
+/// Discovers only the encoder candidates that the live engine (`VideoEncoder::new` /
+/// `encode_of`) will actually select on this machine (C4).
 fn discover_encoders_cancellable(cancel: &AtomicBool) -> Vec<DiscoveredEncoder> {
+    let (live_hw, has_x264) = ffenc::discover_live_h264_and_x264(Some(cancel));
+    if cancel.load(Ordering::Acquire) {
+        return Vec::new();
+    }
+    select_bench_encoders(cfg!(target_os = "macos"), live_hw.as_deref(), has_x264)
+}
+
+fn select_bench_encoders(is_macos: bool, live_ff_hw: Option<&str>, has_libx264: bool) -> Vec<DiscoveredEncoder> {
     let mut out = Vec::new();
-    #[cfg(target_os = "macos")]
-    {
-        if cancel.load(Ordering::Acquire) {
-            return out;
-        }
+    if is_macos {
         out.push(DiscoveredEncoder {
             backend: "videotoolbox".into(),
             studio_encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
@@ -598,57 +604,25 @@ fn discover_encoders_cancellable(cancel: &AtomicBool) -> Vec<DiscoveredEncoder> 
             ffmpeg_name: None,
             preset: None,
         });
+    } else if let Some(enc) = live_ff_hw {
+        let (label, family) = match enc {
+            "h264_nvenc" => ("NVIDIA NVENC", EncoderFamily::Nvenc),
+            "h264_qsv" => ("Intel Quick Sync", EncoderFamily::Qsv),
+            "h264_amf" => ("AMD AMF", EncoderFamily::Amf),
+            "h264_mf" => ("Hardware (Media Foundation)", EncoderFamily::MediaFoundation),
+            _ => ("Hardware (FFmpeg)", EncoderFamily::Nvenc),
+        };
+        out.push(DiscoveredEncoder {
+            backend: enc.into(),
+            studio_encoder_id: "ffmpeg_hardware".into(),
+            label: label.into(),
+            family,
+            ffmpeg_name: Some(enc.into()),
+            preset: None,
+        });
     }
 
-    let ff_list = ffenc::probe_encoders_cancellable(Some(cancel));
-    for enc in &ff_list {
-        match enc.as_str() {
-            "h264_nvenc" => out.push(DiscoveredEncoder {
-                backend: "h264_nvenc".into(),
-                studio_encoder_id: "ffmpeg_hardware".into(),
-                label: "NVIDIA NVENC".into(),
-                family: EncoderFamily::Nvenc,
-                ffmpeg_name: Some(enc.clone()),
-                preset: None,
-            }),
-            "h264_qsv" => out.push(DiscoveredEncoder {
-                backend: "h264_qsv".into(),
-                studio_encoder_id: "ffmpeg_hardware".into(),
-                label: "Intel Quick Sync".into(),
-                family: EncoderFamily::Qsv,
-                ffmpeg_name: Some(enc.clone()),
-                preset: None,
-            }),
-            "h264_amf" => out.push(DiscoveredEncoder {
-                backend: "h264_amf".into(),
-                studio_encoder_id: "ffmpeg_hardware".into(),
-                label: "AMD AMF".into(),
-                family: EncoderFamily::Amf,
-                ffmpeg_name: Some(enc.clone()),
-                preset: None,
-            }),
-            "h264_mf" => out.push(DiscoveredEncoder {
-                backend: "h264_mf".into(),
-                studio_encoder_id: "ffmpeg_hardware".into(),
-                label: "Hardware (Media Foundation)".into(),
-                family: EncoderFamily::MediaFoundation,
-                ffmpeg_name: Some(enc.clone()),
-                preset: None,
-            }),
-            // On non-macOS, probe `h264_videotoolbox` if present; on macOS native VT is already first.
-            "h264_videotoolbox" if cfg!(not(target_os = "macos")) => out.push(DiscoveredEncoder {
-                backend: "h264_videotoolbox".into(),
-                studio_encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
-                label: "Apple VideoToolbox".into(),
-                family: EncoderFamily::VideoToolbox,
-                ffmpeg_name: Some(enc.clone()),
-                preset: None,
-            }),
-            _ => {}
-        }
-    }
-
-    if ff_list.iter().any(|e| e == "libx264") {
+    if has_libx264 {
         for preset in ["faster", "veryfast", "superfast", "ultrafast"] {
             out.push(DiscoveredEncoder {
                 backend: "libx264".into(),
@@ -1439,10 +1413,12 @@ impl Engine {
             }
         }
         let job_id = params.job_id.clone();
+        let cancel_flag = params.cancel.clone();
         let done_guard = WorkerDoneGuard(params.done_tx.clone());
         let outcome = self.run_benchmark_task_inner(params).await;
-        // All encoders, sampler threads, and temp folders are dropped before signalling `worker_done` (C3).
-        drop(done_guard);
+        // All encoders, sampler threads, and temp folders are dropped inside
+        // `run_benchmark_task_inner`; apply final state before releasing `done_guard` (C3).
+        let outcome = if cancel_flag.load(Ordering::Acquire) { WorkerOutcome::Cancelled } else { outcome };
         match outcome {
             WorkerOutcome::Cancelled => self.finish_bench_cancelled(&job_id),
             WorkerOutcome::Failed(mode, error, candidates) => {
@@ -1455,6 +1431,7 @@ impl Engine {
                 {
                     r.started_mono.elapsed().as_millis() as u64
                 } else {
+                    drop(done_guard);
                     return;
                 };
                 slot.state = MachineState::Done(DoneInner {
@@ -1470,6 +1447,7 @@ impl Engine {
                 self.emit_auto_config_frame(&view);
             }
         }
+        drop(done_guard);
     }
 
     async fn run_benchmark_task_inner(&self, params: BenchmarkTaskParams) -> WorkerOutcome {
@@ -1583,6 +1561,9 @@ impl Engine {
                 }
             }
             let encoders = discover_encoders_cancellable(&cancel_clone);
+            if cancel_clone.load(Ordering::Acquire) {
+                return Err("cancelled".into());
+            }
             if encoders.is_empty() {
                 return Err(
                     "No working video encoder was found on this computer. Install FFmpeg or check your graphics drivers."
@@ -2832,5 +2813,35 @@ mod tests {
             "auto_config_cancel reported Idle while worker still held hardware encoder session!"
         );
         assert!(engine.studio_record(true).await.is_ok(), "outputs allowed once cancel waited for teardown");
+    }
+
+    #[test]
+    fn bench_encoder_discovery_matches_live_selection_path() {
+        // Off-macOS: only the single live FFmpeg hardware encoder (e.g. h264_nvenc or h264_qsv) is
+        // included — never alternative GPU backends that VideoEncoder::new won't open.
+        let nv = select_bench_encoders(false, Some("h264_nvenc"), true);
+        let hw_nv: Vec<_> = nv.iter().filter(|e| e.family.is_hardware()).collect();
+        assert_eq!(hw_nv.len(), 1);
+        assert_eq!(hw_nv[0].backend, "h264_nvenc");
+        assert_eq!(hw_nv[0].studio_encoder_id, "ffmpeg_hardware");
+        assert_eq!(nv.iter().filter(|e| !e.family.is_hardware()).count(), 4);
+
+        let qsv = select_bench_encoders(false, Some("h264_qsv"), true);
+        let hw_qsv: Vec<_> = qsv.iter().filter(|e| e.family.is_hardware()).collect();
+        assert_eq!(hw_qsv.len(), 1);
+        assert_eq!(hw_qsv[0].backend, "h264_qsv");
+        assert_eq!(hw_qsv[0].studio_encoder_id, "ffmpeg_hardware");
+
+        // When no hardware FFmpeg encoder works (or live fell back to libx264), never emit ffmpeg_hardware.
+        let sw_only = select_bench_encoders(false, None, true);
+        assert!(sw_only.iter().all(|e| !e.family.is_hardware() && e.studio_encoder_id == "obs_x264"));
+        assert_eq!(sw_only.len(), 4);
+
+        // macOS always uses native VideoToolbox + libx264 (never ffmpeg_hardware).
+        let mac = select_bench_encoders(true, Some("h264_videotoolbox"), true);
+        let hw_mac: Vec<_> = mac.iter().filter(|e| e.family.is_hardware()).collect();
+        assert_eq!(hw_mac.len(), 1);
+        assert_eq!(hw_mac[0].studio_encoder_id, "com.apple.videotoolbox.videoencoder.ave.avc");
+        assert!(hw_mac[0].ffmpeg_name.is_none());
     }
 }

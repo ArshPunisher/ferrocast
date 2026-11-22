@@ -95,15 +95,25 @@ pub fn path() -> Option<PathBuf> {
     ffmpeg()
 }
 
-/// The H.264 encoders tried, best first, on this system.
-fn candidates() -> &'static [&'static str] {
-    if cfg!(windows) {
+/// Platform-ordered H.264 FFmpeg candidates, hardware first then `libx264` (C4 single source of truth).
+pub fn candidates_for_platform(is_windows: bool, is_macos: bool) -> &'static [&'static str] {
+    if is_windows {
         &["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"]
-    } else if cfg!(target_os = "macos") {
+    } else if is_macos {
         &["h264_videotoolbox", "libx264"]
     } else {
         &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]
     }
+}
+
+/// The H.264 encoders tried, best first, on this system.
+fn candidates() -> &'static [&'static str] {
+    candidates_for_platform(cfg!(windows), cfg!(target_os = "macos"))
+}
+
+/// Picks the first encoder in `list` that passes `probe` (shared selection logic for live and bench).
+pub fn select_h264_from<'a>(list: &[&'a str], mut probe: impl FnMut(&str) -> bool) -> Option<&'a str> {
+    list.iter().copied().find(|&e| probe(e))
 }
 
 /// What an encoder needs to be the one we mean: Media Foundation's only as a GPU's (its software
@@ -148,7 +158,8 @@ pub fn probe_encoders_cancellable(cancel: Option<&AtomicBool>) -> Vec<String> {
     found
 }
 
-/// The first H.264 encoder that encodes a few frames here (asked once).
+/// The first H.264 encoder that encodes a few frames here (asked once), using the same
+/// platform candidate list as `candidates()`.
 pub fn h264_encoder() -> Option<String> {
     // `FERROCAST_AV_FFMPEG_ENCODER=libx264` picks one (to test it, or to work round a driver).
     if let Ok(e) = std::env::var("FERROCAST_AV_FFMPEG_ENCODER")
@@ -159,16 +170,37 @@ pub fn h264_encoder() -> Option<String> {
     ENCODER
         .get_or_init(|| {
             let ff = ffmpeg()?;
-            let default_list: &[&str] = if cfg!(windows) {
-                &["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"]
-            } else if cfg!(target_os = "macos") {
-                &["h264_videotoolbox", "libx264"]
-            } else {
-                &["h264_nvenc", "libx264"]
-            };
-            default_list.iter().find(|e| probe_with(&ff, e)).map(|e| (*e).to_string())
+            select_h264_from(candidates(), |e| probe_with(&ff, e)).map(String::from)
         })
         .clone()
+}
+
+/// Returns the live FFmpeg hardware H.264 encoder that `VideoEncoder::new` will actually open
+/// off-macOS (`None` on macOS where native VideoToolbox is used, or when only `libx264` works)
+/// and whether `libx264` software encoding works through FFmpeg (C4).
+pub fn discover_live_h264_and_x264(cancel: Option<&AtomicBool>) -> (Option<String>, bool) {
+    if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return (None, false);
+    }
+    if cfg!(target_os = "macos") {
+        let has_x264 =
+            !cancel.is_some_and(|c| c.load(Ordering::Acquire)) && ffmpeg().is_some_and(|ff| probe_with(&ff, "libx264"));
+        return (None, has_x264);
+    }
+    let active = h264_encoder();
+    if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return (None, false);
+    }
+    let live_hw = active.as_deref().filter(|&e| e != "libx264").map(String::from);
+    let has_x264 = if active.as_deref() == Some("libx264") {
+        true
+    } else if active.is_none() {
+        // `h264_encoder()` already probed `libx264` at the tail of `candidates()`.
+        false
+    } else {
+        !cancel.is_some_and(|c| c.load(Ordering::Acquire)) && ffmpeg().is_some_and(|ff| probe_with(&ff, "libx264"))
+    };
+    (live_hw, has_x264)
 }
 
 /// One FLV tag: kind (8 audio, 9 video), time in ms, body.
@@ -1535,5 +1567,17 @@ sleep $slow"#;
         }
         assert!(cancelled_err, "blocking write should abort once cancel fires");
         assert!(started.elapsed() < std::time::Duration::from_secs(2), "blocked past cancel: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn candidates_for_platform_and_live_selection_share_same_order_on_all_oses() {
+        let linux = candidates_for_platform(false, false);
+        assert_eq!(linux, &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]);
+        assert_eq!(select_h264_from(linux, |e| e == "h264_qsv"), Some("h264_qsv"));
+        assert_eq!(select_h264_from(linux, |e| e == "h264_amf"), Some("h264_amf"));
+        let windows = candidates_for_platform(true, false);
+        assert_eq!(windows, &["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"]);
+        let macos = candidates_for_platform(false, true);
+        assert_eq!(macos, &["h264_videotoolbox", "libx264"]);
     }
 }
