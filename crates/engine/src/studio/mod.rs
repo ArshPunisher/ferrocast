@@ -131,6 +131,8 @@ pub(crate) struct Studio {
     /// The Studio's copy and paste of sources and filters: kept while another collection is
     /// opened, gone when the app quits.
     pub clipboard: Mutex<Option<clipboard::Clip>>,
+    /// The clips library's state: its folder override (tests) and the background jobs.
+    pub clips: crate::clips::ClipsState,
 }
 
 impl Default for Studio {
@@ -169,6 +171,7 @@ impl Default for Studio {
             rules_busy: Mutex::default(),
             holds: Mutex::default(),
             clipboard: Mutex::default(),
+            clips: crate::clips::ClipsState::default(),
         }
     }
 }
