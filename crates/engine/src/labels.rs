@@ -73,15 +73,16 @@ pub(crate) struct LabelRuntime {
 }
 
 impl LabelRuntime {
-    fn ensure_train(&mut self, cfg: ComboTrainConfig, now_ms: Millis) -> &mut ComboTrain {
+    /// The train for `cfg`, made if it isn't there. `None` when the limit is reached and every
+    /// existing train is active: nothing live is evicted, and the new configuration is refused
+    /// (its label shows no train) rather than adding state and per-event work without bound.
+    fn ensure_train(&mut self, cfg: ComboTrainConfig, now_ms: Millis) -> Option<&mut ComboTrain> {
         let key = TrainKey::from(cfg);
         if !self.trains.contains_key(&key) && self.trains.len() >= MAX_TRAINS {
-            // Keep trains bounded under adversarial configs by evicting only inactive trains.
-            if let Some(idle_key) = self.trains.iter().find(|(_, t)| !t.view(now_ms).active).map(|(k, _)| *k) {
-                self.trains.remove(&idle_key);
-            }
+            let idle_key = self.trains.iter().find(|(_, t)| !t.view(now_ms).active).map(|(k, _)| *k)?;
+            self.trains.remove(&idle_key);
         }
-        self.trains.entry(key).or_insert_with(|| ComboTrain::new(cfg))
+        Some(self.trains.entry(key).or_insert_with(|| ComboTrain::new(cfg)))
     }
 
     fn observe_event(&mut self, event: &Event, now_ms: Millis) {
@@ -207,7 +208,7 @@ impl Engine {
         rt.latest = latest;
         rt.alltime = alltime;
         rt.monthly.insert(MonthZoneKey::Offset(0), ((m_start, m_end), monthly));
-        rt.ensure_train(ComboTrainConfig::default(), now_ms);
+        let _ = rt.ensure_train(ComboTrainConfig::default(), now_ms);
         rt.hydrated = true;
     }
 
@@ -306,7 +307,7 @@ impl Engine {
 
         let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
         for cfg in train_cfgs {
-            rt.ensure_train(cfg, now_ms);
+            let _ = rt.ensure_train(cfg, now_ms);
         }
 
         let mut counter_vars = Vars::new();
@@ -350,7 +351,7 @@ impl Engine {
                 continue;
             }
 
-            let raw = eval_non_train(&opts, &rt);
+            let raw = eval_non_train(&opts, &rt, now_ms);
             let mut vars = counter_vars.clone();
             vars.insert("value".into(), raw.clone());
             vars.insert("name".into(), raw.clone());
@@ -383,11 +384,14 @@ impl Engine {
     }
 }
 
-fn eval_non_train(opts: &LabelOptions, rt: &LabelRuntime) -> String {
+fn eval_non_train(opts: &LabelOptions, rt: &LabelRuntime, now_ms: Millis) -> String {
     if let Some(latest) = rt.latest.label(opts.source) {
         return latest;
     }
-    let month_totals = rt.monthly.get(&MonthZoneKey::from_opts(opts)).map(|(_, t)| t);
+    // Only a total for the month it is now: after a failed refresh the cache can still hold
+    // last month's, which must not show as this month's.
+    let key = MonthZoneKey::from_opts(opts);
+    let month_totals = rt.monthly.get(&key).filter(|(bounds, _)| *bounds == key.bounds(now_ms)).map(|(_, t)| t);
     match opts.source {
         LabelSource::SessionFollows => rt.session.follows.to_string(),
         LabelSource::SessionSubs => rt.session.subs.to_string(),
@@ -495,7 +499,7 @@ mod tests {
         let cfg = ComboTrainConfig { window_s: 60, step_s: 15, max_s: 90, threshold: 2 };
         {
             let mut rt = engine.inner.labels.lock().unwrap();
-            rt.ensure_train(cfg, now_ms);
+            let _ = rt.ensure_train(cfg, now_ms);
             // Skewed platform timestamps 5 minutes in the past must still ignite using local now_ms
             for (i, who) in ["Fan1", "Fan2"].into_iter().enumerate() {
                 let mut e = Event::live(
@@ -515,7 +519,7 @@ mod tests {
         // Fill MAX_TRAINS other configs and verify the active train is NOT evicted!
         let mut rt = engine.inner.labels.lock().unwrap();
         for w in 10..=(10 + MAX_TRAINS as u32 + 2) {
-            rt.ensure_train(ComboTrainConfig { window_s: w, step_s: 15, max_s: 120, threshold: 2 }, now_ms);
+            let _ = rt.ensure_train(ComboTrainConfig { window_s: w, step_s: 15, max_s: 120, threshold: 2 }, now_ms);
         }
         let active_key = TrainKey::from(cfg);
         assert!(rt.trains.contains_key(&active_key), "active train must not be evicted as idle");
@@ -599,5 +603,46 @@ mod tests {
         rt.end_fill();
         assert_eq!(rt.monthly.get(&key).unwrap().1.follows, 3, "1, 5 from the log, plus 6 seen live");
         assert!(rt.fill_buffer.is_empty(), "nothing is kept once no load is running");
+    }
+
+    #[test]
+    fn the_train_limit_holds_when_every_train_is_active() {
+        let now = Millis(1_000_000);
+        let mut rt = LabelRuntime::default();
+        let live = |i: u32| ComboTrainConfig { window_s: 60 + i, step_s: 15, max_s: 300, threshold: 1 };
+        for i in 0..MAX_TRAINS as u32 {
+            let t = rt.ensure_train(live(i), now).expect("room");
+            let mut e = Event::live(
+                Platform::Twitch,
+                Some(format!("e{i}")),
+                now,
+                EventKind::Follow { actor: Actor::named(Platform::Twitch, "A") },
+            );
+            e.id = format!("e{i}");
+            t.observe_at(&e, now);
+            assert!(t.view(now).active);
+        }
+        assert!(rt.ensure_train(live(99), now).is_none(), "a 25th active configuration is refused");
+        assert_eq!(rt.trains.len(), MAX_TRAINS);
+    }
+
+    #[test]
+    fn last_months_cached_total_is_not_shown_as_this_months() {
+        let now = Millis(1_000_000_000_000);
+        let key = MonthZoneKey::Offset(0);
+        let (cur_start, cur_end) = key.bounds(now);
+        let mut rt = LabelRuntime::default();
+        let mut old = PeriodTotals::default();
+        old.follows = 7;
+        // The cache still holds an entry for the month before.
+        rt.monthly.insert(key.clone(), ((Millis(cur_start.0 - 2_678_400_000), cur_start), old));
+        let opts =
+            validate_label(&json!({ "source": "monthly_follows", "template": "{value}", "timezone_offset_min": 0 }))
+                .unwrap();
+        assert_eq!(eval_non_train(&opts, &rt, now), "0");
+        let mut fresh = PeriodTotals::default();
+        fresh.follows = 2;
+        rt.monthly.insert(key, ((cur_start, cur_end), fresh));
+        assert_eq!(eval_non_train(&opts, &rt, now), "2");
     }
 }
