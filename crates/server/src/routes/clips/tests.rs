@@ -249,3 +249,116 @@ async fn a_clip_plays_with_ranges_and_only_by_its_plain_name() {
         assert_eq!((s, c.as_str()), (StatusCode::NOT_FOUND, "clip_not_found"));
     }
 }
+
+fn ffmpeg() -> Option<std::path::PathBuf> {
+    std::env::var_os("FERROCAST_FFMPEG")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(ferrocast_engine::golive::find_ffmpeg)
+}
+
+fn make_clip(ffmpeg: &std::path::Path, out: &std::path::Path, secs: u32, size: &str, audio: bool) {
+    let mut c = std::process::Command::new(ffmpeg);
+    c.args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("testsrc=size={size}:rate=30:duration={secs}"));
+    if audio {
+        c.args(["-f", "lavfi", "-i"]).arg(format!("sine=frequency=440:duration={secs}"));
+    }
+    c.args(["-c:v", "libx264", "-pix_fmt", "yuv420p"]);
+    if audio {
+        c.args(["-c:a", "aac", "-shortest"]);
+    }
+    assert!(c.arg(out).status().unwrap().success());
+}
+
+async fn job_done(r: &Running, id: &str) -> Value {
+    for _ in 0..300 {
+        let (s, v) = body(r.get(&format!("/clips/jobs/{id}")).await).await;
+        assert_eq!(s, StatusCode::OK);
+        if !matches!(v["state"].as_str(), Some("queued" | "running")) {
+            return v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("job didn't finish");
+}
+
+/// The whole flow over HTTP with a real ffmpeg and two generated clips: compile with a crossfade,
+/// look at the result (facts, picture, bytes), trim it, rename it, and put it in the (test) Trash.
+#[tokio::test]
+async fn two_generated_clips_are_compiled_trimmed_renamed_and_trashed_over_http() {
+    let Some(ffmpeg) = ffmpeg() else {
+        eprintln!("SKIPPED: no ffmpeg on this machine");
+        return;
+    };
+    let r = start().await;
+    let trash = tempfile::tempdir().unwrap();
+    r.engine.set_trash_folder_for_test(Some(trash.path().to_path_buf()));
+    make_clip(&ffmpeg, &r.clips.path().join("one.mp4"), 3, "640x360", true);
+    make_clip(&ffmpeg, &r.clips.path().join("two.mp4"), 3, "320x240", false);
+    let (s, job) = body(
+        r.post(
+            "/clips/compile",
+            json!({ "clips": ["one.mp4", "two.mp4"], "crossfade_s": 0.5, "normalize": true, "name": "Highlights" }),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{job}");
+    let done = job_done(&r, job["id"].as_str().unwrap()).await;
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["output"], "Highlights.mp4");
+    let (_, probe) = body(r.get("/clips/Highlights.mp4").await).await;
+    let d = probe["duration_ms"].as_u64().unwrap();
+    assert!((5300..=5800).contains(&d), "length {d}");
+    assert_eq!(
+        (probe["width"].as_u64(), probe["height"].as_u64(), probe["has_audio"].as_bool()),
+        (Some(640), Some(360), Some(true))
+    );
+    let (_, thumb) = body(r.get("/clips/Highlights.mp4/thumbnail").await).await;
+    assert!(thumb["image"].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
+    let part = r
+        .client
+        .get(format!("{}/api/v1/clips/Highlights.mp4/file", r.base))
+        .bearer_auth(&r.token)
+        .header("range", "bytes=0-7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(part.bytes().await.unwrap().len(), 8);
+    // Trim a second of it, exactly.
+    let (s, tj) =
+        body(r.post("/clips/Highlights.mp4/trim", json!({ "start_ms": 1000, "end_ms": 3000, "precise": true })).await)
+            .await;
+    assert_eq!(s, StatusCode::ACCEPTED, "{tj}");
+    let td = job_done(&r, tj["id"].as_str().unwrap()).await;
+    assert_eq!((td["state"].as_str(), td["output"].as_str()), (Some("done"), Some("Highlights trimmed.mp4")));
+    // The listing shows all of them, the edits as edits; no half-made file is left.
+    let (_, list) = body(r.get("/clips").await).await;
+    let kinds: Vec<(&str, &str)> = list["clips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["id"].as_str().unwrap(), c["kind"].as_str().unwrap()))
+        .collect();
+    assert!(kinds.contains(&("Highlights.mp4", "recording")), "{kinds:?}");
+    assert!(kinds.contains(&("Highlights trimmed.mp4", "edit")), "{kinds:?}");
+    assert!(
+        std::fs::read_dir(r.clips.path())
+            .unwrap()
+            .flatten()
+            .all(|f| !f.file_name().to_string_lossy().ends_with(".part"))
+    );
+    let (s, v) = body(r.put("/clips/Highlights%20trimmed.mp4", json!({ "name": "Best bit" })).await).await;
+    assert_eq!((s, v["id"].as_str()), (StatusCode::OK, Some("Best bit.mp4")));
+    assert_eq!(r.delete("/clips/Best%20bit.mp4").await.status(), StatusCode::NO_CONTENT);
+    assert!(trash.path().join("Best bit.mp4").is_file() && !r.clips.path().join("Best bit.mp4").exists());
+    // The jobs stay listed until dismissed.
+    let (_, jobs) = body(r.get("/clips/jobs").await).await;
+    assert_eq!(jobs["jobs"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        r.delete(&format!("/clips/jobs/{}", job["id"].as_str().unwrap())).await.status(),
+        StatusCode::NO_CONTENT
+    );
+}
