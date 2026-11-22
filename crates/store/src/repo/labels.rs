@@ -71,12 +71,18 @@ pub fn latest_labels(store: &Store) -> Result<LatestLabels> {
 
         // Simple single-row kinds
         for kind in ["follow", "subscription", "gift_batch", "raid"] {
-            let mut st = c.prepare(
+            let sql = if kind == "subscription" {
+                "SELECT id, platform, source_id, origin, occurred_at, received_at, data, seq
+                 FROM events
+                 WHERE origin = 'live' AND hidden = 0 AND kind = ?1 AND json_extract(data, '$.gifted_by') IS NULL
+                 ORDER BY seq DESC LIMIT 1"
+            } else {
                 "SELECT id, platform, source_id, origin, occurred_at, received_at, data, seq
                  FROM events
                  WHERE origin = 'live' AND hidden = 0 AND kind = ?1
-                 ORDER BY seq DESC LIMIT 1",
-            )?;
+                 ORDER BY seq DESC LIMIT 1"
+            };
+            let mut st = c.prepare(sql)?;
             let mut rows = st.query_map([kind], row_to_event)?;
             if let Some(ev) = rows.next().transpose()? {
                 latest.observe(&ev);
@@ -245,5 +251,50 @@ mod tests {
         assert_eq!(latest.label(LabelSource::LatestBits).as_deref(), Some("FebBits 750 bits"));
         assert_eq!(latest.label(LabelSource::LatestRaid).as_deref(), Some("FebRaider (33)"));
         assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn latest_labels_excludes_gifted_subscription_recipients() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let base = 1_700_000_000_000i64;
+        let a = |n: &str| {
+            let mut actor = Actor::named(ferrocast_core::event::Platform::Twitch, n);
+            actor.id = Some(n.into());
+            actor
+        };
+        insert(
+            &store,
+            &ev(
+                "s-own",
+                base,
+                EventKind::Subscription {
+                    actor: a("OwnSub"),
+                    tier: Tier::Tier1,
+                    months: 1,
+                    gifted_by: None,
+                    message: None,
+                },
+            ),
+        )
+        .unwrap();
+        insert(
+            &store,
+            &ev(
+                "s-gifted",
+                base + 1000,
+                EventKind::Subscription {
+                    actor: a("GiftedRecipient"),
+                    tier: Tier::Tier1,
+                    months: 1,
+                    gifted_by: Some(a("Gifter")),
+                    message: None,
+                },
+            ),
+        )
+        .unwrap();
+
+        let latest = latest_labels(&store).unwrap();
+        assert_eq!(latest.label(LabelSource::LatestSub).as_deref(), Some("OwnSub"));
     }
 }

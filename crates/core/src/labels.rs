@@ -132,7 +132,7 @@ impl PeriodTotals {
             EventKind::Follow { .. } => {
                 self.follows = self.follows.saturating_add(1);
             }
-            EventKind::Subscription { actor, .. } => {
+            EventKind::Subscription { actor, gifted_by: None, .. } => {
                 self.subs = self.subs.saturating_add(1);
                 if !actor.anonymous {
                     let k = actor_key(event.platform, actor.id.as_deref(), &actor.display_name);
@@ -292,7 +292,7 @@ impl LatestLabels {
             EventKind::Follow { actor } => {
                 self.follower = Some(actor.display_name.clone());
             }
-            EventKind::Subscription { actor, .. } => {
+            EventKind::Subscription { actor, gifted_by: None, .. } => {
                 self.sub = Some(actor.display_name.clone());
             }
             EventKind::GiftBatch { gifter, count, .. } => {
@@ -558,7 +558,7 @@ fn train_actor(event: &Event) -> Option<(String, String)> {
         EventKind::Follow { actor } => {
             Some((actor_key(event.platform, actor.id.as_deref(), &actor.display_name), actor.display_name.clone()))
         }
-        EventKind::Subscription { actor, .. } => {
+        EventKind::Subscription { actor, gifted_by: None, .. } => {
             Some((actor_key(event.platform, actor.id.as_deref(), &actor.display_name), actor.display_name.clone()))
         }
         EventKind::GiftBatch { gifter, .. } => {
@@ -889,5 +889,50 @@ mod tests {
         assert!(!train.view(Millis(190_000)).active);
         assert!(train.tick(Millis(190_000)));
         assert_eq!(train.render("{value}", Millis(190_000)), "");
+    }
+
+    #[test]
+    fn gifted_subscription_recipients_are_not_double_counted() {
+        let mut period = PeriodTotals::default();
+        let mut latest = LatestLabels::default();
+        let mut train = ComboTrain::new(ComboTrainConfig { window_s: 60, step_s: 15, max_s: 90, threshold: 2 });
+
+        let own_sub = sub(1_000, "RealSub");
+        let batch = Event::live(
+            Platform::Twitch,
+            Some("gb1".into()),
+            Millis(2_000),
+            EventKind::GiftBatch { gifter: who("GenerousGifter"), tier: Tier::Tier1, count: 5 },
+        );
+        let gifted_sub = Event::live(
+            Platform::Twitch,
+            Some("gs1".into()),
+            Millis(2_100),
+            EventKind::Subscription {
+                actor: who("LuckyRecipient"),
+                tier: Tier::Tier1,
+                months: 1,
+                gifted_by: Some(who("GenerousGifter")),
+                message: None,
+            },
+        );
+
+        for ev in [&own_sub, &batch, &gifted_sub] {
+            period.observe(ev);
+            latest.observe(ev);
+            train.observe(ev);
+        }
+
+        // 1 own sub + 5 from GiftBatch = 6 total (not 7!)
+        assert_eq!(period.subs, 6);
+        assert!(!period.supporters.values().any(|s| s.name == "LuckyRecipient"));
+        assert_eq!(latest.label(LabelSource::LatestSub).as_deref(), Some("RealSub"));
+        assert_eq!(latest.label(LabelSource::LatestGifter).as_deref(), Some("GenerousGifter (5)"));
+
+        // Train only counts own_sub + batch = 2 events (not 3!)
+        let v = train.view(Millis(2_100));
+        assert!(v.active);
+        assert_eq!(v.events, 2);
+        assert_eq!(v.latest_actor.as_deref(), Some("GenerousGifter"));
     }
 }
