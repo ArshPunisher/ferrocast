@@ -606,3 +606,12 @@ async fn the_job_queue_has_a_limit() {
     let again = e.start_clip_job(JobKind::Trim, "now fine".into(), |_ctx| async move { Ok(Made { output: None }) });
     assert_ne!(again.state, JobState::Failed, "{again:?}");
 }
+
+/// A crossfade too small to matter is none, in the check and in the graph alike.
+#[test]
+fn a_tiny_crossfade_is_none_everywhere() {
+    let (g0, t0) = compile_graph(&[piece("a.mp4", 5000, true), piece("b.mp4", 5000, true)], 640, 360, 0.0004, false);
+    let (g1, t1) = compile_graph(&[piece("a.mp4", 5000, true), piece("b.mp4", 5000, true)], 640, 360, 0.0, false);
+    assert_eq!((g0, t0), (g1, t1), "0.4 ms is rounded away like 0");
+    assert!(fade_ms_of(0.0004) == 0 && fade_ms_of(0.0006) == 1);
+}

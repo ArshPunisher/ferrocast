@@ -121,7 +121,8 @@ pub fn plain_name(raw: &str) -> Result<&str, EngineError> {
         )
     };
     let n = raw.trim_matches(' ');
-    if n.is_empty() || n.chars().count() > MAX_NAME + 8 {
+    // In bytes too: a file system takes a limited number, and "name 999.mp4.part" is added.
+    if n.is_empty() || n.chars().count() > MAX_NAME + 8 || n.len() > MAX_NAME_BYTES {
         return Err(bad("it is empty or too long"));
     }
     if n != raw || n.starts_with('.') || n.ends_with('.') {
@@ -131,7 +132,8 @@ pub fn plain_name(raw: &str) -> Result<&str, EngineError> {
     {
         return Err(bad("it has a character a file name can't have"));
     }
-    let stem = n.split('.').next().unwrap_or(n).to_ascii_uppercase();
+    // "CON .mp4" is the device too: Windows ignores trailing spaces before the dot.
+    let stem = n.split('.').next().unwrap_or(n).trim_end().to_ascii_uppercase();
     let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || ((stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.chars().count() == 4
@@ -143,9 +145,12 @@ pub fn plain_name(raw: &str) -> Result<&str, EngineError> {
 }
 
 /// A new clip's name, without its extension.
+/// The most bytes a clip's name may take (leaving room for " 999.mp4.part" in a 255 byte limit).
+const MAX_NAME_BYTES: usize = 200;
+
 pub fn new_stem(raw: &str) -> Result<String, EngineError> {
     let n = plain_name(raw)?;
-    if n.chars().count() > MAX_NAME {
+    if n.chars().count() > MAX_NAME || n.len() > MAX_NAME_BYTES - 20 {
         return Err(refuse(
             400,
             "bad_clip_name",
@@ -363,12 +368,17 @@ pub fn parse_probe(stderr: &str) -> Probe {
     for line in stderr.lines() {
         let l = line.trim();
         // "displaymatrix: rotation of -90.00 degrees": a phone's portrait video is stored sideways.
-        if let Some(rest) = l.split("rotation of").nth(1)
+        // Only the stream's own side-data line, never a container tag (a title or comment can say
+        // anything).
+        if l.starts_with("displaymatrix:")
+            && let Some(rest) = l.split("rotation of").nth(1)
             && let Some(deg) = rest.split_whitespace().next().and_then(|d| d.parse::<f32>().ok())
         {
             quarter_turn = (deg.abs().round() as i64 % 180) == 90;
         }
-        if let Some(rest) = l.strip_prefix("Duration:") {
+        if p.duration_ms.is_none()
+            && let Some(rest) = l.strip_prefix("Duration:")
+        {
             let t = rest.trim().split(',').next().unwrap_or("").trim();
             let parts: Vec<&str> = t.split(':').collect();
             if let [h, m, s] = parts.as_slice()

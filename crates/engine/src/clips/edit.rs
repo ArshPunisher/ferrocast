@@ -100,6 +100,11 @@ pub struct Piece {
 }
 
 /// The filter graph and total length (ms) of a compilation at `w`×`h`.
+/// A crossfade in whole milliseconds: rounded (not cut), so the check and the graph agree.
+pub(crate) fn fade_ms_of(fade_s: f32) -> u64 {
+    (fade_s.clamp(0.0, MAX_FADE_S) * 1000.0).round() as u64
+}
+
 pub fn compile_graph(pieces: &[Piece], w: u32, h: u32, fade_s: f32, normalize: bool) -> (String, u64) {
     let n = pieces.len();
     let fps = pieces.first().map_or(30, |p| p.fps.clamp(24, 60));
@@ -122,7 +127,7 @@ pub fn compile_graph(pieces: &[Piece], w: u32, h: u32, fade_s: f32, normalize: b
             );
         }
     }
-    let fade_ms = (fade_s.clamp(0.0, MAX_FADE_S) * 1000.0).round() as u64;
+    let fade_ms = fade_ms_of(fade_s);
     let total;
     let (mut v_last, mut a_last) = ("[v0]".to_string(), "[a0]".to_string());
     if fade_ms == 0 {
@@ -433,7 +438,7 @@ impl Engine {
                     "Leave it out, or wait until it is saved.",
                 )
             })?;
-            let fade_ms = (req.crossfade_s * 1000.0) as u64;
+            let fade_ms = fade_ms_of(req.crossfade_s);
             if fade_ms > 0 && d < fade_ms * 2 {
                 return Err(refuse(
                     400,

@@ -413,3 +413,37 @@ async fn a_linked_srt_beside_a_clip_is_left_alone() {
     assert_eq!(std::fs::read(outside.path().join("id_rsa")).unwrap(), b"PRIVATE KEY");
     assert!(std::fs::symlink_metadata(clips.path().join("Game.srt")).is_ok(), "the link itself was taken");
 }
+
+#[test]
+fn a_name_fits_the_file_system_in_bytes_and_a_device_name_with_a_space_is_still_one() {
+    // 120 three-byte characters are 360 bytes: over what a file system takes for a name.
+    assert!(new_stem(&"€".repeat(100)).is_err(), "a name of many bytes");
+    assert!(new_stem(&"a".repeat(100)).is_ok());
+    for dev in ["CON .mp4", "nul  .mkv", "Com1 .mp4"] {
+        assert!(plain_name(dev).is_err(), "{dev:?} is a Windows device name");
+    }
+}
+
+#[test]
+fn ffmpeg_out_of_disk_is_said_as_that_not_as_a_bad_clip() {
+    let stderr = "Input #0, mov, from 'a.mp4':\nStream mapping:\n[out#0/mp4] Error writing trailer: No space left on device\nError closing file x.part: No space left on device\n";
+    let e = crate::clips::jobs::ffmpeg_trouble_from(stderr);
+    let EngineError::Refused { message, hint, status, .. } = e else { panic!() };
+    assert_eq!(status, 507, "insufficient storage");
+    assert!(message.to_lowercase().contains("disk") || message.to_lowercase().contains("space"), "{message}");
+    assert!(hint.to_lowercase().contains("free"), "{hint}");
+    // Any other failure keeps the line that says what happened (the last, not an early warning).
+    let other = crate::clips::jobs::ffmpeg_trouble_from(
+        "warning: something odd\nx.mp4: Invalid data found when processing input\n",
+    );
+    let EngineError::Refused { message, .. } = other else { panic!() };
+    assert!(message.contains("Invalid data"), "{message}");
+}
+
+#[test]
+fn only_the_streams_own_lines_set_the_duration_and_the_rotation() {
+    let text = "Input #0, mov,mp4, from 'a.mp4':\n  Metadata:\n    title           : Duration: 99:00:00.00, start: 0\n    comment         : rotation of -90.00 degrees\n  Duration: 00:00:10.00, start: 0.000000, bitrate: 1000 kb/s\n  Stream #0:0: Video: h264, yuv420p, 1920x1080, 30 fps\n";
+    let p = parse_probe(text);
+    assert_eq!(p.duration_ms, Some(10_000), "a title tag set the length");
+    assert_eq!((p.width, p.height), (Some(1920), Some(1080)), "a comment tag turned the picture");
+}

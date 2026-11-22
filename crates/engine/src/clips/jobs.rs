@@ -452,7 +452,7 @@ pub(crate) async fn run_ffmpeg(
         _ => {
             let _ = tokio::fs::remove_file(part).await;
             tracing::warn!(error = %text.trim(), "ffmpeg failed on a clip job");
-            return Err(ffmpeg_trouble(first_line(&text)));
+            return Err(ffmpeg_trouble_from(&text));
         }
     }
     // The finished file takes its name only if nothing is there.
@@ -476,9 +476,27 @@ impl Drop for PartGuard {
     }
 }
 
+#[allow(dead_code)]
 fn first_line(t: &str) -> String {
     let l = t.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("it stopped without saying why");
     l.chars().take(160).collect()
+}
+
+/// What ffmpeg said, as the trouble: a full disk is said as that (with what to do), otherwise the
+/// last line that says what went wrong (the early ones are often warnings).
+pub(crate) fn ffmpeg_trouble_from(stderr: &str) -> EngineError {
+    let lower = stderr.to_lowercase();
+    if lower.contains("no space left on device") || lower.contains("disk full") || lower.contains("not enough space") {
+        return EngineError::Refused {
+            status: 507,
+            code: "disk_full",
+            message: "The disk is full, so the clip couldn't be saved.".into(),
+            hint: "Free some space in the recordings folder, then try again.".into(),
+            retry_after: None,
+        };
+    }
+    let last = stderr.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("it stopped without saying why");
+    ffmpeg_trouble(last.chars().take(160).collect())
 }
 
 fn ffmpeg_trouble(why: String) -> EngineError {
