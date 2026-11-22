@@ -245,7 +245,18 @@ async fn media_response(app: &AppState, id: &str, headers: &HeaderMap) -> Respon
 
 /// An open file as a response, honouring one `Range` (a video seeks), sent only as media:
 /// `nosniff` and a sandboxing CSP, since it shares the dashboard's origin.
-pub(crate) async fn range_response(mut file: tokio::fs::File, mime: &str, headers: &HeaderMap) -> Response {
+pub(crate) async fn range_response(file: tokio::fs::File, mime: &str, headers: &HeaderMap) -> Response {
+    range_response_cached(file, mime, headers, "private, max-age=3600").await
+}
+
+/// `range_response` with its own `Cache-Control` (a file reached with a session in its address
+/// is sent `no-store`).
+pub(crate) async fn range_response_cached(
+    mut file: tokio::fs::File,
+    mime: &str,
+    headers: &HeaderMap,
+    cache_control: &str,
+) -> Response {
     // The size on disk, not the stored one: a wrong Content-Length breaks the response.
     let len = match file.metadata().await {
         Ok(m) => m.len(),
@@ -255,7 +266,7 @@ pub(crate) async fn range_response(mut file: tokio::fs::File, mime: &str, header
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, mime)
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CACHE_CONTROL, "private, max-age=3600")
+        .header(header::CACHE_CONTROL, cache_control)
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CONTENT_SECURITY_POLICY, "default-src 'none'; sandbox")
         .header(header::REFERRER_POLICY, "no-referrer");

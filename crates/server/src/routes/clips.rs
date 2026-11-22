@@ -18,6 +18,22 @@ use crate::AppState;
 use crate::error::ApiResult;
 use crate::extract::{Body, OptionalBody};
 
+/// Clips are this PC's own: a paired phone or browser on the network holds a session token too,
+/// and is turned away here (the relay's tunnel is turned away by `remote_scope`).
+async fn at_this_pc(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let from_elsewhere = req.extensions().get::<crate::remote::RemotePrincipal>().is_some()
+        || req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .is_some_and(|c| !crate::is_loopback(c.0.ip()));
+    if from_elsewhere {
+        return crate::error::ApiError::forbidden("Clips are managed at this computer.")
+            .hint("Open Ferrocast on the PC to browse, edit or send clips.")
+            .into_response();
+    }
+    next.run(req).await
+}
+
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/clips", get(list))
@@ -33,6 +49,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/clips/{id}/captions.srt", get(captions_srt))
         .route("/clips/{id}/captions/burn", post(burn))
         .route("/clips/{id}/upload", post(upload))
+        .layer(axum::middleware::from_fn(at_this_pc))
 }
 
 #[derive(Deserialize, Default)]
@@ -64,7 +81,7 @@ async fn file(State(app): State<AppState>, Path(id): Path<String>, headers: Head
         Err(e) => return crate::error::ApiError::from(e).into_response(),
     };
     match tokio::fs::File::open(&path).await {
-        Ok(f) => crate::assets::range_response(f, mime, &headers).await,
+        Ok(f) => crate::assets::range_response_cached(f, mime, &headers, "no-store").await,
         Err(_) => crate::error::ApiError::from(ferrocast_engine::clips::no_such_clip()).into_response(),
     }
 }

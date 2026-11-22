@@ -123,6 +123,13 @@ pub(crate) fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+pub(crate) fn is_loopback(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
 /// Every request: the Host must be ours (anti DNS-rebinding).
 async fn host_guard(State(app): State<AppState>, req: Request, next: Next) -> Response {
     if !app.guard.host_ok(req.headers()) {
@@ -199,6 +206,8 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
 
 #[cfg(test)]
 mod automations_tests;
+#[cfg(test)]
+mod clips_exposure_tests;
 #[cfg(test)]
 mod designs_tests;
 #[cfg(test)]
