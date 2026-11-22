@@ -130,8 +130,22 @@ fn probe_with(ff: &Path, e: &str) -> bool {
 
 /// Lists every H.264 encoder FFmpeg can open here (hardware first, then `libx264`).
 pub fn probe_encoders() -> Vec<String> {
+    probe_encoders_cancellable(None)
+}
+
+/// Lists available H.264 FFmpeg encoders while checking an optional cancellation flag between probes.
+pub fn probe_encoders_cancellable(cancel: Option<&AtomicBool>) -> Vec<String> {
     let Some(ff) = ffmpeg() else { return Vec::new() };
-    candidates().iter().copied().filter(|e| probe_with(&ff, e)).map(String::from).collect()
+    let mut found = Vec::new();
+    for &enc in candidates() {
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            break;
+        }
+        if probe_with(&ff, enc) {
+            found.push(enc.to_string());
+        }
+    }
+    found
 }
 
 /// The first H.264 encoder that encodes a few frames here (asked once).
@@ -271,6 +285,33 @@ impl Proc {
             return Err(self.died());
         }
         Ok(())
+    }
+
+    /// Bounded blocking write that aborts immediately and kills FFmpeg when `cancel` is signalled.
+    fn write_cancellable(&mut self, mut bytes: Vec<u8>, cancel: Option<&AtomicBool>) -> Result<(), AvError> {
+        let Some(flag) = cancel else {
+            return self.write(bytes);
+        };
+        loop {
+            if flag.load(Ordering::Acquire) {
+                self.stdin = None;
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err(AvError::Encoder("FFmpeg cancelled".into()));
+            }
+            let w = self.stdin.as_ref().ok_or_else(|| AvError::Encoder("the encoder was already finished".into()))?;
+            if self.broken.load(Ordering::Acquire) {
+                return Err(self.died());
+            }
+            match w.try_send(bytes) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(b)) => {
+                    bytes = b;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(TrySendError::Disconnected(_)) => return Err(self.died()),
+            }
+        }
     }
 
     /// As [`Self::write`], but never waits: false when FFmpeg is a whole queue behind (the frame
@@ -488,6 +529,8 @@ pub(crate) struct Video {
     pub(crate) skipped: u64,
     /// When set, writes block on a tiny pipe queue so benchmarks measure true encoder throughput.
     blocking: bool,
+    /// Optional cancellation signal for blocking benchmark writes (C3).
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for Video {
@@ -509,7 +552,12 @@ impl Video {
         Ok(Self::with_proc(Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?, cfg, enc, false))
     }
 
-    pub(crate) fn new_named(cfg: &VideoConfig, encoder: &str, blocking_cap: Option<usize>) -> Result<Self, AvError> {
+    pub(crate) fn new_named(
+        cfg: &VideoConfig,
+        encoder: &str,
+        blocking_cap: Option<usize>,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<Self, AvError> {
         if cfg.codec != VideoCodec::H264 {
             return Err(AvError::Encoder("HEVC through FFmpeg isn't done yet: H.264 is".into()));
         }
@@ -517,7 +565,9 @@ impl Video {
             Some(cap) => Proc::spawn_bounded(&args(cfg, encoder), cap)?,
             None => Proc::spawn(&args(cfg, encoder), frame_bytes(cfg))?,
         };
-        Ok(Self::with_proc(proc, cfg, encoder.to_string(), blocking_cap.is_some()))
+        let mut video = Self::with_proc(proc, cfg, encoder.to_string(), blocking_cap.is_some());
+        video.cancel = cancel;
+        Ok(video)
     }
 
     fn with_proc(proc: Proc, cfg: &VideoConfig, name: String, blocking: bool) -> Self {
@@ -539,6 +589,7 @@ impl Video {
             made_upto: None,
             skipped: 0,
             blocking,
+            cancel: None,
         }
     }
 
@@ -891,7 +942,7 @@ impl Video {
         // Each packet gets its time from `times` in order, so a frame left out is just missing:
         // nothing after it moves.
         if self.blocking {
-            self.proc.write(raw)?;
+            self.proc.write_cancellable(raw, self.cancel.as_deref())?;
             self.times.push_back(pts_us);
         } else if self.proc.try_write(raw)? {
             self.times.push_back(pts_us);
@@ -1453,5 +1504,36 @@ sleep $slow"#;
         let got = drain_stderr(std::io::Cursor::new(big.as_bytes()));
         assert_eq!(got.chars().count(), 400);
         assert!(got.ends_with("FINAL_ERROR_TAIL"), "got tail: {got}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_write_unblocks_and_kills_stalled_encoder_on_cancel() {
+        let mut stuck = Command::new("sh");
+        stuck.args(["-c", "exec sleep 30"]);
+        let proc = Proc::start_with_cap(stuck, 1).unwrap_or_else(|e| panic!("{e}"));
+        let mut c = cfg(RateControl::Cbr);
+        (c.width, c.height) = (128, 128);
+        let big = 128 * 128 * 3 / 2;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut v = Video::with_proc(proc, &c, "fake".into(), true);
+        v.cancel = Some(cancel.clone());
+
+        let cancel_bg = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            cancel_bg.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let mut cancelled_err = false;
+        for i in 0..20 {
+            if let Err(e) = v.encode_raw(vec![0u8; big], i) {
+                assert!(e.to_string().contains("cancelled"), "unexpected error: {e}");
+                cancelled_err = true;
+                break;
+            }
+        }
+        assert!(cancelled_err, "blocking write should abort once cancel fires");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "blocked past cancel: {:?}", started.elapsed());
     }
 }

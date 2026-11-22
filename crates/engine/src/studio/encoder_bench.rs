@@ -285,8 +285,9 @@ struct RunningInner {
     candidates: Vec<BenchCandidate>,
     upload_check: Option<UploadCheck>,
     cancel: Arc<AtomicBool>,
+    cancelling: bool,
     cancel_notify: Arc<Notify>,
-    scratch_dir: Option<PathBuf>,
+    worker_done: tokio::sync::watch::Receiver<bool>,
 }
 
 #[derive(Debug)]
@@ -323,17 +324,35 @@ pub struct AutoConfigSlot {
     seq: u64,
     state: MachineState,
     timing: BenchTiming,
+    #[cfg(test)]
+    test_session_alive: Option<Arc<AtomicBool>>,
+    #[cfg(test)]
+    test_step_delay: Option<Duration>,
 }
 
 impl Default for AutoConfigSlot {
     fn default() -> Self {
-        Self { seq: 0, state: MachineState::Idle, timing: BenchTiming::default() }
+        Self {
+            seq: 0,
+            state: MachineState::Idle,
+            timing: BenchTiming::default(),
+            #[cfg(test)]
+            test_session_alive: None,
+            #[cfg(test)]
+            test_step_delay: None,
+        }
     }
 }
 
 impl AutoConfigSlot {
     pub fn set_timing_for_test(&mut self, timing: BenchTiming) {
         self.timing = timing;
+    }
+
+    #[cfg(test)]
+    fn set_worker_hook_for_test(&mut self, alive: Arc<AtomicBool>, delay: Duration) {
+        self.test_session_alive = Some(alive);
+        self.test_step_delay = Some(delay);
     }
 
     fn next_job_id(&mut self) -> String {
@@ -564,10 +583,13 @@ struct DiscoveredEncoder {
     preset: Option<String>,
 }
 
-fn discover_encoders() -> Vec<DiscoveredEncoder> {
+fn discover_encoders_cancellable(cancel: &AtomicBool) -> Vec<DiscoveredEncoder> {
     let mut out = Vec::new();
     #[cfg(target_os = "macos")]
     {
+        if cancel.load(Ordering::Acquire) {
+            return out;
+        }
         out.push(DiscoveredEncoder {
             backend: "videotoolbox".into(),
             studio_encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
@@ -578,7 +600,7 @@ fn discover_encoders() -> Vec<DiscoveredEncoder> {
         });
     }
 
-    let ff_list = ffenc::probe_encoders();
+    let ff_list = ffenc::probe_encoders_cancellable(Some(cancel));
     for enc in &ff_list {
         match enc.as_str() {
             "h264_nvenc" => out.push(DiscoveredEncoder {
@@ -1059,7 +1081,7 @@ fn run_candidate_step(
     fps: u32,
     bitrate_kbps: u32,
     timing: BenchTiming,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     sampler: &BackgroundLoadSampler,
 ) -> Result<BenchCandidate, StepAbort> {
     if cancel.load(Ordering::Relaxed) {
@@ -1092,7 +1114,7 @@ fn run_candidate_step(
     };
 
     // Phase 1: Synchronous/backpressured throughput measurement to find true ms/frame.
-    let mut cap_enc = VideoEncoder::for_benchmark(cfg, cand.ffmpeg_name.as_deref(), Some(2))
+    let mut cap_enc = VideoEncoder::for_benchmark(cfg, cand.ffmpeg_name.as_deref(), Some(2), Some(cancel.clone()))
         .map_err(|e| StepAbort::Failed(format!("{} failed to start: {e}", cand.label)))?;
     let total_burst = timing.burst_frames.max(timing.warmup_frames + 5);
     let mut frame_times_ms = Vec::with_capacity(total_burst as usize);
@@ -1108,13 +1130,20 @@ fn run_candidate_step(
         }
         let t0 = Instant::now();
         let key = i % (fps.max(1) * 2) == 0;
-        cap_enc
-            .encode(frames_data.frame(i as usize), i64::from(i) * frame_us, key)
-            .map_err(|e| StepAbort::Failed(format!("{} encode error: {e}", cand.label)))?;
+        if let Err(e) = cap_enc.encode(frames_data.frame(i as usize), i64::from(i) * frame_us, key) {
+            if cancel.load(Ordering::Acquire) {
+                return Err(StepAbort::Cancelled);
+            }
+            return Err(StepAbort::Failed(format!("{} encode error: {e}", cand.label)));
+        }
         let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if i >= timing.warmup_frames {
             frame_times_ms.push(dt_ms);
         }
+    }
+    if cancel.load(Ordering::Acquire) {
+        drop(cap_enc);
+        return Err(StepAbort::Cancelled);
     }
     let _ = cap_enc.flush();
     let steady_elapsed_ms = steady_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
@@ -1127,7 +1156,7 @@ fn run_candidate_step(
     }
 
     // Phase 2: Real-time paced stability pass (verifies skipped & lagged frames without OS sampler stalls).
-    let mut rt_enc = VideoEncoder::for_benchmark(cfg, cand.ffmpeg_name.as_deref(), None)
+    let mut rt_enc = VideoEncoder::for_benchmark(cfg, cand.ffmpeg_name.as_deref(), None, Some(cancel.clone()))
         .map_err(|e| StepAbort::Failed(format!("{} failed to open realtime pass: {e}", cand.label)))?;
     let rt_warmup = timing.warmup_frames.clamp(1, 3);
     for w_i in 0..rt_warmup {
@@ -1182,6 +1211,10 @@ fn run_candidate_step(
             }
         }
         next_due += frame_interval;
+    }
+    if cancel.load(Ordering::Acquire) {
+        drop(rt_enc);
+        return Err(StepAbort::Cancelled);
     }
     let _ = rt_enc.flush();
     let rt_elapsed = rt_start.elapsed().as_secs_f64().max(0.001);
@@ -1240,6 +1273,20 @@ struct BenchmarkTaskParams {
     timing: BenchTiming,
     cancel: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
+    done_tx: tokio::sync::watch::Sender<bool>,
+}
+
+enum WorkerOutcome {
+    Cancelled,
+    Failed(AutoConfigMode, String, Vec<BenchCandidate>),
+    Done(WorkerDone),
+}
+
+struct WorkerDone {
+    mode: AutoConfigMode,
+    candidates: Vec<BenchCandidate>,
+    upload_check: Option<UploadCheck>,
+    picked: BenchRecommendation,
 }
 
 impl Engine {
@@ -1304,6 +1351,7 @@ impl Engine {
         let _op = self.studio().auto_config_op.lock().await;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_notify = Arc::new(Notify::new());
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
 
         let (job_id, timing, view, canvas) = {
             // Hold `output_gate` across the idle check, settings read, and claim transition so no
@@ -1356,16 +1404,26 @@ impl Engine {
                 candidates: Vec::new(),
                 upload_check: None,
                 cancel: cancel.clone(),
+                cancelling: false,
                 cancel_notify: cancel_notify.clone(),
-                scratch_dir: None,
+                worker_done: done_rx,
             });
             (job_id, timing, slot.view(), canvas)
         };
         self.emit_auto_config_frame(&view);
 
         let engine = self.clone();
-        let params =
-            BenchmarkTaskParams { job_id, mode, fps_pref, include_upload, canvas, timing, cancel, cancel_notify };
+        let params = BenchmarkTaskParams {
+            job_id,
+            mode,
+            fps_pref,
+            include_upload,
+            canvas,
+            timing,
+            cancel,
+            cancel_notify,
+            done_tx,
+        };
         tokio::spawn(async move {
             engine.run_benchmark_task(params).await;
         });
@@ -1374,26 +1432,67 @@ impl Engine {
     }
 
     async fn run_benchmark_task(self, params: BenchmarkTaskParams) {
-        let BenchmarkTaskParams { job_id, mode, fps_pref, include_upload, canvas, timing, cancel, cancel_notify } =
-            params;
+        struct WorkerDoneGuard(tokio::sync::watch::Sender<bool>);
+        impl Drop for WorkerDoneGuard {
+            fn drop(&mut self) {
+                let _ = self.0.send(true);
+            }
+        }
+        let job_id = params.job_id.clone();
+        let done_guard = WorkerDoneGuard(params.done_tx.clone());
+        let outcome = self.run_benchmark_task_inner(params).await;
+        // All encoders, sampler threads, and temp folders are dropped before signalling `worker_done` (C3).
+        drop(done_guard);
+        match outcome {
+            WorkerOutcome::Cancelled => self.finish_bench_cancelled(&job_id),
+            WorkerOutcome::Failed(mode, error, candidates) => {
+                self.finish_bench_failed(&job_id, mode, error, candidates);
+            }
+            WorkerOutcome::Done(done) => {
+                let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+                let elapsed_ms = if let MachineState::Running(r) = &slot.state
+                    && r.job_id == job_id
+                {
+                    r.started_mono.elapsed().as_millis() as u64
+                } else {
+                    return;
+                };
+                slot.state = MachineState::Done(DoneInner {
+                    mode: done.mode,
+                    candidates: done.candidates,
+                    upload_check: done.upload_check,
+                    upload_error: None,
+                    picked: done.picked,
+                    duration_ms: elapsed_ms,
+                });
+                let view = slot.view();
+                drop(slot);
+                self.emit_auto_config_frame(&view);
+            }
+        }
+    }
+
+    async fn run_benchmark_task_inner(&self, params: BenchmarkTaskParams) -> WorkerOutcome {
+        let BenchmarkTaskParams {
+            job_id,
+            mode,
+            fps_pref,
+            include_upload,
+            canvas,
+            timing,
+            cancel,
+            cancel_notify,
+            done_tx: _,
+        } = params;
         self.share_ffmpeg();
         let data_dir = self.golive_data_dir();
         let _temp_dir = match BenchTempDir::create(data_dir, &job_id) {
             Ok(d) => Some(d),
-            Err(e) => {
-                self.finish_bench_failed(&job_id, mode, e, Vec::new());
-                return;
-            }
+            Err(e) => return WorkerOutcome::Failed(mode, e, Vec::new()),
         };
         if let Some(d) = &_temp_dir {
             let marker = d.path().join("probe.lock");
             let _ = std::fs::write(&marker, job_id.as_bytes());
-            let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
-            if let MachineState::Running(r) = &mut slot.state
-                && r.job_id == job_id
-            {
-                r.scratch_dir = Some(d.path().to_path_buf());
-            }
         }
 
         let mut upload_check: Option<UploadCheck> = None;
@@ -1401,24 +1500,17 @@ impl Engine {
             let fut = self.golive_upload_check();
             tokio::pin!(fut);
             let res = tokio::select! {
-                _ = cancel_notify.notified() => {
-                    self.finish_bench_cancelled(&job_id);
-                    return;
-                }
+                _ = cancel_notify.notified() => return WorkerOutcome::Cancelled,
                 r = &mut fut => r,
             };
             match res {
                 Ok(uc) => upload_check = Some(uc),
-                Err(e) => {
-                    self.finish_bench_failed(&job_id, mode, e.to_string(), Vec::new());
-                    return;
-                }
+                Err(e) => return WorkerOutcome::Failed(mode, e.to_string(), Vec::new()),
             }
         }
 
         if cancel.load(Ordering::Relaxed) {
-            self.finish_bench_cancelled(&job_id);
-            return;
+            return WorkerOutcome::Cancelled;
         }
 
         // Gather enabled Go live main destinations so pick logic honours service caps & sharing.
@@ -1463,9 +1555,34 @@ impl Engine {
 
         let host_cpu_supported = self.studio_host().ok().is_some();
         let rt_handle = tokio::runtime::Handle::try_current().ok();
+        #[cfg(test)]
+        let test_hook = {
+            let slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+            slot.test_session_alive.clone().zip(slot.test_step_delay)
+        };
 
         let res = tokio::task::spawn_blocking(move || -> Result<Vec<BenchCandidate>, String> {
-            let encoders = discover_encoders();
+            #[cfg(test)]
+            struct TestSessionGuard(Arc<AtomicBool>);
+            #[cfg(test)]
+            impl Drop for TestSessionGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            #[cfg(test)]
+            let _test_guard = test_hook.as_ref().map(|(alive, _)| {
+                alive.store(true, Ordering::Release);
+                TestSessionGuard(alive.clone())
+            });
+            #[cfg(test)]
+            if let Some((_, delay)) = test_hook {
+                std::thread::sleep(delay);
+                if cancel_clone.load(Ordering::Acquire) {
+                    return Err("cancelled".into());
+                }
+            }
+            let encoders = discover_encoders_cancellable(&cancel_clone);
             if encoders.is_empty() {
                 return Err(
                     "No working video encoder was found on this computer. Install FFmpeg or check your graphics drivers."
@@ -1648,58 +1765,24 @@ impl Engine {
 
         let candidates = match res {
             Ok(Ok(list)) => list,
-            Ok(Err(e)) if e == "cancelled" => {
-                self.finish_bench_cancelled(&job_id);
-                return;
-            }
-            Ok(Err(e)) => {
-                self.finish_bench_failed(&job_id, mode, e, Vec::new());
-                return;
-            }
+            Ok(Err(e)) if e == "cancelled" => return WorkerOutcome::Cancelled,
+            Ok(Err(e)) => return WorkerOutcome::Failed(mode, e, Vec::new()),
             Err(e) => {
-                self.finish_bench_failed(
-                    &job_id,
-                    mode,
-                    format!("Benchmark worker stopped unexpectedly: {e}"),
-                    Vec::new(),
-                );
-                return;
+                return WorkerOutcome::Failed(mode, format!("Benchmark worker stopped unexpectedly: {e}"), Vec::new());
             }
         };
 
         if cancel.load(Ordering::Relaxed) {
-            self.finish_bench_cancelled(&job_id);
-            return;
+            return WorkerOutcome::Cancelled;
         }
 
         let pick_input = PickInput { mode, fps_preference: fps_pref, canvas, upload_kbps, platforms };
         let picked = match pick_recommendation(&candidates, &pick_input) {
             Ok(p) => p,
-            Err(e) => {
-                self.finish_bench_failed(&job_id, mode, e, candidates);
-                return;
-            }
+            Err(e) => return WorkerOutcome::Failed(mode, e, candidates),
         };
 
-        let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
-        let elapsed_ms = if let MachineState::Running(r) = &slot.state
-            && r.job_id == job_id
-        {
-            r.started_mono.elapsed().as_millis() as u64
-        } else {
-            return;
-        };
-        slot.state = MachineState::Done(DoneInner {
-            mode,
-            candidates,
-            upload_check,
-            upload_error: None,
-            picked,
-            duration_ms: elapsed_ms,
-        });
-        let view = slot.view();
-        drop(slot);
-        self.emit_auto_config_frame(&view);
+        WorkerOutcome::Done(WorkerDone { mode, candidates, upload_check, picked })
     }
 
     fn finish_bench_cancelled(&self, job_id: &str) {
@@ -1726,29 +1809,41 @@ impl Engine {
         }
     }
 
-    /// Cancels a running benchmark immediately and cleans up state/temp files.
-    pub fn auto_config_cancel(&self) -> AutoConfigView {
-        let mut scratch = None;
-        let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
-        if let MachineState::Running(r) = &mut slot.state {
-            r.cancel.store(true, Ordering::Release);
-            r.cancel_notify.notify_waiters();
-            scratch = r.scratch_dir.take();
-            slot.state = MachineState::Idle;
-        }
-        let view = slot.view();
-        drop(slot);
-        if let Some(path) = scratch {
-            let _ = std::fs::remove_dir_all(&path);
-            if let Some(parent) = path.parent()
-                && parent.file_name().and_then(|n| n.to_str()) == Some("auto-config-tmp")
-                && parent.read_dir().is_ok_and(|mut r| r.next().is_none())
-            {
-                let _ = std::fs::remove_dir(parent);
+    /// Requests benchmark cancellation and waits until the background worker has exited and
+    /// released all hardware encoder sessions and temporary folders before reporting Idle (C3).
+    pub async fn auto_config_cancel(&self) -> AutoConfigView {
+        let waiting = {
+            let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+            if let MachineState::Running(r) = &mut slot.state {
+                r.cancel.store(true, Ordering::Release);
+                r.cancel_notify.notify_waiters();
+                r.cancelling = true;
+                r.current_label = Some("Stopping benchmark…".into());
+                let job_id = r.job_id.clone();
+                let done_rx = r.worker_done.clone();
+                let view = slot.view();
+                Some((job_id, done_rx, view))
+            } else {
+                None
             }
+        };
+
+        if let Some((job_id, mut done_rx, stopping_view)) = waiting {
+            self.emit_auto_config_frame(&stopping_view);
+            let _ = done_rx.wait_for(|done| *done).await;
+            let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+            if let MachineState::Running(r) = &slot.state
+                && r.job_id == job_id
+            {
+                slot.state = MachineState::Idle;
+            }
+            let view = slot.view();
+            drop(slot);
+            self.emit_auto_config_frame(&view);
+            view
+        } else {
+            self.auto_config_status()
         }
-        self.emit_auto_config_frame(&view);
-        view
     }
 
     /// Snapshots current `StudioSettings`, applies recommendation (or explicit overrides), and starts
@@ -2530,7 +2625,7 @@ mod tests {
             .unwrap();
         assert_eq!(running.state, AutoConfigStateKind::Running);
         tokio::time::sleep(Duration::from_millis(80)).await;
-        let cancelled = engine.auto_config_cancel();
+        let cancelled = engine.auto_config_cancel().await;
         assert_eq!(cancelled.state, AutoConfigStateKind::Idle);
         assert!(!home_dir.join("auto-config-tmp").exists(), "temp folder cleaned after cancel");
 
@@ -2628,7 +2723,7 @@ mod tests {
         // Stopping an output stays allowed even while benchmark runs.
         assert!(engine.studio_record(false).await.is_ok(), "stopping record stays allowed");
 
-        let _ = engine.auto_config_cancel();
+        let _ = engine.auto_config_cancel().await;
         assert!(engine.studio_record(true).await.is_ok(), "outputs allowed again once cancelled");
     }
 
@@ -2683,6 +2778,59 @@ mod tests {
             !(bench_res.is_ok() && rec_res.is_ok()),
             "TOCTOU race: both benchmark ({bench_res:?}) and studio_record(true) ({rec_res:?}) succeeded!"
         );
-        let _ = engine.auto_config_cancel();
+        let _ = engine.auto_config_cancel().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_for_worker_and_releases_sessions_before_idle() {
+        let (engine, _host, _dir) = test_engine().await;
+        let session_alive = Arc::new(AtomicBool::new(false));
+        engine
+            .studio()
+            .auto_config
+            .lock()
+            .unwrap()
+            .set_worker_hook_for_test(session_alive.clone(), Duration::from_millis(160));
+
+        let running = engine
+            .auto_config_benchmark(BenchmarkReq {
+                mode: Some("record".into()),
+                fps_preference: Some(60),
+                include_upload: Some(false),
+                max_seconds: Some(4),
+            })
+            .await
+            .unwrap();
+        assert_eq!(running.state, AutoConfigStateKind::Running);
+
+        // Wait until the worker enters the simulated encoder session.
+        for _ in 0..40 {
+            if session_alive.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(session_alive.load(Ordering::Acquire), "worker should hold encoder session");
+
+        let e_cancel = engine.clone();
+        let cancel_task = tokio::spawn(async move { e_cancel.auto_config_cancel().await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            engine.auto_config_status().state,
+            AutoConfigStateKind::Running,
+            "state must remain Running while worker session teardown is still in flight"
+        );
+        assert!(
+            matches!(engine.studio_record(true).await, Err(EngineError::Refused { status: 409, .. })),
+            "outputs must still be blocked while worker session is tearing down"
+        );
+
+        let cancelled = cancel_task.await.unwrap();
+        assert_eq!(cancelled.state, AutoConfigStateKind::Idle);
+        assert!(
+            !session_alive.load(Ordering::Acquire),
+            "auto_config_cancel reported Idle while worker still held hardware encoder session!"
+        );
+        assert!(engine.studio_record(true).await.is_ok(), "outputs allowed once cancel waited for teardown");
     }
 }

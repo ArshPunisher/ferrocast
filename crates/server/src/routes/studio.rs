@@ -1788,7 +1788,7 @@ async fn engine_auto_config_benchmark(
 }
 
 async fn engine_auto_config_cancel(State(app): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(app.engine.auto_config_cancel())))
+    Ok(Json(json!(app.engine.auto_config_cancel().await)))
 }
 
 async fn engine_auto_config_apply(

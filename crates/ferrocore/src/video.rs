@@ -264,16 +264,18 @@ impl VideoEncoder {
     }
 
     /// Opens a specific FFmpeg H.264 encoder (or native VideoToolbox when `ffmpeg_encoder` is `None`
-    /// on macOS), with optional bounded blocking queue capacity for synchronous benchmarking.
+    /// on macOS), with optional bounded blocking queue capacity and cancellation signal for
+    /// synchronous benchmarking.
     pub fn for_benchmark(
         config: VideoConfig,
         ffmpeg_encoder: Option<&str>,
         blocking_cap: Option<usize>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Self, AvError> {
         Self::check(&config)?;
         if let Some(enc) = ffmpeg_encoder {
             return Ok(Self {
-                inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new_named(&config, enc, blocking_cap)?)),
+                inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new_named(&config, enc, blocking_cap, cancel)?)),
                 config,
             });
         }
