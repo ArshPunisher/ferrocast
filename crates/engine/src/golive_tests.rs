@@ -168,7 +168,7 @@ async fn stream_in(e: &Engine) -> tokio::task::JoinHandle<()> {
         let mut ts = 0u32;
         loop {
             let data: &'static [u8] =
-                if (ts / 40) % 4 == 0 { &[0x17, 0x01, 0, 0, 0, 0xAA] } else { &[0x27, 0x01, 0, 0, 0, 0xBB] };
+                if (ts / 40).is_multiple_of(4) { &[0x17, 0x01, 0, 0, 0, 0xAA] } else { &[0x27, 0x01, 0, 0, 0, 0xBB] };
             obs.video(ts, data).await;
             ts += 40;
             tokio::time::sleep(std::time::Duration::from_millis(40)).await;
