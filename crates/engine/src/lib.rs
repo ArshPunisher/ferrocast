@@ -216,6 +216,8 @@ struct Inner {
     labels: Mutex<labels::LabelRuntime>,
     /// Current stream health tracker persisted to the last-5 streams store.
     stream_health: Mutex<diagnostics::ActiveStreamHealth>,
+    /// Serializes support diagnostics bundle creation so concurrent requests don't spike I/O/CPU.
+    diagnostics_busy: tokio::sync::Mutex<()>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -369,6 +371,7 @@ impl Engine {
                 safe_mode: Mutex::new(Default::default()),
                 labels: Mutex::new(Default::default()),
                 stream_health: Mutex::new(Default::default()),
+                diagnostics_busy: tokio::sync::Mutex::new(()),
             }),
         };
         tokio::spawn(prune(engine.clone()));

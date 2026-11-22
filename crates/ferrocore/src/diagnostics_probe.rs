@@ -144,3 +144,25 @@ pub fn probe_audio_devices() -> Vec<AudioDeviceProbe> {
 pub fn probe_audio_devices() -> Vec<AudioDeviceProbe> {
     Vec::new()
 }
+
+/// Opens a regular file at `path` without following a symlink on the final path component.
+pub fn open_regular_nofollow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let sym = std::fs::symlink_metadata(path)?;
+        if sym.file_type().is_symlink() || !sym.file_type().is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+        }
+        std::fs::File::open(path)?
+    };
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    Ok(file)
+}

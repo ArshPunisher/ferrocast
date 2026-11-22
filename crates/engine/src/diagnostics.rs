@@ -188,6 +188,7 @@ impl Engine {
 
     /// Returns a redacted diagnostic preview (without creating a zip on disk).
     pub async fn diagnostics_preview(&self) -> Result<SupportReport, EngineError> {
+        let _guard = self.inner.diagnostics_busy.lock().await;
         let (input, secrets, users, _logs, _crashes) = self.gather_diagnostics().await?;
         let s_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
         let u_refs: Vec<&str> = users.iter().map(String::as_str).collect();
@@ -196,6 +197,7 @@ impl Engine {
 
     /// Builds the complete redacted support zip archive in memory (`(filename, zip_bytes, report)`).
     pub async fn diagnostics_zip_bytes(&self) -> Result<(String, Vec<u8>, SupportReport), EngineError> {
+        let _guard = self.inner.diagnostics_busy.lock().await;
         let (input, secrets, users, logs, crash_files) = self.gather_diagnostics().await?;
         let s_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
         let u_refs: Vec<&str> = users.iter().map(String::as_str).collect();
@@ -211,6 +213,8 @@ impl Engine {
         let mut zw = zip::ZipWriter::new(cursor);
         let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
+        let mut used_entries = HashSet::from(["SUMMARY.txt".to_string(), "report.json".to_string()]);
+
         zw.start_file("SUMMARY.txt", opts).map_err(zip_err)?;
         zw.write_all(summary_txt.as_bytes()).map_err(zip_err)?;
 
@@ -219,13 +223,15 @@ impl Engine {
 
         for (name, body) in logs {
             let safe_name = sanitize_zip_component(&redact_text(&name, &s_refs, &u_refs));
-            zw.start_file(format!("logs/{safe_name}"), opts).map_err(zip_err)?;
+            let entry_path = dedup_zip_entry(&mut used_entries, "logs", &safe_name);
+            zw.start_file(&entry_path, opts).map_err(zip_err)?;
             zw.write_all(body.as_bytes()).map_err(zip_err)?;
         }
 
         for (name, bytes) in crash_files {
             let safe_name = sanitize_zip_component(&redact_text(&name, &s_refs, &u_refs));
-            zw.start_file(format!("crashes/{safe_name}"), opts).map_err(zip_err)?;
+            let entry_path = dedup_zip_entry(&mut used_entries, "crashes", &safe_name);
+            zw.start_file(&entry_path, opts).map_err(zip_err)?;
             zw.write_all(&bytes).map_err(zip_err)?;
         }
 
@@ -382,8 +388,13 @@ impl Engine {
         let monitoring_device =
             studio.as_ref().and_then(|v| v.get("monitoring").and_then(Value::as_str).map(String::from));
 
-        let logs_included: Vec<String> =
-            logs.iter().map(|(n, _)| redact_text(&format!("logs/{n}"), &s_refs, &u_refs)).collect();
+        let logs_included: Vec<String> = logs
+            .iter()
+            .map(|(n, _)| {
+                let safe = sanitize_zip_component(&redact_text(n, &s_refs, &u_refs));
+                format!("logs/{safe}")
+            })
+            .collect();
 
         let input = DiagnosticInput {
             generated_at,
@@ -580,11 +591,7 @@ fn gather_redacted_logs(logs_dir: &Path, secrets: &[&str], users: &[&str]) -> (V
     let mut errors = Vec::new();
     for fname in ["ferrocast.1.log", "ferrocast.log"] {
         let p = logs_dir.join(fname);
-        if !p.is_file() {
-            continue;
-        }
-        let Ok(meta) = std::fs::metadata(&p) else { continue };
-        let Ok(raw_bytes) = read_tail_bytes(&p, meta.len(), MAX_LOG_BYTES_PER_FILE) else { continue };
+        let Ok(raw_bytes) = read_tail_bytes(&p, MAX_LOG_BYTES_PER_FILE) else { continue };
         let text = String::from_utf8_lossy(&raw_bytes);
         let all_lines: Vec<String> = text.lines().map(strip_ansi).collect();
         let start = all_lines.len().saturating_sub(MAX_LOG_LINES_PER_FILE);
@@ -600,18 +607,25 @@ fn gather_redacted_logs(logs_dir: &Path, secrets: &[&str], users: &[&str]) -> (V
     (files_out, errors)
 }
 
-fn read_tail_bytes(path: &Path, len: u64, cap: u64) -> std::io::Result<Vec<u8>> {
+fn read_tail_bytes(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)?;
-    if len > cap {
-        f.seek(SeekFrom::Start(len - cap))?;
-    }
-    let mut buf = Vec::with_capacity(len.min(cap) as usize);
-    f.read_to_end(&mut buf)?;
+    let mut f = ferrocore::diagnostics_probe::open_regular_nofollow(path)?;
+    let actual_len = f.metadata()?.len();
+    let trimmed = if actual_len > cap {
+        let back = i64::try_from(cap).unwrap_or(i64::MAX);
+        if f.seek(SeekFrom::End(-back)).is_err() {
+            f.seek(SeekFrom::Start(0))?;
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+    let mut buf = Vec::with_capacity(actual_len.min(cap) as usize);
+    (&f).take(cap).read_to_end(&mut buf)?;
     // Drop partial leading line after seek
-    if len > cap
-        && let Some(pos) = buf.iter().position(|&b| b == b'\n')
-    {
+    if trimmed && let Some(pos) = buf.iter().position(|&b| b == b'\n') {
         return Ok(buf[pos + 1..].to_vec());
     }
     Ok(buf)
@@ -648,13 +662,23 @@ fn gather_redacted_crashes(
     secrets: &[&str],
     users: &[&str],
 ) -> (Vec<CrashDumpSummary>, Vec<(String, Vec<u8>)>) {
+    use std::io::Read;
+
     let Ok(rd) = std::fs::read_dir(crashes_dir) else {
         return (Vec::new(), Vec::new());
     };
     let mut entries: Vec<(std::path::PathBuf, std::fs::Metadata)> = rd
         .filter_map(|e| e.ok())
         .filter_map(|e| {
+            // Inspect DirEntry file_type (lstat) first so symlinks are skipped without following.
+            if !e.file_type().ok().is_some_and(|ft| ft.is_file()) {
+                return None;
+            }
             let p = e.path();
+            let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+            if !matches!(ext.as_str(), "dmp" | "mdmp" | "txt" | "log" | "crash" | "ips") {
+                return None;
+            }
             let m = e.metadata().ok()?;
             m.is_file().then_some((p, m))
         })
@@ -668,44 +692,55 @@ fn gather_redacted_crashes(
 
     let mut meta_out = Vec::new();
     let mut files_out = Vec::new();
+    let mut used_names = HashSet::new();
     let mut total_bytes: u64 = 0;
 
-    for (path, meta) in entries.into_iter().take(MAX_CRASH_FILES) {
+    for (path, _dir_meta) in entries.into_iter().take(MAX_CRASH_FILES) {
+        let Ok(file) = ferrocore::diagnostics_probe::open_regular_nofollow(&path) else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else {
+            continue;
+        };
         let raw_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("crash");
-        let name = redact_text(raw_name, secrets, users);
+        let redacted_safe = sanitize_zip_component(&redact_text(raw_name, secrets, users));
+        let name = dedup_component(&mut used_names, &redacted_safe);
         let modified_ms = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
-        let is_binary_dmp = ext == "dmp";
+        let is_binary_dmp = matches!(ext.as_str(), "dmp" | "mdmp");
 
         let mut included = false;
         let mut summary = None;
 
         if total_bytes < MAX_TOTAL_CRASH_ZIP_BYTES {
             let limit = if is_binary_dmp { MAX_BINARY_DUMP_BYTES } else { MAX_TEXT_CRASH_BYTES };
-            if meta.len() <= limit
-                && total_bytes.saturating_add(meta.len()) <= MAX_TOTAL_CRASH_ZIP_BYTES
-                && let Ok(mut bytes) = std::fs::read(&path)
-            {
-                if is_binary_dmp {
-                    let is_mdmp = bytes.starts_with(b"MDMP");
-                    redact_bytes_in_place(&mut bytes, secrets, users);
-                    summary = Some(if is_mdmp {
-                        "Windows minidump (redacted)".into()
+            let file_len = meta.len();
+            if file_len <= limit && total_bytes.saturating_add(file_len) <= MAX_TOTAL_CRASH_ZIP_BYTES {
+                let mut bytes = Vec::with_capacity(file_len as usize);
+                if (&file).take(limit.saturating_add(1)).read_to_end(&mut bytes).is_ok()
+                    && (bytes.len() as u64) <= limit
+                {
+                    if is_binary_dmp {
+                        let is_mdmp = bytes.starts_with(b"MDMP");
+                        redact_bytes_in_place(&mut bytes, secrets, users);
+                        summary = Some(if is_mdmp {
+                            "Windows minidump (redacted)".into()
+                        } else {
+                            "Binary dump (redacted)".into()
+                        });
                     } else {
-                        "Binary dump (redacted)".into()
-                    });
-                } else {
-                    let text = String::from_utf8_lossy(&bytes);
-                    let red = redact_text(&text, secrets, users);
-                    bytes = red.into_bytes();
+                        let text = String::from_utf8_lossy(&bytes);
+                        let red = redact_text(&text, secrets, users);
+                        bytes = red.into_bytes();
+                    }
+                    total_bytes = total_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
+                    files_out.push((name.clone(), bytes));
+                    included = true;
                 }
-                total_bytes = total_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
-                files_out.push((name.clone(), bytes));
-                included = true;
             }
         }
 
@@ -723,8 +758,40 @@ fn gather_redacted_crashes(
 }
 
 fn sanitize_zip_component(name: &str) -> String {
-    let cleaned: String = name.chars().map(|c| if matches!(c, '/' | '\\' | '\0' | ':') { '_' } else { c }).collect();
+    let cleaned: String =
+        name.chars().map(|c| if matches!(c, '/' | '\\' | '\0' | ':') || c.is_control() { '_' } else { c }).collect();
     if cleaned.is_empty() || cleaned == "." || cleaned == ".." { "file.txt".into() } else { cleaned }
+}
+
+fn dedup_component(seen: &mut HashSet<String>, base: &str) -> String {
+    if seen.insert(base.to_string()) {
+        return base.to_string();
+    }
+    let (stem, ext) = match base.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, Some(e)),
+        _ => (base, None),
+    };
+    let mut n = 2usize;
+    loop {
+        let candidate = match ext {
+            Some(e) => format!("{stem}-{n}.{e}"),
+            None => format!("{stem}-{n}"),
+        };
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+fn dedup_zip_entry(seen: &mut HashSet<String>, dir: &str, base: &str) -> String {
+    let prefix = format!("{dir}/");
+    let mut names_in_dir: HashSet<String> =
+        seen.iter().filter_map(|entry| entry.strip_prefix(&prefix).map(str::to_string)).collect();
+    let unique = dedup_component(&mut names_in_dir, base);
+    let full = format!("{prefix}{unique}");
+    seen.insert(full.clone());
+    full
 }
 
 fn format_utc_stamp(ts: Millis) -> String {
@@ -1056,5 +1123,78 @@ mod tests {
         let mut log_body = String::new();
         arc.by_name("logs/ferrocast.log").unwrap().read_to_string(&mut log_body).unwrap();
         assert!(!log_body.contains("file secret phrase 123"));
+    }
+
+    #[tokio::test]
+    async fn support_zip_blocks_symlinks_filters_crash_extensions_and_dedups_redacted_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let crashes = dir.path().join("crashes");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&crashes).unwrap();
+
+        #[cfg(unix)]
+        {
+            let target = outside.path().join("outside-secret.txt");
+            std::fs::write(&target, "2026-11-22T03:00:00Z INFO SYMLINK_SECRET_DATA_123\n").unwrap();
+            std::os::unix::fs::symlink(&target, logs.join("ferrocast.log")).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(logs.join("ferrocast.log"), "2026-11-22T03:00:00Z INFO normal log\n").unwrap();
+        }
+
+        // Disallowed crash extensions must not be included in report or zip.
+        std::fs::write(crashes.join("secret.env"), "ENV_LEAK_456").unwrap();
+        std::fs::write(crashes.join("dump.bin"), "BIN_LEAK_789").unwrap();
+
+        // Two allowed crash files whose filenames redact to the exact same string.
+        std::fs::write(crashes.join("panic-198.51.100.1.txt"), "first crash body").unwrap();
+        std::fs::write(crashes.join("panic-198.51.100.2.txt"), "second crash body").unwrap();
+
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        let (_name, bytes, report) = engine.diagnostics_zip_bytes().await.unwrap();
+        let mut arc = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        let mut all_crash_contents = Vec::new();
+        for idx in 0..arc.len() {
+            let mut entry = arc.by_index(idx).unwrap();
+            let entry_name = entry.name().unwrap().to_string();
+            assert!(seen.insert(entry_name.clone()), "duplicate zip entry name: {entry_name}");
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf).unwrap();
+            let body = String::from_utf8_lossy(&buf).into_owned();
+            assert!(!body.contains("SYMLINK_SECRET_DATA_123"), "symlink target leaked in {entry_name}");
+            assert!(!body.contains("ENV_LEAK_456"), ".env file leaked in {entry_name}");
+            assert!(!body.contains("BIN_LEAK_789"), ".bin file leaked in {entry_name}");
+            if entry_name.starts_with("crashes/") {
+                all_crash_contents.push(body);
+            }
+        }
+        assert!(
+            !report.crashes.iter().any(|c| c.filename.ends_with(".env") || c.filename.ends_with(".bin")),
+            "disallowed crash extension listed in report: {:?}",
+            report.crashes
+        );
+        assert!(
+            all_crash_contents.iter().any(|b| b.contains("first crash body")),
+            "first colliding crash missing: {all_crash_contents:?}"
+        );
+        assert!(
+            all_crash_contents.iter().any(|b| b.contains("second crash body")),
+            "second colliding crash missing: {all_crash_contents:?}"
+        );
+
+        assert_eq!(sanitize_zip_component("a/b\\c:\r\n\t\x1bd"), "a_b_c_____d");
+
+        // Verify read_tail_bytes caps bytes read and handles small files safely.
+        let tail_file = outside.path().join("tail.log");
+        std::fs::write(&tail_file, "line1\nline2_keep\nline3_end\n").unwrap();
+        let tailed = read_tail_bytes(&tail_file, 16).unwrap();
+        let tailed_str = String::from_utf8_lossy(&tailed);
+        assert!(!tailed_str.contains("line1"), "old line should be dropped on seek: {tailed_str}");
+        assert!(tailed_str.contains("line3_end"), "tail missing: {tailed_str}");
     }
 }
