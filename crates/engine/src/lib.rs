@@ -393,6 +393,7 @@ impl Engine {
         tokio::spawn(pipeline::run(engine.clone(), rx));
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
+        tokio::spawn(schedule::run(engine.clone()));
         tokio::spawn(automation::run(engine.clone()));
         tokio::spawn(loyalty::run(engine.clone()));
         tokio::spawn(polls::run(engine.clone()));
@@ -779,5 +780,8 @@ fn load_state(store: &Store) -> Result<(State, AlertQueue), StoreError> {
 
 #[cfg(test)]
 mod facebook_tests;
+pub mod schedule;
+#[cfg(test)]
+mod schedule_tests;
 #[cfg(test)]
 mod tests;
