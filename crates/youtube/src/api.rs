@@ -778,6 +778,177 @@ impl Api {
         self.thumbnail_on(video, &bytes, mime).await
     }
 
+    /// videos.insert, the resumable way: one request opens a session, then the file goes in
+    /// pieces (so progress shows, and a dropped line picks up where YouTube left off) → the
+    /// new video's id. Costs 1,600 units of the day's quota.
+    pub async fn upload_video(
+        &self,
+        meta: &ferrocast_connector::VideoUpload,
+        source: &mut dyn ferrocast_connector::UploadSource,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<String, YoutubeError> {
+        let total = source.len();
+        if total == 0 {
+            return Err(YoutubeError::Refused("that file is empty".into()));
+        }
+        let session = self.open_upload(meta, total).await?;
+        let mut offset = 0u64;
+        let mut token = self.access().await?;
+        let mut failures = 0u32;
+        progress(0, total);
+        loop {
+            let want = UPLOAD_CHUNK.min((total - offset) as usize);
+            let chunk = source
+                .read_at(offset, want)
+                .map_err(|e| YoutubeError::Refused(format!("the file couldn't be read: {e}")))?;
+            if chunk.len() != want {
+                return Err(YoutubeError::Refused("the file changed while it was being sent".into()));
+            }
+            let end = offset + want as u64 - 1;
+            let res = self
+                .http
+                .put(&session)
+                .bearer_auth(&token)
+                .header(reqwest::header::CONTENT_RANGE, format!("bytes {offset}-{end}/{total}"))
+                .timeout(upload_chunk_deadline(want))
+                .body(chunk)
+                .send()
+                .await;
+            let res = match res {
+                Ok(r) => r,
+                Err(e) => {
+                    failures += 1;
+                    if failures > UPLOAD_RETRIES {
+                        return Err(YoutubeError::network(e));
+                    }
+                    tokio::time::sleep(upload_backoff(failures)).await;
+                    offset = self.upload_resume_point(&session, &token, total).await.unwrap_or(offset);
+                    continue;
+                }
+            };
+            let status = res.status().as_u16();
+            match status {
+                200 | 201 => {
+                    progress(total, total);
+                    let body: Value = res.json().await.map_err(YoutubeError::network)?;
+                    return body
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                        .ok_or_else(|| YoutubeError::Protocol("YouTube didn't say the new video's id".into()));
+                }
+                308 => {
+                    failures = 0;
+                    // "Range: bytes=0-N": YouTube has the first N+1 bytes (none: no header).
+                    let had = res
+                        .headers()
+                        .get(reqwest::header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.rsplit('-').next())
+                        .and_then(|n| n.trim().parse::<u64>().ok())
+                        .map_or(0, |n| n + 1);
+                    // It can't have more than was sent, and never goes backwards past progress made.
+                    offset = had.min(offset + want as u64).max(offset);
+                    progress(offset, total);
+                }
+                401 => {
+                    failures += 1;
+                    if failures > 1 {
+                        return Err(YoutubeError::SignInNeeded);
+                    }
+                    token = self.refresh_after_401(&token).await?;
+                }
+                500 | 502 | 503 | 504 => {
+                    failures += 1;
+                    if failures > UPLOAD_RETRIES {
+                        return Err(YoutubeError::Refused(format!("YouTube kept answering {status}; try again later")));
+                    }
+                    tokio::time::sleep(upload_backoff(failures)).await;
+                    offset = self.upload_resume_point(&session, &token, total).await.unwrap_or(offset);
+                }
+                _ => return Err(YoutubeError::from_response(res).await),
+            }
+        }
+    }
+
+    /// Opens an upload session → its address.
+    async fn open_upload(&self, meta: &ferrocast_connector::VideoUpload, total: u64) -> Result<String, YoutubeError> {
+        let url = upload_base(&self.ep.api) + "/videos";
+        let mut snippet = json!({
+            "title": meta.title,
+            "description": meta.description,
+            "tags": meta.tags,
+        });
+        if let Some(c) = &meta.category_id {
+            snippet["categoryId"] = json!(c);
+        }
+        let body = json!({
+            "snippet": snippet,
+            "status": {
+                "privacyStatus": Privacy::parse(&meta.privacy).unwrap_or(Privacy::Private).as_str(),
+                "selfDeclaredMadeForKids": meta.made_for_kids,
+            },
+        });
+        let mut token = self.access().await?;
+        for attempt in 0..2 {
+            let res = self
+                .http
+                .post(&url)
+                .query(&[("uploadType", "resumable"), ("part", "snippet,status")])
+                .bearer_auth(&token)
+                .header("X-Upload-Content-Type", "video/*")
+                .header("X-Upload-Content-Length", total.to_string())
+                .json(&body)
+                .send()
+                .await
+                .map_err(YoutubeError::network)?;
+            if res.status().as_u16() == 401 && attempt == 0 {
+                token = self.refresh_after_401(&token).await?;
+                continue;
+            }
+            if !res.status().is_success() {
+                return Err(YoutubeError::from_response(res).await);
+            }
+            let loc = res
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+                .ok_or_else(|| YoutubeError::Protocol("YouTube didn't open an upload".into()))?;
+            // The file (and the sign-in with it) goes only where YouTube's own upload host is.
+            return if upload_host_ok(&loc, &self.ep.api) {
+                Ok(loc)
+            } else {
+                Err(YoutubeError::Protocol("YouTube sent the upload somewhere unexpected".into()))
+            };
+        }
+        Err(YoutubeError::SignInNeeded)
+    }
+
+    /// How much of the file YouTube has (asks with an empty range).
+    async fn upload_resume_point(&self, session: &str, token: &str, total: u64) -> Option<u64> {
+        let res = self
+            .http
+            .put(session)
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_RANGE, format!("bytes */{total}"))
+            .header(reqwest::header::CONTENT_LENGTH, "0")
+            .send()
+            .await
+            .ok()?;
+        match res.status().as_u16() {
+            308 => Some(
+                res.headers()
+                    .get(reqwest::header::RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.rsplit('-').next())
+                    .and_then(|n| n.trim().parse::<u64>().ok())
+                    .map_or(0, |n| n + 1),
+            ),
+            _ => None,
+        }
+    }
+
     /// thumbnails.set on one video.
     async fn thumbnail_on(&self, id: &str, image: &[u8], mime: &str) -> Result<(), YoutubeError> {
         let url = upload_base(&self.ep.api) + "/thumbnails/set";
@@ -813,6 +984,47 @@ impl Api {
         }
         Err(YoutubeError::SignInNeeded)
     }
+}
+
+#[cfg(test)]
+pub(crate) const UPLOAD_CHUNK_FOR_TEST: usize = UPLOAD_CHUNK;
+
+#[cfg(test)]
+pub(crate) fn upload_host_ok_for_test(url: &str, api: &str) -> bool {
+    upload_host_ok(url, api)
+}
+
+/// An upload goes in pieces of this size (a multiple of 256 KB, as YouTube asks).
+const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
+/// A piece is tried again this many times in a row before the upload is given up.
+const UPLOAD_RETRIES: u32 = 4;
+
+/// How long a piece of `bytes` may take: 30 s, plus time at a slow upload (128 KB/s), at most 10 minutes.
+fn upload_chunk_deadline(bytes: usize) -> std::time::Duration {
+    std::time::Duration::from_secs((30 + bytes as u64 / (128 * 1024)).min(600))
+}
+
+fn upload_backoff(failures: u32) -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let _ = failures;
+        std::time::Duration::from_millis(5)
+    }
+    #[cfg(not(test))]
+    std::time::Duration::from_secs(2u64.saturating_pow(failures).min(30))
+}
+
+/// Whether an upload address is on the same host as the API's upload address, or YouTube's.
+fn upload_host_ok(url: &str, api: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    let google = u.scheme() == "https"
+        && u.host_str().is_some_and(|h| {
+            h == "googleapis.com" || h.ends_with(".googleapis.com") || h == "youtube.com" || h.ends_with(".youtube.com")
+        });
+    let same = reqwest::Url::parse(api)
+        .ok()
+        .is_some_and(|a| a.scheme() == u.scheme() && a.host_str() == u.host_str() && a.port() == u.port());
+    google || same
 }
 
 /// YouTube's own limit for a thumbnail.

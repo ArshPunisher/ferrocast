@@ -91,6 +91,15 @@ impl Connector for YoutubeConnector {
         Ok(self.api.set_chapters(video, chapters).await?)
     }
 
+    async fn upload_video(
+        &self,
+        meta: &ferrocast_connector::VideoUpload,
+        source: &mut dyn ferrocast_connector::UploadSource,
+        progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<String> {
+        Ok(self.api.upload_video(meta, source, progress).await?)
+    }
+
     async fn peek_ingest(&self) -> Result<String> {
         Ok(self.api.peek_ingest().await?)
     }

@@ -2092,3 +2092,229 @@ async fn a_key_the_vertical_canvas_sends_to_is_never_the_normal_streams() {
     assert!(own.key.starts_with("var-key-"), "{}", own.key);
     assert_eq!(own.note.as_deref(), Some("Ferrocast · variable"));
 }
+
+// ---------------------------------------------------------------- video upload (clips)
+
+struct Bytes(Vec<u8>);
+
+impl ferrocast_connector::UploadSource for Bytes {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+    fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let a = (offset as usize).min(self.0.len());
+        Ok(self.0[a..(a + len).min(self.0.len())].to_vec())
+    }
+}
+
+#[derive(Default)]
+struct UploadLog {
+    opened: Vec<(String, serde_json::Value, Option<String>, Option<String>)>,
+    ranges: Vec<String>,
+    got: usize,
+    /// Answers to give for the next pieces: a status per request (200 when none are left).
+    fail_next: Vec<u16>,
+    /// Where the session address points ("" = this server).
+    location: String,
+    seen_auth: Vec<String>,
+}
+
+/// A fake resumable-upload server: opens a session, takes pieces, answers 308 until the end.
+async fn fake_upload(log: Arc<Mutex<UploadLog>>) -> Endpoints {
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    let base_cell = Arc::new(Mutex::new(String::new()));
+    let (l1, l2, b1, b2) = (log.clone(), log.clone(), base_cell.clone(), base_cell.clone());
+    let app = axum::Router::new()
+        .route(
+            "/api/upload/videos",
+            axum::routing::post(
+                move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+                      h: HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let (l, b) = (l1.clone(), b1.clone());
+                    async move {
+                        let mut l = l.lock().unwrap();
+                        let hv = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(String::from);
+                        l.opened.push((
+                            format!(
+                                "{}|{}",
+                                q.get("uploadType").cloned().unwrap_or_default(),
+                                q.get("part").cloned().unwrap_or_default()
+                            ),
+                            body,
+                            hv("x-upload-content-length"),
+                            hv("authorization"),
+                        ));
+                        let loc = if l.location.is_empty() {
+                            format!("{}/api/session/abc", b.lock().unwrap())
+                        } else {
+                            l.location.clone()
+                        };
+                        let mut out = HeaderMap::new();
+                        out.insert("location", HeaderValue::from_str(&loc).unwrap());
+                        (StatusCode::OK, out, String::new())
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/session/abc",
+            axum::routing::put(move |h: HeaderMap, body: axum::body::Bytes| {
+                let l = l2.clone();
+                let _ = &b2;
+                async move {
+                    let mut l = l.lock().unwrap();
+                    let range = h.get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    l.seen_auth.push(h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string());
+                    l.ranges.push(range.clone());
+                    if !l.fail_next.is_empty() {
+                        let s = l.fail_next.remove(0);
+                        return (StatusCode::from_u16(s).unwrap(), HeaderMap::new(), "{}".to_string());
+                    }
+                    let mut out = HeaderMap::new();
+                    // "bytes */N": a question about how much is there.
+                    if range.starts_with("bytes */") {
+                        if l.got > 0 {
+                            out.insert("range", HeaderValue::from_str(&format!("bytes=0-{}", l.got - 1)).unwrap());
+                        }
+                        return (StatusCode::PERMANENT_REDIRECT, out, String::new());
+                    }
+                    let (span, total) = range.trim_start_matches("bytes ").split_once('/').unwrap();
+                    let (a, b) = span.split_once('-').unwrap();
+                    let (a, b, total): (usize, usize, usize) =
+                        (a.parse().unwrap(), b.parse().unwrap(), total.parse().unwrap());
+                    assert_eq!(body.len(), b - a + 1);
+                    l.got = b + 1;
+                    if b + 1 == total {
+                        (StatusCode::OK, out, "{\"id\":\"vid-new\"}".to_string())
+                    } else {
+                        out.insert("range", HeaderValue::from_str(&format!("bytes=0-{b}")).unwrap());
+                        (StatusCode::PERMANENT_REDIRECT, out, String::new())
+                    }
+                }
+            }),
+        );
+    // The pieces are 8 MB: past axum's default 2 MB.
+    let app = app.layer(axum::extract::DefaultBodyLimit::disable());
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    *base_cell.lock().unwrap() = base.clone();
+    tokio::spawn(async move { axum::serve(rest, app).await });
+    Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    }
+}
+
+fn clip_meta() -> ferrocast_connector::VideoUpload {
+    ferrocast_connector::VideoUpload {
+        title: "Best play".into(),
+        description: "from the stream".into(),
+        tags: vec!["fps".into()],
+        privacy: "unlisted".into(),
+        category_id: Some("20".into()),
+        made_for_kids: false,
+    }
+}
+
+#[tokio::test]
+async fn a_video_is_sent_in_pieces_with_its_details_and_reports_progress() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    let api = video_api(fake_upload(log.clone()).await);
+    // A bit over two pieces.
+    let size = 2 * super::api::UPLOAD_CHUNK_FOR_TEST + 1000;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let id = api
+        .upload_video(&clip_meta(), &mut Bytes(vec![7u8; size]), &move |a, b| s2.lock().unwrap().push((a, b)))
+        .await
+        .unwrap();
+    assert_eq!(id, "vid-new");
+    let l = log.lock().unwrap();
+    let (kind, body, len, auth) = &l.opened[0];
+    assert_eq!(kind, "resumable|snippet,status");
+    assert_eq!(len.as_deref(), Some(size.to_string().as_str()));
+    assert_eq!(auth.as_deref(), Some("Bearer a"));
+    assert_eq!(body["snippet"]["title"], "Best play");
+    assert_eq!(body["snippet"]["categoryId"], "20");
+    assert_eq!(body["status"]["privacyStatus"], "unlisted");
+    assert_eq!(body["status"]["selfDeclaredMadeForKids"], false);
+    assert_eq!(l.ranges.len(), 3, "{:?}", l.ranges);
+    assert!(l.ranges[0].starts_with("bytes 0-") && l.ranges[2].ends_with(&format!("/{size}")));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.first(), Some(&(0, size as u64)));
+    assert_eq!(seen.last(), Some(&(size as u64, size as u64)));
+    assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "progress only goes forward: {seen:?}");
+}
+
+#[tokio::test]
+async fn an_unknown_privacy_is_private_never_public() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    let api = video_api(fake_upload(log.clone()).await);
+    let mut m = clip_meta();
+    m.privacy = "everyone".into();
+    api.upload_video(&m, &mut Bytes(vec![1; 10]), &|_, _| {}).await.unwrap();
+    assert_eq!(log.lock().unwrap().opened[0].1["status"]["privacyStatus"], "private");
+}
+
+#[tokio::test]
+async fn a_dropped_piece_resumes_where_youtube_left_off() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().fail_next = vec![503];
+    let api = video_api(fake_upload(log.clone()).await);
+    let size = super::api::UPLOAD_CHUNK_FOR_TEST + 500;
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; size]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    let l = log.lock().unwrap();
+    // The first piece failed once (503), the question "how much do you have" got 0, and it went again.
+    assert!(l.ranges.iter().any(|r| r.starts_with("bytes */")), "{:?}", l.ranges);
+    assert_eq!(l.got, size);
+}
+
+#[tokio::test]
+async fn too_many_failures_give_up_in_words() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().fail_next = vec![503; 20];
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    assert!(matches!(err, YoutubeError::Refused(ref m) if m.contains("503")), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_refused_upload_says_why_and_an_empty_file_isnt_sent() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().fail_next = vec![403];
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    assert!(matches!(err, YoutubeError::Refused(_)), "{err:?}");
+    assert!(matches!(
+        api.upload_video(&clip_meta(), &mut Bytes(Vec::new()), &|_, _| {}).await,
+        Err(YoutubeError::Refused(_))
+    ));
+    assert_eq!(log.lock().unwrap().opened.len(), 1, "an empty file never opens a session");
+}
+
+#[tokio::test]
+async fn the_file_and_sign_in_only_go_to_youtubes_upload_host() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().location = "https://evil.example.com/steal".into();
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    assert!(matches!(err, YoutubeError::Protocol(_)), "{err:?}");
+    assert!(log.lock().unwrap().ranges.is_empty(), "nothing was sent");
+    assert!(super::api::upload_host_ok_for_test(
+        "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=x",
+        "https://www.googleapis.com/youtube/v3"
+    ));
+    assert!(!super::api::upload_host_ok_for_test(
+        "https://googleapis.com.evil.com/x",
+        "https://www.googleapis.com/youtube/v3"
+    ));
+    assert!(!super::api::upload_host_ok_for_test(
+        "http://www.googleapis.com/x",
+        "https://www.googleapis.com/youtube/v3"
+    ));
+    assert!(!super::api::upload_host_ok_for_test("file:///etc/passwd", "https://www.googleapis.com/youtube/v3"));
+}
