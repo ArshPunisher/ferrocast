@@ -627,10 +627,6 @@ pub(crate) fn write_new_then_rename(target: &Path, bytes: &[u8]) -> std::io::Res
     Err(std::io::Error::other("couldn't make a file to write the captions in"))
 }
 
-fn now_nanos() -> u32 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos())
-}
-
 /// Whether this ffmpeg has the `subtitles` filter (it needs libass).
 pub(crate) async fn ffmpeg_can_draw_captions(ffmpeg: &Path) -> bool {
     let mut cmd = super::jobs::hidden(ffmpeg);

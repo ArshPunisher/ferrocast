@@ -207,8 +207,7 @@ pub(crate) fn scrub_secrets(text: &str) -> String {
     'outer: while !rest.is_empty() {
         for name in ["upload_id=", "access_token=", "token=", "key="] {
             if let Some(after) = rest.strip_prefix(name) {
-                let end =
-                    after.find(|c: char| matches!(c, '&' | ')' | '"' | '\'' | ' ' | '\n' | '>')).unwrap_or(after.len());
+                let end = after.find(['&', ')', '"', '\'', ' ', '\n', '>']).unwrap_or(after.len());
                 out.push_str(name);
                 out.push_str("...");
                 rest = &after[end..];
