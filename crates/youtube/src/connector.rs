@@ -75,6 +75,17 @@ impl Connector for YoutubeConnector {
         Ok(self.api.update_broadcast_info(info).await?)
     }
 
+    async fn schedule_broadcast(
+        &self,
+        info: &ferrocast_connector::StreamInfo,
+        start_ms: i64,
+    ) -> Result<ferrocast_connector::ScheduledBroadcast> {
+        let title = info.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "Live".to_string());
+        let id = self.api.schedule_broadcast(&title, info.description.as_deref(), start_ms).await?;
+        let url = Some(format!("https://www.youtube.com/watch?v={id}"));
+        Ok(ferrocast_connector::ScheduledBroadcast { id, url })
+    }
+
     async fn search_categories(&self, query: &str) -> Result<Vec<ferrocast_connector::CategoryHit>> {
         Ok(crate::api::search_video_categories(query))
     }

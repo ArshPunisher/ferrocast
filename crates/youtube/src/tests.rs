@@ -2092,3 +2092,39 @@ async fn a_key_the_vertical_canvas_sends_to_is_never_the_normal_streams() {
     assert!(own.key.starts_with("var-key-"), "{}", own.key);
     assert_eq!(own.note.as_deref(), Some("Ferrocast · variable"));
 }
+
+/// A scheduled broadcast is made for a later time and never starts by itself: Go live is the
+/// streamer's press. (Auto start off, so YouTube doesn't flip it live when a signal arrives.)
+#[tokio::test]
+async fn a_scheduled_broadcast_has_its_time_and_never_auto_starts() {
+    use ferrocast_connector::Connector;
+    use ferrocast_core::stream_info::StreamInfo;
+    let made: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
+    let m = made.clone();
+    let app = axum::Router::new().route(
+        "/api/liveBroadcasts",
+        axum::routing::post(move |axum::Json(b): axum::Json<serde_json::Value>| {
+            let m = m.clone();
+            async move {
+                m.lock().unwrap().push(b);
+                axum::Json(serde_json::json!({ "id": "sched-1" }))
+            }
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let ep =
+        Endpoints { authorize: String::new(), token: String::new(), api: format!("{base}/api"), grpc: String::new() };
+    let c = crate::YoutubeConnector { api: Arc::new(video_api(ep)), live: Arc::default() };
+    let info = StreamInfo { title: Some("Friday show".into()), ..Default::default() };
+    // 2027-01-15T18:30:00Z
+    let got = c.schedule_broadcast(&info, 1_800_037_800_000).await.unwrap();
+    assert_eq!(got.id, "sched-1");
+    assert_eq!(got.url.as_deref(), Some("https://www.youtube.com/watch?v=sched-1"));
+    let b = made.lock().unwrap()[0].clone();
+    assert_eq!(b["snippet"]["title"], "Friday show");
+    assert_eq!(b["snippet"]["scheduledStartTime"], "2027-01-15T18:30:00Z");
+    assert_eq!(b["contentDetails"]["enableAutoStart"], false);
+    assert_eq!(b["contentDetails"]["enableAutoStop"], false);
+}
