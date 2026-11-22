@@ -615,3 +615,17 @@ fn a_tiny_crossfade_is_none_everywhere() {
     assert_eq!((g0, t0), (g1, t1), "0.4 ms is rounded away like 0");
     assert!(fade_ms_of(0.0004) == 0 && fade_ms_of(0.0006) == 1);
 }
+
+/// Captions are made for the first 15 minutes of sound: a longer clip is refused with the reason
+/// up front, not captioned silently only as far as that.
+#[test]
+fn a_clip_longer_than_the_captioned_stretch_is_refused_with_the_reason() {
+    assert!(captions_length_problem(Some(14 * 60_000)).is_none());
+    assert!(captions_length_problem(Some(15 * 60_000)).is_none());
+    let e = captions_length_problem(Some(16 * 60_000)).expect("over the stretch");
+    let EngineError::Refused { code, message, hint, .. } = e else { panic!() };
+    assert_eq!(code, "captions_too_long");
+    assert!(message.contains("15 minutes") && hint.to_lowercase().contains("trim"), "{message} / {hint}");
+    // A length that isn't known is not refused (the job says what it finds).
+    assert!(captions_length_problem(None).is_none());
+}

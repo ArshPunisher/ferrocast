@@ -100,6 +100,22 @@ pub struct Piece {
 }
 
 /// The filter graph and total length (ms) of a compilation at `w`×`h`.
+/// The stretch of a clip's sound that is transcribed (the speech model reads it from memory).
+pub(crate) const CAPTIONED_MINUTES: u64 = 15;
+
+/// Why a clip of this length can't be captioned whole, or None.
+pub(crate) fn captions_length_problem(duration_ms: Option<u64>) -> Option<EngineError> {
+    let d = duration_ms?;
+    (d > CAPTIONED_MINUTES * 60_000).then(|| {
+        refuse(
+            422,
+            "captions_too_long",
+            format!("Captions are made for clips up to {CAPTIONED_MINUTES} minutes, and this one is longer."),
+            "Trim it into parts of 15 minutes or less, then make captions for each.",
+        )
+    })
+}
+
 /// A crossfade in whole milliseconds: rounded (not cut), so the check and the graph agree.
 pub(crate) fn fade_ms_of(fade_s: f32) -> u64 {
     (fade_s.clamp(0.0, MAX_FADE_S) * 1000.0).round() as u64
@@ -543,6 +559,11 @@ impl Engine {
         let ffmpeg = self.clips_ffmpeg()?;
         if std::fs::symlink_metadata(srt_beside(&path)).is_ok() {
             return Err(EngineError::Conflict("That clip has captions already: edit them instead.".into()));
+        }
+        // A longer clip is refused up front, with the reason, not captioned only as far as 15 minutes.
+        let probe = probe_file(&ffmpeg, &path).await?;
+        if let Some(e) = captions_length_problem(probe.duration_ms) {
+            return Err(e);
         }
         let base = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         Ok(self.start_clip_job(JobKind::Captions, format!("Captions for {base}"), move |ctx| async move {
