@@ -22,7 +22,8 @@ use crate::import::overlay_parse::{
 use crate::studio_host::ShelfAct;
 use crate::{Engine, EngineError, now};
 
-const MAX_STAGED_PREVIEWS: usize = 4;
+/// Parsed packs held in memory between a preview and its import (each can be 300 MB).
+const MAX_STAGED_PREVIEWS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StagedOverlay {
@@ -207,6 +208,8 @@ impl Engine {
         zip_bytes: Vec<u8>,
         filename: String,
     ) -> Result<OverlayPackPreview, EngineError> {
+        // One pack is read at a time: previews don't queue up, each holding a lot of memory.
+        let _one_at_a_time = self.inner.import_busy.try_lock().map_err(|_| super::busy())?;
         let data = self.store().dir().to_path_buf();
         let parsed = tokio::task::spawn_blocking(move || parse_overlay_zip(&zip_bytes, &filename))
             .await
@@ -260,7 +263,7 @@ impl Engine {
         self.ensure_idle_for_switch("scene collections").await?;
 
         let staged = take_staged_preview(&self.inner.overlay_import, req.preview_id.trim())?;
-        let parsed = staged.parsed;
+        let mut parsed = staged.parsed;
         let requested_name = req.name.as_deref().unwrap_or(&parsed.suggested_name);
         let clean_name = studio_library::check_name(requested_name).map_err(EngineError::Invalid)?;
 
@@ -269,7 +272,8 @@ impl Engine {
         let pack_dir = packs_root(&data).join(&pack_id);
 
         // 1. Copy validated media assets into Ferrocast's own packs directory.
-        let assets = parsed.assets.clone();
+        // Moved, not copied: a pack's media can be hundreds of megabytes.
+        let assets = std::mem::take(&mut parsed.assets);
         let pack_dir_for_copy = pack_dir.clone();
         let (asset_paths, media_copied, media_bytes) =
             tokio::task::spawn_blocking(move || -> Result<(Vec<String>, usize, u64), EngineError> {

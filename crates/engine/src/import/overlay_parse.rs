@@ -243,6 +243,17 @@ fn refused(status: u16, code: &'static str, msg: impl Into<String>, hint: impl I
     EngineError::Refused { status, code, message: msg.into(), hint: hint.into(), retry_after: None }
 }
 
+/// How much of an entry may be read: its own cap, or what is left of the whole pack's limit,
+/// whichever is less (so the last entry can't take the total past it).
+pub(crate) fn entry_read_limit(entry_cap: usize, total_left: u64) -> u64 {
+    (entry_cap as u64).min(total_left)
+}
+
+/// Compression this strong (unpacked / packed) on a file this big isn't a picture, a video or
+/// a font: it is a zip bomb. Text packs 10:1 or so; media is near 1:1.
+const MAX_RATIO: u64 = 100;
+const RATIO_CHECK_FROM: u64 = 1024 * 1024;
+
 fn classify_ext(path: &str) -> Option<(EntryKind, &'static str)> {
     let fname = path.rsplit('/').next().unwrap_or(path);
     let (_, raw_ext) = fname.rsplit_once('.')?;
@@ -439,8 +450,22 @@ fn extract_zip(zip_bytes: &[u8]) -> Result<ExtractedZip, EngineError> {
             ));
         }
 
+        let packed = entry.compressed_size().max(1);
+        let too_squashed = |unpacked: u64| unpacked >= RATIO_CHECK_FROM && unpacked / packed > MAX_RATIO;
+        let bomb = || {
+            refused(
+                413,
+                "suspicious_compression",
+                format!("\"{clean_path}\" is packed far tighter than a picture, video or font can be."),
+                "That looks like a zip bomb. Only import theme packs from sources you trust.",
+            )
+        };
+        if too_squashed(entry.size()) {
+            return Err(bomb());
+        }
         let mut buf = Vec::new();
-        entry.take((entry_cap as u64) + 1).read_to_end(&mut buf).map_err(|_| {
+        let left = MAX_OVERLAY_UNPACKED.saturating_sub(total_unpacked);
+        entry.take(entry_read_limit(entry_cap, left) + 1).read_to_end(&mut buf).map_err(|_| {
             refused(
                 415,
                 "bad_overlay_file",
@@ -455,6 +480,9 @@ fn extract_zip(zip_bytes: &[u8]) -> Result<ExtractedZip, EngineError> {
                 format!("\"{clean_path}\" unpacks past the {} MB per-file limit.", entry_cap / 1024 / 1024),
                 "Compress large files inside the pack and try again.",
             ));
+        }
+        if too_squashed(buf.len() as u64) {
+            return Err(bomb());
         }
         total_unpacked = total_unpacked.saturating_add(buf.len() as u64);
         if total_unpacked > MAX_OVERLAY_UNPACKED {

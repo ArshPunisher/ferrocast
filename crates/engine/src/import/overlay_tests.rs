@@ -1086,3 +1086,47 @@ async fn an_endless_font_stylesheet_or_file_is_cut_off_as_it_arrives() {
         handle.abort();
     }
 }
+
+// ---- Neon review H3: a small upload can't become a lot of memory ------------------------------
+
+#[test]
+fn a_file_that_unpacks_to_a_thousand_times_its_size_is_refused() {
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    // 4 MB of zeros packs to a few KB: a zip bomb in small.
+    let zeros = vec![0u8; 4 * 1024 * 1024];
+    let zip = build_zip(vec![("config.json", &cfg, None), ("assets/loop.webm", &zeros, None)]);
+    assert!(zip.len() < 64 * 1024, "the bomb is small: {}", zip.len());
+    match parse_overlay_zip(&zip, "bomb.overlay") {
+        Err(EngineError::Refused { status: 413, code, .. }) => assert_eq!(code, "suspicious_compression"),
+        other => panic!("expected a refusal for the compression ratio, got {:?}", other.map(|p| p.suggested_name)),
+    }
+}
+
+#[tokio::test]
+async fn only_one_pack_is_read_at_a_time_and_few_previews_are_kept() {
+    let (e, _dir) = engine().await;
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let zip = build_zip(vec![("config.json", &cfg, None)]);
+    {
+        // While an import (or another preview) holds the lock, a preview is turned away, not queued.
+        let _held = e.inner.import_busy.lock().await;
+        match e.preview_overlay_pack(zip.clone(), "a.overlay".into()).await {
+            Err(EngineError::Conflict(_)) => {}
+            other => panic!("a preview while busy should be refused: {:?}", other.map(|p| p.preview_id)),
+        }
+    }
+    // Only two previews are kept in memory: the oldest goes.
+    let first = e.preview_overlay_pack(zip.clone(), "1.overlay".into()).await.unwrap();
+    e.preview_overlay_pack(zip.clone(), "2.overlay".into()).await.unwrap();
+    e.preview_overlay_pack(zip, "3.overlay".into()).await.unwrap();
+    let gone = e.import_overlay_pack(OverlayPackImportReq { preview_id: first.preview_id, ..Default::default() }).await;
+    assert!(matches!(gone, Err(EngineError::Refused { status: 404, .. })), "{:?}", gone.map(|r| r.id));
+}
+
+#[test]
+fn what_is_left_of_the_total_limit_bounds_each_read() {
+    use crate::import::overlay_parse::entry_read_limit;
+    assert_eq!(entry_read_limit(60, 1_000), 60);
+    assert_eq!(entry_read_limit(60, 10), 10, "near the total limit the read is cut there");
+    assert_eq!(entry_read_limit(60, 0), 0);
+}
