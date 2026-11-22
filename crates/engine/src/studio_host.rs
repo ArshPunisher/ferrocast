@@ -3232,7 +3232,9 @@ pub(crate) fn failed(message: String) -> EngineError {
         return refused(404, "studio_no_source", message, "Refresh the list of sources.");
     }
     // An item id that isn't in the scene (a box, a crop, a batch): like the other item routes.
-    if message.contains("has no item") {
+    // Its exact shape (`"Scene" has no item 9.`), so a scene or source named "has no item" doesn't
+    // read as one.
+    if message.starts_with('"') && message.contains("\" has no item ") && !message.starts_with("There's no") {
         return refused(404, "studio_no_source", message, "Refresh the list of sources.");
     }
     // Several boxes at once: a group and one of its own sources can't be in one request.
@@ -4127,6 +4129,9 @@ mod tests {
     fn an_item_that_is_not_in_the_scene_is_a_404_like_the_other_item_routes() {
         let e = failed("\"Main\" has no item 999.".into());
         assert!(matches!(&e, EngineError::Refused { status: 404, code: "studio_no_source", .. }), "{e:?}");
+        // A scene called that is still a missing scene.
+        let e = failed("There's no scene called \"has no item\".".into());
+        assert!(matches!(&e, EngineError::Refused { status: 404, code: "studio_no_scene", .. }), "{e:?}");
     }
 
     #[test]
