@@ -222,3 +222,34 @@ async fn a_start_too_far_away_is_refused_and_a_stored_one_cannot_panic_the_tick(
     e.db(move |s| ferrocast_store::repo::settings::set(s, "schedule", &vec![bad])).await.unwrap();
     e.schedule_tick(now().0).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_reminder_is_said_only_once_the_plans_are_saved() {
+    let (e, _d) = engine().await;
+    let item = e.schedule_create(input("Show", &[Platform::Twitch], HOUR)).await.unwrap();
+    // Saving the schedule now fails (reading still works).
+    e.db(|s| {
+        s.write(|tx| {
+            Ok(tx.execute_batch(
+                "CREATE TRIGGER no_schedule_writes BEFORE UPDATE ON settings
+                 BEGIN SELECT RAISE(ABORT, 'read only'); END;",
+            )?)
+        })
+    })
+    .await
+    .unwrap();
+    let mut live = e.subscribe_live();
+    let at = item.start_ms - 5 * 60_000;
+    assert!(e.schedule_tick(at).await.is_err(), "the failed save is reported");
+    let mut said = 0;
+    while let Ok(f) = live.try_recv() {
+        if f.text.contains("\"type\":\"notice\"") && f.text.contains("schedule:") {
+            said += 1;
+        }
+    }
+    assert_eq!(said, 0, "a reminder that could not be marked done must not be said (it would repeat)");
+    // With saving back, the next tick says it, once.
+    e.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TRIGGER no_schedule_writes")?))).await.unwrap();
+    assert_eq!(e.schedule_tick(at).await.unwrap().len(), 1);
+    assert!(e.schedule_tick(at).await.unwrap().is_empty());
+}

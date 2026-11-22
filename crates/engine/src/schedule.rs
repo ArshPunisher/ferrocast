@@ -195,6 +195,9 @@ impl Engine {
         let n = all.len();
         all.retain(|p| at_ms < p.start_ms.saturating_add(KEEP_AFTER_START_MS));
         let mut said = Vec::new();
+        // Said only once the plans are saved as reminded: a failed save sends nothing, so the next
+        // tick says it (once), instead of saying it now and again on every tick after.
+        let mut notices: Vec<(String, String)> = Vec::new();
         let mut changed = all.len() != n;
         for p in &mut all {
             let due = p.start_ms.saturating_sub(i64::from(p.remind_minutes) * 60_000);
@@ -212,15 +215,15 @@ impl Engine {
                     let mins = (p.start_ms.saturating_sub(at_ms).saturating_add(59_999)) / 60_000;
                     format!("\"{title}\" starts in {mins} minute{}.", if mins == 1 { "" } else { "s" })
                 };
-                self.send_live(LiveFrame::new(
-                    "notice",
-                    &Notice::new(NoticeLevel::Info, &msg).key(format!("schedule:{}", p.id)),
-                ));
+                notices.push((format!("schedule:{}", p.id), msg.clone()));
                 said.push(msg);
             }
         }
         if changed {
             self.schedule_save(all).await?;
+        }
+        for (key, msg) in notices {
+            self.send_live(LiveFrame::new("notice", &Notice::new(NoticeLevel::Info, &msg).key(key)));
         }
         Ok(said)
     }
