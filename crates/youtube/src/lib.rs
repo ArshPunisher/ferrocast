@@ -69,7 +69,13 @@ pub enum YoutubeError {
 
 impl YoutubeError {
     pub(crate) fn network(e: impl std::fmt::Display) -> Self {
-        YoutubeError::Network(e.to_string())
+        YoutubeError::Network(scrub_secrets(&e.to_string()))
+    }
+
+    /// A failed request, said without the address it went to: a resumable upload's address is a
+    /// capability to write into that upload, and reqwest puts the whole URL in its message.
+    pub(crate) fn from_reqwest(e: reqwest::Error) -> Self {
+        YoutubeError::network(e.without_url())
     }
 
     /// Maps a non-success REST response, recognising quota and auth problems.
@@ -191,6 +197,29 @@ pub(crate) fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+/// Replaces the values of the parameters that make an address a capability (`upload_id`, `key`,
+/// `access_token`, `token`) wherever they appear in a message.
+pub(crate) fn scrub_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    'outer: while !rest.is_empty() {
+        for name in ["upload_id=", "access_token=", "token=", "key="] {
+            if let Some(after) = rest.strip_prefix(name) {
+                let end =
+                    after.find(|c: char| matches!(c, '&' | ')' | '"' | '\'' | ' ' | '\n' | '>')).unwrap_or(after.len());
+                out.push_str(name);
+                out.push_str("...");
+                rest = &after[end..];
+                continue 'outer;
+            }
+        }
+        let c = rest.chars().next().unwrap_or(' ');
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 pub fn http_client() -> reqwest::Client {

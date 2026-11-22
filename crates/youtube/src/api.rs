@@ -850,7 +850,7 @@ impl Api {
                 Err(e) => {
                     failures += 1;
                     if failures > UPLOAD_RETRIES {
-                        return Err(if is_last { lost_touch() } else { YoutubeError::network(e) });
+                        return Err(if is_last { lost_touch() } else { YoutubeError::from_reqwest(e) });
                     }
                     tokio::time::sleep(upload_backoff(failures)).await;
                     ask_first = true;
@@ -867,7 +867,7 @@ impl Api {
                         // answer to a status question, so the video is not lost track of.
                         Err(e) => match self.upload_status(&session, &token, total).await {
                             Some(UploadStatus::Done(id)) => return Ok(id),
-                            _ => return Err(YoutubeError::network(e)),
+                            _ => return Err(YoutubeError::from_reqwest(e)),
                         },
                     };
                     return body

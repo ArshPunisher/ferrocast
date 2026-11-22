@@ -2428,3 +2428,20 @@ async fn a_final_piece_that_went_in_but_never_answered_is_found_when_retries_run
     let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
     assert_eq!(id, "vid-new", "the question found it");
 }
+
+/// The resumable session address is a capability to write into the upload: no error, log line
+/// or job message ever carries it.
+#[tokio::test]
+async fn a_failed_upload_request_never_shows_the_session_address() {
+    let secret = "AEnB2Uo_SECRET_SESSION_TOKEN_123";
+    // A real request that fails (nothing listens), whose URL carries the secret.
+    let url = format!("http://127.0.0.1:1/upload/youtube/v3/videos?uploadType=resumable&upload_id={secret}");
+    let e = reqwest::Client::new().put(&url).send().await.unwrap_err();
+    assert!(e.to_string().contains(secret), "the premise: reqwest puts the URL in its message");
+    let mapped = YoutubeError::from_reqwest(e).to_string();
+    assert!(!mapped.contains(secret), "{mapped}");
+    // And a message that already carries the address (any other path) is scrubbed too.
+    let text = format!("error sending request for url ({url}): timed out");
+    let scrubbed = YoutubeError::network(text).to_string();
+    assert!(!scrubbed.contains(secret), "{scrubbed}");
+}
