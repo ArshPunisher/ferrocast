@@ -77,6 +77,10 @@ impl Engine {
         }
         let mut g = self.inner.stream_health.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(rec) = g.active.as_mut() {
+            // Bounded like Go live's own log: a long, unstable stream can't grow the record.
+            if rec.destination_log.len() >= 200 {
+                rec.destination_log.remove(0);
+            }
             rec.destination_log.push(ev);
         }
     }

@@ -302,6 +302,10 @@ fn redact_report(report: &mut SupportReport, secrets: &[&str], users: &[&str]) {
             d.state = sc(&d.state);
             d.last_error = d.last_error.as_deref().map(sc);
         }
+        for ev in &mut st.destination_log {
+            ev.id = sc(&ev.id);
+            ev.name = sc(&ev.name);
+        }
         for issue in &mut st.issues {
             *issue = sc(issue);
         }
@@ -2446,7 +2450,12 @@ mod tests {
             frame_ms: 16.0,
             destinations: Vec::new(),
             issues: vec!["auth Bearer issue_bearer_tok_44 from 198.51.100.88".into()],
-            destination_log: Vec::new(),
+            destination_log: vec![DestinationEvent {
+                id: "c_1 token=log_secret_id_55".into(),
+                name: "Backup owner@log.example /Users/leakUser99/x".into(),
+                at: Millis(1_500),
+                on: true,
+            }],
         });
 
         let report = build_support_report(inp, &["opaqueReportSecret"], &["leakUser99"]);
@@ -2460,6 +2469,8 @@ mod tests {
             "enc_pw_33",
             "issue_bearer_tok_44",
             "198.51.100.88",
+            "log_secret_id_55",
+            "owner@log.example",
         ] {
             assert!(!json.contains(forbidden), "field leaked {forbidden:?} into SupportReport: {json}");
         }
