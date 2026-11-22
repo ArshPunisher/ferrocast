@@ -21,6 +21,7 @@ pub mod bot;
 pub mod cloud;
 pub mod db;
 pub mod discord;
+pub mod facebook;
 pub mod guests;
 mod history;
 pub mod kick;
@@ -119,6 +120,8 @@ pub struct AppState {
     pub(crate) remote: Arc<remote::Runtime>,
     /// The Ferrocast bot for Discord (off without the `DISCORD_*` settings).
     pub(crate) discord: Arc<discord::Runtime>,
+    /// Facebook sign-in (off without `FACEBOOK_APP_ID` and `FACEBOOK_APP_SECRET`).
+    pub(crate) facebook: Arc<facebook::Runtime>,
     /// The weekly email (off without `BREVO_API_KEY`).
     pub(crate) mail: Arc<mail::Runtime>,
     /// The 24/7 cloud bot (Twitch off without `TWITCH_CLOUD_*`, Kick with the Kick app).
@@ -156,6 +159,7 @@ impl AppState {
             smart: Arc::default(),
             remote: Arc::default(),
             discord: Arc::default(),
+            facebook: Arc::default(),
             mail: Arc::default(),
             bot: Arc::default(),
             tip_domains: Arc::default(),
@@ -167,6 +171,12 @@ impl AppState {
             signups: Arc::default(),
             signups_hour: Arc::default(),
         }
+    }
+
+    /// Facebook sign-in (`facebook::Config::from_env()` in production).
+    pub fn with_facebook(mut self, cfg: facebook::Config) -> AppState {
+        self.facebook = Arc::new(facebook::Runtime::new(cfg));
+        self
     }
 
     /// Billing settings (`billing::BillingConfig::from_env()` in production).
@@ -363,6 +373,8 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/v1/installs", post(new_install))
         .route("/v1/link", get(link))
+        .route("/v1/facebook/oauth", post(facebook::oauth))
+        .route("/v1/facebook/callback", get(facebook::callback))
         .route("/v1/kick/oauth", post(kick_oauth))
         .route("/v1/kick/callback", get(kick_callback))
         .route("/v1/kick/refresh", post(kick_refresh))
