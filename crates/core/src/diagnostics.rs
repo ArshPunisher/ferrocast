@@ -136,6 +136,16 @@ pub struct DestinationHealthSnapshot {
     pub last_error: Option<String>,
 }
 
+/// A destination turned on or off while the stream ran (or at its start).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestinationEvent {
+    pub id: String,
+    pub name: String,
+    pub at: Millis,
+    /// `true` = it started sending, `false` = it stopped.
+    pub on: bool,
+}
+
 /// Health snapshot of one live stream (up to the most recent 5 stored locally).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StreamHealthRecord {
@@ -160,6 +170,9 @@ pub struct StreamHealthRecord {
     pub frame_ms: f64,
     pub destinations: Vec<DestinationHealthSnapshot>,
     pub issues: Vec<String>,
+    /// Which destinations were on, and when they were turned on or off (older records: none).
+    #[serde(default)]
+    pub destination_log: Vec<DestinationEvent>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +301,10 @@ fn redact_report(report: &mut SupportReport, secrets: &[&str], users: &[&str]) {
             d.target = sc(&d.target);
             d.state = sc(&d.state);
             d.last_error = d.last_error.as_deref().map(sc);
+        }
+        for ev in &mut st.destination_log {
+            ev.id = sc(&ev.id);
+            ev.name = sc(&ev.name);
         }
         for issue in &mut st.issues {
             *issue = sc(issue);
@@ -2380,6 +2397,7 @@ mod tests {
                 last_error: None,
             }],
             issues: vec!["drop".into()],
+            destination_log: Vec::new(),
         });
         let report = build_support_report(stream_issues, &[], &["arshramgarhia"]);
         let codes: Vec<_> = report.likely_causes.iter().map(|c| c.code.as_str()).collect();
@@ -2432,6 +2450,12 @@ mod tests {
             frame_ms: 16.0,
             destinations: Vec::new(),
             issues: vec!["auth Bearer issue_bearer_tok_44 from 198.51.100.88".into()],
+            destination_log: vec![DestinationEvent {
+                id: "c_1 token=log_secret_id_55".into(),
+                name: "Backup owner@log.example /Users/leakUser99/x".into(),
+                at: Millis(1_500),
+                on: true,
+            }],
         });
 
         let report = build_support_report(inp, &["opaqueReportSecret"], &["leakUser99"]);
@@ -2445,6 +2469,8 @@ mod tests {
             "enc_pw_33",
             "issue_bearer_tok_44",
             "198.51.100.88",
+            "log_secret_id_55",
+            "owner@log.example",
         ] {
             assert!(!json.contains(forbidden), "field leaked {forbidden:?} into SupportReport: {json}");
         }

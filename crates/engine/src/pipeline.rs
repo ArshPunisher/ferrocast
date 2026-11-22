@@ -255,7 +255,13 @@ impl Engine {
                     st.live.values().any(|l| *l)
                 };
                 if !any_live && e.origin == Origin::Live {
-                    self.health_stream_ended(at).await;
+                    if self.golive_stream_running() {
+                        // The stream is still on air (no platform gets it any more): the session
+                        // record stays open until the stream itself ends.
+                        self.health_end_deferred();
+                    } else {
+                        self.health_stream_ended(at).await;
+                    }
                 }
             }
             EventKind::Reversal { original_source_id, reason } => {

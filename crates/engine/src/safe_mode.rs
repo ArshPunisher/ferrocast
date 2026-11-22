@@ -576,6 +576,7 @@ mod tests {
             let engine1 = Engine::start_with_memory_secrets(dir.path()).await.unwrap_or_else(|e| panic!("{e}"));
             engine1
                 .record_stream_health(ferrocast_core::diagnostics::StreamHealthRecord {
+                    destination_log: Vec::new(),
                     id: "crashed-live-1".into(),
                     started_at: ferrocast_core::event::Millis(1_700_000_000_000),
                     ended_at: None,
