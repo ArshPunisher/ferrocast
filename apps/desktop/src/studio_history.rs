@@ -23,6 +23,16 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MERGE: Duration = Duration::from_secs(3);
 /// Arrow-key nudges this close together are one step.
 const NUDGES: Duration = Duration::from_secs(1);
+/// How long a drag that never saved (a lost pointer, a closed page) can keep a step open: after
+/// this a move of the same sources is a step of its own, not folded into hours-old work.
+const OPEN_MAX: Duration = Duration::from_secs(30);
+
+impl Step {
+    /// Still being added to by a drag that hasn't saved.
+    fn live(&self) -> bool {
+        self.open && self.at.elapsed() < OPEN_MAX
+    }
+}
 
 #[derive(Debug)]
 struct Step {
@@ -132,7 +142,10 @@ impl History {
             StudioAct::SetItemBox { scene, id, save, .. } => {
                 let key = ("box", scene.clone(), *id);
                 // A drag's moves, or nudges with the arrow keys in a row, are one step.
-                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
+                if self
+                    .undo
+                    .last()
+                    .is_some_and(|s| s.key.as_ref() == Some(&key) && (s.live() || s.at.elapsed() < NUDGES))
                 {
                     // An unsaved move joining a step already closed reopens it: the drag goes on.
                     return Some(Before { open: !*save, ..joined(*save) });
@@ -145,7 +158,10 @@ impl History {
                 ids.sort_unstable();
                 // The whole sorted list is the key: two sets that happen to hash alike are two drags.
                 let key = ("boxes", format!("{scene}\u{1}{ids:?}"), 0);
-                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
+                if self
+                    .undo
+                    .last()
+                    .is_some_and(|s| s.key.as_ref() == Some(&key) && (s.live() || s.at.elapsed() < NUDGES))
                 {
                     return Some(Before { open: !*save, ..joined(*save) });
                 }
@@ -158,7 +174,7 @@ impl History {
             StudioAct::SetItemCrop { scene, id, save, .. } => {
                 let key = ("crop", scene.clone(), *id);
                 // A drag's crops are one step.
-                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.open) {
+                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.live()) {
                     return Some(joined(*save));
                 }
                 Some(fresh(format!("Crop {}", item_name(c, scene, *id)?), Some(key), !*save))
@@ -509,6 +525,39 @@ mod tests {
         go(&mut h, 80.0, true);
         assert_eq!(h.list().0.len(), 1, "one step: {:?}", h.list().0);
         assert!(h.undo.last().is_some_and(|s| !s.open), "the save closes it");
+    }
+
+    /// A drag that never saved (the pointer was lost, the page closed) leaves its step open; a
+    /// move of the same sources long after must not fold into it (Undo would go back that far).
+    #[test]
+    fn an_abandoned_drags_step_does_not_swallow_later_moves() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in ["A", "B"] {
+            c.add_source("Main", "color_source_v3", n, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, x: f32, save: bool| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, 50.0, false); // a drag that never saves
+        assert_eq!(h.list().0.len(), 1);
+        if let Some(s) = h.undo.last_mut() {
+            s.at -= OPEN_MAX * 2; // ...and is left for a minute
+        }
+        go(&mut h, 90.0, true); // a later, finished move of the same two
+        assert_eq!(h.list().0.len(), 2, "two steps: {:?}", h.list().0);
     }
 
     /// Two different sets of items moved within a second of each other are two steps, even when
