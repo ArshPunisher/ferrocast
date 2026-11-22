@@ -224,16 +224,24 @@ pub struct BenchmarkReq {
     pub max_seconds: Option<u64>,
 }
 
+fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 /// Request payload for `POST /api/v1/studio/engine/auto-config/apply`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ApplyReq {
     #[serde(default)]
     pub encoder: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_some")]
     pub video_encoder: Option<Option<String>>,
     #[serde(default)]
     pub encoder_settings: Option<Map<String, Value>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_some")]
     pub scale: Option<Option<[u32; 2]>>,
     #[serde(default)]
     pub fps: Option<u32>,
@@ -2055,7 +2063,11 @@ impl Engine {
             next.fps = p.fps;
             next.video_kbps = p.video_kbps;
         }
+        let had_explicit_video_encoder = req.video_encoder.is_some();
         if let Some(enc) = req.encoder {
+            if enc == "software" && !had_explicit_video_encoder {
+                next.video_encoder = None;
+            }
             next.encoder = enc;
         }
         if let Some(ve) = req.video_encoder {
@@ -3807,5 +3819,42 @@ mod tests {
             assert_eq!(st.state, AutoConfigStateKind::RolledBack);
             assert_eq!(host.settings.lock().unwrap().video_kbps, 3500);
         }
+    }
+
+    #[tokio::test]
+    async fn h8_apply_req_json_null_clears_scale_and_video_encoder_and_software_clears_hw_id() {
+        let req: ApplyReq = serde_json::from_str(
+            r#"{"encoder":"software","fps":60,"video_kbps":6000,"scale":null,"video_encoder":null}"#,
+        )
+        .unwrap();
+        assert_eq!(req.scale, Some(None), "explicit JSON null must deserialize as Some(None) to clear scale");
+        assert_eq!(
+            req.video_encoder,
+            Some(None),
+            "explicit JSON null must deserialize as Some(None) to clear video_encoder"
+        );
+
+        let omitted: ApplyReq = serde_json::from_str(r#"{"fps":60}"#).unwrap();
+        assert_eq!(omitted.scale, None);
+        assert_eq!(omitted.video_encoder, None);
+
+        let (engine, host, _dir) = test_engine().await;
+        {
+            let mut s = host.settings.lock().unwrap();
+            s.encoder = "hardware".into();
+            s.video_encoder = Some("com.apple.videotoolbox.videoencoder.ave.avc".into());
+            s.scale = Some([1280, 720]);
+            s.fps = 30;
+            s.video_kbps = 4000;
+        }
+        let clear_req: ApplyReq =
+            serde_json::from_str(r#"{"encoder":"software","fps":60,"video_kbps":6000,"scale":null}"#).unwrap();
+        engine.auto_config_apply(clear_req).await.unwrap();
+        let updated = engine.studio_settings().await.unwrap();
+        assert_eq!(updated.scale, None, "explicit null scale in ApplyReq must clear previous downscale");
+        assert_eq!(
+            updated.video_encoder, None,
+            "switching encoder to software must clear stale hardware video_encoder"
+        );
     }
 }
