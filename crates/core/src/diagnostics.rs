@@ -2516,7 +2516,7 @@ mod tests {
             format!("(token:{key})"),
             format!("user=ana:{key}:end"),
             format!("a.b/{key}.json"),
-            format!("{key}"),
+            key.clone(),
             format!("FC_KEY_{}", "AB12".repeat(16)),
         ] {
             let out = redact_text(&text, &[], &[]);
