@@ -501,24 +501,31 @@ impl Engine {
         let path = self.clip_path(id).await?;
         let srt = srt_beside(&path);
         tokio::task::spawn_blocking(move || -> Result<Vec<Cue>, EngineError> {
-            let Ok(meta) = std::fs::symlink_metadata(&srt) else { return Ok(Vec::new()) };
-            if !meta.file_type().is_file() || meta.len() > MAX_SRT_BYTES {
-                return Err(refuse(
-                    422,
-                    "bad_captions",
-                    "That clip's caption file can't be read.",
-                    "Delete it and make the captions again.",
-                ));
+            if std::fs::symlink_metadata(&srt).is_err() {
+                return Ok(Vec::new());
             }
-            // Read as text or said: a file that isn't text (or can't be opened) is not "no captions".
-            let text = std::fs::read_to_string(&srt).map_err(|_| {
+            let bad = || {
                 refuse(
                     422,
                     "bad_captions",
                     "That clip's caption file can't be read.",
                     "Delete it and make the captions again.",
                 )
-            })?;
+            };
+            // The very file the name is (no link, one name only), read from that handle under the
+            // size limit: a hard link to a file outside the folder is not read.
+            let file = super::open_plain(&srt).map_err(|_| bad())?;
+            if file.metadata().map_err(|_| bad())?.len() > MAX_SRT_BYTES {
+                return Err(bad());
+            }
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(file, MAX_SRT_BYTES + 1), &mut bytes)
+                .map_err(|_| bad())?;
+            if bytes.len() as u64 > MAX_SRT_BYTES {
+                return Err(bad());
+            }
+            // Read as text or said: a file that isn't text is not "no captions".
+            let text = String::from_utf8(bytes).map_err(|_| bad())?;
             Ok(parse_srt(&text))
         })
         .await

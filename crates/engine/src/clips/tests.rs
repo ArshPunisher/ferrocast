@@ -492,3 +492,17 @@ fn opening_a_clip_refuses_a_link_swapped_in_after_the_check() {
     std::fs::hard_link(outside.path().join("secret.mp4"), dir.path().join("hard.mp4")).unwrap();
     assert!(open_plain(&dir.path().join("hard.mp4")).is_err(), "opened a hard link");
 }
+
+/// CodeRabbit (CWE-59): a caption file that is a hard link to a file outside the folder is not
+/// read, and the read is bounded on the opened handle.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hard_linked_caption_file_is_refused_not_read() {
+    let (e, _data, clips) = engine().await;
+    let outside = tempfile::tempdir().unwrap();
+    touch(clips.path(), "a.mp4", b"video");
+    touch(outside.path(), "secret.srt", b"1\n00:00:00,000 --> 00:00:01,000\nsecret words\n\n");
+    std::fs::hard_link(outside.path().join("secret.srt"), clips.path().join("a.srt")).unwrap();
+    let r = e.clip_captions("a.mp4").await;
+    assert!(matches!(r, Err(EngineError::Refused { code: "bad_captions", .. })), "{r:?}");
+}
