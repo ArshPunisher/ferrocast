@@ -641,10 +641,19 @@ fn saved_scenes(doc: Option<&Value>) -> Value {
         .collect();
     let scenes: Vec<Value> =
         names.iter().map(|n| json!({ "name": n, "items": 0, "current": false, "preview": false })).collect();
+    let named_transitions = ferrocast_studio::stage::saved_named_transitions(doc);
+    let transition_matrix = ferrocast_studio::stage::saved_transition_matrix(doc);
     json!({
         "scenes": scenes,
         "current": doc.and_then(|d| d.get("current_scene")).and_then(Value::as_str).unwrap_or(""),
-        "transition": null,
+        // What a switch would use: the default named transition (the dashboard reads it).
+        "transition": named_transitions
+            .iter()
+            .find(|t| t.default)
+            .or(named_transitions.first())
+            .map_or(json!({ "kind": "fade_transition", "ms": 300 }), |t| json!({ "kind": t.kind, "ms": t.ms })),
+        "named_transitions": named_transitions,
+        "transition_matrix": transition_matrix,
         "preview": null,
         "vertical": null,
         "saved": true,
@@ -1390,6 +1399,8 @@ fn scenes_json(c: &Collection) -> Result<Value, String> {
         "scenes": c.scenes(),
         "current": c.current(),
         "transition": c.transition(),
+        "named_transitions": c.named_transitions(),
+        "transition_matrix": c.transition_matrix(),
         // Studio Mode's preview (null when it's off), its quick transitions and options.
         "preview": c.preview_scene(),
         "quick": c.quick_transitions(),
@@ -1557,6 +1568,35 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::SetTransition { kind, ms } => done(c.set_transition(&TransitionInfo { kind, ms })),
         A::SetSceneTransition { scene, transition } => {
             done(c.set_scene_transition(&scene, transition.map(|t| TransitionInfo { kind: t.kind, ms: t.ms }).as_ref()))
+        }
+        A::AddNamedTransition { transition: t } => {
+            let created = c.add_named_transition(&ferrocast_studio::NamedTransition {
+                name: t.name,
+                kind: t.kind,
+                ms: t.ms,
+                settings: t.settings,
+                default: t.default,
+            })?;
+            v(to_json!(created))
+        }
+        A::UpdateNamedTransition { name, patch } => {
+            let updated = c.update_named_transition(
+                &name,
+                patch.kind.as_deref(),
+                patch.ms,
+                patch.settings.as_ref(),
+                patch.default,
+            )?;
+            v(to_json!(updated))
+        }
+        A::RenameNamedTransition { name, new_name } => v(to_json!(c.rename_named_transition(&name, &new_name)?)),
+        A::DuplicateNamedTransition { name, new_name } => {
+            v(to_json!(c.duplicate_named_transition(&name, new_name.as_deref())?))
+        }
+        A::DeleteNamedTransition { name } => done(c.delete_named_transition(&name)),
+        A::SetDefaultNamedTransition { name } => done(c.set_default_named_transition(&name)),
+        A::SetTransitionMatrixRule { from, to, transition } => {
+            done(c.set_matrix_rule(from.as_deref(), to.as_deref(), transition.as_deref()))
         }
         A::Items { scene } => v(to_json!(c.items(&scene)?)),
         A::AddSource { scene, source, fit } => {
@@ -4646,6 +4686,40 @@ mod saved_scene_tests {
         assert_eq!(saved_scenes(None)["scenes"], json!([]));
         assert_eq!(saved_scenes(Some(&json!({ "scene_order": "nope" })))["scenes"], json!([]));
     }
+
+    #[test]
+    fn a_stopped_studio_still_answers_with_a_transition_and_only_valid_matrix_rules() {
+        // No file: the dashboard still gets a transition object, never null.
+        let v = saved_scenes(None);
+        assert_eq!(v["transition"]["kind"], "fade_transition");
+        assert_eq!(v["transition"]["ms"], 300);
+        // A collection whose matrix names a deleted scene and a missing transition.
+        let doc = json!({
+            "current_scene": "Main",
+            // The scenes as a real collection has them: in `sources` too (a running Studio and a
+            // stopped one read the same scenes).
+            "sources": [
+                { "id": "scene", "name": "Main", "settings": { "items": [] } },
+                { "id": "scene", "name": "BRB", "settings": { "items": [] } }
+            ],
+            "scene_order": [{ "name": "Main" }, { "name": "BRB" }],
+            "transitions": [{ "id": "swipe_transition", "name": "Wipe", "settings": {} }],
+            "current_transition": "Wipe",
+            "transition_duration": 450,
+            "ferrocast": {
+                "named_transitions_v2": true,
+                "transition_matrix": [
+                    { "from": null, "to": "BRB", "transition": "Wipe" },
+                    { "from": "Gone", "to": "BRB", "transition": "Wipe" },
+                    { "from": "Main", "to": "BRB", "transition": "Nope" }
+                ]
+            }
+        });
+        let v = saved_scenes(Some(&doc));
+        let rules = v["transition_matrix"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "dangling rules are dropped: {rules:?}");
+        assert_eq!(v["transition"]["kind"], "swipe_transition");
+    }
 }
 
 #[cfg(test)]
@@ -5296,5 +5370,49 @@ mod import_tests {
         );
 
         drop(engine);
+    }
+
+    #[test]
+    fn studio_run_and_scenes_json_expose_and_mutate_named_transitions_and_matrix() {
+        use ferrocast_engine::studio_host::{NamedTransitionInput, StudioAct};
+        use serde_json::json;
+
+        let c =
+            ferrocast_studio::stage::Stage::new(ferrocast_studio::Canvas { width: 320, height: 180, fps: 30 }, "Main")
+                .unwrap_or_else(|e| panic!("{e}"));
+        c.add_scene("BRB").unwrap();
+
+        let created = super::run(
+            &c,
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput {
+                    name: "Scene Swipe".into(),
+                    kind: "swipe_transition".into(),
+                    ms: 350,
+                    settings: json!({ "direction": "left" }),
+                    default: false,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(created["name"], "Scene Swipe");
+
+        super::run(
+            &c,
+            StudioAct::SetTransitionMatrixRule {
+                from: Some("Main".into()),
+                to: Some("BRB".into()),
+                transition: Some("Scene Swipe".into()),
+            },
+        )
+        .unwrap();
+        super::run(&c, StudioAct::RenameNamedTransition { name: "Scene Swipe".into(), new_name: "Quick Swipe".into() })
+            .unwrap();
+
+        let doc = super::scenes_json(&c).unwrap();
+        assert!(doc["named_transitions"].as_array().unwrap().iter().any(|t| t["name"] == "Quick Swipe"));
+        assert_eq!(doc["transition_matrix"][0]["transition"], "Quick Swipe");
+        assert_eq!(doc["transition_matrix"][0]["from"], "Main");
+        assert_eq!(doc["transition_matrix"][0]["to"], "BRB");
     }
 }
