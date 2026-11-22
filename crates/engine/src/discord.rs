@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use crate::frames::{LiveFrame, Notice, NoticeLevel};
 use crate::{Engine, EngineError, now};
 
-const WEBHOOK_KEY: &str = "discord-webhook";
+pub(crate) const WEBHOOK_KEY: &str = "discord-webhook";
 /// One post per platform per this long: a stream that drops and comes back isn't news.
 const REPOST_AFTER_MS: i64 = 30 * 60 * 1000;
 

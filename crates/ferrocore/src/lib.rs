@@ -48,6 +48,7 @@ pub mod audio;
 pub mod audio_thread;
 mod compose;
 pub mod delay;
+pub mod diagnostics_probe;
 pub mod engine;
 pub mod ffenc;
 pub mod ffsrc;

@@ -429,6 +429,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn log(&self, _lines: usize) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Extra Studio hardware/encoder/renderer telemetry for support diagnostics.
+    async fn diagnostics_studio(&self) -> Option<Value> {
+        None
+    }
     /// Shows the log file in Finder or Explorer (OBS's Show Log Files).
     async fn show_log(&self) -> Result<(), String> {
         Err(NOT_HERE.into())

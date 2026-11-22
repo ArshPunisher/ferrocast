@@ -32,7 +32,7 @@ use crate::frames::LiveFrame;
 use crate::state::ConnectorView;
 use crate::{Engine, EngineError};
 
-const PASSWORD_KEY: &str = "obs-password";
+pub(crate) const PASSWORD_KEY: &str = "obs-password";
 const SETTINGS_KEY: &str = "obs";
 const LOCAL_HOST: &str = "127.0.0.1";
 /// How often a working connection is checked.

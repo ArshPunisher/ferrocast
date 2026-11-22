@@ -1,7 +1,6 @@
 //! What an overlay receives first (API.md §6 `snapshot`) and overlay CRUD for the API.
 
 use ferrocast_core::overlay::{Overlay, Preset, WidgetKind};
-use ferrocast_core::template::{Template, Vars};
 use ferrocast_store::repo;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -72,6 +71,7 @@ impl Engine {
         let saved = self.db(move |s| repo::overlays::update(s, &o)).await?;
         let view = self.overlay_view(&saved);
         self.push_config(&saved).await;
+        self.push_overlay_labels_for(&saved).await;
         Ok(view)
     }
 
@@ -184,25 +184,12 @@ impl Engine {
         };
         let mut events = events;
         events.reverse();
-        let (goals, viewers, labels) = {
+        let (labels, label_trains) = self.overlay_labels_and_trains(o).await;
+        let (goals, viewers) = {
             let st = self.state();
             let viewers: serde_json::Map<String, Value> =
                 st.viewers.iter().map(|(p, c)| (platform_key(*p).to_string(), json!(c))).collect();
-            let labels: serde_json::Map<String, Value> = o
-                .widgets
-                .iter()
-                .filter(|w| w.kind == WidgetKind::Label)
-                .map(|w| {
-                    let source = w.config.get("source").and_then(Value::as_str).unwrap_or("");
-                    let tpl = w.config.get("template").and_then(Value::as_str).unwrap_or("{value}");
-                    let mut vars = Vars::new();
-                    vars.insert("value".into(), st.session.label(source));
-                    self.counter_vars(&mut vars); // `{count:deaths}` (Studio counters)
-                    let text = Template::parse(tpl).map(|t| t.render(&vars)).unwrap_or_default();
-                    (w.id.clone(), json!(text))
-                })
-                .collect();
-            (st.goals.iter().map(ferrocast_core::goal::Goal::view).collect::<Vec<_>>(), viewers, labels)
+            (st.goals.iter().map(ferrocast_core::goal::Goal::view).collect::<Vec<_>>(), viewers)
         };
         let has = |k: WidgetKind| o.widgets.iter().any(|w| w.kind == k);
         let credits = if has(WidgetKind::EndCredits) { Some(self.credits().await?) } else { None };
@@ -210,7 +197,7 @@ impl Engine {
         let view = self.overlay_view(o);
         Ok(json!({
             "overlay": view_public(&view),
-            "state": { "goals": goals, "labels": labels, "viewers": viewers, "events": events, "chat": chat,
+            "state": { "goals": goals, "labels": labels, "label_trains": label_trains, "viewers": viewers, "events": events, "chat": chat,
                        "poll": self.poll(), "giveaway": self.giveaway_card().await,
                        "credits": credits, "chat_highlight": chat_highlight,
                        "show": self.show_overlay_state(), "music": self.music_now() },

@@ -23,6 +23,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0009_designs.sql"),
     include_str!("../migrations/0010_studio.sql"),
     include_str!("../migrations/0011_autoreplies.sql"),
+    include_str!("../migrations/0012_labels_index.sql"),
 ];
 
 /// Schema version this build understands.
@@ -150,6 +151,16 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let v: i64 = s.read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+        let has_idx: i64 = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='events_origin_hidden_kind_at'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(has_idx, 1);
         drop(s);
         Store::open(dir.path()).unwrap();
         assert!(!dir.path().join("backups").exists(), "no backup when nothing migrated");
@@ -177,6 +188,16 @@ mod tests {
         let s = Store::open(dir.path()).unwrap();
         let v: i64 = s.read(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?)).unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+        let has_idx: i64 = s
+            .read(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='events_origin_hidden_kind_at'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(has_idx, 1);
         assert!(dir.path().join("backups").exists(), "a backup is taken before migrating");
         let o = crate::repo::overlays::get(&s, "o1").unwrap();
         assert_eq!((o.name.as_str(), o.design), ("Main", None), "existing overlays keep working");

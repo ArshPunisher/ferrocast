@@ -7,12 +7,14 @@ pub mod designs;
 pub mod events;
 pub mod giveaways;
 pub mod goals;
+pub mod labels;
 pub mod loyalty;
 pub mod media;
 pub mod overlays;
 pub mod recap;
 pub mod rules;
 pub mod settings;
+pub mod stream_health;
 pub mod studio;
 pub mod viewers;
 
