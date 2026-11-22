@@ -167,6 +167,7 @@ impl Engine {
             // it first. Refresh session + trains cleanly; note pipeline persists BEFORE support_event!
         }
         let now_ms = crate::now();
+        let mut needs_tip_rehydrate = false;
         {
             let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
             // Ensure train sees live events even if hydrate_labels happened after DB insert.
@@ -174,6 +175,9 @@ impl Engine {
                 // Only update counters incrementally when we didn't literally just hydrate after DB write!
                 if hydrated {
                     rt.observe_event(event, now_ms);
+                    if matches!(event.kind, EventKind::Reversal { .. }) && rt.latest.tip.is_none() {
+                        needs_tip_rehydrate = true;
+                    }
                 } else {
                     rt.session.observe(event);
                     for t in rt.trains.values_mut() {
@@ -181,6 +185,10 @@ impl Engine {
                     }
                 }
             }
+        }
+        if needs_tip_rehydrate && let Ok(refreshed) = self.db(repo::labels::latest_labels).await {
+            let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
+            rt.latest.tip = refreshed.tip;
         }
         self.push_all_overlay_labels().await;
     }
@@ -340,5 +348,69 @@ pub(crate) async fn run(engine: Engine) {
         if expired {
             engine.push_all_overlay_labels().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrocast_core::event::{Actor, PaymentStatus, Platform, ReversalReason, TipProvider};
+    use ferrocast_core::money::Money;
+    use ferrocast_store::repo::events;
+
+    #[tokio::test]
+    async fn live_reversal_of_hydrated_tip_falls_back_to_prior_captured_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine1 = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        let actor = |n: &str| Actor::named(Platform::Tips, n);
+        let tip = |id: &str, name: &str, cents: i64, at: i64| {
+            let mut e = Event::live(
+                Platform::Tips,
+                Some(id.into()),
+                Millis(at),
+                EventKind::Tip {
+                    actor: actor(name),
+                    money: Money::new(cents, "USD"),
+                    message: None,
+                    provider: TipProvider::Stripe,
+                    payment_ref: id.into(),
+                    status: PaymentStatus::Captured,
+                },
+            );
+            e.id = id.into();
+            e
+        };
+        let t1 = tip("t1", "OlderTipper", 1500, 1_700_000_000_000);
+        let t2 = tip("t2", "RefundedTipper", 9000, 1_700_000_001_000);
+        engine1
+            .db(move |s| {
+                events::insert(s, &t1)?;
+                events::insert(s, &t2)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        engine1.shutdown();
+
+        // Simulate restart: hydrate_labels loads t2; then t2 gets reversed live -> falls back to t1!
+        let engine2 = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        engine2.hydrate_labels().await;
+        {
+            let rt = engine2.inner.labels.lock().unwrap();
+            assert_eq!(rt.latest.label(LabelSource::LatestTip).as_deref(), Some("RefundedTipper $90"));
+        }
+        let mut rev = Event::live(
+            Platform::Tips,
+            Some("rev-t2".into()),
+            Millis(1_700_000_002_000),
+            EventKind::Reversal { original_source_id: "t2".into(), reason: ReversalReason::Refund },
+        );
+        rev.id = "rev-t2".into();
+        let rev_ins = rev.clone();
+        engine2.db(move |s| events::insert(s, &rev_ins).map(|_| ())).await.unwrap();
+        engine2.labels_observe_event(&rev).await;
+
+        let rt = engine2.inner.labels.lock().unwrap();
+        assert_eq!(rt.latest.label(LabelSource::LatestTip).as_deref(), Some("OlderTipper $15"));
     }
 }

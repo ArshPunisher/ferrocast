@@ -273,7 +273,7 @@ impl PeriodTotals {
 }
 
 /// Latest-X snapshots across all streams (hydrated from SQLite and updated live).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LatestLabels {
     pub follower: Option<String>,
     pub sub: Option<String>,
@@ -281,7 +281,24 @@ pub struct LatestLabels {
     pub tip: Option<(String, Money)>,
     pub bits: Option<(String, u64)>,
     pub raid: Option<(String, u32)>,
+    #[serde(skip)]
+    tip_history: Vec<(Option<String>, String, Money)>,
+    #[serde(skip)]
+    reversed_sources: HashSet<String>,
 }
+
+impl PartialEq for LatestLabels {
+    fn eq(&self, other: &Self) -> bool {
+        self.follower == other.follower
+            && self.sub == other.sub
+            && self.gifter == other.gifter
+            && self.tip == other.tip
+            && self.bits == other.bits
+            && self.raid == other.raid
+    }
+}
+
+impl Eq for LatestLabels {}
 
 impl LatestLabels {
     pub fn observe(&mut self, event: &Event) {
@@ -289,6 +306,11 @@ impl LatestLabels {
             return;
         }
         match &event.kind {
+            EventKind::Reversal { original_source_id, .. } => {
+                self.reversed_sources.insert(original_source_id.clone());
+                self.tip_history.retain(|(src, _, _)| src.as_deref() != Some(original_source_id.as_str()));
+                self.tip = self.tip_history.last().map(|(_, n, m)| (n.clone(), m.clone()));
+            }
             EventKind::Follow { actor } => {
                 self.follower = Some(actor.display_name.clone());
             }
@@ -300,7 +322,16 @@ impl LatestLabels {
             }
             EventKind::Tip { actor, money, status: PaymentStatus::Captured, .. }
             | EventKind::PaidMessage { actor, money, .. } => {
+                if let Some(src) = &event.source_id
+                    && self.reversed_sources.contains(src)
+                {
+                    return;
+                }
                 let name = if actor.anonymous { "Anonymous".to_string() } else { actor.display_name.clone() };
+                self.tip_history.push((event.source_id.clone(), name.clone(), money.clone()));
+                if self.tip_history.len() > 32 {
+                    self.tip_history.remove(0);
+                }
                 self.tip = Some((name, money.clone()));
             }
             EventKind::PlatformGift { actor, value, .. } if value.unit == ValueUnit::Bits => {
@@ -805,6 +836,7 @@ mod tests {
         session.observe(&rev);
         monthly.observe(&rev);
         alltime.observe(&rev);
+        latest.observe(&rev);
 
         assert_eq!(session.formatted_tips(), "₹500");
         assert!(session.top_supporter_display().starts_with("Eve"));
@@ -816,7 +848,7 @@ mod tests {
         assert_eq!(latest.label(LabelSource::LatestGifter).as_deref(), Some("FebGifter (4)"));
         assert_eq!(latest.label(LabelSource::LatestBits).as_deref(), Some("Carol 1,500 bits"));
         assert_eq!(latest.label(LabelSource::LatestRaid).as_deref(), Some("Dan (42)"));
-        assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("Frank $600"));
+        assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("Eve ₹500"));
     }
 
     #[test]
@@ -934,5 +966,72 @@ mod tests {
         assert!(v.active);
         assert_eq!(v.events, 2);
         assert_eq!(v.latest_actor.as_deref(), Some("GenerousGifter"));
+    }
+
+    #[test]
+    fn latest_labels_rolls_back_and_ignores_late_reversed_tips() {
+        let mut latest = LatestLabels::default();
+        let t1 = Event::live(
+            Platform::Tips,
+            Some("tip-1".into()),
+            Millis(1_000),
+            EventKind::Tip {
+                actor: who("FirstTipper"),
+                money: Money::new(1_000, "USD"),
+                message: None,
+                provider: TipProvider::Stripe,
+                payment_ref: "ref-1".into(),
+                status: PaymentStatus::Captured,
+            },
+        );
+        let t2 = Event::live(
+            Platform::Tips,
+            Some("tip-2".into()),
+            Millis(2_000),
+            EventKind::Tip {
+                actor: who("BadTipper"),
+                money: Money::new(5_000, "USD"),
+                message: None,
+                provider: TipProvider::Stripe,
+                payment_ref: "ref-2".into(),
+                status: PaymentStatus::Captured,
+            },
+        );
+        let rev2 = Event::live(
+            Platform::Tips,
+            Some("rev-2".into()),
+            Millis(3_000),
+            EventKind::Reversal { original_source_id: "tip-2".into(), reason: ReversalReason::Chargeback },
+        );
+        let late_rev = Event::live(
+            Platform::Tips,
+            Some("rev-3".into()),
+            Millis(4_000),
+            EventKind::Reversal { original_source_id: "tip-3".into(), reason: ReversalReason::Refund },
+        );
+        let t3_late = Event::live(
+            Platform::Tips,
+            Some("tip-3".into()),
+            Millis(4_500),
+            EventKind::Tip {
+                actor: who("AlreadyReversed"),
+                money: Money::new(9_000, "USD"),
+                message: None,
+                provider: TipProvider::Stripe,
+                payment_ref: "ref-3".into(),
+                status: PaymentStatus::Captured,
+            },
+        );
+
+        latest.observe(&t1);
+        latest.observe(&t2);
+        assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("BadTipper $50"));
+        latest.observe(&rev2);
+        assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("FirstTipper $10"));
+
+        // Reversal observed before delayed duplicate/replayed tip
+        latest.observe(&late_rev);
+        latest.observe(&t3_late);
+        assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("FirstTipper $10"));
     }
 }

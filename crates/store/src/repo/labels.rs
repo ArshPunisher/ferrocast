@@ -1,8 +1,6 @@
 //! SQLite reads for local stream labels (session, monthly, all-time, and latest-X).
 
-use std::collections::HashSet;
-
-use ferrocast_core::event::{Event, EventKind, Millis, Origin, PaymentStatus};
+use ferrocast_core::event::{Event, Millis};
 use ferrocast_core::labels::{LatestLabels, PeriodTotals, summarize_events};
 use rusqlite::params;
 
@@ -58,15 +56,6 @@ pub fn period_totals(store: &Store, from_ms: Option<i64>, to_ms: Option<i64>) ->
 /// Hydrates latest-X labels (follower, sub, gifter, tip, bits, raid) from the local SQLite log.
 pub fn latest_labels(store: &Store) -> Result<LatestLabels> {
     store.read(|c| {
-        let reversed: HashSet<String> = {
-            let mut st = c.prepare(
-                "SELECT json_extract(data, '$.original_source_id') FROM events
-                 WHERE origin = 'live' AND hidden = 0 AND kind = 'reversal'",
-            )?;
-            let rows = st.query_map([], |r| r.get::<_, Option<String>>(0))?;
-            rows.filter_map(|r| r.ok().flatten()).collect()
-        };
-
         let mut latest = LatestLabels::default();
 
         // Simple single-row kinds
@@ -95,44 +84,32 @@ pub fn latest_labels(store: &Store) -> Result<LatestLabels> {
                 "SELECT id, platform, source_id, origin, occurred_at, received_at, data, seq
                  FROM events
                  WHERE origin = 'live' AND hidden = 0 AND kind IN ('tip', 'paid_message')
-                 ORDER BY seq DESC LIMIT 50",
+                   AND (kind = 'paid_message' OR json_extract(data, '$.status') = 'captured')
+                   AND (source_id IS NULL OR NOT EXISTS (
+                       SELECT 1 FROM events r
+                       WHERE r.kind = 'reversal' AND r.origin = 'live' AND r.hidden = 0
+                         AND json_extract(r.data, '$.original_source_id') = events.source_id
+                   ))
+                 ORDER BY seq DESC LIMIT 1",
             )?;
-            let rows = st.query_map([], row_to_event)?;
-            for ev in rows {
-                let ev = ev?;
-                if ev.origin != Origin::Live {
-                    continue;
-                }
-                if ev.source_id.as_deref().is_some_and(|s| reversed.contains(s)) {
-                    continue;
-                }
-                match &ev.kind {
-                    EventKind::Tip { status: PaymentStatus::Captured, .. } | EventKind::PaidMessage { .. } => {
-                        latest.observe(&ev);
-                        break;
-                    }
-                    _ => {}
-                }
+            let mut rows = st.query_map([], row_to_event)?;
+            if let Some(ev) = rows.next().transpose()? {
+                latest.observe(&ev);
             }
         }
 
-        // Latest bits event (checking recent platform_gift rows)
+        // Latest bits event (filtered before LIMIT 1)
         {
             let mut st = c.prepare(
                 "SELECT id, platform, source_id, origin, occurred_at, received_at, data, seq
                  FROM events
                  WHERE origin = 'live' AND hidden = 0 AND kind = 'platform_gift'
-                 ORDER BY seq DESC LIMIT 50",
+                   AND json_extract(data, '$.value.unit') = 'bits'
+                 ORDER BY seq DESC LIMIT 1",
             )?;
-            let rows = st.query_map([], row_to_event)?;
-            for ev in rows {
-                let ev = ev?;
-                if let EventKind::PlatformGift { value, .. } = &ev.kind
-                    && value.unit == ferrocast_core::money::ValueUnit::Bits
-                {
-                    latest.observe(&ev);
-                    break;
-                }
+            let mut rows = st.query_map([], row_to_event)?;
+            if let Some(ev) = rows.next().transpose()? {
+                latest.observe(&ev);
             }
         }
 
@@ -142,7 +119,7 @@ pub fn latest_labels(store: &Store) -> Result<LatestLabels> {
 
 #[cfg(test)]
 mod tests {
-    use ferrocast_core::event::{Actor, ReversalReason, Tier, TipProvider};
+    use ferrocast_core::event::{Actor, EventKind, Origin, PaymentStatus, ReversalReason, Tier, TipProvider};
     use ferrocast_core::labels::month_bounds;
     use ferrocast_core::money::{Money, PlatformValue, ValueUnit};
     use ferrocast_core::overlay::LabelSource;
@@ -296,5 +273,83 @@ mod tests {
 
         let latest = latest_labels(&store).unwrap();
         assert_eq!(latest.label(LabelSource::LatestSub).as_deref(), Some("OwnSub"));
+    }
+
+    #[test]
+    fn latest_labels_finds_valid_tip_and_bits_past_50_noise_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let base = 1_700_000_000_000i64;
+        let a = |n: &str| {
+            let mut actor = Actor::named(ferrocast_core::event::Platform::Twitch, n);
+            actor.id = Some(n.into());
+            actor
+        };
+
+        insert(
+            &store,
+            &ev(
+                "tip-real",
+                base,
+                EventKind::Tip {
+                    actor: a("RealTipper"),
+                    money: Money::new(2500, "USD"),
+                    message: None,
+                    provider: TipProvider::Stripe,
+                    payment_ref: "real-ref".into(),
+                    status: PaymentStatus::Captured,
+                },
+            ),
+        )
+        .unwrap();
+        insert(
+            &store,
+            &ev(
+                "bits-real",
+                base + 1,
+                EventKind::PlatformGift {
+                    actor: a("RealBitter"),
+                    value: PlatformValue { unit: ValueUnit::Bits, amount: 1200 },
+                    message: None,
+                },
+            ),
+        )
+        .unwrap();
+
+        for i in 0..55 {
+            insert(
+                &store,
+                &ev(
+                    &format!("tip-pend-{i}"),
+                    base + 100 + i,
+                    EventKind::Tip {
+                        actor: a("PendingUser"),
+                        money: Money::new(100, "USD"),
+                        message: None,
+                        provider: TipProvider::Stripe,
+                        payment_ref: format!("pend-{i}"),
+                        status: PaymentStatus::Pending,
+                    },
+                ),
+            )
+            .unwrap();
+            insert(
+                &store,
+                &ev(
+                    &format!("gift-kicks-{i}"),
+                    base + 200 + i,
+                    EventKind::PlatformGift {
+                        actor: a("KicksUser"),
+                        value: PlatformValue { unit: ValueUnit::Kicks, amount: 50 },
+                        message: None,
+                    },
+                ),
+            )
+            .unwrap();
+        }
+
+        let latest = latest_labels(&store).unwrap();
+        assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("RealTipper $25"));
+        assert_eq!(latest.label(LabelSource::LatestBits).as_deref(), Some("RealBitter 1,200 bits"));
     }
 }
