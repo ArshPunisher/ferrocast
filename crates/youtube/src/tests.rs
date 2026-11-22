@@ -2124,6 +2124,10 @@ struct UploadLog {
     take_nothing: bool,
     /// How many of the next questions about where it stands are not answered (a 500).
     status_fail: usize,
+    /// Every question about where it stands is answered with this status (a 401, a 404...), when set.
+    status_code: Option<u16>,
+    /// The same, but only this many times (then it is answered as usual).
+    status_code_times: usize,
     /// How many pieces (not questions) were sent.
     pieces: usize,
     token_hits: usize,
@@ -2199,6 +2203,17 @@ async fn fake_upload(log: Arc<Mutex<UploadLog>>) -> Endpoints {
                     }
                     // "bytes */N": a question about how much is there.
                     if range.starts_with("bytes */") {
+                        if let Some(code) = l.status_code
+                            && (l.status_code_times == 0 || {
+                                l.status_code_times -= 1;
+                                if l.status_code_times == 0 {
+                                    l.status_code = None;
+                                }
+                                true
+                            })
+                        {
+                            return (StatusCode::from_u16(code).unwrap(), out, String::new());
+                        }
                         if l.status_fail > 0 {
                             l.status_fail -= 1;
                             return (StatusCode::INTERNAL_SERVER_ERROR, out, String::new());
@@ -2483,4 +2498,38 @@ async fn the_upload_client_does_not_follow_a_redirect() {
     assert_eq!(res.status().as_u16(), 307, "the redirect was followed");
     let reached = tokio::time::timeout(std::time::Duration::from_millis(300), other.accept()).await;
     assert!(reached.is_err(), "the second host was contacted");
+}
+
+/// A dead upload session (404 or 410) is given up on at once and said, not asked about five times
+/// and then called "YouTube stopped answering".
+#[tokio::test]
+async fn a_gone_upload_session_fails_fast_with_its_own_reason() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        l.fail_next = vec![503];
+        l.status_code = Some(404);
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    let YoutubeError::Refused(m) = &err else { panic!("{err:?}") };
+    assert!(m.contains("session") && m.to_lowercase().contains("start"), "{m}");
+    let asked = log.lock().unwrap().ranges.iter().filter(|r| r.starts_with("bytes */")).count();
+    assert_eq!(asked, 1, "asked more than once about a dead session");
+}
+
+/// An expired sign-in while asking where the upload stands is refreshed, not retried as is.
+#[tokio::test]
+async fn a_401_on_the_question_refreshes_the_sign_in_and_the_upload_goes_on() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        l.fail_next = vec![503];
+        l.status_code = Some(401);
+        l.status_code_times = 1;
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    assert!(log.lock().unwrap().token_hits >= 1, "the sign-in wasn't refreshed");
 }

@@ -804,11 +804,24 @@ impl Api {
         loop {
             if ask_first {
                 match self.upload_status(&session, &token, total).await {
-                    Some(UploadStatus::Done(id)) => {
+                    UploadStatus::Done(id) => {
                         progress(total, total);
                         return Ok(id);
                     }
-                    Some(UploadStatus::Resume(at)) => {
+                    UploadStatus::Gone => {
+                        return Err(YoutubeError::Refused(
+                            "YouTube no longer has this upload session. Start the upload again".into(),
+                        ));
+                    }
+                    UploadStatus::Unauthorized => {
+                        refreshes += 1;
+                        if refreshes > 1 {
+                            return Err(YoutubeError::SignInNeeded);
+                        }
+                        token = self.refresh_after_401(&token).await?;
+                        continue;
+                    }
+                    UploadStatus::Resume(at) => {
                         if at > offset {
                             (failures, stalls) = (0, 0);
                         }
@@ -817,7 +830,7 @@ impl Api {
                         progress(offset, total);
                         ask_first = false;
                     }
-                    None => {
+                    UploadStatus::Transient => {
                         failures += 1;
                         if failures > UPLOAD_RETRIES {
                             return Err(lost_touch());
@@ -866,7 +879,7 @@ impl Api {
                         // The last piece was taken but its answer was cut off: YouTube repeats the
                         // answer to a status question, so the video is not lost track of.
                         Err(e) => match self.upload_status(&session, &token, total).await {
-                            Some(UploadStatus::Done(id)) => return Ok(id),
+                            UploadStatus::Done(id) => return Ok(id),
                             _ => return Err(YoutubeError::from_reqwest(e)),
                         },
                     };
@@ -983,8 +996,8 @@ impl Api {
 
     /// Asks the session where it stands (an empty range): how much YouTube has, or, when it has
     /// all of it, the answer it gave for the whole (the new video).
-    async fn upload_status(&self, session: &str, token: &str, total: u64) -> Option<UploadStatus> {
-        let res = self
+    async fn upload_status(&self, session: &str, token: &str, total: u64) -> UploadStatus {
+        let Ok(res) = self
             .http
             .put(session)
             .bearer_auth(token)
@@ -992,21 +1005,28 @@ impl Api {
             .header(reqwest::header::CONTENT_LENGTH, "0")
             .send()
             .await
-            .ok()?;
+        else {
+            return UploadStatus::Transient;
+        };
         match res.status().as_u16() {
-            308 => Some(UploadStatus::Resume(
+            401 => UploadStatus::Unauthorized,
+            404 | 410 => UploadStatus::Gone,
+            308 => UploadStatus::Resume(
                 res.headers()
                     .get(reqwest::header::RANGE)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.rsplit('-').next())
                     .and_then(|n| n.trim().parse::<u64>().ok())
                     .map_or(0, |n| n.saturating_add(1)),
-            )),
-            200 | 201 => {
-                let body: Value = res.json().await.ok()?;
-                body.get("id").and_then(Value::as_str).map(|id| UploadStatus::Done(id.to_string()))
-            }
-            _ => None,
+            ),
+            200 | 201 => match res.json::<Value>().await {
+                Ok(body) => body
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map_or(UploadStatus::Transient, |id| UploadStatus::Done(id.to_string())),
+                Err(_) => UploadStatus::Transient,
+            },
+            _ => UploadStatus::Transient,
         }
     }
 
@@ -1068,6 +1088,12 @@ enum UploadStatus {
     Resume(u64),
     /// YouTube has it all: the new video's id.
     Done(String),
+    /// The sign-in expired (a long upload outlives its token): refresh it and ask again.
+    Unauthorized,
+    /// The upload session is gone (expired or never there): asking again can't help.
+    Gone,
+    /// No answer, or one that says nothing: ask again after a pause.
+    Transient,
 }
 
 /// An upload goes in pieces of this size (a multiple of 256 KB, as YouTube asks).
