@@ -136,6 +136,8 @@ pub(crate) struct Studio {
     /// The Studio's copy and paste of sources and filters: kept while another collection is
     /// opened, gone when the app quits.
     pub clipboard: Mutex<Option<clipboard::Clip>>,
+    /// The clips library's state: its folder override (tests) and the background jobs.
+    pub clips: crate::clips::ClipsState,
     /// Encoder stress benchmark and setting rollback state machine.
     pub auto_config: Mutex<encoder_bench::AutoConfigSlot>,
     /// Pre-apply encoder settings queued on startup after an unclean exit, applied when `StudioHost` attaches.
@@ -180,6 +182,7 @@ impl Default for Studio {
             rules_busy: Mutex::default(),
             holds: Mutex::default(),
             clipboard: Mutex::default(),
+            clips: crate::clips::ClipsState::default(),
             auto_config: Mutex::default(),
             pending_startup_restore: Mutex::default(),
         }

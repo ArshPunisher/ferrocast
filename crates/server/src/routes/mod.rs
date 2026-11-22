@@ -4,6 +4,7 @@ pub(crate) mod api_keys;
 mod app;
 mod autoreplies;
 mod bot;
+mod clips;
 mod cloud_backups;
 mod cloud_bot;
 mod cloud_sync;
@@ -230,6 +231,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/pro/backups/{id}/restore", post(cloud_backups::restore))
         // Studio: counters, quotes, modules, stream info, show, OBS helpers, moments
         .merge(studio::routes())
+        // Clips and highlights: browse, trim, compile, caption, send to YouTube
+        .merge(clips::routes())
         // Go live everywhere: destinations, OBS setup, the upload check
         .merge(golive::routes())
         // auto-replies (bot answers to chat that mentions something)

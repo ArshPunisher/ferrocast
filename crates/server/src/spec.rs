@@ -307,6 +307,48 @@ const ALERTS_DESIGNS_MEDIA: &[RouteDoc] = &[
     doc("DELETE", "/media/{id}", "Designs & Media", "Delete an uploaded media asset.", None, None),
 ];
 
+const CLIPS_ROUTES: &[RouteDoc] = &[
+    doc(
+        "GET",
+        "/clips",
+        "Clips",
+        "The clips in the recordings folder, newest first (optional search by name; PC only).",
+        None,
+        None,
+    ),
+    doc(
+        "POST",
+        "/clips/compile",
+        "Clips",
+        "Join several clips into one in the background (crossfade, loudness; PC only).",
+        None,
+        None,
+    ),
+    doc(
+        "GET",
+        "/clips/jobs",
+        "Clips",
+        "Clip work running or finished (trim, compile, captions, burn, upload; PC only).",
+        None,
+        None,
+    ),
+    doc("GET", "/clips/jobs/{id}", "Clips", "One clip job's state and progress.", None, None),
+    doc("DELETE", "/clips/jobs/{id}", "Clips", "Dismiss a finished clip job from the list.", None, None),
+    doc("POST", "/clips/jobs/{id}/cancel", "Clips", "Stop a waiting or running clip job.", None, None),
+    doc("GET", "/clips/{id}", "Clips", "What ffmpeg says about a clip: length, size, sound.", None, None),
+    doc("PUT", "/clips/{id}", "Clips", "Rename a clip (its captions follow).", None, None),
+    doc("DELETE", "/clips/{id}", "Clips", "Move a clip and its captions to the Trash.", None, None),
+    doc("GET", "/clips/{id}/thumbnail", "Clips", "A small picture from the clip.", None, None),
+    doc("GET", "/clips/{id}/file", "Clips", "The clip's bytes (byte ranges supported) for playback.", None, None),
+    doc("POST", "/clips/{id}/trim", "Clips", "Cut part of a clip into a new clip (a job).", None, None),
+    doc("GET", "/clips/{id}/captions", "Clips", "The clip's captions as cues.", None, None),
+    doc("PUT", "/clips/{id}/captions", "Clips", "Save edited captions beside the clip.", None, None),
+    doc("POST", "/clips/{id}/captions", "Clips", "Make captions with the local speech model (a job).", None, None),
+    doc("GET", "/clips/{id}/captions.srt", "Clips", "The captions as a .srt download.", None, None),
+    doc("POST", "/clips/{id}/captions/burn", "Clips", "Burn the captions into a new copy (a job).", None, None),
+    doc("POST", "/clips/{id}/upload", "Clips", "Send the clip to YouTube (a job; private by default).", None, None),
+];
+
 const GO_LIVE_ROUTES: &[RouteDoc] = &[
     doc(
         "GET",
@@ -1828,6 +1870,7 @@ pub fn all_rest_routes() -> impl Iterator<Item = &'static RouteDoc> {
         .chain(BOT_AND_WIDGETS)
         .chain(ALERTS_DESIGNS_MEDIA)
         .chain(GO_LIVE_ROUTES)
+        .chain(CLIPS_ROUTES)
         .chain(OBS_AND_MUSIC)
         .chain(STUDIO_ENGINE_ROUTES)
         .chain(MOMENTS_AND_SHOW)

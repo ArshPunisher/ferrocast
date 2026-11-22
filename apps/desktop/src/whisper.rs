@@ -184,6 +184,9 @@ pub fn transcribe(
     p.set_print_realtime(false);
     p.set_print_special(false);
     p.set_print_timestamps(false);
+    // Whoever asked is gone (a cancelled job): stop at the next step instead of running on.
+    let cancel = how.cancel.clone();
+    p.set_abort_callback_safe(move || cancel.load(std::sync::atomic::Ordering::Relaxed));
     state.full(p, sound).map_err(|e| format!("The clip couldn't be transcribed ({e})."))?;
     Ok(state
         .as_iter()

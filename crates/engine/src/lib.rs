@@ -11,6 +11,7 @@ mod accounts;
 mod actions;
 pub mod api_keys;
 mod backups;
+pub mod clips;
 mod cloud_backup;
 mod cloud_bot;
 mod cloud_sync;

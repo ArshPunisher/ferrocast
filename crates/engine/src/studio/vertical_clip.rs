@@ -92,9 +92,8 @@ pub fn srt(said: &[Said]) -> String {
 
 /// ffmpeg's arguments to read a clip's sound as 16 kHz mono floats on stdout.
 fn audio_args(clip: &Path) -> Vec<OsString> {
-    let mut a: Vec<OsString> =
-        ["-hide_banner", "-loglevel", "error", "-nostdin", "-i"].iter().map(OsString::from).collect();
-    a.push(clip.as_os_str().to_owned());
+    let mut a: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-nostdin"].iter().map(OsString::from).collect();
+    a.extend(crate::clips::input_args(clip));
     for s in ["-vn", "-ac", "1", "-ar", "16000", "-t", "900", "-f", "f32le", "-"] {
         a.push(s.into());
     }
@@ -117,9 +116,8 @@ const MAX_POINTS: usize = 120;
 
 /// ffmpeg's arguments to read a clip as small RGBA pictures, `LOOK_EVERY_S` apart, on stdout.
 fn look_args(clip: &Path) -> Vec<OsString> {
-    let mut a: Vec<OsString> =
-        ["-hide_banner", "-loglevel", "error", "-nostdin", "-i"].iter().map(OsString::from).collect();
-    a.push(clip.as_os_str().to_owned());
+    let mut a: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-nostdin"].iter().map(OsString::from).collect();
+    a.extend(crate::clips::input_args(clip));
     let vf = format!("fps={},scale={LOOK_W}:{LOOK_H}", 1.0 / LOOK_EVERY_S);
     for s in ["-an", "-vf", &vf, "-frames:v", &MAX_LOOKS.to_string(), "-f", "rawvideo", "-pix_fmt", "rgba", "-"] {
         a.push(s.into());
@@ -202,7 +200,9 @@ pub fn vertical_path(clip: &Path) -> Option<PathBuf> {
 /// `fill`: the frame's middle over time (`path_expr`): the clip fills 1080×1920, cut to follow
 /// it, instead of sitting whole over the blurred copy.
 pub fn vertical_args(clip: &Path, out: &Path, subs: Option<&str>, fill: Option<&str>) -> Vec<OsString> {
-    let burn = subs.map(|f| format!(",subtitles={f}:force_style='{SUB_STYLE}'")).unwrap_or_default();
+    let burn = subs
+        .map(|f| format!(",subtitles={}:force_style='{SUB_STYLE}'", crate::clips::filter_text(f)))
+        .unwrap_or_default();
     let filter = match fill {
         Some(m) => format!(
             "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,\
@@ -217,8 +217,8 @@ pub fn vertical_args(clip: &Path, out: &Path, subs: Option<&str>, fill: Option<&
     };
     let filter = filter.as_str();
     let mut a: Vec<OsString> =
-        ["-hide_banner", "-loglevel", "error", "-nostdin", "-n", "-i"].iter().map(OsString::from).collect();
-    a.push(clip.as_os_str().to_owned());
+        ["-hide_banner", "-loglevel", "error", "-nostdin", "-n"].iter().map(OsString::from).collect();
+    a.extend(crate::clips::input_args(clip));
     for s in [
         "-filter_complex",
         filter,
@@ -267,7 +267,8 @@ impl Engine {
         };
         let engine = self.clone();
         tokio::spawn(async move {
-            let subs = if cfg.clip_captions { engine.clip_subtitles(&ffmpeg, &clip).await } else { None };
+            let subs =
+                if cfg.clip_captions { engine.clip_subtitles(&ffmpeg, &clip, Default::default()).await } else { None };
             if cfg.vertical_clips {
                 let fill = if cfg.vertical_fill { engine.clip_focus(&ffmpeg, &clip).await } else { None };
                 make_vertical(&ffmpeg, &clip, subs.as_deref(), fill.as_deref()).await;
@@ -329,10 +330,16 @@ impl Engine {
     }
 
     /// Writes "<clip>.srt" (never over one already there) → its path, when anything was said.
-    async fn clip_subtitles(&self, ffmpeg: &Path, clip: &Path) -> Option<PathBuf> {
+    pub(crate) async fn clip_subtitles(
+        &self,
+        ffmpeg: &Path,
+        clip: &Path,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<PathBuf> {
         let out = srt_path(clip);
-        if out.exists() {
-            return Some(out);
+        // A name that is taken (even by a link) is not written over.
+        if std::fs::symlink_metadata(&out).is_ok() {
+            return std::fs::symlink_metadata(&out).ok().filter(|m| m.file_type().is_file()).map(|_| out);
         }
         // The better model when it's here, else the fast one.
         let Some(model) = self.speech_model_path("small").or_else(|| self.speech_model_path("base")) else {
@@ -349,7 +356,10 @@ impl Engine {
         };
         let sound: Vec<f32> =
             sound.as_chunks::<4>().0.iter().take(16_000 * MAX_AUDIO_SECONDS).map(|b| f32::from_le_bytes(*b)).collect();
-        let how = Transcribe { model, language: "auto".into(), translate: false };
+        // The flag is the caller's: set (by it, or by this future being dropped) the transcription
+        // stops at its next step.
+        let _stop_when_gone = CancelOnDrop(cancel.clone());
+        let how = Transcribe { model, language: "auto".into(), translate: false, cancel };
         let said = match self.studio_host() {
             Ok(h) => h.transcribe(sound, how).await,
             Err(e) => Err(e.to_string()),
@@ -365,15 +375,43 @@ impl Engine {
             tracing::info!("no clip subtitles: nothing was said");
             return None;
         }
-        let part = out.with_extension("srt.part");
-        if tokio::fs::write(&part, text).await.is_ok() && tokio::fs::rename(&part, &out).await.is_ok() {
+        if publish_srt(&out, &text) {
             tracing::info!(file = %out.display(), "clip subtitles written");
             Some(out)
         } else {
-            let _ = tokio::fs::remove_file(&part).await;
             None
         }
     }
+}
+
+/// Cancels `work` (sets the flag) and waits for it to be over, at most `limit`: a transcription
+/// runs on a thread that only stops at its next step, and the job's place in the queue is not
+/// given up before it has.
+pub(crate) async fn stop_and_wait<T>(
+    flag: &std::sync::atomic::AtomicBool,
+    work: tokio::task::JoinHandle<T>,
+    limit: std::time::Duration,
+) {
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = tokio::time::timeout(limit, work).await;
+}
+
+/// Sets the flag when dropped: the transcription asked for is no longer wanted.
+pub(crate) struct CancelOnDrop(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Writes subtitles beside a clip: into a file made new (so a link left at a predictable name
+/// isn't followed) renamed over nothing (an existing file, or a link, is left alone).
+pub(crate) fn publish_srt(out: &Path, text: &str) -> bool {
+    if std::fs::symlink_metadata(out).is_ok() {
+        return false;
+    }
+    crate::clips::edit::write_new_then_rename(out, text.as_bytes()).is_ok()
 }
 
 /// Makes "<clip> vertical.mp4" (never over one already there), with `subs` burned in when
@@ -430,6 +468,73 @@ async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>, fill: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancelled job holds its place until the transcription it started has actually ended.
+    #[tokio::test]
+    async fn a_cancelled_transcription_is_waited_for() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (f, e) = (flag.clone(), ended.clone());
+        let work = tokio::spawn(async move {
+            while !f.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // It takes a moment to wind down after being told.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            e.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        stop_and_wait(&flag, work, std::time::Duration::from_secs(5)).await;
+        assert!(ended.load(std::sync::atomic::Ordering::Relaxed), "returned before the work had ended");
+    }
+
+    /// Dropping the asker stops the transcription it started.
+    #[test]
+    fn a_dropped_asker_stops_the_transcription() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = CancelOnDrop(flag.clone());
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        drop(guard);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Subtitles are never written through a link left at their name or their temporary name.
+    #[cfg(unix)]
+    #[test]
+    fn subtitles_are_never_written_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        // A link where the finished file would go: not followed, not replaced.
+        let out = dir.path().join("a.srt");
+        std::os::unix::fs::symlink(&victim, &out).unwrap();
+        assert!(!publish_srt(&out, "1\n00:00:00,000 --> 00:00:01,000\nhi\n\n"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        // A link at the old predictable temporary name: left alone too.
+        let out2 = dir.path().join("b.srt");
+        std::os::unix::fs::symlink(&victim, dir.path().join("b.srt.part")).unwrap();
+        assert!(publish_srt(&out2, "text"));
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert_eq!(std::fs::read_to_string(&out2).unwrap(), "text");
+    }
+
+    /// Every ffmpeg run on a clip reads only files, as the one container its extension names.
+    #[test]
+    fn every_vertical_clip_run_reads_files_only_as_the_named_container() {
+        for (name, demux) in [("a.mp4", "mov"), ("a.MOV", "mov"), ("a.mkv", "matroska")] {
+            let clip = Path::new(name);
+            for (label, args) in [
+                ("audio", audio_args(clip)),
+                ("look", look_args(clip)),
+                ("vertical", vertical_args(clip, Path::new("o.mp4"), None, None)),
+            ] {
+                let i = args.iter().position(|x| x == "-i").unwrap_or_else(|| panic!("{label}: no -i"));
+                let before: Vec<String> = args[..i].iter().map(|x| x.to_string_lossy().into_owned()).collect();
+                let has = |a: &str, b: &str| before.windows(2).any(|w| w[0] == a && w[1] == b);
+                assert!(has("-protocol_whitelist", "file"), "{label} {name}: no protocol whitelist: {before:?}");
+                assert!(has("-f", demux), "{label} {name}: no -f {demux}: {before:?}");
+            }
+        }
+    }
 
     #[test]
     fn the_copy_sits_beside_the_clip() {
