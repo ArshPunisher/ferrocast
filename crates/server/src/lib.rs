@@ -293,6 +293,8 @@ mod plugins_tests;
 #[cfg(test)]
 mod remote_tests;
 #[cfg(test)]
+mod scope_tests;
+#[cfg(test)]
 mod spec_tests;
 #[cfg(test)]
 mod tests;
