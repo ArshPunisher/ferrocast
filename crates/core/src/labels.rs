@@ -13,7 +13,26 @@ use crate::overlay::LabelSource;
 use crate::template::{Template, Vars};
 
 const MS_PER_MIN: i64 = 60_000;
+const MS_PER_HOUR: i64 = 3_600_000;
 const MS_PER_DAY: i64 = 86_400_000;
+
+/// Supported IANA timezones with deterministic DST rules in pure core without external clock crates.
+pub const SUPPORTED_TIMEZONES: &[&str] = &[
+    "UTC",
+    "Asia/Kolkata",
+    "Asia/Tokyo",
+    "Europe/London",
+    "Europe/Berlin",
+    "America/New_York",
+    "America/Chicago",
+    "America/Los_Angeles",
+    "Australia/Sydney",
+];
+
+/// Returns `true` if `tz` is a supported timezone identifier.
+pub fn is_supported_timezone(tz: &str) -> bool {
+    SUPPORTED_TIMEZONES.contains(&tz)
+}
 
 /// Returns `(month_start_utc, next_month_start_utc)` in half-open `[start, end)` form for the
 /// calendar month containing `at` under fixed UTC offset `tz_offset_min` (`-720..=840`).
@@ -28,6 +47,93 @@ pub fn month_bounds(at: Millis, tz_offset_min: i32) -> (Millis, Millis) {
     let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
     let end_days = days_from_civil(next_year, next_month, 1);
     (Millis(start_days * MS_PER_DAY - offset_ms), Millis(end_days * MS_PER_DAY - offset_ms))
+}
+
+/// Returns `(month_start_utc, next_month_start_utc)` using DST-aware `timezone` when supplied and
+/// supported, falling back to fixed `fallback_offset_min` otherwise.
+pub fn month_bounds_for_zone(at: Millis, timezone: Option<&str>, fallback_offset_min: i32) -> (Millis, Millis) {
+    let Some(tz) = timezone.filter(|s| is_supported_timezone(s)) else {
+        return month_bounds(at, fallback_offset_min);
+    };
+    let Some(off_at) = iana_offset_at(tz, at) else {
+        return month_bounds(at, fallback_offset_min);
+    };
+    let shifted = at.0.saturating_add(i64::from(off_at) * MS_PER_MIN);
+    let days = shifted.div_euclid(MS_PER_DAY);
+    let (year, month, _) = civil_from_days(days);
+    let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+
+    let start_utc_approx = Millis(days_from_civil(year, month, 1) * MS_PER_DAY - i64::from(off_at) * MS_PER_MIN);
+    let off_start = iana_offset_at(tz, start_utc_approx).unwrap_or(off_at);
+    let start_ms = days_from_civil(year, month, 1) * MS_PER_DAY - i64::from(off_start) * MS_PER_MIN;
+
+    let end_utc_approx =
+        Millis(days_from_civil(next_year, next_month, 1) * MS_PER_DAY - i64::from(off_start) * MS_PER_MIN);
+    let off_end = iana_offset_at(tz, end_utc_approx).unwrap_or(off_start);
+    let end_ms = days_from_civil(next_year, next_month, 1) * MS_PER_DAY - i64::from(off_end) * MS_PER_MIN;
+
+    (Millis(start_ms), Millis(end_ms))
+}
+
+/// Computes the exact UTC offset in minutes for supported IANA zones at UTC instant `at`.
+pub fn iana_offset_at(tz: &str, at: Millis) -> Option<i32> {
+    if !is_supported_timezone(tz) {
+        return None;
+    }
+    match tz {
+        "UTC" => return Some(0),
+        "Asia/Kolkata" => return Some(330),
+        "Asia/Tokyo" => return Some(540),
+        _ => {}
+    }
+    let approx_year = civil_from_days(at.0.div_euclid(MS_PER_DAY)).0;
+    let offset = match tz {
+        "Europe/London" => {
+            let start = last_sunday_days(approx_year, 3) * MS_PER_DAY + MS_PER_HOUR;
+            let end = last_sunday_days(approx_year, 10) * MS_PER_DAY + MS_PER_HOUR;
+            if at.0 >= start && at.0 < end { 60 } else { 0 }
+        }
+        "Europe/Berlin" => {
+            let start = last_sunday_days(approx_year, 3) * MS_PER_DAY + MS_PER_HOUR;
+            let end = last_sunday_days(approx_year, 10) * MS_PER_DAY + MS_PER_HOUR;
+            if at.0 >= start && at.0 < end { 120 } else { 60 }
+        }
+        "America/New_York" => us_dst_offset(approx_year, at.0, -300, -240),
+        "America/Chicago" => us_dst_offset(approx_year, at.0, -360, -300),
+        "America/Los_Angeles" => us_dst_offset(approx_year, at.0, -480, -420),
+        "Australia/Sydney" => {
+            // AEDT (+660) runs 1st Sun Oct 02:00 AEST -> 1st Sun Apr 03:00 AEDT across New Year.
+            let end_apr = nth_sunday_days(approx_year, 4, 1) * MS_PER_DAY + 3 * MS_PER_HOUR - 660 * MS_PER_MIN;
+            let start_oct = nth_sunday_days(approx_year, 10, 1) * MS_PER_DAY + 2 * MS_PER_HOUR - 600 * MS_PER_MIN;
+            if at.0 < end_apr || at.0 >= start_oct { 660 } else { 600 }
+        }
+        _ => return None,
+    };
+    Some(offset)
+}
+
+fn us_dst_offset(year: i64, at_ms: i64, std_min: i32, dst_min: i32) -> i32 {
+    let start = nth_sunday_days(year, 3, 2) * MS_PER_DAY + 2 * MS_PER_HOUR - i64::from(std_min) * MS_PER_MIN;
+    let end = nth_sunday_days(year, 11, 1) * MS_PER_DAY + 2 * MS_PER_HOUR - i64::from(dst_min) * MS_PER_MIN;
+    if at_ms >= start && at_ms < end { dst_min } else { std_min }
+}
+
+fn weekday_from_days(z: i64) -> i64 {
+    (z + 4).rem_euclid(7)
+}
+
+fn nth_sunday_days(year: i64, month: u32, n: u32) -> i64 {
+    let first = days_from_civil(year, month, 1);
+    let wd = weekday_from_days(first);
+    let first_sun_offset = (7 - wd) % 7;
+    first + first_sun_offset + 7 * i64::from(n.saturating_sub(1))
+}
+
+fn last_sunday_days(year: i64, month: u32) -> i64 {
+    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let last_day = days_from_civil(ny, nm, 1) - 1;
+    let wd = weekday_from_days(last_day);
+    last_day - wd
 }
 
 /// Converts days since 1970-01-01 to `(year, month 1..=12, day 1..=31)` in the proleptic Gregorian
@@ -839,6 +945,28 @@ mod tests {
         let (s, e) = month_bounds(ist_feb_1_instant, 330);
         assert_eq!(s, ist_feb_1_instant);
         assert_eq!(e, utc_ms(2026, 2, 28, 18, 30, 0, 0));
+
+        // DST-aware Europe/London: March 29 2026 shifts GMT (+0) -> BST (+60), so March 31 23:30 UTC is April 1 BST
+        let lon_mar_15 = utc_ms(2026, 3, 15, 12, 0, 0, 0);
+        assert_eq!(
+            month_bounds_for_zone(lon_mar_15, Some("Europe/London"), 0),
+            (utc_ms(2026, 3, 1, 0, 0, 0, 0), utc_ms(2026, 3, 31, 23, 0, 0, 0))
+        );
+        let lon_apr_start = utc_ms(2026, 3, 31, 23, 30, 0, 0);
+        assert_eq!(
+            month_bounds_for_zone(lon_apr_start, Some("Europe/London"), 0),
+            (utc_ms(2026, 3, 31, 23, 0, 0, 0), utc_ms(2026, 4, 30, 23, 0, 0, 0))
+        );
+
+        // DST-aware America/New_York: March 8 2026 shifts EST (-300) -> EDT (-240)
+        let ny_mar_15 = utc_ms(2026, 3, 15, 12, 0, 0, 0);
+        assert_eq!(
+            month_bounds_for_zone(ny_mar_15, Some("America/New_York"), 0),
+            (utc_ms(2026, 3, 1, 5, 0, 0, 0), utc_ms(2026, 4, 1, 4, 0, 0, 0))
+        );
+        // Southern-hemisphere Australia/Sydney: Jan is AEDT (+660), July is AEST (+600)
+        assert_eq!(iana_offset_at("Australia/Sydney", utc_ms(2026, 1, 15, 0, 0, 0, 0)), Some(660));
+        assert_eq!(iana_offset_at("Australia/Sydney", utc_ms(2026, 7, 15, 0, 0, 0, 0)), Some(600));
     }
 
     #[test]

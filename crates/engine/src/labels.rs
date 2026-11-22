@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use ferrocast_core::event::{Event, EventKind, Millis, Origin};
 use ferrocast_core::labels::{
-    ComboTrain, ComboTrainConfig, ComboTrainView, LatestLabels, PeriodTotals, format_thousands, month_bounds,
+    ComboTrain, ComboTrainConfig, ComboTrainView, LatestLabels, PeriodTotals, format_thousands, is_supported_timezone,
+    month_bounds, month_bounds_for_zone,
 };
 use ferrocast_core::overlay::{LabelOptions, LabelSource, Overlay, WidgetKind, validate_label};
 use ferrocast_core::template::{Template, Vars};
@@ -33,6 +34,28 @@ impl From<ComboTrainConfig> for TrainKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MonthZoneKey {
+    Offset(i32),
+    Zone(String),
+}
+
+impl MonthZoneKey {
+    fn from_opts(opts: &LabelOptions) -> Self {
+        match opts.timezone.as_deref() {
+            Some(tz) if is_supported_timezone(tz) => Self::Zone(tz.to_string()),
+            _ => Self::Offset(opts.timezone_offset_min),
+        }
+    }
+
+    fn bounds(&self, at: Millis) -> (Millis, Millis) {
+        match self {
+            Self::Offset(off) => month_bounds(at, *off),
+            Self::Zone(tz) => month_bounds_for_zone(at, Some(tz), 0),
+        }
+    }
+}
+
 /// Engine-held state for local stream labels (session, monthly cache, all-time, latest-X,
 /// and active hype/combo trains).
 #[derive(Debug, Default)]
@@ -41,7 +64,7 @@ pub(crate) struct LabelRuntime {
     latest: LatestLabels,
     session: PeriodTotals,
     alltime: PeriodTotals,
-    monthly: HashMap<i32, ((Millis, Millis), PeriodTotals)>,
+    monthly: HashMap<MonthZoneKey, ((Millis, Millis), PeriodTotals)>,
     trains: HashMap<TrainKey, ComboTrain>,
 }
 
@@ -67,8 +90,8 @@ impl LabelRuntime {
 
         // Update cached months matching `event.occurred_at` (or always pass reversals cleanly).
         let is_reversal = matches!(event.kind, EventKind::Reversal { .. });
-        self.monthly.retain(|tz, ((start, end), totals)| {
-            let (cur_start, cur_end) = month_bounds(now_ms, *tz);
+        self.monthly.retain(|tz_key, ((start, end), totals)| {
+            let (cur_start, cur_end) = tz_key.bounds(now_ms);
             if cur_start != *start || cur_end != *end {
                 // Month rolled over: drop stale cache so next eval reloads [cur_start, cur_end).
                 return false;
@@ -105,7 +128,7 @@ impl LabelRuntime {
 
     fn rollover_months(&mut self, now_ms: Millis) -> bool {
         let before = self.monthly.len();
-        self.monthly.retain(|tz, ((start, end), _)| month_bounds(now_ms, *tz) == (*start, *end));
+        self.monthly.retain(|tz_key, ((start, end), _)| tz_key.bounds(now_ms) == (*start, *end));
         self.monthly.len() != before
     }
 
@@ -150,16 +173,16 @@ impl Engine {
         let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
         rt.latest = latest;
         rt.alltime = alltime;
-        rt.monthly.insert(0, ((m_start, m_end), monthly));
+        rt.monthly.insert(MonthZoneKey::Offset(0), ((m_start, m_end), monthly));
         rt.ensure_train(ComboTrainConfig::default(), now_ms);
         rt.hydrated = true;
     }
 
-    async fn ensure_month_cached(&self, tz_offset_min: i32, now_ms: Millis) {
-        let bounds = month_bounds(now_ms, tz_offset_min);
+    async fn ensure_month_cached(&self, key: MonthZoneKey, now_ms: Millis) {
+        let bounds = key.bounds(now_ms);
         {
             let rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some((cached_bounds, _)) = rt.monthly.get(&tz_offset_min)
+            if let Some((cached_bounds, _)) = rt.monthly.get(&key)
                 && *cached_bounds == bounds
             {
                 return;
@@ -168,7 +191,7 @@ impl Engine {
         let (start, end) = bounds;
         if let Ok(totals) = self.db(move |s| repo::labels::period_totals(s, Some(start.0), Some(end.0))).await {
             let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
-            rt.monthly.insert(tz_offset_min, (bounds, totals));
+            rt.monthly.insert(key, (bounds, totals));
         }
     }
 
@@ -219,13 +242,16 @@ impl Engine {
             self.hydrate_labels().await;
         }
 
-        // Gather all monthly timezone offsets and hype train configs needed by widgets on `o`.
+        // Gather all monthly timezones and hype train configs needed by widgets on `o`.
         let mut tz_needed = Vec::new();
         let mut train_cfgs = Vec::new();
         for w in o.widgets.iter().filter(|w| w.kind == WidgetKind::Label) {
             if let Ok(opts) = validate_label(&w.config) {
-                if opts.source.is_monthly() && !tz_needed.contains(&opts.timezone_offset_min) {
-                    tz_needed.push(opts.timezone_offset_min);
+                if opts.source.is_monthly() {
+                    let key = MonthZoneKey::from_opts(&opts);
+                    if !tz_needed.contains(&key) {
+                        tz_needed.push(key);
+                    }
                 }
                 if opts.source.is_train() {
                     train_cfgs.push(ComboTrainConfig {
@@ -327,7 +353,7 @@ fn eval_non_train(opts: &LabelOptions, rt: &LabelRuntime) -> String {
     if let Some(latest) = rt.latest.label(opts.source) {
         return latest;
     }
-    let month_totals = rt.monthly.get(&opts.timezone_offset_min).map(|(_, t)| t);
+    let month_totals = rt.monthly.get(&MonthZoneKey::from_opts(opts)).map(|(_, t)| t);
     match opts.source {
         LabelSource::SessionFollows => rt.session.follows.to_string(),
         LabelSource::SessionSubs => rt.session.subs.to_string(),
@@ -485,7 +511,7 @@ mod tests {
             let mut rt = engine.inner.labels.lock().unwrap();
             let mut jan_totals = PeriodTotals::default();
             jan_totals.follows = 42;
-            rt.monthly.insert(0, (jan_bounds, jan_totals));
+            rt.monthly.insert(MonthZoneKey::Offset(0), (jan_bounds, jan_totals));
             rt.hydrated = true;
         }
 
@@ -495,7 +521,7 @@ mod tests {
         {
             let rt = engine.inner.labels.lock().unwrap();
             assert_ne!(
-                rt.monthly.get(&0).map(|(b, _)| *b),
+                rt.monthly.get(&MonthZoneKey::Offset(0)).map(|(b, _)| *b),
                 Some(jan_bounds),
                 "stale January bounds must be evicted/replaced"
             );

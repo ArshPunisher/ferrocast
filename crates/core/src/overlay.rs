@@ -277,6 +277,8 @@ pub struct LabelOptions {
     pub template: String,
     #[serde(default = "default_label_theme")]
     pub theme: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default)]
     pub timezone_offset_min: i32,
     #[serde(default = "default_train_window_s")]
@@ -319,6 +321,11 @@ pub fn validate_label(config: &Value) -> Result<LabelOptions, String> {
     }
     let opts: LabelOptions =
         serde_json::from_value(config.clone()).map_err(|e| format!("config: invalid label options ({e})."))?;
+    if let Some(ref tz) = opts.timezone
+        && !crate::labels::is_supported_timezone(tz)
+    {
+        return Err(format!("config.timezone: unsupported timezone '{tz}'."));
+    }
     if !(-720..=840).contains(&opts.timezone_offset_min) {
         return Err("config.timezone_offset_min: must be -720 to 840 minutes.".into());
     }
@@ -533,6 +540,7 @@ mod tests {
                 "train_step_s": 15,
                 "train_max_s": 300,
                 "train_threshold": 3,
+                "timezone": "America/New_York",
                 "timezone_offset_min": 330
             }),
         )]);
@@ -546,6 +554,7 @@ mod tests {
             json!({ "source": "hype_train", "train_window_s": 120, "train_max_s": 60 }),
             json!({ "source": "hype_train", "train_threshold": 0 }),
             json!({ "source": "monthly_subs", "timezone_offset_min": 900 }),
+            json!({ "source": "monthly_subs", "timezone": "Mars/Olympus" }),
         ] {
             o.widgets[0].config = bad;
             assert!(matches!(o.validate(), Err(OverlayError::Label { .. })), "should fail: {}", o.widgets[0].config);

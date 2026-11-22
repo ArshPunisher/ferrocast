@@ -1946,8 +1946,18 @@ async fn overlays_validate_new_label_options_and_reject_bad_train_settings() {
         "id": "w1",
         "kind": "label",
         "x": 10, "y": 10, "w": 300, "h": 50,
-        "config": { "source": "monthly_tips", "template": "Month: {value}", "theme": "molten", "timezone_offset_min": 330 }
+        "config": { "source": "monthly_tips", "template": "Month: {value}", "theme": "molten", "timezone": "Europe/London", "timezone_offset_min": 0 }
     }]);
     let res_ok = r.put(&format!("/api/v1/overlays/{id}"), ok_ov).await;
     assert_eq!(res_ok.status(), StatusCode::OK);
+
+    let mut bad_tz = created.clone();
+    bad_tz["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "monthly_tips", "template": "Month: {value}", "theme": "molten", "timezone": "Mars/Olympus" }
+    }]);
+    let res_bad_tz = r.put(&format!("/api/v1/overlays/{id}"), bad_tz).await;
+    assert_eq!(error_code(res_bad_tz).await.0, StatusCode::BAD_REQUEST);
 }
