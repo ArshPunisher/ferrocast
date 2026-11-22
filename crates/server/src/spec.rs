@@ -2405,7 +2405,12 @@ fn schedule_schemas() -> Map<String, Value> {
                 "required": ["title"],
                 "properties": {
                     "title": { "type": "string", "minLength": 1, "maxLength": 140 },
-                    "category": { "type": ["string", "null"] },
+                    "category": {
+                        "type": ["object", "null"],
+                        "description": "`{ name, ids? }`: the category's name and, where known, each platform's id.",
+                        "required": ["name"],
+                        "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 100 }, "ids": { "type": "object" } }
+                    },
                     "description": { "type": ["string", "null"] },
                     "tags": { "type": ["array", "null"], "items": { "type": "string" } },
                     "language": { "type": ["string", "null"] }
@@ -2448,11 +2453,11 @@ fn schedule_schemas() -> Map<String, Value> {
     }));
     m.insert("GoLiveDestinationCreate".into(), json!({
         "type": "object",
-        "required": ["name", "url", "key"],
+        "required": ["name", "url"],
         "properties": {
             "name": { "type": "string", "minLength": 1, "maxLength": 40 },
             "url": { "type": "string", "description": "rtmp://, rtmps://, srt://, rist:// or https:// (WebRTC WHIP)." },
-            "key": { "type": "string", "maxLength": 512, "description": "No spaces. Never returned." },
+            "key": { "type": "string", "maxLength": 512, "description": "No spaces. Never returned. Needed for RTMP and RTMPS; optional for SRT (stream id), RIST (passphrase) and WebRTC (bearer token)." },
             "canvas": { "type": "string", "enum": ["main", "vertical"] },
             "brand": { "type": "string", "enum": ["x", "instagram", "facebook"], "description": "Names a server and key pasted from that platform; changes nothing about how the stream is sent." }
         }

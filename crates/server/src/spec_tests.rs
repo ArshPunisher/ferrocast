@@ -428,4 +428,9 @@ fn the_schedule_routes_and_a_destinations_brand_are_described() {
         schemas["GoLiveDestinationCreate"]["properties"]["brand"]["enum"],
         json!(["x", "instagram", "facebook"])
     );
+    // SRT, RIST and WHIP servers need no key, so it is not required of every request.
+    let required = schemas["GoLiveDestinationCreate"]["required"].as_array().unwrap();
+    assert!(!required.iter().any(|r| r == "key"), "{required:?}");
+    // A stream's category is `{ name, ids? }`, not a string.
+    assert_eq!(schemas["ScheduleCreate"]["properties"]["info"]["properties"]["category"]["type"][0], "object");
 }
