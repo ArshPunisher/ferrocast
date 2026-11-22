@@ -25,3 +25,8 @@ pub async fn recap(State(app): State<AppState>, Query(q): Query<HashMap<String, 
     };
     Ok(Json(json!(app.engine.recap(since).await?)))
 }
+
+/// Session end-credits participants (followers, subs, gifters, tippers/bits, raiders, mods).
+pub async fn credits(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.credits().await?)))
+}

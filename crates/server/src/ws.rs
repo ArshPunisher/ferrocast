@@ -251,7 +251,7 @@ enum Inbound {
 fn wants(o: &Overlay, a: &Audience) -> bool {
     match a {
         Audience::All => true,
-        Audience::Chat => o.wants_chat(),
+        Audience::Chat => o.wants_chat_events(),
         Audience::Alerts => o.widgets.iter().any(|w| matches!(w.kind, WidgetKind::Alerts | WidgetKind::Events)),
         Audience::Overlay(id) => *id == o.id,
         Audience::Widget(kind) => o.widgets.iter().any(|w| w.kind == *kind),
@@ -287,6 +287,9 @@ async fn send_snapshot_as(
         snap["state"]["events"] = json!([]);
         snap["state"]["chat"] = json!([]);
         snap["state"]["labels"] = json!({});
+        // Real supporters and the pinned message are names, too.
+        snap["state"]["credits"] = Value::Null;
+        snap["state"]["chat_highlight"] = Value::Null;
     }
     let text = envelope(Some(app.engine.current_seq()), "snapshot", &snap);
     tx.send(Message::Text(Utf8Bytes::from(text.as_ref()))).await.is_ok()

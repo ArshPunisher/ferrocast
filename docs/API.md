@@ -81,6 +81,7 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 | POST | `/api/v1/setup/complete` | → 204: first run is done, `setup_done` stays true (it's also true once an overlay exists) |
 | GET | `/api/v1/stats/session` | → `{ live, started_at (kept after the stream ends), follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
 | GET | `/api/v1/recap?since=<ms>` | → `Recap` (below): this stream so far, or the last one after it ended. `since` (optional, not in the future, else 400 `since: …`) picks the start instead |
+| GET | `/api/v1/credits` | → `Credits` (`{ started_at, followers, subs, gifters, tippers, raiders, mods }`): session end-credits roster (capped at 200 per section; human mods only, bots excluded) |
 | GET | `/api/v1/themes` | → `{ id, name, description, pro }[]`: `molten` (default), `daylight`, `arcade`, `minimal`, `sticker`; unknown ids fall back to `molten` |
 | GET | `/api/v1/updates` | → `UpdateView` (below). Never offer an update while `blocked_while_live` (R-60). `checked_at: null` means not checked yet, which is not "up to date" |
 | POST | `/api/v1/updates/check` | "Check for updates": asks the desktop app to read the feed now and answers 200 `UpdateView` once it has (after 20 s still `checking: true`; the `update` frame brings the rest). A failed check is in `error`, not an HTTP error. 409 `no_updater` (with where to download) in the headless app |
@@ -112,7 +113,7 @@ An overlay is one OBS browser source (a 1920×1080 canvas by default) holding wi
 ```ts
 type Overlay = { id: string; name: string; url: string; width: number; height: number; widgets: Widget[]; updated_at: number;
                  design: { id: string; scene: string; branded: boolean; follows: boolean } | null /* the gallery design it came from (§4 Designs) */ };
-type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll" | "giveaway" | "layer";
+type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll" | "giveaway" | "end_credits" | "emote_wall" | "chat_highlight" | "layer";
                 x: number; y: number; w: number; h: number; config: object;
                 locked?: boolean; hidden?: boolean; rotation?: number /* degrees, -360…360 */; opacity?: number /* 0…1 */ };
 // locked/hidden/rotation/opacity are left out when false/false/0/1. Widgets are drawn bottom to top in array order.
@@ -136,6 +137,9 @@ Widget `config` per kind:
 - `viewers`: `{ platforms: Platform[], theme: string }`
 - `poll`: `{ theme: string }` (shows the running or last poll; hidden when there's none)
 - `giveaway`: `{ theme: string }` (how to enter while open, then a winner card)
+- `end_credits`: `{ theme: string, title?: string (≤80 chars), sections?: ("followers" | "subs" | "gifters" | "tippers" | "raiders" | "mods")[] (1–6 unique), speed?: number (20–300 px/s), font?: FontFamily, text_color?: Color | null, accent_color?: Color | null, background?: Color | null, loop?: boolean }`
+- `emote_wall`: `{ theme: string, platforms?: Platform[], max_emotes?: number (5–120), size?: number (24–128 px), lifetime_s?: number (1–20), physics?: "bounce" | "rain" | "fountain" }`. Emote images are filtered strictly to trusted platform CDN hosts (`static-cdn.jtvnw.net`, `files.kick.com`, `images.kick.com`, `cdn.7tv.app`, `cdn.betterttv.net`, `cdn.frankerfacez.com`, `yt3.ggpht.com`)
+- `chat_highlight`: `{ theme: string, duration_s?: number | null (5–3600 s or null = until dismissed), font_size?: number (14–48 px), show_badges?: boolean, show_platform?: boolean }`
 - `layer` (a piece of a scene): `{ type: "image" | "text" | "shape" | "frame" | "webcam" | "brand" | "fx" | "music" | "sound", anim?: { in: AnimIn, delay_ms: 0…10000, loop: "none" | "float" | "pulse" | "shimmer" }, css?: string }` plus, by type:
   - `image`: `{ media: MediaRef, fit?: "cover" | "contain" | "fill", radius? }`
   - `text`: `{ text (≤500 chars, shown as is), font?: FontFamily, size? 6…400, weight? 100…900, color?, align?: "left" | "center" | "right", uppercase?, italic?, letter_spacing? -0.2…1, shadow?: "none" | "soft" | "hard" | "glow", outline? 0…20, outline_color? }`
@@ -292,6 +296,7 @@ Tips goals are in **major units** of their currency everywhere (API, `goals` fra
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/v1/chat?limit=200` | → `Event[]` (recent chat_message events): this stream's (and the 5 minutes before it), or the last 6 hours while offline; chat overlays' snapshots likewise. When a new stream starts, chat overlays get `clear_chat` (`platform: null`) and dashboards a `resync`, so a stream never opens with the last one's messages |
+| GET / POST / DELETE | `/api/v1/chat/highlight` | GET → `ChatHighlight \| null`. POST `{ event_id, duration_s?: 5..3600 \| null }` → `200 ChatHighlight` (400 names invalid field, 404 `highlight_not_found` when hidden/missing). DELETE → `204` dismisses the pinned message; deleting the message, banning the user, or starting a new stream also clears it |
 | POST | `/api/v1/chat/send` | `{ text, platforms: Platform[] \| "all", reply_to?: { platform, message_id } }` → `{ sent: Platform[], failed: { platform, reason }[] }` |
 | POST | `/api/v1/mod/delete` | `{ platform, message_id }` → 204 |
 | POST | `/api/v1/mod/timeout` | `{ platform, user_id, seconds, reason? }` → 204 |
@@ -1045,6 +1050,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `chatter { event_id, kind: "first" } | { event_id, kind: "returning", days }` (after that message's `event` frame; replayed with it on reconnect)
 - `giveaway { giveaway: GiveawayView | null }` (on every change, at most every 250 ms while entries come in)
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
+- `chat_highlight { highlight: ChatHighlight | null }` (when a chat message is pinned, replaced, dismissed, expired, deleted, or cleared)
 - `update UpdateView` (§4): on every change (a check starting or finishing, download progress at most 5 times a second, installing, ready, failed)
 - `account AccountView` (§4 Ferrocast account): on every change (sign-in started, finished, failed or cancelled, signed out, a refresh that changed it). Never sent to phones.
 - `golive { live, stats: StreamStats, vertical_live, vertical_stats: StreamStats, destinations: DestinationView[], cut_state: CutState | null, ffmpeg: FfmpegState }` (§4 Go live everywhere): every second while OBS streams to Ferrocast, and after every change
@@ -1060,11 +1066,11 @@ Page: `GET /o/<token>/` (the overlay bundle). Media: `GET /o/<token>/media/<id>`
 Server → overlay frames `{ v: 1, seq, type, data }`:
 | type | data |
 |---|---|
-| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null, show: { countdown_ends_at: number \| null }, music: MusicNow } }`, always first. `show.countdown_ends_at` is Start show's countdown end (ms): a text layer with `countdown` follows it unless `countdown_show: false`, restarts each time it comes on air unless `countdown_restart: false`, and counts up ("+01:23") past zero with `countdown_up` |
-| `event` | `Event`: chat messages and alertable events the overlay's widgets need (filtered server-side) |
+| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null, credits?: Credits \| null, chat_highlight?: ChatHighlight \| null, show: { countdown_ends_at: number \| null }, music: MusicNow } }`, always first. `show.countdown_ends_at` is Start show's countdown end (ms): a text layer with `countdown` follows it unless `countdown_show: false`, restarts each time it comes on air unless `countdown_restart: false`, and counts up ("+01:23") past zero with `countdown_up` |
+| `event` | `Event`: chat messages and alertable events the overlay's widgets need (filtered server-side; `emote_wall`-only overlays receive live `chat_message`/moderation frames without snapshot chat backfill) |
 | `alert` | `RenderedAlert` |
 | `alert_hide` | `{ alert_id }` |
-| `state` | partial `{ goals?, labels?, viewers?, poll?, giveaway?, show? }` (`show` whenever Start show's countdown starts, ends or is cancelled) (`poll` and `giveaway` only to overlays with that widget) |
+| `state` | partial `{ goals?, labels?, viewers?, poll?, giveaway?, credits?, chat_highlight?, show? }` (`show` whenever Start show's countdown starts, ends or is cancelled) (`poll`, `giveaway`, `credits`, `chat_highlight` only to overlays with that widget) |
 | `config` | `Overlay` (re-render without reloading) |
 | `music` | `MusicNow` (§4 Music), `seq: 0` (never replayed): only to overlays with an `fx`, `music` or `sound` layer, when the song or playing changes at once and the loudness at most 15 times a second |
 | `delete_message` | `{ platform, message_id }` |

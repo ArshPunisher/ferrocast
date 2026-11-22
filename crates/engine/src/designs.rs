@@ -391,7 +391,7 @@ impl Engine {
                 let o2 = o.clone();
                 let saved = self.db(move |s| repo::overlays::update(s, &o2)).await?;
                 let view = self.overlay_view(&saved);
-                self.push_config(&saved);
+                self.push_config(&saved).await;
                 Ok(view)
             }
             None => {
@@ -487,6 +487,9 @@ impl WidgetKey for ferrocast_core::design::WidgetContent {
             K::Viewers => "viewers",
             K::Poll => "poll",
             K::Giveaway => "giveaway",
+            K::EndCredits => "end_credits",
+            K::EmoteWall => "emote_wall",
+            K::ChatHighlight => "chat_highlight",
             K::Layer => "layer",
         }
     }
