@@ -914,3 +914,90 @@ fn the_overlay_token_and_paths_never_land_in_text_a_pack_controls() {
     assert!(!text_source.contains("SECRET-TOKEN") && !text_source.contains("/Users/victim"), "{text_source}");
     assert!(!out["name"].to_string().contains("/Users/victim"));
 }
+
+// ---- Neon review H1: a pack's fonts can't take over fonts already on this computer ------------
+
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+async fn import_pack(e: &Engine, zip: Vec<u8>, name: &str) -> OverlayPackImportReport {
+    let prev = e.preview_overlay_pack(zip, name.into()).await.unwrap();
+    e.import_overlay_pack(OverlayPackImportReq { preview_id: prev.preview_id, ..Default::default() }).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_bundled_font_lives_with_its_pack_and_leaves_with_it() {
+    let (e, dir) = engine().await;
+    let mock = start_mock_google_fonts("ok").await;
+    e.set_google_fonts_api(&mock.base);
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let ttf = make_test_ttf("FerroMockFont");
+    let rep = import_pack(
+        &e,
+        build_zip(vec![("config.json", &cfg, None), ("fonts/FerroMockFont-Bold.ttf", &ttf, None)]),
+        "a.overlay",
+    )
+    .await;
+    assert_eq!(rep.fonts[0].status, FontStatus::Bundled);
+    let fonts = fonts_dir(dir.path());
+    let under_packs = files_under(&fonts.join("packs"));
+    assert_eq!(under_packs.len(), 1, "the font sits in the pack's own folder: {under_packs:?}");
+    let index = std::fs::read_to_string(fonts.join("index.json")).unwrap_or_default();
+    assert!(!index.contains("bundled"), "the shared font cache isn't touched: {index}");
+    e.undo_overlay_pack(&rep.undo_token).await.unwrap();
+    assert!(files_under(&fonts.join("packs")).is_empty(), "the pack's font goes on undo");
+}
+
+#[tokio::test]
+async fn a_bundled_font_never_replaces_a_family_already_cached() {
+    let (e, dir) = engine().await;
+    let mock = start_mock_google_fonts("ok").await;
+    e.set_google_fonts_api(&mock.base);
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    // The family is fetched and cached first (what a later pack's font would want to replace).
+    let first = import_pack(&e, build_zip(vec![("config.json", &cfg, None)]), "a.overlay").await;
+    let _ = first;
+    let before = std::fs::read_to_string(fonts_dir(dir.path()).join("index.json")).unwrap();
+    assert!(before.contains("google_fonts"), "the family is cached from Google: {before}");
+    let mut evil = make_test_ttf("FerroMockFont");
+    evil.extend_from_slice(b"trojan"); // a different file, same family
+    let rep =
+        import_pack(&e, build_zip(vec![("config.json", &cfg, None), ("fonts/Evil.ttf", &evil, None)]), "b.overlay")
+            .await;
+    assert_eq!(rep.fonts[0].status, FontStatus::Cached, "the cached font is the one used");
+    assert_eq!(std::fs::read_to_string(fonts_dir(dir.path()).join("index.json")).unwrap(), before);
+    assert!(files_under(&fonts_dir(dir.path()).join("packs")).is_empty(), "the pack's copy isn't installed");
+}
+
+#[tokio::test]
+async fn a_woff_with_only_its_magic_bytes_is_not_installed() {
+    let (e, dir) = engine().await;
+    let mock = start_mock_google_fonts("ok").await;
+    e.set_google_fonts_api(&mock.base);
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let mut fake = b"wOF2".to_vec();
+    fake.extend_from_slice(&[0u8; 32]);
+    let rep = import_pack(
+        &e,
+        build_zip(vec![("config.json", &cfg, None), ("fonts/FerroMockFont.woff2", &fake, None)]),
+        "w.overlay",
+    )
+    .await;
+    assert_ne!(rep.fonts[0].status, FontStatus::Bundled, "a woff can't be loaded, so it isn't claimed");
+    let all: Vec<_> = files_under(&fonts_dir(dir.path()))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|x| x == "woff2"))
+        .collect();
+    assert!(all.is_empty(), "{all:?}");
+}

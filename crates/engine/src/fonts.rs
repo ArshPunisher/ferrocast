@@ -395,7 +395,42 @@ fn extract_css_font_urls(css: &str) -> Vec<String> {
     ttf_or_otf
 }
 
-fn bundled_matches_spec(spec: &FontSpec, bundled: &[BundledFontFile]) -> bool {
+/// The folder a pack's own fonts live in (`<data>/fonts/packs/<pack>/`, inside the folder the
+/// text renderer loads, so they work while the pack is in use and go with it on Undo). They are
+/// never written into the shared cache or its index.
+pub(crate) fn pack_fonts_dir(data: &Path, pack_id: &str) -> PathBuf {
+    fonts_dir(data).join("packs").join(pack_id)
+}
+
+/// The families a bundled font file stands for: what it declares, or the name its file suggests.
+fn bundled_family_names(bf: &BundledFontFile) -> Vec<String> {
+    if !bf.declared_families.is_empty() {
+        return bf.declared_families.clone();
+    }
+    parse_font_spec(None, Some(&bf.archive_path), 0, None).map(|s| vec![s.family]).unwrap_or_default()
+}
+
+/// The pack's fonts that may be installed: files this program can load (a `.woff` or `.woff2`
+/// can't be, and only its first bytes were looked at), for a family not already on this
+/// computer or in the cache. A pack can't take over a font that is already there.
+fn bundled_to_install<'a>(
+    data: &Path,
+    idx: &FontIndex,
+    installed: &BTreeSet<String>,
+    bundled: &'a [BundledFontFile],
+) -> Vec<&'a BundledFontFile> {
+    bundled
+        .iter()
+        .filter(|b| matches!(b.ext, "ttf" | "otf" | "ttc"))
+        .filter(|b| {
+            !bundled_family_names(b)
+                .iter()
+                .any(|f| installed_matches(installed, f) || cached_files_for_family(data, idx, f).is_some())
+        })
+        .collect()
+}
+
+fn bundled_matches_spec(spec: &FontSpec, bundled: &[&BundledFontFile]) -> bool {
     let fam_low = spec.family.to_ascii_lowercase();
     let raw_low = spec.raw_ref.as_deref().map(|r| r.rsplit(['/', '\\']).next().unwrap_or(r).to_ascii_lowercase());
     bundled.iter().any(|b| {
@@ -419,6 +454,7 @@ pub fn preview_fonts(
 ) -> Vec<FontPreviewEntry> {
     let idx = load_index(data);
     let local_families = ferrocore::fonts::dir_font_families(&fonts_dir(data));
+    let kept = bundled_to_install(data, &idx, installed, bundled);
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for spec in specs {
@@ -426,7 +462,7 @@ pub fn preview_fonts(
         if !seen.insert(key) {
             continue;
         }
-        if bundled_matches_spec(spec, bundled) {
+        if bundled_matches_spec(spec, &kept) {
             out.push(FontPreviewEntry {
                 family: spec.family.clone(),
                 style: spec.style.clone(),
@@ -476,6 +512,7 @@ pub fn preview_fonts(
 /// from Google Fonts into `<data>/fonts/` with local caching and offline-friendly fallbacks.
 pub async fn resolve_and_install_fonts(
     data: &Path,
+    pack_id: &str,
     specs: &[FontSpec],
     bundled: &[BundledFontFile],
     installed: &BTreeSet<String>,
@@ -486,49 +523,28 @@ pub async fn resolve_and_install_fonts(
     let mut idx = load_index(data);
     let mut index_dirty = false;
 
-    // 1. Persist any bundled fonts from the zip safely into `<data>/fonts/`.
+    // 1. Save the pack's own fonts in the pack's folder (not the shared cache or its index):
+    // only loadable files, only for families not already here, and a failed write is not claimed.
+    let pack_dir = pack_fonts_dir(data, pack_id);
     let mut bundled_saved_by_key: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for bf in bundled {
+    let mut written: Vec<&BundledFontFile> = Vec::new();
+    for bf in bundled_to_install(data, &idx, installed, bundled) {
         let mut h = Sha256::new();
         h.update(&bf.bytes);
         let digest: String = h.finalize().iter().take(4).map(|b| format!("{b:02x}")).collect();
         let stem = bf.archive_path.rsplit('/').next().and_then(|n| n.split('.').next()).unwrap_or("pack-font");
         let file_name = format!("{}-{}.{}", family_slug(stem), digest, bf.ext);
-        let target = dir.join(&file_name);
-        if !target.exists() && write_atomic(&target, &bf.bytes).is_ok() {
-            // saved
+        let target = pack_dir.join(&file_name);
+        if let Err(e) = write_atomic(&target, &bf.bytes) {
+            tracing::warn!(error = %e, font = %bf.archive_path, "couldn't save a pack's font");
+            continue;
         }
-        for fam in &bf.declared_families {
-            let key = fam.to_ascii_lowercase();
-            bundled_saved_by_key.entry(key.clone()).or_default().push(file_name.clone());
-            idx.insert(
-                key,
-                CachedFontEntry {
-                    family: fam.clone(),
-                    files: vec![file_name.clone()],
-                    source: "bundled".into(),
-                    license: "Bundled with theme pack".into(),
-                },
-            );
-            index_dirty = true;
+        for fam in bundled_family_names(bf) {
+            bundled_saved_by_key.entry(fam.to_ascii_lowercase()).or_default().push(file_name.clone());
         }
-        if bf.declared_families.is_empty()
-            && let Some(inferred) = parse_font_spec(None, Some(&bf.archive_path), 0, None)
-        {
-            let key = inferred.family.to_ascii_lowercase();
-            bundled_saved_by_key.entry(key.clone()).or_default().push(file_name.clone());
-            idx.insert(
-                key,
-                CachedFontEntry {
-                    family: inferred.family,
-                    files: vec![file_name.clone()],
-                    source: "bundled".into(),
-                    license: "Bundled with theme pack".into(),
-                },
-            );
-            index_dirty = true;
-        }
+        written.push(bf);
     }
+    let bundled = &written;
 
     let local_families = ferrocore::fonts::dir_font_families(&dir);
     let client = reqwest::Client::builder()

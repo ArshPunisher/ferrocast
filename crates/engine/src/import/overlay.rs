@@ -306,6 +306,7 @@ impl Engine {
         let fetch_fonts = req.fetch_fonts.unwrap_or(true);
         let (font_results, offline_font_fallback) = resolve_and_install_fonts(
             &data,
+            &pack_id,
             &parsed.font_specs,
             &parsed.bundled_fonts,
             &installed,
@@ -357,6 +358,7 @@ impl Engine {
         let final_doc = finalize_doc(&parsed.doc_template, &asset_paths, &overlay_urls);
         let rollback_media_and_overlays = || async {
             let _ = count_and_remove_dir(&pack_dir);
+            let _ = count_and_remove_dir(&crate::fonts::pack_fonts_dir(&data, &pack_id));
             for ov in &created_overlays {
                 let id = ov.id.clone();
                 let _ = self.db(move |s| overlays::delete(s, &id)).await;
@@ -525,6 +527,11 @@ impl Engine {
         } else {
             0
         };
+        // The pack's own fonts go with it (the shared cache of Google fonts stays).
+        if pack_ok {
+            let fonts_of_pack = crate::fonts::pack_fonts_dir(&data, &rec.pack_id);
+            let _ = tokio::task::spawn_blocking(move || count_and_remove_dir(&fonts_of_pack)).await;
+        }
         durable::remove_with_backup(&rec_path);
 
         Ok(OverlayPackUndoReport {
