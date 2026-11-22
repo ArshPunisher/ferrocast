@@ -7,6 +7,7 @@ mod collection;
 mod denoiser;
 mod ffi;
 pub mod import;
+pub mod import_preview;
 pub mod kinds;
 mod naming;
 mod ndi_io;

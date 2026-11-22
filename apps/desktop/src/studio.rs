@@ -92,6 +92,10 @@ struct Held {
     preview_holes: Vec<(f64, f64, f64, f64, f64)>,
     /// How much of the preview shows, 0 to 1.
     preview_opacity: Option<f64>,
+    /// Performance mode: the preview, Studio Mode's second picture and the vertical picture are
+    /// not drawn (outputs and projectors are untouched). Kept here so a picture made again
+    /// after a canvas change is paused too.
+    preview_paused: bool,
     /// The dialog backdrop's shade over the preview, 0 to 1.
     preview_shade: f64,
     /// The same for Studio Mode's picture of what's on air.
@@ -251,6 +255,7 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&v.holes);
     p.set_opacity(v.opacity.unwrap_or(1.0));
     p.set_shade(v.shade);
+    p.set_paused(h.preview_paused);
     h.vertical.view = Some(p);
     Ok(())
 }
@@ -1557,6 +1562,15 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         }
         A::AddExisting { scene, name } => v(to_json!(json!({ "item": c.add_existing(&scene, &name)? }))),
         A::EditItem { scene, id, edit } => done(c.edit_item(&scene, id, item_edit(edit))),
+        // A key held down: shown or hidden for as long as it is held, never saved (the engine
+        // puts it back on release).
+        A::PushItem { scene, id, visible, release } => {
+            // The engine's view only: nothing is written to the collection.
+            done(c.hold_item(&scene, id, (!release).then_some(visible)))
+        }
+        A::PushFilter { name, filter, enabled, release } => {
+            done(c.hold_filter(&name, &filter, (!release).then_some(enabled)))
+        }
         A::Sources => v(to_json!(c.sources())),
         A::Rename { name, new_name } => done(c.rename(&name, &new_name)),
         A::Settings { name } => c.settings(&name),
@@ -1630,6 +1644,23 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
                 Some(it) => c.paste_item_filters_from(&it.scene, it.id, &from, src_item),
                 None => c.paste_filters_from(&name, &from, src_item),
             })
+        }
+        A::CopySource { scene, id } => v(Ok(c.copy_source(&scene, id)?.to_json())),
+        A::CopyFilters { name, item } => {
+            let item = item.as_ref().map(|i| (i.scene.as_str(), i.id));
+            v(Ok(c.copy_filters(&name, item)?.to_json()))
+        }
+        A::PasteSource { scene, clip } => {
+            let clip = ferrocast_studio::stage::SourceClip::from_json(&clip)
+                .ok_or_else(|| ferrocast_studio::StudioError::Failed("That isn't a copied source.".into()))?;
+            let (item, notes) = c.paste_source(&scene, &clip)?;
+            v(to_json!(json!({ "item": item, "notes": notes })))
+        }
+        A::PasteFilterClip { name, item, clip } => {
+            let clip = ferrocast_studio::stage::FilterClip::from_json(&clip)
+                .ok_or_else(|| ferrocast_studio::StudioError::Failed("That isn't a copy of filters.".into()))?;
+            let item = item.as_ref().map(|i| (i.scene.as_str(), i.id));
+            v(Ok(json!({ "notes": c.paste_filter_values(&name, item, &clip)? })))
         }
         A::SetItemFilterScope { scene, id, own } => v(to_json!(c.set_item_filter_scope(&scene, id, own)?)),
         A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
@@ -1739,6 +1770,7 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&h.program_holes);
     p.set_opacity(h.program_opacity.unwrap_or(1.0));
     p.set_shade(h.program_shade);
+    p.set_paused(h.preview_paused);
     h.program_view = Some(p);
     Ok(())
 }
@@ -1764,6 +1796,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&h.preview_holes);
     p.set_opacity(h.preview_opacity.unwrap_or(1.0));
     p.set_shade(h.preview_shade);
+    p.set_paused(h.preview_paused);
     h.preview = Some(p);
     sync_views(h);
     Ok(())
@@ -2267,6 +2300,21 @@ impl StudioHost for DesktopStudio {
         serde_json::to_value(opts).map_err(|e| e.to_string())
     }
 
+    async fn set_preview_paused(&self, paused: bool) -> Result<(), String> {
+        self.on_main(move |h| {
+            h.preview_paused = paused;
+            // Only the three views over the page: projectors and every output draw on.
+            for p in [h.preview.as_ref(), h.program_view.as_ref(), h.vertical.view.as_ref()].into_iter().flatten() {
+                p.set_paused(paused);
+            }
+        })
+        .await
+    }
+
+    async fn preview_paused(&self) -> bool {
+        self.on_main(|h| h.preview_paused).await.unwrap_or(false)
+    }
+
     async fn program_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
@@ -2589,7 +2637,8 @@ impl StudioHost for DesktopStudio {
 
             let capture_target = target.clone();
             let flag = cancel_flag.clone();
-            let image = tokio::task::spawn_blocking(move || {
+            let (image, problem) = tokio::task::spawn_blocking(move || {
+                let mut problem: Option<String> = None;
                 let pic = match capture_target {
                     StillTarget::Display(id, w) => {
                         ferrocore::screen_still_cancel(ferrocore::screen::Target::Display(id), w, &flag).ok()
@@ -2597,11 +2646,21 @@ impl StudioHost for DesktopStudio {
                     StillTarget::Window(id, w) => {
                         ferrocore::screen_still_cancel(ferrocore::screen::Target::Window(id), w, &flag).ok()
                     }
-                    StillTarget::Camera(id, w) => ferrocore::camera_still_cancel(&id, w, &flag).ok(),
+                    // A camera says why it gave nothing (permission off, in use): the page shows it.
+                    StillTarget::Camera(id, w) => match ferrocore::camera_still_cancel(&id, w, &flag) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
+                                problem = Some(e.to_string());
+                            }
+                            None
+                        }
+                    },
                 };
-                pic.and_then(|p| {
+                let image = pic.and_then(|p| {
                     ferrocast_studio::jpeg_data_url(&p.rgba, p.width, p.height, p.premultiplied, "picker").ok()
-                })
+                });
+                (image, problem)
             })
             .await
             .map_err(|e| e.to_string())?;
@@ -2616,7 +2675,7 @@ impl StudioHost for DesktopStudio {
                 map.insert(target, (Instant::now(), img.clone()));
             }
             *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(image.clone());
-            return Ok(json!({ "image": image }));
+            return Ok(json!({ "image": image, "error": problem }));
         }
         // How a source is doing: its settings read on the main thread, a Browser source's
         // address tried off it (the app's web client, its time limit).
@@ -3846,34 +3905,71 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn obs_collections(&self) -> Result<Value, String> {
-        let Some(dir) = ferrocast_studio::import::obs_scenes_dir() else { return Ok(json!([])) };
+        let Some(dir) = ferrocast_studio::import_preview::obs_dir() else { return Ok(json!([])) };
         let list = tokio::task::spawn_blocking(move || ferrocast_studio::import::list(&dir))
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_value(list).map_err(|e| e.to_string())
     }
 
+    async fn preview_obs(&self, id: String) -> Result<Value, String> {
+        let dir =
+            ferrocast_studio::import_preview::obs_dir().ok_or("OBS's scene collections aren't on this computer.")?;
+        let preview = tokio::task::spawn_blocking(move || {
+            let (inputs, filters) = ferrocast_studio::import_preview::supported_kinds();
+            let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
+            ferrocast_studio::import_preview::preview_obs(&dir, &id, web, Some(&inputs), Some(&filters))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        serde_json::to_value(preview).map_err(|e| e.to_string())
+    }
+
     async fn import_obs(&self, id: String) -> Result<Value, String> {
         let dir =
-            ferrocast_studio::import::obs_scenes_dir().ok_or("OBS's scene collections aren't on this computer.")?;
-        let doc = ferrocast_studio::import::read(&dir, &id).map_err(|e| e.to_string())?;
+            ferrocast_studio::import_preview::obs_dir().ok_or("OBS's scene collections aren't on this computer.")?;
+        // A file of up to 64 MB is read and parsed off the async worker.
+        let read_id = id.clone();
+        let doc = tauri::async_runtime::spawn_blocking(move || ferrocast_studio::import::read(&dir, &read_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
         // A new scene collection of the same name (the Studio's own stay as they are).
         let name = doc.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
         self.shelf("collections".into(), ShelfAct::Import { name, doc }).await
     }
 
     async fn streamlabs_collections(&self) -> Result<Value, String> {
-        let Some(dir) = ferrocast_studio::streamlabs::scenes_dir() else { return Ok(json!([])) };
+        let Some(dir) = ferrocast_studio::import_preview::streamlabs_dir() else { return Ok(json!([])) };
         let list = tokio::task::spawn_blocking(move || ferrocast_studio::streamlabs::list(&dir))
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_value(list).map_err(|e| e.to_string())
     }
 
-    async fn import_streamlabs(&self, id: String) -> Result<Value, String> {
-        let dir = ferrocast_studio::streamlabs::scenes_dir()
+    async fn preview_streamlabs(&self, id: String) -> Result<Value, String> {
+        let dir = ferrocast_studio::import_preview::streamlabs_dir()
             .ok_or("Streamlabs' scene collections aren't on this computer.")?;
-        let doc = ferrocast_studio::streamlabs::read(&dir, &id).map_err(|e| e.to_string())?;
+        let preview = tokio::task::spawn_blocking(move || {
+            let (inputs, filters) = ferrocast_studio::import_preview::supported_kinds();
+            let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
+            ferrocast_studio::import_preview::preview_streamlabs(&dir, &id, web, Some(&inputs), Some(&filters))
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        serde_json::to_value(preview).map_err(|e| e.to_string())
+    }
+
+    async fn import_streamlabs(&self, id: String) -> Result<Value, String> {
+        let dir = ferrocast_studio::import_preview::streamlabs_dir()
+            .ok_or("Streamlabs' scene collections aren't on this computer.")?;
+        let read_id = id.clone();
+        let doc = tauri::async_runtime::spawn_blocking(move || ferrocast_studio::streamlabs::read(&dir, &read_id))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
         let name = doc.get("name").and_then(Value::as_str).unwrap_or("Streamlabs scenes").to_string();
         // From here on it's an OBS collection: the same import, web pages and missing kinds.
         self.shelf("collections".into(), ShelfAct::Import { name, doc }).await
@@ -3998,22 +4094,13 @@ impl StudioHost for DesktopStudio {
             ShelfAct::Import { name, mut doc } => {
                 let name = library::check_name(&name)?;
                 let mut lib = library::load(&data);
+                let previous_id = lib.collections.current.clone();
                 let name = lib.collections.free_name(&name);
                 let id = lib.collections.new_id(&name);
                 // OBS's Browser sources become Web page sources here; note kinds this OBS lacks.
-                let known = self
-                    .on_main(|h| {
-                        h.collection.as_ref().map(|_| {
-                            ferrocast_studio::kinds::kinds()
-                                .inputs
-                                .into_iter()
-                                .map(|k| k.id)
-                                .collect::<std::collections::BTreeSet<_>>()
-                        })
-                    })
-                    .await?;
+                let (known_inputs, _) = ferrocast_studio::import_preview::supported_kinds();
                 let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
-                let mut report = ferrocast_studio::import::convert(&mut doc, web, known.as_ref());
+                let mut report = ferrocast_studio::import::convert(&mut doc, web, Some(&known_inputs));
                 report.name = name.clone();
                 if let Some(o) = doc.as_object_mut() {
                     o.insert("name".into(), json!(name));
@@ -4029,6 +4116,7 @@ impl StudioHost for DesktopStudio {
                 let mut v = serde_json::to_value(&report).map_err(|e| e.to_string())?;
                 if let Some(o) = v.as_object_mut() {
                     o.insert("id".into(), json!(id));
+                    o.insert("previous_id".into(), json!(previous_id));
                 }
                 Ok(v)
             }
@@ -4907,5 +4995,261 @@ mod projector_tests {
                 && !old.projector_restore
                 && !old.projector_hide_cursor
         );
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    fn write_default_fixtures(obs_dir: &std::path::Path, sl_dir: &std::path::Path) {
+        let obs_main = serde_json::json!({
+            "name": "Main OBS Fixture",
+            "current_scene": "Main Stage",
+            "scene_order": [{"name": "Main Stage"}, {"name": "BRB"}],
+            "sources": [
+                {
+                    "id": "macos-avcapture",
+                    "name": "DeskCam",
+                    "settings": {"device": "cam0"},
+                    "filters": []
+                },
+                {
+                    "id": "browser_source",
+                    "name": "AlertBox",
+                    "settings": {"url": "http://127.0.0.1:4040/alerts"},
+                    "filters": []
+                },
+                {
+                    "id": "spout_capture",
+                    "name": "SpoutFeed",
+                    "settings": {},
+                    "filters": []
+                },
+                {
+                    "id": "coreaudio_input_capture",
+                    "name": "Mic",
+                    "settings": {"device_id": "default"},
+                    "filters": [{"id": "vst_filter", "name": "GateVST", "settings": {}}]
+                },
+                {
+                    "id": "scene",
+                    "name": "Main Stage",
+                    "settings": {
+                        "items": [
+                            {"name": "DeskCam", "pos": {"x": 0.0, "y": 0.0}},
+                            {"name": "AlertBox", "pos": {"x": 100.0, "y": 100.0}}
+                        ]
+                    }
+                },
+                {
+                    "id": "scene",
+                    "name": "BRB",
+                    "settings": {"items": []}
+                }
+            ]
+        });
+        if let Err(e) = std::fs::write(obs_dir.join("main_setup.json"), obs_main.to_string()) {
+            panic!("write obs fixture: {e}");
+        }
+        if let Err(e) = std::fs::write(obs_dir.join("broken_backup.json"), "{broken json!!") {
+            panic!("write broken fixture: {e}");
+        }
+        let manifest = serde_json::json!({
+            "collections": [{"id": "sl_neon", "name": "Streamlabs Neon"}]
+        });
+        if let Err(e) = std::fs::write(sl_dir.join("manifest.json"), manifest.to_string()) {
+            panic!("write sl manifest: {e}");
+        }
+        let sl_doc = serde_json::json!({
+            "nodeType": "RootNode",
+            "sources": {
+                "items": [
+                    {
+                        "id": "src-cam",
+                        "name": "WinCam",
+                        "type": "dshow_input",
+                        "settings": {"video_device_id": "win-cam-1"},
+                        "filters": {"items": []}
+                    },
+                    {
+                        "id": "src-alerts",
+                        "name": "SL Alerts",
+                        "type": "browser_source",
+                        "settings": {"url": "https://streamlabs.com/alert-box/v3/demo"},
+                        "filters": {"items": []}
+                    },
+                    {
+                        "id": "src-wheel",
+                        "name": "SpinWheel",
+                        "type": "streamlabs_spin_wheel",
+                        "settings": {},
+                        "filters": {"items": []}
+                    }
+                ]
+            },
+            "scenes": {
+                "items": [
+                    {
+                        "id": "sc-main",
+                        "name": "Live Scene",
+                        "sceneItems": {
+                            "items": [
+                                {"sourceId": "src-cam", "x": 0.0, "y": 0.0, "scaleX": 1.0, "scaleY": 1.0},
+                                {"sourceId": "src-alerts", "x": 40.0, "y": 40.0, "scaleX": 1.0, "scaleY": 1.0}
+                            ]
+                        }
+                    }
+                ]
+            }
+        });
+        if let Err(e) = std::fs::write(sl_dir.join("sl_neon.json"), sl_doc.to_string()) {
+            panic!("write sl fixture: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn real_importer_preview_import_and_undo_with_ferrocast_home() {
+        let scratch = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        // Only with a variable made for it: the test writes a collection and removes it again, so it
+        // never runs on the real home just because FERROCAST_HOME happens to be set.
+        let from_env = std::env::var_os("FERROCAST_IMPORT_TEST_USE_HOME").filter(|v| !v.is_empty()).and_then(|_| {
+            let obs = ferrocast_studio::import_preview::obs_dir()?;
+            let sl = ferrocast_studio::import_preview::streamlabs_dir()?;
+            Some((crate::data_dir(), obs, sl))
+        });
+        let (home, obs_dir, sl_dir) = match from_env {
+            Some(paths) => paths,
+            None => {
+                let home = scratch.path().join("home");
+                let obs = scratch.path().join("obs");
+                let sl = scratch.path().join("sl");
+                for dir in [&home, &obs, &sl] {
+                    if let Err(e) = std::fs::create_dir_all(dir) {
+                        panic!("mkdir: {e}");
+                    }
+                }
+                write_default_fixtures(&obs, &sl);
+                (home, obs, sl)
+            }
+        };
+
+        let engine = ferrocast_engine::Engine::start_with_mode(&home, false)
+            .await
+            .unwrap_or_else(|e| panic!("engine start: {e}"));
+        let (inputs, filters) = ferrocast_studio::import_preview::supported_kinds();
+        let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
+
+        let obs_list = ferrocast_studio::import::list(&obs_dir);
+        assert!(obs_list.iter().any(|c| c.id == "main_setup"), "{obs_list:?}");
+
+        let obs_preview =
+            ferrocast_studio::import_preview::preview_obs(&obs_dir, "main_setup", web, Some(&inputs), Some(&filters))
+                .unwrap_or_else(|e| panic!("obs preview: {e}"));
+        assert_eq!(obs_preview.name, "Main OBS Fixture");
+        // Browser sources only become Web page sources where the Studio has them (a Mac).
+        assert_eq!(obs_preview.web_pages >= 1, web.is_some(), "{obs_preview:?}");
+        assert!(obs_preview.skipped.iter().any(|s| s.kind == "spout_capture"), "{obs_preview:?}");
+        assert!(obs_preview.skipped.iter().any(|s| s.kind == "vst_filter"), "{obs_preview:?}");
+
+        let broken_err = ferrocast_studio::import_preview::preview_obs(
+            &obs_dir,
+            "broken_backup",
+            web,
+            Some(&inputs),
+            Some(&filters),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("expected broken json error"));
+        assert!(broken_err.to_string().contains("JSON is damaged"), "{broken_err}");
+
+        let mut obs_doc =
+            ferrocast_studio::import::read(&obs_dir, "main_setup").unwrap_or_else(|e| panic!("obs read: {e}"));
+        let obs_report = ferrocast_studio::import::convert(&mut obs_doc, web, Some(&inputs));
+
+        let mut lib = crate::studio_library::load(&home);
+        let previous_id = lib.shelf(crate::studio_library::Kind::Collections).current.clone();
+        let imported_name = {
+            let shelf = lib.shelf(crate::studio_library::Kind::Collections);
+            let checked =
+                crate::studio_library::check_name("Main OBS Fixture").unwrap_or_else(|e| panic!("check_name: {e}"));
+            shelf.free_name(&checked)
+        };
+        let imported_id = lib.shelf(crate::studio_library::Kind::Collections).new_id(&imported_name);
+        let imported_path = crate::studio_library::file(&home, crate::studio_library::Kind::Collections, &imported_id);
+        if let Some(parent) = imported_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            panic!("mkdir collection parent: {e}");
+        }
+        let body = serde_json::to_string_pretty(&obs_doc).unwrap_or_else(|e| panic!("json: {e}"));
+        if let Err(e) = std::fs::write(&imported_path, body) {
+            panic!("write imported collection: {e}");
+        }
+        {
+            let shelf = lib.shelf_mut(crate::studio_library::Kind::Collections);
+            shelf.list.push(crate::studio_library::Entry { id: imported_id.clone(), name: imported_name });
+            shelf.current = imported_id.clone();
+        }
+        crate::studio_library::save(&home, &lib);
+
+        let reloaded = crate::studio_library::load(&home);
+        assert_eq!(reloaded.shelf(crate::studio_library::Kind::Collections).current, imported_id);
+        assert!(imported_path.is_file());
+        assert_eq!(obs_report.web_pages, usize::from(web.is_some()));
+
+        // Undo the import: restore previous_id and remove imported file and library entry.
+        let mut undone = crate::studio_library::load(&home);
+        {
+            let shelf = undone.shelf_mut(crate::studio_library::Kind::Collections);
+            shelf.current = previous_id.clone();
+            shelf.list.retain(|item| item.id != imported_id);
+        }
+        crate::studio_library::save(&home, &undone);
+        if let Err(e) = std::fs::remove_file(&imported_path) {
+            panic!("remove undone collection: {e}");
+        }
+        let after_undo = crate::studio_library::load(&home);
+        assert_eq!(after_undo.shelf(crate::studio_library::Kind::Collections).current, previous_id);
+        assert!(!imported_path.exists());
+
+        // Streamlabs preview & import under FERROCAST_HOME.
+        let sl_list = ferrocast_studio::streamlabs::list(&sl_dir);
+        assert_eq!(sl_list.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["sl_neon"]);
+        let sl_preview = ferrocast_studio::import_preview::preview_streamlabs(
+            &sl_dir,
+            "sl_neon",
+            web,
+            Some(&inputs),
+            Some(&filters),
+        )
+        .unwrap_or_else(|e| panic!("sl preview: {e}"));
+        assert_eq!(sl_preview.web_pages, usize::from(web.is_some()));
+        // Cameras and sound devices are only asked for again where the import resets them (a Mac).
+        assert_eq!(!sl_preview.device_resets.is_empty(), cfg!(target_os = "macos"));
+        assert!(sl_preview.skipped.iter().any(|s| s.kind == "streamlabs_spin_wheel"));
+
+        let mut sl_doc =
+            ferrocast_studio::streamlabs::read(&sl_dir, "sl_neon").unwrap_or_else(|e| panic!("sl read: {e}"));
+        let sl_report = ferrocast_studio::import::convert(&mut sl_doc, web, Some(&inputs));
+        assert_eq!(sl_report.web_pages, usize::from(web.is_some()));
+        let sl_path = crate::studio_library::file(&home, crate::studio_library::Kind::Collections, "sl-neon");
+        if let Err(e) = std::fs::write(&sl_path, sl_doc.to_string()) {
+            panic!("write sl imported: {e}");
+        }
+        assert!(sl_path.is_file());
+        println!(
+            "real importer verified under {}: obs(scenes={}, sources={}, web_pages={}, skipped={}), sl(scenes={}, sources={}, web_pages={}, resets={}, skipped={})",
+            home.display(),
+            obs_preview.scenes,
+            obs_preview.sources,
+            obs_report.web_pages,
+            obs_preview.skipped.len(),
+            sl_preview.scenes,
+            sl_preview.sources,
+            sl_report.web_pages,
+            sl_preview.device_resets.len(),
+            sl_preview.skipped.len()
+        );
+
+        drop(engine);
     }
 }
