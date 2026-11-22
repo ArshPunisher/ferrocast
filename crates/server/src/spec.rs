@@ -509,6 +509,54 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
     ),
     doc("GET", "/studio/engine/stream", "Studio Engine", "Studio stream output stats and status.", None, None),
     doc("POST", "/studio/engine/stream", "Studio Engine", "Start or stop studio output streaming.", None, None),
+    doc(
+        "GET",
+        "/studio/engine/auto-config",
+        "Studio Engine",
+        "Encoder auto-config state: the running benchmark, its pick, and any unconfirmed apply.",
+        None,
+        Some("AutoConfigView"),
+    ),
+    doc(
+        "POST",
+        "/studio/engine/auto-config/benchmark",
+        "Studio Engine",
+        "Start the encoder benchmark (and optional upload check). Returns at once; progress arrives as `auto_config` frames.",
+        Some("AutoConfigBenchmarkRequest"),
+        Some("AutoConfigView"),
+    ),
+    doc(
+        "POST",
+        "/studio/engine/auto-config/cancel",
+        "Studio Engine",
+        "Cancel a running benchmark.",
+        None,
+        Some("AutoConfigView"),
+    ),
+    doc(
+        "POST",
+        "/studio/engine/auto-config/apply",
+        "Studio Engine",
+        "Apply the picked output settings (or explicit overrides) and start the 30 s confirm window and 1 min dropped-frame watch.",
+        Some("AutoConfigApplyRequest"),
+        Some("AutoConfigView"),
+    ),
+    doc(
+        "POST",
+        "/studio/engine/auto-config/keep",
+        "Studio Engine",
+        "Confirm the applied settings so they are kept.",
+        None,
+        Some("AutoConfigView"),
+    ),
+    doc(
+        "POST",
+        "/studio/engine/auto-config/undo",
+        "Studio Engine",
+        "Restore the output settings from before the apply.",
+        None,
+        Some("AutoConfigView"),
+    ),
     doc("GET", "/studio/engine/scenes", "Studio Engine", "List studio scenes and active scene.", None, None),
     doc(
         "POST",
@@ -1988,8 +2036,191 @@ fn build_openapi() -> Value {
     })
 }
 
+/// The encoder auto-config schemas. Built one by one: a single `json!` this size passes the macro
+/// recursion limit.
+fn auto_config_schemas() -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("AutoConfigBenchmarkRequest".into(), json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["stream", "record"], "description": "Default `stream`." },
+                "fps_preference": { "type": "integer", "enum": [30, 60], "description": "Default 60." },
+                "include_upload": { "type": "boolean", "description": "Measure upload first. Default true for `stream`, false for `record`." },
+                "max_seconds": { "type": "integer", "minimum": 2, "maximum": 35, "description": "Time budget for the encoder tests. Default 24." }
+            }
+        }));
+    m.insert("AutoConfigApplyRequest".into(), json!({
+            "type": "object",
+            "description": "Every field is optional: what is left out comes from the benchmark's pick. `video_encoder` and `scale` accept an explicit null (clear it).",
+            "properties": {
+                "encoder": { "type": "string", "enum": ["hardware", "software"] },
+                "video_encoder": { "type": ["string", "null"] },
+                "encoder_settings": { "type": "object", "additionalProperties": true },
+                "scale": {
+                    "type": ["array", "null"],
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": { "type": "integer", "minimum": 1 }
+                },
+                "fps": { "type": "integer", "enum": [24, 25, 30, 48, 50, 60, 120] },
+                "video_kbps": { "type": "integer", "minimum": 500, "maximum": 60000 },
+                "label": { "type": "string" }
+            }
+        }));
+    m.insert(
+        "AutoConfigAppliedSummary".into(),
+        json!({
+            "type": "object",
+            "required": ["encoder", "video_encoder", "encoder_settings", "scale", "fps", "video_kbps", "label"],
+            "properties": {
+                "encoder": { "type": "string" },
+                "video_encoder": { "type": ["string", "null"] },
+                "encoder_settings": { "type": "object", "additionalProperties": true },
+                "scale": {
+                    "type": ["array", "null"],
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": { "type": "integer" }
+                },
+                "fps": { "type": "integer" },
+                "video_kbps": { "type": "integer" },
+                "label": { "type": "string" }
+            }
+        }),
+    );
+    m.insert("AutoConfigCandidate".into(), json!({
+            "type": "object",
+            "description": "One encoder setting that was tested, with its verdict in plain words.",
+            "required": ["label", "family", "hardware", "width", "height", "fps", "bitrate_kbps", "passed", "reason"],
+            "properties": {
+                "encoder_backend": { "type": "string" },
+                "studio_encoder_id": { "type": "string" },
+                "label": { "type": "string" },
+                "family": { "type": "string", "enum": ["video_toolbox", "nvenc", "qsv", "amf", "media_foundation", "x264"] },
+                "hardware": { "type": "boolean" },
+                "preset": { "type": ["string", "null"] },
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "fps": { "type": "integer" },
+                "bitrate_kbps": { "type": "integer" },
+                "frames_tested": { "type": "integer" },
+                "encode_ms_avg": { "type": "number" },
+                "encode_ms_p95": { "type": "number" },
+                "encode_ms_max": { "type": "number" },
+                "budget_ms": { "type": "number" },
+                "fps_achieved": { "type": "number" },
+                "headroom_pct": { "type": "number" },
+                "skipped_frames": { "type": "integer" },
+                "lagged_frames": { "type": "integer" },
+                "cpu_pct": { "type": ["number", "null"] },
+                "gpu_pct": { "type": ["number", "null"] },
+                "elapsed_ms": { "type": "integer" },
+                "passed": { "type": "boolean" },
+                "reason": { "type": "string" }
+            }
+        }));
+    m.insert("AutoConfigRecommendation".into(), json!({
+            "type": "object",
+            "description": "The benchmark's pick.",
+            "required": ["encoder", "video_encoder", "encoder_settings", "label", "fps", "video_kbps", "limited_by", "why"],
+            "properties": {
+                "encoder": { "type": "string" },
+                "video_encoder": { "type": ["string", "null"] },
+                "studio_encoder_id": { "type": "string" },
+                "encoder_settings": { "type": "object", "additionalProperties": true },
+                "label": { "type": "string" },
+                "preset": { "type": ["string", "null"] },
+                "scale": {
+                    "type": ["array", "null"],
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": { "type": "integer" }
+                },
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "fps": { "type": "integer" },
+                "video_kbps": { "type": "integer" },
+                "headroom_pct": { "type": "number" },
+                "limited_by": { "type": "string", "enum": ["headroom", "upload", "platform_cap", "balanced"] },
+                "why": { "type": "string" }
+            }
+        }));
+    m.insert("AutoConfigUploadCheck".into(), json!({
+            "type": "object",
+            "description": "The upload speed check that went before the benchmark.",
+            "required": ["at", "measured_by", "rows", "verdict"],
+            "properties": {
+                "at": { "type": "integer", "description": "Unix milliseconds." },
+                "measured_by": { "type": "string", "description": "`twitch` (bandwidth-test mode) or `estimate`." },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["id", "name", "need_kbps"],
+                        "properties": {
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "server": { "type": ["string", "null"] },
+                            "delay_ms": { "type": ["integer", "null"] },
+                            "need_kbps": { "type": "integer" },
+                            "problem": { "type": "string", "description": "Present only when the platform could not be checked." }
+                        }
+                    }
+                },
+                "verdict": {
+                    "type": "object",
+                    "required": ["upload_kbps", "need_kbps", "fits", "fit_count", "message"],
+                    "properties": {
+                        "upload_kbps": { "type": "integer" },
+                        "need_kbps": { "type": "integer" },
+                        "fits": { "type": "boolean" },
+                        "fit_count": { "type": "integer" },
+                        "message": { "type": "string" }
+                    }
+                }
+            }
+        }));
+    m.insert("AutoConfigView".into(), json!({
+            "type": "object",
+            "description": "The auto-config state machine, as the REST routes answer and as the `auto_config` live frame carries.",
+            "required": [
+                "state", "job_id", "mode", "phase", "progress_pct", "current_label", "elapsed_ms", "estimated_total_ms",
+                "candidates", "upload_check", "upload_error", "picked", "duration_ms", "error", "applied", "confirmed",
+                "confirm_remaining_s", "watch_remaining_s", "first_minute_drops", "first_minute_lags", "rollback_offered",
+                "rollback_trigger", "rollback_reason", "restored"
+            ],
+            "properties": {
+                "state": { "type": "string", "enum": ["idle", "running", "failed", "done", "applied", "rolled_back"] },
+                "job_id": { "type": ["string", "null"] },
+                "mode": { "type": "string", "enum": ["stream", "record"] },
+                "phase": { "type": ["string", "null"], "enum": ["upload", "discovering", "encoding", "picking", null] },
+                "progress_pct": { "type": "integer", "minimum": 0, "maximum": 100 },
+                "current_label": { "type": ["string", "null"] },
+                "elapsed_ms": { "type": "integer" },
+                "estimated_total_ms": { "type": "integer" },
+                "candidates": { "type": "array", "items": { "$ref": "#/components/schemas/AutoConfigCandidate" } },
+                "upload_check": { "oneOf": [{ "$ref": "#/components/schemas/AutoConfigUploadCheck" }, { "type": "null" }] },
+                "upload_error": { "type": ["string", "null"] },
+                "picked": { "oneOf": [{ "$ref": "#/components/schemas/AutoConfigRecommendation" }, { "type": "null" }] },
+                "duration_ms": { "type": ["integer", "null"] },
+                "error": { "type": ["string", "null"] },
+                "applied": { "oneOf": [{ "$ref": "#/components/schemas/AutoConfigAppliedSummary" }, { "type": "null" }] },
+                "confirmed": { "type": "boolean" },
+                "confirm_remaining_s": { "type": "integer", "description": "Seconds left to keep the applied settings before they roll back." },
+                "watch_remaining_s": { "type": "integer", "description": "Seconds left of the first-minute dropped-frame watch." },
+                "first_minute_drops": { "type": "integer" },
+                "first_minute_lags": { "type": "integer" },
+                "rollback_offered": { "type": "boolean" },
+                "rollback_trigger": { "type": ["string", "null"], "enum": ["user_undo", "timeout", "dropped_frames", null] },
+                "rollback_reason": { "type": ["string", "null"] },
+                "restored": { "oneOf": [{ "$ref": "#/components/schemas/AutoConfigAppliedSummary" }, { "type": "null" }] }
+            }
+        }));
+    m
+}
+
 fn schemas() -> Value {
-    json!({
+    let mut doc = json!({
         "ApiError": {
             "type": "object",
             "required": ["error"],
@@ -2214,7 +2445,11 @@ fn schemas() -> Value {
             "type": "object",
             "description": "Partial update of non-sensitive local application preferences."
         }
-    })
+    });
+    if let Some(map) = doc.as_object_mut() {
+        map.extend(auto_config_schemas());
+    }
+    doc
 }
 
 /// A frame of the live socket. The `type` constant is the wire discriminator: with it a frame
@@ -2269,7 +2504,7 @@ fn overlay_inbound(name: &str, summary: &str, data_schema: Value) -> Value {
 }
 
 fn build_asyncapi() -> Value {
-    json!({
+    let mut doc = json!({
         "asyncapi": "3.0.0",
         "info": {
             "title": "Ferrocast Live & Overlay WebSocket API",
@@ -2336,6 +2571,7 @@ fn build_asyncapi() -> Value {
                     "marker": live_message("marker", "New stream marker created.", "read_only, studio_control, go_live", json!({ "type": "object" })),
                     "counter": live_message("counter", "Updated bot counter (`{ name, value }`).", "read_only, chat, studio_control", json!({ "type": "object" })),
                     "show": live_message("show", "Show countdown and live rundown state (`{ show }`).", "read_only, studio_control, go_live", json!({ "type": "object" })),
+                    "auto_config": live_message("auto_config", "Encoder auto-config progress and result: the same `AutoConfigView` the `/studio/engine/auto-config` routes return. Sent on connect only while a run is not idle.", "PC session and the owner's remote only; never sent to API keys", json!({ "$ref": "#/components/schemas/AutoConfigView" })),
                     "snapshot": live_message("snapshot", "Overlay reconnect full state snapshot.", "overlay channel only", json!({ "type": "object" }))
                 }
             },
@@ -2381,5 +2617,22 @@ fn build_asyncapi() -> Value {
                 "summary": "Report alert start/finish acknowledgement from overlay page."
             }
         }
-    })
+    });
+    // A frame's data may point at these (`#/components/schemas/...`), the same schemas the REST
+    // side uses, so the two documents cannot say different things about one object.
+    let all = schemas();
+    let mut shared = Map::new();
+    for name in [
+        "AutoConfigView",
+        "AutoConfigCandidate",
+        "AutoConfigRecommendation",
+        "AutoConfigUploadCheck",
+        "AutoConfigAppliedSummary",
+    ] {
+        if let Some(def) = all.get(name) {
+            shared.insert(name.to_string(), def.clone());
+        }
+    }
+    doc["components"] = json!({ "schemas": shared });
+    doc
 }

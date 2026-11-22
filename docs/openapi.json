@@ -189,6 +189,597 @@
         ],
         "type": "object"
       },
+      "AutoConfigAppliedSummary": {
+        "properties": {
+          "encoder": {
+            "type": "string"
+          },
+          "encoder_settings": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "scale": {
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "video_encoder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "video_kbps": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "encoder",
+          "video_encoder",
+          "encoder_settings",
+          "scale",
+          "fps",
+          "video_kbps",
+          "label"
+        ],
+        "type": "object"
+      },
+      "AutoConfigApplyRequest": {
+        "description": "Every field is optional: what is left out comes from the benchmark's pick. `video_encoder` and `scale` accept an explicit null (clear it).",
+        "properties": {
+          "encoder": {
+            "enum": [
+              "hardware",
+              "software"
+            ],
+            "type": "string"
+          },
+          "encoder_settings": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "fps": {
+            "enum": [
+              24,
+              25,
+              30,
+              48,
+              50,
+              60,
+              120
+            ],
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "scale": {
+            "items": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "video_encoder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "video_kbps": {
+            "maximum": 60000,
+            "minimum": 500,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "AutoConfigBenchmarkRequest": {
+        "properties": {
+          "fps_preference": {
+            "description": "Default 60.",
+            "enum": [
+              30,
+              60
+            ],
+            "type": "integer"
+          },
+          "include_upload": {
+            "description": "Measure upload first. Default true for `stream`, false for `record`.",
+            "type": "boolean"
+          },
+          "max_seconds": {
+            "description": "Time budget for the encoder tests. Default 24.",
+            "maximum": 35,
+            "minimum": 2,
+            "type": "integer"
+          },
+          "mode": {
+            "description": "Default `stream`.",
+            "enum": [
+              "stream",
+              "record"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "AutoConfigCandidate": {
+        "description": "One encoder setting that was tested, with its verdict in plain words.",
+        "properties": {
+          "bitrate_kbps": {
+            "type": "integer"
+          },
+          "budget_ms": {
+            "type": "number"
+          },
+          "cpu_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "elapsed_ms": {
+            "type": "integer"
+          },
+          "encode_ms_avg": {
+            "type": "number"
+          },
+          "encode_ms_max": {
+            "type": "number"
+          },
+          "encode_ms_p95": {
+            "type": "number"
+          },
+          "encoder_backend": {
+            "type": "string"
+          },
+          "family": {
+            "enum": [
+              "video_toolbox",
+              "nvenc",
+              "qsv",
+              "amf",
+              "media_foundation",
+              "x264"
+            ],
+            "type": "string"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "fps_achieved": {
+            "type": "number"
+          },
+          "frames_tested": {
+            "type": "integer"
+          },
+          "gpu_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "hardware": {
+            "type": "boolean"
+          },
+          "headroom_pct": {
+            "type": "number"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "lagged_frames": {
+            "type": "integer"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "preset": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "skipped_frames": {
+            "type": "integer"
+          },
+          "studio_encoder_id": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "label",
+          "family",
+          "hardware",
+          "width",
+          "height",
+          "fps",
+          "bitrate_kbps",
+          "passed",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "AutoConfigRecommendation": {
+        "description": "The benchmark's pick.",
+        "properties": {
+          "encoder": {
+            "type": "string"
+          },
+          "encoder_settings": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "headroom_pct": {
+            "type": "number"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "limited_by": {
+            "enum": [
+              "headroom",
+              "upload",
+              "platform_cap",
+              "balanced"
+            ],
+            "type": "string"
+          },
+          "preset": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scale": {
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "studio_encoder_id": {
+            "type": "string"
+          },
+          "video_encoder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "video_kbps": {
+            "type": "integer"
+          },
+          "why": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "encoder",
+          "video_encoder",
+          "encoder_settings",
+          "label",
+          "fps",
+          "video_kbps",
+          "limited_by",
+          "why"
+        ],
+        "type": "object"
+      },
+      "AutoConfigUploadCheck": {
+        "description": "The upload speed check that went before the benchmark.",
+        "properties": {
+          "at": {
+            "description": "Unix milliseconds.",
+            "type": "integer"
+          },
+          "measured_by": {
+            "description": "`twitch` (bandwidth-test mode) or `estimate`.",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "properties": {
+                "delay_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "need_kbps": {
+                  "type": "integer"
+                },
+                "problem": {
+                  "description": "Present only when the platform could not be checked.",
+                  "type": "string"
+                },
+                "server": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "need_kbps"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "verdict": {
+            "properties": {
+              "fit_count": {
+                "type": "integer"
+              },
+              "fits": {
+                "type": "boolean"
+              },
+              "message": {
+                "type": "string"
+              },
+              "need_kbps": {
+                "type": "integer"
+              },
+              "upload_kbps": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "upload_kbps",
+              "need_kbps",
+              "fits",
+              "fit_count",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "at",
+          "measured_by",
+          "rows",
+          "verdict"
+        ],
+        "type": "object"
+      },
+      "AutoConfigView": {
+        "description": "The auto-config state machine, as the REST routes answer and as the `auto_config` live frame carries.",
+        "properties": {
+          "applied": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AutoConfigAppliedSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/AutoConfigCandidate"
+            },
+            "type": "array"
+          },
+          "confirm_remaining_s": {
+            "description": "Seconds left to keep the applied settings before they roll back.",
+            "type": "integer"
+          },
+          "confirmed": {
+            "type": "boolean"
+          },
+          "current_label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "elapsed_ms": {
+            "type": "integer"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "estimated_total_ms": {
+            "type": "integer"
+          },
+          "first_minute_drops": {
+            "type": "integer"
+          },
+          "first_minute_lags": {
+            "type": "integer"
+          },
+          "job_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "enum": [
+              "stream",
+              "record"
+            ],
+            "type": "string"
+          },
+          "phase": {
+            "enum": [
+              "upload",
+              "discovering",
+              "encoding",
+              "picking",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "picked": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AutoConfigRecommendation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "progress_pct": {
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "restored": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AutoConfigAppliedSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rollback_offered": {
+            "type": "boolean"
+          },
+          "rollback_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rollback_trigger": {
+            "enum": [
+              "user_undo",
+              "timeout",
+              "dropped_frames",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "enum": [
+              "idle",
+              "running",
+              "failed",
+              "done",
+              "applied",
+              "rolled_back"
+            ],
+            "type": "string"
+          },
+          "upload_check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AutoConfigUploadCheck"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "upload_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "watch_remaining_s": {
+            "description": "Seconds left of the first-minute dropped-frame watch.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "state",
+          "job_id",
+          "mode",
+          "phase",
+          "progress_pct",
+          "current_label",
+          "elapsed_ms",
+          "estimated_total_ms",
+          "candidates",
+          "upload_check",
+          "upload_error",
+          "picked",
+          "duration_ms",
+          "error",
+          "applied",
+          "confirmed",
+          "confirm_remaining_s",
+          "watch_remaining_s",
+          "first_minute_drops",
+          "first_minute_lags",
+          "rollback_offered",
+          "rollback_trigger",
+          "rollback_reason",
+          "restored"
+        ],
+        "type": "object"
+      },
       "BanResult": {
         "properties": {
           "banned": {
@@ -19895,6 +20486,401 @@
         "x-pc-only": true
       }
     },
+    "/api/v1/studio/engine/auto-config": {
+      "get": {
+        "operationId": "get_studio_engine_auto_config",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoConfigView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Encoder auto-config state: the running benchmark, its pick, and any unconfirmed apply.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/studio/engine/auto-config/apply": {
+      "post": {
+        "operationId": "post_studio_engine_auto_config_apply",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutoConfigApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoConfigView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Apply the picked output settings (or explicit overrides) and start the 30 s confirm window and 1 min dropped-frame watch.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/studio/engine/auto-config/benchmark": {
+      "post": {
+        "operationId": "post_studio_engine_auto_config_benchmark",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AutoConfigBenchmarkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoConfigView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Start the encoder benchmark (and optional upload check). Returns at once; progress arrives as `auto_config` frames.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/studio/engine/auto-config/cancel": {
+      "post": {
+        "operationId": "post_studio_engine_auto_config_cancel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoConfigView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Cancel a running benchmark.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/studio/engine/auto-config/keep": {
+      "post": {
+        "operationId": "post_studio_engine_auto_config_keep",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoConfigView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Confirm the applied settings so they are kept.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/studio/engine/auto-config/undo": {
+      "post": {
+        "operationId": "post_studio_engine_auto_config_undo",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AutoConfigView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Restore the output settings from before the apply.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
     "/api/v1/studio/engine/black": {
       "post": {
         "operationId": "post_studio_engine_black",
@@ -34227,3 +35213,4 @@
     }
   ]
 }
+
