@@ -560,9 +560,12 @@ fn tokens_in(text: &str) -> Vec<String> {
                 i += 2;
                 continue;
             }
-            if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '}') {
+            // No closing brace anywhere after this one: nothing later can close either.
+            let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '}') else { break };
+            {
                 let inner: String = chars[i + 1..i + 1 + rel_end].iter().collect();
-                let raw = inner.split('|').next().unwrap_or("").trim().to_string();
+                // The overlay reads `{name}` exactly (no spaces), so this does too.
+                let raw = inner.split('|').next().unwrap_or("").to_string();
                 if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':') {
                     out.push(raw);
                 }
@@ -577,11 +580,16 @@ fn tokens_in(text: &str) -> Vec<String> {
 
 fn url_attr_ok(value: &str) -> bool {
     let v = value.trim().to_ascii_lowercase();
-    if v.chars().any(|c| c.is_control() || c.is_whitespace()) || v.contains('&') || v.contains('\\') {
+    if v.chars().any(|c| c.is_control() || c.is_whitespace()) || v.contains('\\') {
         return false;
     }
     if v.starts_with('#') {
         return true;
+    }
+    // Entities (`&#106;avascript:`) only matter where a scheme could hide; a picture host's
+    // signed links (`?ex=…&hm=…`) legitimately carry `&`.
+    if v.contains('&') && !v.starts_with("https://") {
+        return false;
     }
     if let Some(rest) = v.strip_prefix("data:image/") {
         return ["png", "jpeg", "gif", "webp", "avif"].iter().any(|t| rest.starts_with(&format!("{t};")));
@@ -1515,5 +1523,18 @@ mod tests {
         }
         let custom = render("a", &r, &r.variations[0], &e).custom.unwrap();
         assert!(custom.vars.values().all(|v| v.chars().count() <= MAX_CUSTOM_VAR_CHARS));
+    }
+
+    #[test]
+    fn signed_picture_links_pass_and_brace_floods_do_not_stall_the_check() {
+        let ok = custom_rule("<img src=\"https://cdn.discordapp.com/a/b.png?ex=65&is=64&hm=abc\" alt=\"\">");
+        assert!(ok.validate().is_ok(), "{:?}", ok.validate());
+        assert!(custom_rule("<a href=\"&#106;avascript:1\">x</a>").validate().is_err());
+        // 20,000 opening braces and no closing one used to be a quadratic scan.
+        let t = std::time::Instant::now();
+        let _ = custom_rule(&"{".repeat(19_000)).validate();
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
+        // The overlay does not read `{ name }`, so it is not a token here either.
+        assert!(custom_rule("<p>{ bogus }</p>").validate().is_ok());
     }
 }
