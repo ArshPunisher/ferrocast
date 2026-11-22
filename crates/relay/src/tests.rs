@@ -1056,3 +1056,112 @@ async fn facebook_sign_in_without_the_app_set_up_says_so_and_a_refused_code_queu
     .await;
     assert!(got.is_empty(), "nothing was queued for the desktop: {got:?}");
 }
+
+/// A Meta whose Page list comes in two pieces. With `foreign`, the second piece is at another origin.
+async fn fake_meta_paged(foreign: Option<String>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::http::{HeaderMap, Uri};
+    let hits: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let h = hits.clone();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    let b2 = base.clone();
+    let app = axum::Router::new()
+        .route(
+            "/oauth/access_token",
+            post(|body: String| async move {
+                if body.contains("fb_exchange_token=SHORT") {
+                    axum::Json(json!({ "access_token": "LONG" }))
+                } else {
+                    axum::Json(json!({ "access_token": "SHORT" }))
+                }
+            }),
+        )
+        .route("/me", get(|| async { axum::Json(json!({ "id": "u1", "name": "Dev Person" })) }))
+        .route(
+            "/me/accounts",
+            get(move |u: Uri, hd: HeaderMap| {
+                let (h, base, foreign) = (h.clone(), b2.clone(), foreign.clone());
+                async move {
+                    let auth = hd.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    h.lock().unwrap().push(format!("{} {auth}", u));
+                    if u.query().is_some_and(|q| q.contains("after=PAGE2")) {
+                        axum::Json(json!({ "data": [{ "id": "p26", "name": "Page 26", "access_token": "T26" }] }))
+                    } else {
+                        let next = foreign
+                            .map(|f| format!("{f}/me/accounts?after=PAGE2"))
+                            .unwrap_or_else(|| format!("{base}/me/accounts?after=PAGE2"));
+                        axum::Json(json!({
+                            "data": [{ "id": "p1", "name": "Page 1", "access_token": "T1" }],
+                            "paging": { "next": next }
+                        }))
+                    }
+                }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(l, app).await });
+    (base, hits)
+}
+
+async fn facebook_callback_status(r: &Relay, auth: &str) -> u16 {
+    let http = reqwest::Client::new();
+    let start: Value = http
+        .post(format!("{}/v1/facebook/oauth", r.base))
+        .bearer_auth(auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = url::Url::parse(start["url"].as_str().unwrap()).unwrap();
+    let state = url.query_pairs().find(|(n, _)| n == "state").unwrap().1.into_owned();
+    http.get(format!("{}/v1/facebook/callback?code=goodcode&state={state}", r.base))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+async fn queued_texts(r: &Relay, auth: &str, wait_ms: u64) -> Vec<Value> {
+    let mut req = format!("{}/v1/link", r.base.replace("http", "ws")).into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {auth}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_millis(wait_ms), async {
+        while let Some(Ok(m)) = ws.next().await {
+            if let TMessage::Text(t) = m {
+                got.push(serde_json::from_str::<Value>(&t).unwrap());
+            }
+        }
+    })
+    .await;
+    got
+}
+
+#[tokio::test]
+async fn every_page_of_pages_is_read_and_a_next_link_to_another_origin_is_not_followed() {
+    // Two pieces on the same origin: both Pages arrive, the token goes only to Meta's origin.
+    let (meta, hits) = fake_meta_paged(None).await;
+    let r = relay_facebook(Some(&meta)).await;
+    let auth = install(&r).await;
+    assert_eq!(facebook_callback_status(&r, &auth).await, 200);
+    let got = queued_texts(&r, &auth, 800).await;
+    let ids: Vec<_> =
+        got[0]["payload"]["pages"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ids, ["p1", "p26"], "{got:?}");
+    assert_eq!(hits.lock().unwrap().len(), 2);
+
+    // A next link that leads somewhere else is refused: no request goes there, nothing is queued.
+    let (evil, evil_hits) = fake_meta_paged(None).await;
+    let (meta, _hits) = fake_meta_paged(Some(evil.clone())).await;
+    let r = relay_facebook(Some(&meta)).await;
+    let auth = install(&r).await;
+    assert_eq!(facebook_callback_status(&r, &auth).await, 502);
+    assert!(
+        evil_hits.lock().unwrap().is_empty(),
+        "the Page token was sent to another origin: {:?}",
+        evil_hits.lock().unwrap()
+    );
+    assert!(queued_texts(&r, &auth, 500).await.is_empty(), "nothing is handed to the desktop on a partial list");
+}

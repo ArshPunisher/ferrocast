@@ -122,10 +122,21 @@ async fn token(st: &AppState, form: &[(&str, &str)]) -> Option<String> {
 }
 
 async fn graph_get(st: &AppState, path: &str, token: &str) -> Option<Value> {
-    let res = st.http.get(format!("{}{path}", st.facebook.cfg.graph_url)).bearer_auth(token).send().await.ok()?;
+    graph_get_url(st, &format!("{}{path}", st.facebook.cfg.graph_url), token).await
+}
+
+/// A Graph call by full address. The token goes only to Meta's own origin: an address anywhere
+/// else (a `paging.next` that was tampered with) is refused before any request.
+async fn graph_get_url(st: &AppState, url: &str, token: &str) -> Option<Value> {
+    let want = url::Url::parse(&st.facebook.cfg.graph_url).ok()?.origin();
+    let u = url::Url::parse(url).ok().filter(|u| u.origin() == want)?;
+    let res = st.http.get(u).bearer_auth(token).send().await.ok()?;
     res.status().is_success().then_some(())?;
     res.json().await.ok()
 }
+
+/// The most pieces of the Page list followed (25 Pages each).
+const MAX_PIECES: usize = 40;
 
 /// Meta sends the person back here. Trades the code (with the secret), then the long-lived token,
 /// learns who they are and which Pages they manage, and hands that to the install's desktop.
@@ -180,15 +191,25 @@ pub(crate) async fn callback(State(st): State<AppState>, Query(q): Query<Callbac
     ) else {
         return page(StatusCode::BAD_GATEWAY, "Facebook sent an account without an id.");
     };
-    let Some(accounts) =
-        graph_get(&st, "/me/accounts?fields=id,name,access_token,picture%7Burl%7D&limit=25", &long).await
-    else {
-        return page(StatusCode::BAD_GATEWAY, "Facebook didn't list your Pages. Try again.");
-    };
+    // Every piece of the list, so a person with many Pages sees all of them; a failed piece fails
+    // the sign-in (nothing is handed over half-way).
+    let mut rows: Vec<Value> = Vec::new();
+    let mut next = Some(format!(
+        "{}/me/accounts?fields=id,name,access_token,picture%7Burl%7D&limit=25",
+        st.facebook.cfg.graph_url
+    ));
+    for _ in 0..MAX_PIECES {
+        let Some(url) = next.take() else { break };
+        let Some(piece) = graph_get_url(&st, &url, &long).await else {
+            return page(StatusCode::BAD_GATEWAY, "Facebook didn't list your Pages. Try again.");
+        };
+        if let Some(r) = piece.get("data").and_then(Value::as_array) {
+            rows.extend(r.iter().cloned());
+        }
+        next = piece.pointer("/paging/next").and_then(Value::as_str).map(String::from);
+    }
     // Only a Page that came with its own token can act as the Page.
-    let pages: Vec<Value> = accounts
-        .get("data")
-        .and_then(Value::as_array)
+    let pages: Vec<Value> = Some(&rows)
         .map(|rows| {
             rows.iter()
                 .filter_map(|p| {
