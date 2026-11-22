@@ -4279,6 +4279,11 @@ impl StudioHost for DesktopStudio {
         self.on_main(|_| serde_json::to_value(ferrocast_studio::screens()).map_err(|e| e.to_string())).await?
     }
 
+    async fn machine_load(&self) -> (Option<f64>, Option<f64>) {
+        let cpu = ferrocast_studio::system::machine_cpu_pct();
+        (Some(cpu), None)
+    }
+
     async fn restart(&self) -> Result<(), String> {
         let busy = self
             .on_main(|h| h.stream.is_some() || h.record.is_some() || h.replay.is_some() || h.virtualcam.is_some())

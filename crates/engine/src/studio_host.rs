@@ -445,6 +445,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn encode_budget(&self, _draft: Option<Value>, _enhanced: bool, _light: bool) -> Result<Value, String> {
         Ok(serde_json::json!({ "budget_mpx": null, "level": "unknown" }))
     }
+    /// Current total machine CPU (%) and GPU (%) load for auto-config benchmarking.
+    async fn machine_load(&self) -> (Option<f64>, Option<f64>) {
+        (None, None)
+    }
     /// macOS's Screen Recording switch for Ferrocast: `{ granted }` (true where there's none).
     async fn screen_access(&self) -> Result<Value, String> {
         Ok(serde_json::json!({ "granted": true }))
