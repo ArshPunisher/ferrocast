@@ -1884,10 +1884,16 @@ fn find_ip_spans(text: &str) -> Vec<(usize, usize, bool)> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
+    let mut no_close = false;
     while i < bytes.len() {
         // Bracketed IPv6: `[...]` (may include `%zone`).
         if bytes[i] == b'[' {
-            if let Some(close) = text[i + 1..].find(']') {
+            // With no `]` anywhere after this one there can't be one after a later `[` either.
+            let found = if no_close { None } else { text[i + 1..].find(']') };
+            if found.is_none() {
+                no_close = true;
+            }
+            if let Some(close) = found {
                 let inner = &text[i + 1..i + 1 + close];
                 let core = inner.split('%').next().unwrap_or(inner);
                 if IpAddr::from_str(core).is_ok() {
@@ -2497,5 +2503,16 @@ mod tests {
         let out = redact_text(&big, &["supersecret"], &["someuser"]);
         assert_eq!(out.len(), big.len());
         assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn many_open_brackets_do_not_make_the_ip_scan_quadratic() {
+        let text = "[".repeat(400_000);
+        let t = std::time::Instant::now();
+        let _ = redact_text(&text, &[], &[]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
+        // Still finds an address after a run of stray brackets.
+        let out = redact_text("[[[[ see [2001:db8::1] done", &[], &[]);
+        assert!(!out.contains("2001:db8::1"), "{out}");
     }
 }
