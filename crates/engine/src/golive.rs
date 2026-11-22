@@ -982,6 +982,11 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn upload_now_for_test(&self, cfg: &GoLiveConfig) -> Option<UploadCheck> {
+        self.upload_now(cfg)
+    }
+
+    #[cfg(test)]
     pub(crate) fn seed_failed_for_test(&self, id: &str) {
         let h = Health {
             state: PushState::Failed { attempts: 3, reason: "refused".into(), detail: None, refused: false },
@@ -1235,7 +1240,7 @@ impl Engine {
             vertical_live,
             vertical_stats,
             destinations,
-            upload: if live {
+            upload: if live || vertical_live {
                 self.upload_now(&cfg).or_else(|| lock(&g.upload).clone())
             } else {
                 lock(&g.upload).clone()
@@ -1523,17 +1528,25 @@ impl Engine {
         }
         let next = GoLiveConfig { destinations: next, ..self.golive_config() };
         self.save_golive(next.clone()).await?;
-        drop(one_at_a_time);
-        // Unticking a paused or failed destination clears it (ticking it again starts fresh).
+        // Unticking a paused or failed destination clears it (ticking it again starts fresh):
+        // under the config lock, so a second toggle can't have its fresh state cleared by this one.
         for d in next.destinations.iter().filter(|d| !d.enabled) {
             lock(&self.golive().protector).release(&d.id);
             lock(&self.golive().paused).remove(&d.id);
             lock(&self.golive().failed).remove(&d.id);
             lock(&self.golive().failed_alerted).remove(&d.id);
         }
+        drop(one_at_a_time);
         self.reconcile_midstream().await;
         if live {
-            self.push_stream_info_to(&added);
+            // Only the ones still ticked and sending: a second toggle may have taken one away.
+            let now = self.golive_config();
+            let running = self.golive_running();
+            let still: Vec<DestinationConfig> = added
+                .into_iter()
+                .filter(|d| now.destinations.iter().any(|n| n.id == d.id && n.enabled) && running.contains(&d.id))
+                .collect();
+            self.push_stream_info_to(&still);
         }
         Ok(next)
     }
@@ -1553,10 +1566,13 @@ impl Engine {
             }
         }
         // Per live canvas: the last destination ticked on a picture that is on air.
+        // Ones that have failed don't count as left: they send nothing, and with only failed
+        // ones left the stream would be ended for the failure.
+        let failed: std::collections::HashSet<String> = lock(&self.golive().failed).keys().cloned().collect();
         let emptied = |canvas: Canvas, on_air: bool| {
             on_air
-                && before.destinations.iter().any(|d| d.enabled && d.canvas == canvas)
-                && !next.iter().any(|d| d.enabled && d.canvas == canvas)
+                && before.destinations.iter().any(|d| d.enabled && d.canvas == canvas && !failed.contains(&d.id))
+                && !next.iter().any(|d| d.enabled && d.canvas == canvas && !failed.contains(&d.id))
         };
         let g = self.golive();
         let last_one =
@@ -1679,16 +1695,30 @@ impl Engine {
         let last = lock(&g.upload).clone()?;
         let main = g.hub.stats().kbps;
         let vert = g.vhub.stats().kbps;
+        let light = g.lhub.stats().kbps;
         let rate = |d: &DestinationConfig| {
-            let live_rate = if d.canvas == Canvas::Vertical { vert } else { main };
-            last.rows
-                .iter()
-                .find(|r| r.id == d.id)
-                .map(|r| r.need_kbps)
-                .filter(|k| *k > 0 && live_rate == 0)
-                .unwrap_or(if live_rate > 0 { live_rate } else { DEFAULT_NEED_KBPS })
+            // What the destination really gets: the lighter stream's rate for a destination on it.
+            let live_rate = if d.canvas == Canvas::Vertical {
+                vert
+            } else if self.on_light(d) && light > 0 {
+                light
+            } else {
+                main
+            };
+            last.rows.iter().find(|r| r.id == d.id).map(|r| r.need_kbps).filter(|k| *k > 0 && live_rate == 0).unwrap_or(
+                if live_rate > 0 {
+                    live_rate
+                } else if d.canvas == Canvas::Vertical {
+                    DEFAULT_VERTICAL_NEED_KBPS
+                } else {
+                    DEFAULT_NEED_KBPS
+                },
+            )
         };
-        let enabled: Vec<&DestinationConfig> = cfg.destinations.iter().filter(|d| d.enabled).collect();
+        // A backup waiting for its ticked main one sends only if that fails: not billed twice.
+        let enabled: Vec<&DestinationConfig> =
+            cfg.destinations.iter().filter(|d| d.enabled && !backs_up(cfg, &d.id).is_some_and(|p| p.enabled)).collect();
+        let streaming = g.hub.live().borrow().on || g.vhub.live().borrow().on;
         let rows: Vec<UploadRow> = enabled
             .iter()
             .map(|d| {
@@ -1699,7 +1729,9 @@ impl Engine {
                     server: old.and_then(|r| r.server.clone()),
                     delay_ms: old.and_then(|r| r.delay_ms),
                     need_kbps: rate(d),
-                    problem: old.and_then(|r| r.problem.clone()),
+                    // A problem found by a check hours ago (unreachable then) isn't held against it
+                    // on a stream that is running now: it is billed as the stream is.
+                    problem: if streaming { None } else { old.and_then(|r| r.problem.clone()) },
                 }
             })
             .collect();
@@ -1720,12 +1752,24 @@ impl Engine {
             return;
         }
         let engine = self.clone();
+        let want_youtube = platforms.contains(&Platform::Youtube);
         tokio::spawn(async move {
             let Ok(saved) = engine.stream_info_saved().await else { return };
             let Some(last) = saved.history.first().filter(|h| recent_push(h, now().0)) else { return };
             if let Err(e) = engine.apply_stream_info(last.info.clone(), Some(platforms), Some("added mid-stream")).await
             {
                 tracing::warn!(error = %e, "couldn't give the title and category to a destination added mid-stream");
+            }
+            // YouTube may not have its broadcast yet: the title it waits with is given as soon as
+            // it has one. (`youtube_when_live` only wakes when a stream starts, and this one
+            // already has.)
+            if want_youtube {
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    if !engine.golive_stream_running() || engine.apply_youtube_pending().await {
+                        break;
+                    }
+                }
             }
         });
     }
@@ -2911,6 +2955,10 @@ impl Engine {
     /// Stops a destination the protector just paused and shows why on its health line.
     pub(crate) fn pause(&self, id: String, top: String) {
         let g = self.golive();
+        // Unticked while the protector was choosing it: nothing to pause (and nothing to bring back).
+        if !self.golive_config().destinations.iter().any(|d| d.id == id && d.enabled) {
+            return;
+        }
         if let Some(r) = lock(&g.running).remove(&id) {
             r.stop.send_replace(true);
         }

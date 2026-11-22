@@ -2059,3 +2059,46 @@ async fn the_last_destination_is_per_live_canvas_and_the_record_stays_open() {
     assert!(e.golive_stream_running());
     assert!(e.golive_senders().is_empty());
 }
+
+/// Taking the one healthy destination away while a sibling has failed is the last one too: with
+/// only the failed one left the stream would be ended for the failure.
+#[tokio::test]
+async fn unticking_the_only_healthy_destination_beside_a_failed_one_asks() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) && e.golive_running().contains(&b.id) }).await;
+    e.seed_failed_for_test(&b.id);
+    let order: Vec<(String, bool)> =
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), d.id == b.id)).collect();
+    let err = e.set_golive_destinations_checked(order, Default::default()).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+}
+
+/// A backup waiting for its ticked main destination isn't billed as a second sender, and a
+/// problem a check found hours ago doesn't zero a destination on a stream that is running.
+#[tokio::test]
+async fn the_upload_estimate_bills_what_really_sends() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    e.seed_upload_for_test(30_000);
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    let mut cfg = e.golive_config();
+    cfg.advanced.per.entry(a.id.clone()).or_default().backup = Some(b.id.clone());
+    for d in &mut cfg.destinations {
+        d.enabled = d.id == a.id || d.id == b.id;
+    }
+    let check = e.upload_now_for_test(&cfg).expect("an estimate");
+    assert_eq!(check.rows.len(), 1, "the standby backup is not billed beside its main: {:?}", check.rows);
+}
