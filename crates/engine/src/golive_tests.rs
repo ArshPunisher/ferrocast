@@ -2161,3 +2161,38 @@ async fn deleting_a_sender_follows_the_canvas_rule_and_its_stop_is_logged() {
     let log = e.golive().dest_log.lock().unwrap().clone();
     assert!(log.iter().any(|ev| ev.id == a.id && ev.name == "A" && !ev.on), "{log:?}");
 }
+
+/// X, Instagram and Facebook have no key Ferrocast can create for the streamer (X and Instagram
+/// only hand keys out in their own apps): the streamer pastes the server and key from there. The
+/// key goes in the secret store like any custom server's, never in the saved settings.
+#[tokio::test]
+async fn a_pasted_key_for_x_instagram_or_facebook_is_a_branded_custom_server() {
+    let (e, _dir) = engine().await;
+    for (brand, label) in [("x", "X"), ("instagram", "Instagram"), ("facebook", "Facebook")] {
+        let d = e
+            .add_golive_destination_branded(
+                label,
+                "rtmps://live.example:443/rtmp/",
+                "SECRET-KEY-VALUE",
+                crate::golive::Canvas::Main,
+                Some(brand),
+            )
+            .await
+            .unwrap();
+        assert_eq!(d.brand.as_deref(), Some(brand));
+        assert_eq!(d.kind, ferrocast_golive::probe::Service::Custom);
+        // The key is not in the saved destination.
+        assert!(!serde_json::to_string(&d).unwrap().contains("SECRET-KEY-VALUE"));
+        assert!(e.golive_config().destinations.iter().any(|x| x.id == d.id && x.brand.as_deref() == Some(brand)));
+    }
+    // A brand that isn't one of those is refused with the list.
+    let err = e
+        .add_golive_destination_branded("Z", "rtmp://127.0.0.1:9/app", "k", crate::golive::Canvas::Main, Some("tiktok"))
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, EngineError::Invalid(m) if m.contains("brand")), "{err:?}");
+    // No brand stays a plain custom server.
+    let plain =
+        e.add_golive_destination("Mine", "rtmp://127.0.0.1:9/app", "k", crate::golive::Canvas::Main).await.unwrap();
+    assert_eq!(plain.brand, None);
+}

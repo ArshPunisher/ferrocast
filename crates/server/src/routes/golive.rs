@@ -89,6 +89,9 @@ struct AddBody {
     /// `vertical` for a server that takes OBS's vertical canvas.
     #[serde(default)]
     canvas: ferrocast_engine::golive::Canvas,
+    /// `x`, `instagram` or `facebook`: a server and key pasted from that platform's own app.
+    #[serde(default)]
+    brand: Option<String>,
 }
 
 /// "Test connection" on a saved destination → `{ ok, rtt_ms?, message, srt_latency_ms? }`.
@@ -115,7 +118,7 @@ async fn test_address(State(app): State<AppState>, Body(b): Body<TestBody>) -> A
 }
 
 async fn add(State(app): State<AppState>, Body(b): Body<AddBody>) -> ApiResult<Response> {
-    let d = app.engine.add_golive_destination(&b.name, &b.url, &b.key, b.canvas).await?;
+    let d = app.engine.add_golive_destination_branded(&b.name, &b.url, &b.key, b.canvas, b.brand.as_deref()).await?;
     Ok((StatusCode::CREATED, Json(json!(d))).into_response())
 }
 

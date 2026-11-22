@@ -329,7 +329,7 @@ const GO_LIVE_ROUTES: &[RouteDoc] = &[
         "POST",
         "/golive/destinations",
         "Go Live",
-        "Add a custom RTMP/SRT destination with stream key (PC only).",
+        "Add a custom RTMP/SRT destination with stream key (PC only). Optional brand (x, instagram, facebook) names a server and key pasted from that platform.",
         None,
         None,
     ),
