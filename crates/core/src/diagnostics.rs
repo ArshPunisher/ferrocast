@@ -1181,7 +1181,7 @@ fn collect_percent_decoded_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
 fn collect_identifier_ci_spans(text: &str, needle: &str, spans: &mut Vec<SensitiveSpan>) {
     let low_text = text.to_lowercase();
     let low_needle = needle.to_lowercase();
-    if low_text.len() != text.len() || low_needle.is_empty() {
+    if low_text.len() != text.len() || low_needle.len() != needle.len() || low_needle.is_empty() {
         for (idx, _) in text.match_indices(needle) {
             spans.push(SensitiveSpan { start: idx, end: idx + needle.len(), kind: SpanKind::User, bracketed: false });
         }
@@ -1365,7 +1365,7 @@ fn collect_pem_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
                     bracketed: false,
                 });
             }
-            pos = body_end.max(body_start + 1);
+            pos = body_end.max(body_start);
         }
     }
 }
@@ -1472,7 +1472,8 @@ fn collect_url_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
             }
         }
 
-        i = scheme_end + url_len.max(1);
+        // `://` is consumed, so this always moves on, and never past the end.
+        i = scheme_end + url_len;
     }
 }
 
@@ -2450,5 +2451,22 @@ mod tests {
         supported_empty.audio.enumeration_supported = true;
         let supported_report = build_support_report(supported_empty, &[], &[]);
         assert!(supported_report.likely_causes.iter().any(|c| c.code == "no_audio_input"));
+    }
+
+    #[test]
+    fn odd_log_endings_never_panic() {
+        for tail in ["connect to http://", "ws://", "x ://", "://", "https://\n"] {
+            let _ = redact_text(tail, &[], &[]);
+        }
+        // A private-key header at the very end of a log (and with only a newline after it).
+        for tail in [
+            "log\n-----BEGIN PRIVATE KEY-----",
+            "log\n-----BEGIN PRIVATE KEY-----\n",
+            "-----BEGIN RSA PRIVATE KEY-----\r\n",
+        ] {
+            let _ = redact_text(tail, &[], &[]);
+        }
+        // A known username whose case-folded form is shorter than itself (the Kelvin sign).
+        let _ = redact_text("kim kim", &[], &["\u{212A}im"]);
     }
 }
