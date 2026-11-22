@@ -2445,3 +2445,42 @@ async fn a_failed_upload_request_never_shows_the_session_address() {
     let scrubbed = YoutubeError::network(text).to_string();
     assert!(!scrubbed.contains(secret), "{scrubbed}");
 }
+
+#[test]
+fn an_upload_address_has_no_credentials_and_no_odd_port() {
+    let api = "https://www.googleapis.com/youtube/v3";
+    for bad in [
+        "https://user:pass@www.googleapis.com/upload/x",
+        "https://www.googleapis.com:8443/upload/x",
+        "https://www.googleapis.com:444/upload/x",
+    ] {
+        assert!(!super::api::upload_host_ok_for_test(bad, api), "{bad}");
+    }
+    assert!(super::api::upload_host_ok_for_test("https://www.googleapis.com:443/upload/x", api));
+}
+
+/// A redirect is not followed: the video chunk would go wherever it points, past the host check.
+#[tokio::test]
+async fn the_upload_client_does_not_follow_a_redirect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_port = first.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = first.accept().await {
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(
+                    format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{other_port}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await;
+        }
+    });
+    let res = super::http_client().put(format!("http://127.0.0.1:{first_port}/up")).body("chunk").send().await.unwrap();
+    assert_eq!(res.status().as_u16(), 307, "the redirect was followed");
+    let reached = tokio::time::timeout(std::time::Duration::from_millis(300), other.accept()).await;
+    assert!(reached.is_err(), "the second host was contacted");
+}

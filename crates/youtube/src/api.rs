@@ -1093,14 +1093,18 @@ fn upload_backoff(failures: u32) -> std::time::Duration {
 /// Whether an upload address is on the same host as the API's upload address, or YouTube's.
 fn upload_host_ok(url: &str, api: &str) -> bool {
     let Ok(u) = reqwest::Url::parse(url) else { return false };
+    // No credentials in the address, and only the standard https port.
+    let plain = u.username().is_empty() && u.password().is_none();
     let google = u.scheme() == "https"
+        && plain
+        && matches!(u.port(), None | Some(443))
         && u.host_str().is_some_and(|h| {
             h == "googleapis.com" || h.ends_with(".googleapis.com") || h == "youtube.com" || h.ends_with(".youtube.com")
         });
     let same = reqwest::Url::parse(api)
         .ok()
         .is_some_and(|a| a.scheme() == u.scheme() && a.host_str() == u.host_str() && a.port() == u.port());
-    google || same
+    google || (same && plain)
 }
 
 /// YouTube's own limit for a thumbnail.

@@ -227,6 +227,9 @@ pub fn http_client() -> reqwest::Client {
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .user_agent(concat!("Ferrocast/", env!("CARGO_PKG_VERSION")))
+        // Never follow a redirect: an upload chunk (or a token) would go wherever it points,
+        // past the host check on the upload address.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default()
 }
