@@ -718,7 +718,7 @@ fn gather_redacted_logs(
         let joined = all_lines[start..].join("\n");
         let redacted = redact_text(&joined, secrets, users);
         for l in redacted.lines() {
-            if is_error_line(l) && errors.len() < 20 {
+            if is_error_line(l) {
                 errors.push(l.to_string());
             }
         }
@@ -727,6 +727,10 @@ fn gather_redacted_logs(
         if include_contents {
             files_out.push((fname.to_string(), redacted));
         }
+    }
+    // Files go oldest first, so the newest errors are the last ones: those are kept.
+    if errors.len() > 20 {
+        errors.drain(..errors.len() - 20);
     }
     (included_names, files_out, errors)
 }
@@ -866,9 +870,14 @@ fn gather_redacted_crashes(
                             let red = redact_text(&text, secrets, users);
                             bytes = red.into_bytes();
                         }
-                        total_bytes = total_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
-                        files_out.push((name.clone(), bytes));
-                        included = true;
+                        // Lossy decoding and redaction can make the text longer than the file
+                        // was: the size that counts is the one that goes into the archive.
+                        let final_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                        if final_len <= limit && total_bytes.saturating_add(final_len) <= MAX_TOTAL_CRASH_ZIP_BYTES {
+                            total_bytes = total_bytes.saturating_add(final_len);
+                            files_out.push((name.clone(), bytes));
+                            included = true;
+                        }
                     }
                 }
             }
@@ -1530,5 +1539,35 @@ mod tests {
         e.state_mut().live.insert(Platform::Twitch, false);
         e.health_stream_ended(Millis(5_000)).await;
         assert!(e.inner.stream_health.lock().unwrap().active.is_none());
+    }
+
+    #[test]
+    fn the_newest_errors_are_kept_when_the_older_log_has_many() {
+        let dir = tempfile::tempdir().unwrap();
+        let old: String = (0..25).map(|i| format!("2026-11-01 ERROR old failure {i}\n")).collect();
+        std::fs::write(dir.path().join("ferrocast.1.log"), old).unwrap();
+        std::fs::write(dir.path().join("ferrocast.log"), "2026-11-22 ERROR the failure that prompted this export\n")
+            .unwrap();
+        let (_, _, errors) = gather_redacted_logs(dir.path(), false, &[], &[]);
+        assert_eq!(errors.len(), 20);
+        assert!(errors.last().unwrap().contains("prompted this export"), "{errors:?}");
+        assert!(errors.first().unwrap().contains("old failure 6"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_crash_text_that_grows_when_decoded_is_checked_against_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mib = 1024 * 1024;
+        // Oldest: invalid UTF-8 that becomes three times longer as text.
+        std::fs::write(dir.path().join("a-text.log"), vec![0xFFu8; 190 * 1024]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(dir.path().join("b.dmp"), vec![b'x'; 7 * mib + 900 * 1024]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(dir.path().join("c.dmp"), vec![b'y'; 7 * mib + 900 * 1024]).unwrap();
+        let (meta, files) = gather_redacted_crashes(dir.path(), true, &[], &[]);
+        let total: usize = files.iter().map(|(_, b)| b.len()).sum();
+        assert!(total as u64 <= 16 * mib as u64, "archive crash data is {total} bytes");
+        let text = meta.iter().find(|m| m.filename.contains("a-text")).unwrap();
+        assert!(!text.included_in_zip, "the grown text did not fit and is left out");
     }
 }
