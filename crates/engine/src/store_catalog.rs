@@ -921,9 +921,17 @@ struct Merged {
     displaced: Option<Variation>,
     /// The ids the pack's variations have in the rule.
     added: Vec<String>,
+    /// A look put back because the update left the rule without a default.
+    restored: Option<Variation>,
 }
 
-fn merge_pack(existing: &[Variation], item_id: &str, incoming: &[Variation]) -> Merged {
+fn merge_pack(
+    existing: &[Variation],
+    item_id: &str,
+    incoming: &[Variation],
+    kind: &str,
+    kept: Option<&Variation>,
+) -> Merged {
     let prefix = format!("store:{item_id}:");
     let mut removed: Vec<Variation> = existing.iter().filter(|v| v.id.starts_with(&prefix)).cloned().collect();
     let mut out: Vec<Variation> = existing.iter().filter(|v| !v.id.starts_with(&prefix)).cloned().collect();
@@ -942,7 +950,74 @@ fn merge_pack(existing: &[Variation], item_id: &str, incoming: &[Variation]) -> 
         added.push(tagged.id.clone());
         out.push(tagged);
     }
-    Merged { variations: out, removed, displaced, added }
+    // An update whose new version has no default, after the old one had: the rule would be left
+    // without one, so the look the pack displaced (else the built-in one) goes back.
+    let had_default = removed.iter().any(|v| v.id.starts_with(&prefix) && v.condition.is_none());
+    let mut restored = None;
+    if had_default && !out.iter().any(|v| v.condition.is_none()) {
+        let back = default_to_restore(kind, kept);
+        if !out.iter().any(|v| v.id == back.id) {
+            added.push(back.id.clone());
+            out.insert(0, back.clone());
+            restored = Some(back);
+        }
+    }
+    Merged { variations: out, removed, displaced, added, restored }
+}
+
+/// The look a rule goes back to when a pack leaves it without a default: the one the pack took
+/// the place of, else the built-in one.
+fn default_to_restore(kind: &str, kept: Option<&Variation>) -> Variation {
+    kept.cloned()
+        .or_else(|| {
+            default_rules()
+                .into_iter()
+                .find(|d| d.kinds.iter().any(|k| k == kind))
+                .and_then(|d| d.variations.into_iter().next())
+        })
+        .unwrap_or_else(|| Variation::new("default", "{name}"))
+}
+
+/// A pack that no longer takes a rule it was in (an update dropped that event): its variations
+/// leave, and a rule left without a default gets the look the pack displaced back.
+fn leave_rule(
+    variations: &[Variation],
+    item_id: &str,
+    rule_id: &str,
+    kind: &str,
+    kept: Option<&Variation>,
+) -> Option<(Vec<Variation>, RuleChange)> {
+    let prefix = format!("store:{item_id}:");
+    let taken: Vec<Variation> = variations.iter().filter(|v| v.id.starts_with(&prefix)).cloned().collect();
+    if taken.is_empty() {
+        return None;
+    }
+    let mut out: Vec<Variation> = variations.iter().filter(|v| !v.id.starts_with(&prefix)).cloned().collect();
+    let mut change = RuleChange {
+        rule_id: rule_id.to_string(),
+        removed: taken,
+        added: Vec::new(),
+        created: false,
+        restored: Vec::new(),
+    };
+    if !out.iter().any(|v| v.condition.is_none()) {
+        let back = default_to_restore(kind, kept);
+        if !out.iter().any(|v| v.id == back.id) {
+            change.added.push(back.id.clone());
+            change.restored.push(back.clone());
+            out.insert(0, back);
+        }
+    }
+    Some((out, change))
+}
+
+/// The Store item whose default look holds the rule's default place, when it is not `item_id`'s own.
+fn other_pack_default(existing: &[Variation], item_id: &str) -> Option<String> {
+    let own = format!("store:{item_id}:");
+    existing
+        .iter()
+        .find(|v| v.condition.is_none() && v.id.starts_with("store:") && !v.id.starts_with(&own))
+        .and_then(|v| v.id.strip_prefix("store:")?.split(':').next().map(str::to_string))
 }
 
 /// What an install changes, as it changes it.
@@ -1263,6 +1338,7 @@ impl Engine {
                     r => (r, false),
                 };
                 let mut plan: Vec<(ferrocast_core::alert::AlertRule, RuleChange)> = Vec::new();
+                let mut left: Vec<String> = Vec::new();
                 for kind_name in bundle.events.iter().map(|e| event_key_str(*e)) {
                     let Some(rule) = current_rules.iter_mut().find(|r| r.kinds.iter().any(|k| k == kind_name)) else {
                         continue;
@@ -1271,7 +1347,25 @@ impl Engine {
                         continue;
                     }
                     let carried = existing.and_then(|o| o.displaced.iter().find(|d| d.rule_id == rule.id));
-                    let merged = merge_pack(&rule.variations, &item.id, &bundle.variations);
+                    // Another pack's default look is not the user's own to keep: a second pack
+                    // can't take its place (removing the second would bring the first one back).
+                    if bundle.variations.iter().any(|v| v.condition.is_none())
+                        && let Some(other) = other_pack_default(&rule.variations, &item.id)
+                    {
+                        return Err(refused(
+                            409,
+                            "store_alert_default_taken",
+                            format!("The Store item {other} already supplies this alert's default look."),
+                            "Remove that item first, then install this one. Nothing was changed.",
+                        ));
+                    }
+                    let merged = merge_pack(
+                        &rule.variations,
+                        &item.id,
+                        &bundle.variations,
+                        rule.kinds.first().map_or("follow", String::as_str),
+                        carried.map(|d| &d.variation),
+                    );
                     let mut next = rule.clone();
                     next.variations = merged.variations;
                     next.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
@@ -1282,6 +1376,10 @@ impl Engine {
                     {
                         applied.displaced.push(DisplacedDefault { rule_id: rule.id.clone(), variation: v });
                     }
+                    if merged.restored.is_some() {
+                        // The pack no longer displaces anything here: the look is the user's again.
+                        applied.displaced.retain(|d| d.rule_id != rule.id);
+                    }
                     plan.push((
                         next,
                         RuleChange {
@@ -1289,9 +1387,31 @@ impl Engine {
                             removed: merged.removed,
                             added: merged.added,
                             created: from_defaults,
-                            restored: Vec::new(),
+                            restored: merged.restored.into_iter().collect(),
                         },
                     ));
+                }
+                // An update that no longer takes a rule the earlier version was in leaves it, and a
+                // rule left without a default gets the look the pack displaced back.
+                if let Some(old) = existing {
+                    for rule_id in &old.rule_ids {
+                        if plan.iter().any(|(r, _)| &r.id == rule_id) {
+                            continue;
+                        }
+                        let Some(rule) = current_rules.iter().find(|r| &r.id == rule_id) else { continue };
+                        let kept = old.displaced.iter().find(|d| &d.rule_id == rule_id).map(|d| &d.variation);
+                        let kind = rule.kinds.first().map_or("follow", String::as_str);
+                        if let Some((out, change)) = leave_rule(&rule.variations, &item.id, rule_id, kind, kept) {
+                            let mut next = rule.clone();
+                            next.variations = out;
+                            next.validate().map_err(|e| EngineError::Invalid(e.to_string()))?;
+                            if !change.restored.is_empty() {
+                                applied.displaced.retain(|d| &d.rule_id != rule_id);
+                            }
+                            plan.push((next, change));
+                            left.push(rule_id.clone());
+                        }
+                    }
                 }
                 if plan.is_empty() {
                     let wanted: Vec<&str> = bundle.events.iter().map(|e| event_key_str(*e)).collect();
@@ -1304,7 +1424,10 @@ impl Engine {
                 }
                 for (rule, change) in plan {
                     self.save_rule(rule.clone()).await?;
-                    applied.rule_ids.push(rule.id);
+                    // A rule the update left is no longer one of the install's.
+                    if !left.contains(&rule.id) {
+                        applied.rule_ids.push(rule.id);
+                    }
                     applied.snap.rule_changes.push(change);
                 }
             }
@@ -1787,19 +1910,10 @@ impl Engine {
             };
             if !r.variations.iter().any(|v| v.condition.is_none()) {
                 // The look the pack took the place of goes back; with none kept, the built-in default.
-                let back = existing
-                    .displaced
-                    .iter()
-                    .find(|d| d.rule_id == r.id)
-                    .map(|d| d.variation.clone())
-                    .or_else(|| {
-                        let kind = r.kinds.first().map(String::as_str).unwrap_or("follow");
-                        default_rules()
-                            .into_iter()
-                            .find(|d| d.kinds.iter().any(|k| k == kind))
-                            .and_then(|d| d.variations.into_iter().next())
-                    })
-                    .unwrap_or_else(|| Variation::new("default", "{name}"));
+                let back = default_to_restore(
+                    r.kinds.first().map_or("follow", String::as_str),
+                    existing.displaced.iter().find(|d| d.rule_id == r.id).map(|d| &d.variation),
+                );
                 if !r.variations.iter().any(|v| v.id == back.id) {
                     change.added.push(back.id.clone());
                     change.restored.push(back.clone());
@@ -2465,6 +2579,56 @@ mod tests {
         assert_eq!(default[0], &mine, "the person's own title, sound and volume, not a built-in one");
     }
 
+    fn look(id: &str, title: &str, default: bool) -> Variation {
+        let mut v = Variation::new(id, title);
+        if !default {
+            v.condition = Some(ferrocast_core::alert::Condition::TierAtLeast { tier: 2 });
+        }
+        v
+    }
+
+    #[test]
+    fn an_update_without_a_default_gives_the_rule_its_displaced_look_back() {
+        let mine = look("follow-default", "mine", true);
+        // v1 of the pack had a default; the user's own was displaced and is kept.
+        let existing = vec![look("store:p:def", "pack default", true), look("c1", "tier two", false)];
+        let incoming = vec![look("big", "pack big", false)];
+        let m = merge_pack(&existing, "p", &incoming, "follow", Some(&mine));
+        let defaults: Vec<_> = m.variations.iter().filter(|v| v.condition.is_none()).collect();
+        assert_eq!(defaults.len(), 1, "one default");
+        assert_eq!(defaults[0], &mine, "the person's own look");
+        assert_eq!(m.restored.as_ref(), Some(&mine));
+        assert!(m.added.contains(&mine.id), "undo can take it out again");
+        assert!(m.removed.iter().any(|v| v.id == "store:p:def"));
+        // An update that still brings a default leaves the user's look where it is kept, not restored.
+        let again = merge_pack(&existing, "p", &[look("def", "pack default v2", true)], "follow", Some(&mine));
+        assert!(again.restored.is_none());
+        assert_eq!(again.variations.iter().filter(|v| v.condition.is_none()).count(), 1);
+    }
+
+    #[test]
+    fn a_pack_that_drops_a_rule_leaves_it_and_gives_back_the_default() {
+        let mine = look("follow-default", "mine", true);
+        let rule = vec![look("store:p:def", "pack default", true), look("c1", "tier two", false)];
+        let (out, change) = leave_rule(&rule, "p", "follow", "follow", Some(&mine)).expect("the pack was in it");
+        assert!(!out.iter().any(|v| v.id.starts_with("store:")));
+        assert_eq!(out.iter().filter(|v| v.condition.is_none()).count(), 1);
+        assert_eq!(out[0], mine);
+        assert_eq!(change.removed.len(), 1);
+        assert_eq!(change.restored, vec![mine.clone()]);
+        assert_eq!(change.added, vec![mine.id.clone()]);
+        // A rule the pack was never in is left alone.
+        assert!(leave_rule(&[look("c1", "x", false)], "p", "follow", "follow", Some(&mine)).is_none());
+    }
+
+    #[test]
+    fn another_packs_default_is_named_and_the_packs_own_is_not() {
+        let rule = vec![look("store:a:def", "a's default", true), look("c1", "x", false)];
+        assert_eq!(other_pack_default(&rule, "b").as_deref(), Some("a"));
+        assert_eq!(other_pack_default(&rule, "a"), None, "its own default is an update, not a conflict");
+        assert_eq!(other_pack_default(&[look("follow-default", "mine", true)], "b"), None, "the user's own");
+    }
+
     #[tokio::test]
     async fn undoing_a_removal_is_refused_over_a_default_look_edited_since() {
         let _lock = TEST_GUARD.lock().await;
@@ -2650,11 +2814,11 @@ mod tests {
             v.condition = None;
             v
         };
-        let first = merge_pack(std::slice::from_ref(&mine), "p", std::slice::from_ref(&theirs));
+        let first = merge_pack(std::slice::from_ref(&mine), "p", std::slice::from_ref(&theirs), "follow", None);
         assert_eq!(first.displaced.as_ref(), Some(&mine));
         assert_eq!(first.added, vec!["store:p:pack-default".to_string()]);
         // Again (an update): the default there is the pack's own, so nothing of the user's is "displaced".
-        let again = merge_pack(&first.variations, "p", std::slice::from_ref(&theirs));
+        let again = merge_pack(&first.variations, "p", std::slice::from_ref(&theirs), "follow", None);
         assert!(again.displaced.is_none(), "the user's look stays recorded from the first install");
         assert_eq!(again.removed.len(), 1, "the pack's own earlier variation is what comes out");
         assert_eq!(again.variations.iter().filter(|v| v.condition.is_none()).count(), 1);
