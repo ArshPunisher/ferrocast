@@ -368,6 +368,10 @@ mod tests {
             ("POST", "/mod/held/a/b/drop"),
             ("GET", "/events"),
             ("GET", "/live"),
+            ("GET", "/diagnostics"),
+            ("GET", "/diagnostics/preview"),
+            ("POST", "/diagnostics/report"),
+            ("POST", "/diagnostics/report.zip"),
         ] {
             assert!(!allowed(Role::Mod, m, p), "{m} {p}");
         }
@@ -428,6 +432,10 @@ mod tests {
             ("POST", "/updates/restart"),
             ("GET", "/live"),
             ("PATCH", "/settings"),
+            ("GET", "/diagnostics"),
+            ("GET", "/diagnostics/preview"),
+            ("POST", "/diagnostics/report"),
+            ("POST", "/diagnostics/report.zip"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }
