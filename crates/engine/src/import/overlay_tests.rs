@@ -847,3 +847,38 @@ fn a_streamlabs_packs_filters_and_node_settings_are_checked_too() {
     assert_eq!(setting(&p, "Cam Border", "bogus"), None);
     assert_eq!(setting(&p, "Cam Border", "unload"), Some(&json!(true)));
 }
+
+#[test]
+fn a_streamlabs_web_source_on_this_computer_or_network_is_emptied_and_notes_hide_secrets() {
+    let png = make_tiny_png();
+    let web = |id: &str, name: &str, url: &str| {
+        json!({
+            "id": id, "name": name, "sceneNodeType": "item", "x": 0.1, "y": 0.1,
+            "scaleX": 1.0 / 1920.0, "scaleY": 1.0 / 1080.0, "visible": true, "locked": false,
+            "content": { "nodeType": "SmartBrowserNode", "data": { "settings": { "url": url, "width": 640, "height": 360 } } }
+        })
+    };
+    let cfg = streamlabs_sample_json(vec![
+        web("w1", "Metadata", "http://169.254.169.254/latest/meta-data/"),
+        web("w2", "Secret", "https://user:hunter2@evil.test/path#access_token=abc123"),
+        web("w3", "Admin", "http://192.168.1.1/admin"),
+        web("w4", "Public", "https://widgets.example.com/chat?token=zzz"),
+    ]);
+    let cfg = serde_json::to_vec(&cfg).unwrap();
+    let zip = build_zip(vec![
+        ("config.json", &cfg, None),
+        ("assets/frame.png", &png, None),
+        ("assets/loop.webm", TINY_WEBM, None),
+        ("assets/stinger.webm", TINY_WEBM, None),
+    ]);
+    let p = parse_overlay_zip(&zip, "x.overlay").unwrap();
+    for n in ["Metadata", "Secret", "Admin"] {
+        assert!(source(&p, n).is_none(), "{n} isn't imported");
+        assert!(p.unknown_sources.iter().any(|u| u.name == n), "{n} is reported");
+    }
+    assert_eq!(setting(&p, "Public", "url"), Some(&json!("https://widgets.example.com/chat?token=zzz")));
+    let notes = p.notes.join("\n");
+    for secret in ["hunter2", "access_token", "abc123", "zzz"] {
+        assert!(!notes.contains(secret), "{secret} in the notes: {notes}");
+    }
+}

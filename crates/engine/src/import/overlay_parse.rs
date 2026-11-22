@@ -810,14 +810,11 @@ fn widget_default_config(kind: WidgetKind, label_text: Option<&str>, font_family
 }
 
 fn redact_url_note(url: &str) -> String {
-    let stripped = url.split('?').next().unwrap_or(url);
-    let mut parts: Vec<&str> = stripped.split('/').collect();
-    for seg in parts.iter_mut().skip(3) {
-        if seg.len() >= 16 && seg.bytes().any(|b| b.is_ascii_digit()) {
-            *seg = "•••";
-        }
+    // Only where it is (scheme and host): a path, query or fragment can hold a token.
+    match reqwest::Url::parse(url.trim()) {
+        Ok(u) if u.host_str().is_some() => format!("{}://{}/…", u.scheme(), u.host_str().unwrap_or_default()),
+        _ => "an address".into(),
     }
-    parts.join("/")
 }
 
 struct BuildCtx<'a> {
@@ -1269,8 +1266,9 @@ fn parse_streamlabs_root(
                 "SmartBrowserNode" => {
                     let settings = data.get("settings").unwrap_or(&Value::Null);
                     let raw_url = settings.get("url").and_then(Value::as_str).unwrap_or("").trim();
-                    let lower_url = raw_url.to_ascii_lowercase();
-                    if lower_url.starts_with("http://") || lower_url.starts_with("https://") {
+                    // Only a page on the public internet: a stranger's pack may not point the
+                    // Studio at this computer, the local network or a file.
+                    if overlay_safe::public_page_url(raw_url).is_some() {
                         let sname = ctx.unique_source_name(item_name_raw);
                         ctx.register_source(
                             sname.clone(),
@@ -1297,9 +1295,8 @@ fn parse_streamlabs_root(
                             scene: scene_name.clone(),
                             name: item_name_raw.to_string(),
                             kind: "SmartBrowserNode".into(),
-                            reason:
-                                "Local HTML browser sources are skipped for security; rebuild in Ferrocast Overlays."
-                                    .into(),
+                            reason: "Only web pages on the internet are imported (not local files, this computer or the local network); rebuild it in Ferrocast Overlays."
+                                .into(),
                         });
                     }
                 }
