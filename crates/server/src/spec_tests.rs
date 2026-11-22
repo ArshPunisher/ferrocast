@@ -275,3 +275,129 @@ fn checked_in_spec_files_match_generated_specs() {
         "docs/asyncapi.json is out of date with spec::asyncapi()! Regenerate it."
     );
 }
+
+fn msg_type(m: &Value) -> Option<&str> {
+    m["payload"]["properties"]["type"]["const"].as_str()
+}
+
+#[test]
+fn every_frame_matches_exactly_one_message_by_its_type() {
+    let a = spec::asyncapi();
+    for channel in ["live", "overlay"] {
+        let msgs = a["channels"][channel]["messages"].as_object().unwrap();
+        let mut seen = BTreeSet::new();
+        for (name, m) in msgs {
+            let t = msg_type(m)
+                .unwrap_or_else(|| panic!("{channel}.{name} has no `type` constant: it would match any frame"));
+            // The message is named by the frame it describes, except the overlay's inbound ones.
+            let want = match name.as_str() {
+                "inbound_ack" => "ack",
+                "inbound_visibility" => "visibility",
+                "inbound_hello" => "hello",
+                other => other,
+            };
+            assert_eq!(t, want, "{channel}.{name}");
+            assert!(seen.insert(t), "{channel}: two messages for type `{t}`");
+            let required: Vec<&str> =
+                m["payload"]["required"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+            assert!(required.contains(&"type") && required.contains(&"data"), "{channel}.{name}: {required:?}");
+        }
+    }
+    // The overlay's inbound frames carry their fields under `data`, as the server reads them.
+    let ack = &a["channels"]["overlay"]["messages"]["inbound_ack"]["payload"]["properties"]["data"];
+    assert_eq!(ack["required"], serde_json::json!(["alert_id", "phase"]));
+    let vis = &a["channels"]["overlay"]["messages"]["inbound_visibility"]["payload"]["properties"]["data"];
+    assert_eq!(vis["required"], serde_json::json!(["visible"]));
+    // Overlay frames are numbered; the type constant is what tells the alert from the ack.
+    assert!(
+        a["channels"]["overlay"]["messages"]["alert"]["payload"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "seq")
+    );
+}
+
+#[test]
+fn the_live_handshake_query_is_in_the_websocket_binding_not_in_parameters() {
+    let a = spec::asyncapi();
+    let live = &a["channels"]["live"];
+    assert!(live.get("parameters").is_none(), "/api/v1/live has no address placeholders");
+    let q = &live["bindings"]["ws"]["query"];
+    assert_eq!(q["type"], "object");
+    for k in ["key", "session", "since"] {
+        assert!(q["properties"][k].is_object(), "query.{k}");
+    }
+    assert_eq!(q["properties"]["since"]["type"], "integer");
+    // The overlay's address does have a placeholder, and it stays a parameter.
+    assert!(a["channels"]["overlay"]["parameters"]["token"].is_object());
+}
+
+fn op<'a>(o: &'a Value, path: &str, method: &str) -> &'a Value {
+    &o["paths"][format!("/api/v1{path}")][method]
+}
+
+#[test]
+fn uploads_are_described_as_multipart_with_their_fields() {
+    let o = spec::openapi();
+    for path in ["/designs/import", "/import", "/media"] {
+        let c = &op(o, path, "post")["requestBody"]["content"];
+        assert!(c.get("application/json").is_none(), "{path}: not json");
+        let schema = &c["multipart/form-data"]["schema"];
+        assert_eq!(schema["required"], serde_json::json!(["file"]), "{path}");
+        assert_eq!(schema["properties"]["file"], serde_json::json!({ "type": "string", "format": "binary" }), "{path}");
+    }
+    let s = &op(o, "/import/streamlabs/preview", "post")["requestBody"]["content"]["multipart/form-data"]["schema"];
+    for k in ["points", "tips"] {
+        assert_eq!(s["properties"][k]["format"], "binary", "{k}");
+    }
+    assert_eq!(s["properties"]["platform"]["enum"], serde_json::json!(["twitch", "youtube", "kick"]));
+    assert!(s.get("required").is_none(), "each field is optional");
+}
+
+#[test]
+fn file_downloads_are_files_with_a_filename_and_keep_their_json_errors() {
+    let o = spec::openapi();
+    for (method, path, mime) in [
+        ("post", "/designs/{id}/export", "application/zip"),
+        ("post", "/export", "application/zip"),
+        ("post", "/diagnostics/report.zip", "application/zip"),
+        ("get", "/pro/backups/key", "text/plain"),
+    ] {
+        let r = &op(o, path, method)["responses"]["200"];
+        let c = &r["content"];
+        assert!(c.get("application/json").is_none(), "{path}: the answer is a file");
+        assert_eq!(c[mime]["schema"], serde_json::json!({ "type": "string", "format": "binary" }), "{path}");
+        assert!(r["headers"]["Content-Disposition"]["schema"]["type"] == "string", "{path}: names the file");
+        assert!(
+            op(o, path, method)["responses"]["401"]["content"]["application/json"].is_object(),
+            "{path}: errors stay json"
+        );
+    }
+    let csv = &op(o, "/moments/markers/export", "get")["responses"]["200"]["content"];
+    assert!(csv["text/csv"].is_object() && csv["text/plain"].is_object());
+}
+
+#[test]
+fn the_moderation_schemas_are_what_the_handlers_and_the_client_send() {
+    let o = spec::openapi();
+    let sch = &o["components"]["schemas"];
+    assert_eq!(sch["ModTimeoutRequest"]["required"], serde_json::json!(["platform", "user_id", "seconds"]));
+    assert!(sch["ModTimeoutRequest"]["properties"].get("duration_s").is_none());
+    // ban: the user as an object, everywhere optional; unban: flat.
+    assert_eq!(sch["ModBanRequest"]["required"], serde_json::json!(["user"]));
+    assert_eq!(
+        sch["ModBanRequest"]["properties"]["user"]["required"],
+        serde_json::json!(["platform", "user_id", "login"])
+    );
+    assert_eq!(sch["ModBanRequest"]["properties"]["everywhere"]["type"], "boolean");
+    assert_eq!(sch["ModUnbanRequest"]["required"], serde_json::json!(["platform", "user_id"]));
+    assert_eq!(
+        op(o, "/mod/unban", "post")["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ModUnbanRequest"
+    );
+    assert_eq!(
+        op(o, "/mod/ban", "post")["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/BanResult"
+    );
+}

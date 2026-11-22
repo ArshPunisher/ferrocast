@@ -107,8 +107,8 @@ const CHAT_AND_MOD: &[RouteDoc] = &[
     doc("DELETE", "/chat/highlight", "Chat & Moderation", "Clear the active chat highlight.", None, None),
     doc("POST", "/mod/delete", "Chat & Moderation", "Delete one chat message by id.", None, None),
     doc("POST", "/mod/timeout", "Chat & Moderation", "Timeout a chatter.", Some("ModTimeoutRequest"), None),
-    doc("POST", "/mod/ban", "Chat & Moderation", "Ban a chatter.", Some("ModBanRequest"), None),
-    doc("POST", "/mod/unban", "Chat & Moderation", "Unban a chatter.", Some("ModBanRequest"), None),
+    doc("POST", "/mod/ban", "Chat & Moderation", "Ban a chatter.", Some("ModBanRequest"), Some("BanResult")),
+    doc("POST", "/mod/unban", "Chat & Moderation", "Unban a chatter.", Some("ModUnbanRequest"), None),
     doc("GET", "/mod/bans", "Chat & Moderation", "Active bans and timeouts.", None, None),
     doc("GET", "/mod/panic", "Chat & Moderation", "Current panic lockdown state.", None, None),
     doc("POST", "/mod/panic", "Chat & Moderation", "Turn panic lockdown mode on or off.", None, None),
@@ -1809,6 +1809,56 @@ fn sample_path(rel_path: &str) -> String {
     format!("/{}", segs.join("/"))
 }
 
+const BINARY: fn() -> Value = || json!({ "type": "string", "format": "binary" });
+
+/// The form an upload takes (the dashboard client sends `FormData`): `file`, or Streamlabs' fields.
+fn multipart_form(method: &str, rel_path: &str) -> Option<Value> {
+    match (method, rel_path) {
+        ("POST", "/designs/import" | "/import" | "/media") => Some(json!({
+            "type": "object",
+            "required": ["file"],
+            "properties": { "file": BINARY() }
+        })),
+        ("POST", "/import/streamlabs/preview") => Some(json!({
+            "type": "object",
+            "description": "Send the exports you have: each field is optional.",
+            "properties": {
+                "platform": { "type": "string", "enum": ["twitch", "youtube", "kick"], "description": "Whose viewers the points are." },
+                "points": BINARY(),
+                "tips": BINARY()
+            }
+        })),
+        _ => None,
+    }
+}
+
+/// A route that answers a file: its media type(s) and the `Content-Disposition` it names it with.
+fn file_response(method: &str, rel_path: &str) -> Option<Value> {
+    let (types, what): (&[&str], &str) = match (method, rel_path) {
+        ("POST", "/designs/{id}/export") => (&["application/zip"], "A `.ferrodesign` package (a zip)."),
+        ("POST", "/export") => {
+            (&["application/zip"], "A `.ferropack` backup bundle (a zip, streamed; it can be gigabytes).")
+        }
+        ("POST", "/diagnostics/report.zip") => (&["application/zip"], "The redacted support report (a zip)."),
+        ("GET", "/pro/backups/key") => (&["text/plain"], "The cloud backup recovery key file (text)."),
+        ("GET", "/moments/markers/export") => {
+            (&["text/csv", "text/plain"], "The markers: CSV, or text (`format=csv|txt|youtube`).")
+        }
+        _ => return None,
+    };
+    let content: Map<String, Value> = types.iter().map(|t| ((*t).to_string(), json!({ "schema": BINARY() }))).collect();
+    Some(json!({
+        "description": what,
+        "headers": {
+            "Content-Disposition": {
+                "description": "`attachment; filename=\"…\"`: the name to save it as.",
+                "schema": { "type": "string" }
+            }
+        },
+        "content": content
+    }))
+}
+
 fn build_openapi() -> Value {
     let mut paths: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
     for r in all_rest_routes() {
@@ -1860,6 +1910,14 @@ fn build_openapi() -> Value {
             );
         }
 
+        // Uploads are forms, not JSON.
+        if let Some(form) = multipart_form(r.method, r.rel_path) {
+            op.insert(
+                "requestBody".into(),
+                json!({ "required": true, "content": { "multipart/form-data": { "schema": form } } }),
+            );
+        }
+
         let ok_status = match r.method {
             "POST" if r.rel_path == "/api-keys" => "201",
             "DELETE" => "204",
@@ -1867,6 +1925,8 @@ fn build_openapi() -> Value {
         };
         let ok_entry = if ok_status == "204" {
             json!({ "description": "Success (no content)" })
+        } else if let Some(file) = file_response(r.method, r.rel_path) {
+            file
         } else if let Some(resp_ref) = r.resp_schema {
             json!({
                 "description": "Success",
@@ -2047,21 +2107,45 @@ fn schemas() -> Value {
         },
         "ModTimeoutRequest": {
             "type": "object",
-            "required": ["platform", "user_id", "duration_s"],
+            "required": ["platform", "user_id", "seconds"],
             "properties": {
                 "platform": { "type": "string" },
                 "user_id": { "type": "string" },
-                "duration_s": { "type": "integer" },
+                "seconds": { "type": "integer", "minimum": 0 },
                 "reason": { "type": ["string", "null"] }
             }
         },
         "ModBanRequest": {
             "type": "object",
+            "required": ["user"],
+            "properties": {
+                "user": {
+                    "type": "object",
+                    "required": ["platform", "user_id", "login"],
+                    "properties": {
+                        "platform": { "type": "string" },
+                        "user_id": { "type": "string" },
+                        "login": { "type": "string" },
+                        "display_name": { "type": ["string", "null"] }
+                    }
+                },
+                "reason": { "type": ["string", "null"], "maxLength": 500 },
+                "everywhere": { "type": "boolean", "description": "Ban on every connected platform, not only this one." }
+            }
+        },
+        "BanResult": {
+            "type": "object",
+            "properties": {
+                "banned": { "type": "array", "items": { "type": "string" }, "description": "Platforms the ban went through on." },
+                "failed": { "type": "array", "items": { "type": "object" }, "description": "Platforms it didn't, with why." }
+            }
+        },
+        "ModUnbanRequest": {
+            "type": "object",
             "required": ["platform", "user_id"],
             "properties": {
                 "platform": { "type": "string" },
-                "user_id": { "type": "string" },
-                "reason": { "type": ["string", "null"] }
+                "user_id": { "type": "string" }
             }
         },
         "TestAlertRequest": {
@@ -2133,7 +2217,9 @@ fn schemas() -> Value {
     })
 }
 
-fn live_message(summary: &str, scope_note: &str, data_schema: Value) -> Value {
+/// A frame of the live socket. The `type` constant is the wire discriminator: with it a frame
+/// matches exactly one message (without it `{"type":"brb"}` would match every message at once).
+fn live_message(name: &str, summary: &str, scope_note: &str, data_schema: Value) -> Value {
     json!({
         "summary": summary,
         "x-ferrocast-scopes": scope_note,
@@ -2142,8 +2228,40 @@ fn live_message(summary: &str, scope_note: &str, data_schema: Value) -> Value {
             "required": ["v", "type", "data"],
             "properties": {
                 "v": { "type": "integer", "const": 1 },
-                "type": { "type": "string" },
+                "type": { "type": "string", "const": name },
                 "seq": { "type": ["integer", "null"] },
+                "data": data_schema
+            }
+        }
+    })
+}
+
+/// A frame the server sends an overlay: numbered, `{ v, seq, type, data }`.
+fn overlay_message(name: &str, summary: &str, data_schema: Value) -> Value {
+    json!({
+        "summary": summary,
+        "payload": {
+            "type": "object",
+            "required": ["v", "seq", "type", "data"],
+            "properties": {
+                "v": { "type": "integer", "const": 1 },
+                "seq": { "type": "integer" },
+                "type": { "type": "string", "const": name },
+                "data": data_schema
+            }
+        }
+    })
+}
+
+/// A frame an overlay sends the server: `{ type, data }`, as `ws.rs` reads it.
+fn overlay_inbound(name: &str, summary: &str, data_schema: Value) -> Value {
+    json!({
+        "summary": summary,
+        "payload": {
+            "type": "object",
+            "required": ["type", "data"],
+            "properties": {
+                "type": { "type": "string", "const": name },
                 "data": data_schema
             }
         }
@@ -2170,39 +2288,55 @@ fn build_asyncapi() -> Value {
             "live": {
                 "address": "/api/v1/live",
                 "description": "Live multiplexed dashboard & API integration stream with sequence replay (`?since=seq`). API keys receive only frame types allowed by their scopes and never receive `account` frames.",
-                "parameters": {
-                    "since": { "description": "Optional last processed `seq` for lossless reconnect replay." },
-                    "key": { "description": "API key when header auth isn't available (prefer `Authorization: Bearer fc_key_...`)." },
-                    "session": { "description": "Browser session token." }
+                "bindings": {
+                    "ws": {
+                        "bindingVersion": "0.1.0",
+                        "method": "GET",
+                        "query": {
+                            "type": "object",
+                            "description": "Handshake query. Send `key` (an API key) or `session`; `since` resumes a dropped connection.",
+                            "properties": {
+                                "since": { "type": "integer", "minimum": 0, "description": "Optional last processed `seq` for lossless reconnect replay." },
+                                "key": { "type": "string", "description": "API key when header auth isn't available (prefer `Authorization: Bearer fc_key_...`). Only on a connection from this machine, unless the owner allowed API keys over LAN." },
+                                "session": { "type": "string", "description": "Browser session token." }
+                            }
+                        },
+                        "headers": {
+                            "type": "object",
+                            "properties": {
+                                "Authorization": { "type": "string", "description": "`Bearer fc_key_...` (recommended)." }
+                            }
+                        }
+                    }
                 },
                 "messages": {
-                    "hello": live_message("Initial handshake with highest sequence number (`{ seq }`).", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "seq": { "type": "integer" } } })),
-                    "resync": live_message("Ring buffer gap notice (`{ missed }`); clients should re-fetch state over REST.", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "missed": { "type": "integer" } } })),
-                    "status": live_message("Connector and OBS health snapshots.", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "connectors": { "type": "object" } } })),
-                    "queue": live_message("Alert queue snapshot (active/paused/muted/pending count).", "read_only, alerts", json!({ "type": "object" })),
-                    "event": live_message("Normalized stream event (follow, sub, gift_sub, tip, bits, raid, chat_message, etc.).", "read_only; chat (chat/mod kinds); alerts (stream events)", json!({ "type": "object", "properties": { "id": { "type": "string" }, "platform": { "type": "string" }, "kind": { "type": "object" } } })),
-                    "notice": live_message("Engine status notice or panic warning (`account:*` notices suppressed for API keys).", "read_only, alerts, studio_control, go_live (chat sees panic only)", json!({ "type": "object", "properties": { "level": { "type": "string" }, "message": { "type": "string" }, "key": { "type": ["string", "null"] } } })),
-                    "goals": live_message("Updated stream goals array.", "read_only, alerts", json!({ "type": "array" })),
-                    "held": live_message("Message/event held by safety filters (`{ event_id, reason }`).", "read_only, chat", json!({ "type": "object" })),
-                    "held_resolved": live_message("Held event released or dropped (`{ event_id, outcome }`).", "read_only, chat", json!({ "type": "object" })),
-                    "panic": live_message("Panic lockdown toggled (`{ on, plan }`).", "read_only, chat", json!({ "type": "object" })),
-                    "chatter": live_message("Updated tracked chatter metadata.", "read_only, chat", json!({ "type": "object" })),
-                    "chat_highlight": live_message("Pinned or cleared featured chat message.", "read_only, chat", json!({ "type": "object" })),
-                    "poll": live_message("Active poll progress or end state.", "read_only, chat", json!({ "type": "object" })),
-                    "giveaway": live_message("Active giveaway state, entry count, or winner.", "read_only, chat", json!({ "type": "object" })),
-                    "tts_pending": live_message("TTS queue items awaiting approval.", "read_only, chat, alerts", json!({ "type": "array" })),
-                    "golive": live_message("Multistream output state and live bitrate telemetry.", "read_only, go_live, studio_control", json!({ "type": "object" })),
-                    "smart_mod": live_message("Smart Moderation triage card.", "read_only, chat", json!({ "type": "object" })),
-                    "update": live_message("Application update check/download state.", "read_only, studio_control", json!({ "type": "object" })),
-                    "account": live_message("Ferrocast cloud account sign-in transition (PC session only, never sent to API keys).", "session only (blocked for API keys)", json!({ "type": "object" })),
-                    "brb": live_message("OBS BRB scene state (`{ on, scene }`).", "read_only, studio_control, go_live", json!({ "type": "object" })),
-                    "obs_health": live_message("OBS FPS/dropped-frames health snapshot.", "read_only, studio_control, go_live", json!({ "type": "object" })),
-                    "live_alert": live_message("Live stream encoder/audio/network alert banner.", "read_only, studio_control, go_live", json!({ "type": "object" })),
-                    "lane": live_message("Live Moments lane items.", "read_only, studio_control, go_live", json!({ "type": "object" })),
-                    "marker": live_message("New stream marker created.", "read_only, studio_control, go_live", json!({ "type": "object" })),
-                    "counter": live_message("Updated bot counter (`{ name, value }`).", "read_only, chat, studio_control", json!({ "type": "object" })),
-                    "show": live_message("Show countdown and live rundown state (`{ show }`).", "read_only, studio_control, go_live", json!({ "type": "object" })),
-                    "snapshot": live_message("Overlay reconnect full state snapshot.", "overlay channel only", json!({ "type": "object" }))
+                    "hello": live_message("hello", "Initial handshake with highest sequence number (`{ seq }`).", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "seq": { "type": "integer" } } })),
+                    "resync": live_message("resync", "Ring buffer gap notice (`{ missed }`); clients should re-fetch state over REST.", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "missed": { "type": "integer" } } })),
+                    "status": live_message("status", "Connector and OBS health snapshots.", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "connectors": { "type": "object" } } })),
+                    "queue": live_message("queue", "Alert queue snapshot (active/paused/muted/pending count).", "read_only, alerts", json!({ "type": "object" })),
+                    "event": live_message("event", "Normalized stream event (follow, sub, gift_sub, tip, bits, raid, chat_message, etc.).", "read_only; chat (chat/mod kinds); alerts (stream events)", json!({ "type": "object", "properties": { "id": { "type": "string" }, "platform": { "type": "string" }, "kind": { "type": "object" } } })),
+                    "notice": live_message("notice", "Engine status notice or panic warning (`account:*` notices suppressed for API keys).", "read_only, alerts, studio_control, go_live (chat sees panic only)", json!({ "type": "object", "properties": { "level": { "type": "string" }, "message": { "type": "string" }, "key": { "type": ["string", "null"] } } })),
+                    "goals": live_message("goals", "Updated stream goals array.", "read_only, alerts", json!({ "type": "array" })),
+                    "held": live_message("held", "Message/event held by safety filters (`{ event_id, reason }`).", "read_only, chat", json!({ "type": "object" })),
+                    "held_resolved": live_message("held_resolved", "Held event released or dropped (`{ event_id, outcome }`).", "read_only, chat", json!({ "type": "object" })),
+                    "panic": live_message("panic", "Panic lockdown toggled (`{ on, plan }`).", "read_only, chat", json!({ "type": "object" })),
+                    "chatter": live_message("chatter", "Updated tracked chatter metadata.", "read_only, chat", json!({ "type": "object" })),
+                    "chat_highlight": live_message("chat_highlight", "Pinned or cleared featured chat message.", "read_only, chat", json!({ "type": "object" })),
+                    "poll": live_message("poll", "Active poll progress or end state.", "read_only, chat", json!({ "type": "object" })),
+                    "giveaway": live_message("giveaway", "Active giveaway state, entry count, or winner.", "read_only, chat", json!({ "type": "object" })),
+                    "tts_pending": live_message("tts_pending", "TTS queue items awaiting approval.", "read_only, chat, alerts", json!({ "type": "array" })),
+                    "golive": live_message("golive", "Multistream output state and live bitrate telemetry.", "read_only, go_live, studio_control", json!({ "type": "object" })),
+                    "smart_mod": live_message("smart_mod", "Smart Moderation triage card.", "read_only, chat", json!({ "type": "object" })),
+                    "update": live_message("update", "Application update check/download state.", "read_only, studio_control", json!({ "type": "object" })),
+                    "account": live_message("account", "Ferrocast cloud account sign-in transition (PC session only, never sent to API keys).", "session only (blocked for API keys)", json!({ "type": "object" })),
+                    "brb": live_message("brb", "OBS BRB scene state (`{ on, scene }`).", "read_only, studio_control, go_live", json!({ "type": "object" })),
+                    "obs_health": live_message("obs_health", "OBS FPS/dropped-frames health snapshot.", "read_only, studio_control, go_live", json!({ "type": "object" })),
+                    "live_alert": live_message("live_alert", "Live stream encoder/audio/network alert banner.", "read_only, studio_control, go_live", json!({ "type": "object" })),
+                    "lane": live_message("lane", "Live Moments lane items.", "read_only, studio_control, go_live", json!({ "type": "object" })),
+                    "marker": live_message("marker", "New stream marker created.", "read_only, studio_control, go_live", json!({ "type": "object" })),
+                    "counter": live_message("counter", "Updated bot counter (`{ name, value }`).", "read_only, chat, studio_control", json!({ "type": "object" })),
+                    "show": live_message("show", "Show countdown and live rundown state (`{ show }`).", "read_only, studio_control, go_live", json!({ "type": "object" })),
+                    "snapshot": live_message("snapshot", "Overlay reconnect full state snapshot.", "overlay channel only", json!({ "type": "object" }))
                 }
             },
             "overlay": {
@@ -2212,20 +2346,21 @@ fn build_asyncapi() -> Value {
                     "token": { "description": "Opaque overlay URL token." }
                 },
                 "messages": {
-                    "snapshot": { "summary": "Initial full overlay config + widget state on connect.", "payload": { "type": "object" } },
-                    "config": { "summary": "Updated overlay config.", "payload": { "type": "object" } },
-                    "state": { "summary": "Updated widget/goal/poll/giveaway/credits state.", "payload": { "type": "object" } },
-                    "event": { "summary": "Public chat/event card frame.", "payload": { "type": "object" } },
-                    "alert": { "summary": "Show alert visual & sound frame.", "payload": { "type": "object" } },
-                    "alert_hide": { "summary": "Dismiss active alert frame (`{ alert_id }`).", "payload": { "type": "object" } },
-                    "tts": { "summary": "Play synthesized TTS audio in overlay.", "payload": { "type": "object" } },
-                    "music": { "summary": "Visualizer spectrum levels & track info.", "payload": { "type": "object" } },
-                    "delete_message": { "summary": "Remove moderated chat message from overlay chatbox.", "payload": { "type": "object" } },
-                    "delete_user": { "summary": "Remove all messages from a timed-out/banned user.", "payload": { "type": "object" } },
-                    "clear_chat": { "summary": "Clear overlay chatbox history.", "payload": { "type": "object" } },
-                    "revoked": { "summary": "Overlay token was rotated or deleted; client should stop reconnecting.", "payload": { "type": "object" } },
-                    "inbound_ack": { "summary": "Client -> server alert playback acknowledgment (`{ type: 'ack', alert_id, phase }`).", "payload": { "type": "object" } },
-                    "inbound_visibility": { "summary": "Client -> server browser source visibility telemetry.", "payload": { "type": "object" } }
+                    "snapshot": overlay_message("snapshot", "Initial full overlay config + widget state on connect.", json!({ "type": "object" })),
+                    "config": overlay_message("config", "Updated overlay config.", json!({ "type": "object" })),
+                    "state": overlay_message("state", "Updated widget/goal/poll/giveaway/credits state.", json!({ "type": "object" })),
+                    "event": overlay_message("event", "Public chat/event card frame.", json!({ "type": "object" })),
+                    "alert": overlay_message("alert", "Show alert visual & sound frame.", json!({ "type": "object" })),
+                    "alert_hide": overlay_message("alert_hide", "Dismiss active alert frame (`{ alert_id }`).", json!({ "type": "object" })),
+                    "tts": overlay_message("tts", "Play synthesized TTS audio in overlay.", json!({ "type": "object" })),
+                    "music": overlay_message("music", "Visualizer spectrum levels & track info.", json!({ "type": "object" })),
+                    "delete_message": overlay_message("delete_message", "Remove moderated chat message from overlay chatbox.", json!({ "type": "object" })),
+                    "delete_user": overlay_message("delete_user", "Remove all messages from a timed-out/banned user.", json!({ "type": "object" })),
+                    "clear_chat": overlay_message("clear_chat", "Clear overlay chatbox history.", json!({ "type": "object" })),
+                    "revoked": overlay_message("revoked", "Overlay token was rotated or deleted; client should stop reconnecting.", json!({ "type": "object" })),
+                    "inbound_hello": overlay_inbound("hello", "Client -> server on connect: where to resume from (`{ since_seq }`).", json!({ "type": "object", "properties": { "since_seq": { "type": ["integer", "null"] } } })),
+                    "inbound_ack": overlay_inbound("ack", "Client -> server alert playback acknowledgment: `{ type: 'ack', data: { alert_id, phase } }`.", json!({ "type": "object", "required": ["alert_id", "phase"], "properties": { "alert_id": { "type": "string" }, "phase": { "type": "string", "enum": ["started", "finished", "failed"] } } })),
+                    "inbound_visibility": overlay_inbound("visibility", "Client -> server browser source visibility telemetry: `{ type: 'visibility', data: { visible } }`.", json!({ "type": "object", "required": ["visible"], "properties": { "visible": { "type": "boolean" } } }))
                 }
             }
         },

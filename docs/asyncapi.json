@@ -3,6 +3,40 @@
   "channels": {
     "live": {
       "address": "/api/v1/live",
+      "bindings": {
+        "ws": {
+          "bindingVersion": "0.1.0",
+          "headers": {
+            "properties": {
+              "Authorization": {
+                "description": "`Bearer fc_key_...` (recommended).",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "method": "GET",
+          "query": {
+            "description": "Handshake query. Send `key` (an API key) or `session`; `since` resumes a dropped connection.",
+            "properties": {
+              "key": {
+                "description": "API key when header auth isn't available (prefer `Authorization: Bearer fc_key_...`). Only on a connection from this machine, unless the owner allowed API keys over LAN.",
+                "type": "string"
+              },
+              "session": {
+                "description": "Browser session token.",
+                "type": "string"
+              },
+              "since": {
+                "description": "Optional last processed `seq` for lossless reconnect replay.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
       "description": "Live multiplexed dashboard & API integration stream with sequence replay (`?since=seq`). API keys receive only frame types allowed by their scopes and never receive `account` frames.",
       "messages": {
         "account": {
@@ -18,6 +52,7 @@
                 ]
               },
               "type": {
+                "const": "account",
                 "type": "string"
               },
               "v": {
@@ -48,6 +83,7 @@
                 ]
               },
               "type": {
+                "const": "brb",
                 "type": "string"
               },
               "v": {
@@ -78,6 +114,7 @@
                 ]
               },
               "type": {
+                "const": "chat_highlight",
                 "type": "string"
               },
               "v": {
@@ -108,6 +145,7 @@
                 ]
               },
               "type": {
+                "const": "chatter",
                 "type": "string"
               },
               "v": {
@@ -138,6 +176,7 @@
                 ]
               },
               "type": {
+                "const": "counter",
                 "type": "string"
               },
               "v": {
@@ -179,6 +218,7 @@
                 ]
               },
               "type": {
+                "const": "event",
                 "type": "string"
               },
               "v": {
@@ -209,6 +249,7 @@
                 ]
               },
               "type": {
+                "const": "giveaway",
                 "type": "string"
               },
               "v": {
@@ -239,6 +280,7 @@
                 ]
               },
               "type": {
+                "const": "goals",
                 "type": "string"
               },
               "v": {
@@ -269,6 +311,7 @@
                 ]
               },
               "type": {
+                "const": "golive",
                 "type": "string"
               },
               "v": {
@@ -299,6 +342,7 @@
                 ]
               },
               "type": {
+                "const": "held",
                 "type": "string"
               },
               "v": {
@@ -329,6 +373,7 @@
                 ]
               },
               "type": {
+                "const": "held_resolved",
                 "type": "string"
               },
               "v": {
@@ -364,6 +409,7 @@
                 ]
               },
               "type": {
+                "const": "hello",
                 "type": "string"
               },
               "v": {
@@ -394,6 +440,7 @@
                 ]
               },
               "type": {
+                "const": "lane",
                 "type": "string"
               },
               "v": {
@@ -424,6 +471,7 @@
                 ]
               },
               "type": {
+                "const": "live_alert",
                 "type": "string"
               },
               "v": {
@@ -454,6 +502,7 @@
                 ]
               },
               "type": {
+                "const": "marker",
                 "type": "string"
               },
               "v": {
@@ -498,6 +547,7 @@
                 ]
               },
               "type": {
+                "const": "notice",
                 "type": "string"
               },
               "v": {
@@ -528,6 +578,7 @@
                 ]
               },
               "type": {
+                "const": "obs_health",
                 "type": "string"
               },
               "v": {
@@ -558,6 +609,7 @@
                 ]
               },
               "type": {
+                "const": "panic",
                 "type": "string"
               },
               "v": {
@@ -588,6 +640,7 @@
                 ]
               },
               "type": {
+                "const": "poll",
                 "type": "string"
               },
               "v": {
@@ -618,6 +671,7 @@
                 ]
               },
               "type": {
+                "const": "queue",
                 "type": "string"
               },
               "v": {
@@ -653,6 +707,7 @@
                 ]
               },
               "type": {
+                "const": "resync",
                 "type": "string"
               },
               "v": {
@@ -683,6 +738,7 @@
                 ]
               },
               "type": {
+                "const": "show",
                 "type": "string"
               },
               "v": {
@@ -713,6 +769,7 @@
                 ]
               },
               "type": {
+                "const": "smart_mod",
                 "type": "string"
               },
               "v": {
@@ -743,6 +800,7 @@
                 ]
               },
               "type": {
+                "const": "snapshot",
                 "type": "string"
               },
               "v": {
@@ -778,6 +836,7 @@
                 ]
               },
               "type": {
+                "const": "status",
                 "type": "string"
               },
               "v": {
@@ -808,6 +867,7 @@
                 ]
               },
               "type": {
+                "const": "tts_pending",
                 "type": "string"
               },
               "v": {
@@ -838,6 +898,7 @@
                 ]
               },
               "type": {
+                "const": "update",
                 "type": "string"
               },
               "v": {
@@ -855,17 +916,6 @@
           "summary": "Application update check/download state.",
           "x-ferrocast-scopes": "read_only, studio_control"
         }
-      },
-      "parameters": {
-        "key": {
-          "description": "API key when header auth isn't available (prefer `Authorization: Bearer fc_key_...`)."
-        },
-        "session": {
-          "description": "Browser session token."
-        },
-        "since": {
-          "description": "Optional last processed `seq` for lossless reconnect replay."
-        }
       }
     },
     "overlay": {
@@ -874,84 +924,426 @@
       "messages": {
         "alert": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "alert",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Show alert visual & sound frame."
         },
         "alert_hide": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "alert_hide",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Dismiss active alert frame (`{ alert_id }`)."
         },
         "clear_chat": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "clear_chat",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Clear overlay chatbox history."
         },
         "config": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "config",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Updated overlay config."
         },
         "delete_message": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "delete_message",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Remove moderated chat message from overlay chatbox."
         },
         "delete_user": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "delete_user",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Remove all messages from a timed-out/banned user."
         },
         "event": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "event",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Public chat/event card frame."
         },
         "inbound_ack": {
           "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "alert_id": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "enum": [
+                      "started",
+                      "finished",
+                      "failed"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "alert_id",
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "type": {
+                "const": "ack",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ],
             "type": "object"
           },
-          "summary": "Client -> server alert playback acknowledgment (`{ type: 'ack', alert_id, phase }`)."
+          "summary": "Client -> server alert playback acknowledgment: `{ type: 'ack', data: { alert_id, phase } }`."
+        },
+        "inbound_hello": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "since_seq": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                },
+                "type": "object"
+              },
+              "type": {
+                "const": "hello",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Client -> server on connect: where to resume from (`{ since_seq }`)."
         },
         "inbound_visibility": {
           "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "visible": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "visible"
+                ],
+                "type": "object"
+              },
+              "type": {
+                "const": "visibility",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ],
             "type": "object"
           },
-          "summary": "Client -> server browser source visibility telemetry."
+          "summary": "Client -> server browser source visibility telemetry: `{ type: 'visibility', data: { visible } }`."
         },
         "music": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "music",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Visualizer spectrum levels & track info."
         },
         "revoked": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "revoked",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Overlay token was rotated or deleted; client should stop reconnecting."
         },
         "snapshot": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "snapshot",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Initial full overlay config + widget state on connect."
         },
         "state": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "state",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Updated widget/goal/poll/giveaway/credits state."
         },
         "tts": {
           "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "tts",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
             "type": "object"
           },
           "summary": "Play synthesized TTS audio in overlay."
