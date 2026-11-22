@@ -111,6 +111,9 @@ use std::sync::atomic::AtomicU64;
 
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+pub(crate) static DROPPED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Frames the encoders left out since the program started: one that was behind (FFmpeg's queue
 /// full) or that VideoToolbox dropped. OBS's "skipped frames due to encoding lag". The engine's
 /// own frames that weren't drawn in time are counted apart (`Stats::skipped`).
@@ -265,7 +268,7 @@ impl VideoEncoder {
 
     /// Opens a specific FFmpeg H.264 encoder (or native VideoToolbox when `ffmpeg_encoder` is `None`
     /// on macOS), with optional bounded blocking queue capacity and cancellation signal for
-    /// synchronous benchmarking.
+    /// synchronous benchmarking. Benchmark instances never mutate global live `DROPPED` metrics.
     pub fn for_benchmark(
         config: VideoConfig,
         ffmpeg_encoder: Option<&str>,
@@ -275,18 +278,29 @@ impl VideoEncoder {
         Self::check(&config)?;
         if let Some(enc) = ffmpeg_encoder {
             return Ok(Self {
-                inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new_named(&config, enc, blocking_cap, cancel)?)),
+                inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new_named(
+                    &config,
+                    enc,
+                    blocking_cap,
+                    cancel,
+                    false,
+                )?)),
                 config,
             });
         }
-        Self::new(config)
+        #[cfg(target_os = "macos")]
+        if !ffmpeg_asked() && !config.software {
+            return Ok(Self { inner: Inner::Native(crate::apple::vt::Encoder::new_for_benchmark(&config)?), config });
+        }
+        let _ = ffmpeg_asked();
+        Ok(Self { inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new_benchmark(&config)?)), config })
     }
 
-    /// Frames skipped because this FFmpeg encoder's input queue stayed full.
+    /// Frames skipped because this encoder's queue or backend left frames out.
     pub fn skipped(&self) -> u64 {
         match &self.inner {
             #[cfg(target_os = "macos")]
-            Inner::Native(_) => 0,
+            Inner::Native(e) => e.skipped(),
             Inner::Ffmpeg(v) => v.skipped,
         }
     }

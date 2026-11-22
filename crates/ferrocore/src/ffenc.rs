@@ -561,6 +561,8 @@ pub(crate) struct Video {
     pub(crate) skipped: u64,
     /// When set, writes block on a tiny pipe queue so benchmarks measure true encoder throughput.
     blocking: bool,
+    /// When false (stress benchmarks), skipped frames stay local and never increment `DROPPED`.
+    pub(crate) record_global_drops: bool,
     /// Optional cancellation signal for blocking benchmark writes (C3).
     cancel: Option<Arc<AtomicBool>>,
 }
@@ -573,6 +575,14 @@ impl std::fmt::Debug for Video {
 
 impl Video {
     pub(crate) fn new(cfg: &VideoConfig) -> Result<Self, AvError> {
+        Self::new_inner(cfg, true)
+    }
+
+    pub(crate) fn new_benchmark(cfg: &VideoConfig) -> Result<Self, AvError> {
+        Self::new_inner(cfg, false)
+    }
+
+    fn new_inner(cfg: &VideoConfig, record_global_drops: bool) -> Result<Self, AvError> {
         if cfg.codec != VideoCodec::H264 {
             return Err(AvError::Encoder("HEVC through FFmpeg isn't done yet: H.264 is".into()));
         }
@@ -581,7 +591,9 @@ impl Video {
         } else {
             h264_encoder().ok_or_else(|| AvError::Encoder("no H.264 encoder works here through FFmpeg".into()))?
         };
-        Ok(Self::with_proc(Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?, cfg, enc, false))
+        let mut video = Self::with_proc(Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?, cfg, enc, false);
+        video.record_global_drops = record_global_drops;
+        Ok(video)
     }
 
     pub(crate) fn new_named(
@@ -589,6 +601,7 @@ impl Video {
         encoder: &str,
         blocking_cap: Option<usize>,
         cancel: Option<Arc<AtomicBool>>,
+        record_global_drops: bool,
     ) -> Result<Self, AvError> {
         if cfg.codec != VideoCodec::H264 {
             return Err(AvError::Encoder("HEVC through FFmpeg isn't done yet: H.264 is".into()));
@@ -598,6 +611,7 @@ impl Video {
             None => Proc::spawn(&args(cfg, encoder), frame_bytes(cfg))?,
         };
         let mut video = Self::with_proc(proc, cfg, encoder.to_string(), blocking_cap.is_some());
+        video.record_global_drops = record_global_drops;
         video.cancel = cancel;
         Ok(video)
     }
@@ -621,6 +635,7 @@ impl Video {
             made_upto: None,
             skipped: 0,
             blocking,
+            record_global_drops: true,
             cancel: None,
         }
     }
@@ -980,7 +995,9 @@ impl Video {
             self.times.push_back(pts_us);
         } else {
             self.skipped += 1;
-            crate::video::note_dropped(1);
+            if self.record_global_drops {
+                crate::video::note_dropped(1);
+            }
             if self.skipped.is_power_of_two() {
                 tracing::warn!(encoder = %self.name, skipped = self.skipped, "the encoder is behind: frames left out");
             }
@@ -1483,6 +1500,7 @@ sleep $slow"#;
     #[cfg(unix)]
     #[test]
     fn frames_left_out_are_counted() {
+        let _serial = crate::video::DROPPED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut stuck = Command::new("sh");
         stuck.args(["-c", "exec sleep 30"]);
         let big = 256 * 256 * 3 / 2;
@@ -1579,5 +1597,26 @@ sleep $slow"#;
         assert_eq!(windows, &["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"]);
         let macos = candidates_for_platform(false, true);
         assert_eq!(macos, &["h264_videotoolbox", "libx264"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn h1_benchmark_skips_stay_local_without_polluting_global_dropped_frames() {
+        let _serial = crate::video::DROPPED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stuck = Command::new("sh");
+        stuck.args(["-c", "exec sleep 30"]);
+        let big = 256 * 256 * 3 / 2;
+        let mut c = cfg(RateControl::Cbr);
+        (c.width, c.height) = (256, 256);
+        let mut v =
+            Video::with_proc(Proc::start(stuck, big).unwrap_or_else(|e| panic!("{e}")), &c, "fake".into(), false);
+        v.record_global_drops = false;
+        let before = crate::video::dropped_frames();
+        for i in 0..200u8 {
+            let _ = v.encode_raw(vec![i; big], i64::from(i));
+        }
+        let after = crate::video::dropped_frames();
+        assert!(v.skipped >= 100, "{} left out locally", v.skipped);
+        assert_eq!(after.saturating_sub(before), 0, "benchmark skips must not pollute global live dropped_frames()");
     }
 }

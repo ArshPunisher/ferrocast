@@ -176,6 +176,10 @@ struct Sink {
     last_dts: Option<i64>,
     /// Set once if the last-resort clamp ever has to break steady-state spacing.
     clamp_logged: bool,
+    /// Per-session dropped frame count (always recorded locally for `skipped()`).
+    dropped: u64,
+    /// When false (stress benchmarks), drops stay local and never increment global `DROPPED`.
+    record_global_drops: bool,
     /// Tests: the session stops answering (callbacks return at once, as a wedged one's would).
     #[cfg(test)]
     mute: bool,
@@ -334,6 +338,8 @@ pub(crate) struct Encoder {
     next_seq: usize,
     /// What each frame costs, logged once a minute (`vt_cost`).
     cost: Box<super::vt_cost::Cost>,
+    /// Whether drops also increment global `crate::video::DROPPED`.
+    record_global_drops: bool,
 }
 
 #[link(name = "IOSurface", kind = "framework")]
@@ -454,6 +460,14 @@ fn fail(what: &str, status: OSStatus) -> AvError {
 
 impl Encoder {
     pub(crate) fn new(cfg: &VideoConfig) -> Result<Self, AvError> {
+        Self::new_inner(cfg, true)
+    }
+
+    pub(crate) fn new_for_benchmark(cfg: &VideoConfig) -> Result<Self, AvError> {
+        Self::new_inner(cfg, false)
+    }
+
+    fn new_inner(cfg: &VideoConfig, record_global_drops: bool) -> Result<Self, AvError> {
         let none = || AvError::Encoder("out of memory setting up the video encoder".into());
         let attrs = Dict::new().ok_or_else(none)?;
         let fmt = int(if cfg.input == PixelFormat::Bgra { BGRA } else { NV12 }).ok_or_else(none)?;
@@ -467,7 +481,7 @@ impl Encoder {
             attrs.set(kCVPixelBufferHeightKey, h.0);
             attrs.set(kCVPixelBufferIOSurfacePropertiesKey, surface.0.0);
         }
-        let sink = Arc::new(Mutex::new(Sink::default()));
+        let sink = Arc::new(Mutex::new(Sink { record_global_drops, ..Sink::default() }));
         // Three frames: the deepest reordering VideoToolbox's real-time H.264 and HEVC use is two.
         // Only container times move, nothing waits.
         if let Ok(mut k) = sink.lock() {
@@ -573,7 +587,12 @@ impl Encoder {
             pool_misses: 0,
             next_seq: 1,
             cost: Box::new(super::vt_cost::Cost::new()),
+            record_global_drops,
         })
+    }
+
+    pub(crate) fn skipped(&self) -> u64 {
+        self.sink.lock().map_or(0, |s| s.dropped)
     }
 
     /// A new bitrate for what's encoded from now on.
@@ -636,7 +655,7 @@ impl Encoder {
                 // The system took the session back: a new one, and this frame goes in as a
                 // keyframe so the stream picks up at once. One try: a second loss is a real fault.
                 tracing::warn!(error = %first, "the Mac's video encoder session was lost; making a new one");
-                let mut fresh = Encoder::new(&self.cfg)?;
+                let mut fresh = Self::new_inner(&self.cfg, self.record_global_drops)?;
                 set_rate(&fresh.session, self.rate_now.0, self.rate_now.1)?;
                 fresh.rate_now = self.rate_now;
                 // Kept to see whether the new session's parameter sets differ from what the
@@ -705,7 +724,12 @@ impl Encoder {
                         // A busy moment: this frame is left out and counted, the output goes on (before,
                         // one miss tore the output down for a second and made its encoders again).
                         PoolMiss::Drop => {
-                            crate::video::note_dropped(1);
+                            if let Ok(mut k) = self.sink.lock() {
+                                k.dropped += 1;
+                            }
+                            if self.record_global_drops {
+                                crate::video::note_dropped(1);
+                            }
                             return Ok(Vec::new());
                         }
                         PoolMiss::Wedged => {
@@ -943,8 +967,12 @@ extern "C" fn output(refcon: *mut c_void, frame: *mut c_void, status: OSStatus, 
         return;
     }
     if flags & DROPPED != 0 {
-        // VideoToolbox left this frame out (it was behind): counted, as FFmpeg's are.
-        crate::video::note_dropped(1);
+        // VideoToolbox left this frame out (it was behind): always track locally; only increment
+        // global live stats when not running an isolated stress benchmark (H1).
+        sink.dropped += 1;
+        if sink.record_global_drops {
+            crate::video::note_dropped(1);
+        }
         return;
     }
     if sbuf.is_null() {
@@ -1356,5 +1384,23 @@ mod tests {
             tiny_or_backwards.is_empty(),
             "no 1 ms clamp steps or backwards DTS on skipped frames: {tiny_or_backwards:?}"
         );
+    }
+
+    #[test]
+    fn h1_vt_benchmark_drops_stay_local_without_polluting_global() {
+        let _serial = crate::video::DROPPED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let Ok(bench_enc) = Encoder::new_for_benchmark(&config()) else { return };
+        let before = crate::video::dropped_frames();
+        output(Arc::as_ptr(&bench_enc.sink).cast_mut().cast(), ptr::null_mut(), 0, DROPPED, ptr::null());
+        let after_bench = crate::video::dropped_frames();
+        assert_eq!(bench_enc.skipped(), 1, "benchmark VT drops must be recorded locally");
+        assert_eq!(after_bench.saturating_sub(before), 0, "benchmark VT drop must not pollute global dropped_frames()");
+
+        let Ok(live_enc) = Encoder::new(&config()) else { return };
+        let before_live = crate::video::dropped_frames();
+        output(Arc::as_ptr(&live_enc.sink).cast_mut().cast(), ptr::null_mut(), 0, DROPPED, ptr::null());
+        let after_live = crate::video::dropped_frames();
+        assert_eq!(live_enc.skipped(), 1);
+        assert_eq!(after_live.saturating_sub(before_live), 1);
     }
 }

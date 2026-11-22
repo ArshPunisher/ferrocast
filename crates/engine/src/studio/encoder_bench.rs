@@ -18,8 +18,7 @@ use ferrocast_golive::bench::{
 use ferrocore::{
     Blend, Bounds, Compositor, Content, Effect, Filter, Item, Picture, Placement, Scene, ffenc,
     video::{
-        Frame, H264Profile, PixelFormat, RateControl, VideoCodec, VideoConfig, VideoEncoder, X264_PRESETS,
-        dropped_frames, x264_index,
+        Frame, H264Profile, PixelFormat, RateControl, VideoCodec, VideoConfig, VideoEncoder, X264_PRESETS, x264_index,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1228,7 +1227,6 @@ fn run_candidate_step(
             .map_err(|e| StepAbort::Failed(format!("{} realtime warmup error: {e}", cand.label)))?;
     }
 
-    let dropped_before = dropped_frames();
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
     let target_rt_frames = ((timing.step_duration.as_secs_f64() * f64::from(fps.max(1))).round() as u32).max(10);
 
@@ -1278,7 +1276,7 @@ fn run_candidate_step(
     }
     let _ = rt_enc.flush();
     let rt_elapsed = rt_start.elapsed().as_secs_f64().max(0.001);
-    let skipped_frames = rt_enc.skipped().saturating_add(dropped_frames().saturating_sub(dropped_before));
+    let skipped_frames = rt_enc.skipped();
     drop(rt_enc);
     let rt_end = Instant::now();
 
