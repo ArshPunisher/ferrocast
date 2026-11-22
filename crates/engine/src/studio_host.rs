@@ -92,8 +92,9 @@ pub struct PreviewRect {
     pub shade: Option<f64>,
 }
 
-/// At most this many holes (menus, panels) at once.
-pub const PREVIEW_HOLES: usize = 16;
+/// At most this many holes at once: menus and panels, and while editing the guide lines, the box
+/// round several picked sources and its handles (a dozen on their own).
+pub const PREVIEW_HOLES: usize = 64;
 
 impl PreviewRect {
     /// `bg` as libobs wants a display's colour (0xAABBGGRR).
@@ -4094,6 +4095,29 @@ mod tests {
         let s = StudioSettings::default();
         assert!(s.snapping && s.snap_screen && s.snap_center && s.snap_sources);
         assert_eq!(s.snap_px, 10);
+    }
+
+    /// The preview's holes: the box round several picked sources alone is a dozen, with a few
+    /// guide lines and a menu that is more than the old 16 (Neon: the app answered 400 and kept
+    /// painting the old holes).
+    #[test]
+    fn the_preview_takes_enough_holes_for_the_edit_guides() {
+        let rect = |n: usize| PreviewRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+            vh: 0.0,
+            canvas: None,
+            bg: None,
+            stripe: None,
+            holes: vec![PreviewHole { x: 0.0, y: 0.0, w: 4.0, h: 4.0, r: 0.0 }; n],
+            opacity: None,
+            shade: None,
+        };
+        assert!(rect(20).validate().is_ok());
+        assert!(rect(PREVIEW_HOLES).validate().is_ok());
+        assert!(rect(PREVIEW_HOLES + 1).validate().is_err());
     }
 
     #[test]
