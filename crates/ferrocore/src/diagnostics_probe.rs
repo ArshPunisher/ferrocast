@@ -151,7 +151,9 @@ pub fn open_regular_nofollow(path: &std::path::Path) -> std::io::Result<std::fs:
     #[cfg(unix)]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?
+        // O_NONBLOCK: opening a FIFO with no writer would wait for one, before the regular-file
+        // check below could refuse it. It has no effect on a regular file.
+        std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?
     };
     #[cfg(not(unix))]
     let file = {
@@ -166,4 +168,33 @@ pub fn open_regular_nofollow(path: &std::path::Path) -> std::io::Result<std::fs:
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
     }
     Ok(file)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::open_regular_nofollow;
+
+    #[test]
+    fn a_fifo_is_refused_promptly_and_a_regular_file_still_opens() {
+        let dir =
+            std::env::temp_dir().join(format!("fc-fifo-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_regular_nofollow(&p).is_err());
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(3)),
+            Ok(true),
+            "a FIFO must be refused, not waited on"
+        );
+        let file = dir.join("log.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        assert!(open_regular_nofollow(&file).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
