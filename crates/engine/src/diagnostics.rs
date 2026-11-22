@@ -277,10 +277,10 @@ impl Engine {
     {
         let generated_at = now();
         let data_dir = self.inner.data_dir.clone();
-        let known_secrets = self.collect_known_secrets();
         let known_usernames = collect_known_usernames(&data_dir);
-        let s_refs: Vec<&str> = known_secrets.iter().map(String::as_str).collect();
-        let u_refs: Vec<&str> = known_usernames.iter().map(String::as_str).collect();
+        let secrets_store = self.inner.secrets.clone();
+        let dest_ids: Vec<String> = self.golive_config().destinations.into_iter().map(|d| d.id).collect();
+        let obs_paths = self.obs_paths();
 
         let studio = match self.studio_host() {
             Ok(h) => h.diagnostics_studio().await,
@@ -318,15 +318,15 @@ impl Engine {
                 .collect()
         };
 
-        // Hardware & filesystem probes off the async executor.
-        let s_owned = known_secrets.clone();
+        // Hardware, secret-store, OBS config & filesystem probes off the async executor.
         let u_owned = known_usernames.clone();
         let studio_for_probe = studio.clone();
         let data_for_probe = data_dir.clone();
 
-        let (os, gpu, audio_devices, disk_free_mb, logs, recent_errors, crash_meta, crash_files) =
+        let (os, gpu, audio_devices, disk_free_mb, known_secrets, logs, recent_errors, crash_meta, crash_files) =
             tokio::task::spawn_blocking(move || {
-                let s_refs: Vec<&str> = s_owned.iter().map(String::as_str).collect();
+                let known_secrets = collect_known_secrets_blocking(secrets_store.as_ref(), &dest_ids, &obs_paths);
+                let s_refs: Vec<&str> = known_secrets.iter().map(String::as_str).collect();
                 let u_refs: Vec<&str> = u_owned.iter().map(String::as_str).collect();
 
                 let os = OsVersionInfo {
@@ -366,10 +366,13 @@ impl Engine {
                 let (crash_meta, crash_files) =
                     gather_redacted_crashes(&data_for_probe.join("crashes"), &s_refs, &u_refs);
 
-                (os, gpu, audio_devices, disk_free_mb, logs, recent_errors, crash_meta, crash_files)
+                (os, gpu, audio_devices, disk_free_mb, known_secrets, logs, recent_errors, crash_meta, crash_files)
             })
             .await
             .map_err(|e| EngineError::Unavailable(e.to_string()))?;
+
+        let s_refs: Vec<&str> = known_secrets.iter().map(String::as_str).collect();
+        let u_refs: Vec<&str> = known_usernames.iter().map(String::as_str).collect();
 
         let selected_encoder =
             studio.as_ref().and_then(|v| v.get("video_encoder").and_then(Value::as_str).map(String::from));
@@ -407,38 +410,42 @@ impl Engine {
 
         Ok((input, known_secrets, known_usernames, logs, crash_files))
     }
+}
 
-    fn collect_known_secrets(&self) -> Vec<String> {
-        let mut out = HashSet::new();
-        let mut keys: Vec<String> = vec![
-            crate::accounts::TWITCH_TOKENS.into(),
-            crate::accounts::YOUTUBE_TOKENS.into(),
-            crate::relay::KICK_TOKENS.into(),
-            crate::relay::INSTALL.into(),
-            crate::obs::PASSWORD_KEY.into(),
-            crate::discord::WEBHOOK_KEY.into(),
-            crate::ferro_account::SESSION.into(),
-            crate::cloud_backup::KEY_SECRET.into(),
-            crate::golive::INGEST_KEY_SECRET.into(),
-            crate::golive::OBS_BEFORE_SECRET.into(),
-            crate::golive::VERTICAL_BEFORE_SECRET.into(),
-            crate::guests::INVITES.into(),
-        ];
-        for d in self.golive_config().destinations {
-            keys.push(format!("{}{}", crate::golive::CUSTOM_KEY_PREFIX, d.id));
-        }
-        for key in keys {
-            if let Ok(Some(val)) = self.inner.secrets.get(&key) {
-                extract_secret_strings(&val, &mut out);
-            }
-        }
-        if let ferrocast_obs::detect::Detection::Found(d) = ferrocast_obs::detect::detect(&self.obs_paths())
-            && let Some(pw) = d.password
-        {
-            extract_secret_strings(&pw, &mut out);
-        }
-        out.into_iter().collect()
+fn collect_known_secrets_blocking(
+    secrets: &dyn ferrocast_secrets::Secrets,
+    dest_ids: &[String],
+    obs_paths: &[PathBuf],
+) -> Vec<String> {
+    let mut out = HashSet::new();
+    let mut keys: Vec<String> = vec![
+        crate::accounts::TWITCH_TOKENS.into(),
+        crate::accounts::YOUTUBE_TOKENS.into(),
+        crate::relay::KICK_TOKENS.into(),
+        crate::relay::INSTALL.into(),
+        crate::obs::PASSWORD_KEY.into(),
+        crate::discord::WEBHOOK_KEY.into(),
+        crate::ferro_account::SESSION.into(),
+        crate::cloud_backup::KEY_SECRET.into(),
+        crate::golive::INGEST_KEY_SECRET.into(),
+        crate::golive::OBS_BEFORE_SECRET.into(),
+        crate::golive::VERTICAL_BEFORE_SECRET.into(),
+        crate::guests::INVITES.into(),
+    ];
+    for id in dest_ids {
+        keys.push(format!("{}{}", crate::golive::CUSTOM_KEY_PREFIX, id));
     }
+    for key in keys {
+        if let Ok(Some(val)) = secrets.get(&key) {
+            extract_secret_strings(&val, &mut out);
+        }
+    }
+    if let ferrocast_obs::detect::Detection::Found(d) = ferrocast_obs::detect::detect(obs_paths)
+        && let Some(pw) = d.password
+    {
+        extract_secret_strings(&pw, &mut out);
+    }
+    out.into_iter().collect()
 }
 
 fn extract_secret_strings(raw: &str, out: &mut HashSet<String>) {
@@ -996,5 +1003,58 @@ mod tests {
         ] {
             assert!(!log_body.contains(secret), "real secret {secret} leaked into log: {log_body}");
         }
+    }
+
+    #[derive(Debug)]
+    struct BlockingCheckSecrets {
+        inner: ferrocast_secrets::FileSecrets,
+        get_threads: std::sync::Mutex<Vec<(String, std::thread::ThreadId)>>,
+    }
+
+    impl Secrets for BlockingCheckSecrets {
+        fn get(&self, key: &str) -> Result<Option<String>, ferrocast_secrets::SecretError> {
+            self.get_threads.lock().unwrap().push((key.to_string(), std::thread::current().id()));
+            self.inner.get(key)
+        }
+
+        fn set(&self, key: &str, value: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            self.inner.set(key, value)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[tokio::test]
+    async fn support_zip_reads_file_secrets_on_blocking_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let wrapper = std::sync::Arc::new(BlockingCheckSecrets {
+            inner: ferrocast_secrets::FileSecrets::new(dir.path()),
+            get_threads: std::sync::Mutex::new(Vec::new()),
+        });
+        wrapper.set(crate::obs::PASSWORD_KEY, "file secret phrase 123").unwrap();
+
+        let engine = Engine::start_with_secrets(dir.path(), wrapper.clone()).await.unwrap();
+        // Wait briefly for initial startup tasks if any, then record get() threads only during diagnostics.
+        tokio::task::yield_now().await;
+        wrapper.get_threads.lock().unwrap().clear();
+
+        std::fs::write(logs.join("ferrocast.log"), "2026-11-22T03:00:00Z INFO file secret phrase 123\n").unwrap();
+        let caller_tid = std::thread::current().id();
+        let (_name, bytes, _report) = engine.diagnostics_zip_bytes().await.unwrap();
+
+        let recorded = wrapper.get_threads.lock().unwrap().clone();
+        assert!(!recorded.is_empty(), "expected secret-store reads during diagnostics");
+        for (key, tid) in recorded {
+            assert_ne!(tid, caller_tid, "blocking Secrets::get({key:?}) ran on async worker thread");
+        }
+
+        let mut arc = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut log_body = String::new();
+        arc.by_name("logs/ferrocast.log").unwrap().read_to_string(&mut log_body).unwrap();
+        assert!(!log_body.contains("file secret phrase 123"));
     }
 }
