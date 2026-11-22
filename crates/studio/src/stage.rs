@@ -3778,32 +3778,57 @@ impl Stage {
                 // snapshot had, else what's on air (a scene whose adding was undone is gone).
                 let live_preview = live.iter().find(|(k, _)| *k == "studio_mode").and_then(|(_, v)| v.as_str());
                 let snap_preview = snapshot.pointer("/ferrocast/studio_mode").and_then(Value::as_str);
-                let preview = [live_preview, snap_preview, Some(on_air.as_str())]
+                let snap_current = snapshot.get("current_scene").and_then(Value::as_str);
+                let first = main_scenes(d).into_iter().next();
+                let preview = [live_preview, snap_preview, Some(on_air.as_str()), snap_current]
                     .into_iter()
                     .flatten()
                     .find(|n| has(d, n))
-                    .map(String::from);
+                    .map(String::from)
+                    // Last: any scene that is there (the live ones were all added after the snapshot).
+                    .or(first);
                 if let Some(p) = preview {
                     d["ferrocast"]["studio_mode"] = json!(p);
                     d["current_scene"] = json!(p);
                 } else if let Some(c) = current_scene.as_ref().filter(|c| c.as_str().is_some_and(|n| has(d, n))) {
                     d["current_scene"] = c.clone();
                 }
-                // What the copy on air (and the one going off) shows keeps its sources.
-                let wanted: Vec<String> = ["program_copy", "program_prev"]
+                // What the copy on air (and the one going off) shows keeps its sources, and what
+                // those need in turn (a group's sources, the source a copy or a sound bar shows).
+                let mut todo: Vec<String> = ["program_copy", "program_prev"]
                     .iter()
                     .filter_map(|k| d.pointer(&format!("/ferrocast/{k}/items")).and_then(Value::as_array))
                     .flatten()
                     .map(|i| name_of(i).to_string())
                     .collect();
-                if let Some(list) = d.get_mut("sources").and_then(Value::as_array_mut) {
-                    for n in wanted {
-                        if !list.iter().any(|x| name_of(x) == n)
-                            && let Some(def) = old_sources.iter().find(|x| name_of(x) == n)
-                        {
-                            list.push(def.clone());
-                        }
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                while let Some(n) = todo.pop() {
+                    if !seen.insert(n.clone()) {
+                        continue;
                     }
+                    let have = d
+                        .get("sources")
+                        .and_then(Value::as_array)
+                        .and_then(|l| l.iter().find(|x| name_of(x) == n))
+                        .cloned();
+                    let def = match have {
+                        Some(def) => def,
+                        None => {
+                            let Some(def) = old_sources.iter().find(|x| name_of(x) == n).cloned() else { continue };
+                            if let Some(list) = d.get_mut("sources").and_then(Value::as_array_mut) {
+                                list.push(def.clone());
+                            }
+                            def
+                        }
+                    };
+                    let items =
+                        def.pointer("/settings/items").and_then(Value::as_array).into_iter().flatten().map(name_of);
+                    let copied = match kind_of(&def) {
+                        "ferrocast_clone" | "source-clone" => def.pointer("/settings/clone").and_then(Value::as_str),
+                        "ferrocast_visualizer" => def.pointer("/settings/source").and_then(Value::as_str),
+                        _ => None,
+                    };
+                    todo.extend(items.chain(copied).map(String::from));
                 }
             }
         });
@@ -8750,6 +8775,19 @@ mod tests {
     }
 
     #[test]
+    fn undo_with_every_preview_candidate_gone_picks_a_scene_that_is_there() {
+        let s = stage();
+        let only_main = s.snapshot();
+        ok(s.add_scene("B"));
+        ok(s.set_current("B"));
+        s.set_studio_mode(true);
+        s.restore_all(&only_main);
+        let preview = s.preview_scene().unwrap_or_else(|| panic!("a preview"));
+        assert!(s.scenes().iter().any(|c| c.name == preview), "{preview} is a scene");
+        ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+    }
+
+    #[test]
     fn a_stopped_studio_and_a_running_one_read_the_same_matrix() {
         // BRB is a scene in `sources` but missing from `scene_order`; a rule targets it, and the
         // vertical canvas's scene is never a target.
@@ -8866,6 +8904,16 @@ mod tests {
         assert!(items.iter().any(|i| name_of(i) == "Red"), "the copy on air still shows Red: {items:?}");
         let sources = doc["sources"].as_array().cloned().unwrap_or_default();
         assert!(sources.iter().any(|x| name_of(x) == "Red"), "and its definition is kept");
+        // A copy of a source added after the snapshot: the source it shows stays too.
+        let before_pair = s.snapshot();
+        ok(s.add_source("Main", "color_source_v3", "Blue", &json!({ "width": 10, "height": 10 }), false));
+        ok(s.add_source("Main", "ferrocast_clone", "Echo", &json!({ "clone": "Blue" }), false));
+        ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        s.restore_all(&before_pair);
+        let sources = s.snapshot()["sources"].as_array().cloned().unwrap_or_default();
+        for n in ["Echo", "Blue"] {
+            assert!(sources.iter().any(|x| name_of(x) == n), "{n} is kept for the copy on air");
+        }
         // The transitions after replace the copy (the old one is kept until the next), and the
         // source nobody uses goes.
         for _ in 0..2 {
