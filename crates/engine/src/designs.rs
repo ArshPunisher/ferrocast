@@ -391,7 +391,7 @@ impl Engine {
                 let o2 = o.clone();
                 let saved = self.db(move |s| repo::overlays::update(s, &o2)).await?;
                 let view = self.overlay_view(&saved);
-                self.push_config(&saved);
+                self.push_config(&saved).await;
                 Ok(view)
             }
             None => {

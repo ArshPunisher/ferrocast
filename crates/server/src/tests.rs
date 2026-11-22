@@ -1828,7 +1828,7 @@ async fn preview_socket_hides_real_credits_and_the_pinned_message() {
     let id = chat.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
     assert_eq!(r.post("/api/v1/chat/highlight", json!({ "event_id": id })).await.status(), StatusCode::OK);
 
-    let (mut real, _) = tokio_tungstenite::connect_async(format!("{url}")).await.unwrap();
+    let (mut real, _) = tokio_tungstenite::connect_async(url.clone()).await.unwrap();
     let real_snap = next_json(&mut real).await;
     assert!(real_snap.to_string().contains("RealFollower"), "the real overlay sees the roster: {real_snap}");
     let (mut test, _) = tokio_tungstenite::connect_async(format!("{url}?test")).await.unwrap();
