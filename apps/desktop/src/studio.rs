@@ -92,6 +92,10 @@ struct Held {
     preview_holes: Vec<(f64, f64, f64, f64, f64)>,
     /// How much of the preview shows, 0 to 1.
     preview_opacity: Option<f64>,
+    /// Performance mode: the preview, Studio Mode's second picture and the vertical picture are
+    /// not drawn (outputs and projectors are untouched). Kept here so a picture made again
+    /// after a canvas change is paused too.
+    preview_paused: bool,
     /// The dialog backdrop's shade over the preview, 0 to 1.
     preview_shade: f64,
     /// The same for Studio Mode's picture of what's on air.
@@ -251,6 +255,7 @@ fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&v.holes);
     p.set_opacity(v.opacity.unwrap_or(1.0));
     p.set_shade(v.shade);
+    p.set_paused(h.preview_paused);
     h.vertical.view = Some(p);
     Ok(())
 }
@@ -1557,6 +1562,15 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         }
         A::AddExisting { scene, name } => v(to_json!(json!({ "item": c.add_existing(&scene, &name)? }))),
         A::EditItem { scene, id, edit } => done(c.edit_item(&scene, id, item_edit(edit))),
+        // A key held down: shown or hidden for as long as it is held, never saved (the engine
+        // puts it back on release).
+        A::PushItem { scene, id, visible, release } => {
+            // The engine's view only: nothing is written to the collection.
+            done(c.hold_item(&scene, id, (!release).then_some(visible)))
+        }
+        A::PushFilter { name, filter, enabled, release } => {
+            done(c.hold_filter(&name, &filter, (!release).then_some(enabled)))
+        }
         A::Sources => v(to_json!(c.sources())),
         A::Rename { name, new_name } => done(c.rename(&name, &new_name)),
         A::Settings { name } => c.settings(&name),
@@ -1630,6 +1644,23 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
                 Some(it) => c.paste_item_filters_from(&it.scene, it.id, &from, src_item),
                 None => c.paste_filters_from(&name, &from, src_item),
             })
+        }
+        A::CopySource { scene, id } => v(Ok(c.copy_source(&scene, id)?.to_json())),
+        A::CopyFilters { name, item } => {
+            let item = item.as_ref().map(|i| (i.scene.as_str(), i.id));
+            v(Ok(c.copy_filters(&name, item)?.to_json()))
+        }
+        A::PasteSource { scene, clip } => {
+            let clip = ferrocast_studio::stage::SourceClip::from_json(&clip)
+                .ok_or_else(|| ferrocast_studio::StudioError::Failed("That isn't a copied source.".into()))?;
+            let (item, notes) = c.paste_source(&scene, &clip)?;
+            v(to_json!(json!({ "item": item, "notes": notes })))
+        }
+        A::PasteFilterClip { name, item, clip } => {
+            let clip = ferrocast_studio::stage::FilterClip::from_json(&clip)
+                .ok_or_else(|| ferrocast_studio::StudioError::Failed("That isn't a copy of filters.".into()))?;
+            let item = item.as_ref().map(|i| (i.scene.as_str(), i.id));
+            v(Ok(json!({ "notes": c.paste_filter_values(&name, item, &clip)? })))
         }
         A::SetItemFilterScope { scene, id, own } => v(to_json!(c.set_item_filter_scope(&scene, id, own)?)),
         A::SetItemBox { scene, id, x, y, w, h, .. } => v(to_json!(c.set_item_box(&scene, id, x, y, w, h)?)),
@@ -1739,6 +1770,7 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&h.program_holes);
     p.set_opacity(h.program_opacity.unwrap_or(1.0));
     p.set_shade(h.program_shade);
+    p.set_paused(h.preview_paused);
     h.program_view = Some(p);
     Ok(())
 }
@@ -1764,6 +1796,7 @@ fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
     p.set_holes(&h.preview_holes);
     p.set_opacity(h.preview_opacity.unwrap_or(1.0));
     p.set_shade(h.preview_shade);
+    p.set_paused(h.preview_paused);
     h.preview = Some(p);
     sync_views(h);
     Ok(())
@@ -2265,6 +2298,21 @@ impl StudioHost for DesktopStudio {
             .await?
             .ok_or_else(|| format!("Ferrocast's own engine doesn't run \"{kind}\" yet."))?;
         serde_json::to_value(opts).map_err(|e| e.to_string())
+    }
+
+    async fn set_preview_paused(&self, paused: bool) -> Result<(), String> {
+        self.on_main(move |h| {
+            h.preview_paused = paused;
+            // Only the three views over the page: projectors and every output draw on.
+            for p in [h.preview.as_ref(), h.program_view.as_ref(), h.vertical.view.as_ref()].into_iter().flatten() {
+                p.set_paused(paused);
+            }
+        })
+        .await
+    }
+
+    async fn preview_paused(&self) -> bool {
+        self.on_main(|h| h.preview_paused).await.unwrap_or(false)
     }
 
     async fn program_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
