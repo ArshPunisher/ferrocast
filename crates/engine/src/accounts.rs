@@ -490,7 +490,11 @@ impl Engine {
             });
             // Comments are asked for, not pushed: connected means the Page is signed in.
             v.state = "connected".into();
+            v.detail = None;
         }
+        // Open dashboards (and a waiting "Connect Facebook" dialog) learn it now, not on reload.
+        let view = self.state().connectors.clone();
+        self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": view })));
         let handle = tokio::spawn(ferrocast_facebook::feed::run(graph, self.sink(), None));
         if let Some(old) =
             self.inner.adapters.lock().unwrap_or_else(|p| p.into_inner()).insert(Platform::Facebook, handle)

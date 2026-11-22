@@ -167,6 +167,20 @@ async fn a_facebook_delete_only_goes_to_a_comment_ferrocast_has_seen() {
 }
 
 #[tokio::test]
+async fn signing_in_to_facebook_tells_open_dashboards_at_once() {
+    let (e, _d, _s) = engine_with(quiet_graph().await, true).await;
+    let mut live = e.subscribe_live();
+    e.finish_facebook(grant(1)).await.unwrap();
+    let mut told = false;
+    while let Ok(f) = live.try_recv() {
+        if f.text.contains("\"type\":\"status\"") && f.text.contains("\"facebook\"") && f.text.contains("connected") {
+            told = true;
+        }
+    }
+    assert!(told, "a status frame with Facebook connected, so a waiting Connect dialog closes");
+}
+
+#[tokio::test]
 async fn a_page_token_that_lapsed_shows_sign_in_needed() {
     let app = axum::Router::new().route(
         "/{page}/live_videos",
