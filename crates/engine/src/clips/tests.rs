@@ -373,3 +373,43 @@ fn a_clip_that_is_being_recorded_cannot_be_used() {
     assert!(matches!(e, EngineError::Refused { status: 409, code: "clip_in_use", .. }), "{e:?}");
     assert!(refuse_if_recording(&names, "Other.mkv").is_ok());
 }
+
+/// A hard link to a file outside the folder is a clip nobody can use: it would stream, upload or
+/// trash a file that isn't in the clips folder at all.
+#[cfg(unix)]
+#[test]
+fn a_hard_linked_file_is_not_a_clip() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    touch(outside.path(), "secret.mp4", b"secret");
+    std::fs::hard_link(outside.path().join("secret.mp4"), dir.path().join("linked.mp4")).unwrap();
+    touch(dir.path(), "plain.mp4", b"plain");
+    assert!(resolve(dir.path(), "linked.mp4").is_err(), "a hard link resolved");
+    assert!(entry_at(dir.path(), "linked.mp4").is_none(), "a hard link was listed");
+    assert!(resolve(dir.path(), "plain.mp4").is_ok());
+    assert!(list_in(dir.path(), None).iter().all(|c| c.id != "linked.mp4"));
+}
+
+/// A `.srt` that is a link is not captions: not shown as captions, not moved with the clip, not
+/// trashed with it (the Trash would copy what it points at).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_linked_srt_beside_a_clip_is_left_alone() {
+    let (e, _data, clips) = engine().await;
+    let outside = tempfile::tempdir().unwrap();
+    let trash = tempfile::tempdir().unwrap();
+    e.set_trash_folder_for_test(Some(trash.path().to_path_buf()));
+    touch(outside.path(), "id_rsa", b"PRIVATE KEY");
+    touch(clips.path(), "Game.mp4", b"video");
+    std::os::unix::fs::symlink(outside.path().join("id_rsa"), clips.path().join("Game.srt")).unwrap();
+    assert!(!entry_at(clips.path(), "Game.mp4").unwrap().has_captions, "a linked .srt shows as captions");
+    e.delete_clip("Game.mp4").await.unwrap();
+    // The clip is in the Trash; what the link pointed at was not copied there, and is untouched.
+    let trashed: Vec<String> = std::fs::read_dir(trash.path())
+        .unwrap()
+        .map(|x| x.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(trashed.len(), 1, "{trashed:?}");
+    assert_eq!(std::fs::read(outside.path().join("id_rsa")).unwrap(), b"PRIVATE KEY");
+    assert!(std::fs::symlink_metadata(clips.path().join("Game.srt")).is_ok(), "the link itself was taken");
+}

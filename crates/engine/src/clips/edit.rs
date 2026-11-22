@@ -241,6 +241,24 @@ pub fn render_srt(cues: &[Cue]) -> String {
     out
 }
 
+/// The subtitles as the renderer sees them for burning in: the braces that start an ASS override
+/// tag (`{\p1}` drawing, `{\fs9999}` size) are swapped for look-alikes, so a caption is only text.
+pub(crate) fn render_srt_for_burn(cues: &[Cue]) -> String {
+    render_srt(cues).replace('{', "\u{FF5B}").replace('}', "\u{FF5D}")
+}
+
+/// A folder only this user can open, made new with a random name, removed when dropped.
+pub(crate) fn private_work_dir() -> std::io::Result<tempfile::TempDir> {
+    let mut b = tempfile::Builder::new();
+    b.prefix("ferrocast-burn-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        b.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    b.tempdir()
+}
+
 /// Cues a person edited, checked: how many, how long, ordered times, no stray control characters.
 pub fn check_cues(cues: &[Cue]) -> Result<(), EngineError> {
     let bad = |m: String| refuse(400, "bad_captions", m, "Fix that caption and save again.");
@@ -464,7 +482,7 @@ impl Engine {
     pub async fn make_clip_captions(&self, id: &str) -> Result<JobView, EngineError> {
         let path = self.clip_path(id).await?;
         let ffmpeg = self.clips_ffmpeg()?;
-        if srt_beside(&path).exists() {
+        if std::fs::symlink_metadata(srt_beside(&path)).is_ok() {
             return Err(EngineError::Conflict("That clip has captions already: edit them instead.".into()));
         }
         let base = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -491,8 +509,8 @@ impl Engine {
         let root = self.clips_folder().await?;
         let path = self.clip_path(id).await?;
         let ffmpeg = self.clips_ffmpeg()?;
-        let srt = srt_beside(&path);
-        if self.clip_captions(id).await?.is_empty() {
+        let cues = self.clip_captions(id).await?;
+        if cues.is_empty() {
             return Err(refuse(
                 422,
                 "no_captions",
@@ -524,20 +542,16 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))?;
             let out = root.join(format!("{stem}.mp4"));
             let part = part_path(&out);
-            // A folder of its own, made new, holding the captions as a plain name (a path with a
-            // colon or quote breaks ffmpeg's filter text).
-            let work = std::env::temp_dir().join(format!("ferrocast-burn-{}-{:x}", std::process::id(), now_nanos()));
-            tokio::fs::create_dir(&work).await.map_err(|e| EngineError::Internal(e.to_string()))?;
-            let copied = tokio::fs::copy(&srt, work.join("subs.srt")).await;
-            let res = match copied {
-                Ok(_) => {
-                    run_ffmpeg(&ctx, &ffmpeg, burn_args(&path, "subs.srt", &part), total, &part, &out, Some(&work))
-                        .await
-                }
-                Err(e) => Err(EngineError::Internal(e.to_string())),
-            };
-            let _ = tokio::fs::remove_dir_all(&work).await;
-            res?;
+            // A folder of its own (private, random, removed when this ends however it ends), holding
+            // the captions as a plain name (a path with a colon or quote breaks ffmpeg's filter
+            // text). They are written from the cues read and checked above, not copied from the
+            // file (which could have changed or become a link since).
+            let work = private_work_dir().map_err(|e| EngineError::Internal(e.to_string()))?;
+            tokio::fs::write(work.path().join("subs.srt"), render_srt_for_burn(&cues))
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+            run_ffmpeg(&ctx, &ffmpeg, burn_args(&path, "subs.srt", &part), total, &part, &out, Some(work.path()))
+                .await?;
             Ok(Made { output: Some(format!("{stem}.mp4")) })
         }))
     }

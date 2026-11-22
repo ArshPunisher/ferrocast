@@ -154,6 +154,25 @@ pub fn new_stem(raw: &str) -> Result<String, EngineError> {
     Ok(n.to_string())
 }
 
+/// A plain file, not a link and not something a link leads to (checked on the name itself).
+pub(crate) fn is_plain_file(p: &Path) -> bool {
+    std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file())
+}
+
+/// More than one name for the same bytes: a hard link may lead out of the clips folder.
+fn shared_bytes(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.nlink() > 1
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
 fn ext_of(name: &str) -> Option<&'static str> {
     let e = Path::new(name).extension()?.to_str()?.to_ascii_lowercase();
     EXTS.iter().copied().find(|x| *x == e)
@@ -202,7 +221,7 @@ pub fn resolve(root: &Path, id: &str) -> Result<PathBuf, EngineError> {
     }
     let path = root.join(id);
     let meta = std::fs::symlink_metadata(&path).map_err(|_| no_such_clip())?;
-    if !meta.file_type().is_file() {
+    if !meta.file_type().is_file() || shared_bytes(&meta) {
         return Err(no_such_clip());
     }
     // Its folder is the clips folder itself (a link in the path would make this differ).
@@ -252,13 +271,13 @@ pub fn entry_at(root: &Path, name: &str) -> Option<ClipEntry> {
     }
     let ext = ext_of(name)?;
     let meta = std::fs::symlink_metadata(root.join(name)).ok()?;
-    if !meta.file_type().is_file() {
+    if !meta.file_type().is_file() || shared_bytes(&meta) {
         return None;
     }
     let stem = name[..name.len() - ext.len() - 1].to_string();
     Some(ClipEntry {
         kind: kind_of(&stem),
-        has_captions: srt_beside(&root.join(name)).is_file(),
+        has_captions: is_plain_file(&srt_beside(&root.join(name))),
         id: name.to_string(),
         name: stem,
         ext: ext.into(),
@@ -558,7 +577,7 @@ impl Engine {
             if path != to {
                 // Captions already at the new name belong to another clip (a.mkv's a.srt): the
                 // renamed clip would show them as its own.
-                if to_srt.exists() && !same_file(&from_srt, &to_srt) {
+                if std::fs::symlink_metadata(&to_srt).is_ok() && !same_file(&from_srt, &to_srt) {
                     return Err(refuse(
                         409,
                         "clip_name_taken",
@@ -568,7 +587,7 @@ impl Engine {
                 }
                 let own = srt_is_exclusive(&path);
                 move_without_replacing(&path, &to)?;
-                if own && from_srt.is_file() && !to_srt.exists() {
+                if own && is_plain_file(&from_srt) && std::fs::symlink_metadata(&to_srt).is_err() {
                     let _ = move_without_replacing(&from_srt, &to_srt);
                 }
             }
@@ -588,7 +607,7 @@ impl Engine {
             // Checked before the clip goes: afterwards it no longer shares the name with anything.
             let own = srt_is_exclusive(&path);
             trash_file(&path, over.as_deref())?;
-            if own && srt.is_file() {
+            if own && is_plain_file(&srt) {
                 let _ = trash_file(&srt, over.as_deref());
             }
             Ok(())

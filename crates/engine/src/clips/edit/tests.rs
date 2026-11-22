@@ -527,3 +527,32 @@ fn trim_compile_burn_and_probe_read_files_only_as_the_named_container() {
         check(&crate::clips::probe_args_for_test(p), demux, "probe");
     }
 }
+
+/// Burned in, a caption's `{\...}` would be read by the subtitle renderer as drawing and font
+/// commands: the braces are made harmless in the copy the renderer sees (the .srt on disk keeps
+/// the person's own text).
+#[test]
+fn ass_override_tags_cannot_reach_the_renderer() {
+    let cues = vec![Cue { start_ms: 0, end_ms: 1000, text: "{\\p1}m 0 0 l 99999 99999{\\fs9999}hi {x}".into() }];
+    let burn = render_srt_for_burn(&cues);
+    assert!(!burn.contains('{') && !burn.contains('}'), "{burn:?}");
+    assert!(burn.contains("hi"));
+    // The file the person edits is untouched.
+    assert!(render_srt(&cues).contains("{\\p1}"));
+}
+
+#[test]
+fn the_burn_works_in_a_private_folder_made_new() {
+    let a = private_work_dir().unwrap();
+    let b = private_work_dir().unwrap();
+    assert_ne!(a.path(), b.path());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "{mode:o}");
+    }
+    let p = a.path().to_path_buf();
+    drop(a);
+    assert!(!p.exists(), "the folder outlived its owner");
+}
