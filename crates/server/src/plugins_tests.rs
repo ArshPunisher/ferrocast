@@ -153,6 +153,29 @@ async fn a_panel_is_a_page_of_its_own() {
     assert_eq!(none.status(), StatusCode::NOT_FOUND);
 }
 
+/// Custom alert sandbox page sets strict CSP (no connect-src, sandbox allow-scripts, no allow-same-origin).
+#[tokio::test]
+async fn alert_sandbox_page_enforces_strict_csp() {
+    let s = start().await;
+    let page = s.client.get(format!("{}/alert-sandbox", s.base)).send().await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let csp = page.headers().get("content-security-policy").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    for want in [
+        "default-src 'none'",
+        "connect-src 'none'",
+        "form-action 'none'",
+        "base-uri 'none'",
+        "frame-ancestors 'self'",
+        "sandbox allow-scripts",
+    ] {
+        assert!(csp.contains(want), "{want} in {csp}");
+    }
+    assert!(!csp.contains("allow-same-origin"), "must never allow-same-origin: {csp}");
+    assert!(!csp.contains("img-src *"), "must restrict asset hosts: {csp}");
+    assert_eq!(page.headers().get("x-content-type-options").and_then(|v| v.to_str().ok()), Some("nosniff"));
+    assert_eq!(page.headers().get("referrer-policy").and_then(|v| v.to_str().ok()), Some("no-referrer"));
+}
+
 /// The catalog before the owner's key is in the app: closed, said plainly (503 with a hint), and
 /// nothing can be installed from it.
 #[tokio::test]

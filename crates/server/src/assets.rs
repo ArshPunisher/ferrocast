@@ -84,6 +84,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/app/", get(dashboard_index))
         .route("/app/{*path}", get(dashboard_file))
         .route("/plugin-panel/{id}", get(plugin_panel_page))
+        .route("/alert-sandbox", get(alert_sandbox_page))
         .route("/o/{token}", get(overlay_redirect))
         .route("/o/{token}/", get(overlay_index))
         .route("/o/{token}/{*path}", get(overlay_file))
@@ -131,6 +132,26 @@ async fn plugin_panel_page(State(app): State<AppState>, Path(id): Path<String>) 
         .header(header::REFERRER_POLICY, "no-referrer")
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(format!("<!doctype html><meta charset=\"utf-8\">{html}")))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+const ALERT_SANDBOX_CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
+    img-src data: blob: https://static-cdn.jtvnw.net https://yt3.ggpht.com https://files.kick.com https://cdn.ferrocast.com https://cdn.discordapp.com; \
+    media-src data: blob:; font-src data: https://fonts.gstatic.com; \
+    connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts";
+
+const ALERT_SANDBOX_HTML: &str = r#"<!doctype html><meta charset="utf-8"><style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent;display:flex;align-items:center;justify-content:center}#fc-custom-root{width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative}</style><style id="fc-custom-style"></style><div id="fc-custom-root" role="status" aria-live="polite"></div><script>(function(){var root=document.getElementById('fc-custom-root');var styleEl=document.getElementById('fc-custom-style');var expectedOrigin=new URLSearchParams(location.search).get('origin')||'';function esc(v){return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/`/g,'&#96;')}function validFieldKey(k){return typeof k==='string'&&/^[a-z][a-z0-9_]{0,39}$/.test(k)}function isObject(v){return typeof v==='object'&&v!==null&&!Array.isArray(v)}function validatePayload(msg){if(!isObject(msg)||msg.type!=='ferro-custom-alert')return null;var p=msg.payload;if(!isObject(p)||typeof p.html!=='string'||p.html.length>80000||typeof p.css!=='string'||p.css.length>80000||!isObject(p.vars)||!isObject(p.fields))return null;return p}function renderTokens(html,vars,fields){var map=Object.create(null);for(var k in vars)if(Object.prototype.hasOwnProperty.call(vars,k)&&typeof vars[k]==='string')map[k]=vars[k];for(var fk in fields)if(Object.prototype.hasOwnProperty.call(fields,fk)&&validFieldKey(fk)){var fv=fields[fk];if(typeof fv==='string'||typeof fv==='number'||typeof fv==='boolean')map[fk]=String(fv)}return html.replace(/\{\{?([a-zA-Z0-9_]+)(?:\|([^}]*))?\}?\}/g,function(full,name,filt){if(full.indexOf('{{')===0)return full.slice(1,-1);if(Object.prototype.hasOwnProperty.call(map,name)&&map[name]!=='')return esc(map[name]);if(filt&&filt.indexOf('default:')===0)return esc(filt.slice(8).replace(/^["']|["']$/g,''));return ''})}function safeCssVal(v){var s=String(v==null?'':v);if(/[;{}<>]|url\s*\(|@import|expression\s*\(|javascript:/i.test(s))return '';return s}window.addEventListener('message',function(ev){if(ev.source!==window.parent)return;if(expectedOrigin&&ev.origin!==expectedOrigin)return;if(!expectedOrigin&&ev.origin==='null')return;var p=validatePayload(ev.data);if(!p)return;var decls=[];for(var fk in p.fields)if(Object.prototype.hasOwnProperty.call(p.fields,fk)&&validFieldKey(fk)){var sv=safeCssVal(p.fields[fk]);if(sv!=='')decls.push('--field-'+fk+':'+sv+';')}styleEl.textContent=(decls.length?':root{'+decls.join('')+'}\n':'')+p.css;while(root.firstChild)root.removeChild(root.firstChild);var frag=document.createRange().createContextualFragment(renderTokens(p.html,p.vars,p.fields));root.appendChild(frag);window.parent.postMessage({type:'ferro-custom-alert-rendered',id:p.alert_id||''},'*')});window.parent.postMessage({type:'ferro-custom-alert-ready'},'*')})();</script>"#;
+
+/// `GET /alert-sandbox`: bootstrap frame for custom HTML/CSS alert rendering under strict
+/// CSP without `allow-same-origin` (API.md §4 / R25).
+async fn alert_sandbox_page() -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_SECURITY_POLICY, ALERT_SANDBOX_CSP)
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(ALERT_SANDBOX_HTML))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
