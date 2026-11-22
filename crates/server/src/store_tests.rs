@@ -182,6 +182,50 @@ async fn store_http_install_undo_uninstall_and_security_errors() {
     assert_eq!(unres.status(), StatusCode::OK);
 }
 
+/// Leaving the token out is the only way to ask for the latest: a token that is empty, null, not
+/// text, unknown or not the latest is refused, and nothing is undone.
+#[tokio::test]
+async fn an_undo_token_is_the_latest_or_refused_never_the_latest_by_default() {
+    let _guard = SERVER_STORE_LOCK.lock().await;
+    let (base, token, client, _engine, _dir, _fstate) = start().await;
+    let url = |p: &str| format!("{base}/api/v1{p}");
+    let post = |path: &'static str, body: Value| {
+        let (client, token, u) = (client.clone(), token.clone(), url(path));
+        async move { client.post(u).bearer_auth(&token).json(&body).send().await.unwrap() }
+    };
+    let first: Value = post("/store/install", json!({ "id": "aurora-pulse" })).await.json().await.unwrap();
+    let second: Value = post("/store/install", json!({ "id": "foundry-goal-widget" })).await.json().await.unwrap();
+    let installed = || {
+        let (client, token, u) = (client.clone(), token.clone(), url("/store/installed"));
+        async move {
+            let v: Value = client.get(u).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+            v["installed"].as_array().map_or(0, Vec::len)
+        }
+    };
+    assert_eq!(installed().await, 2);
+    for (body, want, code) in [
+        (json!({ "token": "" }), StatusCode::BAD_REQUEST, "store_undo_bad_token"),
+        (json!({ "token": null }), StatusCode::BAD_REQUEST, "store_undo_bad_token"),
+        (json!({ "token": 7 }), StatusCode::BAD_REQUEST, "store_undo_bad_token"),
+        (json!({ "token": ["x"] }), StatusCode::BAD_REQUEST, "store_undo_bad_token"),
+        (json!({ "token": "nope" }), StatusCode::NOT_FOUND, "store_undo_unknown"),
+        (json!({ "token": first["undo"]["token"] }), StatusCode::CONFLICT, "store_undo_out_of_order"),
+    ] {
+        let res = post("/store/undo", body.clone()).await;
+        assert_eq!(res.status(), want, "{body}");
+        let v: Value = res.json().await.unwrap();
+        assert_eq!(v["error"]["code"], code, "{body}");
+        assert!(v["error"]["hint"].as_str().is_some_and(|h| !h.is_empty()), "{body}: says what to do");
+        assert_eq!(installed().await, 2, "{body}: nothing was undone");
+    }
+    // No token, or the latest's own, undoes the latest.
+    assert_eq!(post("/store/undo", json!({})).await.status(), StatusCode::OK);
+    assert_eq!(installed().await, 1);
+    assert_eq!(post("/store/undo", json!({ "token": first["undo"]["token"] })).await.status(), StatusCode::OK);
+    assert_eq!(installed().await, 0);
+    let _ = second;
+}
+
 /// Installing, updating, removing and undoing are for the PC itself: a device on the network
 /// holding a (paired) session token is refused, and reading the catalog still works for it.
 #[tokio::test]
@@ -199,6 +243,7 @@ async fn a_device_on_the_network_cannot_install_or_undo() {
         engine: engine.clone(),
         sessions: sessions.clone(),
         guard: auth::Guard { port: 47820, lan: true, dev_origins: vec![] },
+        api_limiter: crate::rate_limit::ApiKeyRateLimiter::default(),
     });
     let paired = sessions.new_code();
     let token = sessions.pair(&paired).unwrap_or_else(|_| panic!("a pairing code is good once"));

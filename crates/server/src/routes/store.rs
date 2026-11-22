@@ -42,7 +42,15 @@ struct IdBody {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct UndoBody {
-    token: Option<String>,
+    /// Left out: the latest action. Anything that is there (null, a number, an empty text) is a
+    /// token and must be a good one: it is never read as "the latest".
+    #[serde(deserialize_with = "present")]
+    token: Option<serde_json::Value>,
+}
+
+/// A field that is there is `Some`, even when it is null (serde would read null as left out).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -138,7 +146,19 @@ async fn undo(
     Body(b): Body<UndoBody>,
 ) -> ApiResult<Json<Value>> {
     at_this_pc(&connect, &remote)?;
-    let out = app.engine.undo_store_action(b.token.as_deref()).await?;
+    let token = match &b.token {
+        None => None,
+        Some(serde_json::Value::String(t)) => Some(t.as_str()),
+        Some(_) => {
+            return Err(ApiError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "store_undo_bad_token",
+                "The undo token must be the text the action gave.",
+            )
+            .hint("Leave the token out to undo the latest action."));
+        }
+    };
+    let out = app.engine.undo_store_action(token).await?;
     Ok(Json(json!(out)))
 }
 
