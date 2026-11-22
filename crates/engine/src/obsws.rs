@@ -1473,16 +1473,16 @@ impl Engine {
             "GetInputAudioSyncOffset" => {
                 let row = self.ows_audio(&self.ows_input_name(d).await?).await?;
                 let sync_ms = row["sync_ms"].as_i64().unwrap_or(0);
-                Ok(json!({ "inputAudioSyncOffset": sync_ms.saturating_mul(1_000_000) }))
+                // obs-websocket 5.5.4: milliseconds, both ways.
+                Ok(json!({ "inputAudioSyncOffset": sync_ms }))
             }
             "SetInputAudioSyncOffset" => {
                 let name = self.ows_input_name(d).await?;
-                let ns = field(d, "inputAudioSyncOffset")?
+                let ms = field(d, "inputAudioSyncOffset")?
                     .as_i64()
-                    .ok_or_else(|| fail(ST_BAD_TYPE, "`inputAudioSyncOffset` must be an integer (nanoseconds)."))?;
-                let ms = ns / 1_000_000;
+                    .ok_or_else(|| fail(ST_BAD_TYPE, "`inputAudioSyncOffset` must be an integer (milliseconds)."))?;
                 if !(-950..=20_000).contains(&ms) {
-                    return Err(fail(ST_OUT_OF_RANGE, "`inputAudioSyncOffset` must correspond to -950..20000 ms."));
+                    return Err(fail(ST_OUT_OF_RANGE, "`inputAudioSyncOffset` must be from -950 to 20000 ms."));
                 }
                 self.ows_audio(&name).await?;
                 let change = AudioChange { sync_ms: Some(ms), ..Default::default() };
@@ -1545,11 +1545,24 @@ impl Engine {
             }
             "GetSceneItemId" => {
                 let source = self.ows_source_name(d).await?;
+                // OBS counts matches from the bottom of the scene up: 0 (the default) is the first, N skips N,
+                // and -1 is the last (the top one). The list here is top first.
+                let offset = match d.get("searchOffset") {
+                    None | Some(Value::Null) => 0,
+                    Some(v) => v.as_i64().ok_or_else(|| fail(ST_BAD_TYPE, "`searchOffset` must be a number."))?,
+                };
+                if offset < -1 {
+                    return Err(fail(ST_OUT_OF_RANGE, "`searchOffset` must be -1 or more."));
+                }
                 let items = self.ows_items(&scene).await?;
-                items
+                let mut matches = items
                     .iter()
                     .flat_map(|i| std::iter::once(i).chain(i["children"].as_array().into_iter().flatten()))
-                    .find(|i| i["name"].as_str() == Some(source.as_str()))
+                    .filter(|i| i["name"].as_str() == Some(source.as_str()))
+                    .collect::<Vec<_>>();
+                matches.reverse();
+                let found = if offset == -1 { matches.last().copied() } else { matches.get(offset as usize).copied() };
+                found
                     .map(|i| json!({ "sceneItemId": i["id"] }))
                     .ok_or_else(|| fail(ST_NOT_FOUND, "No scene items were found in the specified scene by that name."))
             }
@@ -1592,9 +1605,28 @@ impl Engine {
                     let new_id = v["id"].as_i64().unwrap_or(id);
                     Ok(json!({ "sceneItemId": new_id }))
                 } else {
+                    // The copy keeps what this item has: its transform and crop, and whether it shows.
                     let name = item["name"].as_str().unwrap_or_default().to_string();
-                    let v = self.studio_act(StudioAct::AddExisting { scene: dst, name }).await.map_err(obs_error)?;
-                    Ok(json!({ "sceneItemId": v["id"].as_i64().unwrap_or(0) }))
+                    let t =
+                        self.studio_act(StudioAct::Transform { scene: scene.clone(), id }).await.map_err(obs_error)?;
+                    let transform: ItemTransform = serde_json::from_value(t)
+                        .map_err(|_| fail(ST_FAILED, "Could not read the item's transform."))?;
+                    let v = self
+                        .studio_act(StudioAct::AddExisting { scene: dst.clone(), name })
+                        .await
+                        .map_err(obs_error)?;
+                    let new_id = v["id"].as_i64().unwrap_or(0);
+                    if new_id != 0 {
+                        self.studio_act(StudioAct::SetTransform { scene: dst.clone(), id: new_id, transform })
+                            .await
+                            .map_err(obs_error)?;
+                        if item["visible"].as_bool() == Some(false) {
+                            self.studio_act(StudioAct::EditItem { scene: dst, id: new_id, edit: ItemEdit::Hide })
+                                .await
+                                .map_err(obs_error)?;
+                        }
+                    }
+                    Ok(json!({ "sceneItemId": new_id }))
                 }
             }
             "GetSceneItemTransform" => {
@@ -1868,9 +1900,17 @@ impl Engine {
                 Ok(json!({ "imageData": v["image"] }))
             }
             "SaveSourceScreenshot" => {
-                let name = self.ows_source_name(d).await?;
-                self.studio_act(StudioAct::Screenshot { name }).await.map_err(obs_error)?;
-                Ok(Value::Null)
+                self.ows_source_name(d).await?;
+                str_field(d, "imageFormat")?;
+                str_field(d, "imageFilePath")?;
+                // A client doesn't get to choose where the PC writes a file (an API key could write
+                // anywhere the app can): said as it is, not answered with a success and no file there.
+                // The Studio's own screenshot goes to the recordings folder; GetSourceScreenshot returns
+                // the picture itself.
+                Err(fail(
+                    ST_FAILED,
+                    "Saving to a path chosen in `imageFilePath` isn't supported. Use GetSourceScreenshot to get the picture.",
+                ))
             }
             _ => Err(fail(ST_UNKNOWN, "Unknown request type.")),
         }
@@ -2830,6 +2870,10 @@ mod tests {
         extra_scenes: Vec<String>,
         stats_calls: usize,
         acts: Vec<&'static str>,
+        /// Every SetTransform: (scene, item).
+        set_transforms: Vec<(String, i64)>,
+        /// Screenshots the Studio was asked to take.
+        shots: usize,
         drain: Option<(f64, f64)>,
         discarded: bool,
         slow_act_once: Option<Arc<tokio::sync::Notify>>,
@@ -2899,6 +2943,8 @@ mod tests {
                 extra_scenes: Vec::new(),
                 stats_calls: 0,
                 acts: Vec::new(),
+                set_transforms: Vec::new(),
+                shots: 0,
                 drain: None,
                 discarded: false,
                 slow_act_once: None,
@@ -3229,7 +3275,8 @@ mod tests {
                         Value::Null
                     }
                     StudioAct::Transform { .. } => serde_json::to_value(&s.cam_transform).unwrap_or(Value::Null),
-                    StudioAct::SetTransform { transform, .. } => {
+                    StudioAct::SetTransform { scene, id, transform } => {
+                        s.set_transforms.push((scene, id));
                         s.cam_transform = transform;
                         Value::Null
                     }
@@ -3359,7 +3406,10 @@ mod tests {
                         json!({ "state": s.media_state.0, "time_ms": s.media_state.1, "duration_ms": s.media_state.2 })
                     }
                     StudioAct::SourcePicture { .. } => json!({ "image": "data:image/png;base64,iVBORw0KGgo=", "width": 1920, "height": 1080 }),
-                    StudioAct::Screenshot { .. } => json!({ "file": "/r/shot.png" }),
+                    StudioAct::Screenshot { .. } => {
+                        s.shots += 1;
+                        json!({ "file": "/r/shot.png" })
+                    }
                     _ => Value::Null,
                 })
             })
@@ -3666,6 +3716,53 @@ mod tests {
         drop(c);
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(e.obsws_view().await.clients, 0);
+    }
+
+    #[tokio::test]
+    async fn a_source_used_twice_is_found_by_its_offset_and_copies_keep_what_they_were() {
+        let (_e, fake, port, pw, _dir) = on().await;
+        let mut c = Client::open(port).await.unwrap();
+        c.identify(&pw, None).await;
+        // Cam (id 7) is used a second time, on top of the first.
+        let dup = c.req("DuplicateSceneItem", json!({ "sceneName": "Game", "sceneItemId": 7 })).await;
+        let top = dup["responseData"]["sceneItemId"].as_i64().unwrap();
+        let find = |offset: Option<i64>| {
+            let mut d = json!({ "sceneName": "Game", "sourceName": "Cam" });
+            if let Some(o) = offset {
+                d["searchOffset"] = json!(o);
+            }
+            d
+        };
+        // OBS searches from the bottom: no offset is the first, 1 skips one, -1 is the last (top).
+        assert_eq!(c.req("GetSceneItemId", find(None)).await["responseData"]["sceneItemId"], 7);
+        assert_eq!(c.req("GetSceneItemId", find(Some(0))).await["responseData"]["sceneItemId"], 7);
+        assert_eq!(c.req("GetSceneItemId", find(Some(1))).await["responseData"]["sceneItemId"], top);
+        assert_eq!(c.req("GetSceneItemId", find(Some(-1))).await["responseData"]["sceneItemId"], top);
+        assert_eq!(c.req("GetSceneItemId", find(Some(2))).await["requestStatus"]["code"], 600);
+        assert_eq!(c.req("GetSceneItemId", find(Some(-2))).await["requestStatus"]["code"], 402);
+        assert_eq!(c.req("GetSceneItemId", find(Some(1))).await["requestStatus"]["result"], true);
+        assert_eq!(
+            c.req("GetSceneItemId", json!({ "sceneName": "Game", "sourceName": "Cam", "searchOffset": "x" })).await["requestStatus"]
+                ["code"],
+            401
+        );
+
+        // A copy into another scene keeps the item's transform and whether it shows.
+        c.req("SetSceneItemEnabled", json!({ "sceneName": "Game", "sceneItemId": 7, "sceneItemEnabled": false })).await;
+        fake.with(|s| s.set_transforms.clear());
+        let to = c
+            .req("DuplicateSceneItem", json!({ "sceneName": "Game", "sceneItemId": 7, "destinationSceneName": "BRB" }))
+            .await;
+        let new_id = to["responseData"]["sceneItemId"].as_i64().unwrap();
+        assert_eq!(
+            fake.with(|s| s.set_transforms.clone()),
+            vec![("BRB".to_string(), new_id)],
+            "transform and crop copied"
+        );
+        assert!(
+            !fake.with(|s| s.items_game.iter().find(|i| i.0 == new_id).map(|i| i.3).unwrap()),
+            "hidden stays hidden"
+        );
     }
 
     #[tokio::test]
@@ -4141,11 +4238,20 @@ mod tests {
             c.req("GetInputAudioMonitorType", json!({ "inputName": "Mic" })).await["responseData"]["monitorType"],
             "OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT"
         );
-        c.req("SetInputAudioSyncOffset", json!({ "inputName": "Mic", "inputAudioSyncOffset": 250_000_000 })).await;
+        // obs-websocket 5.5.4 speaks milliseconds both ways.
+        c.req("SetInputAudioSyncOffset", json!({ "inputName": "Mic", "inputAudioSyncOffset": 250 })).await;
+        assert_eq!(fake.with(|s| s.mic_sync_ms), 250, "the Studio's own offset is the milliseconds sent");
         assert_eq!(
             c.req("GetInputAudioSyncOffset", json!({ "inputName": "Mic" })).await["responseData"]["inputAudioSyncOffset"],
-            250_000_000
+            250
         );
+        for bad in [20_001, -951] {
+            assert_eq!(
+                c.req("SetInputAudioSyncOffset", json!({ "inputName": "Mic", "inputAudioSyncOffset": bad })).await["requestStatus"]
+                    ["code"],
+                402
+            );
+        }
         c.req("SetInputAudioBalance", json!({ "inputName": "Mic", "inputAudioBalance": 0.75 })).await;
         assert_eq!(
             c.req("GetInputAudioBalance", json!({ "inputName": "Mic" })).await["responseData"]["inputAudioBalance"],
@@ -4205,10 +4311,24 @@ mod tests {
                 .unwrap()
                 .starts_with("data:image/png;base64,")
         );
+        // A file path from a client is never written to: said, not pretended.
+        let saved = c
+            .req(
+                "SaveSourceScreenshot",
+                json!({ "sourceName": "Cam", "imageFormat": "png", "imageFilePath": "/tmp/x.png" }),
+            )
+            .await;
+        assert_eq!(
+            (saved["requestStatus"]["result"].clone(), saved["requestStatus"]["code"].clone()),
+            (json!(false), json!(702))
+        );
+        assert!(saved["requestStatus"]["comment"].as_str().unwrap().contains("imageFilePath"), "{saved}");
+        assert_eq!(fake.with(|s| s.shots), 0, "nothing was saved anywhere");
         assert_eq!(
             c.req("SaveSourceScreenshot", json!({ "sourceName": "Cam", "imageFormat": "png" })).await["requestStatus"]
-                ["result"],
-            true
+                ["code"],
+            300,
+            "the path is a required field"
         );
 
         assert_eq!(c.req("SplitRecordFile", json!({})).await["requestStatus"]["code"], 501);
