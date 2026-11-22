@@ -90,6 +90,10 @@ pub(crate) struct Studio {
     pub machine: Mutex<show::BroadcastMachine>,
     /// Serializes stream start/stop, delayed stop, and Studio stop so no click order races.
     pub output_lock: tokio::sync::Mutex<()>,
+    /// Mutual exclusion gate between starting any output and claiming a benchmark run (C2).
+    pub output_gate: tokio::sync::Mutex<()>,
+    /// Serializes `auto_config_benchmark` / `cancel` / `apply` / `undo` state transitions (C2/H7).
+    pub auto_config_op: tokio::sync::Mutex<()>,
     /// Monotonic origin for Show timers (`away`, `live_watch`) so wall-clock jumps never fire them.
     pub mono_origin: std::time::Instant,
     /// Last monotonic sample timestamp seen by `live_watch_tick` (for wake-jump detection).
@@ -152,6 +156,8 @@ impl Default for Studio {
             spike: Mutex::default(),
             machine: Mutex::default(),
             output_lock: tokio::sync::Mutex::new(()),
+            output_gate: tokio::sync::Mutex::new(()),
+            auto_config_op: tokio::sync::Mutex::new(()),
             mono_origin: std::time::Instant::now(),
             last_watch_mono: Mutex::default(),
             show_wake: Notify::new(),

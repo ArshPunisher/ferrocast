@@ -2728,10 +2728,15 @@ impl Engine {
 
     pub async fn studio_record(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
-        if on {
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
             let s = host.settings().await;
             self.ffmpeg_first(s.record_needs_ffmpeg()).await?;
-        }
+            Some(g)
+        } else {
+            None
+        };
         host.record(on).await.map_err(failed)
     }
 
@@ -2752,6 +2757,13 @@ impl Engine {
         if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
             return Err(EngineError::Invalid("name: a scene or source's name.".into()));
         }
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         self.studio_host()?.record_source(name.to_string(), on).await.map_err(failed)
     }
 
@@ -2760,6 +2772,13 @@ impl Engine {
     }
 
     pub async fn studio_replay(&self, on: bool) -> Result<Value, EngineError> {
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         self.studio_host()?.replay(on).await.map_err(failed)
     }
 
@@ -2771,6 +2790,13 @@ impl Engine {
         if let Some(s) = &source {
             check_source_name(s)?;
         }
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         self.studio_host()?.virtual_camera(on, source).await.map_err(failed)
     }
 
@@ -2787,6 +2813,13 @@ impl Engine {
         if let Some(n) = &name {
             check_source_name(n)?;
         }
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         self.studio_host()?.ndi_output(on, name).await.map_err(failed)
     }
 
@@ -2966,6 +2999,13 @@ impl Engine {
 
     /// Runs `studio_stream` while the caller already holds `studio().output_lock`.
     pub(crate) async fn studio_stream_locked(&self, on: bool) -> Result<Value, EngineError> {
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         let host = self.studio_host()?;
         let s = host.settings().await;
         self.note_studio_settings(&s);
@@ -3296,14 +3336,19 @@ impl Engine {
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
         let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
-        // Swapping what the Studio shows is refused during a show or while it streams or
-        // records; with no desktop host attached (headless) the show itself still counts.
-        if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
+        // Swapping what the Studio shows is refused during a show, benchmark, or while it streams
+        // or records; with no desktop host attached (headless) the show/benchmark still count.
+        let _gate = if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
             let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
             self.ensure_idle_for_switch(noun).await?;
             // A held key's item is in the collection being left: put it back first.
             self.studio_release_holds().await;
-        }
+            Some(g)
+        } else {
+            None
+        };
         if let Some(host) = host {
             let out = host.shelf(kind.to_string(), act).await.map_err(failed)?;
             // Another collection may have its own vertical picture (or none): the stream follows.
@@ -3337,8 +3382,10 @@ impl Engine {
         self.studio_host()?.screens().await.map_err(failed)
     }
 
-    /// Opens Ferrocast again; refused while the Studio streams or records.
+    /// Opens Ferrocast again; refused while the Studio streams, records, or benchmarks.
     pub async fn studio_restart(&self) -> Result<(), EngineError> {
+        let _gate = self.studio().output_gate.lock().await;
+        self.ensure_no_benchmark_running()?;
         self.studio_host()?.restart().await.map_err(failed)
     }
 

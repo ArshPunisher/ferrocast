@@ -707,9 +707,11 @@ impl Engine {
             }
         }
 
-        // Atomically claim `Preparing` before any `.await` so double-clicks or racing starts
-        // never overlap, and abort any pending delayed stop from an earlier ended Show.
+        // Atomically claim `Preparing` under `output_gate` before any `.await` so double-clicks,
+        // racing starts, or concurrent encoder benchmarks can never TOCTOU-overlap (C2).
         let my_gen = {
+            let _gate = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
             if matches!(
                 m.phase,

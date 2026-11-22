@@ -528,14 +528,10 @@ struct BenchTempDir(PathBuf);
 impl BenchTempDir {
     fn create(base: Option<PathBuf>, job_id: &str) -> Result<Self, String> {
         let root = base.unwrap_or_else(std::env::temp_dir).join("auto-config-tmp");
-        if root.exists()
-            && let Ok(entries) = std::fs::read_dir(&root)
-        {
-            for entry in entries.flatten() {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
         let dir = root.join(job_id);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't prepare scratch folder: {e}"))?;
         Ok(Self(dir))
     }
@@ -1273,6 +1269,21 @@ impl Engine {
         .await
     }
 
+    /// Refuses with HTTP 409 if an encoder benchmark is currently active (C2).
+    pub(crate) fn ensure_no_benchmark_running(&self) -> Result<(), EngineError> {
+        let slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_running() {
+            return Err(EngineError::Refused {
+                status: 409,
+                code: "benchmark_running",
+                message: "An encoder benchmark is running.".into(),
+                hint: "Wait for the benchmark to finish or cancel it first.".into(),
+                retry_after: None,
+            });
+        }
+        Ok(())
+    }
+
     /// Starts an encoder stress benchmark (and upload test in `stream` mode unless skipped).
     pub async fn auto_config_benchmark(&self, req: BenchmarkReq) -> Result<AutoConfigView, EngineError> {
         let mode = match req.mode.as_deref().unwrap_or("stream") {
@@ -1290,19 +1301,29 @@ impl Engine {
         }
         let include_upload = req.include_upload.unwrap_or(mode == AutoConfigMode::Stream);
 
-        self.ensure_benchmark_idle().await?;
-
-        let canvas = if let Ok(host) = self.studio_host() {
-            let s = host.settings().await;
-            [s.width, s.height]
-        } else {
-            [1920, 1080]
-        };
-
+        let _op = self.studio().auto_config_op.lock().await;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_notify = Arc::new(Notify::new());
 
-        let (job_id, timing, view) = {
+        let (job_id, timing, view, canvas) = {
+            // Hold `output_gate` across the idle check, settings read, and claim transition so no
+            // output start can race through TOCTOU between checking idle and marking Running (C2).
+            let _gate = self.studio().output_gate.lock().await;
+            {
+                let slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+                if slot.is_running() {
+                    return Err(EngineError::Conflict("An encoder benchmark is already running.".into()));
+                }
+            }
+            self.ensure_benchmark_idle().await?;
+
+            let canvas = if let Ok(host) = self.studio_host() {
+                let s = host.settings().await;
+                [s.width, s.height]
+            } else {
+                [1920, 1080]
+            };
+
             let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
             if slot.is_running() {
                 return Err(EngineError::Conflict("An encoder benchmark is already running.".into()));
@@ -1338,7 +1359,7 @@ impl Engine {
                 cancel_notify: cancel_notify.clone(),
                 scratch_dir: None,
             });
-            (job_id, timing, slot.view())
+            (job_id, timing, slot.view(), canvas)
         };
         self.emit_auto_config_frame(&view);
 
@@ -1754,10 +1775,8 @@ impl Engine {
         }
 
         let (mode, picked, candidates, upload_check, duration_ms, timing) = {
+            self.ensure_no_benchmark_running()?;
             let slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
-            if slot.is_running() {
-                return Err(EngineError::Conflict("Finish or cancel the benchmark before applying settings.".into()));
-            }
             match &slot.state {
                 MachineState::Done(d) => (
                     d.mode,
@@ -1881,6 +1900,7 @@ impl Engine {
 
     /// Immediately restores the pre-apply `StudioSettings` snapshot.
     pub async fn auto_config_undo(&self) -> Result<AutoConfigView, EngineError> {
+        let _op = self.studio().auto_config_op.lock().await;
         self.rollback_now(None, RollbackTrigger::UserUndo, "Restored your previous settings.".into()).await
     }
 
@@ -2077,6 +2097,7 @@ mod tests {
         stream_stats_override: Mutex<Option<Result<Value, String>>>,
         record_stats_override: Mutex<Option<Result<Value, String>>>,
         delay_drain_val: Mutex<Option<(f64, f64)>>,
+        settings_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     }
 
     impl Default for BenchMockHost {
@@ -2093,6 +2114,7 @@ mod tests {
                 stream_stats_override: Mutex::new(None),
                 record_stats_override: Mutex::new(None),
                 delay_drain_val: Mutex::new(None),
+                settings_barrier: Mutex::new(None),
             }
         }
     }
@@ -2101,6 +2123,24 @@ mod tests {
     impl StudioHost for BenchMockHost {
         fn delay_drain(&self) -> Option<(f64, f64)> {
             *self.delay_drain_val.lock().unwrap()
+        }
+        async fn record_source(&self, _name: String, on: bool) -> Result<Value, String> {
+            Ok(serde_json::json!({ "active": on }))
+        }
+        async fn replay(&self, on: bool) -> Result<Value, String> {
+            Ok(serde_json::json!({ "active": on }))
+        }
+        async fn virtual_camera(&self, on: bool, _source: Option<String>) -> Result<Value, String> {
+            Ok(serde_json::json!({ "active": on }))
+        }
+        async fn ndi_output(&self, on: bool, _name: Option<String>) -> Result<Value, String> {
+            Ok(serde_json::json!({ "active": on }))
+        }
+        async fn restart(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn shelf(&self, _kind: String, _act: crate::studio_host::ShelfAct) -> Result<Value, String> {
+            Ok(serde_json::json!({ "ok": true }))
         }
         async fn status(&self) -> crate::studio_host::StudioStatus {
             crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
@@ -2159,6 +2199,10 @@ mod tests {
             Ok(Value::Null)
         }
         async fn settings(&self) -> StudioSettings {
+            let barrier = self.settings_barrier.lock().unwrap().clone();
+            if let Some(b) = barrier {
+                b.wait().await;
+            }
             self.settings.lock().unwrap().clone()
         }
         async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String> {
@@ -2540,5 +2584,105 @@ mod tests {
                 c.reason
             );
         }
+    }
+
+    #[tokio::test]
+    async fn output_starts_refused_while_benchmark_running() {
+        let (engine, _host, _dir) = test_engine().await;
+        let running = engine
+            .auto_config_benchmark(BenchmarkReq {
+                mode: Some("record".into()),
+                fps_preference: Some(60),
+                include_upload: Some(false),
+                max_seconds: Some(8),
+            })
+            .await
+            .unwrap();
+        assert_eq!(running.state, AutoConfigStateKind::Running);
+
+        fn assert_busy<T: std::fmt::Debug>(res: Result<T, EngineError>, what: &str) {
+            match res {
+                Err(EngineError::Refused { status: 409, code, .. }) => {
+                    assert!(matches!(code, "studio_busy" | "benchmark_running"), "{what}: unexpected code {code}");
+                }
+                other => panic!("{what}: expected 409 refusal while benchmark running, got {other:?}"),
+            }
+        }
+
+        assert_busy(engine.studio_stream(true).await, "studio_stream(true)");
+        assert_busy(engine.studio_record(true).await, "studio_record(true)");
+        assert_busy(engine.studio_record_source("Cam", true).await, "studio_record_source(true)");
+        assert_busy(engine.studio_replay(true).await, "studio_replay(true)");
+        assert_busy(engine.studio_virtual_camera(true, None).await, "studio_virtual_camera(true)");
+        assert_busy(engine.studio_ndi_output(true, None).await, "studio_ndi_output(true)");
+        assert_busy(
+            engine.start_show_with(crate::studio::show::ShowStartOpts { force: true, stream: Some(false) }).await,
+            "start_show_with",
+        );
+        assert_busy(engine.studio_restart().await, "studio_restart");
+        assert_busy(
+            engine.studio_shelf("collections", crate::studio_host::ShelfAct::Switch { id: "other".into() }).await,
+            "studio_shelf(Switch)",
+        );
+
+        // Stopping an output stays allowed even while benchmark runs.
+        assert!(engine.studio_record(false).await.is_ok(), "stopping record stays allowed");
+
+        let _ = engine.auto_config_cancel();
+        assert!(engine.studio_record(true).await.is_ok(), "outputs allowed again once cancelled");
+    }
+
+    #[tokio::test]
+    async fn no_toctou_between_benchmark_claim_and_output_start_and_isolated_temp_dir() {
+        // Temp dir isolation: sibling job directory must NOT be deleted when creating a new BenchTempDir.
+        let tmp_parent = tempfile::tempdir().unwrap();
+        let sibling = tmp_parent.path().join("auto-config-tmp").join("existing-job");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let keep_file = sibling.join("keep.txt");
+        std::fs::write(&keep_file, b"ok").unwrap();
+        let created = BenchTempDir::create(Some(tmp_parent.path().to_path_buf()), "new-job").unwrap();
+        assert!(keep_file.exists(), "BenchTempDir::create must not wipe sibling job folders");
+        drop(created);
+        assert!(keep_file.exists(), "Dropping BenchTempDir must leave sibling job folders alone");
+
+        // TOCTOU race between `auto_config_benchmark` and `studio_record(true)`:
+        // Pause `auto_config_benchmark` inside `host.settings()`, trigger `studio_record(true)` while
+        // it waits, then release the barrier. Both must NOT succeed simultaneously.
+        let (engine, host, _dir) = test_engine().await;
+        // Let hardware encoding be used on `record` without triggering ffmpeg download inside `studio_record`.
+        host.settings.lock().unwrap().encoder = "hardware".into();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *host.settings_barrier.lock().unwrap() = Some(barrier.clone());
+
+        let e_bench = engine.clone();
+        let bench_handle = tokio::spawn(async move {
+            e_bench
+                .auto_config_benchmark(BenchmarkReq {
+                    mode: Some("record".into()),
+                    fps_preference: Some(60),
+                    include_upload: Some(false),
+                    max_seconds: Some(4),
+                })
+                .await
+        });
+
+        // Wait briefly so `bench_handle` reaches the `host.settings()` barrier if it unlocked `output_gate`.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let e_rec = engine.clone();
+        let rec_handle = tokio::spawn(async move { e_rec.studio_record(true).await });
+
+        // Give `rec_handle` a chance to contend on the lock/settings barrier, then release barrier.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        *host.settings_barrier.lock().unwrap() = None;
+        // Release whichever task(s) are waiting on the 2-party barrier without deadlocking if serialized.
+        let _ = tokio::time::timeout(Duration::from_millis(100), barrier.wait()).await;
+
+        let bench_res = bench_handle.await.unwrap();
+        let rec_res = rec_handle.await.unwrap();
+        assert!(
+            !(bench_res.is_ok() && rec_res.is_ok()),
+            "TOCTOU race: both benchmark ({bench_res:?}) and studio_record(true) ({rec_res:?}) succeeded!"
+        );
+        let _ = engine.auto_config_cancel();
     }
 }
