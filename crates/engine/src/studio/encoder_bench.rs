@@ -1719,7 +1719,9 @@ impl Engine {
                                 hw_passed = true;
                                 best_viable_tier = (w, h, fps);
                                 if let Some(ceil) = &ceil_clone
-                                    && (ceil.max_height < h || ceil.max_fps < fps)
+                                    && (u64::from(ceil.max_width) * u64::from(ceil.max_height)
+                                        < u64::from(w) * u64::from(h)
+                                        || ceil.max_fps < fps)
                                     && Instant::now() + timing.step_duration <= deadline
                                 {
                                     let up_label = format!("{} ({}×{} @ {} fps)", hw.label, ceil.max_width, ceil.max_height, ceil.max_fps);
@@ -1758,7 +1760,7 @@ impl Engine {
             let has_passing_hw = results.iter().any(|c| c.hardware && c.passed);
             let mut sw_tier = best_viable_tier;
             if let Some(ceil) = &ceil_clone
-                && ceil.max_height < sw_tier.1
+                && u64::from(ceil.max_width) * u64::from(ceil.max_height) < u64::from(sw_tier.0) * u64::from(sw_tier.1)
             {
                 sw_tier = (ceil.max_width, ceil.max_height, ceil.max_fps);
             }

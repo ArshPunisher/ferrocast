@@ -255,24 +255,33 @@ pub fn evaluate_candidate(m: CandidateMeasurement) -> BenchCandidate {
     }
 }
 
-/// Scales `(cw, ch)` to target height `h`, rounding width to an even integer and never upscaling.
-pub fn scale_for_height(canvas: [u32; 2], target_h: u32) -> [u32; 2] {
+/// Scales `(cw, ch)` proportionally to target short edge `target_short`, preserving orientation
+/// (`9:16` vertical, `16:9` horizontal, `1:1` square), rounding to even integers, never upscaling.
+pub fn scale_for_short_edge(canvas: [u32; 2], target_short: u32) -> [u32; 2] {
     let cw = canvas[0].max(128) & !1;
     let ch = canvas[1].max(72) & !1;
-    if target_h >= ch {
+    let short = cw.min(ch);
+    if target_short >= short {
         return [cw, ch];
     }
-    let w = (((f64::from(cw) * f64::from(target_h)) / f64::from(ch)).round() as u32) & !1;
-    [w.max(128), target_h.max(72) & !1]
+    if cw < ch {
+        let w = (target_short.max(128) & !1).min(cw);
+        let h = (((f64::from(ch) * f64::from(w)) / f64::from(cw)).round() as u32) & !1;
+        [w, h.max(72)]
+    } else {
+        let h = (target_short.max(72) & !1).min(ch);
+        let w = (((f64::from(cw) * f64::from(h)) / f64::from(ch)).round() as u32) & !1;
+        [w.max(128), h]
+    }
 }
 
 /// Candidate `(width, height, fps)` ladder in descending quality order for benchmark runs.
 pub fn candidate_ladder(canvas: [u32; 2], fps_preference: u32) -> Vec<(u32, u32, u32)> {
     let [cw, ch] = [canvas[0].max(128) & !1, canvas[1].max(72) & !1];
-    let top_h = ch.min(1080);
+    let top_short = cw.min(ch).min(1080);
     let mut tiers = Vec::new();
-    let add = |list: &mut Vec<(u32, u32, u32)>, h: u32, fps: u32| {
-        let [w, rh] = scale_for_height([cw, ch], h);
+    let add = |list: &mut Vec<(u32, u32, u32)>, short: u32, fps: u32| {
+        let [w, rh] = scale_for_short_edge([cw, ch], short);
         let item = (w, rh, fps);
         if !list.contains(&item) {
             list.push(item);
@@ -280,20 +289,20 @@ pub fn candidate_ladder(canvas: [u32; 2], fps_preference: u32) -> Vec<(u32, u32,
     };
 
     if fps_preference >= 60 {
-        add(&mut tiers, top_h, 60);
-        if top_h > 720 {
+        add(&mut tiers, top_short, 60);
+        if top_short > 720 {
             add(&mut tiers, 720, 60);
         }
-        add(&mut tiers, 720.min(top_h), 30);
-        if top_h > 480 {
+        add(&mut tiers, 720.min(top_short), 30);
+        if top_short > 480 {
             add(&mut tiers, 480, 30);
         }
     } else {
-        add(&mut tiers, top_h, 30);
-        if top_h > 720 {
+        add(&mut tiers, top_short, 30);
+        if top_short > 720 {
             add(&mut tiers, 720, 30);
         }
-        if top_h > 480 {
+        if top_short > 480 {
             add(&mut tiers, 480, 30);
         }
     }
@@ -345,7 +354,7 @@ pub fn stream_ceiling(
         }
     };
 
-    let (target_h, max_fps) = if want_fps == 60 {
+    let (target_short, max_fps) = if want_fps == 60 {
         if bitrate_kbps >= 6000 {
             (1080, 60)
         } else if bitrate_kbps >= 3500 {
@@ -363,7 +372,7 @@ pub fn stream_ceiling(
         (480, 30)
     };
 
-    let [max_width, max_height] = scale_for_height(canvas, target_h);
+    let [max_width, max_height] = scale_for_short_edge(canvas, target_short);
     UploadCeiling {
         bitrate_kbps,
         max_width,
@@ -419,6 +428,7 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
     }
 
     let [cw, ch] = [input.canvas[0].max(128) & !1, input.canvas[1].max(72) & !1];
+    let canvas_short = cw.min(ch);
     let ceiling = match input.mode {
         AutoConfigMode::Stream => {
             Some(stream_ceiling(input.upload_kbps, &input.platforms, input.fps_preference, [cw, ch]))
@@ -429,7 +439,7 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
     let (cap_w, cap_h, cap_fps) = match &ceiling {
         Some(c) => (c.max_width, c.max_height, c.max_fps),
         None => {
-            let [w, h] = scale_for_height([cw, ch], ch.min(1440));
+            let [w, h] = scale_for_short_edge([cw, ch], canvas_short.min(1440));
             (w, h, if input.fps_preference >= 60 { 60 } else { 30 })
         }
     };
@@ -476,13 +486,16 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
     };
 
     let (out_w, out_h, out_fps) = effective_of(best);
+    let out_short = out_w.min(out_h);
     let scale = if out_w == cw && out_h == ch { None } else { Some([out_w, out_h]) };
 
     let (video_kbps, limited_by) = match (&ceiling, best.passed) {
         (Some(ceil), true) => {
-            let encoder_downgraded = out_h < ceil.max_height || out_fps < ceil.max_fps;
+            let encoder_downgraded = u64::from(out_w) * u64::from(out_h)
+                < u64::from(ceil.max_width) * u64::from(ceil.max_height)
+                || out_fps < ceil.max_fps;
             let kbps = if encoder_downgraded {
-                ceil.bitrate_kbps.min(stream_tier_cap(out_h, out_fps)).max(1500)
+                ceil.bitrate_kbps.min(stream_tier_cap(out_short, out_fps)).max(1500)
             } else {
                 ceil.bitrate_kbps
             };
@@ -490,16 +503,16 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
             (kbps, why_limit)
         }
         (Some(ceil), false) => {
-            let tier_max = stream_tier_cap(out_h, out_fps);
+            let tier_max = stream_tier_cap(out_short, out_fps);
             (ceil.bitrate_kbps.min(tier_max).max(1500), LimitedBy::Headroom)
         }
         (None, _) => {
-            let why_limit = if !best.passed || out_h < ch.min(1440) || out_fps < cap_fps {
+            let why_limit = if !best.passed || out_short < canvas_short.min(1440) || out_fps < cap_fps {
                 LimitedBy::Headroom
             } else {
                 LimitedBy::Balanced
             };
-            (record_kbps_for(out_h, out_fps), why_limit)
+            (record_kbps_for(out_short, out_fps), why_limit)
         }
     };
 
@@ -539,6 +552,8 @@ fn build_why(
     input: &PickInput,
 ) -> String {
     let mbps = f64::from(video_kbps) / 1000.0;
+    let best_short = best.width.min(best.height);
+    let out_short = out_w.min(out_h);
     let enc_phrase = if !best.passed {
         format!(
             "All tested settings pushed the encoder near or past {} fps capacity; {} was lightest ({:.1} ms/frame).",
@@ -547,12 +562,12 @@ fn build_why(
     } else if best.width != out_w || best.height != out_h || best.fps != out_fps {
         format!(
             "{} passed {}p{} at {:.1} ms/frame ({:.0}% headroom); output sized to {}×{} @ {} fps.",
-            best.label, best.height, best.fps, best.encode_ms_avg, best.headroom_pct, out_w, out_h, out_fps
+            best.label, best_short, best.fps, best.encode_ms_avg, best.headroom_pct, out_w, out_h, out_fps
         )
     } else {
         format!(
             "{} held {}p{} at {:.1} ms/frame ({:.0}% headroom).",
-            best.label, out_h, out_fps, best.encode_ms_avg, best.headroom_pct
+            best.label, out_short, out_fps, best.encode_ms_avg, best.headroom_pct
         )
     };
 
@@ -572,7 +587,7 @@ fn build_why(
                     ceil.cap_platform.unwrap_or("platform limits")
                 ),
                 LimitedBy::Headroom => {
-                    format!(" Targeted {mbps:.1} Mbps at {out_h}p{out_fps} to match encoder headroom.")
+                    format!(" Targeted {mbps:.1} Mbps at {out_short}p{out_fps} to match encoder headroom.")
                 }
                 LimitedBy::Balanced => format!(" Set {mbps:.1} Mbps."),
             };
@@ -923,5 +938,48 @@ mod tests {
     fn candidate_ladder_keeps_720p_canvas_under_native_bounds() {
         let tiers = candidate_ladder([1280, 720], 60);
         assert_eq!(tiers, vec![(1280, 720, 60), (1280, 720, 30), (852, 480, 30)]);
+    }
+
+    #[test]
+    fn h4_vertical_canvas_scales_on_short_edge_without_distortion() {
+        let ladder = candidate_ladder([1080, 1920], 60);
+        assert_eq!(ladder, vec![(1080, 1920, 60), (720, 1280, 60), (720, 1280, 30), (480, 852, 30)]);
+
+        let ceil_hi = stream_ceiling(Some(10_000), &[youtube()], 60, [1080, 1920]);
+        assert_eq!((ceil_hi.max_width, ceil_hi.max_height, ceil_hi.max_fps), (1080, 1920, 60));
+
+        let ceil_lo = stream_ceiling(Some(3_000), &[youtube()], 60, [1080, 1920]);
+        assert_eq!((ceil_lo.max_width, ceil_lo.max_height, ceil_lo.max_fps), (480, 852, 30));
+
+        let cands = vec![meas(EncoderFamily::VideoToolbox, None, 1080, 1920, 60, 2.5, Some(10.0))];
+        let rec_record = pick_recommendation(
+            &cands,
+            &PickInput {
+                mode: AutoConfigMode::Record,
+                fps_preference: 60,
+                canvas: [1080, 1920],
+                upload_kbps: None,
+                platforms: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(rec_record.scale, None);
+        assert_eq!((rec_record.width, rec_record.height, rec_record.fps), (1080, 1920, 60));
+        assert_eq!(rec_record.video_kbps, 12_000, "vertical 1080x1920 should map to 1080p60 bitrate tier");
+        assert!(rec_record.why.contains("1080p60"), "unexpected vertical description: {}", rec_record.why);
+
+        let rec_tight = pick_recommendation(
+            &cands,
+            &PickInput {
+                mode: AutoConfigMode::Stream,
+                fps_preference: 60,
+                canvas: [1080, 1920],
+                upload_kbps: Some(3_000),
+                platforms: vec![youtube()],
+            },
+        )
+        .unwrap();
+        assert_eq!(rec_tight.scale, Some([480, 852]));
+        assert_eq!(rec_tight.fps, 30);
     }
 }
