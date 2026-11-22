@@ -54,6 +54,17 @@ pub fn insert(store: &Store, d: &Design) -> Result<Design> {
 /// Saves an edit. The kind can't change (an alert look doesn't become a theme), and the
 /// creation time and origin stay what they were.
 pub fn update(store: &Store, d: &Design) -> Result<Design> {
+    save_update(store, d, false)
+}
+
+/// The Store's own replacement of an installed design by a new version of its package. Like
+/// `update`, but a design that has no package id yet takes the one `d` carries (so a later
+/// version is matched by identity). Only the package import calls this; the API's edit can't.
+pub fn update_import(store: &Store, d: &Design) -> Result<Design> {
+    save_update(store, d, true)
+}
+
+fn save_update(store: &Store, d: &Design, record_source: bool) -> Result<Design> {
     checked(d)?;
     let current = get(store, &d.id)?;
     if current.kind() != d.kind() {
@@ -67,6 +78,9 @@ pub fn update(store: &Store, d: &Design) -> Result<Design> {
     let mut saved = d.clone();
     saved.created_at = current.created_at;
     saved.origin = current.origin;
+    if record_source && saved.origin.source.is_none() {
+        saved.origin.source = d.origin.source.clone();
+    }
     saved.updated_at = now_ms().max(current.updated_at + 1);
     saved.name = saved.name.trim().to_string();
     // Only built-ins are part of the paid catalogue; the streamer's own never are.
