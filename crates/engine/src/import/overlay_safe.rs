@@ -244,6 +244,35 @@ fn public_v4(ip: std::net::Ipv4Addr) -> bool {
         || o[0] >= 240)
 }
 
+/// A capture setting that says which window, application, display, device or process to take.
+fn names_what_to_capture(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    [
+        "window",
+        "owner",
+        "application",
+        "app_",
+        "_app",
+        "device",
+        "display",
+        "monitor",
+        "screen",
+        "uuid",
+        "bundle",
+        "game",
+        "executable",
+        "process",
+        "camera",
+        "microphone",
+        "_id",
+        "id_",
+    ]
+    .iter()
+    .any(|w| k.contains(w))
+        || k == "id"
+        || k == "app"
+}
+
 fn scalar_ok(v: &Value) -> bool {
     match v {
         Value::Bool(_) | Value::Number(_) => true,
@@ -398,8 +427,18 @@ fn clean_settings(cx: &mut Cx, name: &str, kind: &str, raw: Option<&Value>, left
                 .collect();
         }
         _ => {
-            // Captures and audio (a device the user picks): plain values only.
-            out = plain_settings(o, &[]);
+            // Captures and audio: what to capture is the user's to pick after the import. A pack
+            // that names a window, app, display or device (`owner_name: "1Password"`) would put
+            // it on air as soon as the scene is, so those settings are dropped; harmless ones
+            // (cursor, preset) stay.
+            let all = plain_settings(o, &[]);
+            let before = all.len();
+            out = all.into_iter().filter(|(k, _)| !names_what_to_capture(k)).collect();
+            if out.len() < before {
+                cx.note(format!(
+                    "“{name}” will ask which window, display or device to use: the pack's choice isn't kept."
+                ));
+            }
         }
     }
     Value::Object(out)

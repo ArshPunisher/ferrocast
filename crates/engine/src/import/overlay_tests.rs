@@ -1470,3 +1470,43 @@ fn a_generated_overlay_source_never_takes_the_name_of_one_the_pack_has() {
     let items = out["sources"][0]["settings"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 1, "and its scene item: {items:?}");
 }
+
+// ---- Security review: a pack can't pick which window, app, display or device to capture --------
+
+#[test]
+fn a_capture_or_audio_source_comes_in_without_saying_which_window_or_device() {
+    let p = obs_pack(
+        vec![
+            json!({ "name": "Win", "id": "window_capture", "settings": {
+                "owner_name": "1Password", "window_name": "Vault", "application": "com.1password.1password",
+                "window": "Vault:1Password:1password", "capture_window": "123", "show_cursor": true } }),
+            json!({ "name": "Mic", "id": "coreaudio_input_capture", "settings": {
+                "device_id": "BuiltInMicrophoneDevice", "muted_hint": false } }),
+            json!({ "name": "Screen", "id": "display_capture", "settings": {
+                "display_uuid": "37D8832A-2D66-02CA-B9F7-8F30A301B230", "monitor_id": "2", "monitor": 1, "show_cursor": true } }),
+            json!({ "name": "Cam", "id": "macos-avcapture", "settings": { "device": "FaceTime", "use_preset": true } }),
+        ],
+        vec![],
+    );
+    let keys =
+        |n: &str| -> Vec<String> { source(&p, n).unwrap()["settings"].as_object().unwrap().keys().cloned().collect() };
+    for (n, gone) in [
+        ("Win", &["owner_name", "window_name", "application", "window", "capture_window"][..]),
+        ("Mic", &["device_id"][..]),
+        ("Screen", &["display_uuid", "monitor_id", "monitor"][..]),
+        ("Cam", &["device"][..]),
+    ] {
+        for k in gone {
+            assert!(!keys(n).iter().any(|x| x == k), "{n} still has {k}: {:?}", keys(n));
+        }
+    }
+    assert_eq!(setting(&p, "Win", "show_cursor"), Some(&json!(true)), "harmless values stay");
+    assert_eq!(setting(&p, "Cam", "use_preset"), Some(&json!(true)));
+    for n in ["Win", "Mic", "Screen", "Cam"] {
+        assert!(
+            p.notes.iter().any(|t| t.contains(&format!("“{n}” will ask which"))),
+            "{n} says it will ask: {:?}",
+            p.notes
+        );
+    }
+}
