@@ -202,16 +202,17 @@ impl Engine {
     }
 
     pub(crate) fn clear_highlight_if_user(&self, platform: Platform, target: &Actor) {
-        if let Some(uid) = &target.id {
-            self.clear_highlight_if_user_id(platform, uid);
-            return;
-        }
         let changed = {
             let mut slot = self.inner.highlight.lock().unwrap_or_else(|p| p.into_inner());
             let matches = slot.current.as_ref().is_some_and(|h| {
                 h.platform == platform
-                    && ((target.login.is_some() && h.actor.login == target.login)
-                        || h.actor.display_name.eq_ignore_ascii_case(&target.display_name))
+                    && match (&target.id, &h.actor.id) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => {
+                            (target.login.is_some() && h.actor.login == target.login)
+                                || h.actor.display_name.eq_ignore_ascii_case(&target.display_name)
+                        }
+                    }
             });
             if matches {
                 slot.current = None;

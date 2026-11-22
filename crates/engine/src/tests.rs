@@ -392,6 +392,27 @@ async fn commands_reply_on_the_source_platform() {
     eventually(|| kick.log().contains(&"say Join us, Sam! reply=k1".to_string())).await;
 }
 
+/// A ban or timeout made from here takes the author's pinned message off stream at
+/// once; it must not wait for the platform to echo the event back.
+#[tokio::test]
+async fn banning_or_timing_out_the_author_unpins_their_message() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw.clone());
+    for (n, act, who) in [("m1", "ban", "pinned"), ("m2", "timeout", "other")] {
+        e.ingest(chat(Platform::Twitch, n, who, "show me")).await;
+        let id = e.db(move |s| ferrocast_store::repo::events::by_source(s, Platform::Twitch, n)).await.unwrap().unwrap();
+        e.pin_chat_highlight(&id, None).await.unwrap();
+        assert!(e.chat_highlight().is_some());
+        if act == "ban" {
+            e.ban(Platform::Twitch, "pinned-id", who, None, None, false).await.unwrap();
+        } else {
+            e.timeout(Platform::Twitch, "other-id", 60, None).await.unwrap();
+        }
+        assert!(e.chat_highlight().is_none(), "{act} must clear the pinned message");
+    }
+}
+
 #[tokio::test]
 async fn ban_everywhere_uses_linked_accounts_and_reports_failures() {
     let (e, _d) = engine().await;
