@@ -591,3 +591,172 @@ async fn a_key_that_expires_has_its_open_live_socket_closed() {
     assert!(closed.is_ok(), "the expired key's socket is still open");
     rig.engine.shutdown();
 }
+
+mod exposure {
+    //! Keys are loopback-only unless the owner switched on "API keys over LAN"; key management is
+    //! the PC's own; a web page can't use a key from the browser.
+    use super::*;
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+
+    struct Lan {
+        app: Router,
+        sessions: Arc<Sessions>,
+        engine: Engine,
+        token: String,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn lan() -> Lan {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        let created = engine
+            .create_api_key(ApiKeyCreate { name: "Lan".into(), scopes: vec![ApiKeyScope::ReadOnly], expires_at: None })
+            .await
+            .unwrap();
+        let sessions = Arc::new(Sessions::new());
+        let app = router(AppState {
+            engine: engine.clone(),
+            sessions: sessions.clone(),
+            guard: auth::Guard { port: 47820, lan: true, dev_origins: vec![] },
+            api_limiter: rate_limit::ApiKeyRateLimiter::default(),
+        });
+        Lan { app, sessions, engine, token: created.token, _dir: dir }
+    }
+
+    fn req(
+        method: &str,
+        uri: &str,
+        peer: &str,
+        bearer: &str,
+        origin: Option<&str>,
+        body: Option<Value>,
+    ) -> HttpRequest<AxumBody> {
+        let mut b = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "192.168.1.9:47820")
+            .header("authorization", format!("Bearer {bearer}"));
+        if let Some(o) = origin {
+            b = b.header("origin", o);
+        }
+        let mut r = match body {
+            Some(v) => b.header("content-type", "application/json").body(AxumBody::from(v.to_string())).unwrap(),
+            None => b.body(AxumBody::empty()).unwrap(),
+        };
+        let addr: SocketAddr = peer.parse().unwrap();
+        r.extensions_mut().insert(ConnectInfo(addr));
+        r
+    }
+
+    #[tokio::test]
+    async fn a_key_works_from_this_pc_and_not_from_the_network_unless_switched_on() {
+        let l = lan().await;
+        let ok = |s: StatusCode| s == StatusCode::OK;
+        let r =
+            l.app.clone().oneshot(req("GET", "/api/v1/status", "127.0.0.1:50000", &l.token, None, None)).await.unwrap();
+        assert!(ok(r.status()), "loopback: {}", r.status());
+        let r = l
+            .app
+            .clone()
+            .oneshot(req("GET", "/api/v1/status", "192.168.1.20:50000", &l.token, None, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "LAN peer, switch off");
+        // The owner switches it on (a PUT /settings with the PC's own token).
+        let on = req(
+            "PUT",
+            "/api/v1/settings",
+            "127.0.0.1:50000",
+            l.sessions.desktop_token(),
+            None,
+            Some(json!({ "api_keys_over_lan": true })),
+        );
+        let r = l.app.clone().oneshot(on).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "switching it on");
+        let r = l
+            .app
+            .clone()
+            .oneshot(req("GET", "/api/v1/status", "192.168.1.20:50000", &l.token, None, None))
+            .await
+            .unwrap();
+        assert!(ok(r.status()), "LAN peer, switch on: {}", r.status());
+        l.engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn key_management_is_this_pcs_own() {
+        let l = lan().await;
+        let desk = l.sessions.desktop_token().to_string();
+        let r =
+            l.app.clone().oneshot(req("GET", "/api/v1/api-keys", "127.0.0.1:50000", &desk, None, None)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        // A paired phone on the network holds a session token too: not for keys.
+        let r = l
+            .app
+            .clone()
+            .oneshot(req("GET", "/api/v1/api-keys", "192.168.1.20:50000", &desk, None, None))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let r = l
+            .app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/api/v1/api-keys",
+                "192.168.1.20:50000",
+                &desk,
+                None,
+                Some(json!({ "name": "x", "scopes": ["read_only"], "expires_at": null })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        l.engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_web_page_cannot_use_a_key_from_the_browser() {
+        let l = lan().await;
+        for origin in ["http://evil.example", "http://192.168.1.50:8080", "null"] {
+            let r = l
+                .app
+                .clone()
+                .oneshot(req("GET", "/api/v1/status", "127.0.0.1:50000", &l.token, Some(origin), None))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{origin}");
+        }
+        l.engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_key_cannot_switch_on_keys_over_lan() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        let created = engine
+            .create_api_key(ApiKeyCreate { name: "S".into(), scopes: vec![ApiKeyScope::Settings], expires_at: None })
+            .await
+            .unwrap();
+        let app = router(AppState {
+            engine: engine.clone(),
+            sessions: Arc::new(Sessions::new()),
+            guard: auth::Guard { port: 47820, lan: false, dev_origins: vec![] },
+            api_limiter: rate_limit::ApiKeyRateLimiter::default(),
+        });
+        let r = app
+            .oneshot(req(
+                "PUT",
+                "/api/v1/settings",
+                "127.0.0.1:50000",
+                &created.token,
+                None,
+                Some(json!({ "api_keys_over_lan": true })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        engine.shutdown();
+    }
+}

@@ -245,10 +245,8 @@ pub(crate) fn rule_custom_changed(engine: &Engine, id: Option<&str>, new: &Value
 
 fn lan_change(engine: &Engine, body: &[u8]) -> bool {
     let Ok(v) = serde_json::from_slice::<Value>(body) else { return false };
-    match v.get("lan_access") {
-        None => false,
-        Some(want) => json!(engine.settings()).get("lan_access") != Some(want),
-    }
+    let now = json!(engine.settings());
+    ["lan_access", "api_keys_over_lan"].iter().any(|f| v.get(f).is_some_and(|want| now.get(f) != Some(want)))
 }
 
 /// The handler for `Engine::set_remote_handler`.

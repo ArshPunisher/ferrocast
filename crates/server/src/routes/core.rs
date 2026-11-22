@@ -416,12 +416,17 @@ pub async fn save_settings(
     let Some(patch) = patch.as_object() else {
         return Err(ApiError::invalid("Settings must be an object."));
     };
-    if api_key.is_some()
-        && let Some(want_lan) = patch.get("lan_access")
-        && json!(app.engine.settings()).get("lan_access") != Some(want_lan)
-    {
-        return Err(ApiError::forbidden("Local API keys can't change LAN access settings.")
-            .hint("Change Allow other devices in Settings on this PC."));
+    // Opening this PC to the network (and to keys over it) is the owner's, on the PC itself.
+    if api_key.is_some() {
+        let now = json!(app.engine.settings());
+        for field in ["lan_access", "api_keys_over_lan"] {
+            if let Some(want) = patch.get(field)
+                && now.get(field) != Some(want)
+            {
+                return Err(ApiError::forbidden("Local API keys can't change LAN access settings.")
+                    .hint("Change Allow other devices in Settings on this PC."));
+            }
+        }
     }
     Ok(Json(json!(app.engine.patch_settings(patch).await?)))
 }

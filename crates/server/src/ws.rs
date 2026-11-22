@@ -43,6 +43,7 @@ fn query_value(raw: Option<&str>, key: &str) -> Option<String> {
 /// scoped local API keys (`Authorization: Bearer fc_key_...` or `?key=fc_key_...`).
 pub async fn live(
     State(app): State<AppState>,
+    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: axum::http::HeaderMap,
     RawQuery(raw): RawQuery,
     ws: WebSocketUpgrade,
@@ -54,6 +55,12 @@ pub async fn live(
     let revoked = ferrocast_engine::api_keys::subscribe_key_revocations();
     let key_scopes = match token.as_deref() {
         Some(tok) if ferrocast_core::api_keys::has_api_key_prefix(tok) => {
+            let peer = connect.as_ref().map(|c| c.0.0);
+            let from_a_page = headers.get(axum::http::header::ORIGIN).is_some();
+            if !crate::key_peer_ok(&app, peer) || from_a_page {
+                return ApiError::forbidden("API keys only work from this computer, and not from a web page.")
+                    .into_response();
+            }
             let Ok(ferrocast_engine::api_keys::ApiKeyAuth::Valid(summary)) = app.engine.authenticate_api_key(tok).await
             else {
                 return ApiError::new(

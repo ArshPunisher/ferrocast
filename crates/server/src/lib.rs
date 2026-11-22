@@ -128,6 +128,19 @@ pub(crate) fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+pub(crate) fn is_loopback(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    }
+}
+
+/// Whether a local API key may be used from `peer`: this PC always; another device only when the
+/// owner switched on "API keys over LAN". (No peer address: an in-process call, which is this PC.)
+pub(crate) fn key_peer_ok(app: &AppState, peer: Option<std::net::SocketAddr>) -> bool {
+    peer.is_none_or(|p| is_loopback(p.ip()) || app.engine.settings().api_keys_over_lan)
+}
+
 /// Every request: the Host must be ours (anti DNS-rebinding).
 async fn host_guard(State(app): State<AppState>, req: Request, next: Next) -> Response {
     if !app.guard.host_ok(req.headers()) {
@@ -206,6 +219,24 @@ async fn handle_api_key_request(
     rel: &str,
     dev_origin: Option<&str>,
 ) -> Response {
+    // A key is for programs on this PC: not from another device (unless the owner allowed it),
+    // and never from a web page (a browser sends an Origin; only the dashboard's dev servers do).
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+    let from_a_page = req
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|o| !o.to_str().is_ok_and(|o| app.guard.dev_origins.iter().any(|d| d == o)));
+    if !key_peer_ok(&app, peer) || from_a_page {
+        let mut res = ApiError::forbidden(if from_a_page {
+            "An API key can't be used from a web page."
+        } else {
+            "API keys only work from this computer."
+        })
+        .hint("Turn on API keys over LAN in Settings on this PC to use one from another device.")
+        .into_response();
+        add_cors(&mut res, dev_origin);
+        return res;
+    }
     let Ok(ApiKeyAuth::Valid(summary)) = app.engine.authenticate_api_key(token).await else {
         let mut res = ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "Invalid, revoked, or expired API key.")
             .into_response();
