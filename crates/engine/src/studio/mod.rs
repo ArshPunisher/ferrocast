@@ -138,6 +138,8 @@ pub(crate) struct Studio {
     pub clipboard: Mutex<Option<clipboard::Clip>>,
     /// Encoder stress benchmark and setting rollback state machine.
     pub auto_config: Mutex<encoder_bench::AutoConfigSlot>,
+    /// Pre-apply encoder settings queued on startup after an unclean exit, applied when `StudioHost` attaches.
+    pub pending_startup_restore: Mutex<Option<encoder_bench::PendingApply>>,
 }
 
 impl Default for Studio {
@@ -179,6 +181,7 @@ impl Default for Studio {
             holds: Mutex::default(),
             clipboard: Mutex::default(),
             auto_config: Mutex::default(),
+            pending_startup_restore: Mutex::default(),
         }
     }
 }

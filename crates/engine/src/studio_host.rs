@@ -2539,6 +2539,14 @@ impl Engine {
     /// The desktop app registers itself once its window exists.
     pub fn set_studio_host(&self, host: Arc<dyn StudioHost>) {
         *self.inner.studio_host.host.write().unwrap_or_else(|p| p.into_inner()) = Some(host);
+        if self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let e = self.clone();
+            rt.spawn(async move {
+                e.flush_pending_startup_restore_to_host().await;
+            });
+        }
     }
 
     pub(crate) fn studio_host(&self) -> Result<Arc<dyn StudioHost>, EngineError> {
@@ -2655,11 +2663,13 @@ impl Engine {
     }
 
     pub async fn studio_settings(&self) -> Result<StudioSettings, EngineError> {
+        self.flush_pending_startup_restore_to_host().await;
         Ok(self.studio_host()?.settings().await)
     }
 
     /// Saves and applies the Studio's settings → `{ settings, restart: string | null }`.
     pub async fn studio_set_settings(&self, s: StudioSettings) -> Result<Value, EngineError> {
+        self.flush_pending_startup_restore_to_host().await;
         s.check()?;
         // x264 runs through FFmpeg in Ferrocast's own engine: fetched now, so it's here by the
         // time Record or Go live is pressed.

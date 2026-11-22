@@ -108,6 +108,71 @@ impl AppliedSummary {
     }
 }
 
+/// The six output-affecting settings touched by auto-config apply/rollback (C6/H6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OutputSnapshot {
+    pub encoder: String,
+    pub video_encoder: Option<String>,
+    pub encoder_settings: Map<String, Value>,
+    pub scale: Option<[u32; 2]>,
+    pub fps: u32,
+    pub video_kbps: u32,
+}
+
+impl OutputSnapshot {
+    pub(crate) fn from_settings(s: &StudioSettings) -> Self {
+        Self {
+            encoder: s.encoder.clone(),
+            video_encoder: s.video_encoder.clone(),
+            encoder_settings: s.encoder_settings.clone(),
+            scale: s.scale,
+            fps: s.fps,
+            video_kbps: s.video_kbps,
+        }
+    }
+
+    pub(crate) fn apply_to(&self, target: &mut StudioSettings) {
+        target.encoder = self.encoder.clone();
+        target.video_encoder = self.video_encoder.clone();
+        target.encoder_settings = self.encoder_settings.clone();
+        target.scale = self.scale;
+        target.fps = self.fps;
+        target.video_kbps = self.video_kbps;
+    }
+}
+
+/// On-disk journal recording an unconfirmed auto-config apply so a quit or crash restores the
+/// previous output settings cleanly (C6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PendingApply {
+    pub version: u32,
+    pub snapshot: OutputSnapshot,
+    pub mode: AutoConfigMode,
+    pub applied_label: String,
+    pub saved_at_ms: u64,
+}
+
+pub(crate) fn pending_apply_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("auto-config-pending.json")
+}
+
+fn restore_output_snapshot_to_profile_file(data_dir: &Path, snap: &OutputSnapshot) -> std::io::Result<StudioSettings> {
+    ferrocast_store::durable::flush_saves(Duration::from_millis(500));
+    let profile_path = ferrocast_store::studio_library::load(data_dir)
+        .current_file(data_dir, ferrocast_store::studio_library::Kind::Profiles);
+    let mut current =
+        ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&profile_path, |s| s.check().is_ok())
+            .map(|loaded| loaded.value)
+            .unwrap_or_default();
+    snap.apply_to(&mut current);
+    if current.check().is_err() {
+        current = StudioSettings::default();
+        snap.apply_to(&mut current);
+    }
+    ferrocast_store::durable::save_json_pretty(&profile_path, &current)?;
+    Ok(current)
+}
+
 /// Public snapshot of the auto-config state machine.
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoConfigView {
@@ -1871,7 +1936,7 @@ impl Engine {
             return Err(EngineError::Invalid("encoder: hardware or software.".into()));
         }
 
-        let (mode, picked, candidates, upload_check, duration_ms, timing) = {
+        let (mode, picked, candidates, upload_check, duration_ms, timing, existing_unconfirmed_snap) = {
             self.ensure_no_benchmark_running()?;
             let slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
             match &slot.state {
@@ -1882,6 +1947,7 @@ impl Engine {
                     d.upload_check.clone(),
                     Some(d.duration_ms),
                     slot.timing,
+                    None,
                 ),
                 MachineState::RolledBack(rb) => (
                     rb.mode,
@@ -1890,22 +1956,30 @@ impl Engine {
                     rb.upload_check.clone(),
                     rb.duration_ms,
                     slot.timing,
+                    None,
                 ),
-                MachineState::Applied(a) => {
-                    (a.mode, a.picked.clone(), a.candidates.clone(), a.upload_check.clone(), a.duration_ms, slot.timing)
-                }
+                MachineState::Applied(a) => (
+                    a.mode,
+                    a.picked.clone(),
+                    a.candidates.clone(),
+                    a.upload_check.clone(),
+                    a.duration_ms,
+                    slot.timing,
+                    (!a.confirmed).then(|| a.snapshot.clone()),
+                ),
                 MachineState::Idle | MachineState::Failed(_) | MachineState::Running(_) => {
                     if req.fps.is_none() && req.video_kbps.is_none() && req.encoder.is_none() {
                         return Err(EngineError::Invalid("Run the benchmark or provide settings to apply.".into()));
                     }
-                    (AutoConfigMode::Stream, None, Vec::new(), None, None, slot.timing)
+                    (AutoConfigMode::Stream, None, Vec::new(), None, None, slot.timing, None)
                 }
             }
         };
 
         let host = self.studio_host()?;
-        let snapshot = host.settings().await;
-        let mut next = snapshot.clone();
+        let current = host.settings().await;
+        let snapshot = existing_unconfirmed_snap.unwrap_or_else(|| current.clone());
+        let mut next = current;
 
         if let Some(p) = &picked {
             next.encoder = p.encoder.clone();
@@ -1935,9 +2009,27 @@ impl Engine {
         }
         next.check()?;
 
-        let _ = self.studio_set_settings(next.clone()).await?;
         let summary =
             AppliedSummary::from_settings(&next, req.label.or_else(|| picked.as_ref().map(|p| p.label.clone())));
+        let pending_path = pending_apply_path(self.data_dir());
+        let had_pending_before = pending_path.exists();
+        let pending = PendingApply {
+            version: 1,
+            snapshot: OutputSnapshot::from_settings(&snapshot),
+            mode,
+            applied_label: summary.label.clone(),
+            saved_at_ms: now().0.max(0) as u64,
+        };
+        if let Err(e) = ferrocast_store::durable::save_json_pretty(&pending_path, &pending) {
+            tracing::warn!(error = %e, "couldn't persist auto-config pending journal");
+        }
+
+        if let Err(e) = self.studio_set_settings(next.clone()).await {
+            if !had_pending_before {
+                ferrocast_store::durable::remove_with_backup(&pending_path);
+            }
+            return Err(e);
+        }
 
         let baseline = StatBaseline::default();
         let (watch_id, view) = {
@@ -1996,6 +2088,7 @@ impl Engine {
         }
         let view = slot.view();
         drop(slot);
+        ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
         self.emit_auto_config_frame(&view);
         Ok(view)
     }
@@ -2034,6 +2127,7 @@ impl Engine {
         };
 
         self.studio_set_settings(snapshot).await?;
+        ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
 
         let view = {
             let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
@@ -2069,6 +2163,141 @@ impl Engine {
         }
 
         Ok(view)
+    }
+
+    /// Startup recovery for C6: if Ferrocast crashed or exited with an unconfirmed auto-config apply
+    /// pending on disk, immediately restore the saved pre-apply output fields on the active profile
+    /// and queue host restoration for when `StudioHost` attaches.
+    pub(crate) fn recover_pending_auto_config_on_startup(&self) {
+        let pending_path = pending_apply_path(self.data_dir());
+        let Some(loaded) =
+            ferrocast_store::durable::load_json_with_backup::<PendingApply>(&pending_path, |p| p.version == 1)
+        else {
+            return;
+        };
+        let pending = loaded.value;
+        match restore_output_snapshot_to_profile_file(self.data_dir(), &pending.snapshot) {
+            Ok(_) => ferrocast_store::durable::remove_with_backup(&pending_path),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to restore unconfirmed auto-config settings to profile file on startup");
+            }
+        }
+        *self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()) = Some(pending);
+    }
+
+    /// Flushes any pending startup rollback onto the attached `StudioHost` (e.g. `DesktopStudio` or test mock).
+    pub(crate) async fn flush_pending_startup_restore_to_host(&self) {
+        if self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).is_none() {
+            return;
+        }
+        let _op = self.studio().auto_config_op.lock().await;
+        let pending = {
+            let guard = self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner());
+            guard.clone()
+        };
+        let Some(pending) = pending else { return };
+        let Ok(host) = self.studio_host() else { return };
+        let mut cur = host.settings().await;
+        pending.snapshot.apply_to(&mut cur);
+        if let Err(e) = cur.check() {
+            tracing::warn!(error = %e, "pending startup auto-config snapshot failed validation; discarding");
+            self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).take();
+            ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
+            return;
+        }
+        if let Err(e) = host.set_settings(cur).await {
+            tracing::warn!(error = %e, "failed to apply startup auto-config rollback to StudioHost");
+            return;
+        }
+        self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).take();
+        ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
+        let saved = host.settings().await;
+        self.note_studio_settings(&saved);
+        self.send_golive_pub();
+        self.send_live(LiveFrame::new(
+            "notice",
+            &Notice::new(NoticeLevel::Warn, "Previous encoder settings restored").key("auto_config_rollback").detail(
+                format!(
+                    "Restored your previous encoder settings because {} wasn't kept before Ferrocast closed.",
+                    pending.applied_label
+                ),
+            ),
+        ));
+    }
+
+    /// Clean-quit safeguard for C6: any unconfirmed auto-config apply is rolled back synchronously
+    /// onto disk (and onto an attached host if responsive) before `Engine::shutdown` completes.
+    pub(crate) fn restore_pending_auto_config_on_shutdown(&self) {
+        let pending_path = pending_apply_path(self.data_dir());
+        let from_slot = {
+            let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+            match &slot.state {
+                MachineState::Applied(a) if !a.confirmed => {
+                    let snap = OutputSnapshot::from_settings(&a.snapshot);
+                    let restored = AppliedSummary::from_settings(&a.snapshot, None);
+                    let candidates = a.candidates.clone();
+                    let upload_check = a.upload_check.clone();
+                    let picked = a.picked.clone();
+                    let mode = a.mode;
+                    let duration_ms = a.duration_ms;
+                    slot.seq = slot.seq.saturating_add(1);
+                    slot.state = MachineState::RolledBack(RolledBackInner {
+                        trigger: RollbackTrigger::Timeout,
+                        reason: "Restored your previous settings when Ferrocast closed before Keep.".into(),
+                        restored,
+                        candidates,
+                        upload_check,
+                        picked,
+                        mode,
+                        duration_ms,
+                    });
+                    Some(snap)
+                }
+                _ => None,
+            }
+        };
+
+        let snap = from_slot.or_else(|| {
+            ferrocast_store::durable::load_json_with_backup::<PendingApply>(&pending_path, |p| p.version == 1)
+                .map(|loaded| loaded.value.snapshot)
+        });
+        let Some(snap) = snap else {
+            return;
+        };
+
+        let disk_ok = match restore_output_snapshot_to_profile_file(self.data_dir(), &snap) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't restore unconfirmed auto-config settings to profile file on shutdown");
+                false
+            }
+        };
+
+        if let Ok(host) = self.studio_host() {
+            let snap_host = snap.clone();
+            if let Ok(handle) =
+                std::thread::Builder::new().name("ferrocast-autoconfig-shutdown".into()).spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        rt.block_on(async move {
+                            let _ = tokio::time::timeout(Duration::from_millis(250), async {
+                                let mut cur = host.settings().await;
+                                snap_host.apply_to(&mut cur);
+                                if cur.check().is_ok() {
+                                    let _ = host.set_settings(cur).await;
+                                }
+                            })
+                            .await;
+                        });
+                    }
+                })
+            {
+                let _ = handle.join();
+            }
+        }
+
+        if disk_ok {
+            ferrocast_store::durable::remove_with_backup(&pending_path);
+        }
     }
 
     async fn watch_rollback_loop(self, watch_id: u64, poll: Duration) {
@@ -3017,5 +3246,146 @@ mod tests {
         assert_eq!(offered2.rollback_trigger, Some(RollbackTrigger::Timeout));
         let kept = engine.auto_config_keep().unwrap();
         assert!(!kept.rollback_offered);
+    }
+
+    #[tokio::test]
+    async fn c6_unconfirmed_apply_restored_on_clean_shutdown_unless_kept() {
+        use ferrocast_store::durable::{load_json_with_backup, save_json_pretty};
+        use ferrocast_store::studio_library::{Kind, load as load_library};
+
+        let dir = tempfile::tempdir().unwrap();
+        let initial =
+            StudioSettings { encoder: "software".into(), fps: 30, video_kbps: 3500, ..StudioSettings::default() };
+        let profile_path = load_library(dir.path()).current_file(dir.path(), Kind::Profiles);
+        save_json_pretty(&profile_path, &initial).unwrap();
+
+        let engine = Engine::start(dir.path()).await.unwrap();
+        let host = Arc::new(BenchMockHost::default());
+        *host.settings.lock().unwrap() = initial.clone();
+        engine.set_studio_host(host.clone());
+        engine.set_auto_config_timing_for_test(BenchTiming::fast_test());
+
+        engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let pending_file = dir.path().join("auto-config-pending.json");
+        assert!(pending_file.exists(), "unconfirmed apply must persist pending rollback journal");
+
+        // Clean quit without clicking Keep must restore pre-apply settings on both disk profile & host.
+        engine.shutdown();
+        assert!(!pending_file.exists(), "shutdown restore should clear pending rollback journal");
+        let on_disk = load_json_with_backup::<StudioSettings>(&profile_path, |s| s.check().is_ok())
+            .expect("profile file should exist on disk")
+            .value;
+        assert_eq!(on_disk.video_kbps, 3500);
+        assert_eq!(on_disk.fps, 30);
+        assert_eq!(on_disk.encoder, "software");
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 3500);
+
+        // Kept apply must clear the pending journal and survive clean shutdown.
+        let engine2 = Engine::start(dir.path()).await.unwrap();
+        let host2 = Arc::new(BenchMockHost::default());
+        *host2.settings.lock().unwrap() = initial;
+        engine2.set_studio_host(host2.clone());
+        engine2.set_auto_config_timing_for_test(BenchTiming::fast_test());
+
+        engine2
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6200),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(pending_file.exists());
+        engine2.auto_config_keep().unwrap();
+        assert!(!pending_file.exists(), "Keep must clear pending rollback journal");
+
+        // Simulate desktop flushing kept settings to profile file as well.
+        save_json_pretty(&profile_path, &*host2.settings.lock().unwrap()).unwrap();
+        engine2.shutdown();
+        let kept_disk = load_json_with_backup::<StudioSettings>(&profile_path, |s| s.check().is_ok()).unwrap().value;
+        assert_eq!(kept_disk.video_kbps, 6200);
+        assert_eq!(host2.settings.lock().unwrap().video_kbps, 6200);
+    }
+
+    #[tokio::test]
+    async fn c6_unconfirmed_apply_survives_crash_and_restores_on_next_start_unless_kept() {
+        use ferrocast_store::durable::{load_json_with_backup, save_json_pretty};
+        use ferrocast_store::studio_library::{Kind, load as load_library};
+
+        let dir = tempfile::tempdir().unwrap();
+        let initial =
+            StudioSettings { encoder: "software".into(), fps: 30, video_kbps: 3500, ..StudioSettings::default() };
+        let profile_path = load_library(dir.path()).current_file(dir.path(), Kind::Profiles);
+        save_json_pretty(&profile_path, &initial).unwrap();
+        let pending_file = dir.path().join("auto-config-pending.json");
+
+        {
+            let engine1 = Engine::start(dir.path()).await.unwrap();
+            let host1 = Arc::new(BenchMockHost::default());
+            *host1.settings.lock().unwrap() = initial.clone();
+            engine1.set_studio_host(host1.clone());
+            engine1.set_auto_config_timing_for_test(BenchTiming::fast_test());
+
+            engine1
+                .auto_config_apply(ApplyReq {
+                    encoder: Some("hardware".into()),
+                    fps: Some(60),
+                    video_kbps: Some(6000),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(pending_file.exists());
+            // Simulate desktop having written the unconfirmed settings to the active profile JSON.
+            save_json_pretty(&profile_path, &*host1.settings.lock().unwrap()).unwrap();
+            // Drop without calling `shutdown()` to simulate a crash / SIGKILL.
+        }
+
+        // Next start sees the unconfirmed journal and immediately restores the disk profile AND host.
+        let engine2 = Engine::start(dir.path()).await.unwrap();
+        assert!(!pending_file.exists(), "startup recovery should clear pending journal after disk restore");
+        let restored_disk =
+            load_json_with_backup::<StudioSettings>(&profile_path, |s| s.check().is_ok()).unwrap().value;
+        assert_eq!(restored_disk.video_kbps, 3500);
+        assert_eq!(restored_disk.fps, 30);
+        assert_eq!(restored_disk.encoder, "software");
+
+        let host2 = Arc::new(BenchMockHost::default());
+        *host2.settings.lock().unwrap() =
+            StudioSettings { encoder: "hardware".into(), fps: 60, video_kbps: 6000, ..StudioSettings::default() };
+        engine2.set_studio_host(host2.clone());
+        let resolved = engine2.studio_settings().await.unwrap();
+        assert_eq!(resolved.video_kbps, 3500);
+        assert_eq!(host2.settings.lock().unwrap().video_kbps, 3500);
+
+        // Kept apply must survive a crash too without rolling back on next start.
+        engine2.set_auto_config_timing_for_test(BenchTiming::fast_test());
+        engine2
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6500),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        engine2.auto_config_keep().unwrap();
+        save_json_pretty(&profile_path, &*host2.settings.lock().unwrap()).unwrap();
+        drop(engine2);
+
+        let engine3 = Engine::start(dir.path()).await.unwrap();
+        let disk_after_kept =
+            load_json_with_backup::<StudioSettings>(&profile_path, |s| s.check().is_ok()).unwrap().value;
+        assert_eq!(disk_after_kept.video_kbps, 6500);
+        engine3.shutdown();
     }
 }
