@@ -131,6 +131,8 @@ pub struct AutoConfigView {
     pub watch_remaining_s: u32,
     pub first_minute_drops: u64,
     pub first_minute_lags: u64,
+    #[serde(default)]
+    pub rollback_offered: bool,
     pub rollback_trigger: Option<RollbackTrigger>,
     pub rollback_reason: Option<String>,
     pub restored: Option<AppliedSummary>,
@@ -213,13 +215,19 @@ impl BenchTiming {
 struct StatBaseline {
     lagged: Option<u64>,
     skipped: Option<u64>,
-    dropped: Option<u64>,
     accumulated_lags: u64,
     accumulated_drops: u64,
 }
 
 impl StatBaseline {
-    fn observe(&mut self, lagged: u64, skipped: u64, dropped: u64) -> (u64, u64) {
+    fn start_live(&mut self, skipped: u64, lagged: u64) {
+        self.skipped = Some(skipped);
+        self.lagged = Some(lagged);
+    }
+
+    /// Observes only encoder-caused skips (`skipped`) and engine render lag (`lagged`) while an
+    /// output is actively encoding; network socket drops are excluded (C5).
+    fn observe_live(&mut self, skipped: u64, lagged: u64) -> (u64, u64) {
         let step_counter = |prev: &mut Option<u64>, cur: u64| -> u64 {
             match *prev {
                 None => {
@@ -230,17 +238,17 @@ impl StatBaseline {
                     *prev = Some(cur);
                     cur - p
                 }
-                // Stream or engine restarted mid-window: new baseline starts at cur.
+                // Engine restarted mid-window: new baseline starts at cur.
                 Some(_) => {
                     *prev = Some(cur);
                     cur
                 }
             }
         };
-        let dl = step_counter(&mut self.lagged, lagged) + step_counter(&mut self.skipped, skipped);
-        let dd = step_counter(&mut self.dropped, dropped);
+        let ds = step_counter(&mut self.skipped, skipped);
+        let dl = step_counter(&mut self.lagged, lagged);
+        self.accumulated_drops = self.accumulated_drops.saturating_add(ds);
         self.accumulated_lags = self.accumulated_lags.saturating_add(dl);
-        self.accumulated_drops = self.accumulated_drops.saturating_add(dd);
         (self.accumulated_drops, self.accumulated_lags)
     }
 }
@@ -252,7 +260,14 @@ struct AppliedInner {
     confirmed: bool,
     applied_mono: Instant,
     confirm_deadline: Instant,
-    watch_deadline: Instant,
+    watch_window: Duration,
+    watch_started: Option<Instant>,
+    watch_deadline: Option<Instant>,
+    was_live: bool,
+    pending_offer: Option<(RollbackTrigger, String)>,
+    rollback_offered: bool,
+    rollback_trigger: Option<RollbackTrigger>,
+    rollback_reason: Option<String>,
     baseline: StatBaseline,
     candidates: Vec<BenchCandidate>,
     upload_check: Option<UploadCheck>,
@@ -388,6 +403,7 @@ impl AutoConfigSlot {
                 watch_remaining_s: 0,
                 first_minute_drops: 0,
                 first_minute_lags: 0,
+                rollback_offered: false,
                 rollback_trigger: None,
                 rollback_reason: None,
                 restored: None,
@@ -413,6 +429,7 @@ impl AutoConfigSlot {
                 watch_remaining_s: 0,
                 first_minute_drops: 0,
                 first_minute_lags: 0,
+                rollback_offered: false,
                 rollback_trigger: None,
                 rollback_reason: None,
                 restored: None,
@@ -438,6 +455,7 @@ impl AutoConfigSlot {
                 watch_remaining_s: 0,
                 first_minute_drops: 0,
                 first_minute_lags: 0,
+                rollback_offered: false,
                 rollback_trigger: None,
                 rollback_reason: None,
                 restored: None,
@@ -463,20 +481,21 @@ impl AutoConfigSlot {
                 watch_remaining_s: 0,
                 first_minute_drops: 0,
                 first_minute_lags: 0,
+                rollback_offered: false,
                 rollback_trigger: None,
                 rollback_reason: None,
                 restored: None,
             },
             MachineState::Applied(a) => {
-                let confirm_rem = if a.confirmed || t_now >= a.confirm_deadline {
+                let confirm_rem = if a.confirmed || a.rollback_offered || t_now >= a.confirm_deadline {
                     0
                 } else {
                     ceil_secs(a.confirm_deadline.saturating_duration_since(t_now))
                 };
-                let watch_rem = if t_now >= a.watch_deadline {
-                    0
-                } else {
-                    ceil_secs(a.watch_deadline.saturating_duration_since(t_now))
+                let watch_rem = match a.watch_deadline {
+                    None => ceil_secs(a.watch_window),
+                    Some(d) if t_now >= d => 0,
+                    Some(d) => ceil_secs(d.saturating_duration_since(t_now)),
                 };
                 AutoConfigView {
                     state: AutoConfigStateKind::Applied,
@@ -499,8 +518,9 @@ impl AutoConfigSlot {
                     watch_remaining_s: watch_rem,
                     first_minute_drops: a.baseline.accumulated_drops,
                     first_minute_lags: a.baseline.accumulated_lags,
-                    rollback_trigger: None,
-                    rollback_reason: None,
+                    rollback_offered: a.rollback_offered,
+                    rollback_trigger: a.rollback_trigger,
+                    rollback_reason: a.rollback_reason.clone(),
                     restored: None,
                 }
             }
@@ -525,6 +545,7 @@ impl AutoConfigSlot {
                 watch_remaining_s: 0,
                 first_minute_drops: 0,
                 first_minute_lags: 0,
+                rollback_offered: false,
                 rollback_trigger: Some(rb.trigger),
                 rollback_reason: Some(rb.reason.clone()),
                 restored: Some(rb.restored.clone()),
@@ -1918,17 +1939,7 @@ impl Engine {
         let summary =
             AppliedSummary::from_settings(&next, req.label.or_else(|| picked.as_ref().map(|p| p.label.clone())));
 
-        let mut baseline = StatBaseline::default();
-        let (gl_drop, _) = self.golive_trouble();
-        if let Ok(st) = host.stats().await {
-            let e = &st["engine"];
-            let s = &st["stream"];
-            let lagged = e["lagged"].as_u64().unwrap_or(0);
-            let skipped = e["skipped"].as_u64().unwrap_or(0);
-            let dropped = s["dropped"].as_u64().unwrap_or(0).saturating_add(gl_drop);
-            baseline.observe(lagged, skipped, dropped);
-        }
-
+        let baseline = StatBaseline::default();
         let (watch_id, view) = {
             let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
             let watch_id = slot.seq.saturating_add(1);
@@ -1940,7 +1951,14 @@ impl Engine {
                 confirmed: false,
                 applied_mono: now_t,
                 confirm_deadline: now_t + timing.confirm_timeout,
-                watch_deadline: now_t + timing.watch_window,
+                watch_window: timing.watch_window,
+                watch_started: None,
+                watch_deadline: None,
+                was_live: false,
+                pending_offer: None,
+                rollback_offered: false,
+                rollback_trigger: None,
+                rollback_reason: None,
                 baseline,
                 candidates,
                 upload_check,
@@ -1960,14 +1978,22 @@ impl Engine {
         Ok(view)
     }
 
-    /// Confirms the applied settings, cancelling the 30 s auto-rollback timer while continuing the
-    /// 1-minute dropped/lagged-frame protection window.
+    /// Confirms applied settings (clearing the 30 s timer and any post-stream rollback offer).
     pub fn auto_config_keep(&self) -> Result<AutoConfigView, EngineError> {
         let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
         let MachineState::Applied(a) = &mut slot.state else {
             return Err(EngineError::Conflict("There are no newly applied settings waiting to be kept.".into()));
         };
+        let was_offered = a.rollback_offered;
         a.confirmed = true;
+        a.pending_offer = None;
+        a.rollback_offered = false;
+        a.rollback_trigger = None;
+        a.rollback_reason = None;
+        let done_watch = a.watch_deadline.is_some_and(|d| Instant::now() >= d);
+        if was_offered || done_watch {
+            slot.state = MachineState::Idle;
+        }
         let view = slot.view();
         drop(slot);
         self.emit_auto_config_frame(&view);
@@ -2046,31 +2072,135 @@ impl Engine {
     }
 
     async fn watch_rollback_loop(self, watch_id: u64, poll: Duration) {
+        let is_output_encoding_live = |st: &Value| -> bool {
+            let active = |k: &str| st[k]["active"].as_bool() == Some(true);
+            active("stream") || active("record") || active("vertical_stream") || active("light_stream")
+        };
+
         let mut interval = tokio::time::interval(poll);
         interval.tick().await;
         loop {
             interval.tick().await;
 
-            let action = {
-                let slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+            let st = match self.studio_host() {
+                Ok(host) => host.stats().await.ok(),
+                Err(_) => None,
+            };
+            let output_live = st.as_ref().is_some_and(is_output_encoding_live);
+
+            enum LoopStep {
+                Continue,
+                OfferAfterStream { view: AutoConfigView, reason: String },
+                TimeoutOffline,
+                WatchComplete,
+                Stop,
+            }
+
+            let step = {
+                let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
                 if slot.seq != watch_id {
                     return;
                 }
-                let MachineState::Applied(a) = &slot.state else {
+                let MachineState::Applied(a) = &mut slot.state else {
                     return;
                 };
                 let now_t = Instant::now();
-                if !a.confirmed && now_t >= a.confirm_deadline {
-                    Some(WatchDecision::Timeout)
-                } else if a.confirmed && now_t >= a.watch_deadline {
-                    Some(WatchDecision::WatchComplete)
+
+                if output_live {
+                    let st_ref = st.as_ref().expect("checked output_live");
+                    let lagged = st_ref["engine"]["lagged"].as_u64().unwrap_or(0);
+                    let skipped = st_ref["engine"]["skipped"].as_u64().unwrap_or(0);
+
+                    // Start the first-minute clock only once live encoding begins (C5).
+                    if a.watch_started.is_none() {
+                        a.watch_started = Some(now_t);
+                        a.watch_deadline = Some(now_t + a.watch_window);
+                        a.baseline.start_live(skipped, lagged);
+                    } else if !a.was_live {
+                        a.baseline.start_live(skipped, lagged);
+                    }
+                    a.was_live = true;
+
+                    // Count only encoder-caused skips while live; never mutate settings mid-stream.
+                    if a.watch_deadline.is_some_and(|d| now_t < d) && a.pending_offer.is_none() && !a.rollback_offered {
+                        let (drops, _lags) = a.baseline.observe_live(skipped, lagged);
+                        if drops >= FIRST_MINUTE_DROP_THRESHOLD {
+                            a.pending_offer = Some((
+                                RollbackTrigger::DroppedFrames,
+                                format!(
+                                    "First minute dropped {drops} encoder-skipped frames. Undo to restore your previous settings, or Keep."
+                                ),
+                            ));
+                        }
+                    }
+                    if !a.confirmed && now_t >= a.confirm_deadline && a.pending_offer.is_none() && !a.rollback_offered {
+                        a.pending_offer = Some((
+                            RollbackTrigger::Timeout,
+                            "Settings weren't confirmed within 30 s while live. Restore your previous settings or Keep."
+                                .into(),
+                        ));
+                    }
+
+                    if a.watch_deadline.is_some_and(|d| now_t >= d)
+                        && a.confirmed
+                        && a.pending_offer.is_none()
+                        && !a.rollback_offered
+                    {
+                        LoopStep::WatchComplete
+                    } else {
+                        LoopStep::Continue
+                    }
                 } else {
-                    None
+                    // Offline or stream/recording just ended.
+                    if a.was_live {
+                        a.was_live = false;
+                        if let Some((trig, reason)) = a.pending_offer.take() {
+                            a.rollback_offered = true;
+                            a.rollback_trigger = Some(trig);
+                            a.rollback_reason = Some(reason.clone());
+                            let view = slot.view();
+                            LoopStep::OfferAfterStream { view, reason }
+                        } else if a.watch_deadline.is_some_and(|d| now_t >= d) && a.confirmed && !a.rollback_offered {
+                            LoopStep::WatchComplete
+                        } else if !a.confirmed && !a.rollback_offered && now_t >= a.confirm_deadline {
+                            LoopStep::TimeoutOffline
+                        } else {
+                            LoopStep::Continue
+                        }
+                    } else if !a.confirmed
+                        && !a.rollback_offered
+                        && a.pending_offer.is_none()
+                        && now_t >= a.confirm_deadline
+                    {
+                        LoopStep::TimeoutOffline
+                    } else if a.watch_started.is_some()
+                        && a.watch_deadline.is_some_and(|d| now_t >= d)
+                        && a.confirmed
+                        && !a.rollback_offered
+                    {
+                        LoopStep::WatchComplete
+                    } else if a.rollback_offered {
+                        LoopStep::Stop
+                    } else {
+                        LoopStep::Continue
+                    }
                 }
             };
 
-            match action {
-                Some(WatchDecision::Timeout) => {
+            match step {
+                LoopStep::Continue => {}
+                LoopStep::Stop => return,
+                LoopStep::OfferAfterStream { view, reason } => {
+                    self.emit_auto_config_frame(&view);
+                    self.send_live(LiveFrame::new(
+                        "notice",
+                        &Notice::new(NoticeLevel::Warn, "Encoder dropped frames during your stream — rollback ready")
+                            .key("auto_config_rollback_offer")
+                            .detail(reason),
+                    ));
+                    return;
+                }
+                LoopStep::TimeoutOffline => {
                     if let Err(e) = self
                         .rollback_now(
                             Some(watch_id),
@@ -2083,73 +2213,20 @@ impl Engine {
                     }
                     return;
                 }
-                Some(WatchDecision::WatchComplete) => {
+                LoopStep::WatchComplete => {
                     let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
                     if slot.seq != watch_id {
                         return;
                     }
-                    if let MachineState::Applied(a) = std::mem::replace(&mut slot.state, MachineState::Idle) {
-                        if let Some(picked) = a.picked {
-                            slot.state = MachineState::Done(DoneInner {
-                                mode: a.mode,
-                                candidates: a.candidates,
-                                upload_check: a.upload_check,
-                                upload_error: None,
-                                picked,
-                                duration_ms: a.duration_ms.unwrap_or(0),
-                            });
-                        }
-                        let view = slot.view();
-                        drop(slot);
-                        self.emit_auto_config_frame(&view);
-                    }
-                    return;
-                }
-                None => {}
-            }
-
-            // First-minute dropped/lagged check via live stats.
-            if let Ok(host) = self.studio_host()
-                && let Ok(st) = host.stats().await
-            {
-                let (gl_drop, _) = self.golive_trouble();
-                let lagged = st["engine"]["lagged"].as_u64().unwrap_or(0);
-                let skipped = st["engine"]["skipped"].as_u64().unwrap_or(0);
-                let dropped = st["stream"]["dropped"].as_u64().unwrap_or(0).saturating_add(gl_drop);
-
-                let bad = {
-                    let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
-                    if slot.seq != watch_id {
-                        return;
-                    }
-                    let MachineState::Applied(a) = &mut slot.state else {
-                        return;
-                    };
-                    if Instant::now() < a.watch_deadline {
-                        let (tot_drops, tot_lags) = a.baseline.observe(lagged, skipped, dropped);
-                        (tot_drops + tot_lags >= FIRST_MINUTE_DROP_THRESHOLD).then_some((tot_drops, tot_lags))
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some((drops, lags)) = bad {
-                    let reason = format!(
-                        "Automatically rolled back because the first minute showed {drops} dropped and {lags} lagged/skipped frames."
-                    );
-                    if let Err(e) = self.rollback_now(Some(watch_id), RollbackTrigger::DroppedFrames, reason).await {
-                        tracing::warn!(error = %e, "auto-config drop rollback failed");
-                    }
+                    slot.state = MachineState::Idle;
+                    let view = slot.view();
+                    drop(slot);
+                    self.emit_auto_config_frame(&view);
                     return;
                 }
             }
         }
     }
-}
-
-enum WatchDecision {
-    Timeout,
-    WatchComplete,
 }
 
 #[cfg(test)]
@@ -2488,6 +2565,8 @@ mod tests {
         assert_eq!(kept.state, AutoConfigStateKind::Applied);
         assert!(kept.confirmed);
 
+        // Live stream starts cleanly with 0 encoder drops; watch timer starts now and completes cleanly.
+        host.streaming.store(true, Ordering::Relaxed);
         // Wait past fast confirm_timeout (180 ms) — still not rolled back because Keep was clicked.
         tokio::time::sleep(Duration::from_millis(240)).await;
         assert_eq!(host.settings.lock().unwrap().video_kbps, 6000);
@@ -2568,15 +2647,28 @@ mod tests {
             .unwrap();
         engine.auto_config_keep().unwrap();
 
-        // Stream starts cleanly, then starts dropping/lagging frames within the watch window.
-        host.dropped.store(4, Ordering::Relaxed);
-        host.lagged.store(3, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Live stream starts, then encoder drops frames within the watch window.
+        host.streaming.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        host.skipped.store(6, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let status = engine.auto_config_status();
-        assert_eq!(status.state, AutoConfigStateKind::RolledBack);
-        assert_eq!(status.rollback_trigger, Some(RollbackTrigger::DroppedFrames));
-        assert!(status.rollback_reason.unwrap_or_default().contains("dropped"));
+        // Settings MUST NOT mutate mid-stream!
+        assert_eq!(engine.auto_config_status().state, AutoConfigStateKind::Applied);
+        assert!(!engine.auto_config_status().rollback_offered, "defer offer presentation until stream ends");
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 6000);
+
+        // End stream -> rollback offer surfaces after stream, user invokes Undo cleanly offline.
+        host.streaming.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let offered = engine.auto_config_status();
+        assert_eq!(offered.state, AutoConfigStateKind::Applied);
+        assert!(offered.rollback_offered);
+        assert_eq!(offered.rollback_trigger, Some(RollbackTrigger::DroppedFrames));
+        assert!(offered.rollback_reason.unwrap_or_default().contains("dropped"));
+
+        let rb = engine.auto_config_undo().await.unwrap();
+        assert_eq!(rb.state, AutoConfigStateKind::RolledBack);
         assert_eq!(host.settings.lock().unwrap().video_kbps, 3500);
         assert_eq!(host.settings.lock().unwrap().fps, 30);
     }
@@ -2843,5 +2935,87 @@ mod tests {
         assert_eq!(hw_mac.len(), 1);
         assert_eq!(hw_mac[0].studio_encoder_id, "com.apple.videotoolbox.videoencoder.ave.avc");
         assert!(hw_mac[0].ffmpeg_name.is_none());
+    }
+
+    #[tokio::test]
+    async fn c5_live_stream_never_mutates_ignores_network_drops_and_waits_for_stream() {
+        let (engine, host, _dir) = test_engine().await;
+        host.settings.lock().unwrap().video_kbps = 3500;
+        engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let baseline_saves = host.save_count.load(Ordering::Relaxed);
+        engine.auto_config_keep().unwrap();
+
+        // 1. Offline preview lags + waiting past watch_window offline must NOT expire the live watch
+        // or roll back settings before the stream starts.
+        host.lagged.store(12, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(
+            engine.auto_config_status().state,
+            AutoConfigStateKind::Applied,
+            "watch clock must wait until live output starts"
+        );
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 6000);
+
+        // 2. Stream goes live; pure network drops (`stream.dropped`) must NOT count as encoder drops
+        // and must NEVER mutate live settings.
+        host.streaming.store(true, Ordering::Relaxed);
+        host.dropped.store(25, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(engine.auto_config_status().first_minute_drops, 0, "network drops must not count");
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 6000);
+        assert_eq!(host.save_count.load(Ordering::Relaxed), baseline_saves);
+
+        // 3. Encoder-caused drops (`engine.skipped`) occur while live: settings MUST stay untouched
+        // on air, and rollback is offered after the stream ends instead.
+        host.skipped.store(7, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            host.settings.lock().unwrap().video_kbps,
+            6000,
+            "live broadcast settings must NEVER change mid-stream"
+        );
+        assert_eq!(host.save_count.load(Ordering::Relaxed), baseline_saves);
+
+        // Stream ends -> rollback is now offered (`RolledBack` is NOT auto-forced, user can Undo).
+        host.streaming.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let post = engine.auto_config_status();
+        assert_eq!(post.state, AutoConfigStateKind::Applied);
+        assert!(post.rollback_offered, "rollback_offered should turn true after stream ends");
+        assert_eq!(post.rollback_trigger, Some(RollbackTrigger::DroppedFrames));
+        assert!(post.first_minute_drops >= 5);
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 6000);
+        let undone = engine.auto_config_undo().await.unwrap();
+        assert_eq!(undone.state, AutoConfigStateKind::RolledBack);
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 3500);
+
+        // Also test unconfirmed 30s timeout while LIVE: never mutates settings mid-stream.
+        engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(7000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        host.streaming.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(260)).await;
+        assert_eq!(host.settings.lock().unwrap().video_kbps, 7000, "timeout must not mutate live stream");
+        host.streaming.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let offered2 = engine.auto_config_status();
+        assert!(offered2.rollback_offered);
+        assert_eq!(offered2.rollback_trigger, Some(RollbackTrigger::Timeout));
+        let kept = engine.auto_config_keep().unwrap();
+        assert!(!kept.rollback_offered);
     }
 }
