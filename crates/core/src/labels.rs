@@ -486,13 +486,24 @@ impl ComboTrain {
         expired
     }
 
-    /// Processes a single incoming event at `event.occurred_at`.
+    /// Processes a single incoming event using `event.occurred_at` as the clock.
     pub fn observe(&mut self, event: &Event) {
+        self.observe_at(event, event.occurred_at);
+    }
+
+    /// Processes a single incoming event anchored at caller-supplied monotonic wall clock `now`.
+    pub fn observe_at(&mut self, event: &Event, now: Millis) {
         if event.origin != Origin::Live {
             return;
         }
         if let EventKind::Reversal { original_source_id, .. } = &event.kind {
-            self.reverse(original_source_id, event.occurred_at);
+            self.reverse(original_source_id, now);
+            return;
+        }
+        // Ignore obviously historical/backdated events (>1h older than local clock) while
+        // tolerating normal platform-vs-PC clock skew so real-time arrivals anchor to `now`.
+        const MAX_TRAIN_CLOCK_SKEW_MS: i64 = 3_600_000;
+        if now.0.saturating_sub(event.occurred_at.0) > MAX_TRAIN_CLOCK_SKEW_MS {
             return;
         }
         let Some((actor_key, actor_name)) = train_actor(event) else {
@@ -503,7 +514,6 @@ impl ComboTrain {
         {
             return;
         }
-        let now = event.occurred_at;
         self.tick(now);
 
         let pulse = TrainPulse { at: now, actor_key, actor_name, source_id: event.source_id.clone() };
@@ -511,10 +521,11 @@ impl ComboTrain {
         let step_ms = self.step_ms();
         let max_ms = self.max_ms();
         if let Some(a) = &mut self.active {
-            // Inside active window: extend countdown by `step_ms`, capped at `now + max_ms`.
+            // Inside active window: extend countdown by `step_ms`, capped at `now + max_ms`,
+            // while never shrinking an existing deadline on out-of-order events.
             let extended = a.ends_at.0.saturating_add(step_ms);
             let capped = now.0.saturating_add(max_ms);
-            a.ends_at = Millis(extended.min(capped));
+            a.ends_at = Millis(a.ends_at.0.max(extended.min(capped)));
             a.events.push(pulse);
             return;
         }
@@ -531,10 +542,13 @@ impl ComboTrain {
         self.reversed.insert(original_source_id.to_string());
         self.tick(now);
         self.warmup.retain(|p| p.source_id.as_deref() != Some(original_source_id));
+        let threshold = usize::try_from(self.cfg.threshold.max(1)).unwrap_or(1);
         if let Some(a) = &mut self.active {
             a.events.retain(|p| p.source_id.as_deref() != Some(original_source_id));
-            if a.events.is_empty() {
+            if a.events.len() < threshold {
+                let remaining = std::mem::take(&mut a.events);
                 self.active = None;
+                self.warmup = remaining.into_iter().collect();
             }
         }
     }
@@ -1136,5 +1150,36 @@ mod tests {
         assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("Anonymous $10"));
         assert!(!train.view(Millis(5_000)).active, "zero/neg tips must not ignite 2-event train");
         assert_eq!(train.view(Millis(5_000)).warmup_count, 1);
+    }
+
+    #[test]
+    fn hype_train_never_shrinks_ends_at_and_deactivates_below_threshold_on_reversal() {
+        let cfg = ComboTrainConfig { window_s: 60, step_s: 15, max_s: 90, threshold: 3 };
+        let mut train = ComboTrain::new(cfg);
+
+        // Ignite at t=100_000 -> ends_at = 160_000; push to 190_000
+        train.observe(&follow(90_000, "A"));
+        train.observe(&follow(95_000, "B"));
+        train.observe(&follow(100_000, "C"));
+        train.observe(&follow(100_000, "D"));
+        train.observe(&follow(100_000, "E"));
+        assert_eq!(train.view(Millis(100_000)).ends_at, Some(Millis(190_000)));
+
+        // Out-of-order delayed event with older occurred_at=10_000 must NOT shrink ends_at!
+        train.observe(&follow(10_000, "OutOfOrder"));
+        assert_eq!(train.view(Millis(100_000)).ends_at, Some(Millis(190_000)));
+
+        // Reversing a train-igniting tip so events drop below threshold must deactivate the train
+        let mut tip_train = ComboTrain::new(cfg);
+        tip_train.observe(&follow(10_000, "X"));
+        tip_train.observe(&follow(15_000, "Y"));
+        let rev_target = tip(20_000, "tip-ignite", "Z", 500, "USD", PaymentStatus::Captured);
+        tip_train.observe(&rev_target);
+        assert!(tip_train.view(Millis(20_000)).active);
+
+        tip_train.reverse("tip-ignite", Millis(25_000));
+        let v = tip_train.view(Millis(25_000));
+        assert!(!v.active, "reversed tip leaving < threshold events must deactivate active train");
+        assert_eq!(v.warmup_count, 2);
     }
 }

@@ -2047,7 +2047,7 @@ async fn overlay_labels_track_session_monthly_alltime_latest_and_hype_train() {
     assert_eq!(labels["st"], "₹500");
     assert_eq!(labels["sr"], "1");
     assert_eq!(labels["lr"], "RaiderBob (25)");
-    assert!(labels["ts"].as_str().unwrap().starts_with("Whale"));
+    assert!(labels["ts"].as_str().unwrap().starts_with("BitsKing"));
     let train = &snap["state"]["label_trains"]["ht"];
     assert_eq!(train["active"], true);
     assert_eq!(train["events"], 4);

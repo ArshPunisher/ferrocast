@@ -46,13 +46,11 @@ pub(crate) struct LabelRuntime {
 }
 
 impl LabelRuntime {
-    fn ensure_train(&mut self, cfg: ComboTrainConfig) -> &mut ComboTrain {
+    fn ensure_train(&mut self, cfg: ComboTrainConfig, now_ms: Millis) -> &mut ComboTrain {
         let key = TrainKey::from(cfg);
         if !self.trains.contains_key(&key) && self.trains.len() >= MAX_TRAINS {
-            // Keep trains bounded under adversarial configs by keeping idle trains clean.
-            if let Some(idle_key) =
-                self.trains.iter().find(|(_, t)| !t.view(Millis(i64::MAX / 2)).active).map(|(k, _)| *k)
-            {
+            // Keep trains bounded under adversarial configs by evicting only inactive trains.
+            if let Some(idle_key) = self.trains.iter().find(|(_, t)| !t.view(now_ms).active).map(|(k, _)| *k) {
                 self.trains.remove(&idle_key);
             }
         }
@@ -87,7 +85,7 @@ impl LabelRuntime {
                 .insert(TrainKey::from(ComboTrainConfig::default()), ComboTrain::new(ComboTrainConfig::default()));
         }
         for train in self.trains.values_mut() {
-            train.observe(event);
+            train.observe_at(event, now_ms);
         }
     }
 
@@ -133,7 +131,7 @@ impl Engine {
         rt.latest = latest;
         rt.alltime = alltime;
         rt.monthly.insert(0, ((m_start, m_end), monthly));
-        rt.ensure_train(ComboTrainConfig::default());
+        rt.ensure_train(ComboTrainConfig::default(), now_ms);
         rt.hydrated = true;
     }
 
@@ -181,7 +179,7 @@ impl Engine {
                 } else {
                     rt.session.observe(event);
                     for t in rt.trains.values_mut() {
-                        t.observe(event);
+                        t.observe_at(event, now_ms);
                     }
                 }
             }
@@ -226,7 +224,7 @@ impl Engine {
 
         let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
         for cfg in train_cfgs {
-            rt.ensure_train(cfg);
+            rt.ensure_train(cfg, now_ms);
         }
 
         let mut counter_vars = Vars::new();
@@ -412,5 +410,42 @@ mod tests {
 
         let rt = engine2.inner.labels.lock().unwrap();
         assert_eq!(rt.latest.label(LabelSource::LatestTip).as_deref(), Some("OlderTipper $15"));
+    }
+
+    #[tokio::test]
+    async fn hype_train_anchors_expiry_to_local_clock_and_protects_active_train_under_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        engine.hydrate_labels().await;
+
+        let now_ms = crate::now();
+        let cfg = ComboTrainConfig { window_s: 60, step_s: 15, max_s: 90, threshold: 2 };
+        {
+            let mut rt = engine.inner.labels.lock().unwrap();
+            rt.ensure_train(cfg, now_ms);
+            // Skewed platform timestamps 5 minutes in the past must still ignite using local now_ms
+            for (i, who) in ["Fan1", "Fan2"].into_iter().enumerate() {
+                let mut e = Event::live(
+                    Platform::Twitch,
+                    Some(format!("skew-{i}")),
+                    Millis(now_ms.0 - 300_000 + i as i64 * 1_000),
+                    EventKind::Follow { actor: Actor::named(Platform::Twitch, who) },
+                );
+                e.id = format!("skew-{i}");
+                rt.observe_event(&e, now_ms);
+            }
+            let view = rt.trains.get(&TrainKey::from(cfg)).unwrap().view(now_ms);
+            assert!(view.active, "train must be active at local now_ms even with 5m platform clock lag");
+            assert!(view.ends_at.unwrap().0 > now_ms.0);
+        }
+
+        // Fill MAX_TRAINS other configs and verify the active train is NOT evicted!
+        let mut rt = engine.inner.labels.lock().unwrap();
+        for w in 10..=(10 + MAX_TRAINS as u32 + 2) {
+            rt.ensure_train(ComboTrainConfig { window_s: w, step_s: 15, max_s: 120, threshold: 2 }, now_ms);
+        }
+        let active_key = TrainKey::from(cfg);
+        assert!(rt.trains.contains_key(&active_key), "active train must not be evicted as idle");
+        assert!(rt.trains.get(&active_key).unwrap().view(now_ms).active);
     }
 }
