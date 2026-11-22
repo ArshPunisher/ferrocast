@@ -17,8 +17,8 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use ferrocast_engine::studio_host::{
-    AudioChange, FilterEdit, ItemEdit, ItemTarget, MediaAct, NewSource, SceneTransition, StudioAct, StudioModeOptions,
-    WebAct,
+    AudioChange, FilterEdit, ItemEdit, ItemTarget, MediaAct, NamedTransitionInput, NamedTransitionPatch, NewSource,
+    SceneTransition, StudioAct, StudioModeOptions, WebAct,
 };
 
 use crate::AppState;
@@ -45,6 +45,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items", get(engine_items).post(engine_add_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/box", put(engine_item_box))
+        .route("/studio/engine/scenes/{scene}/items/boxes", put(engine_item_boxes))
         .route("/studio/engine/scenes/{scene}/items/{id}/crop", put(engine_item_crop))
         .route("/studio/engine/scenes/{scene}/thumbnail", get(engine_scene_thumbnail))
         .route(
@@ -117,6 +118,15 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/library/{kind}/{id}/export", get(engine_shelf_export))
         .route("/studio/engine/scenes/{scene}/audio", get(engine_audio))
         .route("/studio/engine/transition", put(engine_transition))
+        .route("/studio/engine/transitions", post(engine_add_named_transition))
+        .route(
+            "/studio/engine/transitions/{name}",
+            put(engine_update_named_transition).delete(engine_delete_named_transition),
+        )
+        .route("/studio/engine/transitions/{name}/rename", post(engine_rename_named_transition))
+        .route("/studio/engine/transitions/{name}/duplicate", post(engine_duplicate_named_transition))
+        .route("/studio/engine/transitions/{name}/default", put(engine_default_named_transition))
+        .route("/studio/engine/transition-matrix", put(engine_set_transition_matrix))
         .route("/studio/engine/top-layer", put(engine_top_layer))
         .route(
             "/studio/engine/transitions/{kind}/settings",
@@ -707,6 +717,25 @@ async fn engine_item_box(
 }
 
 #[derive(Deserialize)]
+struct BoxesBody {
+    items: Vec<ferrocast_engine::studio_host::ItemBoxIn>,
+    #[serde(default)]
+    save: bool,
+    #[serde(default)]
+    reason: ferrocast_engine::studio_host::BoxReason,
+}
+
+/// `PUT …/items/boxes` `{ items: [{ id, x, y, w, h }], save?, reason? }`: several items moved and sized at
+/// once (aligned, spaced out, a group of picked ones moved or resized) as one step → the items.
+async fn engine_item_boxes(
+    State(app): State<AppState>,
+    Path(scene): Path<String>,
+    Body(b): Body<BoxesBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SetItemBoxes { scene, items: b.items, save: b.save, reason: b.reason }).await
+}
+
+#[derive(Deserialize)]
 struct ThumbQuery {
     #[serde(default = "thumb_width")]
     w: u32,
@@ -772,6 +801,88 @@ async fn engine_set_transition_settings(
     Body(b): Body<SettingsBody>,
 ) -> ApiResult<StatusCode> {
     act_done(&app, StudioAct::SetTransitionSettings { kind, settings: b.settings }).await
+}
+
+/// `POST /studio/engine/transitions`: adds a named transition → 201 `{ name, kind, ms, settings, default }`.
+async fn engine_add_named_transition(
+    State(app): State<AppState>,
+    Body(transition): Body<NamedTransitionInput>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) = act(&app, StudioAct::AddNamedTransition { transition }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+/// `PUT /studio/engine/transitions/{name}`: updates a named transition → `{ name, kind, ms, settings, default }`.
+async fn engine_update_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(patch): Body<NamedTransitionPatch>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::UpdateNamedTransition { name, patch }).await
+}
+
+#[derive(Deserialize)]
+struct RenameTransitionBody {
+    name: String,
+}
+
+/// `POST /studio/engine/transitions/{name}/rename` `{ name }` → updated named transition.
+async fn engine_rename_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Body(b): Body<RenameTransitionBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::RenameNamedTransition { name, new_name: b.name }).await
+}
+
+#[derive(Deserialize, Default)]
+struct DuplicateTransitionBody {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// `POST /studio/engine/transitions/{name}/duplicate` `{ name? }` → 201 new named transition.
+async fn engine_duplicate_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    OptionalBody(b): OptionalBody<DuplicateTransitionBody>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let Json(v) = act(&app, StudioAct::DuplicateNamedTransition { name, new_name: b.name }).await?;
+    Ok((StatusCode::CREATED, Json(v)))
+}
+
+/// `PUT /studio/engine/transitions/{name}/default`: sets the default transition → 204.
+async fn engine_default_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetDefaultNamedTransition { name }).await
+}
+
+/// `DELETE /studio/engine/transitions/{name}`: deletes a named transition → 204.
+async fn engine_delete_named_transition(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::DeleteNamedTransition { name }).await
+}
+
+#[derive(Deserialize)]
+struct TransitionMatrixBody {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    transition: Option<String>,
+}
+
+/// `PUT /studio/engine/transition-matrix` `{ from, to, transition }`: sets or clears a matrix rule → 204.
+async fn engine_set_transition_matrix(
+    State(app): State<AppState>,
+    Body(b): Body<TransitionMatrixBody>,
+) -> ApiResult<StatusCode> {
+    act_done(&app, StudioAct::SetTransitionMatrixRule { from: b.from, to: b.to, transition: b.transition }).await
 }
 
 /// `PUT /studio/engine/studio-mode` `{ on }`.
