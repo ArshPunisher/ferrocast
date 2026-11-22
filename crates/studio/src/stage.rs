@@ -1904,7 +1904,18 @@ impl Stage {
         // The box's top left, whatever the item is aligned by.
         t.alignment = 5;
         (t.x, t.y) = (x, y);
-        self.set_transform(scene, id, &t)
+        let info = self.set_transform(scene, id, &t)?;
+        // A flipped item in bounds is drawn from another corner than `x, y` (the bounds' alignment
+        // and the flip move its origin): the frame's corner is what the caller sees and sends back,
+        // so `x, y` are moved by what they are off, and a nudge of 1 pixel is 1 pixel.
+        if home == scene {
+            let (dx, dy) = (x - info.frame[4], y - info.frame[5]);
+            if dx.abs() > 0.01 || dy.abs() > 0.01 {
+                (t.x, t.y) = (t.x + dx, t.y + dy);
+                return self.set_transform(scene, id, &t);
+            }
+        }
+        Ok(info)
     }
 
     pub fn set_item_crop(&self, scene: &str, id: i64, crop: [i32; 4]) -> Result<ItemInfo, StudioError> {
@@ -6574,6 +6585,38 @@ mod tests {
 
     /// Several items moved and sized at once (align, distribute, a group moved or resized): all
     /// of them or none, so one step can be undone whole.
+    /// Sending an item its own box back changes nothing: not for a flipped item in bounds, whose
+    /// drawn corner is not where the item's `x, y` say (Neon #7: a 1 pixel nudge threw it a whole
+    /// width across).
+    #[test]
+    fn an_items_own_box_sent_back_leaves_it_where_it_is() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        for (flip_x, flip_y, bounds, align) in
+            [(-1.0, 1.0, "fit", 0), (1.0, -1.0, "fit", 0), (-1.0, -1.0, "stretch", 5), (-1.0, 1.0, "fit", 5)]
+        {
+            let mut t = ok(s.transform("Main", a.id));
+            t.bounds = bounds.into();
+            (t.bounds_width, t.bounds_height, t.bounds_alignment) = (100.0, 100.0, align);
+            (t.scale_x, t.scale_y) = (flip_x, flip_y);
+            (t.x, t.y, t.alignment) = (100.0, 100.0, 5);
+            ok(s.set_transform("Main", a.id, &t));
+            let frame =
+                |s: &Stage| ok(s.items("Main")).into_iter().find(|i| i.id == a.id).map(|i| i.frame).unwrap_or([0.0; 6]);
+            let f = frame(&s);
+            let (w, h) = (f[0].hypot(f[1]), f[2].hypot(f[3]));
+            ok(s.set_item_box("Main", a.id, f[4], f[5], w, h));
+            let g = frame(&s);
+            for k in 0..6 {
+                assert!((f[k] - g[k]).abs() < 0.01, "{bounds} {flip_x},{flip_y} align {align}: {f:?} became {g:?}");
+            }
+            // And a nudge of 1 pixel moves it by 1.
+            ok(s.set_item_box("Main", a.id, f[4] + 1.0, f[5], w, h));
+            let n = frame(&s);
+            assert!((n[4] - f[4] - 1.0).abs() < 0.01 && (n[5] - f[5]).abs() < 0.01, "{bounds}: nudge {f:?} -> {n:?}");
+        }
+    }
+
     /// A group and a source inside it can't be asked for together: moving the source fits the
     /// group again, so the group's own box would then be applied to the changed group and move
     /// the source a second time (Neon #4).
@@ -6636,23 +6679,15 @@ mod tests {
         let inside = ok(s.set_item_boxes("Main", &[(a.id, 0.0, 0.0, 200.0, 100.0), (b.id, 400.0, 0.0, 50.0, 50.0)]));
         assert_eq!(inside.len(), 2);
         assert!(group.group);
-        // A group listed before its child: what comes back is the final state, after the group
-        // has been fitted round its moved source.
-        let g = group.clone();
-        let before = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap_or_else(|| panic!("the group"));
-        let kid = before.children.first().map(|k| (k.id, k.frame)).unwrap_or((0, [0.0; 6]));
-        let res = ok(s.set_item_boxes(
-            "Main",
-            &[
-                (g.id, before.frame[4], before.frame[5], before.frame[0], before.frame[3]),
-                (kid.0, kid.1[4] + 80.0, kid.1[5], kid.1[0], kid.1[3]),
-            ],
-        ));
+        // What comes back is the final state, after the group has been fitted round the sources
+        // moved in it (the first one's answer isn't from before the second moved).
         let after = ok(s.items("Main"));
-        let now =
-            |id| after.iter().flat_map(|i| std::iter::once(i.clone()).chain(i.children.clone())).find(|i| i.id == id);
-        assert_eq!(res[0].frame, now(g.id).map(|i| i.frame).unwrap_or([0.0; 6]), "the group as it ended up");
-        assert_eq!(res[1].frame, now(kid.0).map(|i| i.frame).unwrap_or([0.0; 6]));
+        let now = |id: i64| {
+            after.iter().flat_map(|i| std::iter::once(i.clone()).chain(i.children.clone())).find(|i| i.id == id)
+        };
+        for r in &inside {
+            assert_eq!(Some(r.frame), now(r.id).map(|i| i.frame), "item {} as it ended up", r.id);
+        }
     }
 
     /// Each item is shown on the stream, in the recording or both; both is the default, nothing
