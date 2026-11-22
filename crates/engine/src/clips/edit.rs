@@ -586,15 +586,35 @@ impl Engine {
             // The transcription is a task of its own so a cancel can wait for it to be over before
             // the job gives up its place (its thread only stops at its next step).
             let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let mut work = {
+            let work = {
                 let (engine, ffmpeg, path, flag) = (ctx.engine.clone(), ffmpeg.clone(), path.clone(), flag.clone());
                 tokio::spawn(async move { engine.clip_subtitles(&ffmpeg, &path, flag).await })
             };
-            let made = tokio::select! {
-                m = &mut work => m.unwrap_or(None),
-                () = ctx.cancel.wait() => {
-                    crate::studio::vertical_clip::stop_and_wait(&flag, work, std::time::Duration::from_secs(60)).await;
-                    return Err(super::jobs::cancelled());
+            // The worker is shared with the timeout path: whoever ends the job first stops it and
+            // waits for it, so it can't go on (or publish captions) after the job's place is given up.
+            let work = std::sync::Arc::new(tokio::sync::Mutex::new(Some(work)));
+            ctx.on_timeout({
+                let (flag, work) = (flag.clone(), work.clone());
+                Box::new(move || {
+                    Box::pin(async move {
+                        if let Some(w) = work.lock().await.take() {
+                            crate::studio::vertical_clip::stop_and_wait(&flag, w, std::time::Duration::from_secs(60))
+                                .await;
+                        }
+                    })
+                })
+            });
+            let made = {
+                let mut guard = work.lock().await;
+                let Some(handle) = guard.as_mut() else { return Err(super::jobs::cancelled()) };
+                tokio::select! {
+                    m = &mut *handle => { let r = m.unwrap_or(None); guard.take(); r }
+                    () = ctx.cancel.wait() => {
+                        if let Some(w) = guard.take() {
+                            crate::studio::vertical_clip::stop_and_wait(&flag, w, std::time::Duration::from_secs(60)).await;
+                        }
+                        return Err(super::jobs::cancelled());
+                    }
                 }
             };
             if made.is_none() {

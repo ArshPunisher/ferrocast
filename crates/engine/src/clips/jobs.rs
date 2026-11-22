@@ -17,6 +17,10 @@ use crate::{Engine, EngineError, now};
 
 /// A job that keeps running this long is stopped (a long compilation of long clips).
 const JOB_LIMIT: Duration = Duration::from_secs(4 * 3600);
+
+/// What stops a job's own worker task and waits for it (run when the job times out, before the
+/// job gives up its place).
+pub(crate) type Cleanup = Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
 /// Finished jobs kept for the list.
 const KEEP: usize = 50;
 /// Jobs waiting or running at once. Each waiting upload holds an open file and a task, and a
@@ -117,6 +121,7 @@ pub struct JobCtx {
     pub engine: Engine,
     pub cancel: Arc<Cancel>,
     id: String,
+    cleanup: Arc<std::sync::Mutex<Option<Cleanup>>>,
 }
 
 impl std::fmt::Debug for JobCtx {
@@ -126,6 +131,11 @@ impl std::fmt::Debug for JobCtx {
 }
 
 impl JobCtx {
+    /// A worker the job started on its own: how to stop it and wait for it, if the job times out.
+    pub(crate) fn on_timeout(&self, c: Cleanup) {
+        *self.cleanup.lock().unwrap_or_else(|p| p.into_inner()) = Some(c);
+    }
+
     pub fn progress(&self, p: f32) {
         self.engine.studio().clips.jobs.update(&self.id, |v| v.progress = p.clamp(0.0, 1.0));
     }
@@ -148,11 +158,32 @@ pub struct Jobs {
     next: AtomicU64,
     /// One job at a time (ffmpeg shouldn't fight the live encoder for the machine).
     gate: Arc<Semaphore>,
+    /// A shorter time limit for tests (0: the real one).
+    limit_ms: AtomicU64,
+}
+
+impl Jobs {
+    fn limit(&self) -> Duration {
+        match self.limit_ms.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => JOB_LIMIT,
+            ms => Duration::from_millis(ms),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_limit_for_test(&self, d: Duration) {
+        self.limit_ms.store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl Default for Jobs {
     fn default() -> Self {
-        Self { recs: std::sync::Mutex::default(), next: AtomicU64::new(0), gate: Arc::new(Semaphore::new(1)) }
+        Self {
+            recs: std::sync::Mutex::default(),
+            next: AtomicU64::new(0),
+            gate: Arc::new(Semaphore::new(1)),
+            limit_ms: AtomicU64::new(0),
+        }
     }
 }
 
@@ -298,7 +329,8 @@ impl Engine {
             return view;
         }
         let engine = self.clone();
-        let ctx = JobCtx { engine: engine.clone(), cancel: cancel.clone(), id: id.clone() };
+        let cleanup: Arc<std::sync::Mutex<Option<Cleanup>>> = Arc::default();
+        let ctx = JobCtx { engine: engine.clone(), cancel: cancel.clone(), id: id.clone(), cleanup: cleanup.clone() };
         tokio::spawn(async move {
             let gate = engine.studio().clips.jobs.gate();
             // Waiting for its turn can be cancelled too.
@@ -326,7 +358,7 @@ impl Engine {
             engine.studio().clips.jobs.update(&id, |v| v.state = JobState::Running);
             // The work stops itself when cancelled (so it can clean up); a cancel that it ignores
             // still ends at the time limit.
-            let result = tokio::time::timeout(JOB_LIMIT, work(ctx)).await;
+            let result = tokio::time::timeout(engine.studio().clips.jobs.limit(), work(ctx)).await;
             match result {
                 Ok(Ok(made)) => finish(JobState::Done, Some(made), None),
                 Ok(Err(e)) if is_cancelled(&e) => finish(JobState::Cancelled, None, cancel_note(&e)),
@@ -334,14 +366,21 @@ impl Engine {
                     tracing::warn!(error = %e, "a clip job failed");
                     finish(JobState::Failed, None, Some(describe(&e)));
                 }
-                Err(_) => finish(
-                    JobState::Failed,
-                    None,
-                    Some(JobError {
-                        message: "That took too long and was stopped.".into(),
-                        hint: "Try fewer or shorter clips.".into(),
-                    }),
-                ),
+                Err(_) => {
+                    // The worker it started is stopped and waited for before this job gives up its place.
+                    let stop = cleanup.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    if let Some(stop) = stop {
+                        stop().await;
+                    }
+                    finish(
+                        JobState::Failed,
+                        None,
+                        Some(JobError {
+                            message: "That took too long and was stopped.".into(),
+                            hint: "Try fewer or shorter clips.".into(),
+                        }),
+                    );
+                }
             }
         });
         view

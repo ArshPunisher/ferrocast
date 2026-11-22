@@ -547,3 +547,37 @@ fn a_file_stamp_notices_another_file_at_the_same_name() {
     std::fs::remove_file(&q).unwrap();
     assert!(s2.check(&q).is_err());
 }
+
+/// CodeRabbit: a job that runs out of time stops and waits for its worker before it gives up its
+/// place, the same as a cancel does.
+#[tokio::test]
+async fn a_timed_out_job_stops_its_worker_before_releasing_its_place() {
+    use crate::clips::jobs::{JobKind, JobState, Made};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (e, _data, _clips) = engine().await;
+    e.studio().clips.jobs.set_limit_for_test(std::time::Duration::from_millis(150));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let s2 = stopped.clone();
+    let view = e.start_clip_job(JobKind::Captions, "slow".into(), move |ctx| async move {
+        ctx.on_timeout(Box::new(move || {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                s2.store(true, Ordering::SeqCst);
+            })
+        }));
+        std::future::pending::<()>().await;
+        Ok(Made { output: None })
+    });
+    let mut state = JobState::Running;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        state = e.clip_jobs().iter().find(|j| j.id == view.id).map(|j| j.state).unwrap();
+        if state == JobState::Failed {
+            break;
+        }
+    }
+    assert_eq!(state, JobState::Failed);
+    // The job only reads as finished after its worker was stopped.
+    assert!(stopped.load(Ordering::SeqCst), "the job finished before its worker was stopped");
+}
