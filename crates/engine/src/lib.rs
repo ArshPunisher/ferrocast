@@ -61,6 +61,7 @@ pub use safe_mode::{SafeModeStatus, StartOptions};
 mod snapshot;
 pub mod speech;
 mod starter;
+pub mod store_catalog;
 pub mod studio;
 pub mod studio_host;
 mod timers;

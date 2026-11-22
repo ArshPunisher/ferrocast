@@ -36,6 +36,7 @@ async-trait = "0.1"
 tempfile = "3"
 ferrocast-testkit.workspace = true
 ferrocast-relay = { path = "../relay" }
+ferrocast-engine = { workspace = true, features = ["test-catalog"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart"] }
 tokio-tungstenite = "0.30"
 zip = { version = "9", default-features = false, features = ["deflate"] }

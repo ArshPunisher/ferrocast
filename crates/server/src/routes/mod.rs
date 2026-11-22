@@ -28,6 +28,7 @@ mod pro;
 mod recap;
 pub(crate) mod remote_scope;
 mod smart;
+mod store;
 mod studio;
 mod tip_pro;
 mod tts;
@@ -239,6 +240,8 @@ pub(crate) fn api() -> Router<AppState> {
         .merge(plugins::routes())
         // "When X, do Y" rules (routes/automations.rs)
         .merge(automations::routes())
+        // Community Theme Store (R37, routes/store.rs; PC only)
+        .merge(store::routes())
 }
 
 /// Upload routes get a body limit just above the largest allowed file.
