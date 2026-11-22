@@ -386,3 +386,12 @@ async fn truncated_automations_loads_bak() {
     let loaded = e.automations();
     assert_eq!(loaded, vec![r1]);
 }
+
+#[tokio::test]
+async fn scene_step_dispatches_set_current_through_studio_host() {
+    let (e, _dir, studio, _chat) = engine().await;
+    e.set_automations(vec![rule("switch", When::Follow, vec![Step::Scene { name: "BRB".into() }])])
+        .unwrap_or_else(|err| panic!("{err}"));
+    e.ingest(live(EventKind::Follow { actor: Actor::named(Platform::Twitch, "Ada") })).await;
+    until(|| did(&studio).contains(&"scene BRB".to_string())).await;
+}

@@ -1791,6 +1791,178 @@ async fn chat_shows_this_stream_not_the_last_one() {
 }
 
 #[tokio::test]
+async fn diagnostics_routes_export_redacted_zip_and_enforce_validation() {
+    use std::io::Read;
+
+    let r = start().await;
+    let folder = tempfile::tempdir().unwrap();
+    let logs = r._dir.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(
+        logs.join("ferrocast.log"),
+        "2026-11-22T03:30:00Z ERROR user=route@test.example ip=198.51.100.77 token=routeSecret999\n",
+    )
+    .unwrap();
+
+    // Unauthenticated denied
+    assert_eq!(
+        r.anonymous(reqwest::Method::GET, "/api/v1/diagnostics/preview").await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // Preview returns structured JSON with likely_causes right on it
+    let preview = r.get("/api/v1/diagnostics/preview").await;
+    assert_eq!(preview.status(), StatusCode::OK);
+    let pv: Value = preview.json().await.unwrap();
+    assert!(pv["likely_causes"].is_array());
+    assert!(pv["app"]["version"].is_string());
+    let pv_text = pv.to_string();
+    assert!(
+        !pv_text.contains("route@test.example")
+            && !pv_text.contains("198.51.100.77")
+            && !pv_text.contains("routeSecret999")
+    );
+
+    // Missing / invalid folder returns 400
+    let bad_dir = r.post("/api/v1/diagnostics/report", json!({ "folder": "/no/such/ferrocast-folder-xyz" })).await;
+    assert_eq!(error_code(bad_dir).await.0, StatusCode::BAD_REQUEST);
+
+    // Valid folder writes real zip archive
+    let created = r.post("/api/v1/diagnostics/report", json!({ "folder": folder.path().display().to_string() })).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let body: Value = created.json().await.unwrap();
+    assert_eq!(body["cancelled"], false);
+    let out_file = std::path::PathBuf::from(body["path"].as_str().unwrap());
+    assert!(out_file.is_file());
+    let mut arc = zip::ZipArchive::new(std::fs::File::open(&out_file).unwrap()).unwrap();
+    let mut summary = String::new();
+    arc.by_name("SUMMARY.txt").unwrap().read_to_string(&mut summary).unwrap();
+    assert!(summary.contains("=== LIKELY CAUSES ==="));
+
+    // Binary .zip endpoint also works for browsers
+    let zip_res = r.post("/api/v1/diagnostics/report.zip", json!({})).await;
+    assert_eq!(zip_res.status(), StatusCode::OK);
+    assert_eq!(zip_res.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("application/zip"));
+    let bytes = zip_res.bytes().await.unwrap();
+    let arc2 = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).unwrap();
+    assert!(arc2.len() >= 2);
+}
+
+#[tokio::test]
+async fn diagnostics_routes_reject_non_loopback_peers_and_expose_content_disposition() {
+    use axum::extract::ConnectInfo;
+    use std::net::SocketAddr;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let out_folder = tempfile::tempdir().unwrap();
+    let engine =
+        Engine::start_with_secrets(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+    let sessions = std::sync::Arc::new(crate::auth::Sessions::new());
+    let paired_token = sessions.pair(&sessions.new_code()).unwrap();
+    let state = crate::AppState {
+        engine,
+        sessions,
+        guard: crate::auth::Guard { port: 47820, lan: true, dev_origins: vec!["http://localhost:5173".into()] },
+    };
+    let app = crate::router(state);
+    let lan_peer: SocketAddr = "192.168.1.50:54321".parse().unwrap();
+
+    // Paired LAN client (non-loopback) must get 403 on all diagnostics routes.
+    for (method, path, body) in [
+        ("GET", "/api/v1/diagnostics/preview", String::new()),
+        ("POST", "/api/v1/diagnostics/report", serde_json::json!({ "folder": out_folder.path() }).to_string()),
+        ("POST", "/api/v1/diagnostics/report.zip", "{}".into()),
+    ] {
+        let mut req = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", "192.168.1.50:47820")
+            .header("authorization", format!("Bearer {paired_token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.clone()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(lan_peer));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "LAN peer unexpectedly allowed on {method} {path}");
+    }
+
+    // Missing ConnectInfo (e.g. non-TCP/synthetic caller) must also fail closed with 403.
+    let no_ip_req = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/v1/diagnostics/preview")
+        .header("host", "127.0.0.1:47820")
+        .header("authorization", format!("Bearer {paired_token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(no_ip_req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    // Loopback peer gets 200 and dev-origin CORS exposes Content-Disposition.
+    let loopback_peer: SocketAddr = "127.0.0.1:54322".parse().unwrap();
+    let mut local_req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/v1/diagnostics/report.zip")
+        .header("host", "127.0.0.1:47820")
+        .header("origin", "http://localhost:5173")
+        .header("authorization", format!("Bearer {paired_token}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    local_req.extensions_mut().insert(ConnectInfo(loopback_peer));
+    let ok_res = app.oneshot(local_req).await.unwrap();
+    assert_eq!(ok_res.status(), StatusCode::OK);
+    let exposed = ok_res
+        .headers()
+        .get(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        exposed.to_ascii_lowercase().contains("content-disposition"),
+        "exposed headers missing Content-Disposition: {exposed:?}"
+    );
+}
+
+#[tokio::test]
+async fn overlays_validate_new_label_options_and_reject_bad_train_settings() {
+    let r = start().await;
+    let created: Value =
+        r.post("/api/v1/overlays", json!({ "name": "Labels", "preset": "blank" })).await.json().await.unwrap();
+    let id = created["id"].as_str().unwrap();
+
+    let mut bad = created.clone();
+    bad["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "hype_train", "template": "{value}", "theme": "molten", "train_window_s": 2 }
+    }]);
+    let res_bad = r.put(&format!("/api/v1/overlays/{id}"), bad).await;
+    assert_eq!(error_code(res_bad).await.0, StatusCode::BAD_REQUEST);
+
+    let mut ok_ov = created.clone();
+    ok_ov["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "monthly_tips", "template": "Month: {value}", "theme": "molten", "timezone": "Europe/London", "timezone_offset_min": 0 }
+    }]);
+    let res_ok = r.put(&format!("/api/v1/overlays/{id}"), ok_ov).await;
+    assert_eq!(res_ok.status(), StatusCode::OK);
+
+    let mut bad_tz = created.clone();
+    bad_tz["widgets"] = json!([{
+        "id": "w1",
+        "kind": "label",
+        "x": 10, "y": 10, "w": 300, "h": 50,
+        "config": { "source": "monthly_tips", "template": "Month: {value}", "theme": "molten", "timezone": "Mars/Olympus" }
+    }]);
+    let res_bad_tz = r.put(&format!("/api/v1/overlays/{id}"), bad_tz).await;
+    assert_eq!(error_code(res_bad_tz).await.0, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn preview_socket_hides_real_credits_and_the_pinned_message() {
     use ferrocast_core::event::{Actor, Content, Event, EventKind, Millis, Platform};
     let r = start().await;

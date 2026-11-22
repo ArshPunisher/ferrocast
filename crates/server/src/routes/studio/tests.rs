@@ -646,6 +646,11 @@ async fn the_studio_engine_needs_the_desktop_app() {
         r.post("/studio/engine/scenes/Gameplay/items/3/edit", json!({ "do": "stream_and_recording" })).await,
         r.post("/studio/engine/obs-collections/import", json!({ "id": "Untitled" })).await,
         r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 10, "y": 20, "w": 640, "h": 360 })).await,
+        r.put(
+            "/studio/engine/scenes/Gameplay/items/boxes",
+            json!({ "items": [{ "id": 3, "x": 10, "y": 20, "w": 640, "h": 360 }, { "id": 4, "x": 0, "y": 0, "w": 50, "h": 50 }] }),
+        )
+        .await,
         r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3 })).await,
         r.put("/studio/engine/preview/selection", json!({ "scene": "Gameplay", "id": 3, "also": [4, 5] })).await,
         r.post("/studio/engine/scenes/Gameplay/items", json!({ "group": "Cam + frame", "items": [3, 4] })).await,
@@ -769,6 +774,23 @@ async fn the_studio_engine_needs_the_desktop_app() {
             "no width",
         ),
         (r.put("/studio/engine/scenes/Gameplay/items/3/box", json!({ "x": 0, "y": 0 })).await, "no size"),
+        (r.put("/studio/engine/scenes/Gameplay/items/boxes", json!({ "items": [] })).await, "no boxes"),
+        (
+            r.put(
+                "/studio/engine/scenes/Gameplay/items/boxes",
+                json!({ "items": [{ "id": 3, "x": 0, "y": 0, "w": 0, "h": 5 }] }),
+            )
+            .await,
+            "a box with no width",
+        ),
+        (
+            r.put(
+                "/studio/engine/scenes/Gameplay/items/boxes",
+                json!({ "items": [{ "id": 3, "x": 0, "y": 0, "w": 5, "h": 5 }, { "id": 3, "x": 1, "y": 1, "w": 5, "h": 5 }] }),
+            )
+            .await,
+            "the same item twice",
+        ),
         (r.post("/studio/engine/scenes/Gameplay/items", json!({ "group": "G", "items": [] })).await, "group of nothing"),
         (r.get("/studio/engine/scenes/Gameplay/thumbnail?w=10").await, "thumbnail too small"),
         (r.get("/studio/engine/scenes/Gameplay/thumbnail?w=5000").await, "thumbnail too big"),
@@ -1143,6 +1165,101 @@ async fn item_filter_routes_forward_item_target_and_validate_queries() {
     assert!(matches!(&acts[10], StudioAct::SourcePicture { filters: true, item, .. } if item == &expected));
 }
 
+#[tokio::test]
+async fn headless_overlay_pack_routes_preview_import_and_undo() {
+    use std::io::{Cursor, Write};
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let r = start().await;
+
+    // Headless library listing works even with no desktop StudioHost attached.
+    let list_res = r.get("/studio/engine/library/collections").await;
+    assert_eq!(list_res.status(), StatusCode::OK);
+    let list_body: Value = list_res.json().await.unwrap();
+    assert_eq!(list_body["current"], "untitled");
+
+    let cfg = json!({
+        "schemaVersion": 2,
+        "nodeType": "RootNode",
+        "data": {
+            "scenes": {
+                "data": {
+                    "items": [
+                        {
+                            "name": "Starter",
+                            "sceneId": "s1",
+                            "slots": {
+                                "data": {
+                                    "items": [
+                                        {
+                                            "id": "w1",
+                                            "name": "Chat Widget",
+                                            "sceneNodeType": "item",
+                                            "x": 0.02,
+                                            "y": 0.4,
+                                            "scaleX": 1.0 / 1920.0,
+                                            "scaleY": 1.0 / 1080.0,
+                                            "content": { "nodeType": "WidgetNode", "data": { "type": "ChatBox" } }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    });
+    let mut zw = ZipWriter::new(Cursor::new(Vec::new()));
+    zw.start_file("config.json", SimpleFileOptions::default()).unwrap();
+    zw.write_all(&serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let zip_bytes = zw.finish().unwrap().into_inner();
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", reqwest::multipart::Part::bytes(zip_bytes).file_name("RoutePack.overlay"));
+    let prev_res = r
+        .client
+        .post(format!("{}/api/v1/studio/engine/library/collections/overlay/preview", r.base))
+        .bearer_auth(&r.token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(prev_res.status(), StatusCode::OK);
+    let preview: Value = prev_res.json().await.unwrap();
+    let preview_id = preview["preview_id"].as_str().unwrap().to_string();
+    assert_eq!(preview["suggested_name"], "RoutePack");
+
+    let imp_res =
+        r.post("/studio/engine/library/collections/overlay/import", json!({ "preview_id": preview_id })).await;
+    assert_eq!(imp_res.status(), StatusCode::CREATED);
+    let imported: Value = imp_res.json().await.unwrap();
+    let undo_token = imported["undo_token"].as_str().unwrap().to_string();
+    assert_eq!(imported["overlays_created"].as_array().map(Vec::len), Some(1));
+
+    let after_list: Value = r.get("/studio/engine/library/collections").await.json().await.unwrap();
+    assert_eq!(after_list["current"], imported["id"]);
+
+    let undo_res = r.post("/studio/engine/library/collections/overlay/undo", json!({ "undo_token": undo_token })).await;
+    assert_eq!(undo_res.status(), StatusCode::OK);
+    let restored_list: Value = r.get("/studio/engine/library/collections").await.json().await.unwrap();
+    assert_eq!(restored_list["current"], "untitled");
+
+    // Bad upload type returns 415.
+    let bad_form = reqwest::multipart::Form::new()
+        .part("file", reqwest::multipart::Part::bytes(b"not a zip".to_vec()).file_name("broken.overlay"));
+    let bad_res = r
+        .client
+        .post(format!("{}/api/v1/studio/engine/library/collections/overlay/preview", r.base))
+        .bearer_auth(&r.token)
+        .multipart(bad_form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
 /// A Studio that keeps performance mode (the preview paused) and nothing else.
 #[derive(Debug, Default)]
 struct PausedHost {
@@ -1492,4 +1609,66 @@ async fn auto_config_benchmark_and_rollback_routes_enforce_guards_and_state_mach
 
     // Keep when nothing is applied -> 409 conflict.
     assert_eq!(r.post("/studio/engine/auto-config/keep", json!({})).await.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn named_transition_and_matrix_routes_validate_and_forward() {
+    let r = start().await;
+    // Without desktop app: clean 422 studio_unavailable.
+    assert_eq!(
+        code(r.post("/studio/engine/transitions", json!({ "name": "Cut", "kind": "cut_transition", "ms": 0 })).await)
+            .await,
+        (StatusCode::UNPROCESSABLE_ENTITY, "studio_unavailable".into())
+    );
+    let host = Arc::new(PausedHost::default());
+    r.engine.set_studio_host(host.clone());
+
+    // Invalid inputs rejected with 400 before reaching host.
+    for (res, msg) in [
+        (
+            r.post("/studio/engine/transitions", json!({ "name": " ", "kind": "fade_transition", "ms": 300 })).await,
+            "empty name",
+        ),
+        (r.post("/studio/engine/transitions", json!({ "name": "Bad", "kind": "laser", "ms": 300 })).await, "bad kind"),
+        (r.put("/studio/engine/transitions/Fade", json!({ "ms": 99999 })).await, "bad ms"),
+        (
+            r.put("/studio/engine/transition-matrix", json!({ "from": null, "to": null, "transition": "Fade" })).await,
+            "any->any",
+        ),
+    ] {
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{msg}");
+    }
+    assert!(host.acts.lock().unwrap().is_empty());
+
+    // Valid CRUD & matrix routes forward exact StudioAct values.
+    assert_eq!(
+        r.post(
+            "/studio/engine/transitions",
+            json!({ "name": "Swipe Fast", "kind": "swipe_transition", "ms": 250, "settings": { "direction": "left" } })
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(r.put("/studio/engine/transitions/Swipe%20Fast", json!({ "ms": 400 })).await.status(), StatusCode::OK);
+    assert_eq!(
+        r.post("/studio/engine/transitions/Swipe%20Fast/rename", json!({ "name": "Quick Swipe" })).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.post("/studio/engine/transitions/Quick%20Swipe/duplicate", json!({})).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        r.put("/studio/engine/transitions/Quick%20Swipe/default", json!({})).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        r.put("/studio/engine/transition-matrix", json!({ "from": "Main", "to": "BRB", "transition": "Quick Swipe" }))
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(r.delete("/studio/engine/transitions/Quick%20Swipe%202").await.status(), StatusCode::NO_CONTENT);
+    assert_eq!(host.acts.lock().unwrap().len(), 7);
 }

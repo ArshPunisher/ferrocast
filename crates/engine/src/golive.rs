@@ -28,11 +28,11 @@ use crate::studio::save_setting;
 use crate::{Engine, EngineError, now};
 
 pub(crate) const CONFIG_KEY: &str = "golive";
-const INGEST_KEY_SECRET: &str = "golive_ingest_key";
-const OBS_BEFORE_SECRET: &str = "golive_obs_before";
+pub(crate) const INGEST_KEY_SECRET: &str = "golive_ingest_key";
+pub(crate) const OBS_BEFORE_SECRET: &str = "golive_obs_before";
 /// Aitum Vertical's first output before Ferrocast pointed it here: `{ "server", "key" }`.
-const VERTICAL_BEFORE_SECRET: &str = "golive_vertical_before";
-const CUSTOM_KEY_PREFIX: &str = "golive_dest_";
+pub(crate) const VERTICAL_BEFORE_SECRET: &str = "golive_vertical_before";
+pub(crate) const CUSTOM_KEY_PREFIX: &str = "golive_dest_";
 /// Custom destinations at most (the upload is the real limit long before).
 const MAX_CUSTOM: usize = 8;
 /// How long the upload test sends to Twitch's bandwidth-test mode.

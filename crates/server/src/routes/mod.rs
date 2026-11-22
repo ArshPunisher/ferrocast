@@ -8,6 +8,7 @@ mod cloud_bot;
 mod cloud_sync;
 mod core;
 mod designs;
+mod diagnostics;
 mod discord;
 mod giveaways;
 mod golive;
@@ -151,6 +152,9 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/music", get(studio::music).put(studio::save_music))
         // settings and data
         .route("/settings", get(core::settings).put(core::save_settings))
+        .route("/diagnostics/preview", get(diagnostics::preview))
+        .route("/diagnostics/report", post(diagnostics::write_report))
+        .route("/diagnostics/report.zip", post(diagnostics::download_zip))
         .route("/themes", get(app::themes))
         .route("/stats/session", get(app::session_stats))
         .route("/recap", get(recap::recap))
@@ -247,6 +251,11 @@ pub(crate) fn uploads() -> Router<AppState> {
             Router::new()
                 .route("/designs/import", post(designs::import))
                 .layer(axum::extract::DefaultBodyLimit::max(designs::MAX_DESIGN_BODY)),
+        )
+        .merge(
+            Router::new()
+                .route("/studio/engine/library/collections/overlay/preview", post(studio::engine_overlay_preview))
+                .layer(axum::extract::DefaultBodyLimit::max(ferrocast_engine::import::overlay_parse::MAX_OVERLAY_BODY)),
         )
         .merge(
             Router::new()

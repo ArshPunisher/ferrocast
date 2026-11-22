@@ -92,8 +92,9 @@ pub struct PreviewRect {
     pub shade: Option<f64>,
 }
 
-/// At most this many holes (menus, panels) at once.
-pub const PREVIEW_HOLES: usize = 16;
+/// At most this many holes at once: menus and panels, and while editing the guide lines, the box
+/// round several picked sources and its handles (a dozen on their own).
+pub const PREVIEW_HOLES: usize = 64;
 
 impl PreviewRect {
     /// `bg` as libobs wants a display's colour (0xAABBGGRR).
@@ -429,6 +430,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn log(&self, _lines: usize) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Extra Studio hardware/encoder/renderer telemetry for support diagnostics.
+    async fn diagnostics_studio(&self) -> Option<Value> {
+        None
+    }
     /// Shows the log file in Finder or Explorer (OBS's Show Log Files).
     async fn show_log(&self) -> Result<(), String> {
         Err(NOT_HERE.into())
@@ -635,8 +640,8 @@ pub struct ItemTransform {
     pub height: u32,
 }
 
-/// The transitions the Studio offers (OBS's own kinds).
-pub const TRANSITION_KINDS: [&str; 7] = [
+/// The transitions the Studio offers (OBS's own kinds + Ferrocast's Move).
+pub const TRANSITION_KINDS: [&str; 8] = [
     "fade_transition",
     "cut_transition",
     "swipe_transition",
@@ -644,6 +649,7 @@ pub const TRANSITION_KINDS: [&str; 7] = [
     "fade_to_color_transition",
     "wipe_transition",
     "obs_stinger_transition",
+    "ferrocast_move",
 ];
 
 /// The kinds of bounding box, as OBS orders them.
@@ -1088,12 +1094,13 @@ impl Default for StudioSettings {
             multiview_layout: "top".into(),
             multiview_labels: true,
             multiview_safe_areas: false,
-            // OBS's defaults.
+            // On, 10 pixels, and everything it can line up with (OBS's own default is the canvas's
+            // edges only): the preview draws a guide line for each thing a source snaps to.
             snapping: true,
             snap_px: 10,
             snap_screen: true,
-            snap_sources: false,
-            snap_center: false,
+            snap_sources: true,
+            snap_center: true,
             confirm_go_live: false,
             confirm_end_stream: true,
             confirm_stop_record: false,
@@ -1358,6 +1365,39 @@ pub struct SceneTransition {
     pub ms: u32,
 }
 
+/// Input to create a saved named transition.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NamedTransitionInput {
+    pub name: String,
+    pub kind: String,
+    pub ms: u32,
+    pub settings: Value,
+    pub default: bool,
+}
+
+impl Default for NamedTransitionInput {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            kind: "fade_transition".into(),
+            ms: 300,
+            settings: serde_json::json!({}),
+            default: false,
+        }
+    }
+}
+
+/// Fields to update on an existing named transition.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NamedTransitionPatch {
+    pub kind: Option<String>,
+    pub ms: Option<u32>,
+    pub settings: Option<Value>,
+    pub default: Option<bool>,
+}
+
 /// Something to do with a Web page source (`POST …/sources/{name}/web` `{ "do": "reload" }`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1447,6 +1487,42 @@ pub struct ItemTarget {
     pub id: i64,
 }
 
+/// The most boxes one `SetItemBoxes` takes.
+pub const MAX_BOXES: usize = 500;
+
+/// One item's box in a batch (`SetItemBoxes`): its first corner and its sides, canvas pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+pub struct ItemBoxIn {
+    pub id: i64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Why several boxes are sent: a move or resize (a drag, the arrow keys), or one click of Align or
+/// Space out, which are named steps of their own in the undo list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoxReason {
+    #[default]
+    Move,
+    Align,
+    Distribute,
+}
+
+/// A box a preview edit sends: numbers on the canvas, sides of at least a pixel.
+fn check_box(x: f32, y: f32, w: f32, h: f32) -> Result<(), EngineError> {
+    const MAX: f32 = 100_000.0;
+    if ![x, y, w, h].iter().all(|v| v.is_finite() && v.abs() <= MAX) {
+        return Err(EngineError::Invalid("x, y, w, h: numbers from -100000 to 100000.".into()));
+    }
+    if w < 1.0 || h < 1.0 {
+        return Err(EngineError::Invalid("w, h: at least 1 pixel.".into()));
+    }
+    Ok(())
+}
+
 /// One thing to do to the scene collection. The routes build these; [`StudioAct::check`]
 /// refuses bad input before the host sees it.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -1493,6 +1569,40 @@ pub enum StudioAct {
     SetSceneTransition {
         scene: String,
         transition: Option<SceneTransition>,
+    },
+    /// Adds a saved named transition → `NamedTransition`.
+    AddNamedTransition {
+        transition: NamedTransitionInput,
+    },
+    /// Updates kind, duration, settings, or default status on a named transition → `NamedTransition`.
+    UpdateNamedTransition {
+        name: String,
+        patch: NamedTransitionPatch,
+    },
+    /// Renames a named transition, keeping default and matrix references → `NamedTransition`.
+    RenameNamedTransition {
+        name: String,
+        new_name: String,
+    },
+    /// Duplicates a named transition (`new_name` optional) → `NamedTransition`.
+    DuplicateNamedTransition {
+        name: String,
+        #[serde(default)]
+        new_name: Option<String>,
+    },
+    /// Deletes a named transition (cleans up matrix references, promotes default if needed).
+    DeleteNamedTransition {
+        name: String,
+    },
+    /// Sets the default named transition.
+    SetDefaultNamedTransition {
+        name: String,
+    },
+    /// Sets or clears a rule in the from-scene / to-scene transition matrix.
+    SetTransitionMatrixRule {
+        from: Option<String>,
+        to: Option<String>,
+        transition: Option<String>,
     },
     /// A scene's sources, top first.
     Items {
@@ -1704,6 +1814,19 @@ pub enum StudioAct {
         h: f32,
         #[serde(default)]
         save: bool,
+    },
+    /// Moves and sizes several items at once, each as `SetItemBox` does: aligning, spacing out, or
+    /// moving and resizing a group of picked items, as one undo step → the items, in the order
+    /// given. All of them or none. `save` at the end of a drag.
+    SetItemBoxes {
+        scene: String,
+        items: Vec<ItemBoxIn>,
+        #[serde(default)]
+        save: bool,
+        /// `align` or `distribute` for one click of those buttons (their own undo step, named
+        /// for it); missing: a move.
+        #[serde(default)]
+        reason: BoxReason,
     },
     /// Crops an item from the preview (Alt-drag on a handle): left, top, right, bottom in the
     /// source's own pixels, keeping what's left where it is on screen → the item. `save` at the
@@ -1958,14 +2081,67 @@ impl StudioAct {
             A::SetSceneTransition { scene, transition } => {
                 check_source_name(scene)?;
                 if let Some(t) = transition {
-                    if !TRANSITION_KINDS.contains(&t.kind.as_str()) {
-                        return Err(EngineError::Invalid(
-                            "kind: fade, cut, swipe, slide, fade to colour, wipe or stinger transition.".into(),
-                        ));
+                    check_transition(t)?;
+                }
+                Ok(())
+            }
+            A::AddNamedTransition { transition } => {
+                check_source_name(&transition.name)?;
+                if !TRANSITION_KINDS.contains(&transition.kind.as_str()) {
+                    return Err(EngineError::Invalid("kind: one of the Studio's transitions.".into()));
+                }
+                if transition.ms > 20_000 {
+                    return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
+                }
+                if !transition.settings.is_object() {
+                    return Err(EngineError::Invalid("settings: an object of OBS transition settings.".into()));
+                }
+                check_settings(&transition.settings)
+            }
+            A::UpdateNamedTransition { name, patch } => {
+                check_source_name(name)?;
+                if let Some(kind) = &patch.kind
+                    && !TRANSITION_KINDS.contains(&kind.as_str())
+                {
+                    return Err(EngineError::Invalid("kind: one of the Studio's transitions.".into()));
+                }
+                if let Some(ms) = patch.ms
+                    && ms > 20_000
+                {
+                    return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
+                }
+                if let Some(settings) = &patch.settings {
+                    if !settings.is_object() {
+                        return Err(EngineError::Invalid("settings: an object of OBS transition settings.".into()));
                     }
-                    if t.ms > 20_000 {
-                        return Err(EngineError::Invalid("ms: a transition lasts 0 to 20000 ms.".into()));
-                    }
+                    check_settings(settings)?;
+                }
+                Ok(())
+            }
+            A::RenameNamedTransition { name, new_name } => {
+                check_source_name(name)?;
+                check_source_name(new_name)
+            }
+            A::DuplicateNamedTransition { name, new_name } => {
+                check_source_name(name)?;
+                if let Some(n) = new_name {
+                    check_source_name(n)?;
+                }
+                Ok(())
+            }
+            A::DeleteNamedTransition { name } | A::SetDefaultNamedTransition { name } => check_source_name(name),
+            A::SetTransitionMatrixRule { from, to, transition } => {
+                if from.is_none() && to.is_none() {
+                    return Err(EngineError::Invalid("from, to: pick a From scene, a To scene, or both.".into()));
+                }
+                if let Some(f) = from {
+                    check_source_name(f)?;
+                }
+                if let Some(t) = to {
+                    check_source_name(t)?;
+                }
+                if let Some(tr) = transition {
+                    check_source_name(tr)?;
                 }
                 Ok(())
             }
@@ -2080,16 +2256,22 @@ impl StudioAct {
                 }
                 Ok(())
             }
-            A::SetItemBox { scene, x, y, w, h, .. } => {
+            A::SetItemBoxes { scene, items, .. } => {
                 check_source_name(scene)?;
-                const MAX: f32 = 100_000.0;
-                if ![*x, *y, *w, *h].iter().all(|v| v.is_finite() && v.abs() <= MAX) {
-                    return Err(EngineError::Invalid("x, y, w, h: numbers from -100000 to 100000.".into()));
+                if items.is_empty() || items.len() > MAX_BOXES {
+                    return Err(EngineError::Invalid(format!("items: 1 to {MAX_BOXES} boxes.")));
                 }
-                if *w < 1.0 || *h < 1.0 {
-                    return Err(EngineError::Invalid("w, h: at least 1 pixel.".into()));
+                for (n, b) in items.iter().enumerate() {
+                    if items[..n].iter().any(|o| o.id == b.id) {
+                        return Err(EngineError::Invalid(format!("items: item {} twice.", b.id)));
+                    }
+                    check_box(b.x, b.y, b.w, b.h)?;
                 }
                 Ok(())
+            }
+            A::SetItemBox { scene, x, y, w, h, .. } => {
+                check_source_name(scene)?;
+                check_box(*x, *y, *w, *h)
             }
             A::Transform { scene, .. } => check_source_name(scene),
             A::Undo | A::Redo | A::History | A::StudioMode { .. } | A::SetStudioOptions { .. } => Ok(()),
@@ -2232,8 +2414,10 @@ impl StudioAct {
     /// It changes the collection (the host saves it after).
     pub fn changes(&self) -> bool {
         use StudioAct as A;
-        if let A::SetItemBox { save: last, .. } | A::SetItemCrop { save: last, .. } | A::TBar { release: last, .. } =
-            self
+        if let A::SetItemBox { save: last, .. }
+        | A::SetItemBoxes { save: last, .. }
+        | A::SetItemCrop { save: last, .. }
+        | A::TBar { release: last, .. } = self
         {
             return *last;
         }
@@ -2341,6 +2525,12 @@ fn check_settings(v: &Value) -> Result<(), EngineError> {
 #[derive(Debug, Default)]
 pub(crate) struct Slot {
     host: std::sync::RwLock<Option<Arc<dyn StudioHost>>>,
+}
+
+impl Slot {
+    pub(crate) fn optional(&self) -> Option<Arc<dyn StudioHost>> {
+        self.host.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
 }
 
 const NONE: &str = "The Studio runs in the Ferrocast app on your computer. Open Ferrocast there.";
@@ -3025,7 +3215,7 @@ impl Engine {
     /// Refuses scene-collection or profile switches (and imports/new) while a Show or any
     /// live Studio output (stream, recording, source record, replay, virtual camera, NDI) is
     /// active, so outputs can never be orphaned or blacked out mid-broadcast (M9-01).
-    async fn ensure_idle_for_switch(&self, noun: &str) -> Result<(), EngineError> {
+    pub(crate) async fn ensure_idle_for_switch(&self, noun: &str) -> Result<(), EngineError> {
         if self.is_show_active() {
             return Err(EngineError::Refused {
                 status: 409,
@@ -3068,19 +3258,46 @@ impl Engine {
         Ok(())
     }
 
-    /// Scene collections or profiles: one act on that list.
+    /// Scene collections or profiles: one act on that list. Falls back to file-backed storage on
+    /// disk when no desktop [`StudioHost`] is attached (such as in `ferrocast-headless`).
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
+        let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
+        // Swapping what the Studio shows is refused during a show or while it streams or
+        // records; with no desktop host attached (headless) the show itself still counts.
         if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
             let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
             self.ensure_idle_for_switch(noun).await?;
             // A held key's item is in the collection being left: put it back first.
             self.studio_release_holds().await;
         }
-        let out = self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)?;
-        // Another collection may have its own vertical picture (or none): the stream follows.
-        self.studio_sync_vertical().await;
-        Ok(out)
+        if let Some(host) = host {
+            let out = host.shelf(kind.to_string(), act).await.map_err(failed)?;
+            // Another collection may have its own vertical picture (or none): the stream follows.
+            self.studio_sync_vertical().await;
+            return Ok(out);
+        }
+
+        let data = self.store().dir().to_path_buf();
+        let kind_owned = kind.to_string();
+        let res = tokio::task::spawn_blocking(move || {
+            use ferrocast_store::studio_library as lib;
+            match act {
+                ShelfAct::List => lib::headless_shelf_list(&data, &kind_owned),
+                ShelfAct::New { name, copy } => lib::headless_shelf_new(&data, &kind_owned, &name, copy),
+                ShelfAct::Switch { id } => lib::headless_shelf_switch(&data, &kind_owned, &id),
+                ShelfAct::Rename { id, name } => lib::headless_shelf_rename(&data, &kind_owned, &id, &name),
+                ShelfAct::Remove { id } => lib::headless_shelf_remove(&data, &kind_owned, &id),
+                ShelfAct::Export { id } => lib::headless_shelf_export(&data, &kind_owned, &id),
+                ShelfAct::Import { name, doc } => {
+                    let (id, _prev, saved_name) = lib::import_collection_doc(&data, &name, doc)?;
+                    Ok(serde_json::json!({ "id": id, "name": saved_name }))
+                }
+            }
+        })
+        .await
+        .map_err(|e| EngineError::Internal(e.to_string()))?;
+        res.map_err(failed)
     }
 
     pub async fn studio_screens(&self) -> Result<Value, EngineError> {
@@ -3176,11 +3393,30 @@ pub(crate) fn failed(message: String) -> EngineError {
     if message.starts_with("There's no source") {
         return refused(404, "studio_no_source", message, "Refresh the list of sources.");
     }
+    // An item id that isn't in the scene (a box, a crop, a batch): like the other item routes.
+    // Its exact shape (`"Scene" has no item 9.`), so a scene or source named "has no item" doesn't
+    // read as one.
+    if message.starts_with('"') && message.contains("\" has no item ") && !message.starts_with("There's no") {
+        return refused(404, "studio_no_source", message, "Refresh the list of sources.");
+    }
+    // Several boxes at once: a group and one of its own sources can't be in one request.
+    if message.contains("can't be moved together") {
+        return EngineError::Invalid(message);
+    }
     if message.starts_with("There's no scene called") {
         return refused(404, "studio_no_scene", message, "Refresh the list of scenes.");
     }
     if message.starts_with("There's no filter called") {
         return refused(404, "studio_no_filter", message, "Refresh the list of filters.");
+    }
+    if message.starts_with("There's no transition called") {
+        return refused(404, "studio_no_transition", message, "Refresh the list of transitions.");
+    }
+    if message.contains("already a transition called") {
+        return refused(409, "studio_name_taken", message, "Pick another transition name.");
+    }
+    if message.starts_with("At least one transition must remain") {
+        return refused(409, "studio_last_transition", message, "Keep at least one transition in the collection.");
     }
     // A collection's own name is in these messages: it must not decide the answer ("in use now").
     if message.contains("is damaged and can't be read") && message.contains("scene collection") {
@@ -4048,6 +4284,53 @@ mod tests {
         assert!(gl.check().is_ok());
     }
 
+    /// A new profile snaps a moved source to the canvas's edges and middle and to other sources'
+    /// edges and middles, 10 pixels near (the guide lines in the preview show what it caught).
+    #[test]
+    fn the_preview_snaps_to_everything_by_default() {
+        let s = StudioSettings::default();
+        assert!(s.snapping && s.snap_screen && s.snap_center && s.snap_sources);
+        assert_eq!(s.snap_px, 10);
+    }
+
+    /// The preview's holes: the box round several picked sources alone is a dozen, with a few
+    /// guide lines and a menu that is more than the old 16 (Neon: the app answered 400 and kept
+    /// painting the old holes).
+    #[test]
+    fn an_item_that_is_not_in_the_scene_is_a_404_like_the_other_item_routes() {
+        let e = failed("\"Main\" has no item 999.".into());
+        assert!(matches!(&e, EngineError::Refused { status: 404, code: "studio_no_source", .. }), "{e:?}");
+        // A scene called that is still a missing scene.
+        let e = failed("There's no scene called \"has no item\".".into());
+        assert!(matches!(&e, EngineError::Refused { status: 404, code: "studio_no_scene", .. }), "{e:?}");
+    }
+
+    #[test]
+    fn a_group_with_its_own_source_in_one_batch_is_a_400() {
+        let e = failed("a group and a source inside it can't be moved together.".into());
+        assert!(matches!(&e, EngineError::Invalid(m) if m.contains("together")), "{e:?}");
+    }
+
+    #[test]
+    fn the_preview_takes_enough_holes_for_the_edit_guides() {
+        let rect = |n: usize| PreviewRect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+            vh: 0.0,
+            canvas: None,
+            bg: None,
+            stripe: None,
+            holes: vec![PreviewHole { x: 0.0, y: 0.0, w: 4.0, h: 4.0, r: 0.0 }; n],
+            opacity: None,
+            shade: None,
+        };
+        assert!(rect(20).validate().is_ok());
+        assert!(rect(PREVIEW_HOLES).validate().is_ok());
+        assert!(rect(PREVIEW_HOLES + 1).validate().is_err());
+    }
+
     #[test]
     fn x264_and_lossless_need_ffmpeg() {
         let s = StudioSettings::default();
@@ -4198,6 +4481,32 @@ mod tests {
         ] {
             assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
         }
+        // Several boxes at once: one act, checked as a whole.
+        let one = |id, x| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 };
+        let many = |items: Vec<ItemBoxIn>, save| StudioAct::SetItemBoxes {
+            scene: "Main".into(),
+            items,
+            save,
+            reason: BoxReason::default(),
+        };
+        assert!(!many(vec![one(3, 0.0)], false).changes());
+        assert!(many(vec![one(3, 0.0)], true).changes());
+        e.studio_act(many(vec![one(3, 1.0), one(4, 2.0)], true)).await.unwrap();
+        for bad in [
+            many(vec![], true),
+            many((0..=MAX_BOXES as i64).map(|i| one(i, 0.0)).collect(), true),
+            many(vec![one(3, 0.0), one(3, 5.0)], true),
+            many(vec![one(3, f32::NAN)], true),
+            many(vec![ItemBoxIn { w: 0.5, ..one(3, 0.0) }], true),
+            StudioAct::SetItemBoxes {
+                scene: String::new(),
+                items: vec![one(3, 0.0)],
+                save: true,
+                reason: BoxReason::default(),
+            },
+        ] {
+            assert!(matches!(e.studio_act(bad.clone()).await.unwrap_err(), EngineError::Invalid(_)), "{bad:?}");
+        }
         let pick =
             StudioAct::Select { scene: Some("Main".into()), id: Some(3), frames: false, also: vec![4], guides: false };
         assert!(!pick.changes());
@@ -4214,7 +4523,7 @@ mod tests {
         e.studio_act(StudioAct::Select { scene: None, id: None, frames: false, also: vec![], guides: false })
             .await
             .unwrap();
-        assert_eq!(fake.acts.lock().unwrap().len(), 4);
+        assert_eq!(fake.acts.lock().unwrap().len(), 5);
 
         // OBS's filter strings become dialog filters; "any file" is left to the dialog.
         let f = FilePick {
@@ -4629,5 +4938,87 @@ mod tests {
         let mut bad_pic_name =
             StudioAct::SourcePicture { name: "a\nb".into(), width: 256, filters: true, item: Some(tgt) };
         assert!(matches!(bad_pic_name.check(), Err(EngineError::Invalid(_))));
+    }
+
+    #[test]
+    fn named_transition_and_matrix_acts_validate_and_map_errors() {
+        let mut good = [
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput {
+                    name: "Quick Fade".into(),
+                    kind: "fade_transition".into(),
+                    ms: 200,
+                    settings: serde_json::json!({}),
+                    default: false,
+                },
+            },
+            StudioAct::UpdateNamedTransition {
+                name: "Quick Fade".into(),
+                patch: NamedTransitionPatch {
+                    kind: Some("ferrocast_move".into()),
+                    ms: Some(400),
+                    settings: Some(serde_json::json!({})),
+                    default: Some(true),
+                },
+            },
+            StudioAct::RenameNamedTransition { name: "Quick Fade".into(), new_name: "Slow Move".into() },
+            StudioAct::DuplicateNamedTransition { name: "Slow Move".into(), new_name: None },
+            StudioAct::DeleteNamedTransition { name: "Slow Move 2".into() },
+            StudioAct::SetDefaultNamedTransition { name: "Fade".into() },
+            StudioAct::SetTransitionMatrixRule {
+                from: Some("Main".into()),
+                to: None,
+                transition: Some("Slow Move".into()),
+            },
+        ];
+        for a in &mut good {
+            assert!(a.check().is_ok(), "{a:?}");
+            assert!(a.changes(), "{a:?}");
+        }
+
+        let mut bad = [
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput { name: " ".into(), ..Default::default() },
+            },
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput {
+                    name: "BadKind".into(),
+                    kind: "explode".into(),
+                    ..Default::default()
+                },
+            },
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput { name: "TooLong".into(), ms: 20_001, ..Default::default() },
+            },
+            StudioAct::AddNamedTransition {
+                transition: NamedTransitionInput {
+                    name: "BadSettings".into(),
+                    settings: serde_json::json!(42),
+                    ..Default::default()
+                },
+            },
+            StudioAct::SetTransitionMatrixRule { from: None, to: None, transition: Some("Fade".into()) },
+            StudioAct::SetTransitionMatrixRule {
+                from: Some("".into()),
+                to: Some("Main".into()),
+                transition: Some("Fade".into()),
+            },
+        ];
+        for b in &mut bad {
+            assert!(matches!(b.check(), Err(EngineError::Invalid(_))), "{b:?}");
+        }
+
+        assert!(matches!(
+            failed("There's no transition called \"Gone\".".into()),
+            EngineError::Refused { status: 404, code: "studio_no_transition", .. }
+        ));
+        assert!(matches!(
+            failed("There's already a transition called \"Fade\".".into()),
+            EngineError::Refused { status: 409, code: "studio_name_taken", .. }
+        ));
+        assert!(matches!(
+            failed("At least one transition must remain.".into()),
+            EngineError::Refused { status: 409, code: "studio_last_transition", .. }
+        ));
     }
 }

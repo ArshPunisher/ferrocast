@@ -37,6 +37,7 @@ getrandom = "0.4"
 fastrand = "2"
 quick-xml = "0.42"
 zip = { version = "9", default-features = false, features = ["deflate"] }
+sysinfo = { version = "0.37", default-features = false, features = ["disk", "system"] }
 # Pro cloud backups: encrypted on this PC (X25519, optional scrypt passphrase). No default
 # features: no plugins, SSH keys, armor or async.
 age = { version = "0.12", default-features = false }

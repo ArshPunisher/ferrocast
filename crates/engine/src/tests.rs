@@ -1899,6 +1899,199 @@ async fn a_failed_background_save_gives_one_notice_and_a_later_success_replaces_
 }
 
 #[tokio::test]
+async fn overlay_labels_track_session_monthly_alltime_latest_and_hype_train() {
+    use ferrocast_core::money::{PlatformValue, ValueUnit};
+    use ferrocast_core::overlay::{Preset, Widget, WidgetKind};
+    use serde_json::json;
+
+    let (e, _d) = engine().await;
+    let now_ms = crate::now().0;
+
+    let view = e.create_overlay("LabelsTest", Preset::Blank).await.unwrap();
+    let mut ov = e.overlay(&view.id).await.unwrap();
+    ov.widgets = vec![
+        Widget::new(
+            "lf",
+            WidgetKind::Label,
+            (10, 10, 300, 50),
+            json!({ "source": "latest_follower", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "sf",
+            WidgetKind::Label,
+            (10, 70, 300, 50),
+            json!({ "source": "session_follows", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "mf",
+            WidgetKind::Label,
+            (10, 130, 300, 50),
+            json!({ "source": "monthly_follows", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "af",
+            WidgetKind::Label,
+            (10, 190, 300, 50),
+            json!({ "source": "alltime_follows", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "sb",
+            WidgetKind::Label,
+            (10, 250, 300, 50),
+            json!({ "source": "session_bits", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "st",
+            WidgetKind::Label,
+            (10, 310, 300, 50),
+            json!({ "source": "session_tips", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "sr",
+            WidgetKind::Label,
+            (10, 370, 300, 50),
+            json!({ "source": "session_raids", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "ts",
+            WidgetKind::Label,
+            (10, 430, 300, 50),
+            json!({ "source": "top_supporter_session", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "lr",
+            WidgetKind::Label,
+            (10, 490, 300, 50),
+            json!({ "source": "latest_raid", "template": "{value}", "theme": "molten" }),
+        ),
+        Widget::new(
+            "ht",
+            WidgetKind::Label,
+            (10, 550, 460, 50),
+            json!({
+                "source": "hype_train",
+                "template": "Hype Lv.{level} ({count}) {timer}",
+                "theme": "molten",
+                "train_window_s": 60,
+                "train_step_s": 15,
+                "train_max_s": 180,
+                "train_threshold": 2
+            }),
+        ),
+    ];
+    e.update_overlay(ov.clone()).await.unwrap();
+    let mut rx = e.subscribe_overlays();
+
+    let fan = |n: &str| {
+        let mut a = Actor::named(Platform::Twitch, n);
+        a.id = Some(format!("id-{n}"));
+        a
+    };
+
+    // Go live on stream 1 and ingest an event far in the past (prev year) + events now
+    let old_ts = 1_577_836_800_000_i64; // 2020-01-01
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("old-follow".into()),
+        Millis(old_ts),
+        EventKind::Follow { actor: fan("PastFan") },
+    ))
+    .await;
+
+    // Stream 1 starts now
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("s1-on".into()),
+        Millis(now_ms - 5_000),
+        EventKind::StreamOnline { title: None },
+    ))
+    .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("f1".into()),
+        Millis(now_ms - 4_000),
+        EventKind::Follow { actor: fan("Alice") },
+    ))
+    .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("b1".into()),
+        Millis(now_ms - 3_000),
+        EventKind::PlatformGift {
+            actor: fan("BitsKing"),
+            value: PlatformValue { unit: ValueUnit::Bits, amount: 1200 },
+            message: None,
+        },
+    ))
+    .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("r1".into()),
+        Millis(now_ms - 2_000),
+        EventKind::Raid { from: fan("RaiderBob"), viewers: 25 },
+    ))
+    .await;
+    e.ingest(Event::live(
+        Platform::Tips,
+        Some("t1".into()),
+        Millis(now_ms - 1_000),
+        EventKind::Tip {
+            actor: fan("Whale"),
+            money: Money::new(50_000, "INR"),
+            message: None,
+            provider: TipProvider::Razorpay,
+            payment_ref: "t1".into(),
+            status: PaymentStatus::Captured,
+        },
+    ))
+    .await;
+
+    // Test alert must not alter label counts or hype train
+    e.test("tip", None).await.unwrap();
+
+    // Verify at least one overlay WS label state push arrived cleanly
+    let mut got_push = false;
+    while let Ok(f) = rx.try_recv() {
+        let v: Value = serde_json::from_str(&f.text).unwrap();
+        if v["type"] == "state" && v["data"]["labels"]["ht"].is_string() {
+            got_push = true;
+        }
+    }
+    assert!(got_push, "label update frame should be pushed over WS");
+
+    let snap = e.overlay_snapshot(&ov).await.unwrap();
+    let labels = &snap["state"]["labels"];
+    assert_eq!(labels["lf"], "Alice");
+    assert_eq!(labels["sf"], "1");
+    assert_eq!(labels["mf"], "1");
+    assert_eq!(labels["af"], "2", "includes the 2020 follower in all-time");
+    assert_eq!(labels["sb"], "1,200");
+    assert_eq!(labels["st"], "₹500");
+    assert_eq!(labels["sr"], "1");
+    assert_eq!(labels["lr"], "RaiderBob (25)");
+    assert!(labels["ts"].as_str().unwrap().starts_with("BitsKing"));
+    let train = &snap["state"]["label_trains"]["ht"];
+    assert_eq!(train["active"], true);
+    assert_eq!(train["events"], 4);
+
+    // Go offline then start Stream 2 -> session resets to 0 while monthly/all-time stay!
+    e.ingest(Event::live(Platform::Twitch, Some("s1-off".into()), Millis(now_ms - 500), EventKind::StreamOffline))
+        .await;
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("s2-on".into()),
+        Millis(now_ms),
+        EventKind::StreamOnline { title: None },
+    ))
+    .await;
+    let snap2 = e.overlay_snapshot(&ov).await.unwrap();
+    assert_eq!(snap2["state"]["labels"]["sf"], "0");
+    assert_eq!(snap2["state"]["labels"]["st"], "0");
+    assert_eq!(snap2["state"]["labels"]["mf"], "1");
+    assert_eq!(snap2["state"]["labels"]["af"], "2");
+}
+
+#[tokio::test]
 async fn mute_and_pause_show_in_the_queue_and_survive_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     {

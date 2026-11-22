@@ -41,8 +41,8 @@ pub(crate) fn saved_tokens<T: serde::de::DeserializeOwned>(
     }
 }
 
-const TWITCH_TOKENS: &str = "twitch-tokens";
-const YOUTUBE_TOKENS: &str = "youtube-tokens";
+pub(crate) const TWITCH_TOKENS: &str = "twitch-tokens";
+pub(crate) const YOUTUBE_TOKENS: &str = "youtube-tokens";
 /// How long the browser sign-in for YouTube may take.
 const YOUTUBE_SIGN_IN: Duration = Duration::from_secs(300);
 

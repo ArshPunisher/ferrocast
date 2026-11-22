@@ -87,7 +87,22 @@ const CACHE_RESET_EVERY: usize = 2000;
 
 impl TextRenderer {
     pub fn new() -> Self {
-        Self { fonts: FontSystem::new(), cache: SwashCache::new(), renders: 0 }
+        let mut fonts = FontSystem::new();
+        if let Some(dir) = crate::fonts::extra_fonts_dir()
+            && dir.is_dir()
+        {
+            fonts.db_mut().load_fonts_dir(dir);
+        }
+        Self { fonts, cache: SwashCache::new(), renders: 0 }
+    }
+
+    /// Re-scans Ferrocast's local font folder (`<data>/fonts/`) after new pack fonts arrive.
+    pub fn reload_extra_fonts(&mut self) {
+        if let Some(dir) = crate::fonts::extra_fonts_dir()
+            && dir.is_dir()
+        {
+            self.fonts.db_mut().load_fonts_dir(dir);
+        }
     }
 
     /// The text as a picture (straight alpha), just big enough for it, its outline and shadow.

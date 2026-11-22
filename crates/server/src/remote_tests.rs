@@ -486,6 +486,9 @@ fn the_relay_and_the_pc_have_the_same_rules() {
         "/obs",
         "/obs/detect",
         "/session/pair",
+        "/diagnostics/preview",
+        "/diagnostics/report",
+        "/diagnostics/report.zip",
     ];
     for path in paths {
         for method in ["GET", "POST", "PUT", "DELETE", "PATCH"] {
@@ -606,4 +609,23 @@ async fn a_phone_may_look_at_the_tip_address_but_never_change_it() {
     assert!(!relay::allowed(relay::Role::Owner, "PUT", "/pro/tips/domain"));
     assert!(!relay::allowed(relay::Role::Owner, "DELETE", "/pro/tips/domain"));
     assert!(!relay::allowed(relay::Role::Mod, "GET", "/pro/tips/domain"));
+}
+
+#[tokio::test]
+async fn remote_owner_and_mod_are_refused_diagnostics_end_to_end() {
+    let (h, _dir) = handler().await;
+    for role in ["owner", "mod"] {
+        for (method, path, body) in [
+            ("GET", "/api/v1/diagnostics/preview", ""),
+            ("POST", "/api/v1/diagnostics/report", r#"{"folder":"/tmp"}"#),
+            ("POST", "/api/v1/diagnostics/report.zip", "{}"),
+        ] {
+            let (s, v) = ask(&h, role, method, path, body).await;
+            assert_eq!(
+                (s, v["error"]["code"].as_str()),
+                (403, Some("not_allowed_for_role")),
+                "expected 403 not_allowed_for_role for {role} {method} {path}: {v}"
+            );
+        }
+    }
 }
