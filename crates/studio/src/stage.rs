@@ -5790,8 +5790,25 @@ pub fn is_valid_transition_kind(kind: &str) -> bool {
     )
 }
 
+/// OBS's own transitions, by the names it shows them under (it doesn't save these in the
+/// collection's `transitions`, only custom ones).
+fn builtin_kind(name: &str) -> Option<&'static str> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "cut" => "cut_transition",
+        "fade" => "fade_transition",
+        "swipe" => "swipe_transition",
+        "slide" => "slide_transition",
+        "stinger" => "obs_stinger_transition",
+        "fade to color" => "fade_to_color_transition",
+        "luma wipe" => "wipe_transition",
+        _ => return None,
+    })
+}
+
 fn guess_transition_kind(name: &str) -> &'static str {
-    if name.eq_ignore_ascii_case("cut") || name == "cut_transition" {
+    if let Some(k) = builtin_kind(name) {
+        k
+    } else if name.eq_ignore_ascii_case("cut") || name == "cut_transition" {
         "cut_transition"
     } else if is_valid_transition_kind(name) {
         match name {
@@ -6002,6 +6019,12 @@ fn import_and_normalize_transitions(d: &mut Value) {
             if has_matrix || has_legacy {
                 continue;
             }
+            // OBS plays the default when it can't find a custom transition by that name (it was
+            // removed): no preset is made up for it. Its own built-ins aren't saved, so those are
+            // known by name.
+            if !transitions.iter().any(|t| t.name == tr_name) && builtin_kind(&tr_name).is_none() {
+                continue;
+            }
             if !transitions.iter().any(|t| t.name == tr_name) {
                 let kind = guess_transition_kind(&tr_name).to_string();
                 let ms = if kind == "cut_transition" { 0 } else { dur_opt.unwrap_or(300) };
@@ -6013,8 +6036,9 @@ fn import_and_normalize_transitions(d: &mut Value) {
                     default: false,
                 });
             }
-            let target_tr = if let Some(dur) = dur_opt
-                && let Some(base) = transitions.iter().find(|t| t.name == tr_name).cloned()
+            // OBS gives an override with no saved duration 300 ms, not the base preset's.
+            let dur = dur_opt.unwrap_or(300);
+            let target_tr = if let Some(base) = transitions.iter().find(|t| t.name == tr_name).cloned()
                 && base.kind != "cut_transition"
                 && base.ms != dur
             {
@@ -6022,16 +6046,33 @@ fn import_and_normalize_transitions(d: &mut Value) {
                 let suffix = format!(" ({dur}ms)");
                 let stem: String = base.name.chars().take(100usize.saturating_sub(suffix.chars().count())).collect();
                 let custom = format!("{stem}{suffix}");
-                if !transitions.iter().any(|t| t.name == custom) {
-                    transitions.push(NamedTransition {
-                        name: custom.clone(),
-                        kind: base.kind,
-                        ms: dur,
-                        settings: base.settings,
-                        default: false,
-                    });
+                // A preset of that name is reused only if it is the same thing; otherwise this
+                // one gets a name of its own.
+                let same = |t: &NamedTransition| t.kind == base.kind && t.ms == dur && t.settings == base.settings;
+                match transitions.iter().find(|t| t.name == custom) {
+                    Some(t) if same(t) => custom,
+                    Some(_) => {
+                        let own = free_transition_name(&transitions, &custom).unwrap_or_else(|_| custom.clone());
+                        transitions.push(NamedTransition {
+                            name: own.clone(),
+                            kind: base.kind,
+                            ms: dur,
+                            settings: base.settings,
+                            default: false,
+                        });
+                        own
+                    }
+                    None => {
+                        transitions.push(NamedTransition {
+                            name: custom.clone(),
+                            kind: base.kind,
+                            ms: dur,
+                            settings: base.settings,
+                            default: false,
+                        });
+                        custom
+                    }
                 }
-                custom
             } else {
                 tr_name
             };
@@ -8521,6 +8562,75 @@ mod tests {
         assert_eq!(mv.boxes().len(), 2);
     }
 
+    /// An OBS collection with scenes A and B, `current` as the default transition at `ms`, and the
+    /// given custom transitions; scene A has the override `name` (at `dur`, if any).
+    fn obs_with_override(current: &str, ms: u64, custom: Value, name: &str, dur: Option<u64>) -> Value {
+        let mut ps = json!({ "transition": name });
+        if let Some(d) = dur {
+            ps["transition_duration"] = json!(d);
+        }
+        json!({
+            "current_scene": "A",
+            "current_transition": current,
+            "transition_duration": ms,
+            "transitions": custom,
+            "sources": [
+                { "id": "scene", "name": "A", "settings": { "items": [] }, "private_settings": ps },
+                { "id": "scene", "name": "B", "settings": { "items": [] }, "private_settings": {} }
+            ],
+            "scene_order": [{ "name": "A" }, { "name": "B" }]
+        })
+    }
+
+    fn rule_target(d: &Value, scene: &str) -> Option<NamedTransition> {
+        let rules = transition_matrix_from_doc(d);
+        let r = rules.iter().find(|r| r.from.is_none() && r.to.as_deref() == Some(scene))?;
+        named_transitions_from_doc(d).into_iter().find(|t| t.name == r.transition)
+    }
+
+    #[test]
+    fn an_obs_override_without_a_duration_is_300_ms_not_the_defaults() {
+        // The default is Swipe at 750 ms; scene A names Swipe with no duration saved: OBS plays 300.
+        let mut d = obs_with_override("Swipe", 750, json!([]), "Swipe", None);
+        import_and_normalize_transitions(&mut d);
+        let t = rule_target(&d, "A").unwrap_or_else(|| panic!("a rule for A"));
+        assert_eq!((t.kind.as_str(), t.ms), ("swipe_transition", 300), "{t:?}");
+        // Cut stays 0.
+        let mut d = obs_with_override("Fade", 750, json!([]), "Cut", None);
+        import_and_normalize_transitions(&mut d);
+        assert_eq!(rule_target(&d, "A").map(|t| t.ms), Some(0));
+    }
+
+    #[test]
+    fn an_obs_override_naming_a_removed_custom_transition_is_ignored() {
+        let mut d =
+            obs_with_override("Fade", 750, json!([{ "name": "Fade", "id": "fade_transition" }]), "Show Swipe", None);
+        import_and_normalize_transitions(&mut d);
+        assert!(transition_matrix_from_doc(&d).is_empty(), "OBS plays the default for it");
+        assert!(named_transitions_from_doc(&d).iter().all(|t| t.name != "Show Swipe"), "no preset made up for it");
+        // A built-in name OBS doesn't save is still understood.
+        let mut d = obs_with_override("Fade", 300, json!([]), "Slide", Some(500));
+        import_and_normalize_transitions(&mut d);
+        assert_eq!(rule_target(&d, "A").map(|t| t.kind), Some("slide_transition".to_string()));
+    }
+
+    #[test]
+    fn an_obs_override_is_never_bound_to_an_unrelated_preset_of_the_same_name() {
+        // The collection already has a Cut preset called "Swipe (700ms)".
+        let custom = json!([
+            { "name": "Fade", "id": "fade_transition" },
+            { "name": "Swipe (700ms)", "id": "cut_transition" }
+        ]);
+        let mut d = obs_with_override("Fade", 300, custom, "Swipe", Some(700));
+        import_and_normalize_transitions(&mut d);
+        let t = rule_target(&d, "A").unwrap_or_else(|| panic!("a rule for A"));
+        assert_eq!((t.kind.as_str(), t.ms), ("swipe_transition", 700), "plays Swipe, not the Cut: {t:?}");
+        assert_ne!(t.name, "Swipe (700ms)");
+        // The one that was there is untouched.
+        let cut = named_transitions_from_doc(&d).into_iter().find(|t| t.name == "Swipe (700ms)");
+        assert_eq!(cut.map(|t| t.kind), Some("cut_transition".to_string()));
+    }
+
     #[test]
     fn a_kinds_settings_are_written_to_the_preset_they_are_read_from() {
         let s = stage();
@@ -9641,6 +9751,7 @@ mod tests {
             "scene_order": [{ "name": "Main / Camera" }, { "name": "BRB ~ 5m" }, { "name": "Plain" }],
             "transitions": [
                 { "id": "swipe_transition", "name": "Swipe", "settings": {} },
+                { "id": "fade_transition", "name": long.clone(), "settings": {} },
                 { "id": "move_transition", "name": "Mover", "settings": {} }
             ],
             "ferrocast": { "scene_transitions": { "Main / Camera": { "kind": "fade_transition", "ms": 100 } } }
