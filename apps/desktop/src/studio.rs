@@ -777,11 +777,16 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
 }
 
 /// The saved settings, falling back to `.bak` when unreadable, or the defaults.
+/// The saved profile, as is: nothing is applied to the engine (a support report can read it
+/// without changing the sound rate or broadcast timing of a running Studio).
+fn read_settings(data: &std::path::Path) -> StudioSettings {
+    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
+        .map(|l| l.value)
+        .unwrap_or_default()
+}
+
 fn load_settings(data: &std::path::Path) -> StudioSettings {
-    let s =
-        ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
-            .map(|l| l.value)
-            .unwrap_or_default();
+    let s = read_settings(data);
     apply_audio_format(&s);
     s
 }
@@ -4174,7 +4179,8 @@ impl StudioHost for DesktopStudio {
     async fn diagnostics_studio(&self) -> Option<Value> {
         let data = self.data.clone();
         self.on_main(move |h| {
-            let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+            // Read, don't apply: this runs for a support report, which must not change the engine.
+            let s = h.settings.clone().unwrap_or_else(|| read_settings(&data));
             let stats = h.collection.as_ref().map(|c| c.stats());
             let encoders: Vec<Value> = ferrocast_studio::kinds::kinds()
                 .encoders
@@ -4778,6 +4784,8 @@ mod budget_tests {
 
         let loaded = load_settings(dir.path());
         assert_eq!((loaded.width, loaded.height, loaded.fps), (1280, 720, 30));
+        let read = read_settings(dir.path());
+        assert_eq!((read.width, read.height, read.fps), (1280, 720, 30), "reads the same profile");
 
         // Corrupt existing settings must not clobber `.bak` on a save_json overwrite.
         save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));
