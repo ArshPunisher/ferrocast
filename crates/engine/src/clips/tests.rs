@@ -476,3 +476,19 @@ async fn an_unreadable_caption_file_is_an_error_not_an_empty_list() {
     assert!(matches!(r, Err(EngineError::Refused { code: "bad_captions", .. })), "{r:?}");
     let _ = std::fs::set_permissions(clips.path().join("a.srt"), std::fs::Permissions::from_mode(0o644));
 }
+
+/// A clip is opened as the very file the name pointed at: a link put in its place after the name
+/// was checked (or a hard link) isn't opened.
+#[cfg(unix)]
+#[test]
+fn opening_a_clip_refuses_a_link_swapped_in_after_the_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    touch(outside.path(), "secret.mp4", b"secret");
+    touch(dir.path(), "plain.mp4", b"plain");
+    assert!(open_plain(&dir.path().join("plain.mp4")).is_ok());
+    std::os::unix::fs::symlink(outside.path().join("secret.mp4"), dir.path().join("swapped.mp4")).unwrap();
+    assert!(open_plain(&dir.path().join("swapped.mp4")).is_err(), "opened through a link");
+    std::fs::hard_link(outside.path().join("secret.mp4"), dir.path().join("hard.mp4")).unwrap();
+    assert!(open_plain(&dir.path().join("hard.mp4")).is_err(), "opened a hard link");
+}

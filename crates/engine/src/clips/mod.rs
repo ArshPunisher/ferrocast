@@ -161,6 +161,27 @@ pub fn new_stem(raw: &str) -> Result<String, EngineError> {
     Ok(n.to_string())
 }
 
+/// Opens a clip as the very file the name is: the name must not be a link, the opened handle must
+/// be that same file (a link put there after a check opens something else and is refused), and
+/// on Unix it must have one name only (a hard link may lead out of the folder).
+pub fn open_plain(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::io::{Error, ErrorKind};
+    let file = std::fs::File::open(path)?;
+    let by_handle = file.metadata()?;
+    let by_name = std::fs::symlink_metadata(path)?;
+    if !by_handle.is_file() || !by_name.file_type().is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a plain file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if by_handle.dev() != by_name.dev() || by_handle.ino() != by_name.ino() || by_handle.nlink() > 1 {
+            return Err(Error::new(ErrorKind::InvalidInput, "not the file the name is"));
+        }
+    }
+    Ok(file)
+}
+
 /// A plain file, not a link and not something a link leads to (checked on the name itself).
 pub(crate) fn is_plain_file(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file())
@@ -330,6 +351,19 @@ pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
 /// The subtitle file beside a clip.
 pub fn srt_beside(clip: &Path) -> PathBuf {
     clip.with_extension("srt")
+}
+
+/// Text for ffmpeg's filter syntax: the characters that separate or quote parts of a filter
+/// (`\\ : ' , ; [ ]`) are escaped, so a name stays one name.
+pub(crate) fn filter_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | ':' | '\'' | ',' | ';' | '[' | ']') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The input half of every ffmpeg run on a clip: files only (no network, no other protocol), read

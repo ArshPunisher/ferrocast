@@ -167,7 +167,7 @@ impl FileSource {
     }
 
     fn open(path: &Path) -> Result<Self, EngineError> {
-        let file = std::fs::File::open(path).map_err(|e| {
+        let file = super::open_plain(path).map_err(|e| {
             refuse(
                 422,
                 "clip_unreadable",
@@ -207,6 +207,16 @@ impl UploadSource for FileSource {
 /// How a platform's trouble reads to the streamer.
 fn describe(e: ConnectorError) -> EngineError {
     match e {
+        // A pause of a minute or two is YouTube asking to slow down; the day's quota comes back
+        // only after hours.
+        ConnectorError::RateLimited { retry_after, .. } if retry_after < std::time::Duration::from_secs(15 * 60) => {
+            refuse(
+                429,
+                "youtube_slow_down",
+                "YouTube asked Ferrocast to slow down for a moment.",
+                &format!("Try again in about {} seconds.", retry_after.as_secs().max(1)),
+            )
+        }
         ConnectorError::RateLimited { retry_after, .. } => refuse(
             429,
             "youtube_quota",

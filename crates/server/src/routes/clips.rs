@@ -80,7 +80,7 @@ async fn file(State(app): State<AppState>, Path(id): Path<String>, headers: Head
         Ok(x) => x,
         Err(e) => return crate::error::ApiError::from(e).into_response(),
     };
-    match tokio::fs::File::open(&path).await {
+    match ferrocast_engine::clips::open_plain(&path).map(tokio::fs::File::from_std) {
         Ok(f) => crate::assets::range_response_cached(f, mime, &headers, "no-store").await,
         Err(_) => crate::error::ApiError::from(ferrocast_engine::clips::no_such_clip()).into_response(),
     }

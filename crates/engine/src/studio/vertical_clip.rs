@@ -200,7 +200,9 @@ pub fn vertical_path(clip: &Path) -> Option<PathBuf> {
 /// `fill`: the frame's middle over time (`path_expr`): the clip fills 1080×1920, cut to follow
 /// it, instead of sitting whole over the blurred copy.
 pub fn vertical_args(clip: &Path, out: &Path, subs: Option<&str>, fill: Option<&str>) -> Vec<OsString> {
-    let burn = subs.map(|f| format!(",subtitles={f}:force_style='{SUB_STYLE}'")).unwrap_or_default();
+    let burn = subs
+        .map(|f| format!(",subtitles={}:force_style='{SUB_STYLE}'", crate::clips::filter_text(f)))
+        .unwrap_or_default();
     let filter = match fill {
         Some(m) => format!(
             "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,\
@@ -265,7 +267,8 @@ impl Engine {
         };
         let engine = self.clone();
         tokio::spawn(async move {
-            let subs = if cfg.clip_captions { engine.clip_subtitles(&ffmpeg, &clip).await } else { None };
+            let subs =
+                if cfg.clip_captions { engine.clip_subtitles(&ffmpeg, &clip, Default::default()).await } else { None };
             if cfg.vertical_clips {
                 let fill = if cfg.vertical_fill { engine.clip_focus(&ffmpeg, &clip).await } else { None };
                 make_vertical(&ffmpeg, &clip, subs.as_deref(), fill.as_deref()).await;
@@ -327,7 +330,12 @@ impl Engine {
     }
 
     /// Writes "<clip>.srt" (never over one already there) → its path, when anything was said.
-    pub(crate) async fn clip_subtitles(&self, ffmpeg: &Path, clip: &Path) -> Option<PathBuf> {
+    pub(crate) async fn clip_subtitles(
+        &self,
+        ffmpeg: &Path,
+        clip: &Path,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<PathBuf> {
         let out = srt_path(clip);
         // A name that is taken (even by a link) is not written over.
         if std::fs::symlink_metadata(&out).is_ok() {
@@ -348,8 +356,8 @@ impl Engine {
         };
         let sound: Vec<f32> =
             sound.as_chunks::<4>().0.iter().take(16_000 * MAX_AUDIO_SECONDS).map(|b| f32::from_le_bytes(*b)).collect();
-        // Cancelled (this future dropped) means the transcription stops, not that it runs on.
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The flag is the caller's: set (by it, or by this future being dropped) the transcription
+        // stops at its next step.
         let _stop_when_gone = CancelOnDrop(cancel.clone());
         let how = Transcribe { model, language: "auto".into(), translate: false, cancel };
         let said = match self.studio_host() {
@@ -374,6 +382,18 @@ impl Engine {
             None
         }
     }
+}
+
+/// Cancels `work` (sets the flag) and waits for it to be over, at most `limit`: a transcription
+/// runs on a thread that only stops at its next step, and the job's place in the queue is not
+/// given up before it has.
+pub(crate) async fn stop_and_wait<T>(
+    flag: &std::sync::atomic::AtomicBool,
+    work: tokio::task::JoinHandle<T>,
+    limit: std::time::Duration,
+) {
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = tokio::time::timeout(limit, work).await;
 }
 
 /// Sets the flag when dropped: the transcription asked for is no longer wanted.
@@ -448,6 +468,24 @@ async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>, fill: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancelled job holds its place until the transcription it started has actually ended.
+    #[tokio::test]
+    async fn a_cancelled_transcription_is_waited_for() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (f, e) = (flag.clone(), ended.clone());
+        let work = tokio::spawn(async move {
+            while !f.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // It takes a moment to wind down after being told.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            e.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        stop_and_wait(&flag, work, std::time::Duration::from_secs(5)).await;
+        assert!(ended.load(std::sync::atomic::Ordering::Relaxed), "returned before the work had ended");
+    }
 
     /// Dropping the asker stops the transcription it started.
     #[test]

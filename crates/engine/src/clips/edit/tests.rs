@@ -629,3 +629,25 @@ fn a_clip_longer_than_the_captioned_stretch_is_refused_with_the_reason() {
     // A length that isn't known is not refused (the job says what it finds).
     assert!(captions_length_problem(None).is_none());
 }
+
+/// The subtitle file's name goes into ffmpeg's filter text: its own separators are escaped, so a
+/// name can never start another filter.
+#[test]
+fn a_subtitle_name_cannot_inject_a_filter() {
+    let part = Path::new("o.part");
+    let args = arg_strs(&burn_args(Path::new("a.mp4"), "x,drawtext=text=boom:y='z'.srt", part));
+    let vf = args.iter().skip_while(|a| *a != "-vf").nth(1).unwrap().clone();
+    // Everything after "subtitles=" up to ":force_style" is one escaped name.
+    let name = vf.strip_prefix("subtitles=").unwrap().split(":force_style").next().unwrap();
+    for sep in [',', ':', '\'', ';', '[', ']'] {
+        let mut prev = ' ';
+        for c in name.chars() {
+            if c == sep {
+                assert_eq!(prev, '\\', "{sep:?} is not escaped in {name:?}");
+            }
+            prev = c;
+        }
+    }
+    // A plain name is unchanged.
+    assert!(arg_strs(&burn_args(Path::new("a.mp4"), "subs.srt", part)).join(" ").contains("subtitles=subs.srt:"));
+}

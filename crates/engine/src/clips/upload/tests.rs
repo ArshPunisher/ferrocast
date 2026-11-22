@@ -328,3 +328,22 @@ fn a_video_id_must_look_like_one_before_it_is_made_a_link() {
         assert!(!video_id_ok(bad), "{bad:?}");
     }
 }
+
+/// A short pause YouTube asks for isn't the day's quota: it is said as a wait of seconds.
+#[test]
+fn a_burst_limit_is_a_short_wait_and_only_a_long_one_is_the_daily_quota() {
+    let burst = describe(ConnectorError::RateLimited {
+        platform: ferrocast_core::event::Platform::Youtube,
+        retry_after: Duration::from_secs(20),
+    });
+    let EngineError::Refused { code, message, hint, .. } = burst else { panic!() };
+    assert_eq!(code, "youtube_slow_down");
+    assert!(!message.to_lowercase().contains("daily") && !hint.contains("midnight"), "{message} / {hint}");
+    let daily = describe(ConnectorError::RateLimited {
+        platform: ferrocast_core::event::Platform::Youtube,
+        retry_after: Duration::from_secs(5 * 3600),
+    });
+    let EngineError::Refused { code, message, .. } = daily else { panic!() };
+    assert_eq!(code, "youtube_quota");
+    assert!(message.to_lowercase().contains("daily"));
+}

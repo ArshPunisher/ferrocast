@@ -341,7 +341,7 @@ pub fn burn_args(input: &Path, subs: &str, part: &Path) -> Vec<OsString> {
     a.extend(super::input_args(input));
     let style = "FontName=Helvetica,Fontsize=18,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=24";
     a.push("-vf".into());
-    a.push(format!("subtitles={subs}:force_style='{style}'").into());
+    a.push(format!("subtitles={}:force_style='{style}'", super::filter_text(subs)).into());
     a.extend(os(&["-threads", "2"]));
     a.extend(os(&[
         "-c:v",
@@ -568,9 +568,19 @@ impl Engine {
         let base = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         Ok(self.start_clip_job(JobKind::Captions, format!("Captions for {base}"), move |ctx| async move {
             ctx.progress(0.05);
+            // The transcription is a task of its own so a cancel can wait for it to be over before
+            // the job gives up its place (its thread only stops at its next step).
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut work = {
+                let (engine, ffmpeg, path, flag) = (ctx.engine.clone(), ffmpeg.clone(), path.clone(), flag.clone());
+                tokio::spawn(async move { engine.clip_subtitles(&ffmpeg, &path, flag).await })
+            };
             let made = tokio::select! {
-                m = ctx.engine.clip_subtitles(&ffmpeg, &path) => m,
-                () = ctx.cancel.wait() => return Err(super::jobs::cancelled()),
+                m = &mut work => m.unwrap_or(None),
+                () = ctx.cancel.wait() => {
+                    crate::studio::vertical_clip::stop_and_wait(&flag, work, std::time::Duration::from_secs(60)).await;
+                    return Err(super::jobs::cancelled());
+                }
             };
             if made.is_none() {
                 return Err(refuse(
