@@ -283,7 +283,8 @@ pub(crate) fn platform(s: &str) -> Result<Platform, ApiError> {
         "twitch" => Ok(Platform::Twitch),
         "youtube" => Ok(Platform::Youtube),
         "kick" => Ok(Platform::Kick),
-        _ => Err(ApiError::invalid(format!("\"{s}\" isn't a platform; use twitch, youtube or kick."))),
+        "facebook" => Ok(Platform::Facebook),
+        _ => Err(ApiError::invalid(format!("\"{s}\" isn't a platform; use twitch, youtube, kick or facebook."))),
     }
 }
 

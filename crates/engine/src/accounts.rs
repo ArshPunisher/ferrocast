@@ -43,6 +43,10 @@ pub(crate) fn saved_tokens<T: serde::de::DeserializeOwned>(
 
 pub(crate) const TWITCH_TOKENS: &str = "twitch-tokens";
 pub(crate) const YOUTUBE_TOKENS: &str = "youtube-tokens";
+/// The Page Facebook acts as (its id and access token), in the secret store.
+pub(crate) const FACEBOOK_PAGE: &str = "facebook-page";
+/// How long the browser sign-in for Facebook may take.
+const FACEBOOK_SIGN_IN: Duration = Duration::from_secs(300);
 /// How long the browser sign-in for YouTube may take.
 const YOUTUBE_SIGN_IN: Duration = Duration::from_secs(300);
 
@@ -59,6 +63,10 @@ pub struct PlatformApps {
     pub relay_url: Option<String>,
     /// Kick's public API (tests point it at a fake).
     pub kick_api: String,
+    /// The owner's Facebook app (id and secret): none until it is registered, and then Connect
+    /// works. Registering it is not something the app can do.
+    pub facebook: Option<ferrocast_facebook::AppCredentials>,
+    pub facebook_endpoints: ferrocast_facebook::Endpoints,
 }
 
 impl PlatformApps {
@@ -86,6 +94,14 @@ impl PlatformApps {
             relay_url: pick("FERROCAST_RELAY_URL", option_env!("FERROCAST_RELAY_URL"))
                 .map(|u| u.trim_end_matches('/').to_string()),
             kick_api: "https://api.kick.com".into(),
+            facebook: match (
+                pick("FERROCAST_FACEBOOK_APP_ID", option_env!("FERROCAST_FACEBOOK_APP_ID")),
+                pick("FERROCAST_FACEBOOK_APP_SECRET", option_env!("FERROCAST_FACEBOOK_APP_SECRET")),
+            ) {
+                (Some(app_id), Some(app_secret)) => Some(ferrocast_facebook::AppCredentials { app_id, app_secret }),
+                _ => None,
+            },
+            facebook_endpoints: ferrocast_facebook::Endpoints::default(),
         }
     }
 }
@@ -118,6 +134,7 @@ impl Engine {
             Platform::Twitch => self.connect_twitch().await,
             Platform::Youtube => self.connect_youtube().await,
             Platform::Kick => self.connect_kick().await,
+            Platform::Facebook => self.connect_facebook().await,
             _ => Err(EngineError::Invalid("That isn't a platform you can sign in to.".into())),
         }
     }
@@ -300,6 +317,23 @@ impl Engine {
         if a.platform == "kick" {
             return self.resume_kick(a.clone()).await;
         }
+        if a.platform == "facebook" {
+            match saved_tokens::<ferrocast_facebook::Page>(&*self.inner.secrets, FACEBOOK_PAGE) {
+                Saved::Unreadable => return true,
+                Saved::Found(page) => self.start_facebook(page, a.clone()),
+                Saved::Missing => {
+                    let _ = self
+                        .submit(Event::live(
+                            Platform::Facebook,
+                            None,
+                            Millis(0),
+                            EventKind::Connector(ConnectorStatus::SignInNeeded),
+                        ))
+                        .await;
+                }
+            }
+            return false;
+        }
         if a.platform == "youtube" {
             match saved_tokens::<ferrocast_youtube::Tokens>(&*self.inner.secrets, YOUTUBE_TOKENS) {
                 Saved::Unreadable => return true,
@@ -362,6 +396,7 @@ impl Engine {
                 self.forget_kick()?;
                 None
             }
+            Platform::Facebook => Some(FACEBOOK_PAGE),
             _ => None,
         };
         if let Some(k) = key {
@@ -370,6 +405,98 @@ impl Engine {
         let key = crate::platform_key(platform).to_string();
         self.db(move |s| repo::settings::remove_account(s, &key)).await?;
         Ok(())
+    }
+
+    /// Facebook sign-in (a Page): the system browser, a one-time loopback redirect. Needs the
+    /// owner's Facebook app (`FERROCAST_FACEBOOK_APP_ID` and `..._APP_SECRET`).
+    async fn connect_facebook(&self) -> Result<ConnectFlow, EngineError> {
+        let app = self.apps().facebook.clone().ok_or_else(|| {
+            EngineError::Unavailable(
+                "This build of Ferrocast has no Facebook app set up, so it can't sign in to Facebook.".into(),
+            )
+        })?;
+        let ep = self.apps().facebook_endpoints.clone();
+        let pending =
+            ferrocast_facebook::oauth::begin(&ep, &app).await.map_err(|e| EngineError::Unavailable(e.to_string()))?;
+        let url = pending.url.clone();
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let http = ferrocast_facebook::http_client();
+            match ferrocast_facebook::oauth::finish(&http, &ep, &app, pending, FACEBOOK_SIGN_IN).await {
+                Ok(grant) => {
+                    if let Err(e) = engine.finish_facebook(grant).await {
+                        engine.notice_detail(
+                            "account:facebook",
+                            NoticeLevel::Error,
+                            "Facebook sign-in didn't finish",
+                            &e.to_string(),
+                        );
+                    }
+                }
+                Err(e) => engine.notice_detail(
+                    "account:facebook",
+                    NoticeLevel::Warn,
+                    "Facebook sign-in failed",
+                    &e.to_string(),
+                ),
+            }
+        });
+        Ok(ConnectFlow::Browser { url })
+    }
+
+    /// The Page that was signed in to (the first one the person manages) becomes the account.
+    pub(crate) async fn finish_facebook(&self, grant: ferrocast_facebook::UserGrant) -> Result<(), EngineError> {
+        let Some(page) = grant.pages.into_iter().next() else {
+            return Err(EngineError::Unavailable(
+                "Facebook shows no Page that you manage. Going live and chat need a Page: make one, then Connect again.".into(),
+            ));
+        };
+        self.save_secret_json(FACEBOOK_PAGE, &page)?;
+        let account = repo::settings::Account {
+            platform: "facebook".into(),
+            user_id: page.id.clone(),
+            login: page.name.clone(),
+            display_name: page.name.clone(),
+            avatar_url: page.avatar_url.clone(),
+            scopes: ferrocast_facebook::SCOPES.iter().map(|s| s.to_string()).collect(),
+            connected_at: now().0,
+        };
+        let saved = account.clone();
+        self.db(move |s| repo::settings::save_account(s, &saved)).await?;
+        self.start_facebook(page, account);
+        self.notice_detail(
+            "account:facebook",
+            NoticeLevel::Info,
+            "Facebook is connected",
+            "Comments show up whenever your Page is live.",
+        );
+        Ok(())
+    }
+
+    /// Registers the connector and reads the Page's live comments.
+    fn start_facebook(&self, page: ferrocast_facebook::Page, account: repo::settings::Account) {
+        let graph = Arc::new(ferrocast_facebook::Graph::new(
+            &self.apps().facebook_endpoints.graph,
+            &page.id,
+            &page.access_token,
+        ));
+        self.register_connector(Arc::new(ferrocast_facebook::FacebookConnector::new(graph.clone())));
+        {
+            let mut st = self.state_mut();
+            let v = st.connectors.entry("facebook".into()).or_insert_with(crate::state::ConnectorView::off);
+            v.account = Some(crate::state::AccountView {
+                name: account.display_name.clone(),
+                avatar_url: account.avatar_url.clone(),
+            });
+            // Comments are asked for, not pushed: connected means the Page is signed in.
+            v.state = "connected".into();
+        }
+        let handle = tokio::spawn(ferrocast_facebook::feed::run(graph, self.sink(), None));
+        if let Some(old) =
+            self.inner.adapters.lock().unwrap_or_else(|p| p.into_inner()).insert(Platform::Facebook, handle)
+        {
+            old.abort();
+        }
     }
 
     async fn connect_youtube(&self) -> Result<ConnectFlow, EngineError> {

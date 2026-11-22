@@ -2293,6 +2293,7 @@ dependencies = [
  "fastrand",
  "ferrocast-connector",
  "ferrocast-core",
+ "ferrocast-facebook",
  "ferrocast-golive",
  "ferrocast-kick",
  "ferrocast-obs",

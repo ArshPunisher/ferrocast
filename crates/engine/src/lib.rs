@@ -770,12 +770,14 @@ fn load_state(store: &Store) -> Result<(State, AlertQueue), StoreError> {
         welcome: get_or_default(store, "welcome")?,
         ..State::default()
     };
-    for key in ["twitch", "youtube", "kick", "obs", "relay"] {
+    for key in ["twitch", "youtube", "kick", "facebook", "obs", "relay"] {
         st.connectors.insert(key.into(), ConnectorView::off());
     }
     let queue = repo::rules::load_queue(store)?.unwrap_or_default();
     Ok((st, queue))
 }
 
+#[cfg(test)]
+mod facebook_tests;
 #[cfg(test)]
 mod tests;
