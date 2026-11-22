@@ -599,3 +599,17 @@ async fn a_rename_whose_captions_cannot_follow_leaves_both_where_they_were() {
     // The same id still works.
     assert_eq!(e.clip_captions("a.mp4").await.unwrap().len(), 1);
 }
+
+/// CodeRabbit: a caption save that would be too big to read back is refused when saving, not
+/// accepted and then locking the clip's captions.
+#[tokio::test]
+async fn captions_too_big_to_read_back_are_refused_on_save() {
+    let (e, _data, clips) = engine().await;
+    touch(clips.path(), "a.mp4", b"video");
+    let big: Vec<crate::clips::edit::Cue> = (0..1000)
+        .map(|i| crate::clips::edit::Cue { start_ms: i * 10, end_ms: i * 10 + 5, text: "\u{1F600}".repeat(300) })
+        .collect();
+    let r = e.set_clip_captions("a.mp4", big).await;
+    assert!(matches!(r, Err(EngineError::Refused { status: 400, code: "bad_captions", .. })), "{r:?}");
+    assert!(!clips.path().join("a.srt").exists(), "nothing was written");
+}

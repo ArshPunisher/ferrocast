@@ -551,6 +551,15 @@ impl Engine {
         let path = self.clip_path(id).await?;
         let srt = srt_beside(&path);
         let text = render_srt(&cues);
+        // Whatever is saved must be readable again: the same limit the read applies.
+        if text.len() as u64 > MAX_SRT_BYTES {
+            return Err(refuse(
+                400,
+                "bad_captions",
+                "Those captions are too long to save.",
+                "Shorten or remove some captions, then save again.",
+            ));
+        }
         tokio::task::spawn_blocking(move || -> Result<(), EngineError> {
             // Not through a link someone put there.
             if std::fs::symlink_metadata(&srt).is_ok_and(|m| !m.file_type().is_file()) {
