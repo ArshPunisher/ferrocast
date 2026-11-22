@@ -1552,12 +1552,17 @@ pub enum StudioAct {
         scene: String,
         id: i64,
         visible: bool,
+        /// The key is let go: the held view is dropped (`visible` is what it was before).
+        #[serde(default)]
+        release: bool,
     },
     /// A push-to-enable / push-to-disable key on a source's own filter; as `PushItem`.
     PushFilter {
         name: String,
         filter: String,
         enabled: bool,
+        #[serde(default)]
+        release: bool,
     },
     /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
     /// frozen camera).

@@ -820,8 +820,8 @@ mod tests {
             acts,
             vec![
                 StudioAct::Items { scene: "Main".into() },
-                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: true },
-                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: false },
+                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: true, release: false },
+                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: false, release: true },
             ]
         );
         assert!(acts.iter().all(|a| !matches!(a, StudioAct::EditItem { .. }) && !a.changes()));
@@ -829,7 +829,10 @@ mod tests {
         run(&engine, "push_show:Main\nBanner", true).await.unwrap_or_else(|e| panic!("{e}"));
         host.take_acts();
         run(&engine, RELEASE_HOLDS, false).await.unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(host.take_acts(), vec![StudioAct::PushItem { scene: "Main".into(), id: 4, visible: false }]);
+        assert_eq!(
+            host.take_acts(),
+            vec![StudioAct::PushItem { scene: "Main".into(), id: 4, visible: false, release: true }]
+        );
         // Nothing held: asking again does nothing.
         run(&engine, RELEASE_HOLDS, false).await.unwrap_or_else(|e| panic!("{e}"));
         assert!(host.take_acts().is_empty());

@@ -222,7 +222,7 @@ impl Engine {
         };
         let first =
             self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).press_at(epoch, action, target.clone(), now);
-        if first && let Err(e) = self.apply_hold(&target, kind.held_state()).await {
+        if first && let Err(e) = self.apply_hold(&target, kind.held_state(), false).await {
             self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).forget(action);
             return Err(e);
         }
@@ -243,7 +243,7 @@ impl Engine {
     /// nothing to put back; a failure that may pass (the Studio was busy) is kept and tried
     /// again, now and a few times in the next seconds.
     async fn restore(&self, target: Target, was: bool) {
-        let Err(e) = self.apply_hold(&target, was).await else { return };
+        let Err(e) = self.apply_hold(&target, was, true).await else { return };
         if gone(&e) {
             tracing::debug!(error = %e, "a held item or filter is gone: nothing to put back");
             return;
@@ -265,7 +265,7 @@ impl Engine {
     async fn retry_pending(&self) {
         let todo = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).take_pending();
         for (target, was) in todo {
-            match self.apply_hold(&target, was).await {
+            match self.apply_hold(&target, was, true).await {
                 Ok(()) => {}
                 Err(e) if gone(&e) => {}
                 Err(_) => self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).keep_pending(target, was),
@@ -273,11 +273,11 @@ impl Engine {
         }
     }
 
-    async fn apply_hold(&self, target: &Target, on: bool) -> Result<(), EngineError> {
+    async fn apply_hold(&self, target: &Target, on: bool, release: bool) -> Result<(), EngineError> {
         let act = match target {
-            Target::Item { scene, id } => StudioAct::PushItem { scene: scene.clone(), id: *id, visible: on },
+            Target::Item { scene, id } => StudioAct::PushItem { scene: scene.clone(), id: *id, visible: on, release },
             Target::Filter { source, filter } => {
-                StudioAct::PushFilter { name: source.clone(), filter: filter.clone(), enabled: on }
+                StudioAct::PushFilter { name: source.clone(), filter: filter.clone(), enabled: on, release }
             }
         };
         // Straight to the host: this runs inside the release that Undo and collection switches
@@ -522,7 +522,7 @@ mod tests {
                 StudioAct::Filters { name, .. } => {
                     self.filters.lock().unwrap().get(&name).cloned().ok_or_else(|| format!("No source \"{name}\"."))
                 }
-                StudioAct::PushItem { scene, id, visible } => {
+                StudioAct::PushItem { scene, id, visible, .. } => {
                     if self.fail_pushes.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err("The Studio is busy.".into());
                     }
@@ -530,7 +530,7 @@ mod tests {
                     let items = scenes.get_mut(&scene).ok_or("No such scene.")?;
                     if set_visible(items, id, visible) { Ok(Value::Null) } else { Err("No such item.".into()) }
                 }
-                StudioAct::PushFilter { name, filter, enabled } => {
+                StudioAct::PushFilter { name, filter, enabled, .. } => {
                     let mut filters = self.filters.lock().unwrap();
                     let list = filters.get_mut(&name).and_then(Value::as_array_mut).ok_or("No such source.")?;
                     let f = list.iter_mut().find(|f| f["name"] == filter).ok_or("No such filter.")?;
@@ -575,10 +575,17 @@ mod tests {
 
     #[test]
     fn a_hold_is_never_saved_and_never_an_undo_step() {
-        assert!(!StudioAct::PushItem { scene: "Main".into(), id: 1, visible: true }.changes());
-        assert!(!StudioAct::PushFilter { name: "Cam".into(), filter: "Blur".into(), enabled: true }.changes());
-        assert!(StudioAct::PushItem { scene: "".into(), id: 1, visible: true }.check().is_err());
-        assert!(StudioAct::PushFilter { name: "Cam".into(), filter: "x\ny".into(), enabled: true }.check().is_err());
+        assert!(!StudioAct::PushItem { scene: "Main".into(), id: 1, visible: true, release: false }.changes());
+        assert!(
+            !StudioAct::PushFilter { name: "Cam".into(), filter: "Blur".into(), enabled: true, release: false }
+                .changes()
+        );
+        assert!(StudioAct::PushItem { scene: "".into(), id: 1, visible: true, release: false }.check().is_err());
+        assert!(
+            StudioAct::PushFilter { name: "Cam".into(), filter: "x\ny".into(), enabled: true, release: false }
+                .check()
+                .is_err()
+        );
     }
 
     #[tokio::test]

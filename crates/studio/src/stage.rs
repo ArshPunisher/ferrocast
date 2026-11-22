@@ -96,6 +96,10 @@ pub struct Stage {
     /// Set while an edit's engine update is done by the caller itself (a moved source goes
     /// straight to the engine's item, not through opening the whole collection again).
     quiet: std::cell::Cell<bool>,
+    /// Keys held down (push to show, hide, filter on or off): how the engine sees an item or a
+    /// filter while they are down. Never in `doc`, so never saved, never in an undo snapshot or
+    /// an export, and gone with this stage (a crash or quit shows the collection as it was).
+    holds: RefCell<Holds>,
     /// Where monitored sound plays (a device's name; None: the system's), kept for each engine.
     // Read only where monitoring plays (macOS, Windows); Linux keeps it for the next build.
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
@@ -124,6 +128,57 @@ pub struct Stage {
     /// The encoders' dropped-frame count when this stage began (the count is the program's): what
     /// the stats call "skipped" is what came after.
     dropped_base: u64,
+}
+
+/// What held keys change in the engine's view (see `Stage::holds`).
+#[derive(Debug, Default)]
+struct Holds {
+    items: std::collections::HashMap<(String, i64), bool>,
+    filters: std::collections::HashMap<(String, String), bool>,
+}
+
+impl Holds {
+    fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.filters.is_empty()
+    }
+
+    /// Puts the held changes on `doc` (a copy made for the engine).
+    fn apply(&self, doc: &mut Value) {
+        let Some(sources) = doc.get_mut("sources").and_then(Value::as_array_mut) else { return };
+        for ((source, filter), on) in &self.filters {
+            for s in sources.iter_mut().filter(|s| name_of(s) == source) {
+                for f in s.get_mut("filters").and_then(Value::as_array_mut).into_iter().flatten() {
+                    if name_of(f) == filter {
+                        f["enabled"] = json!(on);
+                    }
+                }
+            }
+        }
+        let group_names: Vec<String> =
+            sources.iter().filter(|s| kind_of(s) == "group").map(|s| name_of(s).to_string()).collect();
+        for ((scene, id), visible) in &self.items {
+            // The item is in the scene itself or in a group shown in it (at any depth).
+            let mut lists = vec![scene.clone()];
+            let mut seen = 0;
+            while seen < lists.len() {
+                let name = lists[seen].clone();
+                seen += 1;
+                let Some(src) = sources.iter_mut().find(|s| name_of(s) == name) else { continue };
+                let mut groups = Vec::new();
+                for it in src.pointer_mut("/settings/items").and_then(Value::as_array_mut).into_iter().flatten() {
+                    if it.get("id").and_then(Value::as_i64) == Some(*id) {
+                        it["visible"] = json!(visible);
+                    }
+                    groups.push(name_of(it).to_string());
+                }
+                for g in groups {
+                    if group_names.contains(&g) && !lists.contains(&g) {
+                        lists.push(g);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn fail(msg: impl Into<String>) -> StudioError {
@@ -530,6 +585,7 @@ impl Stage {
             canvas,
             doc: RefCell::new(doc),
             quiet: std::cell::Cell::new(false),
+            holds: RefCell::default(),
             monitor_device: RefCell::new(None),
             true_peak: std::cell::Cell::new(false),
             low_latency: std::cell::Cell::new(false),
@@ -560,6 +616,7 @@ impl Stage {
             canvas,
             doc: RefCell::new(doc),
             quiet: std::cell::Cell::new(false),
+            holds: RefCell::default(),
             monitor_device: RefCell::new(None),
             true_peak: std::cell::Cell::new(false),
             low_latency: std::cell::Cell::new(false),
@@ -600,7 +657,7 @@ impl Stage {
             return Ok(e.clone());
         }
         crate::webfetch::install();
-        let shared = own::Shared::open_at(self.canvas, &self.doc.borrow())?;
+        let shared = self.live(|d| own::Shared::open_at(self.canvas, d))?;
         // Monitoring plays from the start, as libobs keeps its device open: opened only when
         // Settings were saved, every new engine (each start, a new picture size) had none, and
         // a source set to be heard here ("Monitor only", "Monitor and output") played nowhere.
@@ -616,6 +673,51 @@ impl Stage {
         Ok(shared)
     }
 
+    /// Runs `f` on the collection as the engine should show it: the document with the held keys'
+    /// changes on top (a copy only while a key is held).
+    fn live<R>(&self, f: impl FnOnce(&Value) -> R) -> R {
+        let holds = self.holds.borrow();
+        if holds.is_empty() {
+            return f(&self.doc.borrow());
+        }
+        let mut shown = self.doc.borrow().clone();
+        holds.apply(&mut shown);
+        f(&shown)
+    }
+
+    /// A push-to-show or push-to-hide key: item `id` of `scene` looks shown or hidden to the
+    /// engine (`Some`) until it is let go (`None`). The document itself does not change.
+    pub fn hold_item(&self, scene: &str, id: i64, visible: Option<bool>) -> Result<(), StudioError> {
+        self.item(scene, id)?;
+        {
+            let mut h = self.holds.borrow_mut();
+            let key = (scene.to_string(), id);
+            match visible {
+                Some(v) => drop(h.items.insert(key, v)),
+                None => drop(h.items.remove(&key)),
+            }
+        }
+        self.edit(|_| ());
+        Ok(())
+    }
+
+    /// As [`hold_item`](Self::hold_item) for a source's own filter switched on or off.
+    pub fn hold_filter(&self, source: &str, filter: &str, enabled: Option<bool>) -> Result<(), StudioError> {
+        if !self.filter_list(source)?.iter().any(|f| name_of(f) == filter) {
+            return Err(fail(format!("\"{source}\" has no filter called \"{filter}\".")));
+        }
+        {
+            let mut h = self.holds.borrow_mut();
+            let key = (source.to_string(), filter.to_string());
+            match enabled {
+                Some(v) => drop(h.filters.insert(key, v)),
+                None => drop(h.filters.remove(&key)),
+            }
+        }
+        self.edit(|_| ());
+        Ok(())
+    }
+
     /// Changes the document, then the engine shows it.
     fn edit<T>(&self, f: impl FnOnce(&mut Value) -> T) -> T {
         let out = f(&mut self.doc.borrow_mut());
@@ -623,7 +725,7 @@ impl Stage {
             return out;
         }
         if let Some(e) = self.engine.borrow().as_ref() {
-            e.reopen(&self.doc.borrow());
+            self.live(|d| e.reopen(d));
         }
         self.sync_pages();
         out
@@ -898,7 +1000,7 @@ impl Stage {
     /// Opens the scenes again in the engine as they are (a plugin's effect came or went).
     pub fn refresh(&self) {
         if let Some(e) = self.engine.borrow().as_ref() {
-            e.reopen_with(&self.doc.borrow(), true);
+            self.live(|d| e.reopen_with(d, true));
         }
     }
 
@@ -1644,7 +1746,7 @@ impl Stage {
             // The move was saved quietly; a refit that had nothing to do (a source still
             // opening) changed nothing else, so the engine is told here either way.
             if let Some(e) = self.engine.borrow().as_ref() {
-                e.reopen(&self.doc.borrow());
+                self.live(|d| e.reopen(d));
             }
             self.sync_pages();
             let it = self.item(scene, id)?;
@@ -1664,7 +1766,7 @@ impl Stage {
             .is_some_and(|e| e.engine.set_item_placement(scene, id, ferrocore::obs::placement_of(&it)));
         if !moved {
             if let Some(e) = self.engine.borrow().as_ref() {
-                e.reopen(&self.doc.borrow());
+                self.live(|d| e.reopen(d));
             }
             self.sync_pages();
         }
@@ -6600,6 +6702,90 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(unique.len(), ids.len(), "no id repeats: {ids:?}");
+    }
+
+    /// What the engine is shown while keys are held, from the stage.
+    fn live_doc(s: &Stage) -> Value {
+        s.live(|d| d.clone())
+    }
+
+    fn visible_in(doc: &Value, scene: &str, id: i64) -> Option<bool> {
+        let src = doc["sources"].as_array()?.iter().find(|x| name_of(x) == scene)?;
+        let items = src.pointer("/settings/items")?.as_array()?;
+        items.iter().find(|i| i["id"].as_i64() == Some(id))?["visible"].as_bool()
+    }
+
+    #[test]
+    fn a_held_item_is_only_in_the_engines_view_never_in_the_collection() {
+        let s = stage();
+        let red = color(&s, "Red");
+        ok(s.edit_item("Main", red.id, ItemEdit::Hide));
+        let before = s.snapshot();
+        ok(s.hold_item("Main", red.id, Some(true)));
+        assert_eq!(visible_in(&live_doc(&s), "Main", red.id), Some(true), "shown to the engine while held");
+        // What a save, an autosave, an export and an undo snapshot see is the document.
+        assert_eq!(visible_in(&s.snapshot(), "Main", red.id), Some(false));
+        assert_eq!(s.snapshot(), before, "nothing changed in the collection");
+        assert_eq!(visible_in(&s.save("Saved"), "Main", red.id), Some(false), "a save while held");
+        // Released: back to the document.
+        ok(s.hold_item("Main", red.id, None));
+        assert_eq!(visible_in(&live_doc(&s), "Main", red.id), Some(false));
+    }
+
+    #[test]
+    fn undo_across_a_hold_never_brings_the_held_state_back() {
+        let s = stage();
+        let red = color(&s, "Red");
+        ok(s.edit_item("Main", red.id, ItemEdit::Hide));
+        ok(s.hold_item("Main", red.id, Some(true)));
+        let taken = s.snapshot(); // what the history takes while the key is down
+        ok(s.edit_item("Main", red.id, ItemEdit::Lock));
+        ok(s.hold_item("Main", red.id, None));
+        s.restore_all(&taken);
+        assert_eq!(visible_in(&s.snapshot(), "Main", red.id), Some(false), "the snapshot has the real state");
+        assert_eq!(visible_in(&live_doc(&s), "Main", red.id), Some(false));
+    }
+
+    #[test]
+    fn a_held_item_inside_a_group_and_a_held_filter_are_overlaid_too() {
+        let s = stage();
+        let red = color(&s, "Red");
+        let blue = color(&s, "Blue");
+        let g = ok(s.group_together("Main", &[red.id, blue.id], "Pair"));
+        let kid = ok(s.items("Main"))
+            .into_iter()
+            .find(|i| i.id == g.id)
+            .and_then(|i| i.children.first().map(|c| c.id))
+            .unwrap_or(0);
+        ok(s.edit_item("Main", kid, ItemEdit::Hide));
+        ok(s.hold_item("Main", kid, Some(true)));
+        assert_eq!(visible_in(&live_doc(&s), "Pair", kid), Some(true));
+        assert_eq!(visible_in(&s.snapshot(), "Pair", kid), Some(false));
+        ok(s.add_filter("Red", "color_filter", "Tint", &json!({})));
+        ok(s.hold_filter("Red", "Tint", Some(false)));
+        let on = |d: &Value| {
+            d["sources"]
+                .as_array()
+                .and_then(|l| l.iter().find(|x| name_of(x) == "Red"))
+                .and_then(|r| r["filters"][0]["enabled"].as_bool())
+        };
+        assert_eq!(on(&live_doc(&s)), Some(false));
+        assert_eq!(on(&s.snapshot()), Some(true), "the collection keeps the filter on");
+        assert!(s.hold_filter("Red", "Nope", Some(true)).is_err(), "no such filter");
+        assert!(s.hold_item("Main", 9999, Some(true)).is_err(), "no such item");
+    }
+
+    #[test]
+    fn a_reopened_collection_shows_nothing_held() {
+        // A crash or a quit while held: what is on disk is the document, and a new stage has no holds.
+        let a = stage();
+        let red = color(&a, "Red");
+        ok(a.edit_item("Main", red.id, ItemEdit::Hide));
+        ok(a.hold_item("Main", red.id, Some(true)));
+        let on_disk = a.snapshot();
+        let b = stage();
+        b.restore_all(&on_disk);
+        assert_eq!(visible_in(&live_doc(&b), "Main", red.id), Some(false));
     }
 
     #[test]

@@ -1540,10 +1540,13 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::EditItem { scene, id, edit } => done(c.edit_item(&scene, id, item_edit(edit))),
         // A key held down: shown or hidden for as long as it is held, never saved (the engine
         // puts it back on release).
-        A::PushItem { scene, id, visible } => {
-            done(c.edit_item(&scene, id, if visible { ItemEdit::Show } else { ItemEdit::Hide }))
+        A::PushItem { scene, id, visible, release } => {
+            // The engine's view only: nothing is written to the collection.
+            done(c.hold_item(&scene, id, (!release).then_some(visible)))
         }
-        A::PushFilter { name, filter, enabled } => done(c.set_source_filter_enabled(&name, &filter, enabled)),
+        A::PushFilter { name, filter, enabled, release } => {
+            done(c.hold_filter(&name, &filter, (!release).then_some(enabled)))
+        }
         A::Sources => v(to_json!(c.sources())),
         A::Rename { name, new_name } => done(c.rename(&name, &new_name)),
         A::Settings { name } => c.settings(&name),
