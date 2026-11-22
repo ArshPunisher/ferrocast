@@ -133,7 +133,8 @@ impl History {
                 // A drag's moves, or nudges with the arrow keys in a row, are one step.
                 if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
                 {
-                    return Some(joined(*save));
+                    // An unsaved move joining a step already closed reopens it: the drag goes on.
+                    return Some(Before { open: !*save, ..joined(*save) });
                 }
                 Some(fresh(format!("Move {}", item_name(c, scene, *id)?), Some(key), !*save))
             }
@@ -145,7 +146,7 @@ impl History {
                 let key = ("boxes", format!("{scene}\u{1}{ids:?}"), 0);
                 if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
                 {
-                    return Some(joined(*save));
+                    return Some(Before { open: !*save, ..joined(*save) });
                 }
                 let label = match ids.as_slice() {
                     [one] => format!("Move {}", item_name(c, scene, *one)?),
@@ -283,6 +284,8 @@ impl History {
                 top.after = now;
                 if b.closes {
                     top.open = false;
+                } else if b.open {
+                    top.open = true;
                 }
             }
             self.redo.clear();
@@ -456,6 +459,43 @@ mod tests {
         run(&mut h, &[a, b], 50.0, true);
         run(&mut h, &[d], 60.0, true);
         assert_eq!(h.list().0, ["Move C", "Move 2 sources", "Move 3 sources"]);
+    }
+
+    /// A drag that starts just after a finished move of the same sources is part of that step, and
+    /// stays so however long it is held still (the step is open again until the drag saves).
+    #[test]
+    fn a_drag_joining_a_finished_move_stays_one_step() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        let go = |h: &mut History, x: f32, save: bool| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        c.add_source("Main", "color_source_v3", "A", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        c.add_source("Main", "color_source_v3", "B", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        go(&mut h, 50.0, true); // a finished move
+        go(&mut h, 60.0, false); // a drag starts right after: joins it
+        assert!(h.undo.last().is_some_and(|s| s.open), "an unsaved drag keeps the step open");
+        // Held still past the nudge window: the next move of the drag is still that step.
+        if let Some(s) = h.undo.last_mut() {
+            s.at -= NUDGES * 2;
+        }
+        go(&mut h, 70.0, false);
+        go(&mut h, 80.0, true);
+        assert_eq!(h.list().0.len(), 1, "one step: {:?}", h.list().0);
+        assert!(h.undo.last().is_some_and(|s| !s.open), "the save closes it");
     }
 
     /// Two different sets of items moved within a second of each other are two steps, even when
