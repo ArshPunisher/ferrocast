@@ -1718,6 +1718,73 @@ const ACCOUNTS_AND_PRO: &[RouteDoc] = &[
     doc("DELETE", "/pro/tips/domain", "Accounts & Pro", "Remove custom tip page domain (PC only).", None, None),
 ];
 
+const STORE_ROUTES: &[RouteDoc] = &[
+    doc(
+        "GET",
+        "/store/catalog",
+        "Community Store",
+        "The signed Store catalog with what is installed. `?fresh=true` fetches it again (PC only).",
+        None,
+        Some("StoreCatalogView"),
+    ),
+    doc(
+        "GET",
+        "/store/installed",
+        "Community Store",
+        "What the Store installed and the latest undo. Works when the catalog does not (PC only).",
+        None,
+        Some("StoreInstalledView"),
+    ),
+    doc(
+        "GET",
+        "/store/assets/{item_id}/{name}",
+        "Community Store",
+        "A picture or sound a catalog item lists, checked against its SHA-256 (PC only).",
+        None,
+        None,
+    ),
+    doc(
+        "POST",
+        "/store/install",
+        "Community Store",
+        "Install a catalog item, checking its package first. 201 with the undo (PC only, at this computer).",
+        Some("StoreIdRequest"),
+        Some("StoreMutationResult"),
+    ),
+    doc(
+        "POST",
+        "/store/update",
+        "Community Store",
+        "Update an installed item to the catalog's newer version (PC only, at this computer).",
+        Some("StoreIdRequest"),
+        Some("StoreMutationResult"),
+    ),
+    doc(
+        "POST",
+        "/store/uninstall",
+        "Community Store",
+        "Remove an installed item, giving back what it displaced (PC only, at this computer).",
+        Some("StoreIdRequest"),
+        Some("StoreMutationResult"),
+    ),
+    doc(
+        "POST",
+        "/store/undo",
+        "Community Store",
+        "Undo the latest Store action. Leave `token` out for the latest; one that is there must be the latest's own (PC only, at this computer).",
+        Some("StoreUndoRequest"),
+        Some("StoreUndoResult"),
+    ),
+    doc(
+        "POST",
+        "/store/resolve-link",
+        "Community Store",
+        "Read a `ferrocast://` Store link into a preview. It never installs: the person confirms first (PC only).",
+        Some("StoreLinkRequest"),
+        Some("StoreLinkPreview"),
+    ),
+];
+
 const PLUGINS_AND_DIAGNOSTICS: &[RouteDoc] = &[
     doc("GET", "/plugins", "Plugins", "List installed sandboxed WASM/panel plugins (PC only).", None, None),
     doc("POST", "/plugins", "Plugins", "Install a `.ferroplugin` package file (PC only).", None, None),
@@ -1767,6 +1834,7 @@ pub fn all_rest_routes() -> impl Iterator<Item = &'static RouteDoc> {
         .chain(SETTINGS_AND_IMPORTS)
         .chain(ACCOUNTS_AND_PRO)
         .chain(PLUGINS_AND_DIAGNOSTICS)
+        .chain(STORE_ROUTES)
 }
 
 static OPENAPI: LazyLock<Value> = LazyLock::new(build_openapi);
@@ -1882,6 +1950,21 @@ fn multipart_form(method: &str, rel_path: &str) -> Option<Value> {
 
 /// A route that answers a file: its media type(s) and the `Content-Disposition` it names it with.
 fn file_response(method: &str, rel_path: &str) -> Option<Value> {
+    // A Store picture or sound is shown, not downloaded: no Content-Disposition, the type is the
+    // item's own, and a locked-down CSP and `nosniff` come with it.
+    if (method, rel_path) == ("GET", "/store/assets/{item_id}/{name}") {
+        let types = ["image/png", "image/jpeg", "image/webp", "image/gif", "audio/mpeg", "audio/ogg", "audio/wav"];
+        let content: Map<String, Value> =
+            types.iter().map(|t| ((*t).to_string(), json!({ "schema": BINARY() }))).collect();
+        return Some(json!({
+            "description": "The asset's bytes (the type is the one the catalog lists).",
+            "headers": {
+                "Content-Security-Policy": { "description": "`default-src 'none'; sandbox`.", "schema": { "type": "string" } },
+                "X-Content-Type-Options": { "description": "`nosniff`.", "schema": { "type": "string" } }
+            },
+            "content": content
+        }));
+    }
     let (types, what): (&[&str], &str) = match (method, rel_path) {
         ("POST", "/designs/{id}/export") => (&["application/zip"], "A `.ferrodesign` package (a zip)."),
         ("POST", "/export") => {
@@ -1924,7 +2007,16 @@ fn build_openapi() -> Value {
             op.insert("x-pc-only".into(), json!(true));
         }
 
-        let params = path_params(r.rel_path);
+        let mut params = path_params(r.rel_path);
+        if (r.method, r.rel_path) == ("GET", "/store/catalog") {
+            params.push(json!({
+                "name": "fresh",
+                "in": "query",
+                "required": false,
+                "description": "`true` fetches and verifies the catalog again instead of using the one kept.",
+                "schema": { "type": "boolean", "default": false }
+            }));
+        }
         if !params.is_empty() {
             op.insert("parameters".into(), Value::Array(params));
         }
@@ -1968,6 +2060,7 @@ fn build_openapi() -> Value {
 
         let ok_status = match r.method {
             "POST" if r.rel_path == "/api-keys" => "201",
+            "POST" if r.rel_path == "/store/install" => "201",
             "DELETE" => "204",
             _ => "200",
         };
@@ -2034,6 +2127,239 @@ fn build_openapi() -> Value {
         },
         "paths": Value::Object(path_obj)
     })
+}
+
+/// The Community Store schemas, one `json!` each (a single one this size passes the macro
+/// recursion limit).
+fn store_schemas() -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert("StoreIdRequest".into(), json!({
+        "type": "object",
+        "required": ["id"],
+        "properties": { "id": { "type": "string", "description": "A catalog item id (3 to 80 of a-z, 0-9, `.`, `-`, `_`)." } }
+    }));
+    m.insert("StoreUndoRequest".into(), json!({
+        "type": "object",
+        "description": "Leave `token` out to undo the latest action. A `token` that is there (even null or empty) must be the latest's own: 400 `store_undo_bad_token` if it is not text, 404 `store_undo_unknown`, 409 `store_undo_out_of_order`; 409 `store_undo_conflict` when the user's own default look was edited since a removal put it back.",
+        "properties": { "token": { "type": "string" } }
+    }));
+    m.insert("StoreLinkRequest".into(), json!({
+        "type": "object",
+        "required": ["uri"],
+        "properties": { "uri": { "type": "string", "maxLength": 512, "description": "`ferrocast://store/install/<id>`, `ferrocast://install/<id>` or `ferrocast://store/item/<id>`, with an optional `?v=<version>`." } }
+    }));
+    m.insert(
+        "StoreUndoSummary".into(),
+        json!({
+            "type": "object",
+            "required": ["token", "action", "item_id", "item_title", "created_at"],
+            "properties": {
+                "token": { "type": "string" },
+                "action": { "type": "string", "enum": ["install", "update", "uninstall"] },
+                "item_id": { "type": "string" },
+                "item_title": { "type": "string" },
+                "created_at": { "type": "integer", "description": "Unix milliseconds." }
+            }
+        }),
+    );
+    m.insert(
+        "StoreCreator".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "name", "handle"],
+            "properties": {
+                "id": { "type": "string" },
+                "name": { "type": "string" },
+                "handle": { "type": "string" },
+                "bio": { "type": "string" },
+                "verified": { "type": "boolean" },
+                "links": {
+                    "type": "object",
+                    "properties": {
+                        "website": { "type": ["string", "null"] },
+                        "twitch": { "type": ["string", "null"] },
+                        "youtube": { "type": ["string", "null"] },
+                        "github": { "type": ["string", "null"] }
+                    }
+                }
+            }
+        }),
+    );
+    let package = json!({
+        "type": "object",
+        "required": ["format", "url", "sha256", "size"],
+        "properties": {
+            "format": { "type": "string", "enum": ["ferrodesign", "ferroalert", "ferroplugin"] },
+            "url": { "type": "string" },
+            "sha256": { "type": "string" },
+            "size": { "type": "integer" }
+        }
+    });
+    let assets = json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["name", "role", "url", "sha256", "size", "mime"],
+            "properties": {
+                "name": { "type": "string" },
+                "role": { "type": "string" },
+                "url": { "type": "string" },
+                "sha256": { "type": "string" },
+                "size": { "type": "integer" },
+                "mime": { "type": "string" }
+            }
+        }
+    });
+    let stats = json!({
+        "type": "object",
+        "required": ["installs", "rating_avg", "rating_count"],
+        "properties": {
+            "installs": { "type": "integer" },
+            "rating_avg": { "type": "number" },
+            "rating_count": { "type": "integer" }
+        }
+    });
+    let custom_alert = json!({
+        "type": ["object", "null"],
+        "properties": {
+            "html": { "type": "string" },
+            "css": { "type": "string" },
+            "fields": { "type": "array", "items": { "type": "object" } },
+            "field_values": { "type": "object", "additionalProperties": true }
+        }
+    });
+    let preview = json!({
+        "type": "object",
+        "required": ["palette", "style", "motion"],
+        "properties": {
+            "palette": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "type": "string" } },
+            "style": { "type": "string", "enum": ["minimal", "bold", "retro", "playful", "tech", "cozy"] },
+            "motion": { "type": "string", "enum": ["still", "smooth", "lively", "bouncy"] },
+            "headline": { "type": ["string", "null"] },
+            "subline": { "type": ["string", "null"] },
+            "layers_hint": { "type": ["integer", "null"] },
+            "design": { "type": ["object", "null"], "description": "A design, as `GET /designs/{id}` returns one." },
+            "custom_alert": custom_alert
+        }
+    });
+    let events = json!({
+        "type": "array",
+        "items": { "type": "string", "enum": ["follow", "sub", "resub", "gift", "member", "bits", "kicks", "tip", "superchat", "raid", "redeem"] }
+    });
+    m.insert("StoreItem".into(), json!({
+        "type": "object",
+        "required": ["id", "kind", "title", "summary", "version", "creator_id", "license", "package", "assets", "stats", "preview", "installed_version", "update_available"],
+        "properties": {
+            "id": { "type": "string" },
+            "kind": { "type": "string", "enum": ["theme", "alert", "widget", "overlay", "plugin"] },
+            "title": { "type": "string" },
+            "summary": { "type": "string" },
+            "version": { "type": "string" },
+            "creator_id": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "license": { "type": "string" },
+            "sandboxed": { "type": "boolean" },
+            "plugin_kind": { "type": ["string", "null"] },
+            "plugin_actions": { "type": "array", "items": { "type": "string" } },
+            "alert_events": events,
+            "featured": { "type": "boolean" },
+            "created_at": { "type": "integer" },
+            "updated_at": { "type": "integer" },
+            "package": package,
+            "assets": assets,
+            "stats": stats,
+            "preview": preview,
+            "installed_version": { "type": ["string", "null"] },
+            "update_available": { "type": "boolean" }
+        }
+    }));
+    m.insert("StoreInstalledItem".into(), json!({
+        "type": "object",
+        "required": ["item_id", "kind", "format", "title", "version", "creator_id", "creator_name", "installed_at", "updated_at", "package_sha256", "design_ids", "rule_ids", "plugin_id", "can_undo", "undo_token", "latest_version", "update_available"],
+        "properties": {
+            "item_id": { "type": "string" },
+            "kind": { "type": "string", "enum": ["theme", "alert", "widget", "overlay", "plugin"] },
+            "format": { "type": "string", "enum": ["ferrodesign", "ferroalert", "ferroplugin"] },
+            "title": { "type": "string" },
+            "version": { "type": "string" },
+            "creator_id": { "type": "string" },
+            "creator_name": { "type": "string" },
+            "installed_at": { "type": "integer" },
+            "updated_at": { "type": "integer" },
+            "package_sha256": { "type": "string" },
+            "design_ids": { "type": "array", "items": { "type": "string" } },
+            "rule_ids": { "type": "array", "items": { "type": "string" } },
+            "plugin_id": { "type": ["string", "null"] },
+            "can_undo": { "type": "boolean", "description": "This item's action is the latest one, so it can be undone." },
+            "undo_token": { "type": ["string", "null"] },
+            "latest_version": { "type": ["string", "null"] },
+            "update_available": { "type": "boolean" }
+        }
+    }));
+    m.insert("StoreCatalogView".into(), json!({
+        "type": "object",
+        "required": ["version", "generated_at", "fetched_at", "stale", "creators", "items", "installed", "last_undo", "warnings"],
+        "properties": {
+            "version": { "type": "integer" },
+            "generated_at": { "type": "integer" },
+            "fetched_at": { "type": "integer" },
+            "stale": { "type": "boolean" },
+            "creators": { "type": "array", "items": { "$ref": "#/components/schemas/StoreCreator" } },
+            "items": { "type": "array", "items": { "$ref": "#/components/schemas/StoreItem" } },
+            "installed": { "type": "array", "items": { "$ref": "#/components/schemas/StoreInstalledItem" } },
+            "last_undo": { "oneOf": [{ "$ref": "#/components/schemas/StoreUndoSummary" }, { "type": "null" }] },
+            "warnings": { "type": "array", "items": { "type": "string" } }
+        }
+    }));
+    m.insert(
+        "StoreInstalledView".into(),
+        json!({
+            "type": "object",
+            "required": ["installed", "last_undo"],
+            "properties": {
+                "installed": { "type": "array", "items": { "$ref": "#/components/schemas/StoreInstalledItem" } },
+                "last_undo": { "oneOf": [{ "$ref": "#/components/schemas/StoreUndoSummary" }, { "type": "null" }] }
+            }
+        }),
+    );
+    m.insert("StoreMutationResult".into(), json!({
+        "type": "object",
+        "required": ["action", "installed", "designs", "undo"],
+        "properties": {
+            "action": { "type": "string", "enum": ["install", "update", "uninstall"] },
+            "installed": { "oneOf": [{ "$ref": "#/components/schemas/StoreInstalledItem" }, { "type": "null" }] },
+            "designs": { "type": "array", "items": { "type": "object" }, "description": "The designs the action added (designs, as `GET /designs/{id}` returns them)." },
+            "undo": { "$ref": "#/components/schemas/StoreUndoSummary" }
+        }
+    }));
+    m.insert(
+        "StoreUndoResult".into(),
+        json!({
+            "type": "object",
+            "required": ["reverted_action", "item_id", "item_title", "installed"],
+            "properties": {
+                "reverted_action": { "type": "string", "enum": ["install", "update", "uninstall"] },
+                "item_id": { "type": "string" },
+                "item_title": { "type": "string" },
+                "installed": { "type": "array", "items": { "$ref": "#/components/schemas/StoreInstalledItem" } }
+            }
+        }),
+    );
+    m.insert("StoreLinkPreview".into(), json!({
+        "type": "object",
+        "required": ["uri", "action", "item", "creator", "installed", "update_available", "safety_notes", "requires_confirmation"],
+        "properties": {
+            "uri": { "type": "string" },
+            "action": { "type": "string", "enum": ["install", "view"] },
+            "item": { "$ref": "#/components/schemas/StoreItem" },
+            "creator": { "$ref": "#/components/schemas/StoreCreator" },
+            "installed": { "oneOf": [{ "$ref": "#/components/schemas/StoreInstalledItem" }, { "type": "null" }] },
+            "update_available": { "type": "boolean" },
+            "safety_notes": { "type": "array", "items": { "type": "string" }, "description": "What is already true, and what will be checked when the person installs." },
+            "requires_confirmation": { "type": "boolean", "const": true }
+        }
+    }));
+    m
 }
 
 /// The encoder auto-config schemas. Built one by one: a single `json!` this size passes the macro
@@ -2448,6 +2774,7 @@ fn schemas() -> Value {
     });
     if let Some(map) = doc.as_object_mut() {
         map.extend(auto_config_schemas());
+        map.extend(store_schemas());
     }
     doc
 }

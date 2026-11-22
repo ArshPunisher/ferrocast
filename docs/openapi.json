@@ -1040,6 +1040,716 @@
         ],
         "type": "object"
       },
+      "StoreCatalogView": {
+        "properties": {
+          "creators": {
+            "items": {
+              "$ref": "#/components/schemas/StoreCreator"
+            },
+            "type": "array"
+          },
+          "fetched_at": {
+            "type": "integer"
+          },
+          "generated_at": {
+            "type": "integer"
+          },
+          "installed": {
+            "items": {
+              "$ref": "#/components/schemas/StoreInstalledItem"
+            },
+            "type": "array"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/StoreItem"
+            },
+            "type": "array"
+          },
+          "last_undo": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StoreUndoSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "integer"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "version",
+          "generated_at",
+          "fetched_at",
+          "stale",
+          "creators",
+          "items",
+          "installed",
+          "last_undo",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "StoreCreator": {
+        "properties": {
+          "bio": {
+            "type": "string"
+          },
+          "handle": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "links": {
+            "properties": {
+              "github": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "twitch": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "website": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "youtube": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "verified": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "handle"
+        ],
+        "type": "object"
+      },
+      "StoreIdRequest": {
+        "properties": {
+          "id": {
+            "description": "A catalog item id (3 to 80 of a-z, 0-9, `.`, `-`, `_`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "StoreInstalledItem": {
+        "properties": {
+          "can_undo": {
+            "description": "This item's action is the latest one, so it can be undone.",
+            "type": "boolean"
+          },
+          "creator_id": {
+            "type": "string"
+          },
+          "creator_name": {
+            "type": "string"
+          },
+          "design_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "format": {
+            "enum": [
+              "ferrodesign",
+              "ferroalert",
+              "ferroplugin"
+            ],
+            "type": "string"
+          },
+          "installed_at": {
+            "type": "integer"
+          },
+          "item_id": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "theme",
+              "alert",
+              "widget",
+              "overlay",
+              "plugin"
+            ],
+            "type": "string"
+          },
+          "latest_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "package_sha256": {
+            "type": "string"
+          },
+          "plugin_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rule_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "type": "string"
+          },
+          "undo_token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "update_available": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "kind",
+          "format",
+          "title",
+          "version",
+          "creator_id",
+          "creator_name",
+          "installed_at",
+          "updated_at",
+          "package_sha256",
+          "design_ids",
+          "rule_ids",
+          "plugin_id",
+          "can_undo",
+          "undo_token",
+          "latest_version",
+          "update_available"
+        ],
+        "type": "object"
+      },
+      "StoreInstalledView": {
+        "properties": {
+          "installed": {
+            "items": {
+              "$ref": "#/components/schemas/StoreInstalledItem"
+            },
+            "type": "array"
+          },
+          "last_undo": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StoreUndoSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "installed",
+          "last_undo"
+        ],
+        "type": "object"
+      },
+      "StoreItem": {
+        "properties": {
+          "alert_events": {
+            "items": {
+              "enum": [
+                "follow",
+                "sub",
+                "resub",
+                "gift",
+                "member",
+                "bits",
+                "kicks",
+                "tip",
+                "superchat",
+                "raid",
+                "redeem"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "assets": {
+            "items": {
+              "properties": {
+                "mime": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "sha256": {
+                  "type": "string"
+                },
+                "size": {
+                  "type": "integer"
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "role",
+                "url",
+                "sha256",
+                "size",
+                "mime"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "type": "integer"
+          },
+          "creator_id": {
+            "type": "string"
+          },
+          "featured": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "installed_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "theme",
+              "alert",
+              "widget",
+              "overlay",
+              "plugin"
+            ],
+            "type": "string"
+          },
+          "license": {
+            "type": "string"
+          },
+          "package": {
+            "properties": {
+              "format": {
+                "enum": [
+                  "ferrodesign",
+                  "ferroalert",
+                  "ferroplugin"
+                ],
+                "type": "string"
+              },
+              "sha256": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "format",
+              "url",
+              "sha256",
+              "size"
+            ],
+            "type": "object"
+          },
+          "plugin_actions": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "plugin_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preview": {
+            "properties": {
+              "custom_alert": {
+                "properties": {
+                  "css": {
+                    "type": "string"
+                  },
+                  "field_values": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "fields": {
+                    "items": {
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "html": {
+                    "type": "string"
+                  }
+                },
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "design": {
+                "description": "A design, as `GET /designs/{id}` returns one.",
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "headline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "layers_hint": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "motion": {
+                "enum": [
+                  "still",
+                  "smooth",
+                  "lively",
+                  "bouncy"
+                ],
+                "type": "string"
+              },
+              "palette": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "style": {
+                "enum": [
+                  "minimal",
+                  "bold",
+                  "retro",
+                  "playful",
+                  "tech",
+                  "cozy"
+                ],
+                "type": "string"
+              },
+              "subline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "palette",
+              "style",
+              "motion"
+            ],
+            "type": "object"
+          },
+          "sandboxed": {
+            "type": "boolean"
+          },
+          "stats": {
+            "properties": {
+              "installs": {
+                "type": "integer"
+              },
+              "rating_avg": {
+                "type": "number"
+              },
+              "rating_count": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "installs",
+              "rating_avg",
+              "rating_count"
+            ],
+            "type": "object"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "type": "string"
+          },
+          "update_available": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "title",
+          "summary",
+          "version",
+          "creator_id",
+          "license",
+          "package",
+          "assets",
+          "stats",
+          "preview",
+          "installed_version",
+          "update_available"
+        ],
+        "type": "object"
+      },
+      "StoreLinkPreview": {
+        "properties": {
+          "action": {
+            "enum": [
+              "install",
+              "view"
+            ],
+            "type": "string"
+          },
+          "creator": {
+            "$ref": "#/components/schemas/StoreCreator"
+          },
+          "installed": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StoreInstalledItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "item": {
+            "$ref": "#/components/schemas/StoreItem"
+          },
+          "requires_confirmation": {
+            "const": true,
+            "type": "boolean"
+          },
+          "safety_notes": {
+            "description": "What is already true, and what will be checked when the person installs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "update_available": {
+            "type": "boolean"
+          },
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "uri",
+          "action",
+          "item",
+          "creator",
+          "installed",
+          "update_available",
+          "safety_notes",
+          "requires_confirmation"
+        ],
+        "type": "object"
+      },
+      "StoreLinkRequest": {
+        "properties": {
+          "uri": {
+            "description": "`ferrocast://store/install/<id>`, `ferrocast://install/<id>` or `ferrocast://store/item/<id>`, with an optional `?v=<version>`.",
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "type": "object"
+      },
+      "StoreMutationResult": {
+        "properties": {
+          "action": {
+            "enum": [
+              "install",
+              "update",
+              "uninstall"
+            ],
+            "type": "string"
+          },
+          "designs": {
+            "description": "The designs the action added (designs, as `GET /designs/{id}` returns them).",
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "installed": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/StoreInstalledItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "undo": {
+            "$ref": "#/components/schemas/StoreUndoSummary"
+          }
+        },
+        "required": [
+          "action",
+          "installed",
+          "designs",
+          "undo"
+        ],
+        "type": "object"
+      },
+      "StoreUndoRequest": {
+        "description": "Leave `token` out to undo the latest action. A `token` that is there (even null or empty) must be the latest's own: 400 `store_undo_bad_token` if it is not text, 404 `store_undo_unknown`, 409 `store_undo_out_of_order`; 409 `store_undo_conflict` when the user's own default look was edited since a removal put it back.",
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "StoreUndoResult": {
+        "properties": {
+          "installed": {
+            "items": {
+              "$ref": "#/components/schemas/StoreInstalledItem"
+            },
+            "type": "array"
+          },
+          "item_id": {
+            "type": "string"
+          },
+          "item_title": {
+            "type": "string"
+          },
+          "reverted_action": {
+            "enum": [
+              "install",
+              "update",
+              "uninstall"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "reverted_action",
+          "item_id",
+          "item_title",
+          "installed"
+        ],
+        "type": "object"
+      },
+      "StoreUndoSummary": {
+        "properties": {
+          "action": {
+            "enum": [
+              "install",
+              "update",
+              "uninstall"
+            ],
+            "type": "string"
+          },
+          "created_at": {
+            "description": "Unix milliseconds.",
+            "type": "integer"
+          },
+          "item_id": {
+            "type": "string"
+          },
+          "item_title": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "action",
+          "item_id",
+          "item_title",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "StudioItemBox": {
         "properties": {
           "h": {
@@ -19759,6 +20469,601 @@
           "go_live",
           "settings"
         ]
+      }
+    },
+    "/api/v1/store/assets/{item_id}/{name}": {
+      "get": {
+        "operationId": "get_store_assets__item_id___name_",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "item_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "audio/mpeg": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "audio/ogg": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "audio/wav": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/gif": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/png": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              },
+              "image/webp": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The asset's bytes (the type is the one the catalog lists).",
+            "headers": {
+              "Content-Security-Policy": {
+                "description": "`default-src 'none'; sandbox`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "`nosniff`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "A picture or sound a catalog item lists, checked against its SHA-256 (PC only).",
+        "tags": [
+          "Community Store"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/store/catalog": {
+      "get": {
+        "operationId": "get_store_catalog",
+        "parameters": [
+          {
+            "description": "`true` fetches and verifies the catalog again instead of using the one kept.",
+            "in": "query",
+            "name": "fresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreCatalogView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "The signed Store catalog with what is installed. `?fresh=true` fetches it again (PC only).",
+        "tags": [
+          "Community Store"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/store/install": {
+      "post": {
+        "operationId": "post_store_install",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoreIdRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreMutationResult"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Install a catalog item, checking its package first. 201 with the undo (PC only, at this computer).",
+        "tags": [
+          "Community Store"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/store/installed": {
+      "get": {
+        "operationId": "get_store_installed",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreInstalledView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "What the Store installed and the latest undo. Works when the catalog does not (PC only).",
+        "tags": [
+          "Community Store"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/store/resolve-link": {
+      "post": {
+        "operationId": "post_store_resolve_link",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoreLinkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreLinkPreview"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a `ferrocast://` Store link into a preview. It never installs: the person confirms first (PC only).",
+        "tags": [
+          "Community Store"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/store/undo": {
+      "post": {
+        "operationId": "post_store_undo",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoreUndoRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreUndoResult"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Undo the latest Store action. Leave `token` out for the latest; one that is there must be the latest's own (PC only, at this computer).",
+        "tags": [
+          "Community Store"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/store/uninstall": {
+      "post": {
+        "operationId": "post_store_uninstall",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoreIdRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreMutationResult"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove an installed item, giving back what it displaced (PC only, at this computer).",
+        "tags": [
+          "Community Store"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/store/update": {
+      "post": {
+        "operationId": "post_store_update",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StoreIdRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StoreMutationResult"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update an installed item to the catalog's newer version (PC only, at this computer).",
+        "tags": [
+          "Community Store"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/stream-info": {
