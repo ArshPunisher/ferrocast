@@ -606,7 +606,12 @@ impl Engine {
                     ));
                 }
                 let own = srt_is_exclusive(&path);
-                move_without_replacing(&path, &to)?;
+                // Only the case changes on a disk that ignores it: one file, so a plain rename.
+                if same_file(&path, &to) {
+                    std::fs::rename(&path, &to).map_err(|e| io_refuse("Couldn't rename it", &e))?;
+                } else {
+                    move_without_replacing(&path, &to)?;
+                }
                 if own && is_plain_file(&from_srt) && std::fs::symlink_metadata(&to_srt).is_err() {
                     let _ = move_without_replacing(&from_srt, &to_srt);
                 }

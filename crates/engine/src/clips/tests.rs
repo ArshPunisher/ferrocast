@@ -447,3 +447,32 @@ fn only_the_streams_own_lines_set_the_duration_and_the_rotation() {
     assert_eq!(p.duration_ms, Some(10_000), "a title tag set the length");
     assert_eq!((p.width, p.height), (Some(1920), Some(1080)), "a comment tag turned the picture");
 }
+
+/// On a case-insensitive disk (macOS, Windows) "boss.mp4" and "Boss.mp4" are one file: renaming
+/// to the other spelling is a rename, not a name clash.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_rename_that_only_changes_the_case_works() {
+    let (e, _data, clips) = engine().await;
+    touch(clips.path(), "boss.mp4", b"video");
+    let renamed = e.rename_clip("boss.mp4", "Boss").await.unwrap();
+    assert_eq!(renamed.id, "Boss.mp4");
+    let names: Vec<String> = std::fs::read_dir(clips.path())
+        .unwrap()
+        .map(|x| x.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["Boss.mp4".to_string()], "{names:?}");
+}
+
+/// A caption file that can't be read is said, not shown as no captions.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_caption_file_is_an_error_not_an_empty_list() {
+    use std::os::unix::fs::PermissionsExt;
+    let (e, _data, clips) = engine().await;
+    touch(clips.path(), "a.mp4", b"video");
+    touch(clips.path(), "a.srt", &[0xff, 0xfe, 0x00, 0x80, 0x81]);
+    let r = e.clip_captions("a.mp4").await;
+    assert!(matches!(r, Err(EngineError::Refused { code: "bad_captions", .. })), "{r:?}");
+    let _ = std::fs::set_permissions(clips.path().join("a.srt"), std::fs::Permissions::from_mode(0o644));
+}

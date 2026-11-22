@@ -494,7 +494,16 @@ impl Engine {
                     "Delete it and make the captions again.",
                 ));
             }
-            Ok(parse_srt(&std::fs::read_to_string(&srt).unwrap_or_default()))
+            // Read as text or said: a file that isn't text (or can't be opened) is not "no captions".
+            let text = std::fs::read_to_string(&srt).map_err(|_| {
+                refuse(
+                    422,
+                    "bad_captions",
+                    "That clip's caption file can't be read.",
+                    "Delete it and make the captions again.",
+                )
+            })?;
+            Ok(parse_srt(&text))
         })
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))?
