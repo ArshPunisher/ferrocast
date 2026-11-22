@@ -22,12 +22,36 @@ use ferrocast_store::{designfile, repo};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-use crate::plugin_catalog::{Source, client as http_client, fetch_capped, file_url, hex_bytes, newer, verify};
+use crate::plugin_catalog::{Source, client as http_client, fetch_capped, file_url, hex_bytes, newer};
 use crate::plugins::{ACTIONS as PLUGIN_ACTIONS, MAX_ZIP as MAX_PLUGIN_ZIP, read_zip as read_plugin_zip};
 use crate::{Engine, EngineError, now};
 
 /// Default signed Community Store catalog endpoint (companion `.sig` lives beside it).
-pub const STORE_CATALOG_URL: &str = "https://raw.githubusercontent.com/ArshPunisher/ferrocast-store/main/catalog.json";
+pub const STORE_CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/ArshPunisher/ferrocast-store/main/store-catalog.json";
+
+/// The file name the Store catalog is signed under (the signature's trusted comment says it): a
+/// plugin catalog signature made with the same key can't pass as a Store catalog.
+pub const STORE_CATALOG_FILE: &str = "store-catalog.json";
+
+/// The catalog's highest accepted signing time and `generated_at` (settings key): an older
+/// catalog than this is a replay and is refused.
+const FLOOR_KEY: &str = "store_catalog_floor";
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+struct CatalogFloor {
+    signed_at: i64,
+    generated_at: i64,
+}
+
+/// Checks the Store catalog: signature, and that it was signed as the Store catalog.
+pub fn verify_store(list: &[u8], sig: &str, key: &str) -> Result<crate::plugin_catalog::SignedFor, String> {
+    let s = crate::plugin_catalog::verify_signed(list, sig, key)?;
+    if s.file != STORE_CATALOG_FILE {
+        return Err("the signature is for another catalog".into());
+    }
+    Ok(s)
+}
 
 /// Public key baked into the app for Community Store catalog verification. Distinct from any test
 /// fixture public key or app updater key. Empty closes the catalog cleanly (`503 catalog_not_open`).
@@ -45,6 +69,7 @@ pub const MAX_ASSET_BYTES: usize = 10 * 1024 * 1024;
 pub const CACHE_TTL: Duration = Duration::from_secs(600);
 pub const STALE_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+#[cfg(any(test, feature = "test-catalog"))]
 static STORE_SOURCE: Mutex<Option<Source>> = Mutex::new(None);
 static STORE_CACHE: Mutex<Option<CachedCatalog>> = Mutex::new(None);
 
@@ -63,24 +88,28 @@ struct VerifiedCatalog {
     warnings: Vec<String>,
 }
 
-/// Overrides the Community Store catalog URL/key (tests only).
+/// Overrides the Community Store catalog URL/key. Tests only: this function does not exist in a
+/// release build (the `test-catalog` feature is for the server's tests).
+#[cfg(any(test, feature = "test-catalog"))]
 pub fn set_source(s: Source) {
     *STORE_SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
     *STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Clears any test override for the Community Store catalog.
+#[cfg(any(test, feature = "test-catalog"))]
 pub fn clear_source() {
     *STORE_SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn current_source() -> Source {
-    STORE_SOURCE.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| Source {
-        url: STORE_CATALOG_URL.into(),
-        key: STORE_CATALOG_KEY.into(),
-        local: false,
-    })
+    #[cfg(any(test, feature = "test-catalog"))]
+    if let Some(s) = STORE_SOURCE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return s;
+    }
+    // A release build has only this: the pinned key, https.
+    Source { url: STORE_CATALOG_URL.into(), key: STORE_CATALOG_KEY.into(), local: false }
 }
 
 fn refused(status: u16, code: &'static str, message: impl Into<String>, hint: impl Into<String>) -> EngineError {
@@ -867,16 +896,42 @@ impl Engine {
             .await
             .map_err(|e| verified_error_map(e, "store_catalog_too_large"))?;
         let sig = String::from_utf8(sig_bytes).unwrap_or_default();
-        if let Err(why) = verify(&list, &sig, &src.key) {
-            tracing::warn!(%why, "community store catalog failed minisign check");
+        let signed = match verify_store(&list, &sig, &src.key) {
+            Ok(s) => s,
+            Err(why) => {
+                tracing::warn!(%why, "community store catalog failed minisign check");
+                return Err(refused(
+                    502,
+                    "store_bad_signature",
+                    "The Community Store catalog signature isn't valid, so it wasn't opened.",
+                    "Installed items stay safe and working. Try refreshing later.",
+                ));
+            }
+        };
+        let verified = parse_and_validate_catalog(&list, &src)?;
+        // Nothing older than what was accepted before: a replayed old (signed) catalog would bring
+        // back an item that was taken down.
+        let floor: CatalogFloor = self.db(|s| repo::settings::get_or_default(s, FLOOR_KEY)).await?;
+        if signed.timestamp < floor.signed_at || verified.generated_at < floor.generated_at {
+            tracing::warn!(
+                signed = signed.timestamp,
+                floor = floor.signed_at,
+                "community store catalog is older than the last accepted one"
+            );
             return Err(refused(
                 502,
-                "store_bad_signature",
-                "The Community Store catalog signature isn't valid, so it wasn't opened.",
-                "Installed items stay safe and working. Try refreshing later.",
+                "store_catalog_rollback",
+                "The Community Store catalog is older than the one Ferrocast already accepted, so it wasn't opened.",
+                "This can be an old copy served by mistake or on purpose. Try again later.",
             ));
         }
-        let verified = parse_and_validate_catalog(&list, &src)?;
+        let next = CatalogFloor {
+            signed_at: signed.timestamp.max(floor.signed_at),
+            generated_at: verified.generated_at.max(floor.generated_at),
+        };
+        if next.signed_at != floor.signed_at || next.generated_at != floor.generated_at {
+            self.db(move |s| repo::settings::set(s, FLOOR_KEY, &next)).await?;
+        }
         let fetched_at = now().0;
         *STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(CachedCatalog { at: Instant::now(), fetched_at, catalog: verified.clone() });
@@ -1579,6 +1634,53 @@ mod tests {
             matches!(too_big, Err(EngineError::Refused { status: 413, code: "store_catalog_too_large", .. })),
             "{too_big:?}"
         );
+    }
+
+    /// A signature made for the plugin catalog (same key, any key) can't open the Store, and the
+    /// reverse: the signed file name is the domain.
+    #[test]
+    fn store_and_plugin_signatures_do_not_pass_as_each_other() {
+        const PLUGIN_LIST: &[u8] = include_bytes!("../testdata/catalog/catalog.json");
+        const PLUGIN_SIG: &str = include_str!("../testdata/catalog/catalog.json.sig");
+        const PLUGIN_KEY: &str = include_str!("../testdata/catalog/test-key.pub");
+        assert_eq!(verify_store(CATALOG_V1, CATALOG_V1_SIG, TEST_KEY).unwrap().file, STORE_CATALOG_FILE);
+        // A real plugin-catalog signature isn't a Store signature...
+        assert!(verify_store(PLUGIN_LIST, PLUGIN_SIG, PLUGIN_KEY).is_err(), "plugin signature opened the Store");
+        // ...and a Store signature isn't a plugin-catalog one, even checked with the Store's key.
+        assert!(crate::plugin_catalog::verify(CATALOG_V1, CATALOG_V1_SIG, TEST_KEY).is_err());
+    }
+
+    /// An older catalog than the last accepted one is a replay and is refused.
+    #[tokio::test]
+    async fn an_older_signed_catalog_is_refused_after_a_newer_one() {
+        let _lock = TEST_GUARD.lock().await;
+        let state = Arc::new(StdMutex::new(MockFixtureState::default()));
+        let port = spawn_fixture_server(state.clone()).await;
+        let (engine, _dir, _studio, _chat) = crate::automation::tests::engine().await;
+        set_source(Source { url: format!("http://127.0.0.1:{port}/catalog.json"), key: TEST_KEY.into(), local: true });
+        {
+            let mut st = state.lock().unwrap();
+            st.catalog = CATALOG_V2.to_vec();
+            st.sig = CATALOG_V2_SIG.into();
+        }
+        engine.store_catalog(true).await.unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            st.catalog = CATALOG_V1.to_vec();
+            st.sig = CATALOG_V1_SIG.into();
+        }
+        let old = engine.store_catalog(true).await;
+        assert!(
+            matches!(old, Err(EngineError::Refused { status: 502, code: "store_catalog_rollback", .. })),
+            "{old:?}"
+        );
+        // The newer one still opens.
+        {
+            let mut st = state.lock().unwrap();
+            st.catalog = CATALOG_V2.to_vec();
+            st.sig = CATALOG_V2_SIG.into();
+        }
+        engine.store_catalog(true).await.unwrap();
     }
 
     #[tokio::test]

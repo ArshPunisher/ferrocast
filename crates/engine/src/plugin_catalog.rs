@@ -47,21 +47,23 @@ pub struct Source {
     pub local: bool,
 }
 
+#[cfg(any(test, feature = "test-catalog"))]
 static SOURCE: Mutex<Option<Source>> = Mutex::new(None);
 static KEPT: Mutex<Option<(Instant, Vec<Entry>)>> = Mutex::new(None);
 
-/// The tests' catalog in place of the real one.
+/// The tests' catalog in place of the real one (not in a release build).
+#[cfg(any(test, feature = "test-catalog"))]
 pub fn set_source(s: Source) {
     *SOURCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
     *KEPT.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn source() -> Source {
-    SOURCE.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| Source {
-        url: CATALOG_URL.into(),
-        key: CATALOG_KEY.into(),
-        local: false,
-    })
+    #[cfg(any(test, feature = "test-catalog"))]
+    if let Some(s) = SOURCE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return s;
+    }
+    Source { url: CATALOG_URL.into(), key: CATALOG_KEY.into(), local: false }
 }
 
 /// A plugin in the catalog.
