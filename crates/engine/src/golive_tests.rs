@@ -1841,18 +1841,13 @@ async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
         GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "twitch")).collect::<Vec<_>>()
     };
     e.set_golive_destinations(only_twitch()).await.unwrap();
+    // The Studio can't apply it to the stream it starts (its encoder is shared with a recording).
+    *studio.cap_refused.lock().unwrap() = Some("the stream shares its encoder with the recording".into());
     e.studio_stream(true).await.unwrap();
     // 7,011 kbps arrives, and goes on arriving.
     push_main(&e, 90_000);
     let feed = keep_streaming(e.golive().hub.clone(), 90_000, 4_000);
     let twitch = |v: &crate::golive::GoLiveView| v.destinations.iter().find(|d| d.id == "twitch").cloned().unwrap();
-    let v = e.golive_view().await;
-    assert!(twitch(&v).capped.is_some(), "held: the badge says so");
-    assert!(twitch(&v).issues.is_empty(), "held: its rounding isn't nagged about");
-    // The Studio can't apply it on the stream on air.
-    *studio.cap_refused.lock().unwrap() = Some("the stream shares its encoder with the recording".into());
-    e.set_golive_destinations(only_twitch().into_iter().chain([]).collect()).await.unwrap();
-    e.sync_stream_cap().await;
     let v = e.golive_view().await;
     assert_eq!(twitch(&v).capped, None, "not claimed");
     assert_eq!(twitch(&v).issues.len(), 1, "{:?}", twitch(&v).issues);
@@ -2101,4 +2096,68 @@ async fn the_upload_estimate_bills_what_really_sends() {
     }
     let check = e.upload_now_for_test(&cfg).expect("an estimate");
     assert_eq!(check.rows.len(), 1, "the standby backup is not billed beside its main: {:?}", check.rows);
+}
+
+/// The cap the running encode started with stays for its whole life: removing the platform that
+/// set it (and any ordinary reconcile after) doesn't raise it, and a compatible destination
+/// is judged against what is really on air (6,000 kbps), not the configured 14,000.
+#[tokio::test]
+async fn the_running_encode_keeps_the_cap_it_started_with() {
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = twitch_studio_settings();
+    e.set_studio_host(studio.clone());
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    let order = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(order(&e, &["twitch", "youtube"])).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    let started = studio.caps.lock().unwrap().last().copied().flatten();
+    assert_eq!(started.and_then(|c| c.max_kbps), Some(6_000));
+    push_main(&e, 20_000);
+    let _keep = keep_streaming(e.golive().hub.clone(), 20_000, 4_000);
+    // Twitch leaves: the encoder keeps its cap, through this and an ordinary reconcile.
+    e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
+    e.reconcile().await;
+    let caps = studio.caps.lock().unwrap().clone();
+    assert!(
+        caps.iter().rev().take(3).all(|c| c.and_then(|c| c.max_kbps) == Some(6_000)),
+        "the cap was raised while live: {caps:?}"
+    );
+    // Kick (8,000) fits a stream that is really 6,000: not refused for the configured 14,000.
+    e.set_golive_destinations(order(&e, &["youtube", "kick"])).await.unwrap();
+}
+
+/// Deleting the only sender of a live picture asks, even when another picture has a ticked
+/// destination; deleting one of two senders is free and its stop goes in the session log.
+#[tokio::test]
+async fn deleting_a_sender_follows_the_canvas_rule_and_its_stop_is_logged() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let (pb, _gb) = platform("key-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let v = e.add_golive_destination("V", "rtmp://127.0.0.1:9/app", "key-v", Canvas::Vertical).await.unwrap();
+    assert!(v.enabled);
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    let err = e.remove_golive_destination(&a.id).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+    // A second main sender: now A can go, and its stop is in the log under its name.
+    let list = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "key-b", Canvas::Main).await.unwrap();
+    e.set_golive_destinations_checked(
+        list(&e, &[a.id.as_str(), b.id.as_str(), v.id.as_str()]),
+        crate::golive::DestinationConfirm { upload: true, last: true },
+    )
+    .await
+    .unwrap();
+    eventually_async(|| async { e.golive_running().contains(&b.id) }).await;
+    e.remove_golive_destination(&a.id).await.unwrap();
+    let log = e.golive().dest_log.lock().unwrap().clone();
+    assert!(log.iter().any(|ev| ev.id == a.id && ev.name == "A" && !ev.on), "{log:?}");
 }

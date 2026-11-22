@@ -568,7 +568,11 @@ pub(crate) struct GoLive {
     cap_failed: std::sync::atomic::AtomicBool,
     /// Set while a destination change is applied to a running stream: the Studio's encoder is
     /// shared by every other output (and a "Same as stream" recording), so its cap isn't touched.
-    cap_frozen: std::sync::atomic::AtomicBool,
+    /// The cap the Studio's running encode was given when it started: what the encode really
+    /// is, whatever the destinations say now (only a new stream gets a new one).
+    applied_cap: Mutex<Option<crate::studio_host::StreamCap>>,
+    /// Names by id of destinations that sent, for the session record (a deleted one keeps its name).
+    dest_names: Mutex<std::collections::HashMap<String, String>>,
     /// A platform said the stream ended while the hub still runs (every destination was
     /// switched off, the stream and recording go on): the session record closes with the hub.
     health_end_pending: std::sync::atomic::AtomicBool,
@@ -663,7 +667,8 @@ impl Default for GoLive {
             studio_video: Mutex::new(None),
             studio_live: std::sync::atomic::AtomicBool::new(false),
             cap_failed: std::sync::atomic::AtomicBool::new(false),
-            cap_frozen: std::sync::atomic::AtomicBool::new(false),
+            applied_cap: Mutex::new(None),
+            dest_names: Mutex::new(std::collections::HashMap::new()),
             health_end_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1015,13 +1020,8 @@ impl Engine {
     /// `reconcile`, for a change made while a stream runs: starts and stops only the outputs
     /// that changed and leaves the Studio's encoder (its cap and shape) alone.
     pub(crate) async fn reconcile_midstream(&self) {
-        let g = self.golive();
-        if !self.golive_stream_running() {
-            return self.reconcile().await;
-        }
-        g.cap_frozen.store(true, std::sync::atomic::Ordering::Release);
+        // While a stream runs `sync_stream_cap` leaves its encoder alone, so this is `reconcile`.
         self.reconcile().await;
-        g.cap_frozen.store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// The destinations sending right now (ids).
@@ -1076,11 +1076,19 @@ impl Engine {
     }
 
     pub(crate) async fn sync_stream_cap(&self) {
-        if self.golive().cap_frozen.load(std::sync::atomic::Ordering::Acquire) {
-            // A destination was added or removed on a running stream: its encoder stays as it is.
+        // A stream is running and its cap was applied: its encoder (shared by every output and a
+        // "Same as stream" recording) keeps it, whatever is ticked or unticked now. The next
+        // stream starts with a cap worked out again. (A cap that failed is tried again.)
+        if self.golive_stream_running() && !self.golive().cap_failed.load(std::sync::atomic::Ordering::Acquire) {
             self.send_golive_pub();
             return;
         }
+        self.sync_stream_cap_now().await;
+    }
+
+    /// Works the cap out and applies it, on a running stream too: for what the streamer chose
+    /// on purpose (the Advanced switch that ignores the platforms' limits).
+    pub(crate) async fn sync_stream_cap_now(&self) {
         let Ok(host) = self.studio_host() else { return };
         let limit = self.studio_limit();
         let no_bframes = self.studio_no_bframes();
@@ -1092,7 +1100,10 @@ impl Engine {
         });
         let failed = &self.golive().cap_failed;
         match host.set_stream_cap(cap).await {
-            Ok(()) => failed.store(false, std::sync::atomic::Ordering::Release),
+            Ok(()) => {
+                failed.store(false, std::sync::atomic::Ordering::Release);
+                *lock(&self.golive().applied_cap) = cap;
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "couldn't update the Studio's stream cap");
                 // The stream on air isn't held to the platform's limit: said, and the view stops
@@ -1661,7 +1672,7 @@ impl Engine {
         // What is on air: the Studio's configured video rate held to the cap it already has, or
         // (from OBS) the measured rate less the sound and the packaging.
         let on_air_kbps = if studio_on && let Some(c) = cfg {
-            c.video_kbps.min(self.studio_limit().map_or(u32::MAX, |l| l.max_kbps))
+            c.video_kbps.min(lock(&g.applied_cap).and_then(|a| a.max_kbps).unwrap_or(u32::MAX))
         } else {
             stats.kbps.saturating_sub(AUDIO_SLACK_KBPS)
         };
@@ -2107,9 +2118,14 @@ impl Engine {
             return Err(EngineError::Invalid("Twitch, YouTube and Kick can be switched off, not removed.".into()));
         }
         // The last one sending is stopped by switching it off, which asks first.
-        if cfg.destinations[i].enabled
-            && self.golive_stream_running()
-            && !cfg.destinations.iter().enumerate().any(|(j, d)| j != i && d.enabled)
+        let gone = &cfg.destinations[i];
+        let canvas_on_air = match gone.canvas {
+            Canvas::Main => self.golive().hub.live().borrow().on,
+            Canvas::Vertical => self.golive().vhub.live().borrow().on,
+        };
+        if gone.enabled
+            && canvas_on_air
+            && !cfg.destinations.iter().enumerate().any(|(j, d)| j != i && d.enabled && d.canvas == gone.canvas)
         {
             return Err(EngineError::Refused {
                 status: 409,
@@ -2440,6 +2456,9 @@ impl Engine {
         let g = self.golive();
         let _one = g.reconciling.lock().await;
         let was_running: std::collections::HashSet<String> = lock(&g.running).keys().cloned().collect();
+        // Set below when a platform's "stream ended" was waiting for the hub to stop: the record
+        // closes after the last stops are noted in it.
+        let mut close_record = false;
         let (main_on, vertical_on, light_on) =
             (g.hub.live().borrow().on, g.vhub.live().borrow().on, g.lhub.live().borrow().on);
         let on = |d: &DestinationConfig| match d.canvas {
@@ -2471,9 +2490,7 @@ impl Engine {
         lock(&g.blocked).retain(|id, _| wanted(id));
         lock(&g.paused).retain(|id, _| wanted(id));
         if !main_on && !vertical_on {
-            if g.health_end_pending.swap(false, std::sync::atomic::Ordering::AcqRel) {
-                self.health_stream_ended(now()).await;
-            }
+            close_record = g.health_end_pending.swap(false, std::sync::atomic::Ordering::AcqRel);
             lock(&g.protector).reset();
             // The next stream starts with every destination given its own chance again.
             *lock(&g.backup) = BackupState::default();
@@ -2497,11 +2514,22 @@ impl Engine {
         self.sync_stream_cap().await;
         // Which destinations started or stopped sending, for the session record.
         let now_running: std::collections::HashSet<String> = lock(&g.running).keys().cloned().collect();
-        for d in &cfg.destinations {
-            let (was, is) = (was_running.contains(&d.id), now_running.contains(&d.id));
-            if was != is {
-                self.note_destination(&d.id, &dest_name(d), is);
+        // By id, with the name remembered, so one deleted while sending still gets its stop.
+        let names: std::collections::HashMap<String, String> = {
+            let mut known = lock(&g.dest_names);
+            for d in &cfg.destinations {
+                known.insert(d.id.clone(), dest_name(d));
             }
+            known.clone()
+        };
+        for id in was_running.union(&now_running) {
+            let (was, is) = (was_running.contains(id), now_running.contains(id));
+            if was != is {
+                self.note_destination(id, names.get(id).map_or(id.as_str(), String::as_str), is);
+            }
+        }
+        if close_record {
+            self.health_stream_ended(now()).await;
         }
         self.send_golive();
     }
@@ -2582,7 +2610,7 @@ impl Engine {
         if rules_changed {
             lock(&self.golive().protector).set_rules(cfg.advanced.rules.clone());
         }
-        self.sync_stream_cap().await;
+        self.sync_stream_cap_now().await;
         Ok(cfg)
     }
 

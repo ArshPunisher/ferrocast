@@ -68,6 +68,9 @@ impl Engine {
     /// the open health record, so the session record says which were live and when.
     pub(crate) fn note_destination(&self, id: &str, name: &str, on: bool) {
         let ev = ferrocast_core::diagnostics::DestinationEvent { id: id.into(), name: name.into(), at: now(), on };
+        // The health lock first, then the log (the order a record starting copies it in): an
+        // event can't be both copied into a new record and appended to it.
+        let mut g = self.inner.stream_health.lock().unwrap_or_else(|p| p.into_inner());
         {
             let mut log = self.golive().dest_log.lock().unwrap_or_else(|p| p.into_inner());
             if log.len() >= 200 {
@@ -75,7 +78,6 @@ impl Engine {
             }
             log.push(ev.clone());
         }
-        let mut g = self.inner.stream_health.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(rec) = g.active.as_mut() {
             // Bounded like Go live's own log: a long, unstable stream can't grow the record.
             if rec.destination_log.len() >= 200 {
