@@ -347,3 +347,21 @@ fn a_burst_limit_is_a_short_wait_and_only_a_long_one_is_the_daily_quota() {
     assert_eq!(code, "youtube_quota");
     assert!(message.to_lowercase().contains("daily"));
 }
+
+/// CodeRabbit: a clip rewritten in place after it was checked is not sent: the open file is
+/// compared with what it was when picked on every read.
+#[test]
+fn a_clip_changed_in_place_is_not_read_on_for_the_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("a.mp4");
+    std::fs::write(&p, vec![7u8; 4096]).unwrap();
+    let mut src = FileSource::open(&p).unwrap();
+    assert_eq!(src.read_at(0, 16).unwrap().len(), 16);
+    // Rewritten in place: same inode, different bytes (and a later modified time).
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+    std::io::Write::write_all(&mut f, &[9u8; 4096]).unwrap();
+    drop(f);
+    let e = src.read_at(0, 16).unwrap_err();
+    assert!(e.to_string().contains("changed"), "{e}");
+}

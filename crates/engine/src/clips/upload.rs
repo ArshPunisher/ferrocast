@@ -147,6 +147,8 @@ fn with_shorts_tag(mut meta: VideoUpload) -> VideoUpload {
 struct FileSource {
     file: std::fs::File,
     len: u64,
+    /// What the file looked like when it was picked: a rewrite in place changes it.
+    modified: Option<std::time::SystemTime>,
 }
 
 impl FileSource {
@@ -179,7 +181,7 @@ impl FileSource {
         if !meta.is_file() {
             return Err(super::no_such_clip());
         }
-        Ok(Self { file, len: meta.len() })
+        Ok(Self { file, len: meta.len(), modified: meta.modified().ok() })
     }
 }
 
@@ -189,6 +191,11 @@ impl UploadSource for FileSource {
     }
 
     fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        // The bytes sent are the bytes that were checked: a clip rewritten in place stops the upload.
+        let now = self.file.metadata()?;
+        if now.len() != self.len || now.modified().ok() != self.modified {
+            return Err(std::io::Error::other("the clip changed while it was being sent"));
+        }
         self.file.seek(SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; len];
         let mut got = 0;
