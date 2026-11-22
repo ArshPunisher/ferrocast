@@ -27,6 +27,7 @@ mod polls;
 mod pro;
 mod recap;
 pub(crate) mod remote_scope;
+mod schedule;
 mod smart;
 mod studio;
 mod tip_pro;
@@ -231,6 +232,8 @@ pub(crate) fn api() -> Router<AppState> {
         .merge(studio::routes())
         // Go live everywhere: destinations, OBS setup, the upload check
         .merge(golive::routes())
+        // Stream scheduler: plans, scheduled broadcasts, reminders (routes/schedule.rs)
+        .merge(schedule::routes())
         // auto-replies (bot answers to chat that mentions something)
         .merge(autoreplies::routes())
         // Pro dashboard from anywhere: devices, pairing links (see crate::remote)

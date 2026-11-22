@@ -2267,3 +2267,59 @@ async fn creating_a_rule_checks_weight_and_interrupt_too() {
     ok["interrupt"] = json!(true);
     assert_eq!(r.post("/api/v1/alert-rules", ok).await.status(), StatusCode::CREATED);
 }
+
+#[tokio::test]
+async fn the_schedule_routes_plan_list_and_delete_with_plain_errors() {
+    let r = start().await;
+    let soon = ferrocast_engine::now().0 + 3_600_000;
+    // A past time is a 400 that names the field.
+    let bad = r
+        .post("/api/v1/schedule", json!({ "info": { "title": "Show" }, "platforms": ["twitch"], "start_ms": 1000 }))
+        .await;
+    assert_eq!(bad.status(), 400);
+    let e: Value = bad.json().await.unwrap();
+    assert!(e["error"]["message"].as_str().unwrap().starts_with("start"), "{e}");
+    // A good plan is 201 and is listed.
+    let ok = r
+        .post(
+            "/api/v1/schedule",
+            json!({ "info": { "title": "Show" }, "platforms": ["twitch", "facebook"], "start_ms": soon }),
+        )
+        .await;
+    assert_eq!(ok.status(), 201);
+    let item: Value = ok.json().await.unwrap();
+    assert_eq!(item["broadcasts"].as_array().unwrap().len(), 2);
+    assert_eq!(item["reminded"], false);
+    let list: Value = r.get("/api/v1/schedule").await.json().await.unwrap();
+    assert_eq!(list["streams"].as_array().unwrap().len(), 1);
+    // Nothing went live.
+    let st: Value = r.get("/api/v1/status").await.json().await.unwrap();
+    assert!(st["live"].as_object().unwrap().values().all(|v| v == &json!(false)), "{st}");
+    // Delete, then an unknown id is 404.
+    let id = item["id"].as_str().unwrap();
+    assert_eq!(
+        r.client
+            .delete(format!("{}/api/v1/schedule/{id}", r.base))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(
+        r.client
+            .delete(format!("{}/api/v1/schedule/{id}", r.base))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    // An unknown field is refused, not ignored.
+    let odd = r
+        .post("/api/v1/schedule", json!({ "info": { "title": "x" }, "platforms": ["tiktok"], "start_ms": soon }))
+        .await;
+    assert!(odd.status().is_client_error());
+}

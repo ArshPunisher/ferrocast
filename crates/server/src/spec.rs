@@ -307,6 +307,33 @@ const ALERTS_DESIGNS_MEDIA: &[RouteDoc] = &[
     doc("DELETE", "/media/{id}", "Designs & Media", "Delete an uploaded media asset.", None, None),
 ];
 
+const SCHEDULE_ROUTES: &[RouteDoc] = &[
+    doc(
+        "GET",
+        "/schedule",
+        "Go Live",
+        "Planned streams, soonest first, with the scheduled broadcasts made for them.",
+        None,
+        None,
+    ),
+    doc(
+        "POST",
+        "/schedule",
+        "Go Live",
+        "Plan a stream: title, category, platforms and start time. Makes scheduled broadcasts where a platform has them (YouTube, Facebook), reminds before the start, never goes live by itself.",
+        None,
+        None,
+    ),
+    doc(
+        "DELETE",
+        "/schedule/{id}",
+        "Go Live",
+        "Remove a planned stream (broadcasts already made on a platform stay there).",
+        None,
+        None,
+    ),
+];
+
 const GO_LIVE_ROUTES: &[RouteDoc] = &[
     doc(
         "GET",
@@ -1761,6 +1788,7 @@ pub fn all_rest_routes() -> impl Iterator<Item = &'static RouteDoc> {
         .chain(BOT_AND_WIDGETS)
         .chain(ALERTS_DESIGNS_MEDIA)
         .chain(GO_LIVE_ROUTES)
+        .chain(SCHEDULE_ROUTES)
         .chain(OBS_AND_MUSIC)
         .chain(STUDIO_ENGINE_ROUTES)
         .chain(MOMENTS_AND_SHOW)

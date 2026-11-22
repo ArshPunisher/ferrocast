@@ -6630,7 +6630,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Add a custom RTMP/SRT destination with stream key (PC only).",
+        "summary": "Add a custom RTMP/SRT destination with stream key (PC only). Optional brand (x, instagram, facebook) names a server and key pasted from that platform.",
         "tags": [
           "Go Live"
         ],
@@ -18342,6 +18342,196 @@
         "summary": "Generate an AI summary for a completed stream.",
         "tags": [
           "Core"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/schedule": {
+      "get": {
+        "operationId": "get_schedule",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Planned streams, soonest first, with the scheduled broadcasts made for them.",
+        "tags": [
+          "Go Live"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      },
+      "post": {
+        "operationId": "post_schedule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Plan a stream: title, category, platforms and start time. Makes scheduled broadcasts where a platform has them (YouTube, Facebook), reminds before the start, never goes live by itself.",
+        "tags": [
+          "Go Live"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/schedule/{id}": {
+      "delete": {
+        "operationId": "delete_schedule__id_",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success (no content)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove a planned stream (broadcasts already made on a platform stay there).",
+        "tags": [
+          "Go Live"
         ],
         "x-ferrocast-scopes": [],
         "x-pc-only": true
@@ -35213,4 +35403,3 @@
     }
   ]
 }
-

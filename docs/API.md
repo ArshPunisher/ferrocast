@@ -124,7 +124,7 @@ Never reachable by any API key (even with all 6 scopes): `/api/v1/api-keys*`, `/
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/v1/accounts` | → `Account[]` (`{ platform, name, avatar_url, connected_at, scopes_ok }`) |
-| POST | `/api/v1/accounts/{platform}/connect` | → `{ flow: "device_code", user_code, verification_url, expires_at }` (Twitch) or `{ flow: "browser", url }` (YouTube, Kick). The engine opens the system browser itself; the UI shows the code and waits for the `connector` event. |
+| POST | `/api/v1/accounts/{platform}/connect` | → `{ flow: "device_code", user_code, verification_url, expires_at }` (Twitch) or `{ flow: "browser", url }` (YouTube, Kick, **Facebook**: a Page you manage; needs the owner's Facebook app, 422 `This build of Ferrocast has no Facebook app set up` otherwise; its comments on a live video arrive as chat events with platform `facebook`, polled through the Graph API, and replies and comment removal work; no bans or timeouts). The engine opens the system browser itself; the UI shows the code and waits for the `connector` event. |
 | DELETE | `/api/v1/accounts/{platform}` | → 204 |
 
 ### Overlays
@@ -1001,6 +1001,18 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 **Upload protection.** While OBS streams and 2 or more destinations are live, a destination getting under 70% of the stream's rate, or skipping packets, for 4 seconds in a row (each destination is judged after its first 3 live seconds) pauses the bottom-most live one in the streamer's order, so the ones above stay smooth: its health becomes `paused` with the reason. After 10 calm seconds, and no earlier than `until_ms` (60 s for the first pause in a stream, doubling each time up to 10 minutes), the highest paused one comes back. The last live destination is never paused. A paused destination isn't restarted by ticking changes; unticking it ends the pause. When the stream ends, nothing stays paused.
 
 Live frame `golive { live, stats, vertical_live, vertical_stats, destinations, cut_state, ffmpeg }` (§5): every second while OBS streams, and after every change.
+
+### Stream schedule (Phase 3 #24, free, local)
+
+Plan a stream, and have the platforms that take scheduled broadcasts make one. It reminds, it never goes live: Go live is always the streamer's own press.
+
+| Method | Path | Body → answer |
+|---|---|---|
+| GET | `/api/v1/schedule` | → `{ streams: ScheduledStream[] }`, soonest first |
+| POST | `/api/v1/schedule` | `{ info: StreamInfo /* title required; category, description… */, platforms: ("twitch"\|"youtube"\|"kick"\|"facebook")[], start_ms /* future, Unix ms */, remind_minutes?: 1–1440 (10) }` → 201 `ScheduledStream { id, info, platforms, start_ms, remind_minutes, reminded, broadcasts: { platform, id?, url?, note? }[] }`. YouTube gets a scheduled broadcast with auto start and stop off (50 quota units); Facebook a scheduled live video; Twitch and Kick have none, so they get the reminder only. A platform that is not connected or says no does not fail the plan: its `broadcasts[]` row has `note` saying why. 400 names the field (`start`, `title`, `platforms`, `remind_minutes`), 409 over 50 plans |
+| DELETE | `/api/v1/schedule/{id}` | → 204 (a broadcast already made on a platform stays there; remove it in that platform). 404 unknown |
+
+The reminder is a `notice` frame (key `schedule:{id}`) once, `remind_minutes` before the start. Plans are dropped a day after their start.
 
 ### Auto-replies (free, local)
 The bot answers chat that mentions something ("discord" → the invite), without a `!command`. Checked on live chat from this channel after moderation passed it; never for a message a command answers (custom, counter, module or points command), never for the streamer's own account (the bot speaks as it, R-28), the connected account, accounts with the bot role or well-known bots (Nightbot, StreamElements…), and never for text the bot itself sent in the last 2 minutes (loop guard). Quiet while the bot is off (`bot_enabled`) or panic mode is on. Rules are checked in order and the **first match wins** (a later rule never answers a message an earlier one matched, even while that one cools down). Each platform has a send budget for auto-replies (R-19: 6 per 30 s on Twitch and Kick, 2 per minute on YouTube); a platform's own rate limit pauses auto-replies there for its `Retry-After`.
