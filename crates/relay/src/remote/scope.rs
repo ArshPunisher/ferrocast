@@ -135,6 +135,10 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Community Theme Store packages and installs stay on the PC only.
     ("*", "/store"),
     ("*", "/store/**"),
+    // Planning a stream spends YouTube quota and makes broadcasts on the platforms (the OpenAPI
+    // spec says x-pc-only): the PC only.
+    ("*", "/schedule"),
+    ("*", "/schedule/**"),
 ];
 
 /// The dashboard API's routes with a variable part, for the audit log's action names:
@@ -388,6 +392,10 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
         ] {
             assert!(!allowed(Role::Mod, m, p), "{m} {p}");
         }
@@ -455,6 +463,10 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }

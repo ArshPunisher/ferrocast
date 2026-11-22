@@ -136,6 +136,10 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Community Theme Store packages and installs stay on the PC only.
     ("*", "/store"),
     ("*", "/store/**"),
+    // Planning a stream spends YouTube quota and makes broadcasts on the platforms (the OpenAPI
+    // spec says x-pc-only): the PC only.
+    ("*", "/schedule"),
+    ("*", "/schedule/**"),
 ];
 
 /// One plain path segment: no `.`/`..`, no encoded `/`, `\`, `.` or NUL, nothing outside
@@ -764,6 +768,10 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
             ("GET", "/studio/engine/auto-config"),
             ("POST", "/studio/engine/auto-config/benchmark"),
             ("POST", "/studio/engine/auto-config/cancel"),
@@ -881,6 +889,10 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }
