@@ -245,6 +245,7 @@ impl Engine {
         )
         .await?;
         engine.init_safe_mode(data_dir, safe_mode_flag);
+        engine.mark_unclean_stream_health().await;
         // OBS's own settings file in its usual place (`start_with` leaves this empty so
         // tests never read the developer's real OBS).
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
@@ -401,7 +402,6 @@ impl Engine {
         engine.load_smart().await;
         tokio::spawn(smart::run(engine.clone()));
         engine.hydrate_labels().await;
-        engine.mark_unclean_stream_health().await;
         tokio::spawn(labels::run(engine.clone()));
         tokio::spawn(ferro_account::run(engine.clone()));
         engine.guests_at_start();
