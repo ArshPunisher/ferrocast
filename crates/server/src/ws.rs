@@ -50,6 +50,8 @@ pub async fn live(
     let bearer = crate::auth::bearer(&headers).map(str::to_string);
     let query_token = query_value(raw.as_deref(), "key").or_else(|| query_value(raw.as_deref(), "session"));
     let token = bearer.or(query_token);
+    // Subscribed before the key is checked, so a revoke in between isn't missed.
+    let revoked = ferrocast_engine::api_keys::subscribe_key_revocations();
     let key_scopes = match token.as_deref() {
         Some(tok) if ferrocast_core::api_keys::has_api_key_prefix(tok) => {
             let Ok(ferrocast_engine::api_keys::ApiKeyAuth::Valid(summary)) = app.engine.authenticate_api_key(tok).await
@@ -73,21 +75,39 @@ pub async fn live(
                 return ApiError::forbidden("This API key doesn't have permission for GET /live.").into_response();
             }
             app.engine.record_api_key_usage(&summary.id, &summary.name, "GET", "/live", 101).await;
-            Some(summary.scopes)
+            Some(LiveKey { id: summary.id, expires_at: summary.expires_at, scopes: summary.scopes })
         }
         Some(tok) if app.sessions.valid(tok) => None,
         _ => return ApiError::unauthorized().into_response(),
     };
     let since = query_value(raw.as_deref(), "since").and_then(|s| s.parse::<u64>().ok());
-    ws.max_message_size(MAX_INBOUND).on_upgrade(move |socket| live_loop(app, socket, since, key_scopes))
+    ws.max_message_size(MAX_INBOUND).on_upgrade(move |socket| live_loop(app, socket, since, key_scopes, revoked))
 }
+
+/// The key a live socket was opened with: it closes when this key is revoked or expires.
+struct LiveKey {
+    id: String,
+    expires_at: Option<i64>,
+    scopes: Vec<ferrocast_core::api_keys::ApiKeyScope>,
+}
+
+/// Close code for a socket whose key was revoked or expired.
+const CLOSE_KEY_OFF: u16 = 4401;
 
 async fn live_loop(
     app: AppState,
     socket: WebSocket,
     since: Option<u64>,
-    key_scopes: Option<Vec<ferrocast_core::api_keys::ApiKeyScope>>,
+    key: Option<LiveKey>,
+    mut revoked: tokio::sync::broadcast::Receiver<String>,
 ) {
+    let key_scopes = key.as_ref().map(|k| k.scopes.clone());
+    let key_id = key.as_ref().map(|k| k.id.clone());
+    // An expiring key is closed when it expires, not only the next time it connects.
+    let expiry = key.as_ref().and_then(|k| k.expires_at).map(|at| {
+        let ms = at.saturating_sub(ferrocast_engine::now().0).max(0);
+        tokio::time::Instant::now() + std::time::Duration::from_millis(u64::try_from(ms).unwrap_or(0))
+    });
     let (mut tx, mut rx) = socket.split();
     // Subscribe before replaying, so nothing falls in the gap; the dashboard drops
     // duplicate event ids.
@@ -128,6 +148,18 @@ async fn live_loop(
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
                 Some(Ok(_)) => {} // the dashboard sends nothing but pings
             },
+            // The key was revoked (or lagged past the notice: closed to be safe).
+            gone = revoked.recv(), if key_id.is_some() => {
+                if matches!(gone, Ok(ref id) if Some(id) != key_id.as_ref()) {
+                    continue;
+                }
+                let _ = tx.send(Message::Close(Some(CloseFrame { code: CLOSE_KEY_OFF, reason: "key revoked".into() }))).await;
+                return;
+            }
+            () = async { match expiry { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
+                let _ = tx.send(Message::Close(Some(CloseFrame { code: CLOSE_KEY_OFF, reason: "key expired".into() }))).await;
+                return;
+            }
             frame = frames.recv() => match frame {
                 Ok(f) => {
                     if !frame_allowed(&f) {

@@ -12,6 +12,16 @@ use crate::{Engine, EngineError, now};
 
 const DEFAULT_AUDIT_LIMIT: usize = 100;
 
+/// Ids of keys just revoked: a live socket held by one listens and closes at once.
+static REVOKED: std::sync::LazyLock<tokio::sync::broadcast::Sender<String>> =
+    std::sync::LazyLock::new(|| tokio::sync::broadcast::channel(64).0);
+
+/// Listens for revoked key ids (subscribe before checking the key, so none falls in the gap).
+#[must_use]
+pub fn subscribe_key_revocations() -> tokio::sync::broadcast::Receiver<String> {
+    REVOKED.subscribe()
+}
+
 /// Outcome of validating a presented `fc_key_*` token.
 #[derive(Debug, Clone)]
 pub enum ApiKeyAuth {
@@ -67,7 +77,11 @@ impl Engine {
         if id.is_empty() {
             return Err(EngineError::NotFound("API key"));
         }
-        self.db(move |s| repo::api_keys::revoke(s, &id)).await
+        let key_id = id.clone();
+        self.db(move |s| repo::api_keys::revoke(s, &id)).await?;
+        // Its open sockets close now (nobody listening is fine).
+        let _ = REVOKED.send(key_id);
+        Ok(())
     }
 
     /// Authenticates a presented `fc_key_*` token by hashing it with SHA-256 and checking active

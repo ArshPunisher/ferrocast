@@ -560,3 +560,34 @@ async fn revoking_a_key_closes_its_open_live_sockets_at_once() {
     assert!(closed.is_ok(), "the revoked key's socket is still open");
     rig.engine.shutdown();
 }
+
+#[tokio::test]
+async fn a_key_that_expires_has_its_open_live_socket_closed() {
+    let rig = Rig::start().await;
+    let ws_base = rig.base.replacen("http://", "ws://", 1);
+    let soon = ferrocast_engine::now().0 + 1500;
+    let res = rig
+        .client
+        .post(rig.url("/api-keys"))
+        .bearer_auth(&rig.session_token)
+        .json(&json!({ "name": "Soon", "scopes": [ApiKeyScope::Chat], "expires_at": soon }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = res.json().await.unwrap();
+    let tok = body["token"].as_str().unwrap().to_string();
+    let mut req = format!("{ws_base}/api/v1/live").into_client_request().unwrap();
+    req.headers_mut().insert("authorization", format!("Bearer {tok}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => break,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the expired key's socket is still open");
+    rig.engine.shutdown();
+}
