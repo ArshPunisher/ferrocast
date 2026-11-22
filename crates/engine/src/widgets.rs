@@ -62,7 +62,7 @@ impl Engine {
         let credits = self.state().session.credits.clone();
         self.send_overlay(OverlayFrame::new(
             Audience::Widget(WidgetKind::EndCredits),
-            0,
+            self.next_seq(),
             "state",
             &json!({ "credits": credits }),
         ));
@@ -229,7 +229,7 @@ impl Engine {
         self.send_live(LiveFrame::new("chat_highlight", &json!({ "highlight": highlight })));
         self.send_overlay(OverlayFrame::new(
             Audience::Widget(WidgetKind::ChatHighlight),
-            0,
+            self.next_seq(),
             "state",
             &json!({ "chat_highlight": highlight }),
         ));
@@ -384,6 +384,49 @@ mod tests {
         assert_eq!(saved.raiders.len(), 1);
         assert_eq!(saved.mods.len(), 1);
         assert_eq!(saved.mods[0].name, "ModOne");
+    }
+
+    /// Overlays drop frames at or below the snapshot's seq, so live widget frames
+    /// must carry a fresh, increasing number (a hard-coded 0 was silently dropped).
+    #[tokio::test]
+    async fn live_widget_frames_carry_increasing_seq() {
+        let (engine, _dir) = test_engine().await;
+        let mut rx = engine.subscribe_overlays();
+        let snap_seq = engine.current_seq();
+        let t0 = now().0 - 10_000;
+        engine
+            .ingest(Event::live(
+                Platform::Twitch,
+                Some("seq-f".into()),
+                Millis(t0),
+                EventKind::Follow { actor: viewer(Platform::Twitch, "SeqFollower", Roles::empty()) },
+            ))
+            .await;
+        engine
+            .ingest(Event::live(
+                Platform::Twitch,
+                Some("seq-m".into()),
+                Millis(t0 + 10),
+                EventKind::ChatMessage {
+                    actor: viewer(Platform::Twitch, "SeqChatter", Roles::empty()),
+                    content: Content::plain("hi"),
+                    reply_to: None,
+                    is_action: false,
+                },
+            ))
+            .await;
+        let id = engine.db(|s| repo::events::by_source(s, Platform::Twitch, "seq-m")).await.unwrap().unwrap();
+        engine.pin_chat_highlight(&id, None).await.unwrap();
+        engine.clear_chat_highlight();
+        let mut seen = Vec::new();
+        while let Ok(f) = rx.try_recv() {
+            if matches!(f.audience, Audience::Widget(_)) {
+                seen.push(f.seq);
+            }
+        }
+        assert!(seen.len() >= 3, "expected credits and highlight frames, got {seen:?}");
+        assert!(seen.iter().all(|s| *s > snap_seq), "frame seq must exceed snapshot seq {snap_seq}: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "frame seqs must increase: {seen:?}");
     }
 
     #[tokio::test]
