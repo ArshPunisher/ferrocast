@@ -307,8 +307,11 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
             // "(n)" may be added: keep room for it.
             // Trimmed first (the Studio trims every name, so "Swipe " and "Swipe" would become one),
             // and never blank.
-            let named = t.get("name").and_then(Value::as_str).unwrap_or("Fade").trim();
-            let wanted: String = if named.is_empty() { "Transition".into() } else { named.chars().take(90).collect() };
+            // Cut to length first, then trimmed again: the cut can leave a space on the end.
+            let named: String =
+                t.get("name").and_then(Value::as_str).unwrap_or("Fade").trim().chars().take(90).collect();
+            let named = named.trim();
+            let wanted: String = if named.is_empty() { "Transition".into() } else { named.to_string() };
             let t_name = tr_names.take(&wanted);
             if let Some(id) = t.get("id").and_then(Value::as_str) {
                 tr_by_id.insert(id.to_string(), t_name.clone());
@@ -457,6 +460,21 @@ mod tests {
         let fade = doc["transitions"][1]["name"].clone();
         assert_eq!(doc["ferrocast"]["transition_matrix"][0]["transition"], fade);
         assert_eq!(doc["current_transition"], fade);
+    }
+
+    #[test]
+    fn a_name_cut_to_length_is_trimmed_before_it_is_made_unique() {
+        let base = "A".repeat(89);
+        let mut v = sample();
+        v["transitions"]["transitions"] = json!([
+            { "id": "t1", "name": format!("{base} X"), "type": "swipe_transition", "duration": 500, "settings": {} },
+            { "id": "t2", "name": base.clone(), "type": "fade_transition", "duration": 300, "settings": {} }
+        ]);
+        let doc = to_obs(&v, "Main");
+        let names: Vec<&str> =
+            doc["transitions"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.iter().all(|n| n.trim() == *n), "{names:?}");
+        assert_ne!(names[0], names[1]);
     }
 
     #[test]
