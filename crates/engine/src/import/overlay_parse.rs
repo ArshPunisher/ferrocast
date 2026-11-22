@@ -114,6 +114,7 @@ fn known_native_kind(id: &str) -> bool {
     )
 }
 
+use super::overlay_safe;
 use crate::EngineError;
 use crate::fonts::{BundledFontFile, FontSpec, detect_font_format, parse_font_spec};
 
@@ -131,8 +132,8 @@ const MAX_IMAGE_ENTRY: usize = 15 * 1024 * 1024;
 const MAX_AUDIO_ENTRY: usize = 10 * 1024 * 1024;
 const MAX_FONT_ENTRY: usize = 15 * 1024 * 1024;
 const MAX_VIDEO_ENTRY: usize = 60 * 1024 * 1024;
-const ASSET_PLACEHOLDER_PREFIX: &str = "__FERRO_PACK_ASSET__:";
-const OVERLAY_PLACEHOLDER_PREFIX: &str = "__FERRO_OVERLAY_URL__:";
+pub(super) const ASSET_PLACEHOLDER_PREFIX: &str = "__FERRO_PACK_ASSET__:";
+pub(super) const OVERLAY_PLACEHOLDER_PREFIX: &str = "__FERRO_OVERLAY_URL__:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1394,7 +1395,7 @@ fn parse_streamlabs_root(
     let mut sources_list: Vec<Value> = obs_scene_sources;
     sources_list.extend(ctx.sources_by_name.into_values());
 
-    let doc = json!({
+    let mut doc = json!({
         "name": pack_name,
         "current_scene": first_scene,
         "current_program_scene": first_scene,
@@ -1404,6 +1405,16 @@ fn parse_streamlabs_root(
         "transitions": transitions,
         "sources": sources_list,
     });
+
+    // The pack's JSON is a stranger's: rebuild it from what is allowed (see overlay_safe).
+    let safe = overlay_safe::make_safe(&mut doc, ctx.lookup.assets.len(), &|r| ctx.lookup.resolve(r));
+    ctx.notes.extend(safe.notes);
+    for m in safe.missing_assets {
+        if ctx.missing_assets_seen.insert(m.to_ascii_lowercase()) {
+            ctx.missing_assets.push(m);
+        }
+    }
+    ctx.web_page_count = count_web_pages(&doc);
 
     let format = if own3d_brand { OverlayPackFormat::Own3d } else { OverlayPackFormat::Streamlabs };
     let source_count = doc["sources"].as_array().map(Vec::len).unwrap_or(0);
@@ -1456,8 +1467,6 @@ fn parse_obs_or_own3d_pack(
     let web_kind = for_this_computer("browser_source").0;
     let mut missing_kinds = Vec::new();
     let mut missing_kinds_seen = BTreeSet::new();
-    let mut web_pages = 0usize;
-    let mut source_count = 0usize;
     if let Some(sources) = doc.get_mut("sources").and_then(Value::as_array_mut) {
         for src in sources.iter_mut() {
             let old_id = src.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1467,14 +1476,13 @@ fn parse_obs_or_own3d_pack(
                 src["id"] = json!(mapped);
                 src["versioned_id"] = json!(mapped);
             }
-            if eff_id == web_kind || eff_id == "browser_source" || eff_id == "ferrocast_web" {
-                web_pages += 1;
-            }
-            if eff_id != "scene" && eff_id != "group" {
-                source_count += 1;
-                if !eff_id.is_empty() && !known_native_kind(eff_id) && missing_kinds_seen.insert(eff_id.to_string()) {
-                    missing_kinds.push(eff_id.to_string());
-                }
+            if eff_id != "scene"
+                && eff_id != "group"
+                && !eff_id.is_empty()
+                && !known_native_kind(eff_id)
+                && missing_kinds_seen.insert(eff_id.to_string())
+            {
+                missing_kinds.push(eff_id.to_string());
             }
         }
     }
@@ -1656,6 +1664,21 @@ fn parse_obs_or_own3d_pack(
         }
     }
 
+    // The pack's JSON is a stranger's: rebuild it from what is allowed (see overlay_safe).
+    let safe = overlay_safe::make_safe(&mut doc, extracted.assets.len(), &|r| lookup.resolve(r));
+    for m in safe.missing_assets {
+        if missing_seen.insert(m.to_ascii_lowercase()) {
+            missing_assets.push(m);
+        }
+    }
+    notes.extend(safe.notes);
+    let web_pages = count_web_pages(&doc);
+    let source_count = doc
+        .get("sources")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter(|s| !matches!(s.get("id").and_then(Value::as_str), Some("scene" | "group"))).count())
+        .unwrap_or(0);
+
     let scenes: Vec<PreviewScene> = doc
         .get("sources")
         .and_then(Value::as_array)
@@ -1682,7 +1705,7 @@ fn parse_obs_or_own3d_pack(
     }
 
     for miss in &missing_kinds {
-        notes.push(format!("Unrecognized source kind \"{miss}\" kept for manual review."));
+        notes.push(format!("Unrecognized source kind \"{miss}\" was left out."));
     }
 
     let format = if own3d_brand || is_own3d_manifest_json(primary) {
@@ -1840,6 +1863,18 @@ pub fn parse_overlay_zip(zip_bytes: &[u8], filename: &str) -> Result<ParsedPack,
     } else {
         parse_obs_or_own3d_pack(&primary, extracted, filename, hint_name, own3d_brand, manifest_fonts)
     }
+}
+
+/// How many browser sources a collection holds.
+fn count_web_pages(doc: &Value) -> usize {
+    doc.get("sources")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter(|s| matches!(s.get("id").and_then(Value::as_str), Some("browser_source" | "ferrocast_web")))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Replaces asset and overlay placeholders inside `doc_template` after assets live on disk and

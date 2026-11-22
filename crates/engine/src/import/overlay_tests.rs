@@ -651,3 +651,199 @@ async fn offline_and_ssrf_and_bundled_font_fallbacks_never_fail_pack_import() {
     assert_eq!(rep3.fonts[0].status, FontStatus::Bundled);
     assert_eq!(mock_hit_check.css_hits.load(Ordering::Relaxed), 0);
 }
+
+// ---- Neon review C1/C2: an imported pack's JSON is untrusted ---------------------------------
+
+/// A pack of OBS JSON with one scene holding `sources` (one item each) and the given assets.
+fn obs_pack(sources: Vec<Value>, assets: Vec<(&str, &[u8])>) -> ParsedPack {
+    let items: Vec<Value> =
+        sources.iter().enumerate().map(|(i, s)| json!({ "id": i + 1, "name": s["name"], "visible": true })).collect();
+    let mut all = vec![json!({ "name": "Main", "id": "scene", "settings": { "items": items } })];
+    all.extend(sources);
+    let doc = json!({
+        "name": "Evil",
+        "current_scene": "Main",
+        "scene_order": [{ "name": "Main" }],
+        "transitions": [{ "name": "Fade", "id": "fade_transition", "settings": {} }],
+        "sources": all,
+    });
+    let json_bytes = serde_json::to_vec(&doc).unwrap();
+    let mut entries: Vec<(&str, &[u8], Option<u32>)> = vec![("scenes.json", &json_bytes, None)];
+    for (n, d) in &assets {
+        entries.push((n, d, None));
+    }
+    parse_overlay_zip(&build_zip(entries), "evil.overlay").unwrap()
+}
+
+fn source<'a>(p: &'a ParsedPack, name: &str) -> Option<&'a Value> {
+    p.doc_template["sources"].as_array()?.iter().find(|s| s["name"] == name)
+}
+
+fn setting<'a>(p: &'a ParsedPack, name: &str, key: &str) -> Option<&'a Value> {
+    source(p, name)?.get("settings")?.get(key)
+}
+
+#[test]
+fn a_browser_source_loads_only_public_web_pages() {
+    let bad = [
+        "file:///etc/passwd",
+        "FILE:///Users/me/keys.txt",
+        "data:text/html,<script>fetch('x')</script>",
+        "javascript:alert(1)",
+        "ftp://x.test/a",
+        "http://127.0.0.1:47820/o/secret/",
+        "http://localhost:3000/",
+        "http://[::1]/admin",
+        "http://192.168.1.1/",
+        "http://10.0.0.5/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://2130706433/",
+        "http://0x7f.1/",
+        "http://user:pw@example.com/",
+        "https://metadata.google.internal/",
+    ];
+    let sources: Vec<Value> = bad
+        .iter()
+        .enumerate()
+        .map(|(i, u)| json!({ "name": format!("B{i}"), "id": "browser_source", "settings": { "url": u } }))
+        .chain([
+            json!({ "name": "Good", "id": "browser_source", "settings": { "url": "https://example.com/widget?x=1", "width": 800, "height": 600 } }),
+            json!({ "name": "Local", "id": "browser_source", "settings": { "is_local_file": true, "local_file": "/etc/passwd", "url": "" } }),
+            json!({ "name": "LocalHtm", "id": "browser_source", "settings": { "url": "file:///x/Y.HTM" } }),
+        ])
+        .collect();
+    let p = obs_pack(sources, vec![]);
+    for (i, url) in bad.iter().enumerate() {
+        assert_eq!(setting(&p, &format!("B{i}"), "url"), Some(&json!("")), "{url}");
+    }
+    assert_eq!(setting(&p, "Good", "url"), Some(&json!("https://example.com/widget?x=1")));
+    assert_eq!(setting(&p, "Good", "width"), Some(&json!(800)));
+    assert_eq!(setting(&p, "Local", "local_file"), None, "no local file for a browser source");
+    assert_ne!(setting(&p, "Local", "is_local_file"), Some(&json!(true)));
+    assert_eq!(setting(&p, "LocalHtm", "url"), Some(&json!("")));
+}
+
+#[test]
+fn a_browser_sources_css_cannot_load_anything() {
+    let p = obs_pack(
+        vec![
+            json!({ "name": "Bad", "id": "browser_source", "settings": { "url": "https://example.com/", "css": "@import url(http://evil.test/x.css); body{}" } }),
+            json!({ "name": "Bad2", "id": "browser_source", "settings": { "url": "https://example.com/", "css": "body{background:url(http://evil.test/p.png)}" } }),
+            json!({ "name": "Fine", "id": "browser_source", "settings": { "url": "https://example.com/", "css": "body { margin: 0; }" } }),
+        ],
+        vec![],
+    );
+    assert_eq!(setting(&p, "Bad", "css"), Some(&json!("")));
+    assert_eq!(setting(&p, "Bad2", "css"), Some(&json!("")));
+    assert_eq!(setting(&p, "Fine", "css"), Some(&json!("body { margin: 0; }")));
+}
+
+#[test]
+fn files_outside_the_pack_are_never_left_in_a_source() {
+    let png = make_tiny_png();
+    let p = obs_pack(
+        vec![
+            json!({ "name": "Img", "id": "image_source", "settings": { "file": "/Users/victim/Desktop/private.png" } }),
+            json!({ "name": "Ok", "id": "image_source", "settings": { "file": "assets/frame.png" } }),
+            json!({ "name": "Slides", "id": "slideshow", "settings": { "files": [
+                { "value": "/Users/victim/a.png", "hidden": false }, { "value": "assets/frame.png" } ], "slide_time": 5000 } }),
+            json!({ "name": "Clip", "id": "ffmpeg_source", "settings": { "is_local_file": false, "input": "http://192.168.0.9/x.mp4",
+                "ffmpeg_options": "protocol_whitelist=file", "local_file": "/etc/hosts" } }),
+            json!({ "name": "Words", "id": "text_ft2_source_v2", "settings": { "text": "hi", "from_file": true,
+                "text_file": "/etc/passwd", "file": "/etc/passwd" } }),
+            json!({ "name": "Masked", "id": "image_source", "settings": { "file": "assets/frame.png" },
+                "filters": [ { "name": "m", "id": "mask_filter", "settings": { "image_path": "/Users/victim/m.png", "opacity": 1 } } ] }),
+        ],
+        vec![("assets/frame.png", &png)],
+    );
+    let file = |n: &str, k: &str| setting(&p, n, k).and_then(Value::as_str).map(str::to_string);
+    assert_eq!(file("Img", "file").unwrap_or_default(), "", "a path outside the pack is cleared");
+    assert!(file("Ok", "file").unwrap().starts_with("__FERRO_PACK_ASSET__:"), "a pack file stays");
+    let slides = setting(&p, "Slides", "files").and_then(Value::as_array).unwrap();
+    assert_eq!(slides.len(), 1, "only pack files stay in a slideshow: {slides:?}");
+    assert_eq!(setting(&p, "Slides", "slide_time"), Some(&json!(5000)));
+    assert_eq!(setting(&p, "Clip", "is_local_file"), Some(&json!(true)));
+    assert_eq!(file("Clip", "local_file").unwrap_or_default(), "");
+    assert_eq!(setting(&p, "Clip", "input"), None);
+    assert_eq!(setting(&p, "Clip", "ffmpeg_options"), None);
+    assert_eq!(setting(&p, "Words", "text"), Some(&json!("hi")));
+    for k in ["from_file", "text_file", "file"] {
+        assert_eq!(setting(&p, "Words", k), None, "{k}");
+    }
+    let mask = &source(&p, "Masked").unwrap()["filters"];
+    assert_eq!(mask[0]["settings"]["image_path"], json!(""));
+}
+
+#[test]
+fn only_known_source_and_filter_kinds_come_in() {
+    let p = obs_pack(
+        vec![
+            json!({ "name": "Vlc", "id": "vlc_source", "settings": { "playlist": [ { "value": "/etc/passwd" } ] } }),
+            json!({ "name": "Web", "id": "ferrocast_web_text", "settings": { "url": "http://169.254.169.254/" } }),
+            json!({ "name": "Magic", "id": "thirdparty_magic_source", "settings": {} }),
+            json!({ "name": "Colour", "id": "color_source_v3", "settings": { "color": 4278190080u32, "width": 100, "height": 50, "evil": "x" },
+                "filters": [
+                    { "name": "v", "id": "ferrocast_vst", "settings": { "path": "/Library/Audio/Plug-Ins/VST3/x.vst3" } },
+                    { "name": "s", "id": "ferrocast_shader", "settings": { "shader_file": "/etc/passwd" } },
+                    { "name": "c", "id": "color_filter_v2", "settings": { "saturation": 0.5, "evil": { "a": 1 } } } ] }),
+        ],
+        vec![],
+    );
+    for gone in ["Vlc", "Web", "Magic"] {
+        assert!(source(&p, gone).is_none(), "{gone} is left out");
+    }
+    let main = source(&p, "Main").unwrap();
+    let items = main["settings"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "scene items for left-out sources go too: {items:?}");
+    let colour = source(&p, "Colour").unwrap();
+    assert_eq!(colour["settings"]["width"], json!(100));
+    assert_eq!(colour["settings"].get("evil"), None);
+    let filters = colour["filters"].as_array().unwrap();
+    assert_eq!(filters.len(), 1, "only the colour filter stays: {filters:?}");
+    assert_eq!(filters[0]["id"], "color_filter_v2");
+    assert_eq!(filters[0]["settings"]["saturation"], json!(0.5));
+    assert_eq!(filters[0]["settings"].get("evil"), None);
+    assert!(p.notes.iter().any(|n| n.contains("vlc_source")), "said in the notes: {:?}", p.notes);
+    assert!(p.missing_kinds.iter().any(|k| k == "thirdparty_magic_source"));
+}
+
+#[test]
+fn a_streamlabs_packs_filters_and_node_settings_are_checked_too() {
+    let png = make_tiny_png();
+    let mut cfg = streamlabs_sample_json(vec![]);
+    let items = cfg.pointer_mut("/data/scenes/data/items/0/slots/data/items").and_then(Value::as_array_mut).unwrap();
+    // The text node reads a file and has a helper-spawning filter; the image node a stray path.
+    for it in items.iter_mut() {
+        match it["id"].as_str() {
+            Some("it-title") => {
+                it["content"]["data"]["settings"]["text_file"] = json!("/etc/passwd");
+                it["content"]["data"]["settings"]["from_file"] = json!(true);
+                it["filters"] = json!([
+                    { "type": "ferrocast_vst", "name": "v", "settings": { "path": "/x.vst3" } },
+                    { "type": "color_filter_v2", "name": "c", "settings": { "saturation": 0.4 } }
+                ]);
+            }
+            Some("it-frame") => {
+                it["content"]["data"]["settings"] = json!({ "unload": true, "bogus": [1, 2] });
+            }
+            _ => {}
+        }
+    }
+    let text = serde_json::to_vec(&cfg).unwrap();
+    let zip = build_zip(vec![
+        ("config.json", &text, None),
+        ("assets/frame.png", &png, None),
+        ("assets/loop.webm", TINY_WEBM, None),
+        ("assets/stinger.webm", TINY_WEBM, None),
+    ]);
+    let p = parse_overlay_zip(&zip, "x.overlay").unwrap();
+    let all = serde_json::to_string(&p.doc_template).unwrap();
+    assert!(!all.contains("ferrocast_vst"), "no helper-spawning filter survives: {all}");
+    assert!(!all.contains("/etc/passwd") && !all.contains("text_file"), "no file read left: {all}");
+    let title = source(&p, "Header Text").unwrap();
+    assert_eq!(title["filters"].as_array().map(Vec::len), Some(1));
+    assert_eq!(title["filters"][0]["id"], "color_filter_v2");
+    assert_eq!(setting(&p, "Header Text", "text"), Some(&json!("LIVE NOW")));
+    assert_eq!(setting(&p, "Cam Border", "bogus"), None);
+    assert_eq!(setting(&p, "Cam Border", "unload"), Some(&json!(true)));
+}

@@ -10,6 +10,7 @@
 
 pub mod overlay;
 pub mod overlay_parse;
+mod overlay_safe;
 pub mod streamelements;
 pub mod streamlabs;
 mod text;
