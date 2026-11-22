@@ -352,6 +352,8 @@ impl Engine {
     pub(crate) async fn rig_set_streaming_locked(&self, rig: &Rig, on: bool) -> Result<(), EngineError> {
         match rig {
             Rig::Obs(c) if on => {
+                let _gate = self.studio().output_gate.lock().await;
+                self.ensure_no_benchmark_running()?;
                 ferrocast_obs::control::start_stream(c).await.map_err(obs_error)?;
                 self.on_stream_started();
                 Ok(())
@@ -363,7 +365,11 @@ impl Engine {
 
     pub(crate) async fn rig_start_record(&self, rig: &Rig) -> Result<(), EngineError> {
         match rig {
-            Rig::Obs(c) => ferrocast_obs::control::start_record(c).await.map_err(obs_error),
+            Rig::Obs(c) => {
+                let _gate = self.studio().output_gate.lock().await;
+                self.ensure_no_benchmark_running()?;
+                ferrocast_obs::control::start_record(c).await.map_err(obs_error)
+            }
             Rig::Studio => self.studio_record(true).await.map(drop),
         }
     }
@@ -379,7 +385,11 @@ impl Engine {
 
     pub(crate) async fn rig_start_replay(&self, rig: &Rig) -> Result<(), EngineError> {
         match rig {
-            Rig::Obs(c) => ferrocast_obs::control::start_replay_buffer(c).await.map_err(obs_error),
+            Rig::Obs(c) => {
+                let _gate = self.studio().output_gate.lock().await;
+                self.ensure_no_benchmark_running()?;
+                ferrocast_obs::control::start_replay_buffer(c).await.map_err(obs_error)
+            }
             Rig::Studio => self.studio_replay(true).await.map(drop),
         }
     }

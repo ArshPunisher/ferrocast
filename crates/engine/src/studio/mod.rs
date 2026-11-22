@@ -20,6 +20,7 @@ pub mod autoreplies;
 pub mod away;
 pub mod chatbot;
 pub mod clipboard;
+pub mod encoder_bench;
 pub(crate) mod game_scenes;
 pub(crate) mod live_watch;
 pub mod moments;
@@ -89,6 +90,10 @@ pub(crate) struct Studio {
     pub machine: Mutex<show::BroadcastMachine>,
     /// Serializes stream start/stop, delayed stop, and Studio stop so no click order races.
     pub output_lock: tokio::sync::Mutex<()>,
+    /// Mutual exclusion gate between starting any output and claiming a benchmark run (C2).
+    pub output_gate: tokio::sync::Mutex<()>,
+    /// Serializes `auto_config_benchmark` / `cancel` / `apply` / `undo` state transitions (C2/H7).
+    pub auto_config_op: tokio::sync::Mutex<()>,
     /// Monotonic origin for Show timers (`away`, `live_watch`) so wall-clock jumps never fire them.
     pub mono_origin: std::time::Instant,
     /// Last monotonic sample timestamp seen by `live_watch_tick` (for wake-jump detection).
@@ -133,6 +138,10 @@ pub(crate) struct Studio {
     pub clipboard: Mutex<Option<clipboard::Clip>>,
     /// The clips library's state: its folder override (tests) and the background jobs.
     pub clips: crate::clips::ClipsState,
+    /// Encoder stress benchmark and setting rollback state machine.
+    pub auto_config: Mutex<encoder_bench::AutoConfigSlot>,
+    /// Pre-apply encoder settings queued on startup after an unclean exit, applied when `StudioHost` attaches.
+    pub pending_startup_restore: Mutex<Option<encoder_bench::PendingApply>>,
 }
 
 impl Default for Studio {
@@ -151,6 +160,8 @@ impl Default for Studio {
             spike: Mutex::default(),
             machine: Mutex::default(),
             output_lock: tokio::sync::Mutex::new(()),
+            output_gate: tokio::sync::Mutex::new(()),
+            auto_config_op: tokio::sync::Mutex::new(()),
             mono_origin: std::time::Instant::now(),
             last_watch_mono: Mutex::default(),
             show_wake: Notify::new(),
@@ -172,6 +183,8 @@ impl Default for Studio {
             holds: Mutex::default(),
             clipboard: Mutex::default(),
             clips: crate::clips::ClipsState::default(),
+            auto_config: Mutex::default(),
+            pending_startup_restore: Mutex::default(),
         }
     }
 }

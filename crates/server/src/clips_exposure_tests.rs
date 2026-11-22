@@ -20,6 +20,7 @@ async fn rig() -> (Router, Arc<Sessions>, ferrocast_engine::Engine, tempfile::Te
         engine: engine.clone(),
         sessions: sessions.clone(),
         guard: auth::Guard { port: 47820, lan: true, dev_origins: vec![] },
+        api_limiter: crate::rate_limit::ApiKeyRateLimiter::default(),
     });
     (app, sessions, engine, data, clips)
 }

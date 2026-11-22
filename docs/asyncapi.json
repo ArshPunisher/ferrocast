@@ -1,0 +1,1936 @@
+{
+  "asyncapi": "3.0.0",
+  "channels": {
+    "live": {
+      "address": "/api/v1/live",
+      "bindings": {
+        "ws": {
+          "bindingVersion": "0.1.0",
+          "headers": {
+            "properties": {
+              "Authorization": {
+                "description": "`Bearer fc_key_...` (recommended).",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "method": "GET",
+          "query": {
+            "description": "Handshake query. Send `key` (an API key) or `session`; `since` resumes a dropped connection.",
+            "properties": {
+              "key": {
+                "description": "API key when header auth isn't available (prefer `Authorization: Bearer fc_key_...`). Only on a connection from this machine, unless the owner allowed API keys over LAN.",
+                "type": "string"
+              },
+              "session": {
+                "description": "Browser session token.",
+                "type": "string"
+              },
+              "since": {
+                "description": "Optional last processed `seq` for lossless reconnect replay.",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        }
+      },
+      "description": "Live multiplexed dashboard & API integration stream with sequence replay (`?since=seq`). API keys receive only frame types allowed by their scopes and never receive `account` frames.",
+      "messages": {
+        "account": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "account",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Ferrocast cloud account sign-in transition (PC session only, never sent to API keys).",
+          "x-ferrocast-scopes": "session only (blocked for API keys)"
+        },
+        "auto_config": {
+          "payload": {
+            "properties": {
+              "data": {
+                "$ref": "#/components/schemas/AutoConfigView"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "auto_config",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Encoder auto-config progress and result: the same `AutoConfigView` the `/studio/engine/auto-config` routes return. Sent on connect only while a run is not idle.",
+          "x-ferrocast-scopes": "PC session and the owner's remote only; never sent to API keys"
+        },
+        "brb": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "brb",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "OBS BRB scene state (`{ on, scene }`).",
+          "x-ferrocast-scopes": "read_only, studio_control, go_live"
+        },
+        "chat_highlight": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "chat_highlight",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Pinned or cleared featured chat message.",
+          "x-ferrocast-scopes": "read_only, chat"
+        },
+        "chatter": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "chatter",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Updated tracked chatter metadata.",
+          "x-ferrocast-scopes": "read_only, chat"
+        },
+        "counter": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "counter",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Updated bot counter (`{ name, value }`).",
+          "x-ferrocast-scopes": "read_only, chat, studio_control"
+        },
+        "event": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "object"
+                  },
+                  "platform": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "event",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Normalized stream event (follow, sub, gift_sub, tip, bits, raid, chat_message, etc.).",
+          "x-ferrocast-scopes": "read_only; chat (chat/mod kinds); alerts (stream events)"
+        },
+        "giveaway": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "giveaway",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Active giveaway state, entry count, or winner.",
+          "x-ferrocast-scopes": "read_only, chat"
+        },
+        "goals": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "array"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "goals",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Updated stream goals array.",
+          "x-ferrocast-scopes": "read_only, alerts"
+        },
+        "golive": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "golive",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Multistream output state and live bitrate telemetry.",
+          "x-ferrocast-scopes": "read_only, go_live, studio_control"
+        },
+        "held": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "held",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Message/event held by safety filters (`{ event_id, reason }`).",
+          "x-ferrocast-scopes": "read_only, chat"
+        },
+        "held_resolved": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "held_resolved",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Held event released or dropped (`{ event_id, outcome }`).",
+          "x-ferrocast-scopes": "read_only, chat"
+        },
+        "hello": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "seq": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "hello",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Initial handshake with highest sequence number (`{ seq }`).",
+          "x-ferrocast-scopes": "read_only, chat, alerts, studio_control, go_live"
+        },
+        "lane": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "lane",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Live Moments lane items.",
+          "x-ferrocast-scopes": "read_only, studio_control, go_live"
+        },
+        "live_alert": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "live_alert",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Live stream encoder/audio/network alert banner.",
+          "x-ferrocast-scopes": "read_only, studio_control, go_live"
+        },
+        "marker": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "marker",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "New stream marker created.",
+          "x-ferrocast-scopes": "read_only, studio_control, go_live"
+        },
+        "notice": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "key": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "level": {
+                    "type": "string"
+                  },
+                  "message": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "notice",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Engine status notice or panic warning (`account:*` notices suppressed for API keys).",
+          "x-ferrocast-scopes": "read_only, alerts, studio_control, go_live (chat sees panic only)"
+        },
+        "obs_health": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "obs_health",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "OBS FPS/dropped-frames health snapshot.",
+          "x-ferrocast-scopes": "read_only, studio_control, go_live"
+        },
+        "panic": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "panic",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Panic lockdown toggled (`{ on, plan }`).",
+          "x-ferrocast-scopes": "read_only, chat"
+        },
+        "poll": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "poll",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Active poll progress or end state.",
+          "x-ferrocast-scopes": "read_only, chat"
+        },
+        "queue": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "queue",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Alert queue snapshot (active/paused/muted/pending count).",
+          "x-ferrocast-scopes": "read_only, alerts"
+        },
+        "resync": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "missed": {
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "resync",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Ring buffer gap notice (`{ missed }`); clients should re-fetch state over REST.",
+          "x-ferrocast-scopes": "read_only, chat, alerts, studio_control, go_live"
+        },
+        "show": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "show",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Show countdown and live rundown state (`{ show }`).",
+          "x-ferrocast-scopes": "read_only, studio_control, go_live"
+        },
+        "smart_mod": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "smart_mod",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Smart Moderation triage card.",
+          "x-ferrocast-scopes": "read_only, chat"
+        },
+        "snapshot": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "snapshot",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Overlay reconnect full state snapshot.",
+          "x-ferrocast-scopes": "overlay channel only"
+        },
+        "status": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "connectors": {
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "status",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Connector and OBS health snapshots.",
+          "x-ferrocast-scopes": "read_only, chat, alerts, studio_control, go_live"
+        },
+        "tts_pending": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "array"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "tts_pending",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "TTS queue items awaiting approval.",
+          "x-ferrocast-scopes": "read_only, chat, alerts"
+        },
+        "update": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "update",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Application update check/download state.",
+          "x-ferrocast-scopes": "read_only, studio_control"
+        }
+      }
+    },
+    "overlay": {
+      "address": "/o/{token}/ws",
+      "description": "Overlay browser-source WebSocket carrying widget snapshots, alerts, music visualizer frames, and display acks.",
+      "messages": {
+        "alert": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "alert",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Show alert visual & sound frame."
+        },
+        "alert_hide": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "alert_hide",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Dismiss active alert frame (`{ alert_id }`)."
+        },
+        "clear_chat": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "clear_chat",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Clear overlay chatbox history."
+        },
+        "config": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "config",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Updated overlay config."
+        },
+        "delete_message": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "delete_message",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Remove moderated chat message from overlay chatbox."
+        },
+        "delete_user": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "delete_user",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Remove all messages from a timed-out/banned user."
+        },
+        "event": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "event",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Public chat/event card frame."
+        },
+        "inbound_ack": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "alert_id": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "enum": [
+                      "started",
+                      "finished",
+                      "failed"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "alert_id",
+                  "phase"
+                ],
+                "type": "object"
+              },
+              "type": {
+                "const": "ack",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Client -> server alert playback acknowledgment: `{ type: 'ack', data: { alert_id, phase } }`."
+        },
+        "inbound_hello": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "since_seq": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                },
+                "type": "object"
+              },
+              "type": {
+                "const": "hello",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Client -> server on connect: where to resume from (`{ since_seq }`)."
+        },
+        "inbound_visibility": {
+          "payload": {
+            "properties": {
+              "data": {
+                "properties": {
+                  "visible": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "visible"
+                ],
+                "type": "object"
+              },
+              "type": {
+                "const": "visibility",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Client -> server browser source visibility telemetry: `{ type: 'visibility', data: { visible } }`."
+        },
+        "music": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "music",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Visualizer spectrum levels & track info."
+        },
+        "revoked": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "revoked",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Overlay token was rotated or deleted; client should stop reconnecting."
+        },
+        "snapshot": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "snapshot",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Initial full overlay config + widget state on connect."
+        },
+        "state": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "state",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Updated widget/goal/poll/giveaway/credits state."
+        },
+        "tts": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "tts",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Play synthesized TTS audio in overlay."
+        }
+      },
+      "parameters": {
+        "token": {
+          "description": "Opaque overlay URL token."
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AutoConfigAppliedSummary": {
+        "properties": {
+          "encoder": {
+            "type": "string"
+          },
+          "encoder_settings": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "scale": {
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "video_encoder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "video_kbps": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "encoder",
+          "video_encoder",
+          "encoder_settings",
+          "scale",
+          "fps",
+          "video_kbps",
+          "label"
+        ],
+        "type": "object"
+      },
+      "AutoConfigCandidate": {
+        "description": "One encoder setting that was tested, with its verdict in plain words.",
+        "properties": {
+          "bitrate_kbps": {
+            "type": "integer"
+          },
+          "budget_ms": {
+            "type": "number"
+          },
+          "cpu_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "elapsed_ms": {
+            "type": "integer"
+          },
+          "encode_ms_avg": {
+            "type": "number"
+          },
+          "encode_ms_max": {
+            "type": "number"
+          },
+          "encode_ms_p95": {
+            "type": "number"
+          },
+          "encoder_backend": {
+            "type": "string"
+          },
+          "family": {
+            "enum": [
+              "video_toolbox",
+              "nvenc",
+              "qsv",
+              "amf",
+              "media_foundation",
+              "x264"
+            ],
+            "type": "string"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "fps_achieved": {
+            "type": "number"
+          },
+          "frames_tested": {
+            "type": "integer"
+          },
+          "gpu_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "hardware": {
+            "type": "boolean"
+          },
+          "headroom_pct": {
+            "type": "number"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "lagged_frames": {
+            "type": "integer"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "preset": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "skipped_frames": {
+            "type": "integer"
+          },
+          "studio_encoder_id": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "label",
+          "family",
+          "hardware",
+          "width",
+          "height",
+          "fps",
+          "bitrate_kbps",
+          "passed",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "AutoConfigRecommendation": {
+        "description": "The benchmark's pick.",
+        "properties": {
+          "encoder": {
+            "type": "string"
+          },
+          "encoder_settings": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "headroom_pct": {
+            "type": "number"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "label": {
+            "type": "string"
+          },
+          "limited_by": {
+            "enum": [
+              "headroom",
+              "upload",
+              "platform_cap",
+              "balanced"
+            ],
+            "type": "string"
+          },
+          "preset": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scale": {
+            "items": {
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "studio_encoder_id": {
+            "type": "string"
+          },
+          "video_encoder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "video_kbps": {
+            "type": "integer"
+          },
+          "why": {
+            "type": "string"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "encoder",
+          "video_encoder",
+          "encoder_settings",
+          "label",
+          "fps",
+          "video_kbps",
+          "limited_by",
+          "why"
+        ],
+        "type": "object"
+      },
+      "AutoConfigUploadCheck": {
+        "description": "The upload speed check that went before the benchmark.",
+        "properties": {
+          "at": {
+            "description": "Unix milliseconds.",
+            "type": "integer"
+          },
+          "measured_by": {
+            "description": "`twitch` (bandwidth-test mode) or `estimate`.",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "properties": {
+                "delay_ms": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "need_kbps": {
+                  "type": "integer"
+                },
+                "problem": {
+                  "description": "Present only when the platform could not be checked.",
+                  "type": "string"
+                },
+                "server": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "id",
+                "name",
+                "need_kbps"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "verdict": {
+            "properties": {
+              "fit_count": {
+                "type": "integer"
+              },
+              "fits": {
+                "type": "boolean"
+              },
+              "message": {
+                "type": "string"
+              },
+              "need_kbps": {
+                "type": "integer"
+              },
+              "upload_kbps": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "upload_kbps",
+              "need_kbps",
+              "fits",
+              "fit_count",
+              "message"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "at",
+          "measured_by",
+          "rows",
+          "verdict"
+        ],
+        "type": "object"
+      },
+      "AutoConfigView": {
+        "description": "The auto-config state machine, as the REST routes answer and as the `auto_config` live frame carries.",
+        "properties": {
+          "applied": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AutoConfigAppliedSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "candidates": {
+            "items": {
+              "$ref": "#/components/schemas/AutoConfigCandidate"
+            },
+            "type": "array"
+          },
+          "confirm_remaining_s": {
+            "description": "Seconds left to keep the applied settings before they roll back.",
+            "type": "integer"
+          },
+          "confirmed": {
+            "type": "boolean"
+          },
+          "current_label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "elapsed_ms": {
+            "type": "integer"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "estimated_total_ms": {
+            "type": "integer"
+          },
+          "first_minute_drops": {
+            "type": "integer"
+          },
+          "first_minute_lags": {
+            "type": "integer"
+          },
+          "job_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "enum": [
+              "stream",
+              "record"
+            ],
+            "type": "string"
+          },
+          "phase": {
+            "enum": [
+              "upload",
+              "discovering",
+              "encoding",
+              "picking",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "picked": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AutoConfigRecommendation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "progress_pct": {
+            "maximum": 100,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "restored": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AutoConfigAppliedSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rollback_offered": {
+            "type": "boolean"
+          },
+          "rollback_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rollback_trigger": {
+            "enum": [
+              "user_undo",
+              "timeout",
+              "dropped_frames",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "enum": [
+              "idle",
+              "running",
+              "failed",
+              "done",
+              "applied",
+              "rolled_back"
+            ],
+            "type": "string"
+          },
+          "upload_check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AutoConfigUploadCheck"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "upload_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "watch_remaining_s": {
+            "description": "Seconds left of the first-minute dropped-frame watch.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "state",
+          "job_id",
+          "mode",
+          "phase",
+          "progress_pct",
+          "current_label",
+          "elapsed_ms",
+          "estimated_total_ms",
+          "candidates",
+          "upload_check",
+          "upload_error",
+          "picked",
+          "duration_ms",
+          "error",
+          "applied",
+          "confirmed",
+          "confirm_remaining_s",
+          "watch_remaining_s",
+          "first_minute_drops",
+          "first_minute_lags",
+          "rollback_offered",
+          "rollback_trigger",
+          "rollback_reason",
+          "restored"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Clients authenticate on `/api/v1/live` using `Authorization: Bearer fc_key_...` (recommended), `?key=...`, or `?session=...`. Reconnecting with `?since=<seq>` replays buffered frames in order. Overlay browser sources connect to `/o/{token}/ws`.",
+    "summary": "Real-time event, queue, status, studio telemetry, and browser-source overlay streams.",
+    "title": "Ferrocast Live & Overlay WebSocket API",
+    "version": "3.4.0"
+  },
+  "operations": {
+    "receiveLiveFrames": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/live"
+      },
+      "summary": "Subscribe to real-time filtered stream events and state updates over `/api/v1/live`."
+    },
+    "receiveOverlayFrames": {
+      "action": "receive",
+      "channel": {
+        "$ref": "#/channels/overlay"
+      },
+      "summary": "Receive overlay alert and widget render frames on `/o/{token}/ws`."
+    },
+    "sendOverlayAck": {
+      "action": "send",
+      "channel": {
+        "$ref": "#/channels/overlay"
+      },
+      "summary": "Report alert start/finish acknowledgement from overlay page."
+    }
+  },
+  "servers": {
+    "local": {
+      "description": "Ferrocast local WebSocket server (loopback default)",
+      "host": "127.0.0.1:47820",
+      "protocol": "ws"
+    }
+  }
+}
+

@@ -83,10 +83,12 @@ pub const OWNER_DENIED: &[Rule] = &[
     // there or start and stop it.
     ("*", "/studio/engine"),
     ("*", "/studio/engine/**"),
-    // Accounts and sign-ins, and pairing more browsers.
+    // Accounts and sign-ins, and pairing more browsers or managing local API keys.
     ("*", "/accounts"),
     ("*", "/accounts/**"),
     ("*", "/session/**"),
+    ("*", "/api-keys"),
+    ("*", "/api-keys/**"),
     // Pro and billing (including pairing more phones and the cloud backups' key).
     ("*", "/pro"),
     ("*", "/pro/**"),

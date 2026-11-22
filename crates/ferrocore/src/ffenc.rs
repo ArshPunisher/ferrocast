@@ -95,15 +95,25 @@ pub fn path() -> Option<PathBuf> {
     ffmpeg()
 }
 
-/// The H.264 encoders tried, best first, on this system.
-fn candidates() -> &'static [&'static str] {
-    if cfg!(windows) {
+/// Platform-ordered H.264 FFmpeg candidates, hardware first then `libx264` (C4 single source of truth).
+pub fn candidates_for_platform(is_windows: bool, is_macos: bool) -> &'static [&'static str] {
+    if is_windows {
         &["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"]
-    } else if cfg!(target_os = "macos") {
+    } else if is_macos {
         &["h264_videotoolbox", "libx264"]
     } else {
-        &["h264_nvenc", "libx264"]
+        &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]
     }
+}
+
+/// The H.264 encoders tried, best first, on this system.
+fn candidates() -> &'static [&'static str] {
+    candidates_for_platform(cfg!(windows), cfg!(target_os = "macos"))
+}
+
+/// Picks the first encoder in `list` that passes `probe` (shared selection logic for live and bench).
+pub fn select_h264_from<'a>(list: &[&'a str], mut probe: impl FnMut(&str) -> bool) -> Option<&'a str> {
+    list.iter().copied().find(|&e| probe(e))
 }
 
 /// What an encoder needs to be the one we mean: Media Foundation's only as a GPU's (its software
@@ -115,7 +125,41 @@ fn must_have(enc: &str) -> &'static [&'static str] {
     }
 }
 
-/// The first H.264 encoder that encodes a few frames here (asked once).
+fn probe_with(ff: &Path, e: &str) -> bool {
+    hidden(Command::new(ff))
+        .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=256x144:r=30"])
+        .args(["-frames:v", "3", "-c:v", e])
+        .args(must_have(e))
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Lists every H.264 encoder FFmpeg can open here (hardware first, then `libx264`).
+pub fn probe_encoders() -> Vec<String> {
+    probe_encoders_cancellable(None)
+}
+
+/// Lists available H.264 FFmpeg encoders while checking an optional cancellation flag between probes.
+pub fn probe_encoders_cancellable(cancel: Option<&AtomicBool>) -> Vec<String> {
+    let Some(ff) = ffmpeg() else { return Vec::new() };
+    let mut found = Vec::new();
+    for &enc in candidates() {
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            break;
+        }
+        if probe_with(&ff, enc) {
+            found.push(enc.to_string());
+        }
+    }
+    found
+}
+
+/// The first H.264 encoder that encodes a few frames here (asked once), using the same
+/// platform candidate list as `candidates()`.
 pub fn h264_encoder() -> Option<String> {
     // `FERROCAST_AV_FFMPEG_ENCODER=libx264` picks one (to test it, or to work round a driver).
     if let Ok(e) = std::env::var("FERROCAST_AV_FFMPEG_ENCODER")
@@ -126,31 +170,37 @@ pub fn h264_encoder() -> Option<String> {
     ENCODER
         .get_or_init(|| {
             let ff = ffmpeg()?;
-            candidates()
-                .iter()
-                .find(|e| {
-                    hidden(Command::new(&ff))
-                        .args([
-                            "-hide_banner",
-                            "-loglevel",
-                            "error",
-                            "-f",
-                            "lavfi",
-                            "-i",
-                            "color=c=black:s=256x144:r=30",
-                        ])
-                        .args(["-frames:v", "3", "-c:v", e])
-                        .args(must_have(e))
-                        .args(["-f", "null", "-"])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success())
-                })
-                .map(|e| (*e).to_string())
+            select_h264_from(candidates(), |e| probe_with(&ff, e)).map(String::from)
         })
         .clone()
+}
+
+/// Returns the live FFmpeg hardware H.264 encoder that `VideoEncoder::new` will actually open
+/// off-macOS (`None` on macOS where native VideoToolbox is used, or when only `libx264` works)
+/// and whether `libx264` software encoding works through FFmpeg (C4).
+pub fn discover_live_h264_and_x264(cancel: Option<&AtomicBool>) -> (Option<String>, bool) {
+    if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return (None, false);
+    }
+    if cfg!(target_os = "macos") {
+        let has_x264 =
+            !cancel.is_some_and(|c| c.load(Ordering::Acquire)) && ffmpeg().is_some_and(|ff| probe_with(&ff, "libx264"));
+        return (None, has_x264);
+    }
+    let active = h264_encoder();
+    if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+        return (None, false);
+    }
+    let live_hw = active.as_deref().filter(|&e| e != "libx264").map(String::from);
+    let has_x264 = if active.as_deref() == Some("libx264") {
+        true
+    } else if active.is_none() {
+        // `h264_encoder()` already probed `libx264` at the tail of `candidates()`.
+        false
+    } else {
+        !cancel.is_some_and(|c| c.load(Ordering::Acquire)) && ffmpeg().is_some_and(|ff| probe_with(&ff, "libx264"))
+    };
+    (live_hw, has_x264)
 }
 
 /// One FLV tag: kind (8 audio, 9 video), time in ms, body.
@@ -179,15 +229,26 @@ struct Proc {
 impl Proc {
     /// `chunk`: about how many bytes each write is, to size the queue.
     fn spawn(args: &[String], chunk: usize) -> Result<Self, AvError> {
+        let cap = (QUEUED_BYTES / chunk.max(1)).clamp(2, 64);
+        Self::spawn_bounded(args, cap)
+    }
+
+    fn spawn_bounded(args: &[String], queue_cap: usize) -> Result<Self, AvError> {
         let ff =
             ffmpeg().ok_or_else(|| AvError::Encoder("FFmpeg isn't here, so this system can't encode yet".into()))?;
         let mut cmd = Command::new(ff);
         cmd.args(["-hide_banner", "-loglevel", "error"]).args(args);
-        Self::start(cmd, chunk)
+        Self::start_with_cap(cmd, queue_cap.clamp(1, 64))
     }
 
     /// Starts `cmd` as FFmpeg is started: raw frames in, FLV tags out.
+    #[cfg(all(test, unix))]
     fn start(cmd: Command, chunk: usize) -> Result<Self, AvError> {
+        let cap = (QUEUED_BYTES / chunk.max(1)).clamp(2, 64);
+        Self::start_with_cap(cmd, cap)
+    }
+
+    fn start_with_cap(cmd: Command, queue_cap: usize) -> Result<Self, AvError> {
         let mut child = hidden(cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -196,7 +257,7 @@ impl Proc {
             .map_err(|e| AvError::Encoder(format!("FFmpeg didn't start ({e})")))?;
         tracing::info!(pid = child.id(), "FFmpeg started");
         let mut pipe = child.stdin.take().ok_or_else(|| AvError::Encoder("FFmpeg took no input".into()))?;
-        let (stdin, queued) = sync_channel::<Vec<u8>>((QUEUED_BYTES / chunk.max(1)).clamp(2, 64));
+        let (stdin, queued) = sync_channel::<Vec<u8>>(queue_cap);
         let broken = Arc::new(AtomicBool::new(false));
         let writer = {
             let broken = broken.clone();
@@ -256,6 +317,33 @@ impl Proc {
             return Err(self.died());
         }
         Ok(())
+    }
+
+    /// Bounded blocking write that aborts immediately and kills FFmpeg when `cancel` is signalled.
+    fn write_cancellable(&mut self, mut bytes: Vec<u8>, cancel: Option<&AtomicBool>) -> Result<(), AvError> {
+        let Some(flag) = cancel else {
+            return self.write(bytes);
+        };
+        loop {
+            if flag.load(Ordering::Acquire) {
+                self.stdin = None;
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err(AvError::Encoder("FFmpeg cancelled".into()));
+            }
+            let w = self.stdin.as_ref().ok_or_else(|| AvError::Encoder("the encoder was already finished".into()))?;
+            if self.broken.load(Ordering::Acquire) {
+                return Err(self.died());
+            }
+            match w.try_send(bytes) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(b)) => {
+                    bytes = b;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(TrySendError::Disconnected(_)) => return Err(self.died()),
+            }
+        }
     }
 
     /// As [`Self::write`], but never waits: false when FFmpeg is a whole queue behind (the frame
@@ -471,6 +559,12 @@ pub(crate) struct Video {
     /// Frames left out because the encoder was behind (OBS's "skipped frames due to encoding
     /// lag").
     pub(crate) skipped: u64,
+    /// When set, writes block on a tiny pipe queue so benchmarks measure true encoder throughput.
+    blocking: bool,
+    /// When false (stress benchmarks), skipped frames stay local and never increment `DROPPED`.
+    pub(crate) record_global_drops: bool,
+    /// Optional cancellation signal for blocking benchmark writes (C3).
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for Video {
@@ -481,6 +575,14 @@ impl std::fmt::Debug for Video {
 
 impl Video {
     pub(crate) fn new(cfg: &VideoConfig) -> Result<Self, AvError> {
+        Self::new_inner(cfg, true)
+    }
+
+    pub(crate) fn new_benchmark(cfg: &VideoConfig) -> Result<Self, AvError> {
+        Self::new_inner(cfg, false)
+    }
+
+    fn new_inner(cfg: &VideoConfig, record_global_drops: bool) -> Result<Self, AvError> {
         if cfg.codec != VideoCodec::H264 {
             return Err(AvError::Encoder("HEVC through FFmpeg isn't done yet: H.264 is".into()));
         }
@@ -489,10 +591,32 @@ impl Video {
         } else {
             h264_encoder().ok_or_else(|| AvError::Encoder("no H.264 encoder works here through FFmpeg".into()))?
         };
-        Ok(Self::with_proc(Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?, cfg, enc))
+        let mut video = Self::with_proc(Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?, cfg, enc, false);
+        video.record_global_drops = record_global_drops;
+        Ok(video)
     }
 
-    fn with_proc(proc: Proc, cfg: &VideoConfig, name: String) -> Self {
+    pub(crate) fn new_named(
+        cfg: &VideoConfig,
+        encoder: &str,
+        blocking_cap: Option<usize>,
+        cancel: Option<Arc<AtomicBool>>,
+        record_global_drops: bool,
+    ) -> Result<Self, AvError> {
+        if cfg.codec != VideoCodec::H264 {
+            return Err(AvError::Encoder("HEVC through FFmpeg isn't done yet: H.264 is".into()));
+        }
+        let proc = match blocking_cap {
+            Some(cap) => Proc::spawn_bounded(&args(cfg, encoder), cap)?,
+            None => Proc::spawn(&args(cfg, encoder), frame_bytes(cfg))?,
+        };
+        let mut video = Self::with_proc(proc, cfg, encoder.to_string(), blocking_cap.is_some());
+        video.record_global_drops = record_global_drops;
+        video.cancel = cancel;
+        Ok(video)
+    }
+
+    fn with_proc(proc: Proc, cfg: &VideoConfig, name: String, blocking: bool) -> Self {
         Self {
             proc,
             times: VecDeque::new(),
@@ -510,6 +634,9 @@ impl Video {
             emitted_upto: None,
             made_upto: None,
             skipped: 0,
+            blocking,
+            record_global_drops: true,
+            cancel: None,
         }
     }
 
@@ -861,11 +988,16 @@ impl Video {
         }
         // Each packet gets its time from `times` in order, so a frame left out is just missing:
         // nothing after it moves.
-        if self.proc.try_write(raw)? {
+        if self.blocking {
+            self.proc.write_cancellable(raw, self.cancel.as_deref())?;
+            self.times.push_back(pts_us);
+        } else if self.proc.try_write(raw)? {
             self.times.push_back(pts_us);
         } else {
             self.skipped += 1;
-            crate::video::note_dropped(1);
+            if self.record_global_drops {
+                crate::video::note_dropped(1);
+            }
             if self.skipped.is_power_of_two() {
                 tracing::warn!(encoder = %self.name, skipped = self.skipped, "the encoder is behind: frames left out");
             }
@@ -1246,7 +1378,7 @@ sleep $slow"#;
     fn fake_video(old: Proc) -> Video {
         let mut c = cfg(RateControl::Cbr);
         (c.width, c.height) = (2, 2);
-        Video::with_proc(old, &c, "fake".into())
+        Video::with_proc(old, &c, "fake".into(), false)
     }
 
     /// Frame `i` (its number is its first byte) at time `i`.
@@ -1368,12 +1500,14 @@ sleep $slow"#;
     #[cfg(unix)]
     #[test]
     fn frames_left_out_are_counted() {
+        let _serial = crate::video::DROPPED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut stuck = Command::new("sh");
         stuck.args(["-c", "exec sleep 30"]);
         let big = 256 * 256 * 3 / 2;
         let mut c = cfg(RateControl::Cbr);
         (c.width, c.height) = (256, 256);
-        let mut v = Video::with_proc(Proc::start(stuck, big).unwrap_or_else(|e| panic!("{e}")), &c, "fake".into());
+        let mut v =
+            Video::with_proc(Proc::start(stuck, big).unwrap_or_else(|e| panic!("{e}")), &c, "fake".into(), false);
         let before = crate::video::dropped_frames();
         for i in 0..200u8 {
             let _ = v.encode_raw(vec![i; big], i64::from(i));
@@ -1420,5 +1554,69 @@ sleep $slow"#;
         let got = drain_stderr(std::io::Cursor::new(big.as_bytes()));
         assert_eq!(got.chars().count(), 400);
         assert!(got.ends_with("FINAL_ERROR_TAIL"), "got tail: {got}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_write_unblocks_and_kills_stalled_encoder_on_cancel() {
+        let mut stuck = Command::new("sh");
+        stuck.args(["-c", "exec sleep 30"]);
+        let proc = Proc::start_with_cap(stuck, 1).unwrap_or_else(|e| panic!("{e}"));
+        let mut c = cfg(RateControl::Cbr);
+        (c.width, c.height) = (128, 128);
+        let big = 128 * 128 * 3 / 2;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut v = Video::with_proc(proc, &c, "fake".into(), true);
+        v.cancel = Some(cancel.clone());
+
+        let cancel_bg = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            cancel_bg.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let mut cancelled_err = false;
+        for i in 0..20 {
+            if let Err(e) = v.encode_raw(vec![0u8; big], i) {
+                assert!(e.to_string().contains("cancelled"), "unexpected error: {e}");
+                cancelled_err = true;
+                break;
+            }
+        }
+        assert!(cancelled_err, "blocking write should abort once cancel fires");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "blocked past cancel: {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn candidates_for_platform_and_live_selection_share_same_order_on_all_oses() {
+        let linux = candidates_for_platform(false, false);
+        assert_eq!(linux, &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]);
+        assert_eq!(select_h264_from(linux, |e| e == "h264_qsv"), Some("h264_qsv"));
+        assert_eq!(select_h264_from(linux, |e| e == "h264_amf"), Some("h264_amf"));
+        let windows = candidates_for_platform(true, false);
+        assert_eq!(windows, &["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"]);
+        let macos = candidates_for_platform(false, true);
+        assert_eq!(macos, &["h264_videotoolbox", "libx264"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn h1_benchmark_skips_stay_local_without_polluting_global_dropped_frames() {
+        let _serial = crate::video::DROPPED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stuck = Command::new("sh");
+        stuck.args(["-c", "exec sleep 30"]);
+        let big = 256 * 256 * 3 / 2;
+        let mut c = cfg(RateControl::Cbr);
+        (c.width, c.height) = (256, 256);
+        let mut v =
+            Video::with_proc(Proc::start(stuck, big).unwrap_or_else(|e| panic!("{e}")), &c, "fake".into(), false);
+        v.record_global_drops = false;
+        let before = crate::video::dropped_frames();
+        for i in 0..200u8 {
+            let _ = v.encode_raw(vec![i; big], i64::from(i));
+        }
+        let after = crate::video::dropped_frames();
+        assert!(v.skipped >= 100, "{} left out locally", v.skipped);
+        assert_eq!(after.saturating_sub(before), 0, "benchmark skips must not pollute global live dropped_frames()");
     }
 }

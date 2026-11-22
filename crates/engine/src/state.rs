@@ -35,6 +35,8 @@ pub struct EngineSettings {
     pub low_motion_overlays: bool,
     /// Let phones and tablets on this network open the dashboard (applies on next start).
     pub lan_access: bool,
+    /// Let local API keys work from other devices on the network (off: this PC only).
+    pub api_keys_over_lan: bool,
     /// Never install an update while any platform is live (R-60).
     pub never_update_while_live: bool,
     pub launch_at_login: bool,
@@ -60,6 +62,7 @@ impl Default for EngineSettings {
             reduced_motion: "system".into(),
             low_motion_overlays: false,
             lan_access: false,
+            api_keys_over_lan: false,
             never_update_while_live: true,
             launch_at_login: false,
             close_to_tray: true,

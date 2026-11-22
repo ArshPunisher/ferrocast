@@ -1925,21 +1925,20 @@ mod tests {
             &ffmpeg().unwrap_or_else(|e| panic!("{e}")),
             &["-i".into(), dir.join("missing.mp4").display().to_string()]
         ));
-        let poll = |ms: u64| {
-            let end = Instant::now() + Duration::from_millis(ms);
-            let (mut got_pic, mut got_snd) = (false, false);
-            while Instant::now() < end {
-                if m.frame_at(0).is_some() {
-                    got_pic = true;
-                }
-                if !m.take_sound().is_empty() {
-                    got_snd = true;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            (got_pic, got_snd)
-        };
-        let (got_pic, got_snd) = poll(750);
+        // Waits for what it expects (pictures, sound, a third of a second played) rather than for a
+        // time to pass: a loaded machine takes longer to start, and a fixed 750 ms failed there.
+        let (mut got_pic, mut got_snd) = (false, false);
+        let started = Instant::now();
+        while !(got_pic && got_snd && m.state().1 > 300_000_000) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "pictures {got_pic}, sound {got_snd}, at {:?}",
+                m.state()
+            );
+            got_pic |= m.frame_at(0).is_some();
+            got_snd |= !m.take_sound().is_empty();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(got_pic, "pictures come");
         assert!(got_snd, "sound comes");
         m.control(Control::Pause);
@@ -1950,7 +1949,8 @@ mod tests {
         assert_eq!(m.state().1, 1_500_000_000);
         m.control(Control::Play);
         // Played as the engine plays it: pictures and sound taken as they come.
-        let until = Instant::now() + Duration::from_millis(2000);
+        // Half a second of file is left: it ends when it ends, however long a loaded machine takes.
+        let until = Instant::now() + Duration::from_secs(60);
         while Instant::now() < until && !m.ended() {
             let _ = m.frame_at(0);
             let _ = m.take_sound();
@@ -1963,7 +1963,7 @@ mod tests {
         let card = Media::open_for_card(&file, true).unwrap_or_else(|e| panic!("{e}"));
         let mut p = None;
         let mut sound = Vec::new();
-        let until = Instant::now() + Duration::from_millis(1000);
+        let until = Instant::now() + Duration::from_secs(60);
         while Instant::now() < until && (p.is_none() || sound.len() < 4) {
             if let Some(f) = card.frame_nv12() {
                 p = Some(f);

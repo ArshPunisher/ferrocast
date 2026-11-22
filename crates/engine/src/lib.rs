@@ -9,6 +9,7 @@
 
 mod accounts;
 mod actions;
+pub mod api_keys;
 mod backups;
 pub mod clips;
 mod cloud_backup;
@@ -421,6 +422,7 @@ impl Engine {
         tokio::spawn(cloud_sync::run(engine.clone()));
         engine.refresh_active_design().await;
         engine.resume_accounts().await;
+        engine.recover_pending_auto_config_on_startup();
         Ok(engine)
     }
 
@@ -508,6 +510,7 @@ impl Engine {
     /// Flushes persistent engine state (SQLite WAL) cleanly during application quit, before
     /// deleting clean-exit markers.
     pub fn shutdown(&self) {
+        self.restore_pending_auto_config_on_shutdown();
         if let Err(err) = self.inner.store.checkpoint() {
             tracing::warn!(%err, "SQLite WAL checkpoint failed during engine shutdown");
         }

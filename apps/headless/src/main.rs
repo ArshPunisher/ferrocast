@@ -27,6 +27,15 @@ async fn main() {
                 None => fail("--port needs a number"),
             },
             "--lan" => opts.lan = true,
+            "--export-specs" => {
+                let Some(out_dir) = args.next().map(PathBuf::from) else {
+                    fail("--export-specs needs a directory path");
+                };
+                if let Err(e) = export_specs(&out_dir) {
+                    fail(&format!("couldn't write specs: {e}"));
+                }
+                return;
+            }
             "-h" | "--help" => {
                 println!("{}", usage());
                 return;
@@ -64,4 +73,13 @@ async fn main() {
 fn fail(msg: &str) -> ! {
     eprintln!("ferrocast-headless: {msg}\n\n{}", usage());
     std::process::exit(2);
+}
+
+fn export_specs(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let oa = ferrocast_server::spec::openapi_pretty().map_err(std::io::Error::other)?;
+    std::fs::write(dir.join("openapi.json"), oa)?;
+    let aa = ferrocast_server::spec::asyncapi_pretty().map_err(std::io::Error::other)?;
+    std::fs::write(dir.join("asyncapi.json"), aa)?;
+    Ok(())
 }

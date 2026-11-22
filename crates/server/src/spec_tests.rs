@@ -1,0 +1,403 @@
+//! Spec-vs-router drift tests ensuring OpenAPI 3.1.0 and AsyncAPI 3.0.0 stay in 1:1 lockstep
+//! with the live Axum router and engine frames.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use axum::body::Body as AxumBody;
+use axum::http::{Method, Request, StatusCode};
+use serde_json::Value;
+use tower::ServiceExt;
+
+use super::*;
+
+fn server_src_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+fn engine_src_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("engine/src")
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_dir() {
+            collect_rs_files(&p, out);
+        } else if p.extension().is_some_and(|e| e == "rs") {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.contains("tests") {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Parses every `.route("/path", methods)` call in `crates/server/src` (excluding non-REST UI/WS
+/// files & routes) into normalized `("METHOD", "/api/v1/...")` pairs.
+fn extract_router_rest_operations() -> BTreeSet<(String, String)> {
+    let mut files = Vec::new();
+    collect_rs_files(&server_src_dir(), &mut files);
+
+    let mut ops = BTreeSet::new();
+    for file in files {
+        let rel = file.strip_prefix(server_src_dir()).unwrap().to_string_lossy().replace('\\', "/");
+        if rel == "assets.rs" || rel == "ws.rs" || rel == "spec.rs" {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        let bytes = text.as_bytes();
+        let mut idx = 0;
+        while let Some(pos) = text[idx..].find(".route(") {
+            let start = idx + pos + 6;
+            let mut depth = 0usize;
+            let mut end = start;
+            let mut in_str = false;
+            let mut esc = false;
+            while end < bytes.len() {
+                let c = bytes[end];
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else if c == b'"' {
+                    in_str = true;
+                } else if c == b'(' {
+                    depth += 1;
+                } else if c == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                end += 1;
+            }
+            let call = &text[start + 1..end];
+            idx = end + 1;
+
+            let Some(q1) = call.find('"') else { continue };
+            let Some(q2_rel) = call[q1 + 1..].find('"') else { continue };
+            let route_path = &call[q1 + 1..q1 + 1 + q2_rel];
+            if route_path == "/live" || route_path == "/o/{token}/ws" {
+                continue;
+            }
+            let rest = &call[q1 + 1 + q2_rel + 1..];
+            for (needle, method) in
+                [("get(", "GET"), ("post(", "POST"), ("put(", "PUT"), ("delete(", "DELETE"), ("patch(", "PATCH")]
+            {
+                if rest.contains(needle) {
+                    ops.insert((method.to_string(), format!("/api/v1{route_path}")));
+                }
+            }
+        }
+    }
+    ops
+}
+
+fn extract_spec_rest_operations(spec: &Value) -> BTreeSet<(String, String)> {
+    let mut ops = BTreeSet::new();
+    let paths = spec["paths"].as_object().expect("openapi.paths object");
+    for (path, item) in paths {
+        for (method, _) in item.as_object().expect("path item object") {
+            let m = method.to_uppercase();
+            if matches!(m.as_str(), "GET" | "POST" | "PUT" | "DELETE" | "PATCH") {
+                ops.insert((m, path.clone()));
+            }
+        }
+    }
+    ops
+}
+
+#[test]
+fn openapi_3_1_matches_every_registered_router_route_bidirectionally() {
+    let spec = spec::openapi();
+    assert_eq!(spec["openapi"], "3.1.0");
+    assert!(spec["components"]["securitySchemes"]["bearerAuth"].is_object());
+
+    let code_ops = extract_router_rest_operations();
+    let spec_ops = extract_spec_rest_operations(spec);
+
+    let missing_in_spec: Vec<_> = code_ops.difference(&spec_ops).collect();
+    let extra_in_spec: Vec<_> = spec_ops.difference(&code_ops).collect();
+
+    assert!(
+        missing_in_spec.is_empty(),
+        "Routes exist in router but are MISSING from OpenAPI spec: {missing_in_spec:?}"
+    );
+    assert!(extra_in_spec.is_empty(), "Routes exist in OpenAPI spec but NOT in router source: {extra_in_spec:?}");
+}
+
+#[tokio::test]
+async fn every_openapi_operation_dispatches_in_real_axum_router() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+    let sessions = Arc::new(Sessions::new());
+    let desktop = sessions.desktop_token().to_string();
+    let state = AppState {
+        engine: engine.clone(),
+        sessions,
+        guard: auth::Guard { port: 47820, lan: false, dev_origins: vec![] },
+        api_limiter: rate_limit::ApiKeyRateLimiter::default(),
+    };
+    let app = router(state);
+    let ops = extract_spec_rest_operations(spec::openapi());
+
+    for (method_str, path) in ops {
+        let concrete = path
+            .replace("{id}", "test_id")
+            .replace("{platform}", "twitch")
+            .replace("{user_id}", "user_1")
+            .replace("{event_id}", "ev_1")
+            .replace("{alert_id}", "al_1")
+            .replace("{kind}", "collections")
+            .replace("{scene}", "Main")
+            .replace("{filter}", "Color")
+            .replace("{name}", "Mic")
+            .replace("{channel}", "desktop")
+            .replace("{token}", "tok_1");
+        let method = Method::from_bytes(method_str.as_bytes()).unwrap();
+        let req = Request::builder()
+            .method(method)
+            .uri(&concrete)
+            .header("host", "127.0.0.1:47820")
+            .header("authorization", format!("Bearer {desktop}"))
+            .body(AxumBody::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        assert_ne!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Spec documents {method_str} {path}, which returned 405 from real router!"
+        );
+        if status == StatusCode::NOT_FOUND {
+            let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            assert_ne!(
+                v["error"]["code"], "no_route",
+                "Spec documents {method_str} {path} ({concrete}), which hit router fallback no_route!"
+            );
+        }
+    }
+
+    engine.shutdown();
+}
+
+#[test]
+fn asyncapi_3_0_covers_every_emitted_live_frame_and_overlay_frame() {
+    let async_spec = spec::asyncapi();
+    assert_eq!(async_spec["asyncapi"], "3.0.0");
+
+    let live_msgs = async_spec["channels"]["live"]["messages"].as_object().unwrap();
+    let overlay_msgs = async_spec["channels"]["overlay"]["messages"].as_object().unwrap();
+
+    let mut files = Vec::new();
+    collect_rs_files(&engine_src_dir(), &mut files);
+    collect_rs_files(&server_src_dir(), &mut files);
+
+    let mut live_kinds = BTreeSet::new();
+    let mut overlay_kinds = BTreeSet::new();
+
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (marker, is_overlay) in [("LiveFrame::new(", false), ("studio_frame(", false), ("OverlayFrame::new(", true)]
+        {
+            let set = if is_overlay { &mut overlay_kinds } else { &mut live_kinds };
+            let mut idx = 0;
+            while let Some(pos) = compact[idx..].find(marker) {
+                let tail = &compact[idx + pos + marker.len()..];
+                idx += pos + marker.len();
+                let target_quote = if is_overlay {
+                    // OverlayFrame::new(audience, seq, "kind", data)
+                    let mut commas = 0usize;
+                    let mut found = None;
+                    for (off, ch) in tail.char_indices() {
+                        if ch == ',' {
+                            commas += 1;
+                            if commas == 2 {
+                                found = tail[off + 1..].trim_start().strip_prefix('"');
+                                break;
+                            }
+                        }
+                    }
+                    found
+                } else {
+                    tail.trim_start().strip_prefix('"')
+                };
+                if let Some(after_q) = target_quote
+                    && let Some(end_q) = after_q.find('"')
+                {
+                    set.insert(after_q[..end_q].to_string());
+                }
+            }
+        }
+    }
+
+    // `envelope(Some(event.seq), "event", &event)` in ws.rs + alert queue replay also emit these
+    live_kinds.insert("event".into());
+    live_kinds.insert("alert".into());
+
+    for k in &live_kinds {
+        assert!(
+            live_msgs.contains_key(k) || k == "alert",
+            "LiveFrame kind `{k}` emitted in code is MISSING from AsyncAPI `channels.live.messages`"
+        );
+    }
+    for k in &overlay_kinds {
+        assert!(
+            overlay_msgs.contains_key(k),
+            "OverlayFrame kind `{k}` emitted in code is MISSING from AsyncAPI `channels.overlay.messages`"
+        );
+    }
+}
+
+#[test]
+fn checked_in_spec_files_match_generated_specs() {
+    let root = repo_root();
+    let openapi_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("docs/openapi.json")).unwrap()).unwrap();
+    let asyncapi_disk: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("docs/asyncapi.json")).unwrap()).unwrap();
+
+    assert_eq!(&openapi_disk, spec::openapi(), "docs/openapi.json is out of date with spec::openapi()! Regenerate it.");
+    assert_eq!(
+        &asyncapi_disk,
+        spec::asyncapi(),
+        "docs/asyncapi.json is out of date with spec::asyncapi()! Regenerate it."
+    );
+}
+
+fn msg_type(m: &Value) -> Option<&str> {
+    m["payload"]["properties"]["type"]["const"].as_str()
+}
+
+#[test]
+fn every_frame_matches_exactly_one_message_by_its_type() {
+    let a = spec::asyncapi();
+    for channel in ["live", "overlay"] {
+        let msgs = a["channels"][channel]["messages"].as_object().unwrap();
+        let mut seen = BTreeSet::new();
+        for (name, m) in msgs {
+            let t = msg_type(m)
+                .unwrap_or_else(|| panic!("{channel}.{name} has no `type` constant: it would match any frame"));
+            // The message is named by the frame it describes, except the overlay's inbound ones.
+            let want = match name.as_str() {
+                "inbound_ack" => "ack",
+                "inbound_visibility" => "visibility",
+                "inbound_hello" => "hello",
+                other => other,
+            };
+            assert_eq!(t, want, "{channel}.{name}");
+            assert!(seen.insert(t), "{channel}: two messages for type `{t}`");
+            let required: Vec<&str> =
+                m["payload"]["required"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+            assert!(required.contains(&"type") && required.contains(&"data"), "{channel}.{name}: {required:?}");
+        }
+    }
+    // The overlay's inbound frames carry their fields under `data`, as the server reads them.
+    let ack = &a["channels"]["overlay"]["messages"]["inbound_ack"]["payload"]["properties"]["data"];
+    assert_eq!(ack["required"], serde_json::json!(["alert_id", "phase"]));
+    let vis = &a["channels"]["overlay"]["messages"]["inbound_visibility"]["payload"]["properties"]["data"];
+    assert_eq!(vis["required"], serde_json::json!(["visible"]));
+    // Overlay frames are numbered; the type constant is what tells the alert from the ack.
+    assert!(
+        a["channels"]["overlay"]["messages"]["alert"]["payload"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "seq")
+    );
+}
+
+#[test]
+fn the_live_handshake_query_is_in_the_websocket_binding_not_in_parameters() {
+    let a = spec::asyncapi();
+    let live = &a["channels"]["live"];
+    assert!(live.get("parameters").is_none(), "/api/v1/live has no address placeholders");
+    let q = &live["bindings"]["ws"]["query"];
+    assert_eq!(q["type"], "object");
+    for k in ["key", "session", "since"] {
+        assert!(q["properties"][k].is_object(), "query.{k}");
+    }
+    assert_eq!(q["properties"]["since"]["type"], "integer");
+    // The overlay's address does have a placeholder, and it stays a parameter.
+    assert!(a["channels"]["overlay"]["parameters"]["token"].is_object());
+}
+
+fn op<'a>(o: &'a Value, path: &str, method: &str) -> &'a Value {
+    &o["paths"][format!("/api/v1{path}")][method]
+}
+
+#[test]
+fn uploads_are_described_as_multipart_with_their_fields() {
+    let o = spec::openapi();
+    for path in ["/designs/import", "/import", "/media"] {
+        let c = &op(o, path, "post")["requestBody"]["content"];
+        assert!(c.get("application/json").is_none(), "{path}: not json");
+        let schema = &c["multipart/form-data"]["schema"];
+        assert_eq!(schema["required"], serde_json::json!(["file"]), "{path}");
+        assert_eq!(schema["properties"]["file"], serde_json::json!({ "type": "string", "format": "binary" }), "{path}");
+    }
+    let s = &op(o, "/import/streamlabs/preview", "post")["requestBody"]["content"]["multipart/form-data"]["schema"];
+    for k in ["points", "tips"] {
+        assert_eq!(s["properties"][k]["format"], "binary", "{k}");
+    }
+    assert_eq!(s["properties"]["platform"]["enum"], serde_json::json!(["twitch", "youtube", "kick"]));
+    assert!(s.get("required").is_none(), "each field is optional");
+}
+
+#[test]
+fn file_downloads_are_files_with_a_filename_and_keep_their_json_errors() {
+    let o = spec::openapi();
+    for (method, path, mime) in [
+        ("post", "/designs/{id}/export", "application/zip"),
+        ("post", "/export", "application/zip"),
+        ("post", "/diagnostics/report.zip", "application/zip"),
+        ("get", "/pro/backups/key", "text/plain"),
+    ] {
+        let r = &op(o, path, method)["responses"]["200"];
+        let c = &r["content"];
+        assert!(c.get("application/json").is_none(), "{path}: the answer is a file");
+        assert_eq!(c[mime]["schema"], serde_json::json!({ "type": "string", "format": "binary" }), "{path}");
+        assert!(r["headers"]["Content-Disposition"]["schema"]["type"] == "string", "{path}: names the file");
+        assert!(
+            op(o, path, method)["responses"]["401"]["content"]["application/json"].is_object(),
+            "{path}: errors stay json"
+        );
+    }
+    let csv = &op(o, "/moments/markers/export", "get")["responses"]["200"]["content"];
+    assert!(csv["text/csv"].is_object() && csv["text/plain"].is_object());
+}
+
+#[test]
+fn the_moderation_schemas_are_what_the_handlers_and_the_client_send() {
+    let o = spec::openapi();
+    let sch = &o["components"]["schemas"];
+    assert_eq!(sch["ModTimeoutRequest"]["required"], serde_json::json!(["platform", "user_id", "seconds"]));
+    assert!(sch["ModTimeoutRequest"]["properties"].get("duration_s").is_none());
+    // ban: the user as an object, everywhere optional; unban: flat.
+    assert_eq!(sch["ModBanRequest"]["required"], serde_json::json!(["user"]));
+    assert_eq!(
+        sch["ModBanRequest"]["properties"]["user"]["required"],
+        serde_json::json!(["platform", "user_id", "login"])
+    );
+    assert_eq!(sch["ModBanRequest"]["properties"]["everywhere"]["type"], "boolean");
+    assert_eq!(sch["ModUnbanRequest"]["required"], serde_json::json!(["platform", "user_id"]));
+    assert_eq!(
+        op(o, "/mod/unban", "post")["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ModUnbanRequest"
+    );
+    assert_eq!(
+        op(o, "/mod/ban", "post")["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/BanResult"
+    );
+}

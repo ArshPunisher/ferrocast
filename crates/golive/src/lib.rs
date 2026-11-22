@@ -8,6 +8,7 @@
 //!                                      └─▶ push: Kick, custom servers
 //! ```
 
+pub mod bench;
 pub mod cut;
 pub mod cutter;
 pub mod demux;

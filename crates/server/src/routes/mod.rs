@@ -1,5 +1,6 @@
 //! `/api/v1` routes (API.md §4).
 
+pub(crate) mod api_keys;
 mod app;
 mod autoreplies;
 mod bot;
@@ -45,8 +46,12 @@ pub(crate) fn api() -> Router<AppState> {
     Router::new()
         // status and pairing
         .route("/status", get(core::status))
+        .route("/openapi.json", get(crate::spec::openapi_json))
+        .route("/asyncapi.json", get(crate::spec::asyncapi_json))
         .route("/session/pair", post(core::pair))
         .route("/session/pair-code", post(core::pair_code))
+        .route("/api-keys", get(api_keys::list).post(api_keys::create))
+        .route("/api-keys/{id}", delete(api_keys::revoke))
         .route("/accounts", get(core::accounts))
         .route("/accounts/{platform}/connect", post(core::connect))
         .route("/accounts/{platform}", delete(core::disconnect))

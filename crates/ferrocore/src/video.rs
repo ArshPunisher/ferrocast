@@ -111,6 +111,9 @@ use std::sync::atomic::AtomicU64;
 
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+pub(crate) static DROPPED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Frames the encoders left out since the program started: one that was behind (FFmpeg's queue
 /// full) or that VideoToolbox dropped. OBS's "skipped frames due to encoding lag". The engine's
 /// own frames that weren't drawn in time are counted apart (`Stats::skipped`).
@@ -263,6 +266,50 @@ impl VideoEncoder {
         Ok(Self { inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new(&config)?)), config })
     }
 
+    /// Opens a specific FFmpeg H.264 encoder (or native VideoToolbox when `ffmpeg_encoder` is `None`
+    /// on macOS), with optional bounded blocking queue capacity and cancellation signal for
+    /// synchronous benchmarking. Benchmark instances never mutate global live `DROPPED` metrics.
+    pub fn for_benchmark(
+        config: VideoConfig,
+        ffmpeg_encoder: Option<&str>,
+        blocking_cap: Option<usize>,
+        cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<Self, AvError> {
+        Self::check(&config)?;
+        if let Some(enc) = ffmpeg_encoder {
+            return Ok(Self {
+                inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new_named(
+                    &config,
+                    enc,
+                    blocking_cap,
+                    cancel,
+                    false,
+                )?)),
+                config,
+            });
+        }
+        #[cfg(target_os = "macos")]
+        if !ffmpeg_asked() && !config.software {
+            let native = if blocking_cap.is_some() {
+                crate::apple::vt::Encoder::new_for_benchmark_sync(&config)?
+            } else {
+                crate::apple::vt::Encoder::new_for_benchmark(&config)?
+            };
+            return Ok(Self { inner: Inner::Native(native), config });
+        }
+        let _ = ffmpeg_asked();
+        Ok(Self { inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new_benchmark(&config)?)), config })
+    }
+
+    /// Frames skipped because this encoder's queue or backend left frames out.
+    pub fn skipped(&self) -> u64 {
+        match &self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(e) => e.skipped(),
+            Inner::Ffmpeg(v) => v.skipped,
+        }
+    }
+
     fn check(config: &VideoConfig) -> Result<(), AvError> {
         if config.width == 0
             || config.height == 0
@@ -408,6 +455,48 @@ impl VideoEncoder {
             #[cfg(target_os = "macos")]
             Inner::Native(e) => e.flush(),
             Inner::Ffmpeg(e) => e.flush(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn h2_vt_benchmark_with_blocking_cap_completes_each_frame_synchronously() {
+        let cfg = VideoConfig {
+            codec: VideoCodec::H264,
+            input: PixelFormat::Nv12,
+            width: 640,
+            height: 360,
+            fps_num: 60,
+            fps_den: 1,
+            bitrate_kbps: 3000,
+            rate: RateControl::Cbr,
+            keyframe_secs: 2,
+            software: false,
+            profile: H264Profile::High,
+            bframes: false,
+            preset: None,
+            tune: None,
+        };
+        let Ok(mut enc) = VideoEncoder::for_benchmark(cfg, None, Some(1), None) else { return };
+        let mut y = vec![80u8; 640 * 360];
+        let uv = vec![128u8; 640 * 180];
+        for i in 0..10i64 {
+            let stripe = ((i as usize * 31) % 360) * 640;
+            for b in &mut y[stripe..stripe + 640] {
+                *b = ((i * 29) % 251) as u8;
+            }
+            let pkts = enc
+                .encode(Frame::Nv12 { y: &y, y_stride: 640, uv: &uv, uv_stride: 640 }, i * 16_667, i == 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                !pkts.is_empty(),
+                "bounded benchmark VideoToolbox encode must complete synchronously before returning (frame {i})"
+            );
         }
     }
 }

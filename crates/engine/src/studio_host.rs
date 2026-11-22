@@ -450,6 +450,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn encode_budget(&self, _draft: Option<Value>, _enhanced: bool, _light: bool) -> Result<Value, String> {
         Ok(serde_json::json!({ "budget_mpx": null, "level": "unknown" }))
     }
+    /// Current total machine CPU (%) and GPU (%) load for auto-config benchmarking.
+    async fn machine_load(&self) -> (Option<f64>, Option<f64>) {
+        (None, None)
+    }
     /// macOS's Screen Recording switch for Ferrocast: `{ granted }` (true where there's none).
     async fn screen_access(&self) -> Result<Value, String> {
         Ok(serde_json::json!({ "granted": true }))
@@ -2538,6 +2542,14 @@ impl Engine {
     /// The desktop app registers itself once its window exists.
     pub fn set_studio_host(&self, host: Arc<dyn StudioHost>) {
         *self.inner.studio_host.host.write().unwrap_or_else(|p| p.into_inner()) = Some(host);
+        if self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let e = self.clone();
+            rt.spawn(async move {
+                e.flush_pending_startup_restore_to_host().await;
+            });
+        }
     }
 
     pub(crate) fn studio_host(&self) -> Result<Arc<dyn StudioHost>, EngineError> {
@@ -2654,11 +2666,23 @@ impl Engine {
     }
 
     pub async fn studio_settings(&self) -> Result<StudioSettings, EngineError> {
+        self.flush_pending_startup_restore_to_host().await;
         Ok(self.studio_host()?.settings().await)
     }
 
     /// Saves and applies the Studio's settings → `{ settings, restart: string | null }`.
     pub async fn studio_set_settings(&self, s: StudioSettings) -> Result<Value, EngineError> {
+        self.studio_set_settings_inner(s, false).await
+    }
+
+    pub(crate) async fn studio_set_settings_inner(
+        &self,
+        s: StudioSettings,
+        from_auto_config: bool,
+    ) -> Result<Value, EngineError> {
+        if !from_auto_config {
+            self.flush_pending_startup_restore_to_host().await;
+        }
         s.check()?;
         // x264 runs through FFmpeg in Ferrocast's own engine: fetched now, so it's here by the
         // time Record or Go live is pressed.
@@ -2668,6 +2692,9 @@ impl Engine {
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
         let saved = host.settings().await;
+        if !from_auto_config {
+            self.disarm_auto_config_if_output_changed(&saved);
+        }
         self.note_studio_settings(&saved);
         self.send_golive_pub();
         // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).
@@ -2727,10 +2754,15 @@ impl Engine {
 
     pub async fn studio_record(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
-        if on {
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
             let s = host.settings().await;
             self.ffmpeg_first(s.record_needs_ffmpeg()).await?;
-        }
+            Some(g)
+        } else {
+            None
+        };
         host.record(on).await.map_err(failed)
     }
 
@@ -2751,6 +2783,13 @@ impl Engine {
         if name.is_empty() || name.chars().count() > 100 || name.chars().any(char::is_control) {
             return Err(EngineError::Invalid("name: a scene or source's name.".into()));
         }
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         self.studio_host()?.record_source(name.to_string(), on).await.map_err(failed)
     }
 
@@ -2759,6 +2798,13 @@ impl Engine {
     }
 
     pub async fn studio_replay(&self, on: bool) -> Result<Value, EngineError> {
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         self.studio_host()?.replay(on).await.map_err(failed)
     }
 
@@ -2770,6 +2816,13 @@ impl Engine {
         if let Some(s) = &source {
             check_source_name(s)?;
         }
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         self.studio_host()?.virtual_camera(on, source).await.map_err(failed)
     }
 
@@ -2786,6 +2839,13 @@ impl Engine {
         if let Some(n) = &name {
             check_source_name(n)?;
         }
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         self.studio_host()?.ndi_output(on, name).await.map_err(failed)
     }
 
@@ -2965,6 +3025,13 @@ impl Engine {
 
     /// Runs `studio_stream` while the caller already holds `studio().output_lock`.
     pub(crate) async fn studio_stream_locked(&self, on: bool) -> Result<Value, EngineError> {
+        let _gate = if on {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
+            Some(g)
+        } else {
+            None
+        };
         let host = self.studio_host()?;
         let s = host.settings().await;
         self.note_studio_settings(&s);
@@ -3211,50 +3278,83 @@ impl Engine {
         self.studio_host()?.close_projectors().await.map_err(failed)
     }
 
-    /// Refuses scene-collection or profile switches (and imports/new) while a Show or any
-    /// live Studio output (stream, recording, source record, replay, virtual camera, NDI) is
-    /// active, so outputs can never be orphaned or blacked out mid-broadcast (M9-01).
-    pub(crate) async fn ensure_idle_for_switch(&self, noun: &str) -> Result<(), EngineError> {
+    /// Refuses scene-collection/profile switches, imports, or encoder benchmarks while a Show or
+    /// any live Studio output (stream including reconnecting, vertical/light stream, delay drain,
+    /// recording, source record, replay, virtual camera, NDI) is active, failing closed on status
+    /// errors so outputs are never disrupted mid-broadcast (M9-01, C1).
+    pub(crate) async fn ensure_outputs_idle(
+        &self,
+        show_action: &str,
+        busy_message: String,
+        busy_hint: String,
+    ) -> Result<(), EngineError> {
+        let busy_err = |message: String, hint: String| EngineError::Refused {
+            status: 409,
+            code: "studio_busy",
+            message,
+            hint,
+            retry_after: None,
+        };
         if self.is_show_active() {
-            return Err(EngineError::Refused {
-                status: 409,
-                code: "studio_busy",
-                message: format!("Stop the show before changing {noun}."),
-                hint: "End the show or cancel the countdown first.".into(),
-                retry_after: None,
-            });
+            return Err(busy_err(
+                format!("Stop the show before {show_action}."),
+                "End the show or cancel the countdown first.".into(),
+            ));
+        }
+        let gl = self.golive();
+        if gl.hub.live().borrow().on || gl.vhub.live().borrow().on || gl.lhub.live().borrow().on {
+            return Err(busy_err(busy_message, busy_hint));
         }
         let Ok(host) = self.studio_host() else { return Ok(()) };
+        if host.delay_drain().is_some() {
+            return Err(busy_err(busy_message, busy_hint));
+        }
         if !host.status().await.running {
             return Ok(());
         }
-        let streaming = host
-            .stream_stats()
-            .await
-            .ok()
-            .is_some_and(|v| v["active"].as_bool() == Some(true) || v["reconnecting"].as_bool() == Some(true));
-        let stats_busy = host.stats().await.ok().is_some_and(|v| {
-            let active = |k: &str| v[k]["active"].as_bool() == Some(true);
-            active("stream")
-                || v["stream"]["reconnecting"].as_bool() == Some(true)
-                || active("vertical_stream")
-                || active("light_stream")
-                || active("record")
-                || active("replay")
-                || active("virtualcam")
-                || active("ndi")
-                || v["source_records"].as_array().is_some_and(|a| !a.is_empty())
-        });
-        if streaming || stats_busy {
-            return Err(EngineError::Refused {
-                status: 409,
-                code: "studio_busy",
-                message: format!("Stop streaming and recording before changing {noun}."),
-                hint: "Stop every active output first.".into(),
-                retry_after: None,
-            });
+        let fail_closed = |what: &str, err: String| {
+            tracing::warn!(what, error = %err, "studio output status unavailable; failing closed");
+            busy_err(
+                format!("Couldn't check {what} before {show_action}: {err}"),
+                "Wait a moment or restart Studio before retrying.".into(),
+            )
+        };
+        let stream = host.stream_stats().await.map_err(|e| fail_closed("stream status", e))?;
+        if stream["active"].as_bool() == Some(true) || stream["reconnecting"].as_bool() == Some(true) {
+            return Err(busy_err(busy_message, busy_hint));
+        }
+        let rec = host.record_stats().await.map_err(|e| fail_closed("recording status", e))?;
+        if rec["active"].as_bool() == Some(true) {
+            return Err(busy_err(busy_message, busy_hint));
+        }
+        let v = host.stats().await.map_err(|e| fail_closed("studio stats", e))?;
+        let active = |k: &str| v[k]["active"].as_bool() == Some(true);
+        let reconnecting = |k: &str| v[k]["reconnecting"].as_bool() == Some(true);
+        let ndi_active = v["ndi"].is_object() && v["ndi"]["active"].as_bool() != Some(false);
+        let stats_busy = active("stream")
+            || reconnecting("stream")
+            || active("vertical_stream")
+            || reconnecting("vertical_stream")
+            || active("light_stream")
+            || reconnecting("light_stream")
+            || active("record")
+            || active("replay")
+            || active("virtualcam")
+            || ndi_active
+            || v["source_records"].as_array().is_some_and(|a| !a.is_empty());
+        if stats_busy {
+            return Err(busy_err(busy_message, busy_hint));
         }
         Ok(())
+    }
+
+    pub(crate) async fn ensure_idle_for_switch(&self, noun: &str) -> Result<(), EngineError> {
+        self.ensure_outputs_idle(
+            &format!("changing {noun}"),
+            format!("Stop streaming and recording before changing {noun}."),
+            "Stop every active output first.".into(),
+        )
+        .await
     }
 
     /// Scene collections or profiles: one act on that list. Falls back to file-backed storage on
@@ -3262,14 +3362,19 @@ impl Engine {
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
         let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
-        // Swapping what the Studio shows is refused during a show or while it streams or
-        // records; with no desktop host attached (headless) the show itself still counts.
-        if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
+        // Swapping what the Studio shows is refused during a show, benchmark, or while it streams
+        // or records; with no desktop host attached (headless) the show/benchmark still count.
+        let _gate = if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
+            let g = self.studio().output_gate.lock().await;
+            self.ensure_no_benchmark_running()?;
             let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
             self.ensure_idle_for_switch(noun).await?;
             // A held key's item is in the collection being left: put it back first.
             self.studio_release_holds().await;
-        }
+            Some(g)
+        } else {
+            None
+        };
         if let Some(host) = host {
             let out = host.shelf(kind.to_string(), act).await.map_err(failed)?;
             // Another collection may have its own vertical picture (or none): the stream follows.
@@ -3303,8 +3408,10 @@ impl Engine {
         self.studio_host()?.screens().await.map_err(failed)
     }
 
-    /// Opens Ferrocast again; refused while the Studio streams or records.
+    /// Opens Ferrocast again; refused while the Studio streams, records, or benchmarks.
     pub async fn studio_restart(&self) -> Result<(), EngineError> {
+        let _gate = self.studio().output_gate.lock().await;
+        self.ensure_no_benchmark_running()?;
         self.studio_host()?.restart().await.map_err(failed)
     }
 

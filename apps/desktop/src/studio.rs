@@ -3173,7 +3173,7 @@ impl StudioHost for DesktopStudio {
                     "every_app": c.every_app(),
                     "source": h.virtualcam_source,
                 })),
-                "ndi": h.ndi.as_ref().filter(|n| n.active()).map(|n| json!({ "name": n.name() })),
+                "ndi": h.ndi.as_ref().filter(|n| n.active()).map(|n| json!({ "active": true, "name": n.name() })),
                 // Captures on air that show nothing (the black screen fixer).
                 "captures": h.collection.as_ref().map(|c| c.capture_problems()).unwrap_or_default(),
                 // Pictures each source has sent to the card, and their size: the page works out
@@ -4362,6 +4362,11 @@ impl StudioHost for DesktopStudio {
         self.on_main(|_| serde_json::to_value(ferrocast_studio::screens()).map_err(|e| e.to_string())).await?
     }
 
+    async fn machine_load(&self) -> (Option<f64>, Option<f64>) {
+        let cpu = ferrocast_studio::system::machine_cpu_pct();
+        (Some(cpu), None)
+    }
+
     async fn restart(&self) -> Result<(), String> {
         let busy = self
             .on_main(|h| h.stream.is_some() || h.record.is_some() || h.replay.is_some() || h.virtualcam.is_some())
@@ -5414,5 +5419,11 @@ mod import_tests {
         assert_eq!(doc["transition_matrix"][0]["transition"], "Quick Swipe");
         assert_eq!(doc["transition_matrix"][0]["from"], "Main");
         assert_eq!(doc["transition_matrix"][0]["to"], "BRB");
+    }
+
+    #[test]
+    fn desktop_machine_load_reports_valid_cpu_percentage() {
+        let cpu = ferrocast_studio::system::machine_cpu_pct();
+        assert!((0.0..=100.0).contains(&cpu) && cpu > 0.0, "unexpected machine CPU pct: {cpu}");
     }
 }
