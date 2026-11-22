@@ -1430,7 +1430,7 @@ struct BenchmarkTaskParams {
 enum WorkerOutcome {
     Cancelled,
     Failed(AutoConfigMode, String, Vec<BenchCandidate>),
-    Done(WorkerDone),
+    Done(Box<WorkerDone>),
 }
 
 struct WorkerDone {
@@ -1931,7 +1931,7 @@ impl Engine {
             Err(e) => return WorkerOutcome::Failed(mode, e, candidates),
         };
 
-        WorkerOutcome::Done(WorkerDone { mode, candidates, upload_check, upload_error, picked })
+        WorkerOutcome::Done(Box::new(WorkerDone { mode, candidates, upload_check, upload_error, picked }))
     }
 
     fn finish_bench_cancelled(&self, job_id: &str) {
@@ -2467,11 +2467,11 @@ impl Engine {
                 Ok(host) => host.stats().await.ok(),
                 Err(_) => None,
             };
-            let output_live = st.as_ref().is_some_and(is_output_encoding_live);
+            let live_stats = st.as_ref().filter(|s| is_output_encoding_live(s));
 
             enum LoopStep {
                 Continue,
-                OfferAfterStream { view: AutoConfigView, reason: String },
+                OfferAfterStream { view: Box<AutoConfigView>, reason: String },
                 TimeoutOffline,
                 WatchComplete,
                 Stop,
@@ -2487,8 +2487,7 @@ impl Engine {
                 };
                 let now_t = Instant::now();
 
-                if output_live {
-                    let st_ref = st.as_ref().expect("checked output_live");
+                if let Some(st_ref) = live_stats {
                     let lagged = st_ref["engine"]["lagged"].as_u64().unwrap_or(0);
                     let skipped = st_ref["engine"]["skipped"].as_u64().unwrap_or(0);
 
@@ -2539,7 +2538,7 @@ impl Engine {
                             a.rollback_offered = true;
                             a.rollback_trigger = Some(trig);
                             a.rollback_reason = Some(reason.clone());
-                            let view = slot.view();
+                            let view = Box::new(slot.view());
                             LoopStep::OfferAfterStream { view, reason }
                         } else if a.watch_deadline.is_some_and(|d| now_t >= d) && a.confirmed && !a.rollback_offered {
                             LoopStep::WatchComplete
