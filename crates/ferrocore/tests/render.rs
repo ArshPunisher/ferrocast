@@ -476,7 +476,9 @@ fn adjust_lifts_dark_noise_as_grey() {
 
 /// The first use of each transition kind costs no more than the next ones: its shader pipeline is
 /// built when the Compositor is (a swipe and a slide used to build theirs mid-transition, a late
-/// frame and an 83 ms / 50 ms hole in the stream the first time each was used, 20 Nov).
+/// frame and an 83 ms / 50 ms hole in the stream the first time each was used, 20 Nov). Checked
+/// as what that is, not by a clock (a slow or virtual graphics card, or a busy runner, stretches
+/// every time but not this): no transition pipeline is built by the first use of any kind.
 #[test]
 fn the_first_use_of_each_transition_costs_no_more_than_the_next() {
     use ferrocore::{Direction, Transition, TransitionKind};
@@ -502,27 +504,20 @@ fn the_first_use_of_each_transition_costs_no_more_than_the_next() {
         for _ in 0..3 {
             let _ = c.render_transition_nv12(&Transition { kind: TransitionKind::Cut, t: 0.0, ..mk(0.0) });
         }
+        let built = c.transition_pipeline_count();
+        assert!(built > 0, "{name}: the compositor builds the transitions' pipelines when it is made");
         let t0 = Instant::now();
         let _ = c.render_transition_nv12(&mk(0.3)).unwrap_or_else(|e| panic!("{e}"));
         let first = t0.elapsed();
-        let mut later: Vec<_> = (0..8)
-            .map(|i| {
-                let t0 = Instant::now();
-                let _ = c.render_transition_nv12(&mk(0.35 + i as f32 * 0.05)).unwrap_or_else(|e| panic!("{e}"));
-                t0.elapsed()
-            })
-            .collect();
-        later.sort();
-        let median = later[later.len() / 2];
-        eprintln!("{name}: first {first:?}, later median {median:?}");
-        // No frame over two frame periods (33 ms at 60 fps) and not slower than twice the next ones;
-        // on CI (a virtual graphics card) only a gross stall fails.
-        let ci = std::env::var("CI").is_ok_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
-        let (most, slack) = if ci { (250, 200) } else { (33, 5) };
-        assert!(first < std::time::Duration::from_millis(most), "{name}: the first use took {first:?}");
-        assert!(
-            first < median * 2 + std::time::Duration::from_millis(slack),
-            "{name}: first {first:?} against {median:?}"
+        for i in 0..8 {
+            let _ = c.render_transition_nv12(&mk(0.35 + i as f32 * 0.05)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        // For the log only: how long the first and a later one took here.
+        eprintln!("{name}: first {first:?}");
+        assert_eq!(
+            c.transition_pipeline_count(),
+            built,
+            "{name}: its first use built a pipeline (mid-transition, that is a late frame)"
         );
     }
 }

@@ -1,24 +1,37 @@
 //! A source whose clock drifts (+300 ppm from 20 s in: a USB mic) starts following it mid-run:
 //! the resampler is made ahead, so engaging it allocates nothing in the mix, and the sound has
-//! no step beyond the signal's own. A test program of its own, so its counting allocator sees
-//! only this one test.
+//! no step beyond the signal's own. A test program of its own, and its counting allocator counts
+//! only the test's own thread (where the mixer runs): the test runner's thread allocates too, when
+//! it prints that a test has run for over a minute, which a slow machine makes this one do.
 
 #![allow(unsafe_code, clippy::unwrap_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ferrocore::mix::{Mixer, SourceSettings};
 
 struct Counting;
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    /// Set on the test's own thread only. (A constant initialiser: reading it allocates nothing.)
+    static COUNTED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn counted() -> bool {
+    COUNTED.try_with(Cell::get).unwrap_or(false)
+}
 static CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // SAFETY: everything is handed straight to the system allocator; the counter is an atomic add.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        if CAPTURE.swap(false, Ordering::SeqCst) {
+        let mine = counted();
+        if mine {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        if mine && CAPTURE.swap(false, Ordering::SeqCst) {
             // The first allocation inside the mixer: where from (the capture itself allocates).
             eprintln!("{}", std::backtrace::Backtrace::force_capture());
         }
@@ -26,7 +39,9 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        if counted() {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: as above.
         unsafe { System.alloc_zeroed(l) }
     }
@@ -35,7 +50,9 @@ unsafe impl GlobalAlloc for Counting {
         unsafe { System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        if counted() {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: as above.
         unsafe { System.realloc(p, l, n) }
     }
@@ -49,6 +66,7 @@ const PIECE: usize = 480;
 
 #[test]
 fn engaging_drift_following_allocates_nothing_and_does_not_click() {
+    COUNTED.with(|c| c.set(true));
     let mut m = Mixer::new(RATE, 40_000_000);
     m.set(1, SourceSettings::default());
     let mut out = Vec::with_capacity(64);

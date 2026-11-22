@@ -2792,6 +2792,24 @@ mod tests {
         (engine, host, dir)
     }
 
+    /// Waits for `cond` to hold, polling. The limit only decides when a broken test gives up.
+    async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !cond() {
+            assert!(Instant::now() < deadline, "gave up waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Reads the Applied state's watcher fields (false when nothing is applied).
+    fn watch_state(engine: &Engine, read: impl Fn(&AppliedInner) -> bool) -> bool {
+        let slot = engine.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
+        match &slot.state {
+            MachineState::Applied(a) => read(a),
+            _ => false,
+        }
+    }
+
     #[test]
     fn parses_macos_ioreg_gpu_pct() {
         let sample_ioreg = r#"+-o AGXAccelerator <class AGXAccelerator> { "PerformanceStatistics" = {"Device Utilization %"=34,"Renderer Utilization %"=29} }"#;
@@ -3012,6 +3030,11 @@ mod tests {
     #[tokio::test]
     async fn apply_first_minute_dropped_or_lagged_frames_trigger_auto_rollback_even_after_keep() {
         let (engine, host, _dir) = test_engine().await;
+        // A watch window no machine can overrun while the test waits for the watcher.
+        engine.set_auto_config_timing_for_test(BenchTiming {
+            watch_window: Duration::from_secs(600),
+            ..BenchTiming::fast_test()
+        });
         host.settings.lock().unwrap().video_kbps = 3500;
         host.settings.lock().unwrap().fps = 30;
         engine
@@ -3025,11 +3048,14 @@ mod tests {
             .unwrap();
         engine.auto_config_keep().unwrap();
 
-        // Live stream starts, then encoder drops frames within the watch window.
+        // Live stream starts. The watcher takes its baseline at its first poll that sees the
+        // stream live, so the frames are dropped only once it has: waiting for that, not for a
+        // fixed time, keeps a busy machine from letting the drops into the baseline.
         host.streaming.store(true, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        wait_for("the watcher to see the stream live", || watch_state(&engine, |a| a.was_live)).await;
         host.skipped.store(6, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for("the watcher to count the dropped frames", || watch_state(&engine, |a| a.pending_offer.is_some()))
+            .await;
 
         // Settings MUST NOT mutate mid-stream!
         assert_eq!(engine.auto_config_status().state, AutoConfigStateKind::Applied);
@@ -3038,7 +3064,7 @@ mod tests {
 
         // End stream -> rollback offer surfaces after stream, user invokes Undo cleanly offline.
         host.streaming.store(false, Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        wait_for("the offer after the stream ends", || engine.auto_config_status().rollback_offered).await;
         let offered = engine.auto_config_status();
         assert_eq!(offered.state, AutoConfigStateKind::Applied);
         assert!(offered.rollback_offered);
@@ -3051,6 +3077,8 @@ mod tests {
         assert_eq!(host.settings.lock().unwrap().fps, 30);
     }
 
+    // Runs the Apple encoder and libx264 for real: only a Mac has both here.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn real_encoder_stress_benchmark_and_mid_run_cancel_on_this_mac() {
         let dir = tempfile::tempdir().unwrap();
@@ -3731,13 +3759,16 @@ mod tests {
 
     #[tokio::test]
     async fn h6_manual_settings_change_during_countdown_preserved_and_disarms_rollback() {
-        let (engine, host, _dir) = test_engine().await;
+        let (engine, host, dir) = test_engine().await;
+        // Full folder paths on every OS (a leading slash is not one on Windows).
+        let old_rec = dir.path().join("old-rec").to_string_lossy().into_owned();
+        let new_rec = dir.path().join("new-rec").to_string_lossy().into_owned();
         {
             let mut s = host.settings.lock().unwrap();
             s.encoder = "software".into();
             s.fps = 30;
             s.video_kbps = 3500;
-            s.record_folder = Some("/old/rec".into());
+            s.record_folder = Some(old_rec.clone());
         }
 
         // 1. Unrelated manual edit during countdown (`record_folder`) must survive Undo/rollback.
@@ -3751,7 +3782,7 @@ mod tests {
             .await
             .unwrap();
         let mut edited = engine.studio_settings().await.unwrap();
-        edited.record_folder = Some("/new/rec".into());
+        edited.record_folder = Some(new_rec.clone());
         engine.studio_set_settings(edited).await.unwrap();
         assert_eq!(
             engine.auto_config_status().state,
@@ -3765,7 +3796,7 @@ mod tests {
         assert_eq!(after_undo.encoder, "software");
         assert_eq!(
             after_undo.record_folder.as_deref(),
-            Some("/new/rec"),
+            Some(new_rec.as_str()),
             "rollback must only restore the 6 output fields without clobbering unrelated edits"
         );
 
@@ -3901,6 +3932,12 @@ mod tests {
 
     #[tokio::test]
     async fn m2_upload_check_failure_degrades_gracefully_with_upload_error() {
+        // The benchmark runs a real encoder. Where none works (a CI runner without FFmpeg), it
+        // fails for that reason and there is no upload check to degrade: nothing to test here.
+        if discover_encoders_cancellable(&AtomicBool::new(false)).is_empty() {
+            eprintln!("skipped: no working video encoder on this computer");
+            return;
+        }
         let (engine, _host, _dir) = test_engine().await;
         // Hold the Go live busy lock so `golive_upload_check()` fails deterministically offline.
         let _busy = engine.golive().busy.lock().await;

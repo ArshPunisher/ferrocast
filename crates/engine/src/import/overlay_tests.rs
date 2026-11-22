@@ -1324,6 +1324,9 @@ fn entries_that_collide_or_aren_t_plain_files_are_refused() {
         let at = zip.windows(4).rposition(|w| w == b"PK\x01\x02").expect("a central directory entry");
         let attrs = ((kind | 0o644) << 16).to_le_bytes();
         zip[at + 38..at + 42].copy_from_slice(&attrs);
+        // The mode is only read from an entry made by Unix ("version made by", high byte 3). The
+        // zip writer marks its entries as made by DOS when it runs on Windows.
+        zip[at + 5] = 3;
         assert!(
             matches!(
                 parse_overlay_zip(&zip, "x.overlay"),

@@ -1023,6 +1023,13 @@ impl Compositor {
         Ok(())
     }
 
+    /// How many transition pipelines exist. A test's way of seeing that none is built when a
+    /// transition is first used (they are built when the compositor is).
+    #[doc(hidden)]
+    pub fn transition_pipeline_count(&self) -> usize {
+        self.transition_pipelines.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     fn transition_pipeline(&self, entry: &'static str, linear: bool) -> wgpu::RenderPipeline {
         let mut cache = self.transition_pipelines.lock().unwrap_or_else(|e| e.into_inner());
         cache
