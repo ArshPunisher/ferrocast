@@ -79,6 +79,16 @@ pub struct Probe {
     pub has_video: bool,
 }
 
+/// A file the OS wouldn't let us rename, write or read: said with a next step (never a bare 500).
+pub(crate) fn io_refuse(what: &str, e: &std::io::Error) -> EngineError {
+    refuse(
+        422,
+        "file_error",
+        format!("{what}: {e}."),
+        "Close anything using the clip, check the folder can be written to, then try again.",
+    )
+}
+
 fn refuse(status: u16, code: &'static str, message: impl Into<String>, hint: &str) -> EngineError {
     EngineError::Refused { status, code, message: message.into(), hint: hint.into(), retry_after: None }
 }
@@ -314,9 +324,23 @@ impl Engine {
     pub async fn clips(&self, query: Option<&str>) -> Result<Vec<ClipEntry>, EngineError> {
         let root = self.clips_folder().await?;
         let q = query.map(String::from);
-        tokio::task::spawn_blocking(move || list_in(&root, q.as_deref()))
-            .await
-            .map_err(|e| EngineError::Internal(e.to_string()))
+        tokio::task::spawn_blocking(move || -> Result<Vec<ClipEntry>, EngineError> {
+            // A folder that isn't there yet is an empty library; one that can't be read is said.
+            match std::fs::read_dir(&root) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(refuse(
+                        422,
+                        "folder_unreadable",
+                        format!("The recordings folder can't be read: {e}."),
+                        "Pick another folder in Settings, or check this one is still there.",
+                    ));
+                }
+                _ => {}
+            }
+            Ok(list_in(&root, q.as_deref()))
+        })
+        .await
+        .map_err(|e| EngineError::Internal(e.to_string()))?
     }
 
     /// The library and what can be done with it now.
@@ -395,7 +419,7 @@ impl Engine {
         let probe = probe_file(&ffmpeg, &path).await.unwrap_or_default();
         // A second in (the first frame is often black), unless the clip is shorter.
         let at = if probe.duration_ms.unwrap_or(0) > 2500 { "1" } else { "0" };
-        tokio::fs::create_dir_all(&dir).await.map_err(|e| EngineError::Internal(e.to_string()))?;
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| io_refuse("Couldn't keep the picture", &e))?;
         let part = dir.join(format!("{key}.part.jpg"));
         let mut cmd = crate::clips::jobs::hidden(&ffmpeg);
         cmd.args([
@@ -424,7 +448,12 @@ impl Engine {
                 "The file may be damaged or still being written.",
             ));
         }
-        tokio::fs::read(&file).await.map_err(|e| EngineError::Internal(e.to_string()))
+        // Now and then, the oldest pictures go, so the folder doesn't grow with every edit.
+        if fastrand::u8(..) < 6 {
+            let d = dir.clone();
+            tokio::task::spawn_blocking(move || prune_thumbs(&d, THUMBS_KEPT));
+        }
+        tokio::fs::read(&file).await.map_err(|e| io_refuse("Couldn't read the picture", &e))
     }
 
     /// Gives a clip another name (and its subtitle file the same), never over another file.
@@ -475,16 +504,16 @@ impl Engine {
 /// the old name removed, which fails when the name is taken).
 pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> Result<(), EngineError> {
     match std::fs::hard_link(from, to) {
-        Ok(()) => std::fs::remove_file(from).map_err(|e| EngineError::Internal(e.to_string())),
+        Ok(()) => std::fs::remove_file(from).map_err(|e| io_refuse("Couldn't finish the move", &e)),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(name_taken()),
         // A file system with no links (some network or exFAT shares): the name is taken first (made
         // new, so nobody else can take it or a link into it), then the file renamed over that.
         Err(_) => match reserve(to) {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(name_taken()),
-            Err(e) => Err(EngineError::Internal(e.to_string())),
+            Err(e) => Err(io_refuse("Couldn't use that name", &e)),
             Ok(()) => std::fs::rename(from, to).map_err(|e| {
                 let _ = std::fs::remove_file(to);
-                EngineError::Internal(e.to_string())
+                io_refuse("Couldn't rename it", &e)
             }),
         },
     }
@@ -494,6 +523,28 @@ pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> Result<(), Engin
 /// held until something is moved over it.
 fn reserve(to: &Path) -> std::io::Result<()> {
     std::fs::OpenOptions::new().write(true).create_new(true).open(to).map(drop)
+}
+
+/// How many pictures are kept (a clip's picture is made again when it changes).
+const THUMBS_KEPT: usize = 3000;
+
+/// Removes the oldest pictures in `dir` beyond `keep` (and a tenth more, so it isn't at the line
+/// every time).
+pub(crate) fn prune_thumbs(dir: &Path, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut all: Vec<(std::time::SystemTime, PathBuf)> = rd
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jpg"))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    if all.len() <= keep {
+        return;
+    }
+    all.sort();
+    let drop = all.len() - keep + keep / 10;
+    for (_, p) in all.into_iter().take(drop) {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// ffmpeg's text about a file, read.

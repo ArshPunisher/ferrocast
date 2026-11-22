@@ -82,7 +82,8 @@ pub fn trim_args(input: &Path, start_ms: u64, len_ms: u64, precise: bool, part: 
             "192k",
         ]));
     } else {
-        a.extend(os(&["-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero"]));
+        // The first picture and every sound: other streams (subtitles, data) don't go into an .mp4.
+        a.extend(os(&["-map", "0:v:0?", "-map", "0:a?", "-c", "copy", "-avoid_negative_ts", "make_zero"]));
     }
     a.extend(os(&["-movflags", "+faststart", "-f", "mp4"]));
     a.push(part.as_os_str().to_owned());
@@ -454,7 +455,7 @@ impl Engine {
                     "Delete it and try again.",
                 ));
             }
-            write_new_then_rename(&srt, text.as_bytes()).map_err(|e| EngineError::Internal(e.to_string()))
+            write_new_then_rename(&srt, text.as_bytes()).map_err(|e| super::io_refuse("Couldn't save the captions", &e))
         })
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))??;

@@ -256,3 +256,45 @@ fn the_freedesktop_trash_gets_an_info_file_so_it_can_be_restored() {
     assert_eq!(iso_time(1_700_000_000), "2023-11-14T22:13:20");
     assert_eq!(iso_time(951_782_400 + 86_399), "2000-02-29T23:59:59");
 }
+
+#[test]
+fn old_pictures_are_pruned_to_a_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..120 {
+        let p = dir.path().join(format!("{i:03}.jpg"));
+        std::fs::write(&p, b"x").unwrap();
+        // The older the lower the number.
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000 + i);
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+    }
+    std::fs::write(dir.path().join("note.txt"), b"not a picture").unwrap();
+    prune_thumbs(dir.path(), 100);
+    let left: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|f| f.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(left.contains(&"note.txt".to_string()) && left.contains(&"119.jpg".to_string()), "newest and others stay");
+    assert!(!left.contains(&"000.jpg".to_string()), "the oldest go");
+    let pics = left.iter().filter(|n| n.ends_with(".jpg")).count();
+    assert!((85..=95).contains(&pics), "{pics}");
+    // Under the limit: nothing goes.
+    prune_thumbs(dir.path(), 500);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), pics + 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_folder_that_cannot_be_read_is_said_not_shown_empty() {
+    use std::os::unix::fs::PermissionsExt;
+    let (e, _d, clips) = engine().await;
+    touch(clips.path(), "a.mp4", b"1");
+    std::fs::set_permissions(clips.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = e.clips(None).await;
+    std::fs::set_permissions(clips.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    if std::fs::read_dir(clips.path()).is_ok() && r.is_ok() {
+        // Running as a user who can read anything: nothing to check.
+        return;
+    }
+    assert!(matches!(r, Err(EngineError::Refused { status: 422, code: "folder_unreadable", .. })), "{r:?}");
+}
