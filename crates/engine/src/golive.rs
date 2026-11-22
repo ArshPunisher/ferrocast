@@ -569,6 +569,9 @@ pub(crate) struct GoLive {
     /// Set while a destination change is applied to a running stream: the Studio's encoder is
     /// shared by every other output (and a "Same as stream" recording), so its cap isn't touched.
     cap_frozen: std::sync::atomic::AtomicBool,
+    /// A platform said the stream ended while the hub still runs (every destination was
+    /// switched off, the stream and recording go on): the session record closes with the hub.
+    health_end_pending: std::sync::atomic::AtomicBool,
 }
 
 /// The last title and category pushed count for this stream only when they were pushed lately
@@ -661,6 +664,7 @@ impl Default for GoLive {
             studio_live: std::sync::atomic::AtomicBool::new(false),
             cap_failed: std::sync::atomic::AtomicBool::new(false),
             cap_frozen: std::sync::atomic::AtomicBool::new(false),
+            health_end_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -995,6 +999,10 @@ impl Engine {
     }
 
     /// Whether a stream is running that a destination change would be applied to.
+    pub(crate) fn health_end_deferred(&self) {
+        self.golive().health_end_pending.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub(crate) fn golive_stream_running(&self) -> bool {
         self.golive().hub.live().borrow().on || self.golive().vhub.live().borrow().on
     }
@@ -1544,7 +1552,16 @@ impl Engine {
                 return Err(refused("golive_needs_new_encode", why, "Stop and start the stream again with it ticked."));
             }
         }
-        if !confirm.last && before.destinations.iter().any(|d| d.enabled) && !next.iter().any(|d| d.enabled) {
+        // Per live canvas: the last destination ticked on a picture that is on air.
+        let emptied = |canvas: Canvas, on_air: bool| {
+            on_air
+                && before.destinations.iter().any(|d| d.enabled && d.canvas == canvas)
+                && !next.iter().any(|d| d.enabled && d.canvas == canvas)
+        };
+        let g = self.golive();
+        let last_one =
+            emptied(Canvas::Main, g.hub.live().borrow().on) || emptied(Canvas::Vertical, g.vhub.live().borrow().on);
+        if !confirm.last && last_one {
             return Err(EngineError::Refused {
                 status: 409,
                 code: "golive_last_destination",
@@ -2410,6 +2427,9 @@ impl Engine {
         lock(&g.blocked).retain(|id, _| wanted(id));
         lock(&g.paused).retain(|id, _| wanted(id));
         if !main_on && !vertical_on {
+            if g.health_end_pending.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                self.health_stream_ended(now()).await;
+            }
             lock(&g.protector).reset();
             // The next stream starts with every destination given its own chance again.
             *lock(&g.backup) = BackupState::default();
@@ -2980,6 +3000,11 @@ impl Engine {
             Err(_) => false,
         };
         if !studio {
+            return;
+        }
+        // Nothing is sending to a platform (all switched off, the stream goes on for a
+        // recording): there is nothing to protect or step down.
+        if lock(&g.running).is_empty() {
             return;
         }
         let cfg = self.golive_config();

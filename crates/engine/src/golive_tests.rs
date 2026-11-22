@@ -2029,3 +2029,33 @@ fn only_a_recent_push_that_some_platform_took_is_given_to_a_new_destination() {
     assert!(!crate::golive::recent_push(&entry(now - 24 * 3_600_000, true), now), "a day-old title");
     assert!(!crate::golive::recent_push(&entry(now - 60_000, false), now), "a push nothing took");
 }
+
+/// The last destination is judged per live picture: a ticked vertical destination (whose picture
+/// isn't on air) doesn't make removing the last main one free. And with nothing sending, a
+/// platform saying the stream ended doesn't close the session record while the hub runs.
+#[tokio::test]
+async fn the_last_destination_is_per_live_canvas_and_the_record_stays_open() {
+    use crate::golive::Canvas;
+    use ferrocast_testkit::rtmp::platform;
+    let (e, _dir) = engine().await;
+    let (pa, _ga) = platform("key-a").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "key-a", Canvas::Main).await.unwrap();
+    let v = e.add_golive_destination("V", "rtmp://127.0.0.1:9/app", "key-v", Canvas::Vertical).await.unwrap();
+    let list = |e: &Engine, on: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.iter().map(|d| (d.id.clone(), on.contains(&d.id.as_str()))).collect()
+    };
+    e.set_golive_destinations(list(&e, &[a.id.as_str(), v.id.as_str()])).await.unwrap();
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async { e.golive_running().contains(&a.id) }).await;
+    let err = e.set_golive_destinations_checked(list(&e, &[v.id.as_str()]), Default::default()).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 409, code: "golive_last_destination", .. }), "{err:?}");
+    e.set_golive_destinations_checked(
+        list(&e, &[v.id.as_str()]),
+        crate::golive::DestinationConfirm { upload: false, last: true },
+    )
+    .await
+    .unwrap();
+    // Nothing sends now, the stream goes on: the session record is told to close with the hub.
+    assert!(e.golive_stream_running());
+    assert!(e.golive_senders().is_empty());
+}

@@ -257,7 +257,13 @@ impl Engine {
     pub(crate) async fn auto_quality_tick_with(&self, feed_dropped: u64) {
         let Ok(host) = self.studio_host() else { return };
         let (_, paused) = self.golive_trouble();
-        let s = ferrocast_core::auto_quality::Signals { dests: self.golive_senders(), feed_dropped, paused };
+        let senders = self.golive_senders();
+        // Live with nothing sending to a platform (kept on for a recording): no upload to judge,
+        // so the bitrate isn't stepped down or up for it.
+        if senders.is_empty() && self.golive_stream_running() {
+            return;
+        }
+        let s = ferrocast_core::auto_quality::Signals { dests: senders, feed_dropped, paused };
         let changed = {
             let mut aq = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
             // Switched off, it still watches: the status bar says when the upload struggles.
