@@ -727,12 +727,33 @@ pub(crate) fn trash_file(path: &Path, over: Option<&Path>) -> Result<(), EngineE
         // The Recycle Bin, through the shell's own call. The path goes in the environment, as data:
         // text after -Command would be part of the command, and a quote in it would run.
         let script = "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:FERROCAST_CLIP_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')";
-        let ok = std::process::Command::new("powershell")
+        // PowerShell by its own full path (a `powershell.exe` earlier on PATH is not run), with no
+        // console window flashing, and a time limit: a dialog nobody sees can't hang this.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let exe = PathBuf::from(root).join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+        let ok = std::process::Command::new(exe)
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("FERROCAST_CLIP_PATH", path)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .ok()
+            .is_some_and(|mut child| {
+                let start = std::time::Instant::now();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status.success(),
+                        Ok(None) if start.elapsed() < std::time::Duration::from_secs(30) => {
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                        }
+                        _ => {
+                            let _ = child.kill();
+                            break false;
+                        }
+                    }
+                }
+            });
         if ok { Ok(()) } else { Err(fail("the Recycle Bin didn't take it".into())) }
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
