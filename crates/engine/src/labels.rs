@@ -103,12 +103,32 @@ impl LabelRuntime {
         any_expired
     }
 
+    fn rollover_months(&mut self, now_ms: Millis) -> bool {
+        let before = self.monthly.len();
+        self.monthly.retain(|tz, ((start, end), _)| month_bounds(now_ms, *tz) == (*start, *end));
+        self.monthly.len() != before
+    }
+
     fn has_active_trains(&self, now_ms: Millis) -> bool {
         self.trains.values().any(|t| t.view(now_ms).active)
     }
 }
 
 impl Engine {
+    /// Checks idle train expiration (and monthly rollover) for a single reaper tick at `now_ms`.
+    pub(crate) async fn labels_reap_tick(&self, now_ms: Millis) -> bool {
+        let changed = {
+            let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
+            let train_expired = if !rt.has_active_trains(now_ms) { false } else { rt.tick_trains(now_ms) };
+            let month_rolled = rt.rollover_months(now_ms);
+            train_expired || month_rolled
+        };
+        if changed {
+            self.push_all_overlay_labels().await;
+        }
+        changed
+    }
+
     /// Loads `latest_labels`, `alltime` totals, and UTC monthly totals from SQLite on startup.
     pub(crate) async fn hydrate_labels(&self) {
         let now_ms = crate::now();
@@ -338,14 +358,7 @@ fn eval_non_train(opts: &LabelOptions, rt: &LabelRuntime) -> String {
 pub(crate) async fn run(engine: Engine) {
     loop {
         tokio::time::sleep(REAPER_TICK).await;
-        let now_ms = crate::now();
-        let expired = {
-            let mut rt = engine.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
-            if !rt.has_active_trains(now_ms) { false } else { rt.tick_trains(now_ms) }
-        };
-        if expired {
-            engine.push_all_overlay_labels().await;
-        }
+        engine.labels_reap_tick(crate::now()).await;
     }
 }
 
@@ -447,5 +460,55 @@ mod tests {
         let active_key = TrainKey::from(cfg);
         assert!(rt.trains.contains_key(&active_key), "active train must not be evicted as idle");
         assert!(rt.trains.get(&active_key).unwrap().view(now_ms).active);
+    }
+
+    #[tokio::test]
+    async fn idle_month_rollover_evicts_stale_monthly_cache_and_pushes_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        let view = engine.create_overlay("MonthRollover", ferrocast_core::overlay::Preset::Blank).await.unwrap();
+        let mut ov = engine.overlay(&view.id).await.unwrap();
+        ov.widgets.push(ferrocast_core::overlay::Widget::new(
+            "mf",
+            WidgetKind::Label,
+            (10, 10, 200, 40),
+            json!({ "source": "monthly_follows", "template": "{value}", "theme": "molten", "timezone_offset_min": 0 }),
+        ));
+        engine.update_overlay(ov.clone()).await.unwrap();
+        let mut rx = engine.subscribe_overlays();
+
+        // Seed stale January 2026 monthly cache
+        let jan_ts = Millis(1_769_900_000_000); // 2026-01-31T22:53:20Z
+        let jan_bounds = month_bounds(jan_ts, 0);
+        let feb_ts = Millis(jan_bounds.1.0 + 1_000); // 2026-02-01T00:00:01Z
+        {
+            let mut rt = engine.inner.labels.lock().unwrap();
+            let mut jan_totals = PeriodTotals::default();
+            jan_totals.follows = 42;
+            rt.monthly.insert(0, (jan_bounds, jan_totals));
+            rt.hydrated = true;
+        }
+
+        // Advance reaper into February without any new events arriving
+        let changed = engine.labels_reap_tick(feb_ts).await;
+        assert!(changed, "month rollover must trigger reaper push");
+        {
+            let rt = engine.inner.labels.lock().unwrap();
+            assert_ne!(
+                rt.monthly.get(&0).map(|(b, _)| *b),
+                Some(jan_bounds),
+                "stale January bounds must be evicted/replaced"
+            );
+        }
+        let mut pushed_mf = None;
+        while let Ok(frame) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&frame.text).unwrap();
+            if v["type"] == "state"
+                && let Some(val) = v["data"]["labels"]["mf"].as_str()
+            {
+                pushed_mf = Some(val.to_string());
+            }
+        }
+        assert_eq!(pushed_mf.as_deref(), Some("0"), "overlay must receive rolled-over monthly value");
     }
 }
