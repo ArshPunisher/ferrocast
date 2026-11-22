@@ -349,6 +349,33 @@ const CLIPS_ROUTES: &[RouteDoc] = &[
     doc("POST", "/clips/{id}/upload", "Clips", "Send the clip to YouTube (a job; private by default).", None, None),
 ];
 
+const SCHEDULE_ROUTES: &[RouteDoc] = &[
+    doc(
+        "GET",
+        "/schedule",
+        "Go Live",
+        "Planned streams, soonest first, with the scheduled broadcasts made for them.",
+        None,
+        Some("ScheduleList"),
+    ),
+    doc(
+        "POST",
+        "/schedule",
+        "Go Live",
+        "Plan a stream: title, category, platforms and start time. Makes scheduled broadcasts where a platform has them (YouTube, Facebook), reminds before the start, never goes live by itself. 201; 400 names the field, 409 over 50 plans.",
+        Some("ScheduleCreate"),
+        Some("ScheduledStream"),
+    ),
+    doc(
+        "DELETE",
+        "/schedule/{id}",
+        "Go Live",
+        "Remove a planned stream (broadcasts already made on a platform stay there).",
+        None,
+        None,
+    ),
+];
+
 const GO_LIVE_ROUTES: &[RouteDoc] = &[
     doc(
         "GET",
@@ -371,8 +398,8 @@ const GO_LIVE_ROUTES: &[RouteDoc] = &[
         "POST",
         "/golive/destinations",
         "Go Live",
-        "Add a custom RTMP/SRT destination with stream key (PC only).",
-        None,
+        "Add a custom RTMP/SRT destination with stream key (PC only). Optional brand (x, instagram, facebook) names a server and key pasted from that platform.",
+        Some("GoLiveDestinationCreate"),
         None,
     ),
     doc(
@@ -1871,6 +1898,7 @@ pub fn all_rest_routes() -> impl Iterator<Item = &'static RouteDoc> {
         .chain(ALERTS_DESIGNS_MEDIA)
         .chain(GO_LIVE_ROUTES)
         .chain(CLIPS_ROUTES)
+        .chain(SCHEDULE_ROUTES)
         .chain(OBS_AND_MUSIC)
         .chain(STUDIO_ENGINE_ROUTES)
         .chain(MOMENTS_AND_SHOW)
@@ -2104,6 +2132,7 @@ fn build_openapi() -> Value {
         let ok_status = match r.method {
             "POST" if r.rel_path == "/api-keys" => "201",
             "POST" if r.rel_path == "/store/install" => "201",
+            "POST" if r.rel_path == "/schedule" => "201",
             "DELETE" => "204",
             _ => "200",
         };
@@ -2400,6 +2429,80 @@ fn store_schemas() -> Map<String, Value> {
             "update_available": { "type": "boolean" },
             "safety_notes": { "type": "array", "items": { "type": "string" }, "description": "What is already true, and what will be checked when the person installs." },
             "requires_confirmation": { "type": "boolean", "const": true }
+        }
+    }));
+    m
+}
+
+/// The stream scheduler's and Go live's destination schemas.
+fn schedule_schemas() -> Map<String, Value> {
+    let mut m = Map::new();
+    let platforms = json!({ "type": "array", "minItems": 1, "items": { "type": "string", "enum": ["twitch", "youtube", "kick", "facebook"] } });
+    m.insert("ScheduleCreate".into(), json!({
+        "type": "object",
+        "required": ["info", "platforms", "start_ms"],
+        "properties": {
+            "info": {
+                "type": "object",
+                "description": "What the stream is about. `title` is required (at most 140 characters, no control characters).",
+                "required": ["title"],
+                "properties": {
+                    "title": { "type": "string", "minLength": 1, "maxLength": 140 },
+                    "category": {
+                        "type": ["object", "null"],
+                        "description": "`{ name, ids? }`: the category's name and, where known, each platform's id.",
+                        "required": ["name"],
+                        "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 100 }, "ids": { "type": "object" } }
+                    },
+                    "description": { "type": ["string", "null"] },
+                    "tags": { "type": ["array", "null"], "items": { "type": "string" } },
+                    "language": { "type": ["string", "null"] }
+                }
+            },
+            "platforms": platforms.clone(),
+            "start_ms": { "type": "integer", "description": "Unix milliseconds: in the future, at most a year ahead." },
+            "remind_minutes": { "type": "integer", "minimum": 1, "maximum": 1440, "default": 10 }
+        }
+    }));
+    m.insert("ScheduledStream".into(), json!({
+        "type": "object",
+        "required": ["id", "info", "platforms", "start_ms", "remind_minutes", "reminded", "broadcasts"],
+        "properties": {
+            "id": { "type": "string" },
+            "info": { "type": "object" },
+            "platforms": platforms,
+            "start_ms": { "type": "integer" },
+            "remind_minutes": { "type": "integer" },
+            "reminded": { "type": "boolean" },
+            "broadcasts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["platform"],
+                    "properties": {
+                        "platform": { "type": "string" },
+                        "id": { "type": "string", "description": "The platform's id for the scheduled broadcast, when one was made." },
+                        "url": { "type": "string", "description": "An https address of it, when the platform gave one." },
+                        "note": { "type": "string", "description": "Why there is no broadcast: not connected, none to make there, or the platform said no." }
+                    }
+                }
+            }
+        }
+    }));
+    m.insert("ScheduleList".into(), json!({
+        "type": "object",
+        "required": ["streams"],
+        "properties": { "streams": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduledStream" } } }
+    }));
+    m.insert("GoLiveDestinationCreate".into(), json!({
+        "type": "object",
+        "required": ["name", "url"],
+        "properties": {
+            "name": { "type": "string", "minLength": 1, "maxLength": 40 },
+            "url": { "type": "string", "description": "rtmp://, rtmps://, srt://, rist:// or https:// (WebRTC WHIP)." },
+            "key": { "type": "string", "maxLength": 512, "description": "No spaces. Never returned. Needed for RTMP and RTMPS; optional for SRT (stream id), RIST (passphrase) and WebRTC (bearer token)." },
+            "canvas": { "type": "string", "enum": ["main", "vertical"] },
+            "brand": { "type": "string", "enum": ["x", "instagram", "facebook"], "description": "Names a server and key pasted from that platform; changes nothing about how the stream is sent." }
         }
     }));
     m
@@ -2818,6 +2921,7 @@ fn schemas() -> Value {
     if let Some(map) = doc.as_object_mut() {
         map.extend(auto_config_schemas());
         map.extend(store_schemas());
+        map.extend(schedule_schemas());
     }
     doc
 }

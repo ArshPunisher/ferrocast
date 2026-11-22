@@ -581,6 +581,39 @@ impl Api {
         Ok(bid)
     }
 
+    /// A broadcast for a later time (liveBroadcasts.insert, 50 units), so viewers can find it and
+    /// be reminded. It is not bound to a stream and never starts or ends by itself: going live
+    /// stays the streamer's own press (the stream start finds it and sets it to start with the
+    /// stream, as for any broadcast that waits). → its video id.
+    pub async fn schedule_broadcast(
+        &self,
+        title: &str,
+        description: Option<&str>,
+        start_ms: i64,
+    ) -> Result<String, YoutubeError> {
+        let mut snippet = json!({
+            "title": title.chars().take(MAX_TITLE_CHARS).collect::<String>(),
+            "scheduledStartTime": rfc3339_utc(start_ms),
+        });
+        if let Some(d) = description {
+            snippet["description"] = json!(d);
+        }
+        let body = json!({
+            "snippet": snippet,
+            "status": { "privacyStatus": (self.privacy)().as_str(), "selfDeclaredMadeForKids": false },
+            "contentDetails": { "enableAutoStart": false, "enableAutoStop": false, "monitorStream": { "enableMonitorStream": false } },
+        });
+        let b = self
+            .call(Method::POST, "/liveBroadcasts", &[("part", "id,snippet,status,contentDetails")], Some(body))
+            .await
+            .map_err(|e| wrap_broadcast_error("couldn't schedule a live broadcast", e))?;
+        let id = b.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        if id.is_empty() {
+            return Err(YoutubeError::Protocol("YouTube scheduled a broadcast without an id".into()));
+        }
+        Ok(id)
+    }
+
     /// A broadcast that waits for "Go live" in YouTube Studio (auto-start off) is set to start
     /// with the stream (liveBroadcasts.update, 50 units): the normal live never sits waiting
     /// while the streamer is live everywhere else (owner, 30 Oct).

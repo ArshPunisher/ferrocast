@@ -28,6 +28,7 @@ mod polls;
 mod pro;
 mod recap;
 pub(crate) mod remote_scope;
+mod schedule;
 mod smart;
 mod store;
 mod studio;
@@ -235,6 +236,8 @@ pub(crate) fn api() -> Router<AppState> {
         .merge(clips::routes())
         // Go live everywhere: destinations, OBS setup, the upload check
         .merge(golive::routes())
+        // Stream scheduler: plans, scheduled broadcasts, reminders (routes/schedule.rs)
+        .merge(schedule::routes())
         // auto-replies (bot answers to chat that mentions something)
         .merge(autoreplies::routes())
         // Pro dashboard from anywhere: devices, pairing links (see crate::remote)
@@ -289,7 +292,8 @@ pub(crate) fn platform(s: &str) -> Result<Platform, ApiError> {
         "twitch" => Ok(Platform::Twitch),
         "youtube" => Ok(Platform::Youtube),
         "kick" => Ok(Platform::Kick),
-        _ => Err(ApiError::invalid(format!("\"{s}\" isn't a platform; use twitch, youtube or kick."))),
+        "facebook" => Ok(Platform::Facebook),
+        _ => Err(ApiError::invalid(format!("\"{s}\" isn't a platform; use twitch, youtube, kick or facebook."))),
     }
 }
 

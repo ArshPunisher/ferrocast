@@ -392,6 +392,51 @@ async fn commands_reply_on_the_source_platform() {
     eventually(|| kick.log().contains(&"say Join us, Sam! reply=k1".to_string())).await;
 }
 
+/// Facebook has no bot: comments never get a command answer, an auto-reply or a welcome (the
+/// notes promise it), while the other platforms do.
+#[tokio::test]
+async fn facebook_comments_never_make_the_bot_speak() {
+    let (e, _d) = engine().await;
+    let fb = FakePlatform::new(Platform::Facebook);
+    let kick = FakePlatform::new(Platform::Kick);
+    e.register_connector(fb.clone());
+    e.register_connector(kick.clone());
+    e.save_command(Command {
+        id: "dc".into(),
+        name: "!discord".into(),
+        aliases: vec![],
+        response: "Join us, {user}!".into(),
+        access: Access::Everyone,
+        cooldown_s: 0,
+        user_cooldown_s: 0,
+        platforms: vec![],
+        enabled: true,
+    })
+    .await
+    .unwrap();
+    let patch = serde_json::json!({ "enabled": true, "template": "Hi {user}, welcome!" });
+    e.patch_welcome(patch.as_object().unwrap()).await.unwrap();
+    e.ingest(chat(Platform::Facebook, "f1", "Asha", "!discord")).await;
+    e.ingest(chat(Platform::Facebook, "f2", "Ravi", "hello there")).await;
+    // The same command on Kick answers (so the silence above is the rule, not a broken setup).
+    e.ingest(chat(Platform::Kick, "k1", "Sam", "!discord")).await;
+    eventually(|| kick.log().contains(&"say Join us, Sam! reply=k1".to_string())).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(fb.log().iter().all(|l| !l.starts_with("say")), "nothing is said on Facebook: {:?}", fb.log());
+}
+
+/// Facebook doesn't let apps ban: nothing was banned, so no ban is written down as if it was.
+#[tokio::test]
+async fn a_ban_facebook_cannot_do_is_not_recorded_as_done() {
+    let (e, _d) = engine().await;
+    let graph = Arc::new(ferrocast_facebook::Graph::new("http://127.0.0.1:9", "page", "T"));
+    e.register_connector(Arc::new(ferrocast_facebook::FacebookConnector::new(graph)));
+    let out = e.ban(Platform::Facebook, "u1", "asha", Some("Asha"), None, false).await.unwrap();
+    assert!(out.ok.is_empty());
+    assert_eq!(out.failed.len(), 1, "{out:?}");
+    assert!(e.bans().entries.is_empty(), "the ban list says someone is banned who is not");
+}
+
 /// A ban or timeout made from here takes the author's pinned message off stream at
 /// once; it must not wait for the platform to echo the event back.
 #[tokio::test]

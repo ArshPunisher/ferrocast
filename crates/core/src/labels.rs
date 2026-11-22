@@ -772,6 +772,7 @@ fn platform_slug(p: Platform) -> &'static str {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
         Platform::Kick => "kick",
+        Platform::Facebook => "facebook",
         Platform::Tips => "tips",
         Platform::Ferrocast => "ferrocast",
     }

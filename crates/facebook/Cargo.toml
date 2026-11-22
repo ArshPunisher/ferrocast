@@ -1,0 +1,29 @@
+[package]
+name = "ferrocast-facebook"
+description = "Facebook adapter: Graph API sign-in, live videos (go live and scheduled) and live comments."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ferrocast-core.workspace = true
+ferrocast-connector.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
+base64 = "0.23"
+getrandom = "0.4"
+url = "2"
+reqwest = { version = "0.13", features = ["json", "form", "query"] }
+
+[dev-dependencies]
+axum = "0.8"
+
+[lints]
+workspace = true

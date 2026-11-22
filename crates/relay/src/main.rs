@@ -144,7 +144,8 @@ async fn main() {
         .with_tts(tts, tts_cap)
         .with_smart(smart, smart_cap)
         .with_smart_backup(smart_backup, smart_backup_cap)
-        .with_admin(admin);
+        .with_admin(admin)
+        .with_facebook(ferrocast_relay::facebook::Config::from_env());
     let remote_cfg = ferrocast_relay::remote::RemoteConfig::from_env();
     match (&remote_cfg.origin, remote_cfg.dashboard_dir.is_some()) {
         (Some(o), true) => tracing::info!(origin = %o, "the dashboard from anywhere is on"),

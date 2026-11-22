@@ -43,6 +43,8 @@ pub(crate) fn saved_tokens<T: serde::de::DeserializeOwned>(
 
 pub(crate) const TWITCH_TOKENS: &str = "twitch-tokens";
 pub(crate) const YOUTUBE_TOKENS: &str = "youtube-tokens";
+/// The Page Facebook acts as (its id and access token), in the secret store.
+pub(crate) const FACEBOOK_PAGE: &str = "facebook-page";
 /// How long the browser sign-in for YouTube may take.
 const YOUTUBE_SIGN_IN: Duration = Duration::from_secs(300);
 
@@ -59,6 +61,9 @@ pub struct PlatformApps {
     pub relay_url: Option<String>,
     /// Kick's public API (tests point it at a fake).
     pub kick_api: String,
+    /// Facebook's Graph API (tests point it at a fake). Signing in to Facebook goes through the
+    /// relay, which holds the Meta app secret: there is none here (R-46).
+    pub facebook_endpoints: ferrocast_facebook::Endpoints,
 }
 
 impl PlatformApps {
@@ -86,6 +91,7 @@ impl PlatformApps {
             relay_url: pick("FERROCAST_RELAY_URL", option_env!("FERROCAST_RELAY_URL"))
                 .map(|u| u.trim_end_matches('/').to_string()),
             kick_api: "https://api.kick.com".into(),
+            facebook_endpoints: ferrocast_facebook::Endpoints::default(),
         }
     }
 }
@@ -118,6 +124,7 @@ impl Engine {
             Platform::Twitch => self.connect_twitch().await,
             Platform::Youtube => self.connect_youtube().await,
             Platform::Kick => self.connect_kick().await,
+            Platform::Facebook => self.connect_facebook().await,
             _ => Err(EngineError::Invalid("That isn't a platform you can sign in to.".into())),
         }
     }
@@ -300,6 +307,25 @@ impl Engine {
         if a.platform == "kick" {
             return self.resume_kick(a.clone()).await;
         }
+        if a.platform == "facebook" {
+            match saved_tokens::<ferrocast_facebook::Page>(&*self.inner.secrets, FACEBOOK_PAGE) {
+                Saved::Unreadable => return true,
+                // The saved token must be the saved account's Page: a half-finished switch (one
+                // Page's token, another's account record) is not started, it asks to sign in again.
+                Saved::Found(page) if page.id == a.user_id => self.start_facebook(page, a.clone()),
+                Saved::Found(_) | Saved::Missing => {
+                    let _ = self
+                        .submit(Event::live(
+                            Platform::Facebook,
+                            None,
+                            Millis(0),
+                            EventKind::Connector(ConnectorStatus::SignInNeeded),
+                        ))
+                        .await;
+                }
+            }
+            return false;
+        }
         if a.platform == "youtube" {
             match saved_tokens::<ferrocast_youtube::Tokens>(&*self.inner.secrets, YOUTUBE_TOKENS) {
                 Saved::Unreadable => return true,
@@ -362,6 +388,7 @@ impl Engine {
                 self.forget_kick()?;
                 None
             }
+            Platform::Facebook => Some(FACEBOOK_PAGE),
             _ => None,
         };
         if let Some(k) = key {
@@ -370,6 +397,91 @@ impl Engine {
         let key = crate::platform_key(platform).to_string();
         self.db(move |s| repo::settings::remove_account(s, &key)).await?;
         Ok(())
+    }
+
+    /// Facebook sign-in (a Page) through the relay, like Kick's: the relay asks Meta with the app
+    /// secret (which only it holds) and hands the Pages to this install over its link, where
+    /// [`Engine::finish_facebook`] takes the first one. Here the browser is opened on Meta's page.
+    async fn connect_facebook(&self) -> Result<ConnectFlow, EngineError> {
+        let url = self.relay_url()?;
+        let auth = self.relay_auth().await?;
+        self.ensure_relay_link();
+        let res = self
+            .relay_http()
+            .post(format!("{url}/v1/facebook/oauth"))
+            .bearer_auth(&auth)
+            .send()
+            .await
+            .map_err(|e| EngineError::Unavailable(format!("Couldn't reach the Ferrocast relay: {e}")))?;
+        let v: serde_json::Value = res.json().await.map_err(|e| EngineError::Unavailable(e.to_string()))?;
+        match v["url"].as_str() {
+            Some(u) => Ok(ConnectFlow::Browser { url: u.to_string() }),
+            None => Err(EngineError::Unavailable(
+                v.pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("The relay couldn't start Facebook sign-in.")
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// The Page that was signed in to (the first one the person manages) becomes the account.
+    pub(crate) async fn finish_facebook(&self, grant: ferrocast_facebook::UserGrant) -> Result<(), EngineError> {
+        let Some(page) = grant.pages.into_iter().next() else {
+            return Err(EngineError::Unavailable(
+                "Facebook shows no Page that you manage. Going live and chat need a Page: make one, then Connect again.".into(),
+            ));
+        };
+        self.save_secret_json(FACEBOOK_PAGE, &page)?;
+        let account = repo::settings::Account {
+            platform: "facebook".into(),
+            user_id: page.id.clone(),
+            login: page.name.clone(),
+            display_name: page.name.clone(),
+            avatar_url: page.avatar_url.clone(),
+            scopes: ferrocast_facebook::SCOPES.iter().map(|s| s.to_string()).collect(),
+            connected_at: now().0,
+        };
+        let saved = account.clone();
+        self.db(move |s| repo::settings::save_account(s, &saved)).await?;
+        self.start_facebook(page, account);
+        self.notice_detail(
+            "account:facebook",
+            NoticeLevel::Info,
+            "Facebook is connected",
+            "Comments show up whenever your Page is live.",
+        );
+        Ok(())
+    }
+
+    /// Registers the connector and reads the Page's live comments.
+    fn start_facebook(&self, page: ferrocast_facebook::Page, account: repo::settings::Account) {
+        let graph = Arc::new(ferrocast_facebook::Graph::new(
+            &self.apps().facebook_endpoints.graph,
+            &page.id,
+            &page.access_token,
+        ));
+        self.register_connector(Arc::new(ferrocast_facebook::FacebookConnector::new(graph.clone())));
+        {
+            let mut st = self.state_mut();
+            let v = st.connectors.entry("facebook".into()).or_insert_with(crate::state::ConnectorView::off);
+            v.account = Some(crate::state::AccountView {
+                name: account.display_name.clone(),
+                avatar_url: account.avatar_url.clone(),
+            });
+            // Comments are asked for, not pushed: connected means the Page is signed in.
+            v.state = "connected".into();
+            v.detail = None;
+        }
+        // Open dashboards (and a waiting "Connect Facebook" dialog) learn it now, not on reload.
+        let view = self.state().connectors.clone();
+        self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": view })));
+        let handle = tokio::spawn(ferrocast_facebook::feed::run(graph, self.sink(), None));
+        if let Some(old) =
+            self.inner.adapters.lock().unwrap_or_else(|p| p.into_inner()).insert(Platform::Facebook, handle)
+        {
+            old.abort();
+        }
     }
 
     async fn connect_youtube(&self) -> Result<ConnectFlow, EngineError> {

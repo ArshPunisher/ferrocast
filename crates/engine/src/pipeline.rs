@@ -425,7 +425,9 @@ impl Engine {
 
         // Only live chat from this channel gets answers: replayed history and Shared Chat
         // messages from a partner channel never make the bot speak (R-11).
-        if bot_on && e.origin == Origin::Live && e.channel.is_none() {
+        // Facebook has no bot: a Page comment gets no command answer, auto-reply or welcome (the
+        // notes promise it, and a reply there would be a public comment as the Page).
+        if bot_on && e.origin == Origin::Live && e.channel.is_none() && Platform::CHAT.contains(&e.platform) {
             if content.text.trim_start().starts_with('!') {
                 if self.answer_studio_command(e).await || self.answer_points_command(e).await {
                     return Moderated::Shown;
@@ -680,6 +682,7 @@ fn platform_label(p: Platform) -> &'static str {
         Platform::Twitch => "Twitch",
         Platform::Youtube => "YouTube",
         Platform::Kick => "Kick",
+        Platform::Facebook => "Facebook",
         Platform::Tips => "Tips",
         Platform::Ferrocast => "Ferrocast",
     }

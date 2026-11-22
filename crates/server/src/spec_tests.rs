@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use axum::body::Body as AxumBody;
 use axum::http::{Method, Request, StatusCode};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use super::*;
@@ -400,4 +400,37 @@ fn the_moderation_schemas_are_what_the_handlers_and_the_client_send() {
         op(o, "/mod/ban", "post")["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
         "#/components/schemas/BanResult"
     );
+}
+
+#[test]
+fn the_schedule_routes_and_a_destinations_brand_are_described() {
+    let o = spec::openapi();
+    let post = &o["paths"]["/api/v1/schedule"]["post"];
+    // The route answers 201 and takes a body: the spec says so (it said 200 and no body).
+    assert!(post["responses"].get("201").is_some(), "{}", post["responses"]);
+    assert!(post["responses"].get("200").is_none());
+    assert_eq!(
+        post["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/ScheduleCreate"
+    );
+    let list = &o["paths"]["/api/v1/schedule"]["get"]["responses"]["200"]["content"]["application/json"]["schema"];
+    assert_eq!(list["$ref"], "#/components/schemas/ScheduleList");
+    let schemas = &o["components"]["schemas"];
+    for name in ["ScheduleCreate", "ScheduledStream", "ScheduleList", "GoLiveDestinationCreate"] {
+        assert!(schemas.get(name).is_some(), "{name} is not described");
+    }
+    assert_eq!(schemas["ScheduleCreate"]["properties"]["remind_minutes"]["maximum"], 1440);
+    // The brand a pasted server can carry is in the request.
+    let dest =
+        &o["paths"]["/api/v1/golive/destinations"]["post"]["requestBody"]["content"]["application/json"]["schema"];
+    assert_eq!(dest["$ref"], "#/components/schemas/GoLiveDestinationCreate");
+    assert_eq!(
+        schemas["GoLiveDestinationCreate"]["properties"]["brand"]["enum"],
+        json!(["x", "instagram", "facebook"])
+    );
+    // SRT, RIST and WHIP servers need no key, so it is not required of every request.
+    let required = schemas["GoLiveDestinationCreate"]["required"].as_array().unwrap();
+    assert!(!required.iter().any(|r| r == "key"), "{required:?}");
+    // A stream's category is `{ name, ids? }`, not a string.
+    assert_eq!(schemas["ScheduleCreate"]["properties"]["info"]["properties"]["category"]["type"][0], "object");
 }

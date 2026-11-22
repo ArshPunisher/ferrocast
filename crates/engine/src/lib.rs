@@ -395,6 +395,7 @@ impl Engine {
         tokio::spawn(pipeline::run(engine.clone(), rx));
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
+        tokio::spawn(schedule::run(engine.clone()));
         tokio::spawn(automation::run(engine.clone()));
         tokio::spawn(loyalty::run(engine.clone()));
         tokio::spawn(polls::run(engine.clone()));
@@ -748,6 +749,7 @@ pub fn platform_key(p: Platform) -> &'static str {
         Platform::Twitch => "twitch",
         Platform::Youtube => "youtube",
         Platform::Kick => "kick",
+        Platform::Facebook => "facebook",
         Platform::Tips => "tips",
         Platform::Ferrocast => "ferrocast",
     }
@@ -771,12 +773,17 @@ fn load_state(store: &Store) -> Result<(State, AlertQueue), StoreError> {
         welcome: get_or_default(store, "welcome")?,
         ..State::default()
     };
-    for key in ["twitch", "youtube", "kick", "obs", "relay"] {
+    for key in ["twitch", "youtube", "kick", "facebook", "obs", "relay"] {
         st.connectors.insert(key.into(), ConnectorView::off());
     }
     let queue = repo::rules::load_queue(store)?.unwrap_or_default();
     Ok((st, queue))
 }
 
+#[cfg(test)]
+mod facebook_tests;
+pub mod schedule;
+#[cfg(test)]
+mod schedule_tests;
 #[cfg(test)]
 mod tests;

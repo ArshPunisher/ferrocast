@@ -168,6 +168,13 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     /// one key per channel ignore it.
     fn set_vertical_keys(&self, _keys: Vec<String>) {}
 
+    /// Creates a broadcast for `start_ms` (Unix ms) on the platform, so viewers can find it and
+    /// be reminded, where the platform has scheduled broadcasts (YouTube, Facebook). It never
+    /// goes live by itself: going live stays the streamer's own Go live.
+    async fn schedule_broadcast(&self, _info: &StreamInfo, _start_ms: i64) -> Result<ScheduledBroadcast> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "schedule a broadcast" })
+    }
+
     /// Where an upright (vertical) stream goes, made by Ferrocast when needed (YouTube Shorts
     /// live). Platforms with one live per channel don't have one.
     async fn vertical_ingest(&self) -> Result<Ingest> {
@@ -196,6 +203,13 @@ impl std::fmt::Debug for Ingest {
 }
 
 pub use ferrocast_core::stream_info::StreamInfo;
+
+/// A broadcast made for a later time: the platform's id for it and a link to it, when there is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledBroadcast {
+    pub id: String,
+    pub url: Option<String>,
+}
 
 /// One category search result.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]

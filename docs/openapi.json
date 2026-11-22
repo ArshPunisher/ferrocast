@@ -840,6 +840,45 @@
         ],
         "type": "object"
       },
+      "GoLiveDestinationCreate": {
+        "properties": {
+          "brand": {
+            "description": "Names a server and key pasted from that platform; changes nothing about how the stream is sent.",
+            "enum": [
+              "x",
+              "instagram",
+              "facebook"
+            ],
+            "type": "string"
+          },
+          "canvas": {
+            "enum": [
+              "main",
+              "vertical"
+            ],
+            "type": "string"
+          },
+          "key": {
+            "description": "No spaces. Never returned. Needed for RTMP and RTMPS; optional for SRT (stream id), RIST (passphrase) and WebRTC (bearer token).",
+            "maxLength": 512,
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 40,
+            "minLength": 1,
+            "type": "string"
+          },
+          "url": {
+            "description": "rtmp://, rtmps://, srt://, rist:// or https:// (WebRTC WHIP).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "url"
+        ],
+        "type": "object"
+      },
       "ModBanRequest": {
         "properties": {
           "everywhere": {
@@ -1003,6 +1042,176 @@
         },
         "required": [
           "token"
+        ],
+        "type": "object"
+      },
+      "ScheduleCreate": {
+        "properties": {
+          "info": {
+            "description": "What the stream is about. `title` is required (at most 140 characters, no control characters).",
+            "properties": {
+              "category": {
+                "description": "`{ name, ids? }`: the category's name and, where known, each platform's id.",
+                "properties": {
+                  "ids": {
+                    "type": "object"
+                  },
+                  "name": {
+                    "maxLength": 100,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "description": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "language": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "tags": {
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "title": {
+                "maxLength": 140,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "title"
+            ],
+            "type": "object"
+          },
+          "platforms": {
+            "items": {
+              "enum": [
+                "twitch",
+                "youtube",
+                "kick",
+                "facebook"
+              ],
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "remind_minutes": {
+            "default": 10,
+            "maximum": 1440,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "start_ms": {
+            "description": "Unix milliseconds: in the future, at most a year ahead.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "info",
+          "platforms",
+          "start_ms"
+        ],
+        "type": "object"
+      },
+      "ScheduleList": {
+        "properties": {
+          "streams": {
+            "items": {
+              "$ref": "#/components/schemas/ScheduledStream"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "streams"
+        ],
+        "type": "object"
+      },
+      "ScheduledStream": {
+        "properties": {
+          "broadcasts": {
+            "items": {
+              "properties": {
+                "id": {
+                  "description": "The platform's id for the scheduled broadcast, when one was made.",
+                  "type": "string"
+                },
+                "note": {
+                  "description": "Why there is no broadcast: not connected, none to make there, or the platform said no.",
+                  "type": "string"
+                },
+                "platform": {
+                  "type": "string"
+                },
+                "url": {
+                  "description": "An https address of it, when the platform gave one.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "platform"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "info": {
+            "type": "object"
+          },
+          "platforms": {
+            "items": {
+              "enum": [
+                "twitch",
+                "youtube",
+                "kick",
+                "facebook"
+              ],
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "remind_minutes": {
+            "type": "integer"
+          },
+          "reminded": {
+            "type": "boolean"
+          },
+          "start_ms": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "info",
+          "platforms",
+          "start_ms",
+          "remind_minutes",
+          "reminded",
+          "broadcasts"
         ],
         "type": "object"
       },
@@ -8576,10 +8785,11 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object"
+                "$ref": "#/components/schemas/GoLiveDestinationCreate"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
@@ -8631,7 +8841,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Add a custom RTMP/SRT destination with stream key (PC only).",
+        "summary": "Add a custom RTMP/SRT destination with stream key (PC only). Optional brand (x, instagram, facebook) names a server and key pasted from that platform.",
         "tags": [
           "Go Live"
         ],
@@ -20343,6 +20553,191 @@
         "summary": "Generate an AI summary for a completed stream.",
         "tags": [
           "Core"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/schedule": {
+      "get": {
+        "operationId": "get_schedule",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleList"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Planned streams, soonest first, with the scheduled broadcasts made for them.",
+        "tags": [
+          "Go Live"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      },
+      "post": {
+        "operationId": "post_schedule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduledStream"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Plan a stream: title, category, platforms and start time. Makes scheduled broadcasts where a platform has them (YouTube, Facebook), reminds before the start, never goes live by itself. 201; 400 names the field, 409 over 50 plans.",
+        "tags": [
+          "Go Live"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/schedule/{id}": {
+      "delete": {
+        "operationId": "delete_schedule__id_",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success (no content)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove a planned stream (broadcasts already made on a platform stay there).",
+        "tags": [
+          "Go Live"
         ],
         "x-ferrocast-scopes": [],
         "x-pc-only": true

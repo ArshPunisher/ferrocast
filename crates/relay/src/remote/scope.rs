@@ -138,6 +138,10 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Clips are files on the PC: browsing, editing, deleting and sending them to YouTube stay here.
     ("*", "/clips"),
     ("*", "/clips/**"),
+    // Planning a stream spends YouTube quota and makes broadcasts on the platforms (the OpenAPI
+    // spec says x-pc-only): the PC only.
+    ("*", "/schedule"),
+    ("*", "/schedule/**"),
 ];
 
 /// The dashboard API's routes with a variable part, for the audit log's action names:
@@ -396,6 +400,10 @@ mod tests {
             ("DELETE", "/clips/a.mp4"),
             ("POST", "/clips/compile"),
             ("POST", "/clips/a.mp4/upload"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
         ] {
             assert!(!allowed(Role::Mod, m, p), "{m} {p}");
         }
@@ -468,6 +476,10 @@ mod tests {
             ("DELETE", "/clips/a.mp4"),
             ("POST", "/clips/compile"),
             ("POST", "/clips/a.mp4/upload"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }

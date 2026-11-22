@@ -66,7 +66,9 @@ pub(crate) const KICK_TOKENS: &str = "kick-tokens";
 impl Engine {
     pub(crate) fn relay_url(&self) -> Result<String, EngineError> {
         self.apps().relay_url.clone().ok_or_else(|| {
-            EngineError::Unavailable("This build of Ferrocast has no relay set up, so Kick and tips can't work.".into())
+            EngineError::Unavailable(
+                "This build of Ferrocast has no relay set up, so Kick, Facebook and tips can't work.".into(),
+            )
         })
     }
 
@@ -232,6 +234,22 @@ impl Engine {
                 let id = payload["message_id"].as_str().unwrap_or("");
                 let e = ferrocast_kick::map::map(ty, id, &payload["body"], Millis(now().0));
                 let _ = self.submit(e).await;
+            }
+            "facebook_connected" => {
+                let done = match ferrocast_facebook::UserGrant::from_relay(payload) {
+                    Some(grant) => self.finish_facebook(grant).await,
+                    None => Err(EngineError::Invalid(
+                        "the relay's Facebook sign-in was not in a form this app reads".into(),
+                    )),
+                };
+                if let Err(e) = done {
+                    self.notice_detail(
+                        "account:facebook",
+                        NoticeLevel::Error,
+                        "Facebook sign-in didn't finish",
+                        &e.to_string(),
+                    );
+                }
             }
             "kick_connected" => {
                 if let Err(e) = self.finish_kick(payload).await {

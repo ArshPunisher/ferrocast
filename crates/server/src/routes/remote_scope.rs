@@ -139,6 +139,10 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Clips are files on the PC: browsing, editing, deleting and sending them to YouTube stay here.
     ("*", "/clips"),
     ("*", "/clips/**"),
+    // Planning a stream spends YouTube quota and makes broadcasts on the platforms (the OpenAPI
+    // spec says x-pc-only): the PC only.
+    ("*", "/schedule"),
+    ("*", "/schedule/**"),
 ];
 
 /// One plain path segment: no `.`/`..`, no encoded `/`, `\`, `.` or NUL, nothing outside
@@ -772,6 +776,10 @@ mod tests {
             ("DELETE", "/clips/a.mp4"),
             ("POST", "/clips/compile"),
             ("POST", "/clips/a.mp4/upload"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
             ("GET", "/studio/engine/auto-config"),
             ("POST", "/studio/engine/auto-config/benchmark"),
             ("POST", "/studio/engine/auto-config/cancel"),
@@ -894,6 +902,10 @@ mod tests {
             ("DELETE", "/clips/a.mp4"),
             ("POST", "/clips/compile"),
             ("POST", "/clips/a.mp4/upload"),
+            // Planning a stream spends YouTube quota and makes broadcasts: the PC only.
+            ("GET", "/schedule"),
+            ("POST", "/schedule"),
+            ("DELETE", "/schedule/s1"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }

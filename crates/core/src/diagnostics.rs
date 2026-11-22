@@ -1465,9 +1465,12 @@ fn collect_url_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
                     if let Some(key_slash_rel) = body[host_slash + 1..trimmed_end].find('/') {
                         let key_start = host_slash + 1 + key_slash_rel + 1;
                         if key_start < trimmed_end {
+                            // The key, and for the ingest URLs of Facebook and Instagram the
+                            // query after it (`?ds=1&s_l=1&a=<auth token>`) too.
+                            let end = if is_rtmp_or_stream { url_len } else { trimmed_end };
                             spans.push(SensitiveSpan {
                                 start: scheme_end + key_start,
-                                end: scheme_end + trimmed_end,
+                                end: scheme_end + end,
                                 kind: SpanKind::Secret,
                                 bracketed: false,
                             });
@@ -2085,6 +2088,19 @@ mod tests {
             disk_free_mb: Some(120_000),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn facebook_and_instagram_stream_urls_lose_their_query_tokens_and_a_page_token_goes() {
+        let fb = "rtmps://live-api-s.facebook.com:443/rtmp/FB-123-0-KEYSECRET?ds=1&s_l=1&a=AUTHTOKEN9";
+        let ig = "rtmps://edgetee-upload-fra5.facebook.com:443/rtmp/17abcSTREAMID?s_sw=0&s_vt=ig&a=IGAUTH77";
+        let out = redact_text(&format!("push {fb} then {ig} done. token EAAGm0PX4ZCpsBAPageToken01 end"), &[], &[]);
+        for secret in ["KEYSECRET", "AUTHTOKEN9", "17abcSTREAMID", "IGAUTH77", "EAAGm0PX4ZCpsBAPageToken01"] {
+            assert!(!out.contains(secret), "{secret} survived in {out}");
+        }
+        // What is around them stays readable, and the host is kept for support.
+        assert!(out.contains("push") && out.contains("then") && out.contains("done."), "{out}");
+        assert!(out.contains("live-api-s.facebook.com"), "{out}");
     }
 
     #[test]

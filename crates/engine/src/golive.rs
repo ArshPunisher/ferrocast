@@ -82,7 +82,14 @@ pub struct DestinationConfig {
     /// Twitch asks for and sends them all to Twitch in one stream. Twitch, main picture only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enhanced: bool,
+    /// A custom server made for a platform whose key is made in its own app: `x`, `instagram` or
+    /// `facebook` (the dashboard shows its name and icon). Display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<String>,
 }
+
+/// Platforms that can be added as a pasted server and key.
+pub const PASTE_BRANDS: &[&str] = &["x", "instagram", "facebook"];
 
 impl DestinationConfig {
     /// Takes the lighter stream (the main picture, an RTMP platform).
@@ -325,6 +332,7 @@ impl Default for GoLiveConfig {
             canvas: Canvas::Main,
             light: false,
             enhanced: false,
+            brand: None,
         };
         Self {
             destinations: vec![
@@ -474,6 +482,10 @@ pub struct DestinationView {
     pub health: Option<Health>,
     /// Why this destination can't start (no account, a missing permission), in words.
     pub blocked: Option<String>,
+    /// A server and key pasted from X, Instagram or Facebook (`x`, `instagram`, `facebook`): the
+    /// dashboard names and marks it. Left out when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<String>,
     /// Its rules broken by the stream OBS is sending (kept in sync with `issues` for older clients).
     pub rules: Vec<String>,
     /// Structured rules broken by the active stream (Contract C-2).
@@ -1230,6 +1242,7 @@ impl Engine {
                         .or_else(|| paused.get(&d.id).cloned())
                         .or_else(|| failed.get(&d.id).cloned()),
                     blocked: blocked.get(&d.id).cloned(),
+                    brand: d.brand.clone(),
                     rules,
                     issues,
                     capped,
@@ -1918,6 +1931,24 @@ impl Engine {
         key: &str,
         canvas: Canvas,
     ) -> Result<DestinationConfig, EngineError> {
+        self.add_golive_destination_branded(name, url, key, canvas, None).await
+    }
+
+    /// Like `add_golive_destination`, for a server the streamer pasted from X, Instagram or
+    /// Facebook (`brand`), so the dashboard can name it.
+    pub async fn add_golive_destination_branded(
+        &self,
+        name: &str,
+        url: &str,
+        key: &str,
+        canvas: Canvas,
+        brand: Option<&str>,
+    ) -> Result<DestinationConfig, EngineError> {
+        if let Some(b) = brand
+            && !PASTE_BRANDS.contains(&b)
+        {
+            return Err(EngineError::Invalid(format!("brand: one of {}, or none.", PASTE_BRANDS.join(", "))));
+        }
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 40 || name.chars().any(char::is_control) {
             return Err(EngineError::Invalid("name: 1 to 40 characters.".into()));
@@ -1975,6 +2006,7 @@ impl Engine {
             canvas,
             light: false,
             enhanced: false,
+            brand: brand.map(String::from),
         };
         cfg.destinations.push(d.clone());
         self.save_golive(cfg).await?;

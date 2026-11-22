@@ -2294,6 +2294,7 @@ dependencies = [
  "fastrand",
  "ferrocast-connector",
  "ferrocast-core",
+ "ferrocast-facebook",
  "ferrocast-golive",
  "ferrocast-kick",
  "ferrocast-obs",
@@ -2328,6 +2329,25 @@ dependencies = [
  "wasmi",
  "wat",
  "zip",
+]
+
+[[package]]
+name = "ferrocast-facebook"
+version = "3.4.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "ferrocast-connector",
+ "ferrocast-core",
+ "getrandom 0.4.3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
