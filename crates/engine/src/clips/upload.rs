@@ -5,6 +5,8 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ferrocast_connector::{ConnectorError, UploadSource, VideoUpload};
 use ferrocast_core::event::Platform;
@@ -19,6 +21,8 @@ pub const QUOTA_UNITS: u32 = 1600;
 /// A Short is square or tall and at most this long (YouTube raised it from 60 s to 3 minutes in
 /// October 2024).
 pub const SHORTS_MAX_MS: u64 = 180_000;
+/// The size of a piece sent to YouTube (the youtube crate's own).
+const PIECE: u64 = 8 * 1024 * 1024;
 const MAX_TITLE: usize = 100;
 const MAX_DESCRIPTION_BYTES: usize = 5000;
 const MAX_TAGS: usize = 30;
@@ -207,6 +211,14 @@ impl Engine {
     pub async fn upload_clip(&self, id: &str, req: UploadReq) -> Result<JobView, EngineError> {
         let req = check(&req)?;
         let path = self.clip_path(id).await?;
+        // The file picked now is the file sent: it is held open from here, so a clip renamed or
+        // replaced by another of the same name while the job waits is not sent under these details.
+        let mut source = {
+            let p = path.clone();
+            tokio::task::spawn_blocking(move || FileSource::open(&p))
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))??
+        };
         let yt = self
             .connector(Platform::Youtube)
             .ok_or_else(|| describe(ConnectorError::NotConnected(Platform::Youtube)))?;
@@ -236,13 +248,31 @@ impl Engine {
         let label =
             format!("Upload {}", path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
         Ok(self.start_clip_job(JobKind::Upload, label, move |ctx| async move {
-            let mut source = FileSource::open(&path)?;
             let c2 = ctx.clone();
-            let progress =
-                move |sent: u64, total: u64| c2.progress(if total == 0 { 0.0 } else { sent as f32 / total as f32 });
+            // Whether the last piece is on its way (or the only one): from then on a stop can't tell
+            // whether YouTube has the video.
+            let last_piece = Arc::new(AtomicBool::new(false));
+            let lp = last_piece.clone();
+            let progress = move |sent: u64, total: u64| {
+                if total.saturating_sub(sent) <= PIECE {
+                    lp.store(true, Ordering::SeqCst);
+                }
+                c2.progress(if total == 0 { 0.0 } else { sent as f32 / total as f32 });
+            };
             let sent = tokio::select! {
                 r = yt.upload_video(&meta, &mut source, &progress) => r.map_err(describe)?,
-                () = ctx.cancel.wait() => return Err(super::jobs::cancelled()),
+                // Stopped while a piece was on its way: if it was the last, YouTube may have the
+                // video already, and nothing here can know.
+                () = ctx.cancel.wait() => {
+                    return Err(if last_piece.load(Ordering::SeqCst) {
+                        super::jobs::cancelled_with(
+                            "Stopped near the end.",
+                            "YouTube may already have the video. Check YouTube Studio before sending it again.",
+                        )
+                    } else {
+                        super::jobs::cancelled()
+                    });
+                }
             };
             let link = if shorts {
                 format!("https://www.youtube.com/shorts/{sent}")

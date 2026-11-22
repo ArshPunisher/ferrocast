@@ -794,7 +794,8 @@ impl Api {
         let session = self.open_upload(meta, total).await?;
         let mut offset = 0u64;
         let mut token = self.access().await?;
-        let mut failures = 0u32;
+        // In a row, each: failed pieces (the line or a 5xx), pieces YouTube took none of, sign-ins refreshed.
+        let (mut failures, mut stalls, mut refreshes) = (0u32, 0u32, 0u32);
         progress(0, total);
         loop {
             let want = UPLOAD_CHUNK.min((total - offset) as usize);
@@ -822,7 +823,14 @@ impl Api {
                         return Err(YoutubeError::network(e));
                     }
                     tokio::time::sleep(upload_backoff(failures)).await;
-                    offset = self.upload_resume_point(&session, &token, total).await.unwrap_or(offset);
+                    match self.upload_status(&session, &token, total).await {
+                        Some(UploadStatus::Done(id)) => {
+                            progress(total, total);
+                            return Ok(id);
+                        }
+                        Some(UploadStatus::Resume(at)) => offset = at,
+                        None => {}
+                    }
                     continue;
                 }
             };
@@ -830,7 +838,15 @@ impl Api {
             match status {
                 200 | 201 => {
                     progress(total, total);
-                    let body: Value = res.json().await.map_err(YoutubeError::network)?;
+                    let body: Value = match res.json().await {
+                        Ok(b) => b,
+                        // The last piece was taken but its answer was cut off: YouTube repeats the
+                        // answer to a status question, so the video is not lost track of.
+                        Err(e) => match self.upload_status(&session, &token, total).await {
+                            Some(UploadStatus::Done(id)) => return Ok(id),
+                            _ => return Err(YoutubeError::network(e)),
+                        },
+                    };
                     return body
                         .get("id")
                         .and_then(Value::as_str)
@@ -838,7 +854,6 @@ impl Api {
                         .ok_or_else(|| YoutubeError::Protocol("YouTube didn't say the new video's id".into()));
                 }
                 308 => {
-                    failures = 0;
                     // "Range: bytes=0-N": YouTube has the first N+1 bytes (none: no header).
                     let had = res
                         .headers()
@@ -848,12 +863,26 @@ impl Api {
                         .and_then(|n| n.trim().parse::<u64>().ok())
                         .map_or(0, |n| n + 1);
                     // It can't have more than was sent, and never goes backwards past progress made.
-                    offset = had.min(offset + want as u64).max(offset);
+                    let next = had.min(offset + want as u64).max(offset);
+                    if next == offset {
+                        // Took nothing of the piece: tried again a few times, then said.
+                        stalls += 1;
+                        if stalls > UPLOAD_RETRIES {
+                            return Err(YoutubeError::Refused(
+                                "YouTube isn't taking the file right now; try again later".into(),
+                            ));
+                        }
+                        tokio::time::sleep(upload_backoff(stalls)).await;
+                    } else {
+                        (failures, stalls, refreshes) = (0, 0, 0);
+                    }
+                    offset = next;
                     progress(offset, total);
                 }
                 401 => {
-                    failures += 1;
-                    if failures > 1 {
+                    // Its own count: a piece that failed before doesn't use up the one refresh.
+                    refreshes += 1;
+                    if refreshes > 1 {
                         return Err(YoutubeError::SignInNeeded);
                     }
                     token = self.refresh_after_401(&token).await?;
@@ -864,7 +893,14 @@ impl Api {
                         return Err(YoutubeError::Refused(format!("YouTube kept answering {status}; try again later")));
                     }
                     tokio::time::sleep(upload_backoff(failures)).await;
-                    offset = self.upload_resume_point(&session, &token, total).await.unwrap_or(offset);
+                    match self.upload_status(&session, &token, total).await {
+                        Some(UploadStatus::Done(id)) => {
+                            progress(total, total);
+                            return Ok(id);
+                        }
+                        Some(UploadStatus::Resume(at)) => offset = at,
+                        None => {}
+                    }
                 }
                 _ => return Err(YoutubeError::from_response(res).await),
             }
@@ -925,8 +961,9 @@ impl Api {
         Err(YoutubeError::SignInNeeded)
     }
 
-    /// How much of the file YouTube has (asks with an empty range).
-    async fn upload_resume_point(&self, session: &str, token: &str, total: u64) -> Option<u64> {
+    /// Asks the session where it stands (an empty range): how much YouTube has, or, when it has
+    /// all of it, the answer it gave for the whole (the new video).
+    async fn upload_status(&self, session: &str, token: &str, total: u64) -> Option<UploadStatus> {
         let res = self
             .http
             .put(session)
@@ -937,14 +974,18 @@ impl Api {
             .await
             .ok()?;
         match res.status().as_u16() {
-            308 => Some(
+            308 => Some(UploadStatus::Resume(
                 res.headers()
                     .get(reqwest::header::RANGE)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.rsplit('-').next())
                     .and_then(|n| n.trim().parse::<u64>().ok())
                     .map_or(0, |n| n + 1),
-            ),
+            )),
+            200 | 201 => {
+                let body: Value = res.json().await.ok()?;
+                body.get("id").and_then(Value::as_str).map(|id| UploadStatus::Done(id.to_string()))
+            }
             _ => None,
         }
     }
@@ -992,6 +1033,14 @@ pub(crate) const UPLOAD_CHUNK_FOR_TEST: usize = UPLOAD_CHUNK;
 #[cfg(test)]
 pub(crate) fn upload_host_ok_for_test(url: &str, api: &str) -> bool {
     upload_host_ok(url, api)
+}
+
+/// Where an upload session stands.
+enum UploadStatus {
+    /// YouTube has this many bytes.
+    Resume(u64),
+    /// YouTube has it all: the new video's id.
+    Done(String),
 }
 
 /// An upload goes in pieces of this size (a multiple of 256 KB, as YouTube asks).

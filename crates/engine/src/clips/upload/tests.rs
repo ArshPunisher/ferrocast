@@ -74,6 +74,8 @@ struct Seen {
     ranges: Vec<String>,
     body_bytes: usize,
     open_status: u16,
+    /// How long the piece's answer is held back (a stop test).
+    hold_ms: u64,
 }
 
 /// A fake YouTube: the token and upload endpoints, nothing else. The owner's real account is never
@@ -107,6 +109,10 @@ async fn mock(seen: Arc<Mutex<Seen>>) -> (tempfile::TempDir, Engine) {
             axum::routing::put(move |h: HeaderMap, body: axum::body::Bytes| {
                 let s = s2.clone();
                 async move {
+                    let hold = s.lock().unwrap().hold_ms;
+                    if hold > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+                    }
                     let mut s = s.lock().unwrap();
                     s.ranges.push(h.get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("").to_string());
                     s.body_bytes += body.len();
@@ -247,4 +253,52 @@ async fn a_short_must_be_square_or_tall_and_short_enough() {
     assert_eq!(done.state, JobState::Done, "{:?}", done.error);
     assert_eq!(done.link.as_deref(), Some("https://www.youtube.com/shorts/vid42"));
     assert!(seen.lock().unwrap().opened[0]["snippet"]["description"].as_str().unwrap().contains("#Shorts"));
+}
+
+#[tokio::test]
+async fn the_file_picked_is_the_file_sent_even_if_another_takes_its_name_meanwhile() {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let (_d, e) = mock(seen.clone()).await;
+    let clips = tempfile::tempdir().unwrap();
+    e.set_clips_folder_for_test(Some(clips.path().to_path_buf()));
+    std::fs::write(clips.path().join("a.mp4"), vec![1u8; 1234]).unwrap();
+    // Another job holds the line, so the upload waits its turn.
+    let blocker = e.start_clip_job(crate::clips::jobs::JobKind::Trim, "block".into(), |ctx| async move {
+        ctx.cancel.wait().await;
+        Err(crate::clips::jobs::cancelled())
+    });
+    let job = e.upload_clip("a.mp4", req()).await.unwrap();
+    // A different clip is saved under the same name while it waits.
+    std::fs::remove_file(clips.path().join("a.mp4")).unwrap();
+    std::fs::write(clips.path().join("a.mp4"), vec![2u8; 999]).unwrap();
+    assert_eq!(e.clip_job(&job.id).unwrap().state, JobState::Queued);
+    e.cancel_clip_job(&blocker.id).unwrap();
+    let done = finished(&e, &job.id).await;
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+    assert_eq!(seen.lock().unwrap().body_bytes, 1234, "the original went, not the replacement");
+}
+
+#[tokio::test]
+async fn stopping_an_upload_near_its_end_says_youtube_may_have_it() {
+    let seen = Arc::new(Mutex::new(Seen { hold_ms: 5000, ..Seen::default() }));
+    let (_d, e) = mock(seen.clone()).await;
+    let clips = tempfile::tempdir().unwrap();
+    e.set_clips_folder_for_test(Some(clips.path().to_path_buf()));
+    std::fs::write(clips.path().join("a.mp4"), vec![9u8; 5000]).unwrap();
+    let job = e.upload_clip("a.mp4", req()).await.unwrap();
+    // The only piece (a small file) is on its way and the answer is held back.
+    for _ in 0..100 {
+        if !seen.lock().unwrap().opened.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    e.cancel_clip_job(&job.id).unwrap();
+    let done = finished(&e, &job.id).await;
+    assert_eq!(done.state, JobState::Cancelled);
+    let note = done.error.expect("a note");
+    assert_eq!(note.message, "Stopped near the end.");
+    assert!(note.hint.contains("YouTube Studio"));
+    assert!(done.link.is_none());
 }

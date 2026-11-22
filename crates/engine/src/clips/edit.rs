@@ -106,8 +106,11 @@ pub fn compile_graph(pieces: &[Piece], w: u32, h: u32, fade_s: f32, normalize: b
             "[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v{i}];"
         );
         if p.has_audio {
+            // Padded and cut to the picture's length, so each sound ends where its picture does and
+            // the crossfade of the two lines up (a clip whose sound is short or long would drift).
             g += &format!(
-                "[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[a{i}];"
+                "[{i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=0:{},asetpts=PTS-STARTPTS[a{i}];",
+                p.duration_ms as f64 / 1000.0
             );
         } else {
             g += &format!(
@@ -441,7 +444,6 @@ impl Engine {
         let path = self.clip_path(id).await?;
         let srt = srt_beside(&path);
         let text = render_srt(&cues);
-        let part = srt.with_extension("srt.part");
         tokio::task::spawn_blocking(move || -> Result<(), EngineError> {
             // Not through a link someone put there.
             if std::fs::symlink_metadata(&srt).is_ok_and(|m| !m.file_type().is_file()) {
@@ -452,11 +454,7 @@ impl Engine {
                     "Delete it and try again.",
                 ));
             }
-            std::fs::write(&part, text).map_err(|e| EngineError::Internal(e.to_string()))?;
-            std::fs::rename(&part, &srt).map_err(|e| {
-                let _ = std::fs::remove_file(&part);
-                EngineError::Internal(e.to_string())
-            })
+            write_new_then_rename(&srt, text.as_bytes()).map_err(|e| EngineError::Internal(e.to_string()))
         })
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))??;
@@ -544,6 +542,31 @@ impl Engine {
             Ok(Made { output: Some(format!("{stem}.mp4")) })
         }))
     }
+}
+
+/// Writes `bytes` to a file of its own beside `target` (made new, so it can't be a link someone
+/// left, and two saves never share one) and renames it over `target`.
+fn write_new_then_rename(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for _ in 0..100 {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let part = target.with_file_name(format!("{name}.{}-{n}.part", std::process::id()));
+        let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            other => other?,
+        };
+        let written = f.write_all(bytes).and_then(|()| f.sync_all());
+        drop(f);
+        let done = written.and_then(|()| std::fs::rename(&part, target));
+        if done.is_err() {
+            let _ = std::fs::remove_file(&part);
+        }
+        return done;
+    }
+    Err(std::io::Error::other("couldn't make a file to write the captions in"))
 }
 
 fn now_nanos() -> u32 {

@@ -2117,6 +2117,12 @@ struct UploadLog {
     /// Where the session address points ("" = this server).
     location: String,
     seen_auth: Vec<String>,
+    /// The final piece's answer is cut off (a body that isn't JSON), though YouTube took it.
+    cut_final: bool,
+    completed: bool,
+    /// Answers 308 with no Range header, forever (a server that takes nothing).
+    take_nothing: bool,
+    token_hits: usize,
 }
 
 /// A fake resumable-upload server: opens a session, takes pieces, answers 308 until the end.
@@ -2124,7 +2130,18 @@ async fn fake_upload(log: Arc<Mutex<UploadLog>>) -> Endpoints {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     let base_cell = Arc::new(Mutex::new(String::new()));
     let (l1, l2, b1, b2) = (log.clone(), log.clone(), base_cell.clone(), base_cell.clone());
+    let l3 = log.clone();
     let app = axum::Router::new()
+        .route(
+            "/token",
+            axum::routing::post(move || {
+                let l = l3.clone();
+                async move {
+                    l.lock().unwrap().token_hits += 1;
+                    axum::Json(json!({ "access_token": "fresh", "refresh_token": "refresh-0", "expires_in": 3600 }))
+                }
+            }),
+        )
         .route(
             "/api/upload/videos",
             axum::routing::post(
@@ -2167,13 +2184,20 @@ async fn fake_upload(log: Arc<Mutex<UploadLog>>) -> Endpoints {
                     let range = h.get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                     l.seen_auth.push(h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string());
                     l.ranges.push(range.clone());
-                    if !l.fail_next.is_empty() {
+                    // Failures are for pieces; a question about where it stands is always answered.
+                    if !range.starts_with("bytes */") && !l.fail_next.is_empty() {
                         let s = l.fail_next.remove(0);
                         return (StatusCode::from_u16(s).unwrap(), HeaderMap::new(), "{}".to_string());
                     }
                     let mut out = HeaderMap::new();
+                    if l.take_nothing {
+                        return (StatusCode::PERMANENT_REDIRECT, out, String::new());
+                    }
                     // "bytes */N": a question about how much is there.
                     if range.starts_with("bytes */") {
+                        if l.completed {
+                            return (StatusCode::OK, out, "{\"id\":\"vid-new\"}".to_string());
+                        }
                         if l.got > 0 {
                             out.insert("range", HeaderValue::from_str(&format!("bytes=0-{}", l.got - 1)).unwrap());
                         }
@@ -2186,6 +2210,10 @@ async fn fake_upload(log: Arc<Mutex<UploadLog>>) -> Endpoints {
                     assert_eq!(body.len(), b - a + 1);
                     l.got = b + 1;
                     if b + 1 == total {
+                        if l.cut_final {
+                            l.completed = true;
+                            return (StatusCode::OK, out, "{\"id\":".to_string());
+                        }
                         (StatusCode::OK, out, "{\"id\":\"vid-new\"}".to_string())
                     } else {
                         out.insert("range", HeaderValue::from_str(&format!("bytes=0-{b}")).unwrap());
@@ -2317,4 +2345,36 @@ async fn the_file_and_sign_in_only_go_to_youtubes_upload_host() {
         "https://www.googleapis.com/youtube/v3"
     ));
     assert!(!super::api::upload_host_ok_for_test("file:///etc/passwd", "https://www.googleapis.com/youtube/v3"));
+}
+
+#[tokio::test]
+async fn a_server_that_takes_nothing_is_given_up_on_not_asked_forever() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().take_nothing = true;
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    assert!(matches!(err, YoutubeError::Refused(ref m) if m.contains("isn't taking")), "{err:?}");
+    // The first try and the retries, a handful, not a loop.
+    assert!(log.lock().unwrap().ranges.len() <= 6, "{:?}", log.lock().unwrap().ranges);
+}
+
+#[tokio::test]
+async fn a_cut_off_answer_to_the_last_piece_still_finds_the_new_video() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().cut_final = true;
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    assert!(log.lock().unwrap().ranges.iter().any(|r| r.starts_with("bytes */")), "it asked the session");
+}
+
+#[tokio::test]
+async fn a_failed_piece_does_not_use_up_the_one_sign_in_refresh() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    // The piece fails (503), its retry is told the sign-in ran out (401), then goes through.
+    log.lock().unwrap().fail_next = vec![503, 401];
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    assert_eq!(log.lock().unwrap().token_hits, 1, "the sign-in was refreshed");
 }

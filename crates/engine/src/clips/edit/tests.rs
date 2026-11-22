@@ -42,6 +42,8 @@ fn a_compilation_joins_with_a_cut_or_a_crossfade_and_one_loudness() {
     assert!(cut.contains("concat=n=2:v=1:a=1") && !cut.contains("xfade") && !cut.contains("loudnorm"));
     // The clip with no sound gets silence, so the joins line up.
     assert!(cut.contains("anullsrc") && cut.contains("[1:v]scale=1280:720"));
+    // A sound is padded and cut to its picture's length, so a short or long one can't drift the fade.
+    assert!(cut.contains("apad,atrim=0:4,"), "{cut}");
     let (fade, total) = compile_graph(&two, 1280, 720, 0.5, true);
     assert_eq!(total, 9500);
     assert!(fade.contains("xfade=transition=fade:duration=0.5:offset=3.500") && fade.contains("acrossfade=d=0.5"));
@@ -422,4 +424,75 @@ async fn burning_captions_in_works_or_says_this_ffmpeg_cant() {
         .filter(|f| f.file_name().to_string_lossy().starts_with(&format!("ferrocast-burn-{}-", std::process::id())))
         .collect();
     assert!(work.is_empty(), "the work folder is removed");
+}
+
+#[test]
+fn two_saves_at_once_never_share_a_file_and_leave_none_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("a.srt");
+    let handles: Vec<_> = (0..16)
+        .map(|i| {
+            let t = target.clone();
+            std::thread::spawn(move || write_new_then_rename(&t, format!("write {i}\n").repeat(500).as_bytes()))
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap().unwrap();
+    }
+    let text = std::fs::read_to_string(&target).unwrap();
+    // Whole: one writer's text, never a mix.
+    let first = text.lines().next().unwrap();
+    assert!(text.lines().all(|l| l == first) && text.lines().count() == 500, "{first}");
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|f| f.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["a.srt"], "no staging file is left");
+}
+
+#[tokio::test]
+async fn a_clip_with_short_sound_still_crossfades_to_the_right_length() {
+    let Some(ffmpeg) = ffmpeg_here() else {
+        eprintln!("SKIPPED: no ffmpeg on this machine");
+        return;
+    };
+    let (e, _d, clips) = engine().await;
+    // 4 s of picture with only 1 s of sound, then 3 s with sound.
+    let ok = std::process::Command::new(&ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=30:duration=4",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+        ])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+        .arg(clips.path().join("short-sound.mp4"))
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    make_clip(&ffmpeg, &clips.path().join("b.mp4"), 3, true, "320x240");
+    let job = e
+        .compile_clips(CompileReq {
+            clips: vec!["short-sound.mp4".into(), "b.mp4".into()],
+            crossfade_s: 1.0,
+            normalize: false,
+            name: Some("Mixed".into()),
+        })
+        .await
+        .unwrap();
+    let done = finished(&e, &job.id).await;
+    assert_eq!(done.state, JobState::Done, "{:?}", done.error);
+    let d = e.clip_probe("Mixed.mp4").await.unwrap().duration_ms.unwrap();
+    // 4 + 3 - 1 s of fade.
+    assert!((5700..=6400).contains(&d), "length {d}");
 }

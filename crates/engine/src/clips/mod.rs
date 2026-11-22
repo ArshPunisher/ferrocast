@@ -192,34 +192,48 @@ pub fn list_in(root: &Path, query: Option<&str>) -> Vec<ClipEntry> {
     let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
     let mut out: Vec<ClipEntry> = rd
         .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            if name.starts_with('.') || plain_name(&name).is_err() {
-                return None;
-            }
-            let ext = ext_of(&name)?;
-            let meta = std::fs::symlink_metadata(e.path()).ok()?;
-            if !meta.file_type().is_file() {
-                return None;
-            }
-            let stem = name[..name.len() - ext.len() - 1].to_string();
-            if q.as_ref().is_some_and(|q| !stem.to_lowercase().contains(q)) {
-                return None;
-            }
-            Some(ClipEntry {
-                kind: kind_of(&stem),
-                has_captions: srt_beside(&root.join(&name)).is_file(),
-                id: name,
-                name: stem,
-                ext: ext.into(),
-                size: meta.len(),
-                modified: meta.modified().map_or(0, ms),
-            })
-        })
+        .filter_map(|e| entry_at(root, &e.file_name().into_string().ok()?))
+        .filter(|c| q.as_ref().is_none_or(|q| c.name.to_lowercase().contains(q)))
         .collect();
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
     out.truncate(MAX_LIST);
     out
+}
+
+/// The clip named `name` in `root` as the library lists it: a plain, known video file, never a link.
+pub fn entry_at(root: &Path, name: &str) -> Option<ClipEntry> {
+    if name.starts_with('.') || plain_name(name).is_err() {
+        return None;
+    }
+    let ext = ext_of(name)?;
+    let meta = std::fs::symlink_metadata(root.join(name)).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let stem = name[..name.len() - ext.len() - 1].to_string();
+    Some(ClipEntry {
+        kind: kind_of(&stem),
+        has_captions: srt_beside(&root.join(name)).is_file(),
+        id: name.to_string(),
+        name: stem,
+        ext: ext.into(),
+        size: meta.len(),
+        modified: meta.modified().map_or(0, ms),
+    })
+}
+
+/// Whether the clip's subtitle file belongs to it alone. The file is named by the clip's name
+/// without its extension (as the vertical copies' are), so `a.mp4` and `a.mkv` would share one:
+/// then it stays with whichever is left rather than moving or going to the Trash with one.
+pub fn srt_is_exclusive(path: &Path) -> bool {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else { return true };
+    let Ok(rd) = std::fs::read_dir(dir) else { return true };
+    !rd.flatten().any(|e| {
+        let p = e.path();
+        p != path
+            && p.file_stem() == Some(stem)
+            && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| ext_of(n).is_some())
+    })
 }
 
 /// The subtitle file beside a clip.
@@ -423,19 +437,19 @@ impl Engine {
         let to = root.join(&new_id);
         let from_srt = srt_beside(&path);
         let to_srt = srt_beside(&to);
-        tokio::task::spawn_blocking(move || -> Result<(), EngineError> {
-            if new_id_equal(&path, &to) {
-                return Ok(());
+        tokio::task::spawn_blocking(move || -> Result<ClipEntry, EngineError> {
+            if path != to {
+                let own = srt_is_exclusive(&path);
+                move_without_replacing(&path, &to)?;
+                if own && from_srt.is_file() && !to_srt.exists() {
+                    let _ = move_without_replacing(&from_srt, &to_srt);
+                }
             }
-            move_without_replacing(&path, &to)?;
-            if from_srt.is_file() && !to_srt.exists() {
-                let _ = move_without_replacing(&from_srt, &to_srt);
-            }
-            Ok(())
+            // From the file itself, not the (capped) list: a clip past the 2,000th still answers.
+            entry_at(&root, &new_id).ok_or_else(no_such_clip)
         })
         .await
-        .map_err(|e| EngineError::Internal(e.to_string()))??;
-        self.clips(None).await?.into_iter().find(|c| c.id == format!("{stem}.{ext}")).ok_or_else(no_such_clip)
+        .map_err(|e| EngineError::Internal(e.to_string()))?
     }
 
     /// Moves a clip (and its subtitle file) to the Trash: never gone for good from here.
@@ -444,8 +458,10 @@ impl Engine {
         let srt = srt_beside(&path);
         let over = self.studio().clips.trash_override.lock().unwrap_or_else(|p| p.into_inner()).clone();
         tokio::task::spawn_blocking(move || -> Result<(), EngineError> {
+            // Checked before the clip goes: afterwards it no longer shares the name with anything.
+            let own = srt_is_exclusive(&path);
             trash_file(&path, over.as_deref())?;
-            if srt.is_file() {
+            if own && srt.is_file() {
                 let _ = trash_file(&srt, over.as_deref());
             }
             Ok(())
@@ -455,24 +471,29 @@ impl Engine {
     }
 }
 
-fn new_id_equal(a: &Path, b: &Path) -> bool {
-    a == b
-}
-
 /// Renames without replacing: the new name appears only if nothing is there (a hard link then
 /// the old name removed, which fails when the name is taken).
 pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> Result<(), EngineError> {
     match std::fs::hard_link(from, to) {
         Ok(()) => std::fs::remove_file(from).map_err(|e| EngineError::Internal(e.to_string())),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(name_taken()),
-        // A file system with no links (some network or exFAT shares): check, then rename.
-        Err(_) => {
-            if std::fs::symlink_metadata(to).is_ok() {
-                return Err(name_taken());
-            }
-            std::fs::rename(from, to).map_err(|e| EngineError::Internal(e.to_string()))
-        }
+        // A file system with no links (some network or exFAT shares): the name is taken first (made
+        // new, so nobody else can take it or a link into it), then the file renamed over that.
+        Err(_) => match reserve(to) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(name_taken()),
+            Err(e) => Err(EngineError::Internal(e.to_string())),
+            Ok(()) => std::fs::rename(from, to).map_err(|e| {
+                let _ = std::fs::remove_file(to);
+                EngineError::Internal(e.to_string())
+            }),
+        },
     }
+}
+
+/// Makes an empty file at `to`, failing when anything is there (a link included): the name is
+/// held until something is moved over it.
+fn reserve(to: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new().write(true).create_new(true).open(to).map(drop)
 }
 
 /// ffmpeg's text about a file, read.
@@ -521,11 +542,12 @@ pub(crate) fn trash_file(path: &Path, over: Option<&Path>) -> Result<(), EngineE
     }
     #[cfg(target_os = "windows")]
     {
-        // The Recycle Bin, through the shell's own call.
-        let script = "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($args[0], 'OnlyErrorDialogs', 'SendToRecycleBin')";
+        // The Recycle Bin, through the shell's own call. The path goes in the environment, as data:
+        // text after -Command would be part of the command, and a quote in it would run.
+        let script = "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($env:FERROCAST_CLIP_PATH, 'OnlyErrorDialogs', 'SendToRecycleBin')";
         let ok = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .arg(path)
+            .env("FERROCAST_CLIP_PATH", path)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -537,7 +559,87 @@ pub(crate) fn trash_file(path: &Path, over: Option<&Path>) -> Result<(), EngineE
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .ok_or_else(|| fail("no home folder".into()))?;
-        move_into(path, &base.join("Trash/files")).map_err(|e| fail(e.to_string()))
+        trash_freedesktop(path, &base.join("Trash")).map_err(|e| fail(e.to_string()))
+    }
+}
+
+/// The freedesktop.org Trash: the file in `files/`, and `info/<name>.trashinfo` saying where it
+/// came from, so the desktop's Trash can put it back. The info file is made first and new, which
+/// is what reserves the name.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn trash_freedesktop(path: &Path, trash: &Path) -> std::io::Result<()> {
+    let (files, info) = (trash.join("files"), trash.join("info"));
+    std::fs::create_dir_all(&files)?;
+    std::fs::create_dir_all(&info)?;
+    let abs = std::fs::canonicalize(path.parent().unwrap_or(Path::new(".")))
+        .map(|d| d.join(path.file_name().unwrap_or_default()))?;
+    let name = abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into());
+    let (stem, ext) = split_ext(&name);
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let text = format!("[Trash Info]\nPath={}\nDeletionDate={}\n", percent_path(&abs), iso_time(secs));
+    for n in 1..1000 {
+        let candidate = if n == 1 { name.clone() } else { format!("{stem} {n}{ext}") };
+        let info_file = info.join(format!("{candidate}.trashinfo"));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&info_file) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(text.as_bytes()) {
+                    let _ = std::fs::remove_file(&info_file);
+                    return Err(e);
+                }
+            }
+        }
+        match place_exclusive(path, &files.join(&candidate)) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&info_file);
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Err(std::io::Error::other("too many files with that name in the Trash"))
+}
+
+/// A path as the .trashinfo file writes it: percent-encoded, with `/` kept.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn percent_path(p: &Path) -> String {
+    let mut out = String::new();
+    for b in p.to_string_lossy().bytes() {
+        if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Unix seconds as `YYYY-MM-DDThh:mm:ss`. The spec asks for local time; UTC is what is known
+/// here without a time-zone library.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+fn iso_time(secs: u64) -> String {
+    let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
+    // Days since 1970-01-01 to a calendar date (Howard Hinnant's civil_from_days).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", rem / 3600, rem / 60 % 60, rem % 60)
+}
+
+fn split_ext(name: &str) -> (String, String) {
+    match name.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (name.to_string(), String::new()),
     }
 }
 
@@ -545,29 +647,32 @@ pub(crate) fn trash_file(path: &Path, over: Option<&Path>) -> Result<(), EngineE
 fn move_into(path: &Path, dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into());
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) => (s.to_string(), format!(".{e}")),
-        None => (name.clone(), String::new()),
-    };
+    let (stem, ext) = split_ext(&name);
     for n in 1..1000 {
         let candidate = if n == 1 { name.clone() } else { format!("{stem} {n}{ext}") };
-        let to = dir.join(&candidate);
-        match std::fs::hard_link(path, &to) {
-            Ok(()) => return std::fs::remove_file(path),
+        match place_exclusive(path, &dir.join(&candidate)) {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            // No links across disks or on some shares: a rename, which keeps a name nothing has.
-            Err(_) => {
-                if std::fs::symlink_metadata(&to).is_ok() {
-                    continue;
-                }
-                return std::fs::rename(path, &to).or_else(|_| {
-                    std::fs::copy(path, &to)?;
-                    std::fs::remove_file(path)
-                });
-            }
+            other => return other,
         }
     }
     Err(std::io::Error::other("too many files with that name in the Trash"))
+}
+
+/// Moves `from` to `to`, which must not exist (`AlreadyExists` when it does, never replaced):
+/// a link then the old name removed; else the name is taken new and the file renamed or, across
+/// disks, copied over it (the source is removed only once the copy is whole).
+fn place_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => return std::fs::remove_file(from),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+        Err(_) => {}
+    }
+    reserve(to)?;
+    let moved = std::fs::rename(from, to).or_else(|_| std::fs::copy(from, to).and_then(|_| std::fs::remove_file(from)));
+    if moved.is_err() {
+        let _ = std::fs::remove_file(to);
+    }
+    moved
 }
 
 /// The state the clips keep.

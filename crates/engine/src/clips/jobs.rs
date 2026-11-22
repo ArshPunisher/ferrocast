@@ -300,7 +300,7 @@ impl Engine {
             let result = tokio::time::timeout(JOB_LIMIT, work(ctx)).await;
             match result {
                 Ok(Ok(made)) => finish(JobState::Done, Some(made), None),
-                Ok(Err(e)) if is_cancelled(&e) => finish(JobState::Cancelled, None, None),
+                Ok(Err(e)) if is_cancelled(&e) => finish(JobState::Cancelled, None, cancel_note(&e)),
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "a clip job failed");
                     finish(JobState::Failed, None, Some(describe(&e)));
@@ -326,6 +326,26 @@ pub(crate) fn cancelled() -> EngineError {
         message: "Cancelled.".into(),
         hint: String::new(),
         retry_after: None,
+    }
+}
+
+/// A cancel that says something (an upload stopped while its last piece was on its way).
+pub(crate) fn cancelled_with(note: &str, hint: &str) -> EngineError {
+    EngineError::Refused {
+        status: 409,
+        code: "job_cancelled",
+        message: note.into(),
+        hint: hint.into(),
+        retry_after: None,
+    }
+}
+
+fn cancel_note(e: &EngineError) -> Option<JobError> {
+    match e {
+        EngineError::Refused { code: "job_cancelled", message, hint, .. } if message != "Cancelled." => {
+            Some(JobError { message: message.clone(), hint: hint.clone() })
+        }
+        _ => None,
     }
 }
 

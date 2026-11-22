@@ -170,3 +170,89 @@ async fn the_folder_is_where_recordings_go_or_a_clips_folder_in_the_data() {
     assert_eq!(e.clips_folder().await.unwrap(), data.path().join("Clips"));
     assert!(e.clips(None).await.unwrap().is_empty(), "no folder yet: no clips, no error");
 }
+
+#[tokio::test]
+async fn a_rename_answers_for_a_clip_past_the_listing_cap() {
+    let (e, _d, clips) = engine().await;
+    // More than the 2,000 the list holds: the clip renamed may be one it leaves out.
+    for i in 0..2005 {
+        touch(clips.path(), &format!("f{i:04}.mp4"), b"x");
+    }
+    assert_eq!(e.clips(None).await.unwrap().len(), 2000);
+    let made = e.rename_clip("f0000.mp4", "Renamed").await.unwrap();
+    assert_eq!(made.id, "Renamed.mp4");
+    assert!(clips.path().join("Renamed.mp4").is_file());
+}
+
+#[tokio::test]
+async fn captions_shared_by_two_clips_with_one_name_stay_with_the_one_left() {
+    let (e, _d, clips) = engine().await;
+    let trash = tempfile::tempdir().unwrap();
+    e.set_trash_folder_for_test(Some(trash.path().to_path_buf()));
+    // a.mp4 and a.mkv are two clips whose captions file is the same a.srt.
+    touch(clips.path(), "a.mp4", b"1");
+    touch(clips.path(), "a.mkv", b"2");
+    touch(clips.path(), "a.srt", b"1\n");
+    assert!(!srt_is_exclusive(&clips.path().join("a.mp4")));
+    e.rename_clip("a.mkv", "b").await.unwrap();
+    assert!(clips.path().join("a.srt").is_file(), "not taken from the clip that keeps the name");
+    assert!(!clips.path().join("b.srt").exists());
+    // Now a.mp4 is the only clip called a: its captions go with it.
+    assert!(srt_is_exclusive(&clips.path().join("a.mp4")));
+    e.delete_clip("a.mp4").await.unwrap();
+    assert!(trash.path().join("a.srt").is_file());
+    // And deleting one of two sharing a name leaves the captions for the other.
+    touch(clips.path(), "c.mp4", b"1");
+    touch(clips.path(), "c.mov", b"2");
+    touch(clips.path(), "c.srt", b"1\n");
+    e.delete_clip("c.mov").await.unwrap();
+    assert!(clips.path().join("c.srt").is_file() && clips.path().join("c.mp4").is_file());
+}
+
+#[test]
+fn a_move_never_replaces_and_never_follows_a_link() {
+    let dir = tempfile::tempdir().unwrap();
+    touch(dir.path(), "from.mp4", b"new");
+    touch(dir.path(), "taken.mp4", b"old");
+    let err = place_exclusive(&dir.path().join("from.mp4"), &dir.path().join("taken.mp4")).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(dir.path().join("taken.mp4")).unwrap(), b"old");
+    assert!(dir.path().join("from.mp4").is_file(), "the source stays when the name is taken");
+    place_exclusive(&dir.path().join("from.mp4"), &dir.path().join("free.mp4")).unwrap();
+    assert_eq!(std::fs::read(dir.path().join("free.mp4")).unwrap(), b"new");
+    assert!(!dir.path().join("from.mp4").exists());
+    assert!(reserve(&dir.path().join("free.mp4")).is_err(), "a name that is there can't be taken");
+    #[cfg(unix)]
+    {
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join("target"), dir.path().join("link.mp4")).unwrap();
+        assert!(reserve(&dir.path().join("link.mp4")).is_err(), "a link isn't a free name, even a dangling one");
+        assert!(!outside.path().join("target").exists());
+    }
+}
+
+#[test]
+fn the_freedesktop_trash_gets_an_info_file_so_it_can_be_restored() {
+    let (home, trash) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let clip = home.path().join("My clip.mp4");
+    std::fs::write(&clip, b"1").unwrap();
+    trash_freedesktop(&clip, trash.path()).unwrap();
+    assert!(!clip.exists() && trash.path().join("files/My clip.mp4").is_file());
+    let info = std::fs::read_to_string(trash.path().join("info/My clip.mp4.trashinfo")).unwrap();
+    let lines: Vec<&str> = info.lines().collect();
+    assert_eq!(lines[0], "[Trash Info]");
+    let want = format!("Path={}", percent_path(&std::fs::canonicalize(home.path()).unwrap().join("My clip.mp4")));
+    assert_eq!(lines[1], want);
+    assert!(lines[1].contains("My%20clip.mp4"));
+    assert!(lines[2].starts_with("DeletionDate=20") && lines[2].len() == "DeletionDate=2026-11-22T10:00:00".len());
+    // The same name again is a new entry with its own info, never over the first.
+    std::fs::write(&clip, b"2").unwrap();
+    trash_freedesktop(&clip, trash.path()).unwrap();
+    assert_eq!(std::fs::read(trash.path().join("files/My clip.mp4")).unwrap(), b"1");
+    assert_eq!(std::fs::read(trash.path().join("files/My clip 2.mp4")).unwrap(), b"2");
+    assert!(trash.path().join("info/My clip 2.mp4.trashinfo").is_file());
+    assert_eq!(percent_path(std::path::Path::new("/a b/\u{e9}.mp4")), "/a%20b/%C3%A9.mp4");
+    assert_eq!(iso_time(0), "1970-01-01T00:00:00");
+    assert_eq!(iso_time(1_700_000_000), "2023-11-14T22:13:20");
+    assert_eq!(iso_time(951_782_400 + 86_399), "2000-02-29T23:59:59");
+}
