@@ -1,7 +1,9 @@
 //! Sending a clip to the streamer's own YouTube channel, through the connection already made in
 //! Settings (nothing new to sign in to; `youtube.force-ssl` already allows `videos.insert`).
 //! A normal video or a Short. The clip stays where it is; the upload is a background job with
-//! progress that can be cancelled. It uses 1,600 of the channel's 10,000 daily quota units.
+//! progress that can be cancelled. YouTube counts it against the app's upload allowance, 100 a day by
+//! default (`videos.insert` has its own "Video Uploads" quota bucket, 1 unit a call, apart from the
+//! 10,000 units other calls share; the Data API's own page, checked 22 Nov 2026).
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -16,8 +18,8 @@ use super::jobs::{JobKind, JobView, Made};
 use super::{probe_file, refuse};
 use crate::{Engine, EngineError};
 
-/// What `videos.insert` costs of the day's quota.
-pub const QUOTA_UNITS: u32 = 1600;
+/// Uploads an app may make a day by default.
+pub const UPLOADS_PER_DAY: u32 = 100;
 /// A Short is square or tall and at most this long (YouTube raised it from 60 s to 3 minutes in
 /// October 2024).
 pub const SHORTS_MAX_MS: u64 = 180_000;
