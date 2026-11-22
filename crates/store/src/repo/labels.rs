@@ -53,6 +53,40 @@ pub fn period_totals(store: &Store, from_ms: Option<i64>, to_ms: Option<i64>) ->
     })
 }
 
+/// Like [`period_totals`], plus the highest event `seq` in the log at the moment of the read
+/// (one snapshot): everything at or below it is counted in the totals, nothing above it is.
+/// A live counter that kept updating while this ran can tell which of its events to add.
+pub fn period_totals_with_watermark(
+    store: &Store,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+) -> Result<(PeriodTotals, u64)> {
+    store.read(|c| {
+        c.execute_batch("BEGIN")?;
+        let out = (|| -> Result<(PeriodTotals, u64)> {
+            let wm: i64 = c.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?;
+            let kinds = serde_json::to_string(SUPPORT_KINDS)?;
+            let mut st = c.prepare(
+                "SELECT id, platform, source_id, origin, occurred_at, received_at, data, seq
+                 FROM events
+                 WHERE origin = 'live' AND hidden = 0
+                   AND (
+                     (kind IN (SELECT value FROM json_each(?1))
+                       AND (?2 IS NULL OR occurred_at >= ?2)
+                       AND (?3 IS NULL OR occurred_at < ?3))
+                     OR kind = 'reversal'
+                   )
+                 ORDER BY seq ASC",
+            )?;
+            let rows = st.query_map(params![kinds, from_ms, to_ms], row_to_event)?;
+            let events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((summarize_events(&events), u64::try_from(wm).unwrap_or(0)))
+        })();
+        let _ = c.execute_batch("COMMIT");
+        out
+    })
+}
+
 /// Hydrates latest-X labels (follower, sub, gifter, tip, bits, raid) from the local SQLite log.
 pub fn latest_labels(store: &Store) -> Result<LatestLabels> {
     store.read(|c| {

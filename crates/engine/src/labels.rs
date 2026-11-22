@@ -66,6 +66,10 @@ pub(crate) struct LabelRuntime {
     alltime: PeriodTotals,
     monthly: HashMap<MonthZoneKey, ((Millis, Millis), PeriodTotals)>,
     trains: HashMap<TrainKey, ComboTrain>,
+    /// Monthly totals being loaded from the log right now. Live events seen meanwhile are kept
+    /// so they can be reconciled with what the load did or did not count.
+    fills_in_flight: usize,
+    fill_buffer: Vec<Event>,
 }
 
 impl LabelRuntime {
@@ -87,6 +91,9 @@ impl LabelRuntime {
         self.latest.observe(event);
         self.session.observe(event);
         self.alltime.observe(event);
+        if self.fills_in_flight > 0 && self.fill_buffer.len() < 10_000 {
+            self.fill_buffer.push(event.clone());
+        }
 
         // Update cached months matching `event.occurred_at` (or always pass reversals cleanly).
         let is_reversal = matches!(event.kind, EventKind::Reversal { .. });
@@ -109,6 +116,32 @@ impl LabelRuntime {
         }
         for train in self.trains.values_mut() {
             train.observe_at(event, now_ms);
+        }
+    }
+
+    /// Installs a freshly loaded month: totals that count every event up to `watermark` (log
+    /// `seq`), plus the live events seen while the load ran that the load could not have counted.
+    fn finish_month_fill(
+        &mut self,
+        key: MonthZoneKey,
+        bounds: (Millis, Millis),
+        mut totals: PeriodTotals,
+        watermark: u64,
+    ) {
+        let (start, end) = bounds;
+        for ev in &self.fill_buffer {
+            let in_month = ev.occurred_at.0 >= start.0 && ev.occurred_at.0 < end.0;
+            if ev.seq > watermark && (in_month || matches!(ev.kind, EventKind::Reversal { .. })) {
+                totals.observe(ev);
+            }
+        }
+        self.monthly.insert(key, (bounds, totals));
+    }
+
+    fn end_fill(&mut self) {
+        self.fills_in_flight = self.fills_in_flight.saturating_sub(1);
+        if self.fills_in_flight == 0 {
+            self.fill_buffer.clear();
         }
     }
 
@@ -189,10 +222,13 @@ impl Engine {
             }
         }
         let (start, end) = bounds;
-        if let Ok(totals) = self.db(move |s| repo::labels::period_totals(s, Some(start.0), Some(end.0))).await {
-            let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
-            rt.monthly.insert(key, (bounds, totals));
+        self.inner.labels.lock().unwrap_or_else(|p| p.into_inner()).fills_in_flight += 1;
+        let loaded = self.db(move |s| repo::labels::period_totals_with_watermark(s, Some(start.0), Some(end.0))).await;
+        let mut rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
+        if let Ok((totals, watermark)) = loaded {
+            rt.finish_month_fill(key, bounds, totals, watermark);
         }
+        rt.end_fill();
     }
 
     pub(crate) async fn labels_reset_session(&self) {
@@ -534,5 +570,34 @@ mod tests {
             }
         }
         assert_eq!(pushed_mf.as_deref(), Some("0"), "overlay must receive rolled-over monthly value");
+    }
+
+    fn follow_event(seq: u64, at: i64) -> Event {
+        let mut e = Event::live(
+            Platform::Twitch,
+            Some(format!("f-{seq}")),
+            Millis(at),
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "Viewer") },
+        );
+        e.seq = seq;
+        e
+    }
+
+    #[test]
+    fn a_monthly_load_adds_only_the_live_events_it_could_not_have_counted() {
+        let mut rt = LabelRuntime::default();
+        let key = MonthZoneKey::Offset(0);
+        let bounds = (Millis(1_000), Millis(9_000));
+        rt.fills_in_flight = 1;
+        // Seen while the load ran: seq 5 was already in the log when it read (counted), seq 6
+        // was not, and seq 7 belongs to another month.
+        for ev in [follow_event(5, 2_000), follow_event(6, 3_000), follow_event(7, 20_000)] {
+            rt.observe_event(&ev, Millis(3_500));
+        }
+        let loaded = ferrocast_core::labels::summarize_events(&[follow_event(1, 1_500), follow_event(5, 2_000)]);
+        rt.finish_month_fill(key.clone(), bounds, loaded, 5);
+        rt.end_fill();
+        assert_eq!(rt.monthly.get(&key).unwrap().1.follows, 3, "1, 5 from the log, plus 6 seen live");
+        assert!(rt.fill_buffer.is_empty(), "nothing is kept once no load is running");
     }
 }
