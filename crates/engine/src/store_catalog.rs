@@ -928,6 +928,28 @@ fn merge_variations(existing: &[Variation], item_id: &str, incoming: &[Variation
 }
 
 /// Why a downloaded plugin package isn't the one the catalog lists: its own id differs.
+/// What a link's confirmation says about safety. Only what is true before anything is
+/// downloaded is said as done (the catalog's signature); what happens to the package is said as
+/// what will be checked when the person installs it.
+fn preview_notes(format: StorePackageFormat, size: u64) -> Vec<String> {
+    let mut notes = vec![
+        "The catalog's signature was checked (minisign).".to_string(),
+        format!("Package size {} KB. Its SHA-256 is checked when you install.", (size / 1024).max(1)),
+    ];
+    notes.push(match format {
+        StorePackageFormat::Ferrodesign => {
+            "A .ferrodesign is pure data. It is opened and checked when you install; nothing runs from it.".into()
+        }
+        StorePackageFormat::Ferroalert => {
+            "When you install, the alert's HTML and CSS are checked against the sandbox rules (an isolated frame, no scripts). Nothing is applied if a check fails.".into()
+        }
+        StorePackageFormat::Ferroplugin => {
+            "When you install, the plugin is opened and its kind, id and permissions are compared with the catalog's. It runs sandboxed (a WGSL shader, resource-capped WASM, or a panel with no network).".into()
+        }
+    });
+    notes
+}
+
 fn plugin_identity_problem(expected: &str, manifest_id: &str) -> Option<String> {
     (!crate::plugins::good_id(manifest_id) || manifest_id != expected)
         .then(|| format!("The plugin's own id ({manifest_id}) isn't the one the catalog lists ({expected})."))
@@ -1170,24 +1192,7 @@ impl Engine {
             .ok_or_else(|| EngineError::Internal("verified item missing creator".into()))?;
         let installed = cat.installed.iter().find(|r| r.item_id == item.id).cloned();
         let update_available = item.update_available;
-        let mut safety_notes = vec![
-            "Catalog signature verified (minisign).".to_string(),
-            format!("Package size {} KB · SHA-256 checked on install.", (item.package.size / 1024).max(1)),
-        ];
-        match item.package.format {
-            StorePackageFormat::Ferrodesign => {
-                safety_notes.push("Pure data (.ferrodesign): contains no executable scripts or remote code.".into());
-            }
-            StorePackageFormat::Ferroalert => {
-                safety_notes
-                    .push("Custom alert HTML/CSS verified by p2e sandbox rules (isolated frame, no scripts).".into());
-            }
-            StorePackageFormat::Ferroplugin => {
-                safety_notes.push(
-                    "Sandboxed plugin verified (WGSL shader / resource-capped WASM / CSP no-network panel).".into(),
-                );
-            }
-        }
+        let safety_notes = preview_notes(item.package.format, item.package.size);
         Ok(StoreLinkPreview {
             uri: parsed.uri,
             action: parsed.action,
@@ -1915,6 +1920,20 @@ mod tests {
             assert!(check_version("uri.v", bad).is_err(), "{bad}");
         }
         assert!(check_version("version", &"1".repeat(33)).is_err(), "still at most 32 characters");
+    }
+
+    /// A link's confirmation doesn't claim checks that haven't run: nothing is downloaded yet.
+    #[test]
+    fn a_preview_says_what_will_be_checked_not_that_it_was() {
+        for f in [StorePackageFormat::Ferrodesign, StorePackageFormat::Ferroalert, StorePackageFormat::Ferroplugin] {
+            let notes = preview_notes(f, 4096).join(" | ");
+            assert!(notes.contains("signature was checked"), "{notes}");
+            assert!(notes.contains("when you install"), "{f:?}: {notes}");
+            for claimed in ["verified by", "Sandboxed plugin verified", "verified (", "p2e"] {
+                assert!(!notes.contains(claimed), "{f:?} claims a check that hasn't run ({claimed}): {notes}");
+            }
+        }
+        assert!(preview_notes(StorePackageFormat::Ferrodesign, 10)[1].contains("1 KB"));
     }
 
     #[test]
