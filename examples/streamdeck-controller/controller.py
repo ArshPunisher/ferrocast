@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import sys
@@ -14,6 +15,45 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 DEFAULT_URL = "http://127.0.0.1:47820"
+
+
+def check_base_url(raw: str) -> str:
+    """The API address, or ValueError. The key travels in every request, so plain http is for this
+    machine only (127.x, ::1, localhost); anything else must be https. No user:password in it."""
+    try:
+        parsed = urllib.parse.urlsplit(raw.strip())
+        host = parsed.hostname or ""
+        parsed.port  # raises ValueError for a bad port
+    except ValueError:
+        raise ValueError("FERROCAST_URL isn't a valid address.") from None
+    if parsed.username or parsed.password:
+        raise ValueError("FERROCAST_URL can't carry a user name or password.")
+    if parsed.scheme == "https" and host:
+        return raw.strip()
+    if parsed.scheme == "http" and host:
+        loopback = host == "localhost"
+        if not loopback:
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = False
+        if loopback:
+            return raw.strip()
+        raise ValueError(
+            "FERROCAST_URL is plain http to another machine: the API key would cross the network in the clear. "
+            "Use https, or an address on this machine (127.0.0.1)."
+        )
+    raise ValueError("FERROCAST_URL must start with https:// (or http:// for this machine).")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follows a redirect: it would send the Authorization header on to wherever it points."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 class FerrocastApiError(RuntimeError):
@@ -34,7 +74,7 @@ class FerrocastController:
     api_key: str
 
     def __post_init__(self) -> None:
-        self.base_url = self.base_url.rstrip("/")
+        self.base_url = check_base_url(self.base_url).rstrip("/")
         if not self.api_key.startswith("fc_key_"):
             raise ValueError("API key must start with 'fc_key_'.")
 
@@ -54,7 +94,7 @@ class FerrocastController:
 
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with _OPENER.open(req, timeout=10) as resp:
                 raw = resp.read().decode("utf-8")
                 return resp.status, (json.loads(raw) if raw else None)
         except urllib.error.HTTPError as err:
@@ -70,6 +110,14 @@ class FerrocastController:
                     hint = parsed["error"].get("hint")
             except json.JSONDecodeError:
                 pass
+            if 300 <= err.code < 400:
+                # Said, not followed: the key stays with the address that was configured.
+                raise FerrocastApiError(
+                    err.code,
+                    "redirect_refused",
+                    f"{method} {rel_path} was redirected; the API key is never sent to another address.",
+                    "Set FERROCAST_URL to the address Ferrocast answers on directly.",
+                ) from None
             if err.code == 429:
                 retry = err.headers.get("Retry-After")
                 if retry:

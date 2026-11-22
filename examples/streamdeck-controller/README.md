@@ -10,6 +10,10 @@ Create a local API key in Ferrocast (**Settings > Advanced > Local API keys**) w
 - `alerts` (pause, resume, skip alerts, or fire test alerts)
 - `read_only` (list scenes, inputs, queue, status)
 
+## Where it connects
+
+`FERROCAST_URL` defaults to `http://127.0.0.1:47820`. The key travels in every request, so plain `http://` is accepted for this machine only (127.x, `::1`, `localhost`); any other address must be `https://`. Redirects are never followed, so the key can't be sent on to another address (a redirect is reported as an error).
+
 ## Usage
 
 ```sh
