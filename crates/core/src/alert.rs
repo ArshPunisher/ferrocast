@@ -4,10 +4,15 @@
 //! variations ("10+ months gets the gold one"). Selection is a pure function of the rules
 //! and the event so the editor can preview it and tests can pin it down.
 
-use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::design::{Anim, AnimIn, AnimOut, TextAnim};
 use crate::event::{Event, EventKind, Platform};
-use crate::template::{Template, TemplateError, Vars, event_vars, with_plurals};
+use crate::layer::{check_css, is_color};
+use crate::template::{KNOWN_VARS, Template, TemplateError, Vars, event_vars, with_plurals};
 
 /// One condition. Variations combine them with all/any.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,6 +108,39 @@ fn message_of(event: &Event) -> Option<&str> {
     }
 }
 
+/// Kind of a custom schema field exposed by a variation's custom HTML/CSS alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomFieldKind {
+    Text,
+    Number,
+    Color,
+    Toggle,
+    Select,
+}
+
+/// One typed custom field in a variation's schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomField {
+    pub key: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub kind: CustomFieldKind,
+    #[serde(default)]
+    pub default: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+/// Default alert entrance, exit and text effect for rules without explicit `anim`.
+pub fn default_alert_anim() -> Anim {
+    Anim { enter: AnimIn::Fade, exit: AnimOut::Fade, text: TextAnim::None, in_ms: 400, out_ms: 350, text_delay_ms: 150 }
+}
+
 /// How an alert looks and sounds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Variation {
@@ -132,6 +170,21 @@ pub struct Variation {
     /// Extra CSS the streamer wrote. The overlay scopes it to the alert (R-39).
     #[serde(default)]
     pub css: String,
+    /// Entrance, exit and text animation timing for this variation (R25).
+    #[serde(default = "default_alert_anim")]
+    pub anim: Anim,
+    /// Render this variation using custom HTML/CSS inside a sandboxed overlay iframe (R25).
+    #[serde(default)]
+    pub custom_enabled: bool,
+    /// Streamer-authored HTML template rendered only inside a sandboxed iframe (R25).
+    #[serde(default)]
+    pub html: String,
+    /// Schema defining editable fields exposed to custom HTML/CSS (R25).
+    #[serde(default)]
+    pub fields: Vec<CustomField>,
+    /// Current override values keyed by `CustomField.key` (R25).
+    #[serde(default)]
+    pub field_values: BTreeMap<String, Value>,
 }
 
 fn default_weight() -> u32 {
@@ -140,6 +193,29 @@ fn default_weight() -> u32 {
 
 /// Largest weight the editor accepts (keeps the sum far from overflow).
 pub const MAX_WEIGHT: u32 = 1_000;
+/// Maximum characters in custom HTML for one alert variation.
+pub const MAX_CUSTOM_HTML: usize = 20_000;
+/// Maximum UTF-8 bytes in custom HTML for one alert variation.
+pub const MAX_CUSTOM_HTML_BYTES: usize = 80_000;
+/// Maximum custom schema fields per variation.
+pub const MAX_CUSTOM_FIELDS: usize = 32;
+pub const MAX_IN_MS: u32 = 3_000;
+pub const MAX_OUT_MS: u32 = 3_000;
+pub const MAX_TEXT_DELAY_MS: u32 = 10_000;
+pub const MAX_FIELD_KEY_LEN: usize = 40;
+pub const MAX_FIELD_LABEL_LEN: usize = 80;
+pub const MAX_FIELD_TEXT_LEN: usize = 500;
+pub const MAX_SELECT_OPTIONS: usize = 20;
+
+/// Explicit static CDN hosts allowed in custom alert CSP (images/fonts only; no connect-src).
+pub const ALLOWED_ASSET_HOSTS: [&str; 6] = [
+    "https://static-cdn.jtvnw.net",
+    "https://yt3.ggpht.com",
+    "https://files.kick.com",
+    "https://cdn.ferrocast.com",
+    "https://cdn.discordapp.com",
+    "https://fonts.gstatic.com",
+];
 
 impl Variation {
     pub fn new(id: &str, title: &str) -> Self {
@@ -158,6 +234,11 @@ impl Variation {
             tts: false,
             layout: "stack".into(),
             css: String::new(),
+            anim: default_alert_anim(),
+            custom_enabled: false,
+            html: String::new(),
+            fields: Vec::new(),
+            field_values: BTreeMap::new(),
         }
     }
 }
@@ -225,17 +306,243 @@ pub enum RuleError {
     NoDefault,
     #[error("variation '{name}': {source}")]
     Template { name: String, source: TemplateError },
+    #[error("variation '{name}': unknown token '{{{token}}}'")]
+    UnknownToken { name: String, token: String },
     #[error("variation '{0}': volume must be 0 to 100")]
     Volume(String),
     #[error("variation '{0}': duration must be 1 to 60 seconds")]
     Duration(String),
     #[error("variation '{0}': weight must be 0 to 1000")]
     Weight(String),
+    #[error("variation '{name}': {reason}")]
+    Anim { name: String, reason: String },
+    #[error("variation '{name}': custom HTML can be up to {MAX_CUSTOM_HTML} characters")]
+    CustomHtmlTooLong { name: String },
+    #[error("{0}")]
+    CustomCss(String),
+    #[error("variation '{name}': {reason}")]
+    CustomSchema { name: String, reason: String },
 }
 
 /// Event kinds a rule may target.
 pub const ALERT_KINDS: [&str; 8] =
     ["follow", "subscription", "gift_batch", "platform_gift", "paid_message", "tip", "raid", "reward_redemption"];
+
+fn schema_err(name: &str, reason: impl Into<String>) -> RuleError {
+    RuleError::CustomSchema { name: name.to_string(), reason: reason.into() }
+}
+
+fn anim_err(name: &str, reason: impl Into<String>) -> RuleError {
+    RuleError::Anim { name: name.to_string(), reason: reason.into() }
+}
+
+fn is_valid_field_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_FIELD_KEY_LEN {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    if !bytes[1..].iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_') {
+        return false;
+    }
+    !matches!(key, "__proto__" | "constructor" | "prototype") && !KNOWN_VARS.contains(&key)
+}
+
+fn validate_field_value(var_name: &str, f: &CustomField, val: &Value) -> Result<(), RuleError> {
+    let key = &f.key;
+    match f.kind {
+        CustomFieldKind::Text => {
+            let s = val.as_str().ok_or_else(|| schema_err(var_name, format!("field '{key}': expected text")))?;
+            if s.chars().count() > MAX_FIELD_TEXT_LEN {
+                return Err(schema_err(
+                    var_name,
+                    format!("field '{key}': text can be up to {MAX_FIELD_TEXT_LEN} characters"),
+                ));
+            }
+        }
+        CustomFieldKind::Number => {
+            let n = val
+                .as_f64()
+                .filter(|x| x.is_finite())
+                .ok_or_else(|| schema_err(var_name, format!("field '{key}': expected a finite number")))?;
+            if let Some(min) = f.min
+                && n < min
+            {
+                return Err(schema_err(var_name, format!("field '{key}': value must be at least {min}")));
+            }
+            if let Some(max) = f.max
+                && n > max
+            {
+                return Err(schema_err(var_name, format!("field '{key}': value must be at most {max}")));
+            }
+        }
+        CustomFieldKind::Color => {
+            let s =
+                val.as_str().ok_or_else(|| schema_err(var_name, format!("field '{key}': expected a colour string")))?;
+            if !is_color(s) {
+                return Err(schema_err(var_name, format!("field '{key}': use #rrggbb or transparent")));
+            }
+        }
+        CustomFieldKind::Toggle => {
+            if !val.is_boolean() {
+                return Err(schema_err(var_name, format!("field '{key}': expected true or false")));
+            }
+        }
+        CustomFieldKind::Select => {
+            let s = val
+                .as_str()
+                .ok_or_else(|| schema_err(var_name, format!("field '{key}': expected one of the select options")))?;
+            if !f.options.iter().any(|opt| opt == s) {
+                return Err(schema_err(var_name, format!("field '{key}': '{s}' isn't one of its options")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_custom_fields(
+    var_name: &str,
+    fields: &[CustomField],
+    values: &BTreeMap<String, Value>,
+) -> Result<HashSet<String>, RuleError> {
+    if fields.len() > MAX_CUSTOM_FIELDS {
+        return Err(schema_err(var_name, format!("can have at most {MAX_CUSTOM_FIELDS} custom fields")));
+    }
+    let mut keys = HashSet::with_capacity(fields.len());
+    let mut by_key = HashMap::with_capacity(fields.len());
+    for f in fields {
+        if !is_valid_field_key(&f.key) {
+            return Err(schema_err(
+                var_name,
+                format!(
+                    "field key '{}' must start with a lowercase letter, use a-z/0-9/_ (up to {MAX_FIELD_KEY_LEN} chars), and not collide with built-in tokens",
+                    f.key
+                ),
+            ));
+        }
+        if !keys.insert(f.key.clone()) {
+            return Err(schema_err(var_name, format!("duplicate custom field key '{}'", f.key)));
+        }
+        let label_len = f.label.trim().chars().count();
+        if label_len == 0 || label_len > MAX_FIELD_LABEL_LEN {
+            return Err(schema_err(
+                var_name,
+                format!("field '{}': label must be 1 to {MAX_FIELD_LABEL_LEN} characters", f.key),
+            ));
+        }
+        if f.kind == CustomFieldKind::Number {
+            if f.min.is_some_and(|x| !x.is_finite()) || f.max.is_some_and(|x| !x.is_finite()) {
+                return Err(schema_err(var_name, format!("field '{}': min and max must be finite numbers", f.key)));
+            }
+            if let (Some(min), Some(max)) = (f.min, f.max)
+                && min > max
+            {
+                return Err(schema_err(var_name, format!("field '{}': min cannot exceed max", f.key)));
+            }
+        }
+        if f.kind == CustomFieldKind::Select {
+            if f.options.is_empty() || f.options.len() > MAX_SELECT_OPTIONS {
+                return Err(schema_err(
+                    var_name,
+                    format!("field '{}': select fields need 1 to {MAX_SELECT_OPTIONS} options", f.key),
+                ));
+            }
+            let mut opt_seen = HashSet::with_capacity(f.options.len());
+            for opt in &f.options {
+                let n = opt.trim().chars().count();
+                if n == 0 || n > MAX_FIELD_LABEL_LEN || !opt_seen.insert(opt.as_str()) {
+                    return Err(schema_err(
+                        var_name,
+                        format!(
+                            "field '{}': select options must be unique and 1 to {MAX_FIELD_LABEL_LEN} chars",
+                            f.key
+                        ),
+                    ));
+                }
+            }
+        }
+        validate_field_value(var_name, f, &f.default)?;
+        by_key.insert(f.key.as_str(), f);
+    }
+    for (k, val) in values {
+        let Some(field) = by_key.get(k.as_str()) else {
+            return Err(schema_err(var_name, format!("unknown custom field value '{k}'")));
+        };
+        validate_field_value(var_name, field, val)?;
+    }
+    Ok(keys)
+}
+
+fn is_allowed_token(token: &str, custom_keys: &HashSet<String>) -> bool {
+    KNOWN_VARS.contains(&token) || custom_keys.contains(token)
+}
+
+fn validate_template_tokens(var_name: &str, src: &str, custom_keys: &HashSet<String>) -> Result<(), RuleError> {
+    let parsed = Template::parse(src).map_err(|source| RuleError::Template { name: var_name.to_string(), source })?;
+    for tok in parsed.variables() {
+        if !is_allowed_token(tok, custom_keys) {
+            return Err(RuleError::UnknownToken { name: var_name.to_string(), token: tok.to_string() });
+        }
+    }
+    Ok(())
+}
+
+/// Strips `<style>...</style>` and `<script>...</script>` blocks so CSS/JS braces aren't treated as tokens.
+fn strip_code_blocks(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    while i < html.len() {
+        let rest_lower = &lower[i..];
+        let tag_end = if rest_lower.starts_with("<style") {
+            Some("</style>")
+        } else if rest_lower.starts_with("<script") {
+            Some("</script>")
+        } else {
+            None
+        };
+        if let Some(close_tag) = tag_end
+            && let Some(end_rel) = rest_lower.find(close_tag)
+        {
+            i += end_rel + close_tag.len();
+            continue;
+        }
+        let Some(ch) = html[i..].chars().next() else { break };
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn validate_html_tokens(var_name: &str, html: &str, custom_keys: &HashSet<String>) -> Result<(), RuleError> {
+    let visible = strip_code_blocks(html);
+    let chars: Vec<char> = visible.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            if chars.get(i + 1) == Some(&'{') {
+                i += 2;
+                continue;
+            }
+            if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '}') {
+                let inner: String = chars[i + 1..i + 1 + rel_end].iter().collect();
+                let raw_tok = inner.split('|').next().unwrap_or("");
+                if !raw_tok.is_empty()
+                    && raw_tok.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
+                    && !is_allowed_token(raw_tok, custom_keys)
+                {
+                    return Err(RuleError::UnknownToken { name: var_name.to_string(), token: raw_tok.to_string() });
+                }
+                i += rel_end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    Ok(())
+}
 
 impl AlertRule {
     /// Checks everything the editor should refuse to save.
@@ -250,9 +557,6 @@ impl AlertRule {
             return Err(RuleError::NoDefault);
         }
         for v in &self.variations {
-            for src in [&v.title, &v.body] {
-                Template::parse(src).map_err(|source| RuleError::Template { name: v.name.clone(), source })?;
-            }
             if v.volume > 100 {
                 return Err(RuleError::Volume(v.name.clone()));
             }
@@ -262,6 +566,30 @@ impl AlertRule {
             if v.weight > MAX_WEIGHT {
                 return Err(RuleError::Weight(v.name.clone()));
             }
+            if v.anim.in_ms > MAX_IN_MS {
+                return Err(anim_err(&v.name, format!("entrance timing must be 0 to {MAX_IN_MS} ms")));
+            }
+            if v.anim.out_ms > MAX_OUT_MS {
+                return Err(anim_err(&v.name, format!("exit timing must be 0 to {MAX_OUT_MS} ms")));
+            }
+            if v.anim.text_delay_ms > MAX_TEXT_DELAY_MS {
+                return Err(anim_err(&v.name, format!("text delay must be 0 to {MAX_TEXT_DELAY_MS} ms")));
+            }
+            if v.anim.in_ms.saturating_add(v.anim.out_ms) >= v.duration_ms {
+                return Err(anim_err(&v.name, "entrance plus exit must be shorter than total alert duration"));
+            }
+            if v.anim.text_delay_ms >= v.duration_ms {
+                return Err(anim_err(&v.name, "text effect delay must start before the alert ends"));
+            }
+            if v.html.len() > MAX_CUSTOM_HTML_BYTES || v.html.chars().count() > MAX_CUSTOM_HTML {
+                return Err(RuleError::CustomHtmlTooLong { name: v.name.clone() });
+            }
+            check_css(&format!("variation '{}'.css", v.name), &v.css).map_err(RuleError::CustomCss)?;
+            let custom_keys = validate_custom_fields(&v.name, &v.fields, &v.field_values)?;
+            for src in [&v.title, &v.body] {
+                validate_template_tokens(&v.name, src, &custom_keys)?;
+            }
+            validate_html_tokens(&v.name, &v.html, &custom_keys)?;
         }
         Ok(())
     }
@@ -325,6 +653,15 @@ pub fn select_with<'a>(rules: &'a [AlertRule], event: &Event, rng: &mut Rng) -> 
     rules.iter().filter(|r| r.applies_to(event)).find_map(|r| r.pick_with(event, rng).map(|v| (r, v)))
 }
 
+/// Custom alert payload rendered strictly inside a sandboxed overlay iframe (R25).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CustomAlertRender {
+    pub html: String,
+    pub css: String,
+    pub fields: BTreeMap<String, Value>,
+    pub vars: Vars,
+}
+
 /// What the overlay receives: text already rendered, media by id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderedAlert {
@@ -348,20 +685,56 @@ pub struct RenderedAlert {
     #[serde(default)]
     pub tts_audio: Option<String>,
     pub test: bool,
+    /// Animation and timing overrides from the alert variation (R25).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anim: Option<Anim>,
+    /// Present when custom HTML/CSS mode is enabled; rendered only inside a sandboxed iframe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<CustomAlertRender>,
     /// The look from the alert design in use, when there is one (API.md §4 Designs). Absent
     /// otherwise, so overlays without design support see the same alert as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design: Option<crate::design::AlertDesignView>,
 }
 
+fn value_as_template_text(val: &Value) -> String {
+    match val {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn resolve_custom_fields(v: &Variation) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    for f in &v.fields {
+        let val = v.field_values.get(&f.key).unwrap_or(&f.default).clone();
+        out.insert(f.key.clone(), val);
+    }
+    out
+}
+
 /// Renders the chosen variation for `event`. Templates were validated when saved; a
 /// template that fails to parse here falls back to its raw text rather than dropping a
 /// paid alert.
 pub fn render(alert_id: &str, rule: &AlertRule, v: &Variation, event: &Event) -> RenderedAlert {
-    let vars: Vars = event_vars(event);
-    let fill =
-        |src: &str| Template::parse(&with_plurals(src)).map(|t| t.render(&vars)).unwrap_or_else(|_| src.to_string());
+    let base_vars: Vars = event_vars(event);
+    let resolved_fields = resolve_custom_fields(v);
+    let mut template_vars = base_vars.clone();
+    for (k, val) in &resolved_fields {
+        template_vars.entry(k.clone()).or_insert_with(|| value_as_template_text(val));
+    }
+    let fill = |src: &str| {
+        Template::parse(&with_plurals(src)).map(|t| t.render(&template_vars)).unwrap_or_else(|_| src.to_string())
+    };
     let body = fill(&v.body);
+    let custom = v.custom_enabled.then(|| CustomAlertRender {
+        html: v.html.clone(),
+        css: v.css.clone(),
+        fields: resolved_fields,
+        vars: base_vars,
+    });
     RenderedAlert {
         alert_id: alert_id.into(),
         event_id: event.id.clone(),
@@ -380,6 +753,8 @@ pub fn render(alert_id: &str, rule: &AlertRule, v: &Variation, event: &Event) ->
         layout: v.layout.clone(),
         css: v.css.clone(),
         test: event.origin == crate::event::Origin::Test,
+        anim: Some(v.anim.clone()),
+        custom,
         design: None,
     }
 }
@@ -713,5 +1088,118 @@ mod tests {
         let a = select_with(&rules, &e, &mut Rng::seeded(4)).unwrap().1.id.clone();
         let b = select_with(&rules, &e, &mut Rng::seeded(4)).unwrap().1.id.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn validates_timing_tokens_custom_code_size_and_field_schema() {
+        let mut r = sub_rule();
+        r.variations[0].title = "Welcome {unknown_token}!".into();
+        assert!(matches!(r.validate(), Err(RuleError::UnknownToken { ref token, .. }) if token == "unknown_token"));
+
+        let mut r = sub_rule();
+        r.variations[0].anim.in_ms = MAX_IN_MS + 1;
+        assert!(matches!(r.validate(), Err(RuleError::Anim { .. })));
+
+        let mut r = sub_rule();
+        r.variations[0].duration_ms = 1_000;
+        r.variations[0].anim.in_ms = 600;
+        r.variations[0].anim.out_ms = 500;
+        assert!(matches!(r.validate(), Err(RuleError::Anim { .. })));
+
+        let mut r = sub_rule();
+        r.variations[0].html = "<div>{bogus}</div>".into();
+        assert!(matches!(r.validate(), Err(RuleError::UnknownToken { ref token, .. }) if token == "bogus"));
+
+        let mut r = sub_rule();
+        r.variations[0].html = "x".repeat(MAX_CUSTOM_HTML + 1);
+        assert!(matches!(r.validate(), Err(RuleError::CustomHtmlTooLong { .. })));
+
+        let mut r = sub_rule();
+        r.variations[0].css = "@import url('https://evil.invalid/a.css');".into();
+        assert!(matches!(r.validate(), Err(RuleError::CustomCss(_))));
+
+        let mut r = sub_rule();
+        r.variations[0].fields = vec![CustomField {
+            key: "name".into(), // cannot shadow built-in KNOWN_VARS
+            label: "Display".into(),
+            kind: CustomFieldKind::Text,
+            default: serde_json::json!("hi"),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        }];
+        assert!(matches!(r.validate(), Err(RuleError::CustomSchema { .. })));
+
+        let mut r = sub_rule();
+        r.variations[0].fields = vec![CustomField {
+            key: "badge_color".into(),
+            label: "Badge colour".into(),
+            kind: CustomFieldKind::Color,
+            default: serde_json::json!("red"), // must be hex or transparent
+            min: None,
+            max: None,
+            options: Vec::new(),
+        }];
+        assert!(matches!(r.validate(), Err(RuleError::CustomSchema { .. })));
+
+        let mut r = sub_rule();
+        r.variations[0].fields = vec![CustomField {
+            key: "badge_label".into(),
+            label: "Badge label".into(),
+            kind: CustomFieldKind::Text,
+            default: serde_json::json!("VIP"),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        }];
+        r.variations[0].field_values.insert("undeclared".into(), serde_json::json!("oops"));
+        assert!(matches!(r.validate(), Err(RuleError::CustomSchema { .. })));
+
+        let mut r = sub_rule();
+        r.variations[0].custom_enabled = true;
+        r.variations[0].fields = vec![
+            CustomField {
+                key: "badge_label".into(),
+                label: "Badge label".into(),
+                kind: CustomFieldKind::Text,
+                default: serde_json::json!("VIP"),
+                min: None,
+                max: None,
+                options: Vec::new(),
+            },
+            CustomField {
+                key: "glow_size".into(),
+                label: "Glow px".into(),
+                kind: CustomFieldKind::Number,
+                default: serde_json::json!(12),
+                min: Some(0.0),
+                max: Some(40.0),
+                options: Vec::new(),
+            },
+        ];
+        r.variations[0].field_values.insert("badge_label".into(), serde_json::json!("Founder"));
+        r.variations[0].html =
+            "<div class='card'><span>{badge_label}</span><b>{name}</b><style>.card{color:#fff}</style></div>".into();
+        r.variations[0].css = ".card { border-radius: 12px; }".into();
+        assert!(r.validate().is_ok());
+
+        let e = sub_with_months(3);
+        let rendered = render("a-custom", &r, &r.variations[0], &e);
+        assert!(rendered.anim.is_some());
+        let custom = rendered.custom.expect("custom enabled renders custom payload");
+        assert_eq!(custom.fields.get("badge_label"), Some(&serde_json::json!("Founder")));
+        assert_eq!(custom.fields.get("glow_size"), Some(&serde_json::json!(12)));
+        assert_eq!(custom.vars.get("name").map(String::as_str), Some("PixelPanda"));
+
+        // Older Variation JSON without R25 fields deserializes cleanly with defaults
+        let mut legacy = serde_json::to_value(Variation::new("legacy", "{name}")).unwrap();
+        let obj = legacy.as_object_mut().unwrap();
+        for key in ["anim", "custom_enabled", "html", "fields", "field_values"] {
+            obj.remove(key);
+        }
+        let parsed: Variation = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.anim, default_alert_anim());
+        assert!(!parsed.custom_enabled);
+        assert!(parsed.fields.is_empty());
     }
 }

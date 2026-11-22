@@ -299,6 +299,8 @@ mod tts_cleanup_tests {
             tts_text: Some("hi".into()),
             tts_audio: tts_media,
             test: false,
+            anim: None,
+            custom: None,
             design: None,
         }
     }
