@@ -1,0 +1,14 @@
+{
+  "name": "ferrocast-follow-reactor-example",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency Node.js example reacting to Ferrocast live follow events with a scoped local API key.",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "test": "node --test follow-reactor.test.mjs"
+  }
+}
