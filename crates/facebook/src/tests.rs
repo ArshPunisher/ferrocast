@@ -354,3 +354,175 @@ async fn a_live_video_comes_back_with_a_usable_permalink() {
     let v = g.create_live_video("t", None, Some(1_800_000_000)).await.unwrap();
     assert_eq!(v.permalink.as_deref(), Some("https://www.facebook.com/page/videos/1"));
 }
+
+// ----------------------------------------------------------------------------- the comment feed
+
+use crate::feed::{self, Timing};
+use ferrocast_core::event::{ConnectorStatus, EventKind, Roles};
+
+fn quick() -> Timing {
+    Timing {
+        poll: std::time::Duration::from_millis(20),
+        idle: std::time::Duration::from_millis(20),
+        recheck: std::time::Duration::from_millis(60),
+        rate_cap: std::time::Duration::from_millis(50),
+    }
+}
+
+async fn serve(app: axum::Router) -> String {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    base
+}
+
+#[tokio::test]
+async fn a_lapsed_sign_in_says_so_once_and_stops_asking() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    let base = serve(axum::Router::new().route(
+        "/{page}/live_videos",
+        get(move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (StatusCode::BAD_REQUEST, Json(json!({ "error": { "code": 190, "message": "expired" } })))
+            }
+        }),
+    ))
+    .await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let g = Arc::new(Graph::new(&base, "page", "T"));
+    tokio::time::timeout(std::time::Duration::from_secs(3), feed::run_with(g, tx, None, quick()))
+        .await
+        .expect("the feed ends by itself when the sign-in lapsed");
+    let ev = rx.recv().await.expect("a status event");
+    assert!(matches!(ev.kind, EventKind::Connector(ConnectorStatus::SignInNeeded)), "{:?}", ev.kind);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "it did not keep asking");
+}
+
+#[tokio::test]
+async fn a_rate_limit_waits_what_facebook_said_and_a_portal_page_is_not_a_sign_out() {
+    // 429 with Retry-After 7 → RateLimited(7 s); an HTML 401 (a captive portal) is not SignInNeeded.
+    let base = serve(
+        axum::Router::new()
+            .route(
+                "/{page}/live_videos",
+                get(|| async { (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "7")], "slow down") }),
+            )
+            .route(
+                "/{id}/comments",
+                get(|| async { (StatusCode::UNAUTHORIZED, "<html>Please log in to the wifi</html>") }),
+            ),
+    )
+    .await;
+    let g = Graph::new(&base, "page", "T");
+    assert!(
+        matches!(g.current_live().await, Err(FacebookError::RateLimited(d)) if d == std::time::Duration::from_secs(7))
+    );
+    let e = g.comments("lv1", None).await.unwrap_err();
+    assert!(!matches!(e, FacebookError::SignInNeeded), "a portal page is not a sign-out: {e:?}");
+}
+
+#[tokio::test]
+async fn the_feed_waits_out_a_rate_limit_instead_of_the_idle_sleep() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = calls.clone();
+    let base = serve(axum::Router::new().route(
+        "/{page}/live_videos",
+        get(move || {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")], "slow")
+            }
+        }),
+    ))
+    .await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let g = Arc::new(Graph::new(&base, "page", "T"));
+    // Idle is long, the rate cap short: if the feed slept the idle time it would ask once.
+    let t = Timing { idle: std::time::Duration::from_secs(30), ..quick() };
+    let h = tokio::spawn(feed::run_with(g, tx, None, t));
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    h.abort();
+    assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
+async fn the_feed_moves_on_when_the_live_video_has_ended() {
+    // The video is live for the first look, then the Page is not live, while the old video's
+    // comments still answer 200 (a recording keeps its comments).
+    let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let comment_polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (l, cp) = (looks.clone(), comment_polls.clone());
+    let base = serve(
+        axum::Router::new()
+            .route(
+                "/{page}/live_videos",
+                get(move || {
+                    let l = l.clone();
+                    async move {
+                        let n = l.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if n == 0 {
+                            Json(json!({ "data": [{ "id": "lv1", "status": "LIVE" }] }))
+                        } else {
+                            Json(json!({ "data": [] }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/{id}/comments",
+                get(move || {
+                    let cp = cp.clone();
+                    async move {
+                        cp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Json(json!({ "data": [] }))
+                    }
+                }),
+            ),
+    )
+    .await;
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let g = Arc::new(Graph::new(&base, "page", "T"));
+    let h = tokio::spawn(feed::run_with(g, tx, None, quick()));
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let at_600 = comment_polls.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let at_1000 = comment_polls.load(std::sync::atomic::Ordering::SeqCst);
+    h.abort();
+    assert_eq!(at_600, at_1000, "it stopped reading the ended video's comments");
+    assert!(looks.load(std::sync::atomic::Ordering::SeqCst) >= 3, "and keeps looking for the next live video");
+}
+
+#[test]
+fn the_pages_own_comments_carry_the_broadcaster_role_and_the_seen_set_is_bounded() {
+    let mk = |from: &str| Comment {
+        id: "c".into(),
+        message: "hi".into(),
+        from_id: Some(from.into()),
+        from_name: "N".into(),
+        avatar_url: None,
+        created_ms: 1,
+    };
+    let own = feed::chat_event_for(&mk("page1"), "page1");
+    let other = feed::chat_event_for(&mk("viewer"), "page1");
+    let roles = |e: &ferrocast_core::event::Event| match &e.kind {
+        EventKind::ChatMessage { actor, .. } => actor.roles,
+        _ => Roles::empty(),
+    };
+    assert!(roles(&own).contains(Roles::BROADCASTER));
+    assert!(!roles(&other).contains(Roles::BROADCASTER));
+
+    let mut seen = feed::SeenIds::new(3);
+    for i in 0..3 {
+        assert!(seen.insert(format!("c{i}")));
+    }
+    assert!(!seen.insert("c1".into()), "a repeat is not new");
+    assert!(seen.insert("c3".into()));
+    assert_eq!(seen.len(), 3, "never more than the cap");
+    assert!(seen.insert("c0".into()), "the oldest was let go, so it counts as new again");
+    seen.clear();
+    assert_eq!(seen.len(), 0);
+}

@@ -67,7 +67,18 @@ impl FacebookError {
     /// Facebook's answer to a refused call: `{ "error": { "message", "code" } }`.
     pub(crate) async fn from_response(res: reqwest::Response) -> Self {
         let status = res.status().as_u16();
-        let body: serde_json::Value = res.json().await.unwrap_or_default();
+        // How long Facebook asked to wait, when it said (seconds), kept within sense.
+        let retry = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let wait = Duration::from_secs(retry.unwrap_or(60).clamp(1, 900));
+        let body: Option<serde_json::Value> = res.json().await.ok();
+        // Only an answer in Facebook's own shape is a verdict on the token: a captive portal or a
+        // proxy's 401 page has no `error` object and says nothing about the sign-in.
+        let has_error = body.as_ref().is_some_and(|b| b.get("error").is_some());
+        let body = body.unwrap_or_default();
         let code = body.pointer("/error/code").and_then(serde_json::Value::as_i64).unwrap_or(0);
         let message = body
             .pointer("/error/message")
@@ -77,9 +88,12 @@ impl FacebookError {
         match code {
             190 | 102 => FacebookError::SignInNeeded,
             // Rate and call-volume limits.
-            4 | 17 | 32 | 341 | 613 => FacebookError::RateLimited(Duration::from_secs(60)),
-            _ if status == 401 => FacebookError::SignInNeeded,
-            _ if status == 429 => FacebookError::RateLimited(Duration::from_secs(60)),
+            4 | 17 | 32 | 341 | 613 => FacebookError::RateLimited(wait),
+            _ if status == 401 && has_error => FacebookError::SignInNeeded,
+            _ if status == 401 => {
+                FacebookError::Protocol("an unexpected reply (HTTP 401) that is not Facebook's".into())
+            }
+            _ if status == 429 => FacebookError::RateLimited(wait),
             _ => FacebookError::Refused(message.chars().take(300).collect()),
         }
     }

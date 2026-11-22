@@ -165,3 +165,27 @@ async fn a_facebook_delete_only_goes_to_a_comment_ferrocast_has_seen() {
     assert_eq!(deletes(), 1);
     assert!(seen.lock().unwrap().iter().any(|(m, p)| m == "DELETE" && p == "/1234_5678"));
 }
+
+#[tokio::test]
+async fn a_page_token_that_lapsed_shows_sign_in_needed() {
+    let app = axum::Router::new().route(
+        "/{page}/live_videos",
+        get(|| async {
+            (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "error": { "code": 190, "message": "expired" } })))
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let (e, _d, _s) = engine_with(base, true).await;
+    e.finish_facebook(grant(1)).await.unwrap();
+    let mut state = String::new();
+    for _ in 0..40 {
+        state = e.state().connectors.get("facebook").map(|c| c.state.clone()).unwrap_or_default();
+        if state == "sign_in_needed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(state, "sign_in_needed");
+}
