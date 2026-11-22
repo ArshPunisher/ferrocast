@@ -10013,10 +10013,12 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(40));
             assert_eq!(px(), [0, 0, 255], "exact pair cut finished right away");
 
-            // Switch back to One, then enter Studio Mode and use TransitionNow & T-bar.
-            ok(s.set_transition(&TransitionInfo { kind: "cut_transition".into(), ms: 0 }));
-            ok(s.set_current("One"));
+            // Back to One by an explicit quick Cut in Studio Mode, then TransitionNow & T-bar. The
+            // default stays the 300 ms Fade: only the matrix makes the rest of these cuts, so the
+            // assertions fail if either path ignores it.
             s.set_studio_mode(true);
+            ok(s.set_preview("One"));
+            ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
             ok(s.set_preview("Two"));
             assert!(s.scenes().into_iter().find(|x| x.name == "Two").unwrap().preview);
             ok(s.transition_now(None));
