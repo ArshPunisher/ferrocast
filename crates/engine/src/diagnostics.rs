@@ -370,7 +370,7 @@ impl Engine {
         let safe_status = self.safe_mode_status();
         let connectors: Vec<ConnectorDiagnostic> = {
             let st = self.state();
-            [Platform::Twitch, Platform::Youtube, Platform::Kick]
+            [Platform::Twitch, Platform::Youtube, Platform::Kick, Platform::Facebook]
                 .into_iter()
                 .filter_map(|p| {
                     let key = platform_key(p);
@@ -542,6 +542,7 @@ fn collect_known_secrets_blocking(
         crate::accounts::TWITCH_TOKENS.into(),
         crate::accounts::YOUTUBE_TOKENS.into(),
         crate::relay::KICK_TOKENS.into(),
+        crate::accounts::FACEBOOK_PAGE.into(),
         crate::relay::INSTALL.into(),
         crate::obs::PASSWORD_KEY.into(),
         crate::discord::WEBHOOK_KEY.into(),
@@ -1036,6 +1037,19 @@ mod tests {
     use ferrocast_secrets::{MemorySecrets, Secrets};
 
     use super::*;
+
+    #[test]
+    fn the_facebook_page_token_is_a_known_secret() {
+        let secrets = MemorySecrets::default();
+        secrets
+            .set(
+                crate::accounts::FACEBOOK_PAGE,
+                r#"{"id":"123456","name":"My Page","access_token":"EAAGpageTokenFixture0123456789","avatar_url":null}"#,
+            )
+            .unwrap();
+        let found = collect_known_secrets_blocking(&secrets, &[], &[]);
+        assert!(found.iter().any(|s| s == "EAAGpageTokenFixture0123456789"), "{found:?}");
+    }
 
     #[tokio::test]
     async fn real_support_zip_scrubs_every_fixture_secret_and_lists_causes_at_top() {
