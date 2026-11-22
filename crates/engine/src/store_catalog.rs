@@ -77,6 +77,25 @@ static STORE_CACHE: Mutex<Option<CachedCatalog>> = Mutex::new(None);
 /// installed?" check and import everything twice.
 static STORE_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Accepting a catalog (floor check, floor update, cache) takes turns too.
+static STORE_PUBLISH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct SignedAt {
+    timestamp: i64,
+}
+
+/// Tests only: holds the next catalog being accepted inside its turn until released.
+#[cfg(test)]
+static PUBLISH_PAUSE: Mutex<Option<std::sync::Arc<tokio::sync::Notify>>> = Mutex::new(None);
+
+#[cfg(test)]
+async fn test_pause_in_publish() {
+    let hold = PUBLISH_PAUSE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(n) = hold {
+        n.notified().await;
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CachedCatalog {
     at: Instant,
@@ -958,9 +977,26 @@ impl Engine {
             }
         };
         let verified = parse_and_validate_catalog(&list, &src)?;
+        let (verified, fetched_at) = self.publish_catalog(signed.timestamp, verified).await?;
+        Ok((verified, fetched_at, src))
+    }
+
+    /// Accepts a verified catalog: checks it against the floor (nothing older than what was
+    /// accepted before), raises the floor and puts it in the cache. One at a time, so that two
+    /// refreshes finishing in the other order than they started can't leave the older one's
+    /// catalog in the cache, or let it pass a floor the newer one is about to raise.
+    async fn publish_catalog(
+        &self,
+        signed_at: i64,
+        verified: VerifiedCatalog,
+    ) -> Result<(VerifiedCatalog, i64), EngineError> {
+        let _in_turn = STORE_PUBLISH.lock().await;
         // Nothing older than what was accepted before: a replayed old (signed) catalog would bring
         // back an item that was taken down.
         let floor: CatalogFloor = self.db(|s| repo::settings::get_or_default(s, FLOOR_KEY)).await?;
+        #[cfg(test)]
+        test_pause_in_publish().await;
+        let signed = SignedAt { timestamp: signed_at };
         if signed.timestamp < floor.signed_at || verified.generated_at < floor.generated_at {
             tracing::warn!(
                 signed = signed.timestamp,
@@ -984,7 +1020,7 @@ impl Engine {
         let fetched_at = now().0;
         *STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(CachedCatalog { at: Instant::now(), fetched_at, catalog: verified.clone() });
-        Ok((verified, fetched_at, src))
+        Ok((verified, fetched_at))
     }
 
     async fn fetch_verified_file(
@@ -1762,6 +1798,40 @@ mod tests {
             st.sig = CATALOG_V2_SIG.into();
         }
         engine.store_catalog(true).await.unwrap();
+    }
+
+    /// Two refreshes that finish in the other order than they started: the older catalog must not
+    /// end up in the cache (or the newer one's floor be passed by it).
+    #[tokio::test]
+    async fn overlapping_refreshes_publish_in_the_order_they_were_accepted() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _dir, _studio, _chat) = crate::automation::tests::engine().await;
+        let src = Source { url: "http://127.0.0.1:1/catalog.json".into(), key: TEST_KEY.into(), local: true };
+        set_source(src.clone());
+        let older = parse_and_validate_catalog(CATALOG_V1, &src).unwrap();
+        let newer = parse_and_validate_catalog(CATALOG_V2, &src).unwrap();
+        let (older_ts, newer_ts) = (
+            verify_store(CATALOG_V1, CATALOG_V1_SIG, TEST_KEY).unwrap().timestamp,
+            verify_store(CATALOG_V2, CATALOG_V2_SIG, TEST_KEY).unwrap().timestamp,
+        );
+        assert!(newer.generated_at > older.generated_at && newer_ts >= older_ts);
+        // The older one is accepted first but is held up inside; the newer one is accepted meanwhile.
+        let hold = Arc::new(tokio::sync::Notify::new());
+        *PUBLISH_PAUSE.lock().unwrap() = Some(hold.clone());
+        let (e1, e2) = (engine.clone(), engine.clone());
+        let a = tokio::spawn(async move { e1.publish_catalog(older_ts, older).await.map(|(c, _)| c.generated_at) });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let b = tokio::spawn(async move { e2.publish_catalog(newer_ts, newer).await.map(|(c, _)| c.generated_at) });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        hold.notify_one();
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert!(a.is_ok() && b.is_ok(), "{a:?} {b:?}");
+        let cached = STORE_CACHE.lock().unwrap().clone().expect("a catalog is cached");
+        assert_eq!(cached.catalog.generated_at, b.unwrap(), "the newer catalog is the one that stays");
+        // And the older one can't come back afterwards.
+        let again = parse_and_validate_catalog(CATALOG_V1, &src).unwrap();
+        let late = engine.publish_catalog(older_ts, again).await;
+        assert!(matches!(late, Err(EngineError::Refused { code: "store_catalog_rollback", .. })), "{late:?}");
     }
 
     /// A Store plugin whose id is already installed by the user is refused and left exactly as it
