@@ -4861,10 +4861,18 @@ impl Stage {
                 d["ferrocast"] = json!({});
             }
             d["ferrocast"]["transition_settings"] = all;
-            let cur = d.get("current_transition").and_then(Value::as_str).map(String::from);
+            // The preset the reads pick (the default one of this kind, else the first), so what is
+            // written is what `transition_settings` gives back; other presets stay as they are.
+            let all = named_transitions_from_doc(d);
+            let target = all
+                .iter()
+                .find(|t| t.default && t.kind == kind)
+                .or_else(|| all.iter().find(|t| t.kind == kind))
+                .map(|t| t.name.clone());
             if let Some(list) = d.get_mut("transitions").and_then(Value::as_array_mut)
-                && let Some(entry) =
-                    cur.as_deref().and_then(|c| list.iter_mut().find(|t| name_of(t) == c && kind_of(t) == kind))
+                && let Some(entry) = target
+                    .as_deref()
+                    .and_then(|c| list.iter_mut().find(|t| name_of(t).trim() == c && kind_of(t) == kind))
             {
                 entry["settings"] = merge(&entry["settings"]);
             }
@@ -8511,6 +8519,27 @@ mod tests {
         // Scenes only: no big boxes.
         mv.look.layout = crate::MultiviewLayout::ScenesOnly;
         assert_eq!(mv.boxes().len(), 2);
+    }
+
+    #[test]
+    fn a_kinds_settings_are_written_to_the_preset_they_are_read_from() {
+        let s = stage();
+        // Fade is the default; a named Swipe preset (not the default) holds Swipe's settings.
+        ok(s.add_named_transition(&NamedTransition {
+            name: "Show Swipe".into(),
+            kind: "swipe_transition".into(),
+            ms: 700,
+            settings: json!({ "direction": "left" }),
+            default: false,
+        }));
+        assert_eq!(s.transition_settings("swipe_transition")["direction"], "left");
+        ok(s.set_transition_settings("swipe_transition", &json!({ "direction": "right" })));
+        assert_eq!(s.transition_settings("swipe_transition")["direction"], "right", "read back what was written");
+        let all = s.named_transitions();
+        let swipe = all.iter().find(|t| t.name == "Show Swipe").unwrap_or_else(|| panic!("the preset"));
+        assert_eq!(swipe.settings["direction"], "right");
+        let fade = all.iter().find(|t| t.kind == "fade_transition").unwrap_or_else(|| panic!("fade"));
+        assert!(fade.settings.get("direction").is_none(), "other presets are left alone: {fade:?}");
     }
 
     #[test]
