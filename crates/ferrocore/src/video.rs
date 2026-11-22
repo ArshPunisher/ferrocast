@@ -263,6 +263,32 @@ impl VideoEncoder {
         Ok(Self { inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new(&config)?)), config })
     }
 
+    /// Opens a specific FFmpeg H.264 encoder (or native VideoToolbox when `ffmpeg_encoder` is `None`
+    /// on macOS), with optional bounded blocking queue capacity for synchronous benchmarking.
+    pub fn for_benchmark(
+        config: VideoConfig,
+        ffmpeg_encoder: Option<&str>,
+        blocking_cap: Option<usize>,
+    ) -> Result<Self, AvError> {
+        Self::check(&config)?;
+        if let Some(enc) = ffmpeg_encoder {
+            return Ok(Self {
+                inner: Inner::Ffmpeg(Box::new(crate::ffenc::Video::new_named(&config, enc, blocking_cap)?)),
+                config,
+            });
+        }
+        Self::new(config)
+    }
+
+    /// Frames skipped because this FFmpeg encoder's input queue stayed full.
+    pub fn skipped(&self) -> u64 {
+        match &self.inner {
+            #[cfg(target_os = "macos")]
+            Inner::Native(_) => 0,
+            Inner::Ffmpeg(v) => v.skipped,
+        }
+    }
+
     fn check(config: &VideoConfig) -> Result<(), AvError> {
         if config.width == 0
             || config.height == 0

@@ -102,7 +102,7 @@ fn candidates() -> &'static [&'static str] {
     } else if cfg!(target_os = "macos") {
         &["h264_videotoolbox", "libx264"]
     } else {
-        &["h264_nvenc", "libx264"]
+        &["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]
     }
 }
 
@@ -113,6 +113,25 @@ fn must_have(enc: &str) -> &'static [&'static str] {
         "h264_mf" => &["-hw_encoding", "1"],
         _ => &[],
     }
+}
+
+fn probe_with(ff: &Path, e: &str) -> bool {
+    hidden(Command::new(ff))
+        .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=black:s=256x144:r=30"])
+        .args(["-frames:v", "3", "-c:v", e])
+        .args(must_have(e))
+        .args(["-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Lists every H.264 encoder FFmpeg can open here (hardware first, then `libx264`).
+pub fn probe_encoders() -> Vec<String> {
+    let Some(ff) = ffmpeg() else { return Vec::new() };
+    candidates().iter().copied().filter(|e| probe_with(&ff, e)).map(String::from).collect()
 }
 
 /// The first H.264 encoder that encodes a few frames here (asked once).
@@ -126,29 +145,14 @@ pub fn h264_encoder() -> Option<String> {
     ENCODER
         .get_or_init(|| {
             let ff = ffmpeg()?;
-            candidates()
-                .iter()
-                .find(|e| {
-                    hidden(Command::new(&ff))
-                        .args([
-                            "-hide_banner",
-                            "-loglevel",
-                            "error",
-                            "-f",
-                            "lavfi",
-                            "-i",
-                            "color=c=black:s=256x144:r=30",
-                        ])
-                        .args(["-frames:v", "3", "-c:v", e])
-                        .args(must_have(e))
-                        .args(["-f", "null", "-"])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success())
-                })
-                .map(|e| (*e).to_string())
+            let default_list: &[&str] = if cfg!(windows) {
+                &["h264_nvenc", "h264_qsv", "h264_amf", "h264_mf", "libx264"]
+            } else if cfg!(target_os = "macos") {
+                &["h264_videotoolbox", "libx264"]
+            } else {
+                &["h264_nvenc", "libx264"]
+            };
+            default_list.iter().find(|e| probe_with(&ff, e)).map(|e| (*e).to_string())
         })
         .clone()
 }
@@ -179,15 +183,26 @@ struct Proc {
 impl Proc {
     /// `chunk`: about how many bytes each write is, to size the queue.
     fn spawn(args: &[String], chunk: usize) -> Result<Self, AvError> {
+        let cap = (QUEUED_BYTES / chunk.max(1)).clamp(2, 64);
+        Self::spawn_bounded(args, cap)
+    }
+
+    fn spawn_bounded(args: &[String], queue_cap: usize) -> Result<Self, AvError> {
         let ff =
             ffmpeg().ok_or_else(|| AvError::Encoder("FFmpeg isn't here, so this system can't encode yet".into()))?;
         let mut cmd = Command::new(ff);
         cmd.args(["-hide_banner", "-loglevel", "error"]).args(args);
-        Self::start(cmd, chunk)
+        Self::start_with_cap(cmd, queue_cap.clamp(1, 64))
     }
 
     /// Starts `cmd` as FFmpeg is started: raw frames in, FLV tags out.
+    #[cfg(all(test, unix))]
     fn start(cmd: Command, chunk: usize) -> Result<Self, AvError> {
+        let cap = (QUEUED_BYTES / chunk.max(1)).clamp(2, 64);
+        Self::start_with_cap(cmd, cap)
+    }
+
+    fn start_with_cap(cmd: Command, queue_cap: usize) -> Result<Self, AvError> {
         let mut child = hidden(cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -196,7 +211,7 @@ impl Proc {
             .map_err(|e| AvError::Encoder(format!("FFmpeg didn't start ({e})")))?;
         tracing::info!(pid = child.id(), "FFmpeg started");
         let mut pipe = child.stdin.take().ok_or_else(|| AvError::Encoder("FFmpeg took no input".into()))?;
-        let (stdin, queued) = sync_channel::<Vec<u8>>((QUEUED_BYTES / chunk.max(1)).clamp(2, 64));
+        let (stdin, queued) = sync_channel::<Vec<u8>>(queue_cap);
         let broken = Arc::new(AtomicBool::new(false));
         let writer = {
             let broken = broken.clone();
@@ -471,6 +486,8 @@ pub(crate) struct Video {
     /// Frames left out because the encoder was behind (OBS's "skipped frames due to encoding
     /// lag").
     pub(crate) skipped: u64,
+    /// When set, writes block on a tiny pipe queue so benchmarks measure true encoder throughput.
+    blocking: bool,
 }
 
 impl std::fmt::Debug for Video {
@@ -489,10 +506,21 @@ impl Video {
         } else {
             h264_encoder().ok_or_else(|| AvError::Encoder("no H.264 encoder works here through FFmpeg".into()))?
         };
-        Ok(Self::with_proc(Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?, cfg, enc))
+        Ok(Self::with_proc(Proc::spawn(&args(cfg, &enc), frame_bytes(cfg))?, cfg, enc, false))
     }
 
-    fn with_proc(proc: Proc, cfg: &VideoConfig, name: String) -> Self {
+    pub(crate) fn new_named(cfg: &VideoConfig, encoder: &str, blocking_cap: Option<usize>) -> Result<Self, AvError> {
+        if cfg.codec != VideoCodec::H264 {
+            return Err(AvError::Encoder("HEVC through FFmpeg isn't done yet: H.264 is".into()));
+        }
+        let proc = match blocking_cap {
+            Some(cap) => Proc::spawn_bounded(&args(cfg, encoder), cap)?,
+            None => Proc::spawn(&args(cfg, encoder), frame_bytes(cfg))?,
+        };
+        Ok(Self::with_proc(proc, cfg, encoder.to_string(), blocking_cap.is_some()))
+    }
+
+    fn with_proc(proc: Proc, cfg: &VideoConfig, name: String, blocking: bool) -> Self {
         Self {
             proc,
             times: VecDeque::new(),
@@ -510,6 +538,7 @@ impl Video {
             emitted_upto: None,
             made_upto: None,
             skipped: 0,
+            blocking,
         }
     }
 
@@ -861,7 +890,10 @@ impl Video {
         }
         // Each packet gets its time from `times` in order, so a frame left out is just missing:
         // nothing after it moves.
-        if self.proc.try_write(raw)? {
+        if self.blocking {
+            self.proc.write(raw)?;
+            self.times.push_back(pts_us);
+        } else if self.proc.try_write(raw)? {
             self.times.push_back(pts_us);
         } else {
             self.skipped += 1;
@@ -1246,7 +1278,7 @@ sleep $slow"#;
     fn fake_video(old: Proc) -> Video {
         let mut c = cfg(RateControl::Cbr);
         (c.width, c.height) = (2, 2);
-        Video::with_proc(old, &c, "fake".into())
+        Video::with_proc(old, &c, "fake".into(), false)
     }
 
     /// Frame `i` (its number is its first byte) at time `i`.
@@ -1373,7 +1405,8 @@ sleep $slow"#;
         let big = 256 * 256 * 3 / 2;
         let mut c = cfg(RateControl::Cbr);
         (c.width, c.height) = (256, 256);
-        let mut v = Video::with_proc(Proc::start(stuck, big).unwrap_or_else(|e| panic!("{e}")), &c, "fake".into());
+        let mut v =
+            Video::with_proc(Proc::start(stuck, big).unwrap_or_else(|e| panic!("{e}")), &c, "fake".into(), false);
         let before = crate::video::dropped_frames();
         for i in 0..200u8 {
             let _ = v.encode_raw(vec![i; big], i64::from(i));

@@ -34,6 +34,19 @@ pub fn usage() -> (f64, u64) {
     sys.process(pid).map_or((0.0, 0), |p| (f64::from(p.cpu_usage()) / cores, p.memory() / (1024 * 1024)))
 }
 
+/// Overall CPU usage across the entire machine (`0..=100` %), for auto-config benchmarking.
+pub fn machine_cpu_pct() -> f64 {
+    static SYS: Mutex<Option<sysinfo::System>> = Mutex::new(None);
+    let mut guard = SYS.lock().unwrap_or_else(|e| e.into_inner());
+    let sys = guard.get_or_insert_with(|| {
+        let mut s = sysinfo::System::new();
+        s.refresh_cpu_usage();
+        s
+    });
+    sys.refresh_cpu_usage();
+    f64::from(sys.global_cpu_usage()).clamp(0.0, 100.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
