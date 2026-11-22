@@ -1065,7 +1065,21 @@ struct SensitiveSpan {
 fn collect_sensitive_spans(text: &str, known_secrets: &[&str], known_usernames: &[&str]) -> Vec<SensitiveSpan> {
     let mut spans = Vec::new();
 
-    // 1. Explicit known secrets (>= 4 chars).
+    collect_known_spans(text, known_secrets, known_usernames, &mut spans);
+
+    // 3. Structural collectors on raw text.
+    collect_structural_spans(text, &mut spans);
+
+    // 4. Percent-decoded pass for URL-encoded secrets/URLs/emails/paths (mapped back to raw spans).
+    if text.contains('%') {
+        collect_percent_decoded_spans(text, known_secrets, known_usernames, &mut spans);
+    }
+
+    merge_sensitive_spans(spans)
+}
+
+/// Registered secrets (>= 4 chars) and usernames (>= 3, on word boundaries).
+fn collect_known_spans(text: &str, known_secrets: &[&str], known_usernames: &[&str], spans: &mut Vec<SensitiveSpan>) {
     let mut secrets: Vec<&str> = known_secrets.iter().copied().filter(|s| s.len() >= 4).collect();
     secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
     for secret in secrets {
@@ -1073,23 +1087,11 @@ fn collect_sensitive_spans(text: &str, known_secrets: &[&str], known_usernames: 
             spans.push(SensitiveSpan { start: idx, end: idx + secret.len(), kind: SpanKind::Secret, bracketed: false });
         }
     }
-
-    // 2. Explicit known usernames (>= 3 chars) on identifier/word boundaries.
     let mut users: Vec<&str> = known_usernames.iter().copied().filter(|u| u.len() >= 3).collect();
     users.sort_by_key(|u| std::cmp::Reverse(u.len()));
     for user in users {
-        collect_identifier_ci_spans(text, user, &mut spans);
+        collect_identifier_ci_spans(text, user, spans);
     }
-
-    // 3. Structural collectors on raw text.
-    collect_structural_spans(text, &mut spans);
-
-    // 4. Percent-decoded pass for URL-encoded secrets/URLs/emails/paths (mapped back to raw spans).
-    if text.contains('%') {
-        collect_percent_decoded_spans(text, &mut spans);
-    }
-
-    merge_sensitive_spans(spans)
 }
 
 fn collect_structural_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
@@ -1134,7 +1136,12 @@ fn merge_sensitive_spans(mut spans: Vec<SensitiveSpan>) -> Vec<SensitiveSpan> {
     merged
 }
 
-fn collect_percent_decoded_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
+fn collect_percent_decoded_spans(
+    text: &str,
+    known_secrets: &[&str],
+    known_usernames: &[&str],
+    spans: &mut Vec<SensitiveSpan>,
+) {
     let bytes = text.as_bytes();
     let mut decoded = String::with_capacity(text.len());
     let mut orig_ranges: Vec<(usize, usize)> = Vec::with_capacity(text.len());
@@ -1165,7 +1172,10 @@ fn collect_percent_decoded_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
     if !saw_pct {
         return;
     }
+    // The decoded text gets everything the raw text does: a registered credential written
+    // with %2d for its hyphens has no key label to give it away.
     let mut dec_spans = Vec::new();
+    collect_known_spans(&decoded, known_secrets, known_usernames, &mut dec_spans);
     collect_structural_spans(&decoded, &mut dec_spans);
     for ds in dec_spans {
         if ds.start < ds.end && ds.end <= orig_ranges.len() {
@@ -2468,5 +2478,13 @@ mod tests {
         }
         // A known username whose case-folded form is shorter than itself (the Kelvin sign).
         let _ = redact_text("kim kim", &[], &["\u{212A}im"]);
+    }
+
+    #[test]
+    fn a_percent_encoded_known_secret_is_redacted() {
+        let secret = "abc-DEF-12345";
+        let out = redact_text("seen value abc%2dDEF%2d12345 in a url path", &[secret], &[]);
+        assert!(!out.contains("abc%2dDEF"), "{out}");
+        assert!(!out.contains("DEF%2d12345"), "{out}");
     }
 }
