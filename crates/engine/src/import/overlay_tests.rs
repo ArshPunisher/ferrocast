@@ -882,3 +882,35 @@ fn a_streamlabs_web_source_on_this_computer_or_network_is_emptied_and_notes_hide
         assert!(!notes.contains(secret), "{secret} in the notes: {notes}");
     }
 }
+
+// ---- Neon review C2: placeholders are filled only where a pack's own file or overlay goes ------
+
+#[test]
+fn the_overlay_token_and_paths_never_land_in_text_a_pack_controls() {
+    let secret_url = "http://127.0.0.1:47820/o/SECRET-TOKEN/".to_string();
+    let urls: BTreeMap<String, String> = BTreeMap::from([("__FERRO_OVERLAY_URL__:0".to_string(), secret_url.clone())]);
+    let paths = vec!["/Users/victim/Library/Application Support/Ferrocast/studio/packs/p1/assets/a.png".to_string()];
+    let tmpl = json!({
+        "name": "__FERRO_PACK_ASSET__:0",
+        "sources": [
+            { "name": "__FERRO_OVERLAY_URL__:0", "id": "text_ft2_source_v2",
+              "settings": { "text": "__FERRO_OVERLAY_URL__:0", "extra": "__FERRO_PACK_ASSET__:0" } },
+            { "name": "Pic", "id": "image_source", "settings": { "file": "__FERRO_PACK_ASSET__:0" },
+              "filters": [ { "id": "mask_filter", "settings": { "image_path": "__FERRO_PACK_ASSET__:0" } } ] },
+            { "name": "Slides", "id": "slideshow", "settings": { "files": [ { "value": "__FERRO_PACK_ASSET__:0" } ] } },
+            { "name": "Overlay", "id": "ferrocast_web", "settings": { "url": "__FERRO_OVERLAY_URL__:0" } }
+        ],
+        "transitions": [ { "id": "obs_stinger_transition", "settings": { "path": "__FERRO_PACK_ASSET__:0" } } ]
+    });
+    let out = finalize_doc(&tmpl, &paths, &urls);
+    // Where a file or the overlay's address belongs, the real value goes in.
+    assert_eq!(out["sources"][1]["settings"]["file"], json!(paths[0]));
+    assert_eq!(out["sources"][1]["filters"][0]["settings"]["image_path"], json!(paths[0]));
+    assert_eq!(out["sources"][2]["settings"]["files"][0]["value"], json!(paths[0]));
+    assert_eq!(out["sources"][3]["settings"]["url"], json!(secret_url));
+    assert_eq!(out["transitions"][0]["settings"]["path"], json!(paths[0]));
+    // Anywhere else the words stay words: nothing a viewer could read.
+    let text_source = serde_json::to_string(&out["sources"][0]).unwrap();
+    assert!(!text_source.contains("SECRET-TOKEN") && !text_source.contains("/Users/victim"), "{text_source}");
+    assert!(!out["name"].to_string().contains("/Users/victim"));
+}

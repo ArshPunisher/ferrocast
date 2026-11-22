@@ -1876,29 +1876,52 @@ fn count_web_pages(doc: &Value) -> usize {
 
 /// Replaces asset and overlay placeholders inside `doc_template` after assets live on disk and
 /// Ferrocast overlays have been created.
+///
+/// A placeholder is filled only where a file or an overlay's address belongs (a setting that
+/// names a file, a slideshow's files, a browser source's `url`). A pack can write the same words
+/// anywhere (a text source, a name); there they stay words, so the overlay's secret address and
+/// this computer's folders never end up in something a viewer can read.
 pub fn finalize_doc(doc_template: &Value, asset_paths: &[String], overlay_urls: &BTreeMap<String, String>) -> Value {
-    fn walk(v: &Value, asset_paths: &[String], overlay_urls: &BTreeMap<String, String>) -> Value {
+    /// Settings that hold a file of the pack.
+    const FILE_KEYS: [&str; 9] =
+        ["file", "local_file", "path", "image_file", "luma_path", "mask_path", "image_path", "clut_path", "value"];
+
+    fn walk(
+        v: &Value,
+        key: Option<&str>,
+        in_files: bool,
+        asset_paths: &[String],
+        overlay_urls: &BTreeMap<String, String>,
+    ) -> Value {
         match v {
             Value::String(s) => {
-                if let Some(rest) = s.strip_prefix(ASSET_PLACEHOLDER_PREFIX)
+                // `value` is a file only inside a slideshow's `files`.
+                let file_here = key.is_some_and(|k| FILE_KEYS.contains(&k) && (k != "value" || in_files));
+                if file_here
+                    && let Some(rest) = s.strip_prefix(ASSET_PLACEHOLDER_PREFIX)
                     && let Ok(idx) = rest.parse::<usize>()
                     && let Some(path) = asset_paths.get(idx)
                 {
                     return Value::String(path.clone());
                 }
-                if s.starts_with(OVERLAY_PLACEHOLDER_PREFIX)
+                if key == Some("url")
+                    && s.starts_with(OVERLAY_PLACEHOLDER_PREFIX)
                     && let Some(url) = overlay_urls.get(s)
                 {
                     return Value::String(url.clone());
                 }
                 Value::String(s.clone())
             }
-            Value::Array(arr) => Value::Array(arr.iter().map(|i| walk(i, asset_paths, overlay_urls)).collect()),
-            Value::Object(map) => {
-                Value::Object(map.iter().map(|(k, val)| (k.clone(), walk(val, asset_paths, overlay_urls))).collect())
-            }
+            Value::Array(arr) => Value::Array(
+                arr.iter().map(|i| walk(i, key, in_files || key == Some("files"), asset_paths, overlay_urls)).collect(),
+            ),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(k, val)| (k.clone(), walk(val, Some(k), in_files, asset_paths, overlay_urls)))
+                    .collect(),
+            ),
             other => other.clone(),
         }
     }
-    walk(doc_template, asset_paths, overlay_urls)
+    walk(doc_template, None, false, asset_paths, overlay_urls)
 }
