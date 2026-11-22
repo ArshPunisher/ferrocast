@@ -279,7 +279,7 @@ fn save_undo_tx(tx: &rusqlite::Transaction<'_>, saved: &StoreUndoEntry) -> Resul
     )?;
     tx.execute(
         "DELETE FROM store_undo WHERE token NOT IN (
-           SELECT token FROM store_undo ORDER BY created_at DESC, rowid DESC LIMIT ?1
+           SELECT token FROM store_undo ORDER BY rowid DESC LIMIT ?1
          )",
         [MAX_UNDO_ENTRIES],
     )?;
@@ -296,7 +296,7 @@ pub fn latest_undo(store: &Store) -> Result<Option<StoreUndoSummary>> {
     store.read(|c| {
         Ok(c.query_row(
             "SELECT token, action, item_id, item_title, created_at FROM store_undo
-             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+             ORDER BY rowid DESC LIMIT 1",
             [],
             |r| {
                 Ok(StoreUndoSummary {
@@ -328,7 +328,7 @@ pub fn peek_undo(store: &Store, token: Option<&str>) -> Result<StoreUndoEntry> {
             None => tx
                 .query_row(
                     "SELECT token, action, item_id, item_title, snapshot_json, created_at
-                     FROM store_undo ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                     FROM store_undo ORDER BY rowid DESC LIMIT 1",
                     [],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                 )
@@ -523,5 +523,37 @@ mod tests {
 
         delete_install(&store, "aurora-pulse").unwrap();
         assert!(list_installs(&store).unwrap().is_empty());
+    }
+    #[test]
+    fn the_latest_undo_is_the_last_written_even_if_the_clock_went_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let entry = |token: &str, at: i64| StoreUndoEntry {
+            token: token.into(),
+            action: "install".into(),
+            item_id: "aurora-pulse".into(),
+            item_title: "Aurora Pulse".into(),
+            snapshot: StoreUndoSnapshot {
+                prev_install: None,
+                created_design_ids: vec![],
+                prev_designs: vec![],
+                cleared_active_alert: None,
+                rule_changes: vec![],
+                created_plugin_id: None,
+                prev_plugin: None,
+            },
+            created_at: at,
+        };
+        save_undo(&store, &entry("first", 5000)).unwrap();
+        // The next action is stamped earlier: the PC's clock was set back.
+        save_undo(&store, &entry("second", 1000)).unwrap();
+        assert_eq!(latest_undo(&store).unwrap().unwrap().token, "second");
+        assert_eq!(peek_undo(&store, None).unwrap().token, "second");
+        // Pruning keeps the newest written, not the newest stamped.
+        for i in 0..MAX_UNDO_ENTRIES {
+            save_undo(&store, &entry(&format!("later-{i}"), 10 + i)).unwrap();
+        }
+        assert!(peek_undo(&store, Some("first")).is_err(), "the oldest written is the one pruned");
+        assert!(peek_undo(&store, Some("second")).is_err(), "and the next oldest");
     }
 }
