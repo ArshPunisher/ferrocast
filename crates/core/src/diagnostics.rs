@@ -1529,11 +1529,13 @@ fn find_closing_quote(inner: &str, quote: char, escaped_json: bool) -> Option<us
 
 fn collect_kv_and_json_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
     let mut offset = 0usize;
+    // Lowercased once (ASCII only, so every offset is the same in both).
+    let lower_all = text.to_ascii_lowercase();
     while offset < text.len() {
         let rest = &text[offset..];
         let prev_byte = offset.checked_sub(1).map(|idx| text.as_bytes()[idx]);
-        let low = rest.to_ascii_lowercase();
-        if let Some((key_name, key_len, val_delim, is_json_key, is_escaped_json)) = match_kv_prefix(&low, prev_byte) {
+        let low = &lower_all[offset..];
+        if let Some((key_name, key_len, val_delim, is_json_key, is_escaped_json)) = match_kv_prefix(low, prev_byte) {
             let after_eq = &rest[key_len..];
             let trim_ws = if is_json_key {
                 after_eq.len() - after_eq.trim_start_matches([' ', '\t', '\r', '\n']).len()
@@ -2486,5 +2488,14 @@ mod tests {
         let out = redact_text("seen value abc%2dDEF%2d12345 in a url path", &[secret], &[]);
         assert!(!out.contains("abc%2dDEF"), "{out}");
         assert!(!out.contains("DEF%2d12345"), "{out}");
+    }
+
+    #[test]
+    fn a_huge_line_is_redacted_in_linear_time() {
+        let big = "a".repeat(1 << 20);
+        let t = std::time::Instant::now();
+        let out = redact_text(&big, &["supersecret"], &["someuser"]);
+        assert_eq!(out.len(), big.len());
+        assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
     }
 }
