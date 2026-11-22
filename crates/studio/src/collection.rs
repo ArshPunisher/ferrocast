@@ -46,6 +46,8 @@ pub struct ItemInfo {
     pub name: String,
     pub kind: String,
     pub visible: bool,
+    /// Where it is shown: "both" (the default), "stream" or "recording".
+    pub show: String,
     pub locked: bool,
     /// It makes sound (shows in the mixer).
     pub audio: bool,
@@ -204,6 +206,12 @@ pub enum ItemEdit {
     ScaleBilinear,
     ScaleLanczos,
     ScaleArea,
+    /// Where it is shown: on the stream and in the recording (the default), only on the stream
+    /// (a chat box a clean recording leaves out), or only in the recording (a camera the stream
+    /// doesn't carry). On a group, it covers the children.
+    StreamAndRecording,
+    StreamOnly,
+    RecordingOnly,
 }
 
 /// Something to do with a Web page source.
