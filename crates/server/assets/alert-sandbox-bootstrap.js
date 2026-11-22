@@ -100,7 +100,7 @@
   /** Lowercase CSS with comments dropped and escapes decoded, as a browser reads it. */
   function normCss(css) {
     var s = css.replace(/\/\*[\s\S]*?\*\//g, '')
-    s = s.replace(/\\([0-9a-fA-F]{1,6})\s?/g, function (_, h) {
+    s = s.replace(/\\([0-9a-fA-F]{1,6})[ \t\n\r\f]?/g, function (_, h) {
       var n = parseInt(h, 16)
       return n > 0 && n < 0x110000 ? String.fromCodePoint(n) : ''
     })
@@ -134,7 +134,9 @@
   function urlOk(value) {
     var v = String(value).trim().toLowerCase()
     // eslint-disable-next-line no-control-regex
-    if (/[\s\u0000-\u001f\u007f&\\]/.test(v)) return false
+    if (/[\s\u0000-\u001f\u007f\\]/.test(v)) return false
+    // Entities only matter where a scheme could hide; signed picture links carry &.
+    if (v.indexOf('&') !== -1 && v.indexOf('https://') !== 0) return false
     if (v.charAt(0) === '#') return true
     var m = /^data:image\/(png|jpeg|gif|webp|avif);/.exec(v)
     if (m) return true

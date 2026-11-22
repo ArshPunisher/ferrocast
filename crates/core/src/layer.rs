@@ -148,7 +148,7 @@ pub fn normalize_css(css: &str) -> String {
             }
             continue;
         }
-        if chars.peek().is_some_and(|w| w.is_whitespace()) {
+        if chars.peek().is_some_and(|w| matches!(w, ' ' | '\t' | '\n' | '\r' | '\x0c')) {
             chars.next();
         }
         out.push(u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32).unwrap_or('\u{fffd}'));
