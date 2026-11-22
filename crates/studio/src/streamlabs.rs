@@ -251,6 +251,12 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         scene_names.push(n);
     }
     let name_of = |id: &str| by_id.get(id).cloned();
+    // Only scenes (not sources) can be an end of a transition rule.
+    let scene_ids: std::collections::HashMap<String, String> = scenes
+        .iter()
+        .zip(&scene_names)
+        .filter_map(|(sc, n)| Some((sc.get("id")?.as_str()?.to_string(), n.clone())))
+        .collect();
     for (sc, n) in scenes.iter().zip(&scene_names) {
         let list: Vec<Value> = items(sc, "sceneItems")
             .iter()
@@ -319,8 +325,16 @@ pub fn to_obs(root: &Value, name: &str) -> Value {
         .filter_map(|c| {
             let tid = c.get("transitionId").and_then(Value::as_str)?;
             let tr = tr_by_id.get(tid)?;
-            let from = c.get("fromSceneId").and_then(Value::as_str).filter(|s| !s.is_empty()).and_then(name_of);
-            let to = c.get("toSceneId").and_then(Value::as_str).filter(|s| !s.is_empty()).and_then(name_of);
+            // "ALL" (or nothing) is a wildcard; any other id must be a scene that came across.
+            // A scene deleted in Streamlabs leaves a dead rule: dropped, not turned into "any".
+            let end = |key: &str| -> Option<Option<String>> {
+                match c.get(key).and_then(Value::as_str) {
+                    None => Some(None),
+                    Some(s) if s.is_empty() || s.eq_ignore_ascii_case("all") => Some(None),
+                    Some(id) => scene_ids.get(id).cloned().map(Some),
+                }
+            };
+            let (from, to) = (end("fromSceneId")?, end("toSceneId")?);
             if from.is_none() && to.is_none() {
                 return None;
             }
@@ -398,6 +412,22 @@ mod tests {
                 ]
             }
         })
+    }
+
+    #[test]
+    fn dangling_transition_ends_are_dropped_and_all_stays_a_wildcard() {
+        let mut v = sample();
+        v["transitions"]["connections"] = json!([
+            { "fromSceneId": "scene_deleted_9", "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": "ALL", "toSceneId": "c2", "transitionId": "t1" },
+            { "fromSceneId": "c1", "toSceneId": "gone_too", "transitionId": "t1" },
+            { "fromSceneId": "s1", "toSceneId": "c2", "transitionId": "t1" }
+        ]);
+        let doc = to_obs(&v, "Main");
+        let rules = doc["ferrocast"]["transition_matrix"].as_array().unwrap();
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0]["from"], Value::Null);
+        assert_eq!(rules[0]["to"], "BRB");
     }
 
     #[test]
