@@ -9,6 +9,7 @@
 //! `.part` name that is renamed when done and never over a file that is there. Nothing here
 //! touches a live output: the clips are files, and the work runs in the background.
 
+pub mod edit;
 pub mod jobs;
 
 use std::path::{Path, PathBuf};

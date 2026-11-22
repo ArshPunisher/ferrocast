@@ -329,7 +329,7 @@ impl Engine {
     }
 
     /// Writes "<clip>.srt" (never over one already there) → its path, when anything was said.
-    async fn clip_subtitles(&self, ffmpeg: &Path, clip: &Path) -> Option<PathBuf> {
+    pub(crate) async fn clip_subtitles(&self, ffmpeg: &Path, clip: &Path) -> Option<PathBuf> {
         let out = srt_path(clip);
         if out.exists() {
             return Some(out);
