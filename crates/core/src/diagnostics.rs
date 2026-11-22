@@ -250,27 +250,44 @@ fn redact_report(report: &mut SupportReport, secrets: &[&str], users: &[&str]) {
     report.os.long_version = sc(&report.os.long_version);
     report.os.kernel_version = sc(&report.os.kernel_version);
     report.gpu.name = sc(&report.gpu.name);
+    report.gpu.backend = sc(&report.gpu.backend);
+    report.gpu.device_type = sc(&report.gpu.device_type);
     report.gpu.driver = sc(&report.gpu.driver);
     report.gpu.driver_info = sc(&report.gpu.driver_info);
     report.gpu.active_renderer = report.gpu.active_renderer.as_deref().map(sc);
+    for enc in &mut report.encoders {
+        enc.id = sc(&enc.id);
+        enc.label = sc(&enc.label);
+        enc.codec = sc(&enc.codec);
+    }
     if let Some(m) = &mut report.audio.monitoring_device {
         *m = sc(m);
     }
     for d in &mut report.audio.devices {
+        d.kind = sc(&d.kind);
         d.name = sc(&d.name);
     }
     for st in &mut report.last_streams {
         st.id = sc(&st.id);
+        st.canvas = sc(&st.canvas);
+        st.encoder_id = st.encoder_id.as_deref().map(sc);
         for d in &mut st.destinations {
+            d.platform = sc(&d.platform);
             d.target = sc(&d.target);
+            d.state = sc(&d.state);
             d.last_error = d.last_error.as_deref().map(sc);
+        }
+        for issue in &mut st.issues {
+            *issue = sc(issue);
         }
     }
     for cr in &mut report.crashes {
         cr.filename = sc(&cr.filename);
+        cr.kind = sc(&cr.kind);
         cr.summary = cr.summary.as_deref().map(sc);
     }
     for cn in &mut report.connectors {
+        cn.state = sc(&cn.state);
         cn.detail = cn.detail.as_deref().map(sc);
     }
     for log_name in &mut report.logs_included {
@@ -2348,5 +2365,55 @@ mod tests {
         let cause_pos = summary.find("=== LIKELY CAUSES ===").unwrap_or(usize::MAX);
         let app_pos = summary.find("=== APP & OS VERSIONS ===").unwrap_or(0);
         assert!(cause_pos < app_pos, "likely causes must appear at the top");
+    }
+
+    #[test]
+    fn redact_report_scrubs_encoder_labels_and_stream_issues() {
+        let mut inp = healthy_input();
+        inp.encoders.push(EncoderInfo {
+            id: "enc token=enc_secret_id_11".into(),
+            label: "NVIDIA NVENC /Users/leakUser99/gpu token=lbl_secret_22".into(),
+            hardware: true,
+            codec: "H.264 owner@enc.example".into(),
+            selected: false,
+        });
+        inp.last_streams.push(StreamHealthRecord {
+            id: "s-1".into(),
+            started_at: Millis(1_000),
+            ended_at: Some(Millis(2_000)),
+            duration_s: 10,
+            platforms: vec![Platform::Twitch],
+            live: false,
+            unclean_end: false,
+            fps_target: 60,
+            canvas: "1920x1080 rtmp://live.twitch.tv/app/live_canvas_key".into(),
+            encoder_id: Some("obs_x264 password=enc_pw_33".into()),
+            sample_rate_hz: 48_000,
+            dropped_frames: 0,
+            skipped_frames: 0,
+            lagged_frames: 0,
+            rendered_frames: 600,
+            avg_fps: 60.0,
+            cpu_pct: 20.0,
+            memory_mb: 512,
+            frame_ms: 16.0,
+            destinations: Vec::new(),
+            issues: vec!["auth Bearer issue_bearer_tok_44 from 198.51.100.88".into()],
+        });
+
+        let report = build_support_report(inp, &["opaqueReportSecret"], &["leakUser99"]);
+        let json = serde_json::to_string(&report).unwrap();
+        for forbidden in [
+            "enc_secret_id_11",
+            "leakUser99",
+            "lbl_secret_22",
+            "owner@enc.example",
+            "live_canvas_key",
+            "enc_pw_33",
+            "issue_bearer_tok_44",
+            "198.51.100.88",
+        ] {
+            assert!(!json.contains(forbidden), "field leaked {forbidden:?} into SupportReport: {json}");
+        }
     }
 }

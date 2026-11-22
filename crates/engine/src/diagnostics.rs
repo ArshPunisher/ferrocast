@@ -189,7 +189,7 @@ impl Engine {
     /// Returns a redacted diagnostic preview (without creating a zip on disk).
     pub async fn diagnostics_preview(&self) -> Result<SupportReport, EngineError> {
         let _guard = self.inner.diagnostics_busy.lock().await;
-        let (input, secrets, users, _logs, _crashes) = self.gather_diagnostics().await?;
+        let (input, secrets, users, _logs, _crashes) = self.gather_diagnostics(false).await?;
         let s_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
         let u_refs: Vec<&str> = users.iter().map(String::as_str).collect();
         Ok(build_support_report(input, &s_refs, &u_refs))
@@ -198,7 +198,7 @@ impl Engine {
     /// Builds the complete redacted support zip archive in memory (`(filename, zip_bytes, report)`).
     pub async fn diagnostics_zip_bytes(&self) -> Result<(String, Vec<u8>, SupportReport), EngineError> {
         let _guard = self.inner.diagnostics_busy.lock().await;
-        let (input, secrets, users, logs, crash_files) = self.gather_diagnostics().await?;
+        let (input, secrets, users, logs, crash_files) = self.gather_diagnostics(true).await?;
         let s_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
         let u_refs: Vec<&str> = users.iter().map(String::as_str).collect();
 
@@ -323,6 +323,7 @@ impl Engine {
 
     async fn gather_diagnostics(
         &self,
+        include_artifacts: bool,
     ) -> Result<(DiagnosticInput, Vec<String>, Vec<String>, Vec<(String, String)>, Vec<(String, Vec<u8>)>), EngineError>
     {
         let generated_at = now();
@@ -373,56 +374,75 @@ impl Engine {
         let studio_for_probe = studio.clone();
         let data_for_probe = data_dir.clone();
 
-        let (os, gpu, audio_devices, disk_free_mb, known_secrets, logs, recent_errors, crash_meta, crash_files) =
-            tokio::task::spawn_blocking(move || {
-                let known_secrets = collect_known_secrets_blocking(secrets_store.as_ref(), &dest_ids, &obs_paths);
-                let s_refs: Vec<&str> = known_secrets.iter().map(String::as_str).collect();
-                let u_refs: Vec<&str> = u_owned.iter().map(String::as_str).collect();
+        let (
+            os,
+            gpu,
+            audio_devices,
+            disk_free_mb,
+            known_secrets,
+            logs_included,
+            logs,
+            recent_errors,
+            crash_meta,
+            crash_files,
+        ) = tokio::task::spawn_blocking(move || {
+            let known_secrets = collect_known_secrets_blocking(secrets_store.as_ref(), &dest_ids, &obs_paths);
+            let s_refs: Vec<&str> = known_secrets.iter().map(String::as_str).collect();
+            let u_refs: Vec<&str> = u_owned.iter().map(String::as_str).collect();
 
-                let os = OsVersionInfo {
-                    name: sysinfo::System::name().unwrap_or_else(|| std::env::consts::OS.into()),
-                    version: sysinfo::System::os_version().unwrap_or_default(),
-                    long_version: sysinfo::System::long_os_version().unwrap_or_default(),
-                    kernel_version: sysinfo::System::kernel_version().unwrap_or_default(),
-                };
+            let os = OsVersionInfo {
+                name: sysinfo::System::name().unwrap_or_else(|| std::env::consts::OS.into()),
+                version: sysinfo::System::os_version().unwrap_or_default(),
+                long_version: sysinfo::System::long_os_version().unwrap_or_default(),
+                kernel_version: sysinfo::System::kernel_version().unwrap_or_default(),
+            };
 
-                let probe_gpu = ferrocore::diagnostics_probe::probe_gpu();
-                let gpu = GpuInfo {
-                    name: probe_gpu.name,
-                    backend: probe_gpu.backend,
-                    device_type: probe_gpu.device_type,
-                    driver: probe_gpu.driver,
-                    driver_info: probe_gpu.driver_info,
-                    is_software: probe_gpu.is_software,
-                    active_renderer: studio_for_probe
-                        .as_ref()
-                        .and_then(|v| v.get("renderer").and_then(Value::as_str).map(String::from)),
-                };
+            let probe_gpu = ferrocore::diagnostics_probe::probe_gpu();
+            let gpu = GpuInfo {
+                name: probe_gpu.name,
+                backend: probe_gpu.backend,
+                device_type: probe_gpu.device_type,
+                driver: probe_gpu.driver,
+                driver_info: probe_gpu.driver_info,
+                is_software: probe_gpu.is_software,
+                active_renderer: studio_for_probe
+                    .as_ref()
+                    .and_then(|v| v.get("renderer").and_then(Value::as_str).map(String::from)),
+            };
 
-                let audio_devices: Vec<AudioDeviceInfo> = ferrocore::diagnostics_probe::probe_audio_devices()
-                    .into_iter()
-                    .map(|d| AudioDeviceInfo {
-                        kind: d.kind,
-                        name: d.name,
-                        is_default: d.is_default,
-                        sample_rate_hz: d.sample_rate_hz,
-                        supported_sample_rates_hz: d.supported_sample_rates_hz,
-                        channels: d.channels,
-                    })
-                    .collect();
+            let audio_devices: Vec<AudioDeviceInfo> = ferrocore::diagnostics_probe::probe_audio_devices()
+                .into_iter()
+                .map(|d| AudioDeviceInfo {
+                    kind: d.kind,
+                    name: d.name,
+                    is_default: d.is_default,
+                    sample_rate_hz: d.sample_rate_hz,
+                    supported_sample_rates_hz: d.supported_sample_rates_hz,
+                    channels: d.channels,
+                })
+                .collect();
 
-                let disk_free_mb = free_disk_mb(&data_for_probe);
-                let (logs, recent_errors) = gather_redacted_logs(&data_for_probe.join("logs"), &s_refs, &u_refs);
-                let (crash_meta, crash_files) =
-                    gather_redacted_crashes(&data_for_probe.join("crashes"), &s_refs, &u_refs);
+            let disk_free_mb = free_disk_mb(&data_for_probe);
+            let (logs_included, logs, recent_errors) =
+                gather_redacted_logs(&data_for_probe.join("logs"), include_artifacts, &s_refs, &u_refs);
+            let (crash_meta, crash_files) =
+                gather_redacted_crashes(&data_for_probe.join("crashes"), include_artifacts, &s_refs, &u_refs);
 
-                (os, gpu, audio_devices, disk_free_mb, known_secrets, logs, recent_errors, crash_meta, crash_files)
-            })
-            .await
-            .map_err(|e| EngineError::Unavailable(e.to_string()))?;
-
-        let s_refs: Vec<&str> = known_secrets.iter().map(String::as_str).collect();
-        let u_refs: Vec<&str> = known_usernames.iter().map(String::as_str).collect();
+            (
+                os,
+                gpu,
+                audio_devices,
+                disk_free_mb,
+                known_secrets,
+                logs_included,
+                logs,
+                recent_errors,
+                crash_meta,
+                crash_files,
+            )
+        })
+        .await
+        .map_err(|e| EngineError::Unavailable(e.to_string()))?;
 
         let selected_encoder =
             studio.as_ref().and_then(|v| v.get("video_encoder").and_then(Value::as_str).map(String::from));
@@ -431,14 +451,6 @@ impl Engine {
             studio.as_ref().and_then(|v| v.get("sample_rate").and_then(Value::as_u64)).unwrap_or(48_000) as u32;
         let monitoring_device =
             studio.as_ref().and_then(|v| v.get("monitoring").and_then(Value::as_str).map(String::from));
-
-        let logs_included: Vec<String> = logs
-            .iter()
-            .map(|(n, _)| {
-                let safe = sanitize_zip_component(&redact_text(n, &s_refs, &u_refs));
-                format!("logs/{safe}")
-            })
-            .collect();
 
         let input = DiagnosticInput {
             generated_at,
@@ -630,7 +642,13 @@ fn free_disk_mb(path: &Path) -> Option<u64> {
     best.map(|d| d.available_space() / (1024 * 1024))
 }
 
-fn gather_redacted_logs(logs_dir: &Path, secrets: &[&str], users: &[&str]) -> (Vec<(String, String)>, Vec<String>) {
+fn gather_redacted_logs(
+    logs_dir: &Path,
+    include_contents: bool,
+    secrets: &[&str],
+    users: &[&str],
+) -> (Vec<String>, Vec<(String, String)>, Vec<String>) {
+    let mut included_names = Vec::new();
     let mut files_out = Vec::new();
     let mut errors = Vec::new();
     for fname in ["ferrocast.1.log", "ferrocast.log"] {
@@ -646,9 +664,13 @@ fn gather_redacted_logs(logs_dir: &Path, secrets: &[&str], users: &[&str]) -> (V
                 errors.push(l.to_string());
             }
         }
-        files_out.push((fname.to_string(), redacted));
+        let safe = sanitize_zip_component(&redact_text(fname, secrets, users));
+        included_names.push(format!("logs/{safe}"));
+        if include_contents {
+            files_out.push((fname.to_string(), redacted));
+        }
     }
-    (files_out, errors)
+    (included_names, files_out, errors)
 }
 
 fn read_tail_bytes(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
@@ -703,6 +725,7 @@ fn is_error_line(l: &str) -> bool {
 
 fn gather_redacted_crashes(
     crashes_dir: &Path,
+    include_contents: bool,
     secrets: &[&str],
     users: &[&str],
 ) -> (Vec<CrashDumpSummary>, Vec<(String, Vec<u8>)>) {
@@ -764,26 +787,31 @@ fn gather_redacted_crashes(
             let limit = if is_binary_dmp { MAX_BINARY_DUMP_BYTES } else { MAX_TEXT_CRASH_BYTES };
             let file_len = meta.len();
             if file_len <= limit && total_bytes.saturating_add(file_len) <= MAX_TOTAL_CRASH_ZIP_BYTES {
-                let mut bytes = Vec::with_capacity(file_len as usize);
-                if (&file).take(limit.saturating_add(1)).read_to_end(&mut bytes).is_ok()
-                    && (bytes.len() as u64) <= limit
-                {
-                    if is_binary_dmp {
-                        let is_mdmp = bytes.starts_with(b"MDMP");
-                        redact_bytes_in_place(&mut bytes, secrets, users);
-                        summary = Some(if is_mdmp {
-                            "Windows minidump (redacted)".into()
-                        } else {
-                            "Binary dump (redacted)".into()
-                        });
-                    } else {
-                        let text = String::from_utf8_lossy(&bytes);
-                        let red = redact_text(&text, secrets, users);
-                        bytes = red.into_bytes();
-                    }
-                    total_bytes = total_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
-                    files_out.push((name.clone(), bytes));
+                if !include_contents {
+                    total_bytes = total_bytes.saturating_add(file_len);
                     included = true;
+                } else {
+                    let mut bytes = Vec::with_capacity(file_len as usize);
+                    if (&file).take(limit.saturating_add(1)).read_to_end(&mut bytes).is_ok()
+                        && (bytes.len() as u64) <= limit
+                    {
+                        if is_binary_dmp {
+                            let is_mdmp = bytes.starts_with(b"MDMP");
+                            redact_bytes_in_place(&mut bytes, secrets, users);
+                            summary = Some(if is_mdmp {
+                                "Windows minidump (redacted)".into()
+                            } else {
+                                "Binary dump (redacted)".into()
+                            });
+                        } else {
+                            let text = String::from_utf8_lossy(&bytes);
+                            let red = redact_text(&text, secrets, users);
+                            bytes = red.into_bytes();
+                        }
+                        total_bytes = total_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(0));
+                        files_out.push((name.clone(), bytes));
+                        included = true;
+                    }
                 }
             }
         }
@@ -1271,5 +1299,30 @@ mod tests {
         assert!(std::path::Path::new(&first.path).is_file());
         assert!(std::path::Path::new(&second.path).is_file());
         assert_eq!(std::fs::read(&first.path).unwrap(), first_bytes);
+    }
+
+    #[tokio::test]
+    async fn preview_gather_skips_buffering_crash_and_log_bodies_while_keeping_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let crashes = dir.path().join("crashes");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::create_dir_all(&crashes).unwrap();
+        std::fs::write(logs.join("ferrocast.log"), "2026-11-22T03:00:00Z ERROR gpu: OutOfMemory\n").unwrap();
+        let dmp_file = std::fs::File::create(crashes.join("big.dmp")).unwrap();
+        dmp_file.set_len(6 * 1024 * 1024).unwrap();
+
+        let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
+        let (input, _s, _u, logs_buf, crashes_buf) = engine.gather_diagnostics(false).await.unwrap();
+        assert!(logs_buf.is_empty(), "preview must not buffer log file contents");
+        assert!(crashes_buf.is_empty(), "preview must not read or buffer crash dump bytes");
+        assert_eq!(input.logs_included, vec!["logs/ferrocast.log"]);
+        assert_eq!(input.recent_log_errors.len(), 1);
+        assert_eq!(input.crashes.len(), 1);
+        assert_eq!(input.crashes[0].size_bytes, 6 * 1024 * 1024);
+        assert!(input.crashes[0].included_in_zip);
+
+        let report = engine.diagnostics_preview().await.unwrap();
+        assert!(report.likely_causes.iter().any(|c| c.code == "crash_dumps_present"));
     }
 }
