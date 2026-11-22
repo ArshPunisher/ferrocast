@@ -187,11 +187,8 @@ impl Engine {
     async fn counter_changed(&self, name: &str, value: i64) {
         self.studio().counters.lock().unwrap_or_else(|p| p.into_inner()).insert(name.to_string(), value);
         self.studio_frame("counter", &json!({ "name": name, "value": value }));
-        let Ok(overlays) = self.db(repo::overlays::list).await else { return };
-        let mut vars = Vars::new();
-        self.counter_vars(&mut vars);
+        let Ok(overlays) = self.db(|s| repo::overlays::list_with_widget_kind(s, "label")).await else { return };
         for o in overlays {
-            let (labels, label_trains) = self.overlay_labels_and_trains(&o).await;
             let has_counter = o.widgets.iter().any(|w| {
                 w.kind == WidgetKind::Label
                     && w.config
@@ -199,7 +196,11 @@ impl Engine {
                         .and_then(Value::as_str)
                         .is_some_and(|tpl| chatbot::counters_in(tpl).iter().any(|c| c == name))
             });
-            if has_counter && !labels.is_empty() {
+            if !has_counter {
+                continue;
+            }
+            let (labels, label_trains) = self.overlay_labels_and_trains(&o).await;
+            if !labels.is_empty() {
                 self.send_overlay(OverlayFrame::new(
                     Audience::Overlay(o.id.clone()),
                     self.next_seq(),

@@ -327,11 +327,9 @@ impl Engine {
 
     /// Broadcasts fresh label values (and active hype train timers) to every overlay with labels.
     pub(crate) async fn push_all_overlay_labels(&self) {
-        let Ok(overlays) = self.db(repo::overlays::list).await else { return };
+        let Ok(overlays) = self.db(|s| repo::overlays::list_with_widget_kind(s, "label")).await else { return };
         for o in overlays {
-            if o.widgets.iter().any(|w| w.kind == WidgetKind::Label) {
-                self.push_overlay_labels_for(&o).await;
-            }
+            self.push_overlay_labels_for(&o).await;
         }
     }
 

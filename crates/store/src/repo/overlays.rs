@@ -31,6 +31,18 @@ pub fn list(store: &Store) -> Result<Vec<Overlay>> {
     })
 }
 
+/// Lists only overlays containing at least one widget whose JSON `kind` matches `kind`.
+pub fn list_with_widget_kind(store: &Store, kind: &str) -> Result<Vec<Overlay>> {
+    store.read(|c| {
+        let mut st = c.prepare(&format!(
+            "SELECT {COLS} FROM overlays
+             WHERE EXISTS (SELECT 1 FROM json_each(widgets) WHERE json_extract(value, '$.kind') = ?1)
+             ORDER BY created_at"
+        ))?;
+        Ok(st.query_map([kind], row)?.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+}
+
 pub fn get(store: &Store, id: &str) -> Result<Overlay> {
     store
         .read(|c| Ok(c.query_row(&format!("SELECT {COLS} FROM overlays WHERE id = ?1"), [id], row).optional()?))?
@@ -204,5 +216,25 @@ mod tests {
         for t in ["", "' OR 1=1 --", "../../x", &"a".repeat(32 * 100), "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"] {
             assert!(by_token(&s, t).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn list_with_widget_kind_filters_label_overlays_in_sql() {
+        use ferrocast_core::overlay::{Widget, WidgetKind};
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let _alerts = create(&s, "AlertsOnly", Preset::AlertsOnly).unwrap();
+        let mut lbl_ov = create(&s, "HasLabel", Preset::Blank).unwrap();
+        lbl_ov.widgets = vec![Widget::new(
+            "lbl",
+            WidgetKind::Label,
+            (0, 0, 200, 40),
+            serde_json::json!({ "source": "latest_follower", "template": "{value}", "theme": "molten" }),
+        )];
+        update(&s, &lbl_ov).unwrap();
+
+        let filtered = list_with_widget_kind(&s, "label").unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, lbl_ov.id);
     }
 }
