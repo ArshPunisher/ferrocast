@@ -276,3 +276,33 @@ async fn a_page_token_that_lapsed_shows_sign_in_needed() {
     }
     assert_eq!(state, "sign_in_needed");
 }
+
+#[tokio::test]
+async fn a_saved_page_that_is_not_the_saved_account_asks_for_a_new_sign_in() {
+    // A half-finished switch (the token of one Page, the account record of another) must not
+    // start: it would act as a Page the account does not name.
+    let graph = quiet_graph().await;
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(ferrocast_secrets::MemorySecrets::default());
+    let apps = || PlatformApps {
+        facebook_endpoints: ferrocast_facebook::Endpoints { graph: graph.clone() },
+        ..Default::default()
+    };
+    let first = Engine::start_with(dir.path(), secrets.clone(), apps()).await.unwrap();
+    first.finish_facebook(grant(1)).await.unwrap();
+    // The account now names another Page than the one whose token is saved.
+    let other = ferrocast_store::repo::settings::Account {
+        platform: "facebook".into(),
+        user_id: "p-other".into(),
+        login: "Other".into(),
+        display_name: "Other".into(),
+        avatar_url: None,
+        scopes: vec![],
+        connected_at: 1,
+    };
+    first.db(move |s| ferrocast_store::repo::settings::save_account(s, &other)).await.unwrap();
+    first.shutdown();
+    let again = Engine::start_with(dir.path(), secrets, apps()).await.unwrap();
+    again.resume_accounts().await;
+    assert!(again.connector(Platform::Facebook).is_none(), "it must not act as a Page the account does not name");
+}

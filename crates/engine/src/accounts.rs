@@ -310,8 +310,10 @@ impl Engine {
         if a.platform == "facebook" {
             match saved_tokens::<ferrocast_facebook::Page>(&*self.inner.secrets, FACEBOOK_PAGE) {
                 Saved::Unreadable => return true,
-                Saved::Found(page) => self.start_facebook(page, a.clone()),
-                Saved::Missing => {
+                // The saved token must be the saved account's Page: a half-finished switch (one
+                // Page's token, another's account record) is not started, it asks to sign in again.
+                Saved::Found(page) if page.id == a.user_id => self.start_facebook(page, a.clone()),
+                Saved::Found(_) | Saved::Missing => {
                     let _ = self
                         .submit(Event::live(
                             Platform::Facebook,
