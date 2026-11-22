@@ -489,6 +489,9 @@ fn the_relay_and_the_pc_have_the_same_rules() {
         "/diagnostics/preview",
         "/diagnostics/report",
         "/diagnostics/report.zip",
+        "/store/catalog",
+        "/store/installed",
+        "/store/install",
     ];
     for path in paths {
         for method in ["GET", "POST", "PUT", "DELETE", "PATCH"] {
