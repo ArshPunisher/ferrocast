@@ -230,8 +230,7 @@ impl Credits {
     /// anything changed. A donor left with nothing is dropped.
     pub fn reverse_tip(&mut self, platform: Platform, actor: &Actor, money: &Money) -> bool {
         let Some(name) = clean_name(actor, true) else { return false };
-        let Some(idx) =
-            self.tippers.iter().position(|t| t.platform == platform && t.name.eq_ignore_ascii_case(&name))
+        let Some(idx) = self.tippers.iter().position(|t| t.platform == platform && t.name.eq_ignore_ascii_case(&name))
         else {
             return false;
         };

@@ -401,7 +401,8 @@ async fn banning_or_timing_out_the_author_unpins_their_message() {
     e.register_connector(tw.clone());
     for (n, act, who) in [("m1", "ban", "pinned"), ("m2", "timeout", "other")] {
         e.ingest(chat(Platform::Twitch, n, who, "show me")).await;
-        let id = e.db(move |s| ferrocast_store::repo::events::by_source(s, Platform::Twitch, n)).await.unwrap().unwrap();
+        let id =
+            e.db(move |s| ferrocast_store::repo::events::by_source(s, Platform::Twitch, n)).await.unwrap().unwrap();
         e.pin_chat_highlight(&id, None).await.unwrap();
         assert!(e.chat_highlight().is_some());
         if act == "ban" {

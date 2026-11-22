@@ -491,14 +491,23 @@ mod tests {
         let secrets = Arc::new(MemorySecrets::default());
         let engine = Engine::start_with_secrets(dir.path(), secrets.clone()).await.unwrap();
         let t0 = now().0 - 120_000;
-        let at = |ms: i64, id: &str, kind: EventKind| Event::live(Platform::Twitch, Some(id.into()), Millis(t0 + ms), kind);
+        let at =
+            |ms: i64, id: &str, kind: EventKind| Event::live(Platform::Twitch, Some(id.into()), Millis(t0 + ms), kind);
         engine.ingest(at(0, "on", EventKind::StreamOnline { title: None })).await;
         engine
-            .ingest(at(1000, "f-in", EventKind::Follow { actor: viewer(Platform::Twitch, "DuringStream", Roles::empty()) }))
+            .ingest(at(
+                1000,
+                "f-in",
+                EventKind::Follow { actor: viewer(Platform::Twitch, "DuringStream", Roles::empty()) },
+            ))
             .await;
         engine.ingest(at(2000, "off", EventKind::StreamOffline)).await;
         engine
-            .ingest(at(3000, "f-late", EventKind::Follow { actor: viewer(Platform::Twitch, "AfterOffline", Roles::empty()) }))
+            .ingest(at(
+                3000,
+                "f-late",
+                EventKind::Follow { actor: viewer(Platform::Twitch, "AfterOffline", Roles::empty()) },
+            ))
             .await;
         drop(engine);
 
