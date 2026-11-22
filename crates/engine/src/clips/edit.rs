@@ -355,11 +355,15 @@ impl Engine {
             return Err(bad(&format!("A crossfade is 0 to {MAX_FADE_S} seconds."), "Pick a shorter fade."));
         }
         let root = self.clips_folder().await?;
+        // Every clip is looked up first (a missing one is a 404 whether or not FFmpeg is here).
+        let mut paths = Vec::new();
+        for id in &req.clips {
+            paths.push(self.clip_path(id).await?);
+        }
         let ffmpeg = self.clips_ffmpeg()?;
         let mut pieces = Vec::new();
         let mut size = None;
-        for id in &req.clips {
-            let path = self.clip_path(id).await?;
+        for (id, path) in req.clips.iter().zip(paths) {
             let p: Probe = probe_file(&ffmpeg, &path).await?;
             let d = p.duration_ms.filter(|d| *d > 0 && p.has_video).ok_or_else(|| {
                 refuse(

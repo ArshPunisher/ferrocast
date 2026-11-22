@@ -58,6 +58,17 @@ pub struct ClipEntry {
     pub has_captions: bool,
 }
 
+/// The clips and what can be done with them now.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClipsOverview {
+    pub folder: String,
+    /// FFmpeg is here (trims, compilations, pictures and captions need it).
+    pub ffmpeg_ready: bool,
+    /// YouTube is connected (sending a clip needs it).
+    pub youtube_connected: bool,
+    pub clips: Vec<ClipEntry>,
+}
+
 /// What ffmpeg says about a file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Probe {
@@ -292,6 +303,23 @@ impl Engine {
         tokio::task::spawn_blocking(move || list_in(&root, q.as_deref()))
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// The library and what can be done with it now.
+    pub async fn clips_overview(&self, query: Option<&str>) -> Result<ClipsOverview, EngineError> {
+        Ok(ClipsOverview {
+            folder: self.clips_folder().await?.display().to_string(),
+            ffmpeg_ready: self.ffmpeg_path().is_some(),
+            youtube_connected: self.connector(ferrocast_core::event::Platform::Youtube).is_some(),
+            clips: self.clips(query).await?,
+        })
+    }
+
+    /// A clip's picture as a data URL (what the dashboard shows in a tile).
+    pub async fn clip_thumbnail_image(&self, id: &str) -> Result<String, EngineError> {
+        use base64::Engine as _;
+        let jpg = self.clip_thumbnail(id).await?;
+        Ok(format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(jpg)))
     }
 
     pub(crate) async fn clip_path(&self, id: &str) -> Result<PathBuf, EngineError> {

@@ -127,6 +127,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.
     ("*", "/diagnostics"),
     ("*", "/diagnostics/**"),
+    // Clips are files on the PC: browsing, editing, deleting and sending them to YouTube stay here.
+    ("*", "/clips"),
+    ("*", "/clips/**"),
 ];
 
 /// One plain path segment: no `.`/`..`, no encoded `/`, `\`, `.` or NUL, nothing outside
@@ -267,6 +270,11 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/clips"),
+            ("GET", "/clips/jobs"),
+            ("DELETE", "/clips/a.mp4"),
+            ("POST", "/clips/compile"),
+            ("POST", "/clips/a.mp4/upload"),
         ] {
             assert!(!allowed(Role::Mod, m, p), "{m} {p}");
         }
@@ -369,6 +377,11 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/clips"),
+            ("GET", "/clips/jobs"),
+            ("DELETE", "/clips/a.mp4"),
+            ("POST", "/clips/compile"),
+            ("POST", "/clips/a.mp4/upload"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }
