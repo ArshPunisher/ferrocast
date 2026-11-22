@@ -256,6 +256,44 @@ pub(crate) fn active_recording_files(stats: &serde_json::Value) -> Vec<PathBuf> 
     out
 }
 
+/// Which file a clip name was when an edit was asked for (identity, size and time), so a queued
+/// job edits that file or fails: never whatever is at the name by the time it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileStamp {
+    #[cfg(unix)]
+    dev_ino: (u64, u64),
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileStamp {
+    pub(crate) fn of(path: &Path) -> Result<FileStamp, EngineError> {
+        let m = std::fs::metadata(path).map_err(|_| no_such_clip())?;
+        Ok(FileStamp {
+            #[cfg(unix)]
+            dev_ino: {
+                use std::os::unix::fs::MetadataExt;
+                (m.dev(), m.ino())
+            },
+            len: m.len(),
+            modified: m.modified().ok(),
+        })
+    }
+
+    /// Fails with a plain refusal when the name is no longer that file.
+    pub(crate) fn check(&self, path: &Path) -> Result<(), EngineError> {
+        if FileStamp::of(path).is_ok_and(|now| now == *self) {
+            return Ok(());
+        }
+        Err(refuse(
+            409,
+            "clip_changed",
+            "That clip was changed or replaced while this was waiting.",
+            "Nothing was made. Pick the clip again and start it again.",
+        ))
+    }
+}
+
 /// The same refusal for a clip that is a file a recording is writing, whatever name it is spelled with.
 pub(crate) fn refuse_if_recording_file(active: &[PathBuf], path: &Path) -> Result<(), EngineError> {
     if active.iter().any(|a| same_file(a, path)) {

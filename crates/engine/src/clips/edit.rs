@@ -368,6 +368,7 @@ impl Engine {
     pub async fn trim_clip(&self, id: &str, req: TrimReq) -> Result<JobView, EngineError> {
         let root = self.clips_folder().await?;
         let path = self.clip_path(id).await?;
+        let stamp = super::FileStamp::of(&path)?;
         let ffmpeg = self.clips_ffmpeg()?;
         let probe = probe_file(&ffmpeg, &path).await?;
         let total = probe.duration_ms.ok_or_else(|| {
@@ -398,6 +399,7 @@ impl Engine {
         let precise = req.precise;
         let (start, len) = (req.start_ms, end - req.start_ms);
         Ok(self.start_clip_job(JobKind::Trim, format!("Trim {base}"), move |ctx| async move {
+            stamp.check(&path)?;
             let stem = tokio::task::spawn_blocking({
                 let (r, w) = (root.clone(), wanted.clone());
                 move || free_stem(&r, &w, "mp4")
@@ -443,8 +445,10 @@ impl Engine {
         }
         let ffmpeg = self.clips_ffmpeg()?;
         let mut pieces = Vec::new();
+        let mut stamps = Vec::new();
         let mut size = None;
         for (id, path) in req.clips.iter().zip(paths) {
+            let stamp = super::FileStamp::of(&path)?;
             let p: Probe = probe_file(&ffmpeg, &path).await?;
             let d = p.duration_ms.filter(|d| *d > 0 && p.has_video).ok_or_else(|| {
                 refuse(
@@ -466,6 +470,7 @@ impl Engine {
             if size.is_none() {
                 size = p.width.zip(p.height);
             }
+            stamps.push((path.clone(), stamp));
             pieces.push(Piece {
                 path,
                 duration_ms: d,
@@ -482,6 +487,9 @@ impl Engine {
         let (fade, norm) = (req.crossfade_s, req.normalize);
         let count = pieces.len();
         Ok(self.start_clip_job(JobKind::Compile, format!("Compile {count} clips"), move |ctx| async move {
+            for (p, st) in &stamps {
+                st.check(p)?;
+            }
             let stem = tokio::task::spawn_blocking({
                 let (r, n) = (root.clone(), wanted.clone());
                 move || free_stem(&r, &n, "mp4")
@@ -605,6 +613,7 @@ impl Engine {
     pub async fn burn_clip_captions(&self, id: &str, name: Option<&str>) -> Result<JobView, EngineError> {
         let root = self.clips_folder().await?;
         let path = self.clip_path(id).await?;
+        let stamp = super::FileStamp::of(&path)?;
         let ffmpeg = self.clips_ffmpeg()?;
         let cues = self.clip_captions(id).await?;
         if cues.is_empty() {
@@ -631,6 +640,7 @@ impl Engine {
         };
         let total = probe.duration_ms.unwrap_or(0);
         Ok(self.start_clip_job(JobKind::Burn, format!("Burn captions into {base}"), move |ctx| async move {
+            stamp.check(&path)?;
             let stem = tokio::task::spawn_blocking({
                 let (r, n) = (root.clone(), wanted.clone());
                 move || free_stem(&r, &n, "mp4")

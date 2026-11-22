@@ -522,3 +522,28 @@ fn an_active_recording_is_found_by_file_identity_not_by_spelling() {
     // A recording file that isn't there yet matches nothing.
     assert!(refuse_if_recording_file(&[dir.path().join("Nope.mkv")], &dir.path().join("Other.mkv")).is_ok());
 }
+
+/// CodeRabbit: a queued edit is bound to the file chosen when it was asked for. A different file
+/// put at the same name (or the same file changed) fails the job instead of editing the wrong one.
+#[test]
+fn a_file_stamp_notices_another_file_at_the_same_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("a.mp4");
+    std::fs::write(&p, b"the original clip").unwrap();
+    let stamp = FileStamp::of(&p).unwrap();
+    assert!(stamp.check(&p).is_ok());
+    // Renamed away and a different clip put at its old name.
+    std::fs::rename(&p, dir.path().join("moved.mp4")).unwrap();
+    std::fs::write(&p, b"a different clip").unwrap();
+    let e = stamp.check(&p).unwrap_err();
+    assert!(matches!(e, EngineError::Refused { status: 409, code: "clip_changed", .. }), "{e:?}");
+    // The same file changed in place.
+    let q = dir.path().join("b.mp4");
+    std::fs::write(&q, b"one").unwrap();
+    let s2 = FileStamp::of(&q).unwrap();
+    std::fs::write(&q, b"one, now longer").unwrap();
+    assert!(s2.check(&q).is_err());
+    // A name that is gone.
+    std::fs::remove_file(&q).unwrap();
+    assert!(s2.check(&q).is_err());
+}
