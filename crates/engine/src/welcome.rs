@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ferrocast_core::event::{Event, EventKind, Millis, Origin};
+use ferrocast_core::event::{Event, EventKind, Millis, Origin, Platform};
 use ferrocast_core::welcome::{self, ChatterMark, WelcomeConfig};
 use ferrocast_store::repo;
 use ferrocast_store::repo::viewers::ChatTouch;
@@ -54,7 +54,14 @@ impl Engine {
             (st.welcome.clone(), st.settings.bot_enabled, st.panic_on)
         };
         let streamer = actor.roles.contains(ferrocast_core::event::Roles::BROADCASTER);
-        if mark != ChatterMark::First || !cfg.enabled || !bot_on || panic || streamer || e.channel.is_some() {
+        if mark != ChatterMark::First
+            || !cfg.enabled
+            || !bot_on
+            || panic
+            || streamer
+            || e.channel.is_some()
+            || !Platform::CHAT.contains(&e.platform)
+        {
             return;
         }
         let at = now();

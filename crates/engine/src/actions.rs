@@ -318,6 +318,8 @@ impl Engine {
         }
         let mut targets = vec![(platform, user_id.to_string())];
         targets.extend(entry.linked.iter().cloned());
+        // Platforms that don't let apps ban (Facebook): nothing was banned there.
+        let mut unsupported = 0usize;
         for (p, uid) in targets {
             match self.connector(p) {
                 Some(c) => match c.ban(&uid, reason.as_deref()).await {
@@ -325,10 +327,20 @@ impl Engine {
                         self.clear_highlight_if_user_id(p, &uid);
                         out.ok.push(p);
                     }
-                    Err(e) => out.failed.push(Failure { platform: p, reason: e.to_string() }),
+                    Err(e) => {
+                        if matches!(e, ConnectorError::NotSupported { .. }) {
+                            unsupported += 1;
+                        }
+                        out.failed.push(Failure { platform: p, reason: e.to_string() });
+                    }
                 },
                 None => out.failed.push(Failure { platform: p, reason: format!("{p} isn't connected") }),
             }
+        }
+        // Nothing was banned anywhere because every platform said it can't: don't write down a
+        // ban that did not happen (the person would show as banned and still be commenting).
+        if out.ok.is_empty() && unsupported > 0 && unsupported == out.failed.len() {
+            return Ok(out);
         }
         let _one_at_a_time = self.config_lock().await;
         let mut list = self.state().bans.clone();
