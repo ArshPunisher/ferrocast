@@ -78,7 +78,16 @@ pub fn check(req: &UploadReq) -> Result<UploadReq, EngineError> {
         return Err(bad("The title has a character that can't be in it.", "Use plain text."));
     }
     no_markup(&title, "The title")?;
-    if req.description.len() > MAX_DESCRIPTION_BYTES {
+    // A Short gets "\n\n#Shorts" added after this check: room is kept for it.
+    let room = if req.shorts
+        && !req.description.to_lowercase().contains("#shorts")
+        && !title.to_lowercase().contains("#shorts")
+    {
+        SHORTS_TAG_BYTES
+    } else {
+        0
+    };
+    if req.description.len() + room > MAX_DESCRIPTION_BYTES {
         return Err(bad(format!("The description can be up to {MAX_DESCRIPTION_BYTES} characters."), "Shorten it."));
     }
     if req.description.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
@@ -111,6 +120,14 @@ pub fn check(req: &UploadReq) -> Result<UploadReq, EngineError> {
         return Err(bad("There are too many tags.", "Keep a few of the best."));
     }
     Ok(UploadReq { title, tags, ..req.clone() })
+}
+
+/// What "\n\n#Shorts" adds to a description.
+const SHORTS_TAG_BYTES: usize = 9;
+
+/// Whether text is shaped like a YouTube video id (what goes into a link).
+fn video_id_ok(id: &str) -> bool {
+    (1..=32).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// The details a Short is sent with: "#Shorts" is in the title or description.
@@ -296,6 +313,9 @@ impl Engine {
                     });
                 }
             };
+            if !video_id_ok(&sent) {
+                return Err(EngineError::Internal("YouTube sent an id that isn't a video id".into()));
+            }
             let link = if shorts {
                 format!("https://www.youtube.com/shorts/{sent}")
             } else {

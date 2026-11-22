@@ -302,3 +302,29 @@ async fn stopping_an_upload_near_its_end_says_youtube_may_have_it() {
     assert!(note.hint.contains("YouTube Studio"));
     assert!(done.link.is_none());
 }
+
+/// "#Shorts" is added after the check: the room for it is kept, so a description that passes can
+/// still be sent.
+#[test]
+fn a_short_keeps_room_for_its_tag() {
+    let mut r = req();
+    r.shorts = true;
+    r.description = "x".repeat(MAX_DESCRIPTION_BYTES - 4);
+    assert!(check(&r).is_err(), "a Short's description plus #Shorts is over the limit");
+    r.description = "x".repeat(MAX_DESCRIPTION_BYTES - 20);
+    assert!(check(&r).is_ok());
+    // Not a Short, or already tagged: no room needed.
+    let mut plain = req();
+    plain.description = "x".repeat(MAX_DESCRIPTION_BYTES - 4);
+    assert!(check(&plain).is_ok());
+}
+
+/// The new video's id comes from YouTube's answer: only an id-shaped one goes into a link.
+#[test]
+fn a_video_id_must_look_like_one_before_it_is_made_a_link() {
+    assert!(video_id_ok("dQw4w9WgXcQ"));
+    assert!(video_id_ok("a_b-C1"));
+    for bad in ["", "a b", "x/../y", "id?x=1", "<script>", &"a".repeat(33)] {
+        assert!(!video_id_ok(bad), "{bad:?}");
+    }
+}

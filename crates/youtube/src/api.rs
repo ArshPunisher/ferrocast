@@ -884,7 +884,7 @@ impl Api {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.rsplit('-').next())
                         .and_then(|n| n.trim().parse::<u64>().ok())
-                        .map_or(0, |n| n + 1);
+                        .map_or(0, |n| n.saturating_add(1));
                     // It can't have more than was sent, and never goes backwards past progress made.
                     let next = had.min(offset + want as u64).max(offset);
                     if next == offset {
@@ -1000,7 +1000,7 @@ impl Api {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.rsplit('-').next())
                     .and_then(|n| n.trim().parse::<u64>().ok())
-                    .map_or(0, |n| n + 1),
+                    .map_or(0, |n| n.saturating_add(1)),
             )),
             200 | 201 => {
                 let body: Value = res.json().await.ok()?;

@@ -93,7 +93,7 @@ impl YoutubeError {
         match (status, reason) {
             (401, _) => YoutubeError::SignInNeeded,
             // The day's units are gone: nothing works until midnight Pacific.
-            (_, "quotaExceeded" | "dailyLimitExceeded") => YoutubeError::QuotaExceeded,
+            (_, "quotaExceeded" | "dailyLimitExceeded" | "uploadLimitExceeded") => YoutubeError::QuotaExceeded,
             // Too many requests in a burst: it passes in seconds (5 s unless YouTube says, at most a minute).
             (403 | 429, "rateLimitExceeded" | "userRateLimitExceeded") | (429, _) => {
                 YoutubeError::RateLimited(rate_wait(retry_after))
