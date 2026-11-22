@@ -5,6 +5,40 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.6.0
+
+A Community Store, clips, more places to go live, a fuller Studio and a redesigned dashboard.
+
+- **Community Store**: browse and install themes, alerts, widgets, overlays and plugins made by
+  other creators, with one-click undo. Every package is checked on your PC before it is used,
+  and a ferrocast:// link opens the Store at the right package.
+- **Clips**: trim a moment, add captions, join several into one video and upload it to YouTube
+  as a clip or a Short. Uploads show their progress and can resume.
+- **More places to go live**: X, Instagram and Facebook (Facebook sign-in goes through the
+  Ferrocast relay), add or remove a destination while you're live, and turning every
+  destination off keeps your stream running.
+- **Schedule a stream**: plan a YouTube or Facebook broadcast for later. Ferrocast reminds you
+  and never starts it for you.
+- **A better first setup**: a test that finds the encoder settings your computer can keep up
+  with, with a way back to your old settings, and an import preview of an OBS or Streamlabs
+  setup the first time you open Ferrocast.
+- **Alerts and widgets**: a new alert editor, three new widgets (End Credits, Emote Wall and
+  Chat Highlight), alerts that can interrupt each other or pick a random look by weight, and a
+  switch to mute the alert queue. Custom alerts run in a closed frame and cannot run scripts.
+- **Overlay packs**: import Streamlabs and OWN3D .overlay packs, with their fonts.
+- **Studio**: named transitions with a from/to matrix, snapping to other sources and to the
+  centre, moving several items as one undo step, showing an item on the stream, in the
+  recording or both, performance mode that pauses the preview, push-to-show and push-to-hide
+  hotkeys, and copy and paste of sources and filters between collections.
+- **Overflow stripes**: Ferrocast draws stripes over what a source runs past the canvas, and
+  the app has ten themes.
+- **For developers**: local API keys with their own scopes, OpenAPI and AsyncAPI documents, more
+  obs-websocket requests and events, and Node and Python examples.
+- **Help**: a "Report a problem" file with your private details removed, and a hardware report.
+- **A new look**: Overlays are a full-width card grid, Designs have a filter rail and a dense
+  gallery, the Store has a category rail, and the alert editor is a full-screen three-pane
+  view. Nothing scrolls sideways at any window width.
+
 ## 3.5.0
 
 Smoother video, a stream that warns you before viewers notice, and many OBS features.
