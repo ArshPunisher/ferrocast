@@ -121,7 +121,10 @@ impl Credits {
                 self.upsert_raider(event.platform, name, *viewers)
             }
             EventKind::ChatMessage { actor, .. } => {
-                if !actor.roles.contains(Roles::MODERATOR) || actor.roles.contains(Roles::BOT) {
+                if !actor.roles.contains(Roles::MODERATOR)
+                    || actor.roles.contains(Roles::BOT)
+                    || actor.roles.contains(Roles::BROADCASTER)
+                {
                     return false;
                 }
                 let Some(name) = clean_name(actor, false) else { return false };
@@ -223,6 +226,26 @@ impl Credits {
         true
     }
 
+    /// Takes a refunded or charged-back payment out of the credits. Returns whether
+    /// anything changed. A donor left with nothing is dropped.
+    pub fn reverse_tip(&mut self, platform: Platform, actor: &Actor, money: &Money) -> bool {
+        let Some(name) = clean_name(actor, true) else { return false };
+        let Some(idx) =
+            self.tippers.iter().position(|t| t.platform == platform && t.name.eq_ignore_ascii_case(&name))
+        else {
+            return false;
+        };
+        let t = &mut self.tippers[idx];
+        let Some(m) = t.amounts.iter_mut().find(|m| m.currency == money.currency) else { return false };
+        m.minor = m.minor.saturating_sub(money.minor).max(0);
+        t.amounts.retain(|m| m.minor > 0);
+        if t.amounts.is_empty() && t.bits == 0 && t.kicks == 0 && t.jewels == 0 {
+            self.tippers.remove(idx);
+        }
+        self.sort_tippers();
+        true
+    }
+
     fn sort_tippers(&mut self) {
         self.tippers.sort_by(|a, b| {
             let score = |t: &CreditTipper| {
@@ -251,7 +274,17 @@ impl Credits {
 
 pub fn build_credits(events: &[Event], started_at: Option<Millis>) -> Credits {
     let mut credits = Credits::new(started_at);
+    let reversed: std::collections::HashSet<&str> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Reversal { original_source_id, .. } => Some(original_source_id.as_str()),
+            _ => None,
+        })
+        .collect();
     for event in events {
+        if event.source_id.as_deref().is_some_and(|s| reversed.contains(s)) {
+            continue;
+        }
         if let Some(start) = started_at
             && event.occurred_at < start
         {
@@ -477,5 +510,63 @@ mod tests {
         }
         assert_eq!(credits.followers.len(), MAX_CREDITS_ROWS);
         assert_eq!(credits.mods.len(), MAX_CREDITS_ROWS);
+    }
+
+    fn tip(source: &str, who: &str, minor: i64) -> Event {
+        Event::live(
+            Platform::Tips,
+            Some(source.into()),
+            Millis(10),
+            EventKind::Tip {
+                actor: actor(Platform::Tips, who, Roles::empty()),
+                money: Money::new(minor, "INR"),
+                message: None,
+                provider: TipProvider::Razorpay,
+                payment_ref: source.into(),
+                status: PaymentStatus::Captured,
+            },
+        )
+    }
+
+    #[test]
+    fn a_refunded_tip_is_dropped_when_building_and_when_reversed_live() {
+        let reversal = ev(
+            Platform::Tips,
+            20,
+            EventKind::Reversal { original_source_id: "pay-1".into(), reason: crate::event::ReversalReason::Refund },
+        );
+        let built = build_credits(&[tip("pay-1", "Scammer", 1_000_000), tip("pay-2", "Honest", 5_000), reversal], None);
+        let names: Vec<_> = built.tippers.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Honest"]);
+
+        let mut live = Credits::new(None);
+        live.record(&tip("pay-1", "Scammer", 1_000_000));
+        live.record(&tip("pay-3", "Scammer", 500));
+        live.record(&tip("pay-2", "Honest", 5_000));
+        let a = actor(Platform::Tips, "Scammer", Roles::empty());
+        assert!(live.reverse_tip(Platform::Tips, &a, &Money::new(1_000_000, "INR")));
+        assert_eq!(live.tippers[0].name, "Honest");
+        assert_eq!(live.tippers.iter().find(|t| t.name == "Scammer").unwrap().amounts[0].minor, 500);
+        assert!(live.reverse_tip(Platform::Tips, &a, &Money::new(500, "INR")));
+        assert!(live.tippers.iter().all(|t| t.name != "Scammer"), "a zeroed donor leaves the credits");
+        assert!(!live.reverse_tip(Platform::Tips, &a, &Money::new(500, "INR")), "nothing left to take back");
+    }
+
+    #[test]
+    fn the_broadcaster_is_not_listed_as_a_moderator() {
+        let mut roles = Roles::MODERATOR;
+        roles.insert(Roles::BROADCASTER);
+        let mut c = Credits::new(None);
+        assert!(!c.record(&ev(
+            Platform::Twitch,
+            1,
+            EventKind::ChatMessage {
+                actor: actor(Platform::Twitch, "TheStreamer", roles),
+                content: Content::plain("hi"),
+                reply_to: None,
+                is_action: false,
+            }
+        )));
+        assert!(c.mods.is_empty());
     }
 }

@@ -431,6 +431,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refunded_tip_leaves_the_live_credits_and_the_restart_rebuild() {
+        let (engine, _dir) = test_engine().await;
+        let t0 = now().0 - 30_000;
+        engine
+            .ingest(Event::live(
+                Platform::Twitch,
+                Some("on-r".into()),
+                Millis(t0),
+                EventKind::StreamOnline { title: None },
+            ))
+            .await;
+        let tip = |src: &str, who: &str, minor: i64, at: i64| {
+            Event::live(
+                Platform::Tips,
+                Some(src.into()),
+                Millis(at),
+                EventKind::Tip {
+                    actor: viewer(Platform::Tips, who, Roles::empty()),
+                    money: Money::new(minor, "INR"),
+                    message: None,
+                    provider: TipProvider::Razorpay,
+                    payment_ref: src.into(),
+                    status: PaymentStatus::Captured,
+                },
+            )
+        };
+        // The session starts "now", so the payments land after it.
+        let after = now().0 + 1000;
+        engine.ingest(tip("pay-bad", "Chargeback", 900_000, after)).await;
+        engine.ingest(tip("pay-ok", "Honest", 5_000, after + 1000)).await;
+        assert_eq!(engine.credits().await.unwrap().tippers.len(), 2);
+        let mut rx = engine.subscribe_overlays();
+        engine
+            .ingest(Event::live(
+                Platform::Tips,
+                Some("rev-1".into()),
+                Millis(t0 + 3000),
+                EventKind::Reversal {
+                    original_source_id: "pay-bad".into(),
+                    reason: ferrocast_core::event::ReversalReason::Chargeback,
+                },
+            ))
+            .await;
+        let c = engine.credits().await.unwrap();
+        assert_eq!(c.tippers.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["Honest"]);
+        let mut pushed = false;
+        while let Ok(f) = rx.try_recv() {
+            pushed |= matches!(f.audience, Audience::Widget(WidgetKind::EndCredits));
+        }
+        assert!(pushed, "open End Credits sources are told");
+    }
+
+    #[tokio::test]
     async fn chat_highlight_lifecycle_clears_on_delete_ban_and_new_stream() {
         let (engine, _dir) = test_engine().await;
         let t0 = now().0 - 10_000;

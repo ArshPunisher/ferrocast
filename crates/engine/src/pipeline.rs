@@ -590,15 +590,22 @@ impl Engine {
         // A refund of something that never alerted (a sale, not a tip) says nothing.
         let Some(original) = original else { return };
         // This stream's totals give the money back too, if it was this stream's.
-        if let EventKind::Tip { money, .. } | EventKind::PaidMessage { money, .. } = &original.kind {
-            let mut st = self.state_mut();
-            let this_stream = st.session.started_at.is_none_or(|start| original.occurred_at >= start);
-            let first_time = st.session.reversed.insert(source_id.to_string());
-            if this_stream
-                && first_time
-                && let Some(m) = st.session.tips.iter_mut().find(|m| m.currency == money.currency)
-            {
-                m.minor = m.minor.saturating_sub(money.minor).max(0);
+        if let EventKind::Tip { money, actor, .. } | EventKind::PaidMessage { money, actor, .. } = &original.kind {
+            let credits_changed = {
+                let mut st = self.state_mut();
+                let this_stream = st.session.started_at.is_none_or(|start| original.occurred_at >= start);
+                let first_time = st.session.reversed.insert(source_id.to_string());
+                if this_stream && first_time {
+                    if let Some(m) = st.session.tips.iter_mut().find(|m| m.currency == money.currency) {
+                        m.minor = m.minor.saturating_sub(money.minor).max(0);
+                    }
+                    st.session.credits.reverse_tip(original.platform, actor, money)
+                } else {
+                    false
+                }
+            };
+            if credits_changed {
+                self.push_credits();
             }
         }
         let what = match reason {
