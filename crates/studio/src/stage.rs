@@ -3728,6 +3728,9 @@ impl Stage {
             .collect();
         let studio_on = self.preview_scene().is_some();
         let current_scene = self.doc.borrow().get("current_scene").cloned();
+        // The sources the copy on air shows, as they are now: undo may be to a time before one
+        // existed, and the engine must not get an on-air item with no source.
+        let old_sources = self.doc.borrow().get("sources").and_then(Value::as_array).cloned().unwrap_or_default();
         self.edit(|d| {
             *d = snapshot.clone();
             let has = |d: &Value, n: &str| {
@@ -3748,8 +3751,36 @@ impl Stage {
                         f.insert((*k).to_string(), v.clone());
                     }
                 }
-                if let Some(c) = current_scene.as_ref().filter(|c| c.as_str().is_some_and(|n| has(d, n))) {
+                // The preview is a scene that is still there: the live one, else the one the
+                // snapshot had, else what's on air (a scene whose adding was undone is gone).
+                let live_preview = live.iter().find(|(k, _)| *k == "studio_mode").and_then(|(_, v)| v.as_str());
+                let snap_preview = snapshot.pointer("/ferrocast/studio_mode").and_then(Value::as_str);
+                let preview = [live_preview, snap_preview, Some(on_air.as_str())]
+                    .into_iter()
+                    .flatten()
+                    .find(|n| has(d, n))
+                    .map(String::from);
+                if let Some(p) = preview {
+                    d["ferrocast"]["studio_mode"] = json!(p);
+                    d["current_scene"] = json!(p);
+                } else if let Some(c) = current_scene.as_ref().filter(|c| c.as_str().is_some_and(|n| has(d, n))) {
                     d["current_scene"] = c.clone();
+                }
+                // What the copy on air (and the one going off) shows keeps its sources.
+                let wanted: Vec<String> = ["program_copy", "program_prev"]
+                    .iter()
+                    .filter_map(|k| d.pointer(&format!("/ferrocast/{k}/items")).and_then(Value::as_array))
+                    .flatten()
+                    .map(|i| name_of(i).to_string())
+                    .collect();
+                if let Some(list) = d.get_mut("sources").and_then(Value::as_array_mut) {
+                    for n in wanted {
+                        if !list.iter().any(|x| name_of(x) == n)
+                            && let Some(def) = old_sources.iter().find(|x| name_of(x) == n)
+                        {
+                            list.push(def.clone());
+                        }
+                    }
                 }
             }
         });
@@ -8480,6 +8511,39 @@ mod tests {
         // Scenes only: no big boxes.
         mv.look.layout = crate::MultiviewLayout::ScenesOnly;
         assert_eq!(mv.boxes().len(), 2);
+    }
+
+    #[test]
+    fn undo_in_studio_mode_keeps_a_preview_and_the_sources_on_air() {
+        let s = stage();
+        s.set_studio_mode(true);
+        // Undo of a scene that was the preview: the preview goes back to one that exists, and the
+        // Transition button still works (CodeRabbit: it pointed at a scene that wasn't there).
+        let before_scene = s.snapshot();
+        ok(s.add_scene("B"));
+        ok(s.set_preview("B"));
+        s.restore_all(&before_scene);
+        let preview = s.preview_scene().unwrap_or_else(|| panic!("a preview"));
+        assert!(s.scenes().iter().any(|c| c.name == preview), "the preview {preview} is a scene");
+        ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        // A source added and sent on air, then its adding undone: the copy on air still has its
+        // source (the engine would get an item with none).
+        let before_source = s.snapshot();
+        ok(s.add_source("Main", "color_source_v3", "Red", &json!({ "width": 10, "height": 10 }), false));
+        ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        s.restore_all(&before_source);
+        let doc = s.snapshot();
+        let items = doc.pointer("/ferrocast/program_copy/items").and_then(Value::as_array).cloned().unwrap_or_default();
+        assert!(items.iter().any(|i| name_of(i) == "Red"), "the copy on air still shows Red: {items:?}");
+        let sources = doc["sources"].as_array().cloned().unwrap_or_default();
+        assert!(sources.iter().any(|x| name_of(x) == "Red"), "and its definition is kept");
+        // The transitions after replace the copy (the old one is kept until the next), and the
+        // source nobody uses goes.
+        for _ in 0..2 {
+            ok(s.transition_now(Some(&TransitionInfo { kind: "cut_transition".into(), ms: 0 })));
+        }
+        let sources = s.snapshot()["sources"].as_array().cloned().unwrap_or_default();
+        assert!(!sources.iter().any(|x| name_of(x) == "Red"), "gone once it isn't on air");
     }
 
     #[test]
