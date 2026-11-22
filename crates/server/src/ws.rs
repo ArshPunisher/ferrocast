@@ -287,6 +287,9 @@ async fn send_snapshot_as(
         snap["state"]["events"] = json!([]);
         snap["state"]["chat"] = json!([]);
         snap["state"]["labels"] = json!({});
+        // Real supporters and the pinned message are names, too.
+        snap["state"]["credits"] = Value::Null;
+        snap["state"]["chat_highlight"] = Value::Null;
     }
     let text = envelope(Some(app.engine.current_seq()), "snapshot", &snap);
     tx.send(Message::Text(Utf8Bytes::from(text.as_ref()))).await.is_ok()

@@ -1791,6 +1791,55 @@ async fn chat_shows_this_stream_not_the_last_one() {
 }
 
 #[tokio::test]
+async fn preview_socket_hides_real_credits_and_the_pinned_message() {
+    use ferrocast_core::event::{Actor, Content, Event, EventKind, Millis, Platform};
+    let r = start().await;
+    let o: Value = r.post("/api/v1/overlays", json!({ "name": "Priv", "preset": "blank" })).await.json().await.unwrap();
+    let mut edit = o.clone();
+    edit["widgets"] = json!([
+        { "id": "ec", "kind": "end_credits", "x": 0, "y": 0, "w": 800, "h": 600, "config": {} },
+        { "id": "hl", "kind": "chat_highlight", "x": 0, "y": 700, "w": 800, "h": 200, "config": {} }
+    ]);
+    let url = o["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    assert_eq!(r.put(&format!("/api/v1/overlays/{}", o["id"].as_str().unwrap()), edit).await.status(), StatusCode::OK);
+    let t0 = ferrocast_engine::now().0;
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("pv-f".into()),
+            Millis(t0 - 2000),
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "RealFollower") },
+        ))
+        .await;
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("pv-m".into()),
+            Millis(t0 - 1000),
+            EventKind::ChatMessage {
+                actor: Actor::named(Platform::Twitch, "RealChatter"),
+                content: Content::plain("secret pinned words"),
+                reply_to: None,
+                is_action: false,
+            },
+        ))
+        .await;
+    let chat: Value = r.get("/api/v1/chat?limit=5").await.json().await.unwrap();
+    let id = chat.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+    assert_eq!(r.post("/api/v1/chat/highlight", json!({ "event_id": id })).await.status(), StatusCode::OK);
+
+    let (mut real, _) = tokio_tungstenite::connect_async(format!("{url}")).await.unwrap();
+    let real_snap = next_json(&mut real).await;
+    assert!(real_snap.to_string().contains("RealFollower"), "the real overlay sees the roster: {real_snap}");
+    let (mut test, _) = tokio_tungstenite::connect_async(format!("{url}?test")).await.unwrap();
+    let snap = next_json(&mut test).await;
+    let text = snap.to_string();
+    for secret in ["RealFollower", "RealChatter", "secret pinned words"] {
+        assert!(!text.contains(secret), "a ?test preview must not carry {secret}: {text}");
+    }
+}
+
+#[tokio::test]
 async fn new_widget_configs_validate_and_isolate_overlay_socket_feeds() {
     use ferrocast_core::event::{Actor, Content, Event, EventKind, Platform};
     use reqwest::Method;
