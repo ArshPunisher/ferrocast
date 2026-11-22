@@ -496,3 +496,34 @@ async fn a_clip_with_short_sound_still_crossfades_to_the_right_length() {
     // 4 + 3 - 1 s of fade.
     assert!((5700..=6400).contains(&d), "length {d}");
 }
+
+/// Every ffmpeg run on a clip reads only files, as the one container its extension names (a
+/// file's own bytes can't pick a playlist or reference demuxer that reads other files).
+#[test]
+fn trim_compile_burn_and_probe_read_files_only_as_the_named_container() {
+    let part = Path::new("o.part");
+    let check = |args: &[OsString], demux: &str, label: &str| {
+        let s = arg_strs(args);
+        let i = s.iter().position(|x| x == "-i").unwrap_or_else(|| panic!("{label}: no -i"));
+        let before = &s[..i];
+        let has = |a: &str, b: &str| before.windows(2).any(|w| w[0] == a && w[1] == b);
+        assert!(has("-protocol_whitelist", "file"), "{label}: {before:?}");
+        assert!(has("-f", demux), "{label}: no -f {demux}: {before:?}");
+    };
+    for (name, demux) in [("a.mp4", "mov"), ("a.mov", "mov"), ("a.mkv", "matroska")] {
+        let p = Path::new(name);
+        check(&trim_args(p, 0, 1000, false, part), demux, "trim");
+        check(&burn_args(p, "subs.srt", part), demux, "burn");
+        let (c, _) = compile_args(&[piece(name, 5000, true), piece(name, 5000, true)], 1280, 720, 0.5, false, part);
+        // Every input, not just the first.
+        let s = arg_strs(&c);
+        for (n, at) in
+            s.iter().enumerate().filter(|(_, x)| *x == "-i").map(|(n, _)| ((), n)).enumerate().map(|(k, (_, n))| (k, n))
+        {
+            let before = &s[..at];
+            assert!(before.windows(2).any(|w| w[0] == "-f" && w[1] == demux), "compile input {n}: no -f {demux}");
+        }
+        check(&c, demux, "compile");
+        check(&crate::clips::probe_args_for_test(p), demux, "probe");
+    }
+}

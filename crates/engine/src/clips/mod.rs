@@ -271,12 +271,33 @@ pub fn srt_beside(clip: &Path) -> PathBuf {
     clip.with_extension("srt")
 }
 
-/// `ffmpeg -i` reading only files: its stderr says the duration, the size and the streams.
-fn probe_args(path: &Path) -> Vec<std::ffi::OsString> {
-    let mut a: Vec<std::ffi::OsString> =
-        ["-hide_banner", "-nostdin", "-protocol_whitelist", "file", "-i"].iter().map(Into::into).collect();
+/// The input half of every ffmpeg run on a clip: files only (no network, no other protocol), read
+/// as the one container the file's extension names. Without `-f`, ffmpeg picks a demuxer from the
+/// file's own bytes, and a crafted `.mp4` can be a playlist or a reference file that reads other
+/// files; `-enable_drefs 0` also keeps a real mov from pointing at outside data.
+pub(crate) fn input_args(path: &Path) -> Vec<std::ffi::OsString> {
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    let mut a: Vec<std::ffi::OsString> = vec!["-protocol_whitelist".into(), "file".into()];
+    if ext == "mkv" {
+        a.extend(["-f", "matroska"].map(Into::into));
+    } else {
+        a.extend(["-f", "mov", "-enable_drefs", "0"].map(Into::into));
+    }
+    a.push("-i".into());
     a.push(path.as_os_str().to_owned());
     a
+}
+
+/// `ffmpeg -i` reading only files: its stderr says the duration, the size and the streams.
+fn probe_args(path: &Path) -> Vec<std::ffi::OsString> {
+    let mut a: Vec<std::ffi::OsString> = ["-hide_banner", "-nostdin"].iter().map(Into::into).collect();
+    a.extend(input_args(path));
+    a
+}
+
+#[cfg(test)]
+pub(crate) fn probe_args_for_test(path: &Path) -> Vec<std::ffi::OsString> {
+    probe_args(path)
 }
 
 /// Reads ffmpeg's text about a file.
@@ -454,22 +475,11 @@ impl Engine {
         // Its own file per render: two requests for one clip never take each other's.
         let part = dir.join(format!("{key}.{}-{:x}.part.jpg", std::process::id(), fastrand::u64(..)));
         let mut cmd = crate::clips::jobs::hidden(&ffmpeg);
-        cmd.args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-protocol_whitelist",
-            "file",
-            "-ss",
-            at,
-            "-i",
-        ])
-        .arg(&path)
-        .args(["-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "5"])
-        .arg(&part)
-        .kill_on_drop(true);
+        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-ss", at])
+            .args(input_args(&path))
+            .args(["-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "5"])
+            .arg(&part)
+            .kill_on_drop(true);
         let ok = matches!(tokio::time::timeout(PROBE_LIMIT, cmd.output()).await, Ok(Ok(o)) if o.status.success());
         // Another request may have published the same picture meanwhile: that one will do.
         if !ok || (tokio::fs::rename(&part, &file).await.is_err() && !file.is_file()) {

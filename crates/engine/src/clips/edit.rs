@@ -70,10 +70,9 @@ fn os(args: &[&str]) -> Vec<OsString> {
 
 /// The arguments of a trim: from `start_ms` for `len_ms`, the streams copied or made again.
 pub fn trim_args(input: &Path, start_ms: u64, len_ms: u64, precise: bool, part: &Path) -> Vec<OsString> {
-    let mut a = os(&["-n", "-protocol_whitelist", "file", "-ss"]);
+    let mut a = os(&["-n", "-ss"]);
     a.push(secs(start_ms).into());
-    a.push("-i".into());
-    a.push(input.as_os_str().to_owned());
+    a.extend(super::input_args(input));
     a.push("-t".into());
     a.push(secs(len_ms).into());
     if precise {
@@ -165,8 +164,7 @@ pub fn compile_args(
     let (graph, v, a) = (it.next().unwrap_or(""), it.next().unwrap_or("[v]"), it.next().unwrap_or("[a]"));
     let mut args = os(&["-n"]);
     for p in pieces {
-        args.extend(os(&["-protocol_whitelist", "file", "-i"]));
-        args.push(p.path.as_os_str().to_owned());
+        args.extend(super::input_args(&p.path));
     }
     args.extend(os(&["-filter_complex"]));
     args.push(graph.into());
@@ -273,8 +271,8 @@ pub fn check_cues(cues: &[Cue]) -> Result<(), EngineError> {
 
 /// The arguments burning `subs` (a plain name in the working folder) into a clip.
 pub fn burn_args(input: &Path, subs: &str, part: &Path) -> Vec<OsString> {
-    let mut a = os(&["-n", "-protocol_whitelist", "file", "-i"]);
-    a.push(input.as_os_str().to_owned());
+    let mut a = os(&["-n"]);
+    a.extend(super::input_args(input));
     let style = "FontName=Helvetica,Fontsize=18,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=24";
     a.push("-vf".into());
     a.push(format!("subtitles={subs}:force_style='{style}'").into());

@@ -92,9 +92,8 @@ pub fn srt(said: &[Said]) -> String {
 
 /// ffmpeg's arguments to read a clip's sound as 16 kHz mono floats on stdout.
 fn audio_args(clip: &Path) -> Vec<OsString> {
-    let mut a: Vec<OsString> =
-        ["-hide_banner", "-loglevel", "error", "-nostdin", "-i"].iter().map(OsString::from).collect();
-    a.push(clip.as_os_str().to_owned());
+    let mut a: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-nostdin"].iter().map(OsString::from).collect();
+    a.extend(crate::clips::input_args(clip));
     for s in ["-vn", "-ac", "1", "-ar", "16000", "-t", "900", "-f", "f32le", "-"] {
         a.push(s.into());
     }
@@ -117,9 +116,8 @@ const MAX_POINTS: usize = 120;
 
 /// ffmpeg's arguments to read a clip as small RGBA pictures, `LOOK_EVERY_S` apart, on stdout.
 fn look_args(clip: &Path) -> Vec<OsString> {
-    let mut a: Vec<OsString> =
-        ["-hide_banner", "-loglevel", "error", "-nostdin", "-i"].iter().map(OsString::from).collect();
-    a.push(clip.as_os_str().to_owned());
+    let mut a: Vec<OsString> = ["-hide_banner", "-loglevel", "error", "-nostdin"].iter().map(OsString::from).collect();
+    a.extend(crate::clips::input_args(clip));
     let vf = format!("fps={},scale={LOOK_W}:{LOOK_H}", 1.0 / LOOK_EVERY_S);
     for s in ["-an", "-vf", &vf, "-frames:v", &MAX_LOOKS.to_string(), "-f", "rawvideo", "-pix_fmt", "rgba", "-"] {
         a.push(s.into());
@@ -217,8 +215,8 @@ pub fn vertical_args(clip: &Path, out: &Path, subs: Option<&str>, fill: Option<&
     };
     let filter = filter.as_str();
     let mut a: Vec<OsString> =
-        ["-hide_banner", "-loglevel", "error", "-nostdin", "-n", "-i"].iter().map(OsString::from).collect();
-    a.push(clip.as_os_str().to_owned());
+        ["-hide_banner", "-loglevel", "error", "-nostdin", "-n"].iter().map(OsString::from).collect();
+    a.extend(crate::clips::input_args(clip));
     for s in [
         "-filter_complex",
         filter,
@@ -430,6 +428,25 @@ async fn make_vertical(ffmpeg: &Path, clip: &Path, subs: Option<&Path>, fill: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every ffmpeg run on a clip reads only files, as the one container its extension names.
+    #[test]
+    fn every_vertical_clip_run_reads_files_only_as_the_named_container() {
+        for (name, demux) in [("a.mp4", "mov"), ("a.MOV", "mov"), ("a.mkv", "matroska")] {
+            let clip = Path::new(name);
+            for (label, args) in [
+                ("audio", audio_args(clip)),
+                ("look", look_args(clip)),
+                ("vertical", vertical_args(clip, Path::new("o.mp4"), None, None)),
+            ] {
+                let i = args.iter().position(|x| x == "-i").unwrap_or_else(|| panic!("{label}: no -i"));
+                let before: Vec<String> = args[..i].iter().map(|x| x.to_string_lossy().into_owned()).collect();
+                let has = |a: &str, b: &str| before.windows(2).any(|w| w[0] == a && w[1] == b);
+                assert!(has("-protocol_whitelist", "file"), "{label} {name}: no protocol whitelist: {before:?}");
+                assert!(has("-f", demux), "{label} {name}: no -f {demux}: {before:?}");
+            }
+        }
+    }
 
     #[test]
     fn the_copy_sits_beside_the_clip() {
