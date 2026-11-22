@@ -73,7 +73,9 @@ pub async fn live(
             match app.api_limiter.check(&summary.id) {
                 crate::rate_limit::RateDecision::Allowed { .. } => {}
                 crate::rate_limit::RateDecision::Exceeded { retry_after_secs, .. } => {
-                    app.engine.record_api_key_usage(&summary.id, &summary.name, "GET", "/live", 429).await;
+                    if crate::rate_limit::audit_429_now(&summary.id) {
+                        app.engine.record_api_key_usage(&summary.id, &summary.name, "GET", "/live", 429).await;
+                    }
                     return ApiError::too_many(retry_after_secs).into_response();
                 }
             }

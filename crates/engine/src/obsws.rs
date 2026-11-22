@@ -2636,10 +2636,11 @@ fn redact_source_settings(v: &Value) -> Value {
             }
         }
         // rtmp://host/app/<key>: the last path part of a stream address.
-        if (out.starts_with("rtmp://") || out.starts_with("rtmps://")) && out.matches('/').count() >= 4 {
-            if let Some(i) = out.rfind('/') {
-                out.replace_range(i + 1.., "***");
-            }
+        if (out.starts_with("rtmp://") || out.starts_with("rtmps://"))
+            && out.matches('/').count() >= 4
+            && let Some(i) = out.rfind('/')
+        {
+            out.replace_range(i + 1.., "***");
         }
         out
     }

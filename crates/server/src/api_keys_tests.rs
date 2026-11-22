@@ -363,9 +363,9 @@ async fn plain_key_is_never_stored_returned_or_logged() {
     assert_eq!(rig.call(reqwest::Method::GET, "/status", &token, None).await, StatusCode::OK);
     // Forbidden route also logs cleanly without token.
     assert_eq!(rig.call(reqwest::Method::GET, "/accounts", &token, None).await, StatusCode::FORBIDDEN);
-    // Query-param auth also must never log the query key.
+    // A query key is refused off the live socket, and is never logged either way.
     let q_res = rig.client.get(format!("{}/api/v1/status?key={token}", rig.base)).send().await.unwrap();
-    assert_eq!(q_res.status(), StatusCode::OK);
+    assert_eq!(q_res.status(), StatusCode::UNAUTHORIZED);
 
     // Also run directly via `oneshot` under explicit `WithSubscriber` so parallel test threads cannot race TLS.
     let direct_app = router(AppState {
@@ -592,22 +592,22 @@ async fn a_key_that_expires_has_its_open_live_socket_closed() {
     rig.engine.shutdown();
 }
 
-mod exposure {
+pub(super) mod exposure_helpers {
     //! Keys are loopback-only unless the owner switched on "API keys over LAN"; key management is
     //! the PC's own; a web page can't use a key from the browser.
     use super::*;
     use axum::extract::ConnectInfo;
     use std::net::SocketAddr;
 
-    struct Lan {
-        app: Router,
-        sessions: Arc<Sessions>,
-        engine: Engine,
-        token: String,
-        _dir: tempfile::TempDir,
+    pub struct Lan {
+        pub app: Router,
+        pub sessions: Arc<Sessions>,
+        pub engine: Engine,
+        pub token: String,
+        pub _dir: tempfile::TempDir,
     }
 
-    async fn lan() -> Lan {
+    pub async fn lan() -> Lan {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::start_with_memory_secrets(dir.path()).await.unwrap();
         let created = engine
@@ -624,7 +624,7 @@ mod exposure {
         Lan { app, sessions, engine, token: created.token, _dir: dir }
     }
 
-    fn req(
+    pub fn req(
         method: &str,
         uri: &str,
         peer: &str,
@@ -632,11 +632,10 @@ mod exposure {
         origin: Option<&str>,
         body: Option<Value>,
     ) -> HttpRequest<AxumBody> {
-        let mut b = HttpRequest::builder()
-            .method(method)
-            .uri(uri)
-            .header("host", "192.168.1.9:47820")
-            .header("authorization", format!("Bearer {bearer}"));
+        let mut b = HttpRequest::builder().method(method).uri(uri).header("host", "192.168.1.9:47820");
+        if !bearer.is_empty() {
+            b = b.header("authorization", format!("Bearer {bearer}"));
+        }
         if let Some(o) = origin {
             b = b.header("origin", o);
         }
@@ -758,5 +757,65 @@ mod exposure {
             .unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         engine.shutdown();
+    }
+}
+
+mod hardening {
+    use super::exposure_helpers::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn a_key_in_the_query_is_accepted_only_on_the_live_socket() {
+        let l = lan().await;
+        let uri = format!("/api/v1/status?key={}", l.token);
+        let r = l.app.clone().oneshot(req("GET", &uri, "127.0.0.1:50000", "", None, None)).await.unwrap();
+        assert_ne!(r.status(), StatusCode::OK, "a ?key= on a plain route");
+        l.engine.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_guesser_is_cut_off_per_address_before_every_try_costs_a_lookup() {
+        let l = lan().await;
+        let bad = format!("{KEY_PREFIX}{}", "0".repeat(64));
+        let mut last = StatusCode::OK;
+        for _ in 0..(rate_limit::BAD_KEY_LIMIT + 5) {
+            let r =
+                l.app.clone().oneshot(req("GET", "/api/v1/status", "127.0.0.2:50000", &bad, None, None)).await.unwrap();
+            last = r.status();
+        }
+        assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+        // Another address is not affected.
+        let r =
+            l.app.clone().oneshot(req("GET", "/api/v1/status", "127.0.0.1:50000", &l.token, None, None)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        l.engine.shutdown();
+    }
+
+    #[test]
+    fn a_flood_of_429s_writes_one_audit_row_per_key_per_window() {
+        let id = format!("flood-{}", ferrocast_engine::now().0);
+        assert!(rate_limit::audit_429_now(&id));
+        for _ in 0..50 {
+            assert!(!rate_limit::audit_429_now(&id));
+        }
+    }
+
+    #[test]
+    fn the_audit_path_is_a_route_template_never_what_was_typed() {
+        use crate::routes::remote_scope::audit_path;
+        assert_eq!(audit_path("/viewers/twitch/someviewer/note"), "/viewers/{platform}/{user_id}/note");
+        assert_eq!(audit_path("/chat"), "/chat");
+        // Not a route: nothing of it is kept (a probe can't write words into the log).
+        assert_eq!(audit_path("/secret-word/another"), "/(unknown)");
+        assert_eq!(audit_path("/chat/xyz-not-a-route"), "/(unknown)");
+    }
+
+    #[test]
+    fn an_unknown_live_frame_is_not_delivered_to_any_key() {
+        use crate::routes::remote_scope::api_key_live_frame_allowed;
+        let all = ApiKeyScope::ALL;
+        assert!(!api_key_live_frame_allowed(&all, r#"{"v":1,"type":"snapshot","data":{}}"#));
+        assert!(!api_key_live_frame_allowed(&all, r#"{"v":1,"type":"a_frame_nobody_listed","data":{}}"#));
+        assert!(api_key_live_frame_allowed(&all, r#"{"v":1,"type":"hello","data":{}}"#));
     }
 }

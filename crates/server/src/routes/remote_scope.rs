@@ -687,7 +687,10 @@ pub fn api_key_live_frame_allowed(scopes: &[ferrocast_core::api_keys::ApiKeyScop
                     || has(ApiKeyScope::GoLive)
             }
         }
-        _ => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::StudioControl),
+        // The app's own update notice: harmless, for anyone who reads.
+        "update" => has(ApiKeyScope::ReadOnly),
+        // A frame nobody listed here goes to nobody: a new one is opted in on purpose.
+        _ => false,
     }
 }
 
@@ -698,14 +701,15 @@ pub fn audit_path(path: &str) -> String {
     let Some(segs) = segments(clean) else {
         return "/(refused)".to_string();
     };
-    let normalized: Vec<&str> = segs
-        .iter()
-        .map(|s| {
-            let plain = s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'.');
-            if plain { *s } else { "{id}" }
+    // Only a route of the API (its template, `{id}` parts kept as written in the docs) is ever
+    // logged: what was typed into a path never is.
+    crate::spec::all_rest_routes()
+        .find(|r| {
+            let t: Vec<&str> = r.rel_path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+            t.len() == segs.len()
+                && t.iter().zip(segs.iter()).all(|(t, s)| (t.starts_with('{') && t.ends_with('}')) || t == s)
         })
-        .collect();
-    format!("/{}", normalized.join("/"))
+        .map_or_else(|| "/(unknown)".to_string(), |r| r.rel_path.to_string())
 }
 
 #[cfg(test)]

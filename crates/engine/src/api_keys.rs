@@ -117,7 +117,12 @@ impl Engine {
         let key_name = key_name.to_string();
         let method = method.to_string();
         let path = path.to_string();
-        let _ = self.db(move |s| repo::api_keys::record_usage(s, &key_id, &key_name, &method, &path, status)).await;
+        if let Err(e) =
+            self.db(move |s| repo::api_keys::record_usage(s, &key_id, &key_name, &method, &path, status)).await
+        {
+            // Said, with what failed and no key or token in it.
+            tracing::warn!(error = %e, "couldn't write an API key audit row");
+        }
     }
 }
 

@@ -18,6 +18,35 @@ pub enum RateDecision {
     Exceeded { limit: usize, retry_after_secs: u64 },
 }
 
+/// Failed key attempts allowed per address per window, before the database is touched again.
+pub const BAD_KEY_LIMIT: usize = 20;
+
+/// Failed key attempts by address (`peer ip`): a guesser is cut off before every try costs a
+/// database lookup.
+pub static BAD_KEYS: std::sync::LazyLock<ApiKeyRateLimiter> =
+    std::sync::LazyLock::new(|| ApiKeyRateLimiter::new(BAD_KEY_LIMIT, DEFAULT_WINDOW));
+
+/// When a 429 for a key was last written to the audit log (one row per key per window: a flood
+/// of refused requests must not become a flood of database writes that wipes the history).
+static LAST_429_AUDIT: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `true` when a 429 for `key_id` should be written to the audit log now (and notes that it was).
+pub fn audit_429_now(key_id: &str) -> bool {
+    let now = Instant::now();
+    let mut m = LAST_429_AUDIT.lock().unwrap_or_else(|p| p.into_inner());
+    if m.len() > MAX_TRACKED_KEYS {
+        m.retain(|_, t| now.saturating_duration_since(*t) < DEFAULT_WINDOW);
+    }
+    match m.get(key_id) {
+        Some(t) if now.saturating_duration_since(*t) < DEFAULT_WINDOW => false,
+        _ => {
+            m.insert(key_id.to_string(), now);
+            true
+        }
+    }
+}
+
 /// Thread-safe sliding-window rate limiter keyed by `api_key.id`.
 #[derive(Debug, Clone)]
 pub struct ApiKeyRateLimiter {
@@ -37,6 +66,15 @@ impl ApiKeyRateLimiter {
     #[must_use]
     pub fn new(limit: usize, window: Duration) -> Self {
         Self { limit: limit.max(1), window, buckets: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    /// Whether `key_id` is at its limit now, without recording anything.
+    pub fn is_over(&self, key_id: &str) -> bool {
+        let now = Instant::now();
+        let map = self.buckets.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(key_id).is_some_and(|q| {
+            q.iter().filter(|t| now.saturating_duration_since(**t) < self.window).count() >= self.limit
+        })
     }
 
     /// Records one attempt for `key_id` at `Instant::now()`.

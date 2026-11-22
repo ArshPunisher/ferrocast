@@ -180,10 +180,11 @@ async fn api_guard(State(app): State<AppState>, req: Request, next: Next) -> Res
     let path = req.uri().path();
     let rel = path.strip_prefix("/api/v1").unwrap_or(path).to_string();
     // GETs may carry the token as ?session= or ?key= so <img>/<audio> and WebSocket clients can auth.
+    // An API key in the query is for the live socket only (a URL ends up in logs and history).
     let query_token = (req.method() == Method::GET)
         .then(|| {
             let q = req.uri().query().unwrap_or("");
-            query_param(q, "session").or_else(|| query_param(q, "key"))
+            query_param(q, "session").or_else(|| if rel == "/live" { query_param(q, "key") } else { None })
         })
         .flatten();
     let token = auth::bearer(req.headers()).map(str::to_string).or(query_token);
@@ -237,7 +238,16 @@ async fn handle_api_key_request(
         add_cors(&mut res, dev_origin);
         return res;
     }
+    // Failed tries are counted by address: past the allowance a guesser is turned away before
+    // the database is touched.
+    let ip = peer.map_or_else(|| "local".to_string(), |p| p.ip().to_string());
+    if rate_limit::BAD_KEYS.is_over(&ip) {
+        let mut res = ApiError::too_many(60).into_response();
+        add_cors(&mut res, dev_origin);
+        return res;
+    }
     let Ok(ApiKeyAuth::Valid(summary)) = app.engine.authenticate_api_key(token).await else {
+        let _ = rate_limit::BAD_KEYS.check(&ip);
         let mut res = ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "Invalid, revoked, or expired API key.")
             .into_response();
         add_cors(&mut res, dev_origin);
@@ -249,7 +259,10 @@ async fn handle_api_key_request(
     let (limit, remaining) = match app.api_limiter.check(&summary.id) {
         rate_limit::RateDecision::Allowed { limit, remaining } => (limit, remaining),
         rate_limit::RateDecision::Exceeded { limit, retry_after_secs } => {
-            app.engine.record_api_key_usage(&summary.id, &summary.name, &method, &safe_path, 429).await;
+            // One row per key per window: a flood of refused requests isn't a flood of writes.
+            if rate_limit::audit_429_now(&summary.id) {
+                app.engine.record_api_key_usage(&summary.id, &summary.name, &method, &safe_path, 429).await;
+            }
             let mut res = ApiError::too_many(retry_after_secs).into_response();
             insert_rate_headers(&mut res, limit, 0);
             add_cors(&mut res, dev_origin);
