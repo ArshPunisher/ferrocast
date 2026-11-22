@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 
 use ferrocast_core::alert::AlertRule;
 use ferrocast_core::command::{Command, Timer};
+use ferrocast_core::credits::Credits;
 use ferrocast_core::event::{ConnectorStatus, Event, EventKind, Millis, Platform};
 use ferrocast_core::filter::FilterConfig;
 use ferrocast_core::goal::Goal;
@@ -263,11 +264,15 @@ pub struct Session {
     /// Payments already taken off `tips` (a refund and a dispute can both arrive).
     #[serde(skip)]
     pub reversed: std::collections::HashSet<String>,
+    /// End-credits participants (followers, subs, gifters, tippers/bits, raiders, mods).
+    #[serde(default)]
+    pub credits: Credits,
 }
 
 impl Session {
-    /// Updates counts from a live event.
-    pub fn record(&mut self, event: &Event) {
+    /// Updates counts from a live event. Returns `true` when end-credits data changed.
+    pub fn record(&mut self, event: &Event) -> bool {
+        let credits_changed = self.credits.record(event);
         match &event.kind {
             EventKind::Follow { actor } => {
                 self.follows += 1;
@@ -305,6 +310,7 @@ impl Session {
             }
             _ => {}
         }
+        credits_changed
     }
 
     /// Text for a label widget source (API.md widget `label`).

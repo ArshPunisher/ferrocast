@@ -56,6 +56,8 @@ fn rendered_alert(id: usize) -> RenderedAlert {
         tts_text: None,
         tts_audio: None,
         test: false,
+        anim: None,
+        custom: None,
         design: None,
     }
 }

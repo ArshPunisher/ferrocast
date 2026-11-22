@@ -150,6 +150,20 @@ impl RemoteHandler for Handler {
                 .hint("Everything else in Settings works from here."),
             );
         }
+        // Custom alert HTML and fields are code-like content: PC only, like plugins.
+        if matches!(method, Method::PUT | Method::POST)
+            && rel.starts_with("/alert-rules")
+            && custom_code_change(&self.engine, rel, &r.body)
+        {
+            return error_response(
+                ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "not_allowed_for_role",
+                    "Custom alert code can only be added or changed on the PC itself.",
+                )
+                .hint("Everything else about an alert works from here."),
+            );
+        }
         let mut builder =
             Request::builder().method(method.clone()).uri(r.path.as_str()).header(header::HOST, self.host.clone());
         let media = method == Method::GET && rel.starts_with("/media/");
@@ -191,6 +205,39 @@ impl RemoteHandler for Handler {
 }
 
 /// Whether a settings body would switch LAN access (sent and different from now).
+/// The custom-code parts of each look (`custom_enabled`, `html`, `fields`), by look id.
+fn custom_parts(rule: &Value) -> std::collections::BTreeMap<String, Value> {
+    rule.get("variations")
+        .and_then(Value::as_array)
+        .map(|vs| {
+            vs.iter()
+                .map(|v| {
+                    let id = v.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let part = json!([
+                        v.get("custom_enabled").and_then(Value::as_bool).unwrap_or(false),
+                        v.get("html").and_then(Value::as_str).unwrap_or_default(),
+                        v.get("fields").cloned().unwrap_or(json!([])),
+                    ]);
+                    (id, part)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a save of an alert rule adds or changes custom HTML or fields against what is
+/// stored (a rule round-tripped unchanged, or a new look with none, is fine).
+fn custom_code_change(engine: &Engine, rel: &str, body: &[u8]) -> bool {
+    let Ok(new) = serde_json::from_slice::<Value>(body) else { return false };
+    let id = rel.strip_prefix("/alert-rules/").map(str::to_string);
+    let stored = id
+        .and_then(|id| engine.rules().into_iter().find(|r| r.id == id))
+        .map(|r| custom_parts(&json!(r)))
+        .unwrap_or_default();
+    let none = json!([false, "", []]);
+    custom_parts(&new).into_iter().any(|(id, part)| part != *stored.get(&id).unwrap_or(&none))
+}
+
 fn lan_change(engine: &Engine, body: &[u8]) -> bool {
     let Ok(v) = serde_json::from_slice::<Value>(body) else { return false };
     match v.get("lan_access") {

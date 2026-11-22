@@ -1466,6 +1466,9 @@ pub fn import_with(doc: &Value, canvas: (u32, u32), before: &dyn Fn(&str) -> Opt
             };
             si.visible = it.get("visible").and_then(Value::as_bool).unwrap_or(true);
             si.item_id = it.get("id").and_then(Value::as_i64).unwrap_or(0);
+            // Where it is shown: the stream, the recording or both (the default, and any collection
+            // from before it existed).
+            si.show = crate::engine::Show::from_name(it.get("ferrocast_show").and_then(Value::as_str).unwrap_or(""));
             if let Some(override_filters) = it.get("ferrocast_filters").and_then(Value::as_array) {
                 let mut override_effects = Vec::new();
                 parse_video_effects(
@@ -1917,6 +1920,27 @@ mod tests {
 
     fn main_items(im: &Imported) -> Vec<SceneItem> {
         im.scenes.iter().find(|(n, _)| n == "Main").map(|(_, i)| i.clone()).unwrap_or_default()
+    }
+
+    /// Where an item is shown (`ferrocast_show`) comes over with it; an item without it, a
+    /// collection from before, is shown everywhere as it was.
+    #[test]
+    fn an_item_keeps_where_it_is_shown() {
+        let sources = vec![
+            json!({ "id": "color_source_v3", "name": "Red", "settings": { "width": 64, "height": 36, "color": 4278190335u32 } }),
+            json!({ "id": "scene", "name": "Main", "settings": { "items": [
+                { "name": "Red", "id": 1 },
+                { "name": "Red", "id": 2, "ferrocast_show": "stream" },
+                { "name": "Red", "id": 3, "ferrocast_show": "recording" },
+                { "name": "Red", "id": 4, "ferrocast_show": "both" },
+                { "name": "Red", "id": 5, "ferrocast_show": "everywhere" },
+                { "name": "Red", "id": 6, "ferrocast_show": 7 },
+            ] } }),
+        ];
+        let im = import(&json!({ "current_program_scene": "Main", "sources": sources }), (1920, 1080));
+        let shown: Vec<crate::engine::Show> = main_items(&im).iter().map(|i| i.show).collect();
+        use crate::engine::Show::{Both, Recording, Stream};
+        assert_eq!(shown, [Both, Stream, Recording, Both, Both, Both]);
     }
 
     #[test]

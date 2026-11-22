@@ -201,6 +201,17 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn options(&self, kind: String) -> Result<Value, String>;
     /// Shows the preview at the box in the dashboard window, or hides it (None).
     async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String>;
+    /// Performance mode: stops (`paused`) or resumes drawing the preview, Studio Mode's second
+    /// picture and the vertical picture, to save GPU and CPU. Never touches a stream, recording,
+    /// replay buffer or virtual camera, which draw their own frames. Kept by the host while it
+    /// runs (the pictures made again after a canvas change stay as they were set).
+    async fn set_preview_paused(&self, _paused: bool) -> Result<(), String> {
+        Err(NOT_HERE.into())
+    }
+    /// Whether performance mode has the preview paused now.
+    async fn preview_paused(&self) -> bool {
+        false
+    }
     /// Studio Mode's second picture, what's on air, over its own box (or none).
     async fn program_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
         Ok(())
@@ -388,11 +399,19 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     }
     /// OBS's scene collections on this computer: `{ id, name, scenes, sources }[]`.
     async fn obs_collections(&self) -> Result<Value, String>;
+    /// Previews OBS's collection `id` without changing anything in the Studio.
+    async fn preview_obs(&self, _id: String) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
     /// Replaces the Studio's scenes with OBS's collection `id` (listed by `obs_collections`;
     /// the old scenes are kept in a file first) → what came in.
     async fn import_obs(&self, id: String) -> Result<Value, String>;
     /// Streamlabs Desktop's scene collections on this computer, like `obs_collections`.
     async fn streamlabs_collections(&self) -> Result<Value, String> {
+        Err(NOT_HERE.into())
+    }
+    /// Previews Streamlabs' collection `id` without changing anything in the Studio.
+    async fn preview_streamlabs(&self, _id: String) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
     /// Adds Streamlabs' collection `id` as a new scene collection (turned into OBS's format,
@@ -821,7 +840,7 @@ impl FilePick {
 /// Shortcut actions with no name in them (OBS's hotkeys and Ferrocast's vertical canvas). Others:
 /// scene:, mute:, push_to_talk:, push_to_mute:, screenshot:, media_*: <name>; show:, hide:
 /// <scene>\n<source>; filter: <source>\n<filter>; quick: <1 to 10>.
-pub const HOTKEY_ACTIONS: [&str; 27] = [
+pub const HOTKEY_ACTIONS: [&str; 30] = [
     "go_live",
     "end_stream",
     "record",
@@ -847,6 +866,9 @@ pub const HOTKEY_ACTIONS: [&str; 27] = [
     "vertical:hide_preview",
     "vertical:toggle_preview",
     "vertical:screenshot",
+    "performance_mode",
+    "performance_mode_on",
+    "performance_mode_off",
     "undo",
     "redo",
 ];
@@ -1249,7 +1271,7 @@ impl StudioSettings {
                     .iter()
                     .any(|p| action.strip_prefix(p).is_some_and(|n| check_source_name(n).is_ok()))
                 // A source in a scene, a filter on a source: two names, a line apart.
-                || ["show:", "hide:", "filter:"].iter().any(|p| {
+                || ["show:", "hide:", "filter:", "push_show:", "push_hide:", "push_filter_on:", "push_filter_off:"].iter().any(|p| {
                     action.strip_prefix(p).and_then(|r| r.split_once('\n')).is_some_and(|(x, y)| {
                         check_source_name(x).is_ok() && check_source_name(y).is_ok()
                     })
@@ -1311,6 +1333,10 @@ pub enum ItemEdit {
     ScaleBilinear,
     ScaleLanczos,
     ScaleArea,
+    /// Where an item is shown: both (the default), only on the stream, or only in the recording.
+    StreamAndRecording,
+    StreamOnly,
+    RecordingOnly,
 }
 
 /// A change to a filter (`POST …/filters/{filter}/edit` `{ "do": "disable" }`).
@@ -1536,6 +1562,24 @@ pub enum StudioAct {
     /// `Audio`, null when none) and the items of that scene and of every scene shown inside it
     /// (as `Items`, by scene name). Replaces a handful of separate reads every tick. Never saved.
     WatchSnapshot,
+    /// A push-to-show / push-to-hide key: an item shown or hidden while its key is held and put back
+    /// on release (`studio_push_hold`). Never saved and never an undo step.
+    PushItem {
+        scene: String,
+        id: i64,
+        visible: bool,
+        /// The key is let go: the held view is dropped (`visible` is what it was before).
+        #[serde(default)]
+        release: bool,
+    },
+    /// A push-to-enable / push-to-disable key on a source's own filter; as `PushItem`.
+    PushFilter {
+        name: String,
+        filter: String,
+        enabled: bool,
+        #[serde(default)]
+        release: bool,
+    },
     /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
     /// frozen camera).
     Look {
@@ -1624,6 +1668,30 @@ pub enum StudioAct {
         item: Option<ItemTarget>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_item: Option<ItemTarget>,
+    },
+    /// Copies an item and its source (a group with every source in it) out as plain data
+    /// (`{ item, sources }`), for the clipboard.
+    CopySource {
+        scene: String,
+        id: i64,
+    },
+    /// Copies a source's (or an item's own) filters out as plain data (`{ filters, from }`).
+    CopyFilters {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
+    },
+    /// Puts a copied source into `scene` of the open collection → `{ item, notes }`.
+    PasteSource {
+        scene: String,
+        clip: Value,
+    },
+    /// Puts copied filters on a source or an item → `{ notes }`.
+    PasteFilterClip {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
+        clip: Value,
     },
     /// Moves and sizes an item from the preview: its box's first corner to (`x`, `y`), its
     /// sides `w` and `h` long, in canvas pixels → the item. `save` at the end of a drag.
@@ -1958,6 +2026,11 @@ impl StudioAct {
                 device.as_mut().map(new).transpose().map(|_| ())
             }
             A::PushKey { name, .. } => check_source_name(name),
+            A::PushItem { scene, .. } => check_source_name(scene),
+            A::PushFilter { name, filter, .. } => {
+                check_source_name(name)?;
+                check_source_name(filter)
+            }
             A::Levels { names } | A::Look { names } => {
                 if names.len() > 64 {
                     return Err(EngineError::Invalid("names: up to 64 sources at once.".into()));
@@ -1989,6 +2062,16 @@ impl StudioAct {
                     return Err(EngineError::Invalid("from: another source than the one pasted onto.".into()));
                 }
                 Ok(())
+            }
+            A::CopySource { scene, .. } => check_source_name(scene),
+            A::CopyFilters { name, item } => check_filter_target(name, item.as_ref()),
+            A::PasteSource { scene, clip } => {
+                check_source_name(scene)?;
+                check_clip(clip, "sources")
+            }
+            A::PasteFilterClip { name, item, clip } => {
+                check_filter_target(name, item.as_ref())?;
+                check_clip(clip, "filters")
             }
             A::SetItemCrop { scene, crop, .. } => {
                 check_source_name(scene)?;
@@ -2172,11 +2255,15 @@ impl StudioAct {
                 | A::AudioByName { .. }
                 | A::Levels { .. }
                 | A::PushKey { .. }
+                | A::PushItem { .. }
+                | A::PushFilter { .. }
                 | A::WatchSnapshot
                 | A::Look { .. }
                 | A::AudioCare
                 | A::Privacy
                 | A::Filters { .. }
+                | A::CopySource { .. }
+                | A::CopyFilters { .. }
                 | A::Screenshot { .. }
                 | A::ScreenshotProgram
                 | A::Refresh
@@ -2204,6 +2291,15 @@ fn check_transition(t: &SceneTransition) -> Result<(), EngineError> {
 }
 
 /// A source or filter kind id from OBS (`color_source`, `com.example.thing`).
+/// A copied list (`key` an array) is at most 200 entries: it comes from the clipboard, but the
+/// route is the same one a script could call.
+fn check_clip(clip: &Value, key: &str) -> Result<(), EngineError> {
+    match clip.get(key).and_then(Value::as_array) {
+        Some(l) if !l.is_empty() && l.len() <= 200 => Ok(()),
+        _ => Err(EngineError::Invalid(format!("clip: a copy with 1 to 200 {key}."))),
+    }
+}
+
 fn check_filter_target(name: &str, item: Option<&ItemTarget>) -> Result<(), EngineError> {
     match item {
         Some(it) => {
@@ -2300,6 +2396,7 @@ impl Engine {
         let (load_collection, allow_auto_start, _enabled_normal) = self.apply_start_options(&opts)?;
         let mut status = if was_running {
             if confirming && load_collection {
+                self.studio_release_holds().await;
                 host.confirm_collection().await.map_err(failed)?
             } else {
                 host.status().await
@@ -2334,6 +2431,8 @@ impl Engine {
 
     pub async fn studio_stop(&self) -> Result<StudioStatus, EngineError> {
         let host = self.studio_host()?;
+        // Keys held down put their items back before the scenes are saved and let go.
+        self.studio_release_holds().await;
         let was_running = host.status().await.running;
         // Cancel any active Show, countdown, or pending delayed stop immediately (even before
         // acquiring output_lock) so an in-flight start_show / go_live_now sees the generation
@@ -2550,9 +2649,25 @@ impl Engine {
         self.studio_host()?.obs_collections().await.map_err(failed)
     }
 
+    /// Previews OBS's scene collection `id` without modifying Studio state.
+    pub async fn studio_preview_obs(&self, id: &str) -> Result<Value, EngineError> {
+        if !collection_id_ok(id) {
+            return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
+        }
+        self.studio_host()?.preview_obs(id.to_string()).await.map_err(failed)
+    }
+
     /// Streamlabs Desktop's scene collections, to import one.
     pub async fn studio_streamlabs_collections(&self) -> Result<Value, EngineError> {
         self.studio_host()?.streamlabs_collections().await.map_err(failed)
+    }
+
+    /// Previews Streamlabs' scene collection `id` without modifying Studio state.
+    pub async fn studio_preview_streamlabs(&self, id: &str) -> Result<Value, EngineError> {
+        if !collection_id_ok(id) {
+            return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
+        }
+        self.studio_host()?.preview_streamlabs(id.to_string()).await.map_err(failed)
     }
 
     /// Brings in Streamlabs' scene collection `id` as a new scene collection.
@@ -2561,6 +2676,8 @@ impl Engine {
             return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
         }
         self.ensure_idle_for_switch("scene collections").await?;
+        // Keys held now belong to the collection being left.
+        self.studio_release_holds().await;
         let host = self.studio_host()?;
         let list = host.streamlabs_collections().await.map_err(failed)?;
         if !list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id)) {
@@ -2581,6 +2698,7 @@ impl Engine {
             return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
         }
         self.ensure_idle_for_switch("scene collections").await?;
+        self.studio_release_holds().await;
         let host = self.studio_host()?;
         let list = host.obs_collections().await.map_err(failed)?;
         let known = list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id));
@@ -2616,6 +2734,11 @@ impl Engine {
     /// Does one thing to the scene collection, after checking it.
     pub async fn studio_act(&self, mut act: StudioAct) -> Result<Value, EngineError> {
         act.check()?;
+        // Undo and redo go back through snapshots: a key held now would be in them, and its
+        // release would then undo the undo. Held keys are let go first.
+        if matches!(act, StudioAct::Undo | StudioAct::Redo) {
+            self.studio_release_holds().await;
+        }
         let turns_vertical = matches!(act, StudioAct::StartVertical { .. } | StudioAct::StopVertical);
         let out = self.studio_host()?.act(act).await.map_err(failed)?;
         if turns_vertical {
@@ -2951,6 +3074,8 @@ impl Engine {
         if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
             let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
             self.ensure_idle_for_switch(noun).await?;
+            // A held key's item is in the collection being left: put it back first.
+            self.studio_release_holds().await;
         }
         let out = self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)?;
         // Another collection may have its own vertical picture (or none): the stream follows.
@@ -2984,6 +3109,20 @@ impl Engine {
         host.vertical_view(vertical).await.map_err(failed)
     }
 
+    /// Performance mode now: whether the preview is paused.
+    pub async fn studio_preview_paused(&self) -> Result<bool, EngineError> {
+        Ok(self.studio_host()?.preview_paused().await)
+    }
+
+    /// Performance mode: pauses (`paused`) or resumes drawing the preview → whether it is paused
+    /// now. The outputs are never touched, so it is allowed while streaming or recording (that
+    /// is what it is for). Said again, it changes nothing.
+    pub async fn studio_set_preview_paused(&self, paused: bool) -> Result<bool, EngineError> {
+        let host = self.studio_host()?;
+        host.set_preview_paused(paused).await.map_err(failed)?;
+        Ok(host.preview_paused().await)
+    }
+
     /// The cursor over the pictures (a CSS cursor name, as the page's stage shows it there).
     pub async fn studio_preview_cursor(&self, cursor: String) -> Result<(), EngineError> {
         if cursor.is_empty() || cursor.len() > 32 || !cursor.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
@@ -3015,7 +3154,7 @@ fn captions_failed(message: String) -> EngineError {
     EngineError::Refused { status: 422, code: "captions_unavailable", message, hint: hint.into(), retry_after: None }
 }
 
-fn failed(message: String) -> EngineError {
+pub(crate) fn failed(message: String) -> EngineError {
     let refused = |status, code, message: String, hint: &str| EngineError::Refused {
         status,
         code,
@@ -3043,6 +3182,23 @@ fn failed(message: String) -> EngineError {
     if message.starts_with("There's no filter called") {
         return refused(404, "studio_no_filter", message, "Refresh the list of filters.");
     }
+    // A collection's own name is in these messages: it must not decide the answer ("in use now").
+    if message.contains("is damaged and can't be read") && message.contains("scene collection") {
+        return refused(
+            422,
+            "studio_collection_broken",
+            message,
+            "Pick another scene collection or start fresh in Ferrocast.",
+        );
+    }
+    if message.contains("is too large to import") {
+        return refused(
+            413,
+            "studio_collection_too_large",
+            message,
+            "Split very large collections in OBS or Streamlabs, or start fresh.",
+        );
+    }
     if message.contains("already a scene collection called") || message.contains("already a profile called") {
         return refused(409, "studio_name_taken", message, "Pick another name.");
     }
@@ -3051,6 +3207,33 @@ fn failed(message: String) -> EngineError {
     }
     if message.contains("There's no scene collection") || message.contains("There's no profile") {
         return refused(404, "studio_no_such", message, "Refresh the list.");
+    }
+    if (message.contains("scene collection") && message.contains("isn't there any more"))
+        || message.contains("scene collections aren't on this computer")
+        || message.contains("has no such scene collection")
+    {
+        return refused(404, "studio_no_obs_collection", message, "Pick one from the list.");
+    }
+    if message.contains("JSON is damaged")
+        || message.contains("is damaged and can't be read")
+        || message.contains("didn't read")
+        || message.contains("isn't an OBS")
+        || message.contains("isn't a Streamlabs")
+    {
+        return refused(
+            422,
+            "studio_collection_broken",
+            message,
+            "Pick another scene collection or start fresh in Ferrocast.",
+        );
+    }
+    if message.contains("too large to") {
+        return refused(
+            413,
+            "studio_collection_too_large",
+            message,
+            "Split very large collections in OBS or Streamlabs, or start fresh.",
+        );
     }
     if message.contains("already a source") || message.contains("already a filter") {
         return refused(409, "studio_name_taken", message, "Pick another name.");
@@ -3269,6 +3452,8 @@ mod tests {
         direct: std::sync::atomic::AtomicBool,
         /// Each `capture_keys(on)` the page asked for.
         captured: std::sync::Mutex<Vec<bool>>,
+        /// Performance mode: the preview is paused.
+        paused: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -3309,6 +3494,13 @@ mod tests {
             self.rects.lock().unwrap_or_else(|p| p.into_inner()).push(rect);
             Ok(())
         }
+        async fn set_preview_paused(&self, paused: bool) -> Result<(), String> {
+            self.paused.store(paused, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn preview_paused(&self) -> bool {
+            self.paused.load(std::sync::atomic::Ordering::SeqCst)
+        }
         async fn defaults(&self, _kind: String) -> Result<Value, String> {
             Ok(serde_json::json!({}))
         }
@@ -3343,6 +3535,22 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             self.acts.lock().unwrap_or_else(|p| p.into_inner()).push(act.clone());
+            // Copies answer as the desktop's Stage does; everything else echoes the act.
+            match &act {
+                StudioAct::CopySource { .. } => {
+                    return Ok(serde_json::json!({
+                        "item": { "name": "Cam", "id": 4 },
+                        "sources": [{ "name": "Cam" }, { "name": "Mic" }],
+                    }));
+                }
+                StudioAct::CopyFilters { name, .. } if name == "Empty" => {
+                    return Ok(serde_json::json!({ "filters": [], "from": "Empty" }));
+                }
+                StudioAct::CopyFilters { name, .. } => {
+                    return Ok(serde_json::json!({ "filters": [{ "name": "Gate" }], "from": name }));
+                }
+                _ => {}
+            }
             Ok(serde_json::to_value(act).unwrap_or_default())
         }
         async fn stream_start(
@@ -3376,8 +3584,53 @@ mod tests {
         async fn obs_collections(&self) -> Result<Value, String> {
             Ok(serde_json::json!([{ "id": "Untitled", "name": "Untitled", "scenes": 2, "sources": 3 }]))
         }
+        async fn preview_obs(&self, id: String) -> Result<Value, String> {
+            match id.as_str() {
+                "Untitled" => Ok(serde_json::json!({
+                    "source": "obs",
+                    "id": "Untitled",
+                    "name": "Untitled",
+                    "scenes": 2,
+                    "sources": 3,
+                    "web_pages": 0,
+                    "scene_names": ["Main", "BRB"],
+                    "truncated_scenes": 0,
+                    "device_resets": [],
+                    "skipped": [],
+                    "skipped_total": 0,
+                    "missing": []
+                })),
+                "broken" => {
+                    Err("OBS's scene collection \"broken\" couldn't be read because the JSON is damaged.".into())
+                }
+                "huge" => Err("The collection file is too large to preview.".into()),
+                _ => Err(format!("OBS's scene collection \"{id}\" isn't there any more.")),
+            }
+        }
         async fn import_obs(&self, id: String) -> Result<Value, String> {
-            Ok(serde_json::json!({ "name": id, "scenes": 2, "sources": 3, "web_pages": 0, "missing": [] }))
+            Ok(
+                serde_json::json!({ "id": "untitled-2", "previous_id": "untitled", "name": id, "scenes": 2, "sources": 3, "web_pages": 0, "missing": [] }),
+            )
+        }
+        async fn preview_streamlabs(&self, id: String) -> Result<Value, String> {
+            if id == "sl-main" {
+                Ok(serde_json::json!({
+                    "source": "streamlabs",
+                    "id": id,
+                    "name": "SL Main",
+                    "scenes": 1,
+                    "sources": 2,
+                    "web_pages": 1,
+                    "scene_names": ["Live"],
+                    "truncated_scenes": 0,
+                    "device_resets": [],
+                    "skipped": [],
+                    "skipped_total": 0,
+                    "missing": []
+                }))
+            } else {
+                Err("That Streamlabs scene collection isn't there any more.".into())
+            }
         }
     }
 
@@ -3477,6 +3730,122 @@ mod tests {
         e.studio_capture_keys(true);
         e.studio_capture_keys(false);
         assert_eq!(*fake.captured.lock().unwrap_or_else(|p| p.into_inner()), vec![true, false]);
+    }
+
+    fn pasted(fake: &Fake) -> Vec<StudioAct> {
+        fake.acts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|a| matches!(a, StudioAct::PasteSource { .. } | StudioAct::PasteFilterClip { .. }))
+            .cloned()
+            .collect()
+    }
+
+    /// Copy and paste: the engine keeps the copy, hands it to the host on paste, says plainly
+    /// when nothing (or the wrong thing) is copied, and keeps it for another collection.
+    #[tokio::test]
+    async fn the_clipboard_keeps_a_copy_for_a_paste_in_any_collection() {
+        let (e, _d) = engine().await;
+        assert!(matches!(e.studio_clipboard().unwrap_err(), EngineError::Missing { code: "clipboard_empty", .. }));
+        assert!(matches!(
+            e.studio_paste_source("Main".into()).await.unwrap_err(),
+            EngineError::Missing { code: "clipboard_empty", .. }
+        ));
+        assert!(matches!(
+            e.studio_copy_source("Main".into(), 4).await.unwrap_err(),
+            EngineError::Refused { code: "studio_unavailable", .. }
+        ));
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        let c = e.studio_copy_source("Main".into(), 4).await.unwrap();
+        assert_eq!(c, serde_json::json!({ "kind": "source", "name": "Cam", "from": "Main", "count": 2 }));
+        assert_eq!(e.studio_clipboard().unwrap(), c);
+        // Another collection opens: the host's state changes, the copy stays.
+        e.studio_act(StudioAct::Refresh).await.unwrap();
+        assert_eq!(e.studio_clipboard().unwrap(), c);
+        e.studio_paste_source("Scene 2".into()).await.unwrap();
+        e.studio_paste_source("Scene 2".into()).await.unwrap();
+        let p = pasted(&fake);
+        assert_eq!(p.len(), 2, "a paste can be repeated");
+        let StudioAct::PasteSource { scene, clip } = &p[0] else { panic!("{p:?}") };
+        assert_eq!((scene.as_str(), clip["sources"].as_array().map(Vec::len)), ("Scene 2", Some(2)));
+        // The wrong kind says what is held; clearing empties it.
+        let wrong = e.studio_paste_filters("Mic".into(), None).await.unwrap_err();
+        assert!(matches!(&wrong, EngineError::Invalid(m) if m.contains("a source")), "{wrong:?}");
+        e.studio_clipboard_clear();
+        assert!(e.studio_clipboard().is_err());
+    }
+
+    #[tokio::test]
+    async fn copied_filters_paste_onto_a_source_or_an_item() {
+        let (e, _d) = engine().await;
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        let none = e.studio_copy_filters("Empty".into(), None).await.unwrap_err();
+        assert!(matches!(&none, EngineError::Invalid(m) if m.contains("Empty")), "{none:?}");
+        assert!(e.studio_clipboard().is_err(), "a failed copy leaves the clipboard as it was");
+        let c = e.studio_copy_filters("Mic".into(), None).await.unwrap();
+        assert_eq!(c, serde_json::json!({ "kind": "filters", "name": "Mic", "from": "Mic", "count": 1 }));
+        let wrong = e.studio_paste_source("Main".into()).await.unwrap_err();
+        assert!(matches!(&wrong, EngineError::Invalid(m) if m.contains("filters")), "{wrong:?}");
+        e.studio_paste_filters("Voice".into(), None).await.unwrap();
+        e.studio_paste_filters(String::new(), Some(ItemTarget { scene: "Main".into(), id: 3 })).await.unwrap();
+        assert_eq!(pasted(&fake).len(), 2);
+    }
+
+    #[test]
+    fn clipboard_acts_check_their_input_and_only_pastes_change_the_collection() {
+        let ok_clip = serde_json::json!({ "sources": [{ "name": "A" }], "filters": [{ "name": "F" }] });
+        assert!(StudioAct::PasteSource { scene: "Main".into(), clip: ok_clip.clone() }.check().is_ok());
+        assert!(StudioAct::PasteFilterClip { name: "Mic".into(), item: None, clip: ok_clip.clone() }.check().is_ok());
+        for bad in [serde_json::json!({}), serde_json::json!({ "sources": [] }), serde_json::json!({ "sources": 3 })] {
+            assert!(StudioAct::PasteSource { scene: "Main".into(), clip: bad }.check().is_err());
+        }
+        let many: Vec<_> = (0..201).map(|_| serde_json::json!({ "name": "x" })).collect();
+        assert!(
+            StudioAct::PasteFilterClip { name: "Mic".into(), item: None, clip: serde_json::json!({ "filters": many }) }
+                .check()
+                .is_err()
+        );
+        assert!(StudioAct::PasteSource { scene: String::new(), clip: ok_clip.clone() }.check().is_err());
+        assert!(!StudioAct::CopySource { scene: "Main".into(), id: 1 }.changes());
+        assert!(!StudioAct::CopyFilters { name: "Mic".into(), item: None }.changes());
+        assert!(StudioAct::PasteSource { scene: "Main".into(), clip: ok_clip.clone() }.changes());
+        assert!(StudioAct::PasteFilterClip { name: "Mic".into(), item: None, clip: ok_clip }.changes());
+    }
+
+    /// Performance mode: the engine asks the host to pause, answers what the host says, and
+    /// saying the same thing twice changes nothing. Without the desktop app it says so (not a
+    /// crash, not a pretend success).
+    #[tokio::test]
+    async fn performance_mode_goes_to_the_host_and_is_idempotent() {
+        let (e, _d) = engine().await;
+        assert!(matches!(
+            e.studio_set_preview_paused(true).await.unwrap_err(),
+            EngineError::Refused { code: "studio_unavailable", .. }
+        ));
+        assert!(e.studio_preview_paused().await.is_err());
+        let fake = Arc::new(Fake::default());
+        e.set_studio_host(fake.clone());
+        assert!(!e.studio_preview_paused().await.unwrap());
+        assert!(e.studio_set_preview_paused(true).await.unwrap());
+        assert!(e.studio_set_preview_paused(true).await.unwrap());
+        assert!(e.studio_preview_paused().await.unwrap());
+        assert!(!e.studio_set_preview_paused(false).await.unwrap());
+        // It never asks the host to do anything to the scenes, the stream or a recording.
+        assert!(fake.acts.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+        assert!(fake.outputs.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn the_performance_mode_keys_are_known_shortcut_actions() {
+        for a in ["performance_mode", "performance_mode_on", "performance_mode_off"] {
+            assert!(HOTKEY_ACTIONS.contains(&a), "{a}");
+            let mut s = StudioSettings::default();
+            s.hotkeys.insert(a.into(), "Alt+P".into());
+            assert!(s.check().is_ok(), "{a}");
+        }
     }
 
     #[tokio::test]
@@ -3606,6 +3975,32 @@ mod tests {
         let v = e.studio_levels(vec!["Mic".into()], false).await.unwrap();
         assert!(v.get("Mic").is_none(), "the fast path answered with no engine: {v}");
         held.await.unwrap().unwrap();
+    }
+
+    /// The readers' words for a file that went bad after it was listed map to the same plain error.
+    #[test]
+    fn a_damaged_or_big_import_file_has_its_own_error() {
+        for (m, status, code) in [
+            (
+                "OBS's scene collection \"x\" is damaged and can't be read. Open it in OBS to check it, or start fresh.",
+                422,
+                "studio_collection_broken",
+            ),
+            (
+                "That Streamlabs scene collection is damaged and can't be read. Open it in Streamlabs to check it, or start fresh.",
+                422,
+                "studio_collection_broken",
+            ),
+            ("OBS's scene collections aren't on this computer.", 404, "studio_no_obs_collection"),
+            ("Streamlabs' scene collections aren't on this computer.", 404, "studio_no_obs_collection"),
+            ("OBS's scene collection \"x\" is too large to import.", 413, "studio_collection_too_large"),
+            ("OBS's scene collection \"in use now\" is too large to import.", 413, "studio_collection_too_large"),
+        ] {
+            assert!(
+                matches!(failed(m.into()), EngineError::Refused { status: s, code: c, .. } if s == status && c == code),
+                "{m}"
+            );
+        }
     }
 
     #[test]
@@ -3751,6 +4146,28 @@ mod tests {
         assert!(matches!(
             failed("Stop streaming and recording before bringing in scenes.".into()),
             EngineError::Refused { status: 409, code: "studio_busy", .. }
+        ));
+        assert_eq!(e.studio_preview_obs("Untitled").await.unwrap()["scenes"], 2);
+        assert_eq!(e.studio_preview_streamlabs("sl-main").await.unwrap()["source"], "streamlabs");
+        for bad in ["../Untitled", "", ".x", "a/b"] {
+            assert!(matches!(e.studio_preview_obs(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
+            assert!(matches!(e.studio_preview_streamlabs(bad).await.unwrap_err(), EngineError::Invalid(_)), "{bad}");
+        }
+        assert!(matches!(
+            e.studio_preview_obs("Other").await.unwrap_err(),
+            EngineError::Refused { status: 404, code: "studio_no_obs_collection", .. }
+        ));
+        assert!(matches!(
+            e.studio_preview_obs("broken").await.unwrap_err(),
+            EngineError::Refused { status: 422, code: "studio_collection_broken", .. }
+        ));
+        assert!(matches!(
+            e.studio_preview_obs("huge").await.unwrap_err(),
+            EngineError::Refused { status: 413, code: "studio_collection_too_large", .. }
+        ));
+        assert!(matches!(
+            e.studio_preview_streamlabs("missing").await.unwrap_err(),
+            EngineError::Refused { status: 404, code: "studio_no_obs_collection", .. }
         ));
     }
 
