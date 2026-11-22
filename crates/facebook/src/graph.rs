@@ -126,7 +126,7 @@ impl Graph {
         let v = self
             .call(
                 Method::POST,
-                &format!("/{}/live_videos", self.page_id),
+                &format!("/{}/live_videos", graph_id(&self.page_id)?),
                 &[("fields", "id,secure_stream_url,stream_url,permalink_url")],
                 Some(body),
             )
@@ -150,7 +150,7 @@ impl Graph {
         let v = self
             .call(
                 Method::GET,
-                &format!("/{}/live_videos", self.page_id),
+                &format!("/{}/live_videos", graph_id(&self.page_id)?),
                 &[("broadcast_status", "[\"LIVE\"]"), ("fields", "id,status"), ("limit", "1")],
                 None,
             )
@@ -174,7 +174,7 @@ impl Graph {
         if let Some(a) = after {
             query.push(("after", a));
         }
-        let v = self.call(Method::GET, &format!("/{live_id}/comments"), &query, None).await?;
+        let v = self.call(Method::GET, &format!("/{}/comments", graph_id(live_id)?), &query, None).await?;
         let list = v
             .get("data")
             .and_then(Value::as_array)
@@ -185,13 +185,13 @@ impl Graph {
     }
 
     pub async fn post_comment(&self, live_id: &str, text: &str) -> Result<(), FacebookError> {
-        self.call(Method::POST, &format!("/{live_id}/comments"), &[], Some(json!({ "message": text })))
+        self.call(Method::POST, &format!("/{}/comments", graph_id(live_id)?), &[], Some(json!({ "message": text })))
             .await
             .map(|_| ())
     }
 
     pub async fn delete_comment(&self, comment_id: &str) -> Result<(), FacebookError> {
-        self.call(Method::DELETE, &format!("/{comment_id}"), &[], None).await.map(|_| ())
+        self.call(Method::DELETE, &format!("/{}", graph_id(comment_id)?), &[], None).await.map(|_| ())
     }
 
     /// Changes a live video's title and description.
@@ -214,8 +214,19 @@ impl Graph {
         if body.is_empty() {
             return Ok(applied);
         }
-        self.call(Method::POST, &format!("/{live_id}"), &[], Some(Value::Object(body))).await?;
+        self.call(Method::POST, &format!("/{}", graph_id(live_id)?), &[], Some(Value::Object(body))).await?;
         Ok(applied)
+    }
+}
+
+/// A Graph id is letters, digits, `_` and `-` and nothing else: no `/`, `.`, `?`, `#` or `%` that
+/// could change which address a call goes to (a comment id can be a Page post or a permission
+/// path otherwise, and the call carries the Page's token).
+fn graph_id(id: &str) -> Result<&str, FacebookError> {
+    if (1..=128).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        Ok(id)
+    } else {
+        Err(FacebookError::Refused("that isn't a Facebook id".into()))
     }
 }
 

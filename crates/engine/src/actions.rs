@@ -193,6 +193,19 @@ impl Engine {
 
     pub async fn delete_message(&self, platform: Platform, message_id: &str) -> Result<(), EngineError> {
         let c = self.connector(platform).ok_or(ConnectorError::NotConnected(platform))?;
+        // Facebook's delete is by object id, and the Page's token can delete a post or a live
+        // video too: only a comment that came in on the live video here is deleted.
+        if platform == Platform::Facebook {
+            let id = message_id.to_string();
+            let known = self.db(move |s| ferrocast_store::repo::events::by_source(s, Platform::Facebook, &id)).await?;
+            if known.is_none() {
+                return Err(EngineError::Missing {
+                    code: "facebook_comment_unknown",
+                    message: "Ferrocast hasn't seen that comment on your Page.",
+                    hint: "Only comments that came in on your live video can be deleted here.",
+                });
+            }
+        }
         c.delete_message(message_id).await?;
         self.hide_message(platform, message_id);
         Ok(())

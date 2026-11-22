@@ -116,3 +116,52 @@ async fn a_saved_page_comes_back_on_the_next_start() {
     again.resume_accounts().await;
     assert!(again.connector(Platform::Facebook).is_some());
 }
+
+/// A Graph that writes down every call it gets (method and path), whatever it is.
+async fn recording_graph() -> (String, Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+    let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> = Arc::default();
+    let s = seen.clone();
+    let app = axum::Router::new().fallback(move |m: axum::http::Method, u: axum::http::Uri| {
+        let s = s.clone();
+        async move {
+            s.lock().unwrap().push((m.to_string(), u.path().to_string()));
+            if u.path().ends_with("/live_videos") && m == axum::http::Method::GET {
+                return Json(json!({ "data": [] }));
+            }
+            Json(json!({ "success": true }))
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    (base, seen)
+}
+
+#[tokio::test]
+async fn a_facebook_delete_only_goes_to_a_comment_ferrocast_has_seen() {
+    let (graph, seen) = recording_graph().await;
+    let (e, _d, _s) = engine_with(graph, true).await;
+    e.finish_facebook(grant(1)).await.unwrap();
+    let deletes = || seen.lock().unwrap().iter().filter(|(m, _)| m == "DELETE").count();
+
+    // A Page post, a live video, a permission: not comments Ferrocast saw, so nothing is sent.
+    for id in ["999_111", "me/permissions", "../123", "1?method=post"] {
+        let err = e.delete_message(Platform::Facebook, id).await.unwrap_err();
+        assert!(matches!(err, EngineError::Missing { code: "facebook_comment_unknown", .. }), "{id}: {err:?}");
+    }
+    assert_eq!(deletes(), 0);
+
+    // A comment that came in on the live video is deleted.
+    let ev = ferrocast_facebook::feed::chat_event(&ferrocast_facebook::Comment {
+        id: "1234_5678".into(),
+        message: "hello".into(),
+        from_id: Some("u1".into()),
+        from_name: "Asha".into(),
+        avatar_url: None,
+        created_ms: 1_000,
+    });
+    e.db(move |s| ferrocast_store::repo::events::insert(s, &ev)).await.unwrap();
+    e.delete_message(Platform::Facebook, "1234_5678").await.unwrap();
+    assert_eq!(deletes(), 1);
+    assert!(seen.lock().unwrap().iter().any(|(m, p)| m == "DELETE" && p == "/1234_5678"));
+}

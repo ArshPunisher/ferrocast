@@ -283,3 +283,39 @@ async fn the_sign_in_flow_checks_state_and_trades_the_code_for_pages() {
         "{calls:?}"
     );
 }
+
+#[tokio::test]
+async fn an_id_that_is_not_a_plain_id_never_reaches_graph() {
+    // Nothing listens here: a request that was sent would come back as a Network error, so a
+    // Refused answer means nothing was sent.
+    let g = Graph::new("http://127.0.0.1:9", "123", "TOKEN");
+    let long = "1".repeat(129);
+    let bad = [
+        "me/permissions",
+        "../123",
+        "123?method=post",
+        "12 3",
+        "",
+        "123#x",
+        "a%2Fb",
+        "12/comments",
+        "a.b",
+        "123\\456",
+        "123\n",
+        long.as_str(),
+    ];
+    for id in bad {
+        assert!(matches!(g.delete_comment(id).await, Err(FacebookError::Refused(_))), "delete {id:?}");
+        assert!(matches!(g.post_comment(id, "hi").await, Err(FacebookError::Refused(_))), "post {id:?}");
+        assert!(matches!(g.comments(id, None).await, Err(FacebookError::Refused(_))), "comments {id:?}");
+        assert!(matches!(g.update_live(id, Some("t"), None).await, Err(FacebookError::Refused(_))), "update {id:?}");
+    }
+    // The Page id is held to the same rule.
+    let odd_page = Graph::new("http://127.0.0.1:9", "me/accounts", "TOKEN");
+    assert!(matches!(odd_page.current_live().await, Err(FacebookError::Refused(_))));
+    assert!(matches!(odd_page.create_live_video("t", None, None).await, Err(FacebookError::Refused(_))));
+    // A real id goes through to the network.
+    for ok in ["123_456", "1234567890123456", "lv-now", "A1_b2-c3"] {
+        assert!(matches!(g.delete_comment(ok).await, Err(FacebookError::Network(_))), "{ok}");
+    }
+}
