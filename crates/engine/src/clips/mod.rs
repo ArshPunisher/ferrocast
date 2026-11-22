@@ -461,16 +461,54 @@ pub(crate) fn probe_args_for_test(path: &Path) -> Vec<std::ffi::OsString> {
     probe_args(path)
 }
 
-/// Reads ffmpeg's text about a file.
+/// Reads ffmpeg's text about a file. The picture's facts (size, turn, frame rate) all come from
+/// the first video stream: the one a compilation and the Shorts check select.
 pub fn parse_probe(stderr: &str) -> Probe {
     let mut p = Probe::default();
+    // The first video stream's own facts, and which stream the lines being read belong to.
+    let mut first_video_seen = false;
+    let mut in_first_video = false;
     let mut quarter_turn = false;
     for line in stderr.lines() {
         let l = line.trim();
+        if l.starts_with("Stream #") {
+            in_first_video = false;
+            if l.contains("Video:") && !l.contains("attached pic") {
+                p.has_video = true;
+                if !first_video_seen {
+                    first_video_seen = true;
+                    in_first_video = true;
+                    // "…, 1920x1080 [SAR 1:1 DAR 16:9], 30 fps…": the first WxH.
+                    let parts: Vec<&str> = l.split([' ', ',']).filter(|t| !t.is_empty()).collect();
+                    if let Some(at) = parts.iter().position(|t| *t == "fps")
+                        && at > 0
+                        && let Ok(f) = parts[at - 1].parse::<f32>()
+                        && f > 0.0
+                    {
+                        p.fps = Some(f);
+                    }
+                    for tok in l.split([' ', ',']) {
+                        if let Some((w, h)) = tok.split_once('x')
+                            && let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>())
+                            && w >= 16
+                            && h >= 16
+                            && p.width.is_none()
+                        {
+                            p.width = Some(w);
+                            p.height = Some(h);
+                        }
+                    }
+                }
+            } else if l.contains("Audio:") {
+                p.has_audio = true;
+            }
+            continue;
+        }
         // "displaymatrix: rotation of -90.00 degrees": a phone's portrait video is stored sideways.
-        // Only the stream's own side-data line, never a container tag (a title or comment can say
-        // anything).
-        if l.starts_with("displaymatrix:")
+        // Only that stream's own side-data line (never a container tag: a title can say anything),
+        // and only the stream the picture's facts come from.
+        if in_first_video
+            && l.starts_with("displaymatrix:")
             && let Some(rest) = l.split("rotation of").nth(1)
             && let Some(deg) = rest.split_whitespace().next().and_then(|d| d.parse::<f32>().ok())
         {
@@ -491,30 +529,6 @@ pub fn parse_probe(stderr: &str) -> Probe {
             {
                 p.duration_ms = Some(h * 3_600_000 + m * 60_000 + (s * 1000.0).round() as u64);
             }
-        } else if l.contains("Video:") && l.contains("Stream #") && !l.contains("attached pic") {
-            p.has_video = true;
-            // "…, 1920x1080 [SAR 1:1 DAR 16:9], 30 fps…": the first WxH.
-            let parts: Vec<&str> = l.split([' ', ',']).filter(|t| !t.is_empty()).collect();
-            if let Some(at) = parts.iter().position(|t| *t == "fps")
-                && at > 0
-                && let Ok(f) = parts[at - 1].parse::<f32>()
-                && f > 0.0
-            {
-                p.fps = Some(f);
-            }
-            for tok in l.split([' ', ',']) {
-                if let Some((w, h)) = tok.split_once('x')
-                    && let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>())
-                    && w >= 16
-                    && h >= 16
-                    && p.width.is_none()
-                {
-                    p.width = Some(w);
-                    p.height = Some(h);
-                }
-            }
-        } else if l.contains("Audio:") && l.contains("Stream #") {
-            p.has_audio = true;
         }
     }
     // The size as it is shown (ffmpeg turns such a clip upright), not as it is stored.

@@ -613,3 +613,36 @@ async fn captions_too_big_to_read_back_are_refused_on_save() {
     assert!(matches!(r, Err(EngineError::Refused { status: 400, code: "bad_captions", .. })), "{r:?}");
     assert!(!clips.path().join("a.srt").exists(), "nothing was written");
 }
+
+/// CodeRabbit: with two video streams, the size, turn and frame rate come from one stream (the
+/// first picture), not mixed from both.
+#[test]
+fn probe_facts_belong_to_the_one_selected_video_stream() {
+    let text = "\
+Input #0, matroska,webm, from 'x.mkv':
+  Duration: 00:00:10.00, start: 0.000000, bitrate: 5000 kb/s
+  Stream #0:0: Video: h264, yuv420p, 1920x1080, 30 fps, 30 tbr, 1k tbn
+  Stream #0:1: Video: h264, yuv420p, 1080x1920, 60 fps, 60 tbr, 1k tbn
+    Side data:
+      displaymatrix: rotation of -90.00 degrees
+  Stream #0:2: Audio: aac, 48000 Hz, stereo, fltp
+";
+    let p = parse_probe(text);
+    assert_eq!((p.width, p.height), (Some(1920), Some(1080)), "the second stream's turn leaked in");
+    assert_eq!(p.fps, Some(30.0));
+    // The rotation belongs to the stream it is listed under.
+    let text2 = "\
+  Duration: 00:00:10.00, start: 0.000000, bitrate: 5000 kb/s
+  Stream #0:0: Video: h264, yuv420p, 1920x1080, 30 fps, 30 tbr, 1k tbn
+  Stream #0:1: Video: h264, yuv420p, 1080x1920, 60 fps, 60 tbr, 1k tbn
+";
+    assert_eq!(parse_probe(text2).fps, Some(30.0));
+    let rotated = "\
+  Duration: 00:00:10.00, start: 0.000000, bitrate: 5000 kb/s
+  Stream #0:0: Video: h264, yuv420p, 1920x1080, 30 fps, 30 tbr, 1k tbn
+    Side data:
+      displaymatrix: rotation of -90.00 degrees
+";
+    let r = parse_probe(rotated);
+    assert_eq!((r.width, r.height), (Some(1080), Some(1920)));
+}
