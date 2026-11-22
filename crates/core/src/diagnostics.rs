@@ -1222,12 +1222,14 @@ fn scrub_url_body(scheme_prefix: &str, body: &str, mask: &str) -> String {
 
 fn scrub_kv_and_json_secrets(text: &str, mask: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
+    let mut offset = 0usize;
+    while offset < text.len() {
+        let rest = &text[offset..];
+        let prev_alnum = offset > 0 && text.as_bytes()[offset - 1].is_ascii_alphanumeric();
         let low = rest.to_ascii_lowercase();
-        if let Some((key_len, val_delim)) = match_kv_prefix(&low) {
+        if let Some((key_name, key_len, val_delim)) = match_kv_prefix(&low, prev_alnum) {
             let after_eq = &rest[key_len..];
-            // Strip optional whitespace after `=` or `:` before quoted value.
+            // Strip optional whitespace after `=` or `:` before value.
             let trim_ws = after_eq.len() - after_eq.trim_start_matches([' ', '\t']).len();
             let v_start = &after_eq[trim_ws..];
             if let Some(q) = v_start.chars().next().filter(|&c| c == '"' || c == '\'') {
@@ -1241,35 +1243,60 @@ fn scrub_kv_and_json_secrets(text: &str, mask: &str) -> String {
                 }
                 if end < inner.len() {
                     out.push(q);
-                    rest = &inner[end + 1..];
+                    offset += key_len + trim_ws + 1 + end + 1;
                 } else {
-                    rest = "";
+                    offset = text.len();
                 }
                 continue;
             }
-            let end = after_eq
+            let mut end = v_start
                 .find(|c: char| c.is_whitespace() || matches!(c, '&' | ',' | ';' | '"' | '\'' | ')' | '}' | ']' | '|'))
-                .unwrap_or(after_eq.len());
-            out.push_str(&rest[..key_len]);
-            let val = &after_eq[..end];
-            if !val.is_empty() && !matches!(val, "null" | "true" | "false" | "none") && val != mask && val != "•••"
+                .unwrap_or(v_start.len());
+            let first = &v_start[..end];
+            if key_name == "authorization" && val_delim == ':' {
+                if first.eq_ignore_ascii_case("bearer") || first.eq_ignore_ascii_case("basic") {
+                    // Leave scheme word intact so `scrub_token_words` scrubs the following token.
+                    out.push_str(&rest[..key_len + trim_ws + end]);
+                    offset += key_len + trim_ws + end;
+                    continue;
+                }
+                // Handle custom auth schemes such as `Authorization: CustomScheme rawkey123`.
+                let rem = &v_start[end..];
+                let ws2 = rem.len() - rem.trim_start_matches([' ', '\t']).len();
+                if ws2 > 0 {
+                    let after_ws2 = &rem[ws2..];
+                    let end2 = after_ws2
+                        .find(|c: char| {
+                            c.is_whitespace() || matches!(c, '&' | ',' | ';' | '"' | '\'' | ')' | '}' | ']' | '|')
+                        })
+                        .unwrap_or(after_ws2.len());
+                    if end2 > 0 {
+                        end += ws2 + end2;
+                    }
+                }
+            }
+            out.push_str(&rest[..key_len + trim_ws]);
+            let val = &v_start[..end];
+            if !val.is_empty()
+                && !matches!(val.to_ascii_lowercase().as_str(), "null" | "true" | "false" | "none")
+                && val != mask
+                && val != "•••"
             {
                 out.push_str(mask);
             } else if !val.is_empty() {
                 out.push_str(val);
             }
-            let _ = val_delim;
-            rest = &after_eq[end..];
+            offset += key_len + trim_ws + end;
             continue;
         }
         let ch = rest.chars().next().unwrap_or('\0');
         out.push(ch);
-        rest = &rest[ch.len_utf8()..];
+        offset += ch.len_utf8();
     }
     out
 }
 
-fn match_kv_prefix(lower: &str) -> Option<(usize, char)> {
+fn match_kv_prefix(lower: &str, prev_alnum: bool) -> Option<(&'static str, usize, char)> {
     const KEYS: &[&str] = &[
         "client_secret",
         "access_token",
@@ -1306,14 +1333,15 @@ fn match_kv_prefix(lower: &str) -> Option<(usize, char)> {
             if after_q2[ws..].starts_with(':') {
                 let total = 1 + k.len() + 1 + ws + 1;
                 let ws2 = lower[total..].len() - lower[total..].trim_start_matches([' ', '\t']).len();
-                return Some((total + ws2, ':'));
+                return Some((k, total + ws2, ':'));
             }
         }
-        // Unquoted `key=` / `key:` (check boundary: word shouldn't be preceded? handled by scanner advancing on match; avoid matching suffix of unrelated word by checking if remaining starts cleanly - note the caller splits inside non-word loops when advancing char by char, Wait: let's guard non-identifier start via helper below if needed; here KEYS match cleanly).
-        if let Some(after_k) = lower.strip_prefix(k)
+        // Unquoted `key=` / `key:` on a non-alphanumeric left boundary (`obs_password=` is fine; `hotkey=` is not).
+        if !prev_alnum
+            && let Some(after_k) = lower.strip_prefix(k)
             && let Some(d) = after_k.chars().next().filter(|&c| c == '=' || c == ':')
         {
-            return Some((k.len() + 1, d));
+            return Some((k, k.len() + 1, d));
         }
     }
     None
@@ -1696,6 +1724,24 @@ mod tests {
         // Preserve non-secret timestamps, SemVer versions, and normal log text
         let safe = "2026-11-22T03:02:11Z INFO ferrocast 1.4.2 Apple M3 Max 48000 Hz";
         assert_eq!(redact_text(safe, &fixture_secrets, &fixture_users), safe);
+    }
+
+    #[test]
+    fn redacts_unquoted_kv_with_whitespace_after_separator() {
+        let cases: &[(&str, &[&str])] = &[
+            ("password: hunter2!", &["hunter2!"]),
+            ("token: my_short_tok", &["my_short_tok"]),
+            ("secret: s3cr3t", &["s3cr3t"]),
+            ("key=   spacedSecret99", &["spacedSecret99"]),
+            ("Authorization: CustomScheme rawkey123", &["rawkey123"]),
+        ];
+        for (raw, forbidden) in cases {
+            let red = redact_text(raw, &[], &[]);
+            for secret in *forbidden {
+                assert!(!red.contains(secret), "secret {secret:?} survived in {red:?} from {raw:?}");
+            }
+        }
+        assert_eq!(redact_text("hotkey=Ctrl+P bypass=true", &[], &[]), "hotkey=Ctrl+P bypass=true");
     }
 
     #[test]
