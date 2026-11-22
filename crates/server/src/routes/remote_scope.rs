@@ -84,10 +84,12 @@ pub const OWNER_DENIED: &[Rule] = &[
     // there or start and stop it.
     ("*", "/studio/engine"),
     ("*", "/studio/engine/**"),
-    // Accounts and sign-ins, and pairing more browsers.
+    // Accounts and sign-ins, and pairing more browsers or managing local API keys.
     ("*", "/accounts"),
     ("*", "/accounts/**"),
     ("*", "/session/**"),
+    ("*", "/api-keys"),
+    ("*", "/api-keys/**"),
     // Pro and billing (including pairing more phones and the cloud backups' key).
     ("*", "/pro"),
     ("*", "/pro/**"),
@@ -220,6 +222,465 @@ pub fn live_frame_allowed(role: Role, frame: &str) -> bool {
         "notice" => v.pointer("/data/key").and_then(|k| k.as_str()) == Some("panic"),
         t => MOD_FRAMES.contains(&t),
     }
+}
+
+/// Endpoints that local API keys may NEVER access, regardless of which scopes are granted.
+pub const KEY_NEVER_ALLOWED: &[Rule] = &[
+    // Managing other API keys or browser/phone pairing sessions.
+    ("*", "/api-keys"),
+    ("*", "/api-keys/**"),
+    ("*", "/session"),
+    ("*", "/session/**"),
+    // Connected platform accounts & Ferrocast account / billing / remote tunnel / cloud services.
+    ("*", "/accounts"),
+    ("*", "/accounts/**"),
+    ("*", "/pro"),
+    ("*", "/pro/**"),
+    // Secrets & external webhooks/passwords/tips configuration.
+    ("*", "/tips"),
+    ("*", "/tips/**"),
+    ("*", "/discord"),
+    ("*", "/discord/**"),
+    ("PUT", "/obs"),
+    ("*", "/obs/detect"),
+    // Diagnostics exports & bundles.
+    ("*", "/diagnostics"),
+    ("*", "/diagnostics/**"),
+    // Plugin catalog, install, toggle, actions, removal.
+    ("*", "/plugins"),
+    ("*", "/plugins/**"),
+    // Arbitrary pack exports, third-party imports, backup restores, updates, uploads.
+    ("*", "/export"),
+    ("*", "/import"),
+    ("*", "/import/**"),
+    ("*", "/designs/import"),
+    ("*", "/designs/*/export"),
+    ("*", "/backups/*/restore"),
+    ("POST", "/media"),
+    ("*", "/updates/*"),
+    // Go live ingest stream keys, creating/deleting destinations, SSRF probes, LAN interfaces.
+    ("*", "/golive/ingest"),
+    ("POST", "/golive/destinations"),
+    ("DELETE", "/golive/destinations/*"),
+    ("*", "/golive/test"),
+    ("*", "/golive/networks"),
+    ("POST", "/golive/new-key"),
+    // Studio remote-control password, guest invite tokens, local filesystem/log/restart/capture paths.
+    ("*", "/studio/remote-control"),
+    ("*", "/studio/remote-control/**"),
+    ("*", "/studio/guests"),
+    ("*", "/studio/guests/**"),
+    ("*", "/studio/engine/log"),
+    ("*", "/studio/engine/log/**"),
+    ("*", "/studio/engine/pick-file"),
+    ("*", "/studio/engine/web-window"),
+    ("*", "/studio/engine/restart"),
+    ("*", "/studio/engine/missing-files"),
+    ("*", "/studio/engine/missing-files/**"),
+    ("*", "/studio/engine/obs-collections"),
+    ("*", "/studio/engine/obs-collections/**"),
+    ("*", "/studio/engine/streamlabs-collections"),
+    ("*", "/studio/engine/streamlabs-collections/**"),
+    ("*", "/studio/engine/library/*/import"),
+    ("*", "/studio/engine/library/*/export"),
+    ("*", "/studio/engine/library/*/*/export"),
+    ("*", "/studio/engine/library/collections/overlay/**"),
+    ("*", "/studio/engine/screen-access/fix"),
+    ("*", "/studio/engine/remux"),
+    ("*", "/studio/engine/keys/capture"),
+    ("POST", "/speech/models/*"),
+    ("DELETE", "/speech/models/*"),
+];
+
+const KEY_COMMON_READ: &[Rule] = &[("GET", "/status"), ("GET", "/openapi.json"), ("GET", "/asyncapi.json")];
+
+pub const READ_ONLY_ALLOWED: &[Rule] = &[
+    ("GET", "/live"),
+    ("GET", "/themes"),
+    ("GET", "/updates"),
+    ("GET", "/stats/session"),
+    ("GET", "/recap"),
+    ("GET", "/recap/summary"),
+    ("GET", "/credits"),
+    ("GET", "/insights/supporters"),
+    ("GET", "/overlays"),
+    ("GET", "/overlays/*"),
+    ("GET", "/designs"),
+    ("GET", "/designs/active-alert"),
+    ("GET", "/designs/*"),
+    ("GET", "/designs/*/obs"),
+    ("GET", "/alert-rules"),
+    ("GET", "/queue"),
+    ("GET", "/events"),
+    ("GET", "/events/*/why"),
+    ("GET", "/goals"),
+    ("GET", "/chat"),
+    ("GET", "/chat/highlight"),
+    ("GET", "/mod/bans"),
+    ("GET", "/mod/panic"),
+    ("GET", "/mod/panic/config"),
+    ("GET", "/mod/held"),
+    ("GET", "/mod/filters"),
+    ("GET", "/viewers/*/*"),
+    ("GET", "/viewers/*/*/note"),
+    ("GET", "/commands"),
+    ("GET", "/timers"),
+    ("GET", "/autoreplies"),
+    ("GET", "/autoreplies/starters"),
+    ("GET", "/loyalty"),
+    ("GET", "/loyalty/leaderboard"),
+    ("GET", "/loyalty/viewers/*/*"),
+    ("GET", "/polls/current"),
+    ("GET", "/giveaways/current"),
+    ("GET", "/welcome"),
+    ("GET", "/tts"),
+    ("GET", "/tts/pending"),
+    ("GET", "/tts/voices"),
+    ("GET", "/tts/cloud"),
+    ("GET", "/media"),
+    ("GET", "/media/*"),
+    ("GET", "/music"),
+    ("GET", "/obs"),
+    ("GET", "/obs/theme"),
+    ("GET", "/obs/scenes"),
+    ("GET", "/obs/inputs"),
+    ("GET", "/obs/stream"),
+    ("GET", "/obs/health"),
+    ("GET", "/obs/switcher"),
+    ("GET", "/golive"),
+    ("GET", "/golive/picture"),
+    ("GET", "/studio/engine"),
+    ("GET", "/studio/engine/**"),
+    ("GET", "/speech/models"),
+    ("GET", "/transcript"),
+    ("GET", "/counters"),
+    ("GET", "/quotes"),
+    ("GET", "/modules"),
+    ("GET", "/stream-info"),
+    ("GET", "/stream-info/categories"),
+    ("GET", "/stream-info/categories/as"),
+    ("GET", "/show"),
+    ("GET", "/show/config"),
+    ("GET", "/show/preflight"),
+    ("GET", "/show/alerts"),
+    ("GET", "/moments/config"),
+    ("GET", "/moments/lane"),
+    ("GET", "/moments/markers"),
+    ("GET", "/moments/markers/export"),
+    ("GET", "/automations"),
+    ("GET", "/settings"),
+    ("GET", "/backups"),
+];
+
+pub const CHAT_ALLOWED: &[Rule] = &[
+    ("GET", "/live"),
+    ("GET", "/chat"),
+    ("POST", "/chat/send"),
+    ("GET", "/chat/highlight"),
+    ("POST", "/chat/highlight"),
+    ("DELETE", "/chat/highlight"),
+    ("POST", "/mod/delete"),
+    ("POST", "/mod/timeout"),
+    ("POST", "/mod/ban"),
+    ("POST", "/mod/unban"),
+    ("GET", "/mod/bans"),
+    ("GET", "/mod/panic"),
+    ("POST", "/mod/panic"),
+    ("GET", "/mod/panic/config"),
+    ("PUT", "/mod/panic/config"),
+    ("GET", "/mod/held"),
+    ("POST", "/mod/held/*/release"),
+    ("POST", "/mod/held/*/drop"),
+    ("GET", "/mod/filters"),
+    ("PUT", "/mod/filters"),
+    ("GET", "/viewers/*/*"),
+    ("GET", "/viewers/*/*/note"),
+    ("PUT", "/viewers/*/*/note"),
+    ("GET", "/commands"),
+    ("POST", "/commands"),
+    ("POST", "/commands/starter"),
+    ("PUT", "/commands/*"),
+    ("DELETE", "/commands/*"),
+    ("GET", "/timers"),
+    ("POST", "/timers"),
+    ("PUT", "/timers/*"),
+    ("DELETE", "/timers/*"),
+    ("GET", "/autoreplies"),
+    ("POST", "/autoreplies"),
+    ("PUT", "/autoreplies/order"),
+    ("POST", "/autoreplies/try"),
+    ("GET", "/autoreplies/starters"),
+    ("PUT", "/autoreplies/*"),
+    ("DELETE", "/autoreplies/*"),
+    ("GET", "/loyalty"),
+    ("PUT", "/loyalty"),
+    ("GET", "/loyalty/leaderboard"),
+    ("GET", "/loyalty/viewers/*/*"),
+    ("POST", "/loyalty/viewers/*/*/adjust"),
+    ("POST", "/polls"),
+    ("GET", "/polls/current"),
+    ("DELETE", "/polls/current"),
+    ("POST", "/polls/current/end"),
+    ("POST", "/giveaways"),
+    ("GET", "/giveaways/current"),
+    ("DELETE", "/giveaways/current"),
+    ("POST", "/giveaways/current/*"),
+    ("GET", "/welcome"),
+    ("PUT", "/welcome"),
+    ("GET", "/tts"),
+    ("PUT", "/tts"),
+    ("GET", "/tts/pending"),
+    ("GET", "/tts/voices"),
+    ("GET", "/tts/cloud"),
+    ("PUT", "/tts/cloud"),
+    ("POST", "/tts/preview"),
+    ("POST", "/tts/*/approve"),
+    ("POST", "/tts/*/reject"),
+    ("GET", "/counters"),
+    ("POST", "/counters"),
+    ("PUT", "/counters/*"),
+    ("DELETE", "/counters/*"),
+    ("POST", "/counters/*/change"),
+    ("GET", "/quotes"),
+    ("POST", "/quotes"),
+    ("PUT", "/quotes/*"),
+    ("DELETE", "/quotes/*"),
+    ("GET", "/modules"),
+    ("PUT", "/modules"),
+];
+
+pub const ALERTS_ALLOWED: &[Rule] = &[
+    ("GET", "/live"),
+    ("GET", "/overlays"),
+    ("POST", "/overlays"),
+    ("GET", "/overlays/*"),
+    ("PUT", "/overlays/*"),
+    ("DELETE", "/overlays/*"),
+    ("POST", "/overlays/*/regenerate-url"),
+    ("POST", "/overlays/*/add-to-obs"),
+    ("POST", "/overlays/*/follow-design"),
+    ("GET", "/designs"),
+    ("POST", "/designs"),
+    ("GET", "/designs/active-alert"),
+    ("PUT", "/designs/active-alert"),
+    ("GET", "/designs/*"),
+    ("PUT", "/designs/*"),
+    ("DELETE", "/designs/*"),
+    ("POST", "/designs/*/duplicate"),
+    ("POST", "/designs/*/use"),
+    ("GET", "/alert-rules"),
+    ("POST", "/alert-rules"),
+    ("PUT", "/alert-rules/*"),
+    ("DELETE", "/alert-rules/*"),
+    ("POST", "/test"),
+    ("GET", "/queue"),
+    ("POST", "/queue/*"),
+    ("POST", "/queue/*/remove"),
+    ("GET", "/events"),
+    ("POST", "/events/*/replay"),
+    ("GET", "/events/*/why"),
+    ("GET", "/goals"),
+    ("POST", "/goals"),
+    ("PUT", "/goals/*"),
+    ("DELETE", "/goals/*"),
+    ("POST", "/goals/*/adjust"),
+    ("GET", "/media"),
+    ("GET", "/media/*"),
+    ("DELETE", "/media/*"),
+];
+
+pub const STUDIO_CONTROL_ALLOWED: &[Rule] = &[
+    ("GET", "/live"),
+    ("GET", "/studio/engine"),
+    ("*", "/studio/engine/**"),
+    ("GET", "/obs"),
+    ("GET", "/obs/theme"),
+    ("DELETE", "/obs/theme"),
+    ("GET", "/designs/*/obs"),
+    ("POST", "/designs/*/obs"),
+    ("GET", "/obs/scenes"),
+    ("GET", "/obs/inputs"),
+    ("POST", "/obs/scene"),
+    ("POST", "/obs/source"),
+    ("POST", "/obs/input/mute"),
+    ("POST", "/obs/replay/save"),
+    ("POST", "/obs/brb"),
+    ("GET", "/obs/stream"),
+    ("POST", "/obs/stream"),
+    ("GET", "/obs/health"),
+    ("POST", "/obs/health"),
+    ("GET", "/music"),
+    ("PUT", "/music"),
+    ("GET", "/moments/config"),
+    ("PUT", "/moments/config"),
+    ("GET", "/moments/lane"),
+    ("POST", "/moments/lane/dismiss-all"),
+    ("POST", "/moments/lane/*/dismiss"),
+    ("GET", "/moments/markers"),
+    ("POST", "/moments/markers"),
+    ("GET", "/moments/markers/export"),
+    ("DELETE", "/moments/markers/*"),
+    ("GET", "/automations"),
+    ("PUT", "/automations"),
+    ("POST", "/automations/*/run"),
+    ("GET", "/show"),
+    ("GET", "/show/preflight"),
+    ("GET", "/show/alerts"),
+    ("POST", "/show/live-scene"),
+    ("POST", "/show/countdown/*"),
+    ("POST", "/show/preflight/fix"),
+];
+
+pub const GO_LIVE_ALLOWED: &[Rule] = &[
+    ("GET", "/live"),
+    ("GET", "/golive"),
+    ("PUT", "/golive/destinations"),
+    ("POST", "/golive/destinations/*/test"),
+    ("PUT", "/golive/destinations/*/light"),
+    ("PUT", "/golive/destinations/*/enhanced"),
+    ("POST", "/golive/obs/setup"),
+    ("POST", "/golive/obs/restore"),
+    ("POST", "/golive/upload-check"),
+    ("PUT", "/golive/protection"),
+    ("PUT", "/golive/aitum"),
+    ("PUT", "/golive/auto-quality"),
+    ("POST", "/golive/vertical/obs/setup"),
+    ("POST", "/golive/vertical/obs/restore"),
+    ("PUT", "/golive/vertical/source"),
+    ("PUT", "/golive/vertical/cut"),
+    ("GET", "/golive/picture"),
+    ("POST", "/golive/ffmpeg"),
+    ("PUT", "/golive/advanced"),
+    ("POST", "/golive/resume/*"),
+    ("GET", "/stream-info"),
+    ("POST", "/stream-info/apply"),
+    ("GET", "/stream-info/categories"),
+    ("GET", "/stream-info/categories/as"),
+    ("POST", "/stream-info/presets"),
+    ("PUT", "/stream-info/presets/*"),
+    ("DELETE", "/stream-info/presets/*"),
+    ("GET", "/show"),
+    ("GET", "/show/config"),
+    ("PUT", "/show/config"),
+    ("GET", "/show/preflight"),
+    ("GET", "/show/alerts"),
+    ("POST", "/show/preflight/fix"),
+    ("POST", "/show/start"),
+    ("POST", "/show/countdown/*"),
+    ("POST", "/show/live-scene"),
+    ("POST", "/show/end"),
+    ("GET", "/obs/stream"),
+    ("POST", "/obs/stream"),
+    ("GET", "/obs/health"),
+    ("POST", "/obs/health"),
+];
+
+pub const SETTINGS_ALLOWED: &[Rule] = &[
+    ("GET", "/settings"),
+    ("PUT", "/settings"),
+    ("GET", "/themes"),
+    ("GET", "/updates"),
+    ("POST", "/setup/complete"),
+    ("GET", "/backups"),
+    ("POST", "/backups"),
+    ("GET", "/obs/switcher"),
+    ("PUT", "/obs/switcher"),
+];
+
+fn scope_rules(scope: ferrocast_core::api_keys::ApiKeyScope) -> &'static [Rule] {
+    use ferrocast_core::api_keys::ApiKeyScope;
+    match scope {
+        ApiKeyScope::ReadOnly => READ_ONLY_ALLOWED,
+        ApiKeyScope::Chat => CHAT_ALLOWED,
+        ApiKeyScope::Alerts => ALERTS_ALLOWED,
+        ApiKeyScope::StudioControl => STUDIO_CONTROL_ALLOWED,
+        ApiKeyScope::GoLive => GO_LIVE_ALLOWED,
+        ApiKeyScope::Settings => SETTINGS_ALLOWED,
+    }
+}
+
+/// Whether an API key holding `scopes` may call `method path` (relative to `/api/v1`, no query).
+/// Uses the same rule/segment matcher as remote device roles and enforces [`KEY_NEVER_ALLOWED`].
+pub fn api_key_allowed(scopes: &[ferrocast_core::api_keys::ApiKeyScope], method: &str, path: &str) -> bool {
+    if scopes.is_empty() {
+        return false;
+    }
+    let Some(segs) = segments(path) else { return false };
+    if !matches!(method, "GET" | "POST" | "PUT" | "DELETE") {
+        return false;
+    }
+    if KEY_NEVER_ALLOWED.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs)) {
+        return false;
+    }
+    if KEY_COMMON_READ.iter().any(|(m, p)| method_is(m, method) && matches(p, &segs)) {
+        return true;
+    }
+    scopes.iter().any(|s| scope_rules(*s).iter().any(|(m, p)| method_is(m, method) && matches(p, &segs)))
+}
+
+/// Whether a live WebSocket frame may be delivered to an API key with `scopes`.
+pub fn api_key_live_frame_allowed(scopes: &[ferrocast_core::api_keys::ApiKeyScope], frame: &str) -> bool {
+    use ferrocast_core::api_keys::ApiKeyScope;
+    if scopes.is_empty() || !scopes.iter().any(|s| *s != ApiKeyScope::Settings) {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(frame) else { return false };
+    let ty = v["type"].as_str().unwrap_or("");
+    if ty == "account" {
+        return false;
+    }
+    let has = |s: ApiKeyScope| scopes.contains(&s);
+    match ty {
+        "hello" | "resync" | "status" => true,
+        "event" => {
+            let kind = v.pointer("/data/kind/type").and_then(|t| t.as_str()).unwrap_or("");
+            if has(ApiKeyScope::ReadOnly) {
+                return true;
+            }
+            if MOD_EVENT_KINDS.contains(&kind) { has(ApiKeyScope::Chat) } else { has(ApiKeyScope::Alerts) }
+        }
+        "chat_highlight" | "held" | "held_resolved" | "panic" | "chatter" | "poll" | "giveaway" | "smart_mod" => {
+            has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Chat)
+        }
+        "tts_pending" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Chat) || has(ApiKeyScope::Alerts),
+        "queue" | "goals" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Alerts),
+        "golive" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::GoLive) || has(ApiKeyScope::StudioControl),
+        "brb" | "obs_health" | "live_alert" | "lane" | "marker" | "show" => {
+            has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::StudioControl) || has(ApiKeyScope::GoLive)
+        }
+        "counter" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Chat) || has(ApiKeyScope::StudioControl),
+        "notice" => {
+            let key = v.pointer("/data/key").and_then(|k| k.as_str()).unwrap_or("");
+            if key.starts_with("account:") {
+                false
+            } else if key == "panic" {
+                has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Chat)
+            } else {
+                has(ApiKeyScope::ReadOnly)
+                    || has(ApiKeyScope::Alerts)
+                    || has(ApiKeyScope::StudioControl)
+                    || has(ApiKeyScope::GoLive)
+            }
+        }
+        _ => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::StudioControl),
+    }
+}
+
+/// Normalizes a relative API path for redacted audit logs (never keeps query strings or rejected paths).
+#[must_use]
+pub fn audit_path(path: &str) -> String {
+    let clean = path.split('?').next().unwrap_or(path);
+    let Some(segs) = segments(clean) else {
+        return "/(refused)".to_string();
+    };
+    let normalized: Vec<&str> = segs
+        .iter()
+        .map(|s| {
+            let plain = s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'.');
+            if plain { *s } else { "{id}" }
+        })
+        .collect();
+    format!("/{}", normalized.join("/"))
 }
 
 #[cfg(test)]

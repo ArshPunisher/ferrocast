@@ -1866,6 +1866,7 @@ async fn diagnostics_routes_reject_non_loopback_peers_and_expose_content_disposi
         engine,
         sessions,
         guard: crate::auth::Guard { port: 47820, lan: true, dev_origins: vec!["http://localhost:5173".into()] },
+        api_limiter: crate::rate_limit::ApiKeyRateLimiter::default(),
     };
     let app = crate::router(state);
     let lan_peer: SocketAddr = "192.168.1.50:54321".parse().unwrap();

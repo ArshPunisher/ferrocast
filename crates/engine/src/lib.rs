@@ -9,6 +9,7 @@
 
 mod accounts;
 mod actions;
+pub mod api_keys;
 mod backups;
 mod cloud_backup;
 mod cloud_bot;

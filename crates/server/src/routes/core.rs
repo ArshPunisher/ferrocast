@@ -387,10 +387,21 @@ pub async fn settings(State(app): State<AppState>) -> Json<Value> {
 
 /// Saves the fields that were sent and keeps the rest, so an older dashboard that doesn't
 /// know a setting can't reset it.
-pub async fn save_settings(State(app): State<AppState>, Body(patch): Body<Value>) -> ApiResult<Json<Value>> {
+pub async fn save_settings(
+    State(app): State<AppState>,
+    api_key: Option<axum::Extension<super::api_keys::ApiKeyPrincipal>>,
+    Body(patch): Body<Value>,
+) -> ApiResult<Json<Value>> {
     let Some(patch) = patch.as_object() else {
         return Err(ApiError::invalid("Settings must be an object."));
     };
+    if api_key.is_some()
+        && let Some(want_lan) = patch.get("lan_access")
+        && json!(app.engine.settings()).get("lan_access") != Some(want_lan)
+    {
+        return Err(ApiError::forbidden("Local API keys can't change LAN access settings.")
+            .hint("Change Allow other devices in Settings on this PC."));
+    }
     Ok(Json(json!(app.engine.patch_settings(patch).await?)))
 }
 

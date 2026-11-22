@@ -39,17 +39,55 @@ fn query_value(raw: Option<&str>, key: &str) -> Option<String> {
 }
 
 /// `GET /api/v1/live?session=…&since=…` (`since`: the last `event` seq the dashboard saw;
-/// missed events are replayed first, R11).
-pub async fn live(State(app): State<AppState>, RawQuery(raw): RawQuery, ws: WebSocketUpgrade) -> Response {
-    let ok = query_value(raw.as_deref(), "session").is_some_and(|t| app.sessions.valid(&t));
-    if !ok {
-        return ApiError::unauthorized().into_response();
-    }
+/// missed events are replayed first, R11). Accepts dashboard pairing tokens (`?session=`) or
+/// scoped local API keys (`Authorization: Bearer fc_key_...` or `?key=fc_key_...`).
+pub async fn live(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+    RawQuery(raw): RawQuery,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let bearer = crate::auth::bearer(&headers).map(str::to_string);
+    let query_token = query_value(raw.as_deref(), "key").or_else(|| query_value(raw.as_deref(), "session"));
+    let token = bearer.or(query_token);
+    let key_scopes = match token.as_deref() {
+        Some(tok) if ferrocast_core::api_keys::has_api_key_prefix(tok) => {
+            let Ok(ferrocast_engine::api_keys::ApiKeyAuth::Valid(summary)) = app.engine.authenticate_api_key(tok).await
+            else {
+                return ApiError::new(
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Invalid, revoked, or expired API key.",
+                )
+                .into_response();
+            };
+            match app.api_limiter.check(&summary.id) {
+                crate::rate_limit::RateDecision::Allowed { .. } => {}
+                crate::rate_limit::RateDecision::Exceeded { retry_after_secs, .. } => {
+                    app.engine.record_api_key_usage(&summary.id, &summary.name, "GET", "/live", 429).await;
+                    return ApiError::too_many(retry_after_secs).into_response();
+                }
+            }
+            if !crate::routes::remote_scope::api_key_allowed(&summary.scopes, "GET", "/live") {
+                app.engine.record_api_key_usage(&summary.id, &summary.name, "GET", "/live", 403).await;
+                return ApiError::forbidden("This API key doesn't have permission for GET /live.").into_response();
+            }
+            app.engine.record_api_key_usage(&summary.id, &summary.name, "GET", "/live", 101).await;
+            Some(summary.scopes)
+        }
+        Some(tok) if app.sessions.valid(tok) => None,
+        _ => return ApiError::unauthorized().into_response(),
+    };
     let since = query_value(raw.as_deref(), "since").and_then(|s| s.parse::<u64>().ok());
-    ws.max_message_size(MAX_INBOUND).on_upgrade(move |socket| live_loop(app, socket, since))
+    ws.max_message_size(MAX_INBOUND).on_upgrade(move |socket| live_loop(app, socket, since, key_scopes))
 }
 
-async fn live_loop(app: AppState, socket: WebSocket, since: Option<u64>) {
+async fn live_loop(
+    app: AppState,
+    socket: WebSocket,
+    since: Option<u64>,
+    key_scopes: Option<Vec<ferrocast_core::api_keys::ApiKeyScope>>,
+) {
     let (mut tx, mut rx) = socket.split();
     // Subscribe before replaying, so nothing falls in the gap; the dashboard drops
     // duplicate event ids.
@@ -71,7 +109,15 @@ async fn live_loop(app: AppState, socket: WebSocket, since: Option<u64>) {
         }
         hello.extend(missed);
     }
+    let frame_allowed = |f: &LiveFrame| {
+        key_scopes
+            .as_deref()
+            .is_none_or(|scopes| crate::routes::remote_scope::api_key_live_frame_allowed(scopes, &f.text))
+    };
     for f in hello {
+        if !frame_allowed(&f) {
+            continue;
+        }
         if tx.send(Message::Text(Utf8Bytes::from(f.text.as_ref()))).await.is_err() {
             return;
         }
@@ -84,6 +130,9 @@ async fn live_loop(app: AppState, socket: WebSocket, since: Option<u64>) {
             },
             frame = frames.recv() => match frame {
                 Ok(f) => {
+                    if !frame_allowed(&f) {
+                        continue;
+                    }
                     if tx.send(Message::Text(Utf8Bytes::from(f.text.as_ref()))).await.is_err() {
                         return;
                     }
