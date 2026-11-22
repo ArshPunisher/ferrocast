@@ -3216,6 +3216,10 @@ pub(crate) fn failed(message: String) -> EngineError {
     if message.starts_with("There's no source") {
         return refused(404, "studio_no_source", message, "Refresh the list of sources.");
     }
+    // Several boxes at once: a group and one of its own sources can't be in one request.
+    if message.contains("can't be moved together") {
+        return EngineError::Invalid(message);
+    }
     if message.starts_with("There's no scene called") {
         return refused(404, "studio_no_scene", message, "Refresh the list of scenes.");
     }
@@ -4100,6 +4104,12 @@ mod tests {
     /// The preview's holes: the box round several picked sources alone is a dozen, with a few
     /// guide lines and a menu that is more than the old 16 (Neon: the app answered 400 and kept
     /// painting the old holes).
+    #[test]
+    fn a_group_with_its_own_source_in_one_batch_is_a_400() {
+        let e = failed("a group and a source inside it can't be moved together.".into());
+        assert!(matches!(&e, EngineError::Invalid(m) if m.contains("together")), "{e:?}");
+    }
+
     #[test]
     fn the_preview_takes_enough_holes_for_the_edit_guides() {
         let rect = |n: usize| PreviewRect {

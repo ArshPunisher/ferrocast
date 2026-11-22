@@ -1831,6 +1831,14 @@ impl Stage {
         for (id, ..) in boxes {
             self.item(scene, *id)?;
         }
+        // A group with one of its own sources: moving the source fits the group again, and the
+        // group's box then lands on the changed group (the source moves twice). Asked for one at
+        // a time, not both.
+        let asked: std::collections::HashSet<i64> = boxes.iter().map(|b| b.0).collect();
+        if self.items(scene)?.iter().any(|g| asked.contains(&g.id) && g.children.iter().any(|c| asked.contains(&c.id)))
+        {
+            return Err(fail("a group and a source inside it can't be moved together.".to_string()));
+        }
         let before = self.snapshot();
         for &(id, x, y, w, h) in boxes {
             if let Err(e) = self.set_item_box(scene, id, x, y, w, h) {
@@ -6566,6 +6574,33 @@ mod tests {
 
     /// Several items moved and sized at once (align, distribute, a group moved or resized): all
     /// of them or none, so one step can be undone whole.
+    /// A group and a source inside it can't be asked for together: moving the source fits the
+    /// group again, so the group's own box would then be applied to the changed group and move
+    /// the source a second time (Neon #4).
+    #[test]
+    fn a_group_and_its_own_source_are_never_moved_in_one_batch() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 100, "height": 100 }), false));
+        let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        let before = s.snapshot();
+        let gb = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap_or_else(|| panic!("the group"));
+        let kid = gb.children[0].clone();
+        for order in [[0, 1], [1, 0]] {
+            let asks = [
+                (g.id, gb.frame[4] + 100.0, gb.frame[5], gb.frame[0], gb.frame[3]),
+                (kid.id, kid.frame[4] + 100.0, kid.frame[5], kid.frame[0], kid.frame[3]),
+            ];
+            let asks = [asks[order[0]], asks[order[1]]];
+            let err = s.set_item_boxes("Main", &asks).unwrap_err().to_string();
+            assert!(err.contains("together"), "{err}");
+            assert_eq!(s.snapshot(), before, "nothing moved");
+        }
+        // Each alone is fine, and two sources of the group are too.
+        ok(s.set_item_boxes("Main", &[(g.id, gb.frame[4] + 10.0, gb.frame[5], gb.frame[0], gb.frame[3])]));
+        ok(s.set_item_boxes("Main", &[(kid.id, kid.frame[4], kid.frame[5], kid.frame[0], kid.frame[3])]));
+    }
+
     #[test]
     fn several_items_are_moved_together_or_not_at_all() {
         let s = stage();
