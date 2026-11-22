@@ -340,6 +340,8 @@ pub(crate) struct Encoder {
     cost: Box<super::vt_cost::Cost>,
     /// Whether drops also increment global `crate::video::DROPPED`.
     record_global_drops: bool,
+    /// When true (bounded benchmark mode), `encode_once_inner` blocks until VT completes each frame.
+    sync_per_frame: bool,
 }
 
 #[link(name = "IOSurface", kind = "framework")]
@@ -460,14 +462,18 @@ fn fail(what: &str, status: OSStatus) -> AvError {
 
 impl Encoder {
     pub(crate) fn new(cfg: &VideoConfig) -> Result<Self, AvError> {
-        Self::new_inner(cfg, true)
+        Self::new_inner(cfg, true, false)
     }
 
     pub(crate) fn new_for_benchmark(cfg: &VideoConfig) -> Result<Self, AvError> {
-        Self::new_inner(cfg, false)
+        Self::new_inner(cfg, false, false)
     }
 
-    fn new_inner(cfg: &VideoConfig, record_global_drops: bool) -> Result<Self, AvError> {
+    pub(crate) fn new_for_benchmark_sync(cfg: &VideoConfig) -> Result<Self, AvError> {
+        Self::new_inner(cfg, false, true)
+    }
+
+    fn new_inner(cfg: &VideoConfig, record_global_drops: bool, sync_per_frame: bool) -> Result<Self, AvError> {
         let none = || AvError::Encoder("out of memory setting up the video encoder".into());
         let attrs = Dict::new().ok_or_else(none)?;
         let fmt = int(if cfg.input == PixelFormat::Bgra { BGRA } else { NV12 }).ok_or_else(none)?;
@@ -588,6 +594,7 @@ impl Encoder {
             next_seq: 1,
             cost: Box::new(super::vt_cost::Cost::new()),
             record_global_drops,
+            sync_per_frame,
         })
     }
 
@@ -655,7 +662,7 @@ impl Encoder {
                 // The system took the session back: a new one, and this frame goes in as a
                 // keyframe so the stream picks up at once. One try: a second loss is a real fault.
                 tracing::warn!(error = %first, "the Mac's video encoder session was lost; making a new one");
-                let mut fresh = Self::new_inner(&self.cfg, self.record_global_drops)?;
+                let mut fresh = Self::new_inner(&self.cfg, self.record_global_drops, self.sync_per_frame)?;
                 set_rate(&fresh.session, self.rate_now.0, self.rate_now.1)?;
                 fresh.rate_now = self.rate_now;
                 // Kept to see whether the new session's parameter sets differ from what the
@@ -806,6 +813,14 @@ impl Encoder {
             }
             self.lost = recoverable(s);
             return Err(fail("encode a frame", s));
+        }
+        if self.sync_per_frame {
+            // SAFETY: the session is live; completing with `CMTime::invalid()` blocks until the
+            // just-submitted frame completes encoding and fires `output()` in synchronous benchmark mode.
+            let cs = unsafe { VTCompressionSessionCompleteFrames(self.session.0, CMTime::invalid()) };
+            if cs != 0 && !recoverable(cs) && !self.session_gone() {
+                return Err(fail("complete frame", cs));
+            }
         }
         self.take()
     }

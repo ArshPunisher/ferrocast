@@ -251,8 +251,8 @@ impl Default for BenchTiming {
         Self {
             total_encode_budget: Duration::from_secs(20),
             step_duration: Duration::from_millis(1800),
-            burst_frames: 24,
-            warmup_frames: 5,
+            burst_frames: 45,
+            warmup_frames: 10,
             confirm_timeout: CONFIRM_TIMEOUT,
             watch_window: WATCH_WINDOW,
             poll_interval: Duration::from_millis(500),
@@ -1130,6 +1130,53 @@ enum StepAbort {
     Failed(String),
 }
 
+fn run_phase1_encode_loop<T, FEncode, FFlush>(
+    state: &mut T,
+    cand_label: &str,
+    total_burst: u32,
+    warmup_frames: u32,
+    cancel: &AtomicBool,
+    mut encode_fn: FEncode,
+    mut flush_fn: FFlush,
+) -> Result<(Vec<f64>, f64), StepAbort>
+where
+    FEncode: FnMut(&mut T, u32) -> Result<(), String>,
+    FFlush: FnMut(&mut T),
+{
+    let mut frame_times_ms = Vec::with_capacity(total_burst as usize);
+    let mut steady_start = None;
+
+    for i in 0..total_burst {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(StepAbort::Cancelled);
+        }
+        if i == warmup_frames {
+            steady_start = Some(Instant::now());
+        }
+        let t0 = Instant::now();
+        if let Err(e) = encode_fn(state, i) {
+            if cancel.load(Ordering::Acquire) {
+                return Err(StepAbort::Cancelled);
+            }
+            return Err(StepAbort::Failed(format!("{cand_label} encode error: {e}")));
+        }
+        let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if i >= warmup_frames {
+            frame_times_ms.push(dt_ms);
+        }
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(StepAbort::Cancelled);
+    }
+    // Capture steady-window elapsed time BEFORE flushing/closing the encoder process so FFmpeg
+    // teardown or child exit waits never inflate per-frame benchmark latency (H2).
+    let steady_elapsed_ms = steady_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+    let steady_count = (total_burst.saturating_sub(warmup_frames)).max(1) as f64;
+    let throughput_avg_ms = (steady_elapsed_ms / steady_count).max(0.05);
+    flush_fn(state);
+    Ok((frame_times_ms, throughput_avg_ms))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_candidate_step(
     compositor: Option<&Compositor>,
@@ -1173,41 +1220,27 @@ fn run_candidate_step(
     };
 
     // Phase 1: Synchronous/backpressured throughput measurement to find true ms/frame.
-    let mut cap_enc = VideoEncoder::for_benchmark(cfg, cand.ffmpeg_name.as_deref(), Some(2), Some(cancel.clone()))
+    let mut cap_enc = VideoEncoder::for_benchmark(cfg, cand.ffmpeg_name.as_deref(), Some(1), Some(cancel.clone()))
         .map_err(|e| StepAbort::Failed(format!("{} failed to start: {e}", cand.label)))?;
     let total_burst = timing.burst_frames.max(timing.warmup_frames + 5);
-    let mut frame_times_ms = Vec::with_capacity(total_burst as usize);
-    let mut steady_start = None;
     let frame_us = 1_000_000i64 / i64::from(fps.max(1));
 
-    for i in 0..total_burst {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(StepAbort::Cancelled);
-        }
-        if i == timing.warmup_frames {
-            steady_start = Some(Instant::now());
-        }
-        let t0 = Instant::now();
-        let key = i % (fps.max(1) * 2) == 0;
-        if let Err(e) = cap_enc.encode(frames_data.frame(i as usize), i64::from(i) * frame_us, key) {
-            if cancel.load(Ordering::Acquire) {
-                return Err(StepAbort::Cancelled);
-            }
-            return Err(StepAbort::Failed(format!("{} encode error: {e}", cand.label)));
-        }
-        let dt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        if i >= timing.warmup_frames {
-            frame_times_ms.push(dt_ms);
-        }
-    }
-    if cancel.load(Ordering::Acquire) {
-        drop(cap_enc);
-        return Err(StepAbort::Cancelled);
-    }
-    let _ = cap_enc.flush();
-    let steady_elapsed_ms = steady_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
-    let steady_count = (total_burst - timing.warmup_frames).max(1) as f64;
-    let throughput_avg_ms = (steady_elapsed_ms / steady_count).max(0.05);
+    let (mut frame_times_ms, throughput_avg_ms) = run_phase1_encode_loop(
+        &mut cap_enc,
+        &cand.label,
+        total_burst,
+        timing.warmup_frames,
+        cancel,
+        |enc, i| {
+            let key = i % (fps.max(1) * 2) == 0;
+            enc.encode(frames_data.frame(i as usize), i64::from(i) * frame_us, key)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        },
+        |enc| {
+            let _ = enc.flush();
+        },
+    )?;
     drop(cap_enc);
 
     if cancel.load(Ordering::Relaxed) {
@@ -3385,5 +3418,29 @@ mod tests {
             load_json_with_backup::<StudioSettings>(&profile_path, |s| s.check().is_ok()).unwrap().value;
         assert_eq!(disk_after_kept.video_kbps, 6500);
         engine3.shutdown();
+    }
+
+    #[test]
+    fn h2_phase1_steady_timing_excludes_flush_teardown() {
+        let cancel = AtomicBool::new(false);
+        let mut dummy = ();
+        let (frame_times, avg_ms) = run_phase1_encode_loop(
+            &mut dummy,
+            "x264",
+            15,
+            5,
+            &cancel,
+            |_, _| {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(())
+            },
+            |_| {
+                // Simulate FFmpeg process teardown + stdin EOF flush latency (300 ms).
+                std::thread::sleep(Duration::from_millis(300));
+            },
+        )
+        .unwrap();
+        assert_eq!(frame_times.len(), 10);
+        assert!(avg_ms < 12.0, "Phase 1 throughput_avg_ms ({avg_ms:.2} ms) was polluted by post-loop flush/teardown!");
     }
 }
