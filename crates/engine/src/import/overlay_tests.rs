@@ -1205,3 +1205,25 @@ async fn a_show_that_starts_while_an_import_downloads_fonts_stops_the_import() {
     assert!(files_under(&dir.path().join("studio").join("packs")).is_empty(), "the copied media was removed");
     handle.abort();
 }
+
+// ---- Neon review M4: no half-made overlay source when the overlay wasn't made -----------------
+
+#[test]
+fn a_source_for_an_overlay_that_was_not_made_is_left_out_with_its_scene_item() {
+    let tmpl = json!({
+        "name": "P",
+        "sources": [
+            { "name": "Main", "id": "scene", "settings": { "items": [
+                { "id": 1, "name": "Title" }, { "id": 2, "name": "Main Overlay" } ] } },
+            { "name": "Title", "id": "text_ft2_source_v2", "settings": { "text": "hi" } },
+            { "name": "Main Overlay", "id": "ferrocast_web", "settings": { "url": "__FERRO_OVERLAY_URL__:0", "width": 1920 } }
+        ]
+    });
+    // create_overlays was off (or making it failed): nothing in the map.
+    let out = finalize_doc(&tmpl, &[], &BTreeMap::new());
+    let text = out.to_string();
+    assert!(!text.contains("__FERRO_OVERLAY_URL__"), "{text}");
+    let names: Vec<&str> = out["sources"].as_array().unwrap().iter().filter_map(|s| s["name"].as_str()).collect();
+    assert_eq!(names, vec!["Main", "Title"]);
+    assert_eq!(out["sources"][0]["settings"]["items"].as_array().unwrap().len(), 1);
+}

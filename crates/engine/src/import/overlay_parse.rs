@@ -1951,5 +1951,31 @@ pub fn finalize_doc(doc_template: &Value, asset_paths: &[String], overlay_urls: 
             other => other.clone(),
         }
     }
-    walk(doc_template, None, false, asset_paths, overlay_urls)
+    let mut out = walk(doc_template, None, false, asset_paths, overlay_urls);
+    drop_unmade_overlay_sources(&mut out);
+    out
+}
+
+/// A browser source whose overlay wasn't made (the option was off, or making it failed) would
+/// keep its placeholder as an address. It is left out, with its scene items.
+fn drop_unmade_overlay_sources(doc: &mut Value) {
+    let Some(list) = doc.get_mut("sources").and_then(Value::as_array_mut) else { return };
+    let unmade: BTreeSet<String> = list
+        .iter()
+        .filter(|s| {
+            s.pointer("/settings/url")
+                .and_then(Value::as_str)
+                .is_some_and(|u| u.starts_with(OVERLAY_PLACEHOLDER_PREFIX))
+        })
+        .filter_map(|s| s.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    if unmade.is_empty() {
+        return;
+    }
+    list.retain(|s| !s.get("name").and_then(Value::as_str).is_some_and(|n| unmade.contains(n)));
+    for s in list.iter_mut() {
+        if let Some(items) = s.pointer_mut("/settings/items").and_then(Value::as_array_mut) {
+            items.retain(|i| !i.get("name").and_then(Value::as_str).is_some_and(|n| unmade.contains(n)));
+        }
+    }
 }
