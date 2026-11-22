@@ -76,26 +76,28 @@ class ControllerTests(unittest.TestCase):
         key = "fc_key_" + "cd" * 32
         ctrl = controller.FerrocastController(self.base, key)
         ctrl.switch_scene("BRB")
-        muted = ctrl.set_mute("Mic")  # toggles False -> True
+        muted = ctrl.set_mute("Mic", True)
         self.assertTrue(muted)
+        # No guessing a toggle: the API doesn't say whether an input is muted.
+        with self.assertRaises(ValueError):
+            ctrl.set_mute("Mic", None)  # type: ignore[arg-type]
         marker = ctrl.add_marker("Clutch")
         self.assertEqual(marker["label"], "Clutch")
         ctrl.queue_action("skip")
         ctrl.test_alert("follow")
 
         self.assertEqual(MockHandler.recorded[0], ("POST", "/api/v1/obs/scene", f"Bearer {key}", {"scene": "BRB"}))
-        self.assertEqual(MockHandler.recorded[1][0:2], ("GET", "/api/v1/obs/inputs"))
         self.assertEqual(
-            MockHandler.recorded[2],
+            MockHandler.recorded[1],
             ("POST", "/api/v1/obs/input/mute", f"Bearer {key}", {"input": "Mic", "muted": True}),
         )
         self.assertEqual(
-            MockHandler.recorded[3],
+            MockHandler.recorded[2],
             ("POST", "/api/v1/moments/markers", f"Bearer {key}", {"label": "Clutch"}),
         )
-        self.assertEqual(MockHandler.recorded[4][0:2], ("POST", "/api/v1/queue/skip"))
+        self.assertEqual(MockHandler.recorded[3][0:2], ("POST", "/api/v1/queue/skip"))
         self.assertEqual(
-            MockHandler.recorded[5],
+            MockHandler.recorded[4],
             ("POST", "/api/v1/test", f"Bearer {key}", {"kind": "follow", "platform": "twitch"}),
         )
 

@@ -87,13 +87,11 @@ class FerrocastController:
     def switch_scene(self, scene: str) -> None:
         self.request("POST", "/obs/scene", {"scene": scene})
 
-    def set_mute(self, input_name: str, muted: bool | None = None) -> bool:
-        if muted is None:
-            _, inputs = self.request("GET", "/obs/inputs")
-            current = next((row for row in inputs if row.get("name") == input_name), None)
-            if current is None:
-                raise FerrocastApiError(404, "not_found", f"OBS input {input_name!r} was not found.")
-            muted = not bool(current.get("muted"))
+    def set_mute(self, input_name: str, muted: bool) -> bool:
+        """Mutes (True) or unmutes (False) an input. Ferrocast's API doesn't report an input's mute
+        state, so a toggle can't be worked out here: say which one you want."""
+        if not isinstance(muted, bool):
+            raise ValueError("Say whether to mute (True) or unmute (False): the API doesn't report the current state.")
         self.request("POST", "/obs/input/mute", {"input": input_name, "muted": muted})
         return muted
 
@@ -128,9 +126,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_scene = sub.add_parser("scene", help="Switch active OBS scene")
     p_scene.add_argument("name", help="Target OBS scene name")
 
-    p_mute = sub.add_parser("mute", help="Set or toggle OBS audio input mute")
+    p_mute = sub.add_parser("mute", help="Mute or unmute an OBS audio input (--on or --off)")
     p_mute.add_argument("input", help="Input name, e.g. Mic")
-    grp = p_mute.add_mutually_exclusive_group()
+    grp = p_mute.add_mutually_exclusive_group(required=True)
     grp.add_argument("--on", action="store_true", help="Mute the input")
     grp.add_argument("--off", action="store_true", help="Unmute the input")
 
@@ -194,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             ctrl.switch_scene(args.name)
             print(f"Switched OBS scene to {args.name}")
         elif args.cmd == "mute":
-            want = True if args.on else (False if args.off else None)
+            want = bool(args.on)
             state = ctrl.set_mute(args.input, want)
             print(f"{args.input}: {'muted' if state else 'unmuted'}")
         elif args.cmd == "marker":
