@@ -15,7 +15,7 @@
   var PARENT = (function () {
     var a = document.documentElement.getAttribute('data-parent') || ''
     if (!a) a = new URLSearchParams(location.search).get('origin') || ''
-    return /^https?:\/\/[^\/?#\\]+$/.test(a) ? a : ''
+    return /^https?:\/\/[^/?#\\]+$/.test(a) ? a : ''
   })()
   if (!PARENT || !root || !styleEl) return
 
@@ -133,12 +133,13 @@
   }
   function urlOk(value) {
     var v = String(value).trim().toLowerCase()
+    // eslint-disable-next-line no-control-regex
     if (/[\s\u0000-\u001f\u007f&\\]/.test(v)) return false
     if (v.charAt(0) === '#') return true
     var m = /^data:image\/(png|jpeg|gif|webp|avif);/.exec(v)
     if (m) return true
     if (v.indexOf('https://') === 0) {
-      var host = v.slice(8).split(/[\/?#]/)[0]
+      var host = v.slice(8).split(/[/?#]/)[0]
       return HOSTS.indexOf(host) !== -1
     }
     return false
@@ -209,7 +210,7 @@
 
   function safeCssVal(v) {
     var s = String(v == null ? '' : v)
-    if (s.length > 500 || /[\\\/*;{}<>()"'`\n\r]/.test(s)) return ''
+    if (s.length > 500 || /[\\/*;{}<>()"'`\n\r]/.test(s)) return ''
     if (/url|image-set|src|expression|@import|javascript/i.test(s)) return ''
     return s
   }
