@@ -1796,6 +1796,7 @@ fn is_prefixed_token(word: &str, lower: &str) -> bool {
         "xoxb-",
         "xoxp-",
         "fcr_",
+        "fc_key_",
         "fca_",
         "age-secret-key-1",
     ];
@@ -2448,6 +2449,13 @@ mod tests {
         ] {
             assert!(!json.contains(forbidden), "field leaked {forbidden:?} into SupportReport: {json}");
         }
+    }
+
+    #[test]
+    fn a_local_api_key_is_redacted_from_report_text() {
+        let key = format!("fc_key_{}", "ab12".repeat(16));
+        let out = redact_text(&format!("the request carried {key} and failed"), &[], &[]);
+        assert!(!out.contains(&key) && !out.contains("fc_key_ab12"), "{out}");
     }
 
     #[test]
