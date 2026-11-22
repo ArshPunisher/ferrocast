@@ -794,11 +794,41 @@ impl Api {
         let session = self.open_upload(meta, total).await?;
         let mut offset = 0u64;
         let mut token = self.access().await?;
-        // In a row, each: failed pieces (the line or a 5xx), pieces YouTube took none of, sign-ins refreshed.
+        // In a row, each: pieces or questions that failed (the line or a 5xx), pieces YouTube took
+        // none of, sign-ins refreshed.
         let (mut failures, mut stalls, mut refreshes) = (0u32, 0u32, 0u32);
+        // After a piece fails, the next thing done is to ask where YouTube stands: a piece is never
+        // sent again on a guess (YouTube may have part of it, or all).
+        let mut ask_first = false;
         progress(0, total);
         loop {
+            if ask_first {
+                match self.upload_status(&session, &token, total).await {
+                    Some(UploadStatus::Done(id)) => {
+                        progress(total, total);
+                        return Ok(id);
+                    }
+                    Some(UploadStatus::Resume(at)) => {
+                        if at > offset {
+                            (failures, stalls) = (0, 0);
+                        }
+                        // Never the whole: a last byte is sent again rather than a piece of nothing.
+                        offset = at.min(total - 1);
+                        progress(offset, total);
+                        ask_first = false;
+                    }
+                    None => {
+                        failures += 1;
+                        if failures > UPLOAD_RETRIES {
+                            return Err(lost_touch());
+                        }
+                        tokio::time::sleep(upload_backoff(failures)).await;
+                        continue;
+                    }
+                }
+            }
             let want = UPLOAD_CHUNK.min((total - offset) as usize);
+            let is_last = offset + want as u64 >= total;
             let chunk = source
                 .read_at(offset, want)
                 .map_err(|e| YoutubeError::Refused(format!("the file couldn't be read: {e}")))?;
@@ -820,17 +850,10 @@ impl Api {
                 Err(e) => {
                     failures += 1;
                     if failures > UPLOAD_RETRIES {
-                        return Err(YoutubeError::network(e));
+                        return Err(if is_last { lost_touch() } else { YoutubeError::network(e) });
                     }
                     tokio::time::sleep(upload_backoff(failures)).await;
-                    match self.upload_status(&session, &token, total).await {
-                        Some(UploadStatus::Done(id)) => {
-                            progress(total, total);
-                            return Ok(id);
-                        }
-                        Some(UploadStatus::Resume(at)) => offset = at,
-                        None => {}
-                    }
+                    ask_first = true;
                     continue;
                 }
             };
@@ -890,17 +913,14 @@ impl Api {
                 500 | 502 | 503 | 504 => {
                     failures += 1;
                     if failures > UPLOAD_RETRIES {
-                        return Err(YoutubeError::Refused(format!("YouTube kept answering {status}; try again later")));
+                        return Err(if is_last {
+                            lost_touch()
+                        } else {
+                            YoutubeError::Refused(format!("YouTube kept answering {status}; try again later"))
+                        });
                     }
                     tokio::time::sleep(upload_backoff(failures)).await;
-                    match self.upload_status(&session, &token, total).await {
-                        Some(UploadStatus::Done(id)) => {
-                            progress(total, total);
-                            return Ok(id);
-                        }
-                        Some(UploadStatus::Resume(at)) => offset = at,
-                        None => {}
-                    }
+                    ask_first = true;
                 }
                 _ => return Err(YoutubeError::from_response(res).await),
             }
@@ -1033,6 +1053,13 @@ pub(crate) const UPLOAD_CHUNK_FOR_TEST: usize = UPLOAD_CHUNK;
 #[cfg(test)]
 pub(crate) fn upload_host_ok_for_test(url: &str, api: &str) -> bool {
     upload_host_ok(url, api)
+}
+
+/// YouTube stopped answering while the video may have been going in: it may have it already.
+fn lost_touch() -> YoutubeError {
+    YoutubeError::Refused(
+        "YouTube stopped answering while the video was going up. It may already have it: check YouTube Studio before sending it again".into(),
+    )
 }
 
 /// Where an upload session stands.

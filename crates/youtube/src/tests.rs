@@ -2122,6 +2122,10 @@ struct UploadLog {
     completed: bool,
     /// Answers 308 with no Range header, forever (a server that takes nothing).
     take_nothing: bool,
+    /// How many of the next questions about where it stands are not answered (a 500).
+    status_fail: usize,
+    /// How many pieces (not questions) were sent.
+    pieces: usize,
     token_hits: usize,
 }
 
@@ -2195,6 +2199,10 @@ async fn fake_upload(log: Arc<Mutex<UploadLog>>) -> Endpoints {
                     }
                     // "bytes */N": a question about how much is there.
                     if range.starts_with("bytes */") {
+                        if l.status_fail > 0 {
+                            l.status_fail -= 1;
+                            return (StatusCode::INTERNAL_SERVER_ERROR, out, String::new());
+                        }
                         if l.completed {
                             return (StatusCode::OK, out, "{\"id\":\"vid-new\"}".to_string());
                         }
@@ -2203,6 +2211,7 @@ async fn fake_upload(log: Arc<Mutex<UploadLog>>) -> Endpoints {
                         }
                         return (StatusCode::PERMANENT_REDIRECT, out, String::new());
                     }
+                    l.pieces += 1;
                     let (span, total) = range.trim_start_matches("bytes ").split_once('/').unwrap();
                     let (a, b) = span.split_once('-').unwrap();
                     let (a, b, total): (usize, usize, usize) =
@@ -2307,7 +2316,8 @@ async fn too_many_failures_give_up_in_words() {
     log.lock().unwrap().fail_next = vec![503; 20];
     let api = video_api(fake_upload(log.clone()).await);
     let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
-    assert!(matches!(err, YoutubeError::Refused(ref m) if m.contains("503")), "{err:?}");
+    // The only piece was the last: YouTube may have it, and the words say to look.
+    assert!(matches!(err, YoutubeError::Refused(ref m) if m.contains("check YouTube Studio")), "{err:?}");
 }
 
 #[tokio::test]
@@ -2377,4 +2387,44 @@ async fn a_failed_piece_does_not_use_up_the_one_sign_in_refresh() {
     let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
     assert_eq!(id, "vid-new");
     assert_eq!(log.lock().unwrap().token_hits, 1, "the sign-in was refreshed");
+}
+
+#[tokio::test]
+async fn a_piece_is_never_sent_again_until_youtube_says_where_it_stands() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        // The piece fails, and the first two questions about where it stands fail too.
+        l.fail_next = vec![503];
+        l.status_fail = 2;
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    let l = log.lock().unwrap();
+    // One failed send (a 503, not counted by the mock's piece counter) and the one that worked: the
+    // questions were asked again, the piece wasn't sent in between.
+    assert_eq!(l.pieces, 1, "{:?}", l.ranges);
+    let asked = l.ranges.iter().filter(|r| r.starts_with("bytes */")).count();
+    assert_eq!(asked, 3, "{:?}", l.ranges);
+    let first_question = l.ranges.iter().position(|r| r.starts_with("bytes */")).unwrap();
+    assert!(
+        l.ranges[first_question..first_question + 3].iter().all(|r| r.starts_with("bytes */")),
+        "no piece between the questions: {:?}",
+        l.ranges
+    );
+}
+
+#[tokio::test]
+async fn a_final_piece_that_went_in_but_never_answered_is_found_when_retries_run_out() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        // Every send of the piece is answered 503, but YouTube has the whole file (a lost answer).
+        l.fail_next = vec![503; 20];
+        l.completed = true;
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new", "the question found it");
 }

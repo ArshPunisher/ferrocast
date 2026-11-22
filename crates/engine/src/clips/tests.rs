@@ -99,6 +99,14 @@ fn ffmpegs_text_gives_the_facts() {
     assert_eq!(p.duration_ms, Some(62_500));
     assert_eq!((p.width, p.height), (Some(1920), Some(1080)));
     assert!(p.has_audio && p.has_video);
+    // A phone's portrait clip is stored sideways with a rotation: its shape is the turned one.
+    let phone = parse_probe(
+        "  Duration: 00:00:03.00, start: 0\n  Stream #0:0: Video: h264, yuv420p, 1920x1080, 30 fps\n    Side data:\n      displaymatrix: rotation of -90.00 degrees\n",
+    );
+    assert_eq!((phone.width, phone.height), (Some(1080), Some(1920)));
+    let upside =
+        parse_probe("  Stream #0:0: Video: h264, 1920x1080, 30 fps\n      displaymatrix: rotation of 180.00 degrees\n");
+    assert_eq!((upside.width, upside.height), (Some(1920), Some(1080)), "a half turn keeps the shape");
     let silent =
         parse_probe("  Duration: 00:00:03.00, start: 0\n  Stream #0:0: Video: h264, yuv420p, 640x360, 25 fps\n");
     assert!(!silent.has_audio && silent.has_video);
@@ -297,4 +305,47 @@ async fn a_folder_that_cannot_be_read_is_said_not_shown_empty() {
         return;
     }
     assert!(matches!(r, Err(EngineError::Refused { status: 422, code: "folder_unreadable", .. })), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_rename_never_takes_captions_that_belong_to_another_clip() {
+    let (e, _d, clips) = engine().await;
+    touch(clips.path(), "one.mp4", b"1");
+    touch(clips.path(), "two.mkv", b"2");
+    touch(clips.path(), "two.srt", b"1\n");
+    // two.mp4 is free, but two.srt is two.mkv's: the clip would show them as its own.
+    assert!(matches!(
+        e.rename_clip("one.mp4", "two").await,
+        Err(EngineError::Refused { status: 409, code: "clip_name_taken", .. })
+    ));
+    assert!(clips.path().join("one.mp4").is_file(), "nothing moved");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_move_that_cannot_remove_the_old_name_takes_the_new_one_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let (src, dst) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    // Same disk (so a link works); the source folder can't be changed.
+    let from = src.path().join("a.mp4");
+    std::fs::write(&from, b"1").unwrap();
+    std::fs::set_permissions(src.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (to, to2) = (dst.path().join("a.mp4"), dst.path().join("b.mp4"));
+    let (r, moved) = (place_exclusive(&from, &to), move_without_replacing(&from, &to2));
+    std::fs::set_permissions(src.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    if r.is_ok() {
+        // Running as a user for whom permissions don't bind (root): nothing to check.
+        return;
+    }
+    assert!(moved.is_err());
+    assert!(from.is_file(), "the source is still there");
+    assert!(!to.exists() && !to2.exists(), "no half-made second name");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_trash_record_keeps_the_bytes_of_a_folder_name_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let p = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/v/caf\xe9/clip.mp4"));
+    assert_eq!(percent_path(p), "/v/caf%E9/clip.mp4");
 }

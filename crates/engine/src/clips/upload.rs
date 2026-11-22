@@ -133,6 +133,22 @@ struct FileSource {
 }
 
 impl FileSource {
+    /// Whether `path` is still the file held open.
+    fn is_same_as(&self, path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            matches!((self.file.metadata(), std::fs::metadata(path)), (Ok(a), Ok(b)) if a.dev() == b.dev() && a.ino() == b.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            matches!(
+                (self.file.metadata().and_then(|m| m.modified()), std::fs::metadata(path).and_then(|m| m.modified())),
+                (Ok(a), Ok(b)) if a == b
+            ) && std::fs::metadata(path).is_ok_and(|m| m.len() == self.len)
+        }
+    }
+
     fn open(path: &Path) -> Result<Self, EngineError> {
         let file = std::fs::File::open(path).map_err(|e| {
             refuse(
@@ -233,6 +249,10 @@ impl Engine {
             }
             if p.duration_ms.is_none_or(|d| d > SHORTS_MAX_MS) {
                 return Err(bad("A Short is at most 3 minutes.", "Trim the clip first."));
+            }
+            // What was checked is what will be sent: the path still names the file held open.
+            if !source.is_same_as(&path) {
+                return Err(refuse(409, "clip_changed", "That clip changed while it was being checked.", "Try again."));
             }
         }
         let shorts = req.shorts;

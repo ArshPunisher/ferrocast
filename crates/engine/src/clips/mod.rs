@@ -238,12 +238,32 @@ pub fn entry_at(root: &Path, name: &str) -> Option<ClipEntry> {
 pub fn srt_is_exclusive(path: &Path) -> bool {
     let (Some(dir), Some(stem)) = (path.parent(), path.file_stem()) else { return true };
     let Ok(rd) = std::fs::read_dir(dir) else { return true };
+    let mine = srt_beside(path);
     !rd.flatten().any(|e| {
         let p = e.path();
-        p != path
-            && p.file_stem() == Some(stem)
-            && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| ext_of(n).is_some())
+        if p == path || !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| ext_of(n).is_some()) {
+            return false;
+        }
+        match p.file_stem() {
+            Some(other) if other == stem => true,
+            // "A" and "a" are one name on a case-insensitive disk: their .srt is then one file.
+            Some(other) if other.eq_ignore_ascii_case(stem) => same_file(&mine, &srt_beside(&p)),
+            _ => false,
+        }
     })
+}
+
+/// Whether two paths are one file on this disk (the same inode; on Windows, the same resolved path).
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        matches!((std::fs::metadata(a), std::fs::metadata(b)), (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+    }
 }
 
 /// The subtitle file beside a clip.
@@ -262,8 +282,15 @@ fn probe_args(path: &Path) -> Vec<std::ffi::OsString> {
 /// Reads ffmpeg's text about a file.
 pub fn parse_probe(stderr: &str) -> Probe {
     let mut p = Probe::default();
+    let mut quarter_turn = false;
     for line in stderr.lines() {
         let l = line.trim();
+        // "displaymatrix: rotation of -90.00 degrees": a phone's portrait video is stored sideways.
+        if let Some(rest) = l.split("rotation of").nth(1)
+            && let Some(deg) = rest.split_whitespace().next().and_then(|d| d.parse::<f32>().ok())
+        {
+            quarter_turn = (deg.abs().round() as i64 % 180) == 90;
+        }
         if let Some(rest) = l.strip_prefix("Duration:") {
             let t = rest.trim().split(',').next().unwrap_or("").trim();
             let parts: Vec<&str> = t.split(':').collect();
@@ -289,6 +316,10 @@ pub fn parse_probe(stderr: &str) -> Probe {
         } else if l.contains("Audio:") && l.contains("Stream #") {
             p.has_audio = true;
         }
+    }
+    // The size as it is shown (ffmpeg turns such a clip upright), not as it is stored.
+    if quarter_turn {
+        (p.width, p.height) = (p.height, p.width);
     }
     p
 }
@@ -420,7 +451,8 @@ impl Engine {
         // A second in (the first frame is often black), unless the clip is shorter.
         let at = if probe.duration_ms.unwrap_or(0) > 2500 { "1" } else { "0" };
         tokio::fs::create_dir_all(&dir).await.map_err(|e| io_refuse("Couldn't keep the picture", &e))?;
-        let part = dir.join(format!("{key}.part.jpg"));
+        // Its own file per render: two requests for one clip never take each other's.
+        let part = dir.join(format!("{key}.{}-{:x}.part.jpg", std::process::id(), fastrand::u64(..)));
         let mut cmd = crate::clips::jobs::hidden(&ffmpeg);
         cmd.args([
             "-hide_banner",
@@ -439,7 +471,8 @@ impl Engine {
         .arg(&part)
         .kill_on_drop(true);
         let ok = matches!(tokio::time::timeout(PROBE_LIMIT, cmd.output()).await, Ok(Ok(o)) if o.status.success());
-        if !ok || tokio::fs::rename(&part, &file).await.is_err() {
+        // Another request may have published the same picture meanwhile: that one will do.
+        if !ok || (tokio::fs::rename(&part, &file).await.is_err() && !file.is_file()) {
             let _ = tokio::fs::remove_file(&part).await;
             return Err(refuse(
                 422,
@@ -468,6 +501,16 @@ impl Engine {
         let to_srt = srt_beside(&to);
         tokio::task::spawn_blocking(move || -> Result<ClipEntry, EngineError> {
             if path != to {
+                // Captions already at the new name belong to another clip (a.mkv's a.srt): the
+                // renamed clip would show them as its own.
+                if to_srt.exists() && !same_file(&from_srt, &to_srt) {
+                    return Err(refuse(
+                        409,
+                        "clip_name_taken",
+                        "Captions with that name already exist beside another clip.",
+                        "Pick another name.",
+                    ));
+                }
                 let own = srt_is_exclusive(&path);
                 move_without_replacing(&path, &to)?;
                 if own && from_srt.is_file() && !to_srt.exists() {
@@ -504,7 +547,11 @@ impl Engine {
 /// the old name removed, which fails when the name is taken).
 pub(crate) fn move_without_replacing(from: &Path, to: &Path) -> Result<(), EngineError> {
     match std::fs::hard_link(from, to) {
-        Ok(()) => std::fs::remove_file(from).map_err(|e| io_refuse("Couldn't finish the move", &e)),
+        Ok(()) => std::fs::remove_file(from).map_err(|e| {
+            // The old name can't be removed (a read-only folder): the new one made is taken back.
+            let _ = std::fs::remove_file(to);
+            io_refuse("Couldn't finish the move", &e)
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(name_taken()),
         // A file system with no links (some network or exFAT shares): the name is taken first (made
         // new, so nobody else can take it or a link into it), then the file renamed over that.
@@ -659,7 +706,12 @@ fn trash_freedesktop(path: &Path, trash: &Path) -> std::io::Result<()> {
 #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 fn percent_path(p: &Path) -> String {
     let mut out = String::new();
-    for b in p.to_string_lossy().bytes() {
+    // The path's own bytes on Unix (a folder name need not be UTF-8), so it restores to where it was.
+    #[cfg(unix)]
+    let bytes = std::os::unix::ffi::OsStrExt::as_bytes(p.as_os_str()).to_vec();
+    #[cfg(not(unix))]
+    let bytes = p.to_string_lossy().into_owned().into_bytes();
+    for b in bytes {
         if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
             out.push(b as char);
         } else {
@@ -714,7 +766,12 @@ fn move_into(path: &Path, dir: &Path) -> std::io::Result<()> {
 /// disks, copied over it (the source is removed only once the copy is whole).
 fn place_exclusive(from: &Path, to: &Path) -> std::io::Result<()> {
     match std::fs::hard_link(from, to) {
-        Ok(()) => return std::fs::remove_file(from),
+        Ok(()) => {
+            return std::fs::remove_file(from).inspect_err(|_| {
+                // The old name can't be removed: the link just made is taken back.
+                let _ = std::fs::remove_file(to);
+            });
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
         Err(_) => {}
     }
