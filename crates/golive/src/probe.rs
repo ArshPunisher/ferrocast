@@ -170,10 +170,10 @@ pub fn ceiling(s: Service, enhanced: bool) -> Option<PlatformLimit> {
         Service::Twitch if !enhanced => {
             Some(PlatformLimit { service: s, name: "Twitch", max_kbps: 6_000, keyframe_secs: 2, h264_only: true })
         }
-        Service::Kick => {
+        Service::Kick if !enhanced => {
             Some(PlatformLimit { service: s, name: "Kick", max_kbps: 8_000, keyframe_secs: 2, h264_only: true })
         }
-        Service::Twitch | Service::Youtube | Service::Custom => None,
+        Service::Twitch | Service::Kick | Service::Youtube | Service::Custom => None,
     }
 }
 
@@ -474,5 +474,11 @@ mod tests {
 
         // Already conforming settings produce no chip.
         assert_eq!(capped_info(limit, 6_000, false, 2, false), None);
+    }
+
+    #[test]
+    fn m2_kick_honors_enhanced_ignore_service_limits() {
+        assert!(ceiling(Service::Kick, false).is_some());
+        assert_eq!(ceiling(Service::Kick, true), None);
     }
 }

@@ -348,7 +348,7 @@ pub fn stream_ceiling(
             // Keep 20% headroom on single/multi-platform upload matching `probe::HEADROOM` / wizard share.
             let share = (f64::from(up) * HEADROOM * 0.9375) / (n as f64); // 0.75 * upload / n
             let stepped = ((share / 500.0).floor() as u32) * 500;
-            let picked = stepped.clamp(1500, cap);
+            let picked = stepped.clamp(500, cap);
             let why = if (share as u32) < cap && picked < cap {
                 LimitedBy::Upload
             } else if cap < (share as u32) || (limit.is_some() && picked == cap) {
@@ -484,15 +484,18 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
             })
             .ok_or_else(|| "No encoder candidate found.".to_string())?
     } else {
-        // Fallback: no candidate met headroom, so pick the lightest/least-dropping option.
+        // Fallback: no candidate met headroom, so pick the lightest/lowest-drop-rate option.
         candidates
             .iter()
             .min_by(|a, b| {
-                let ad = a.skipped_frames + a.lagged_frames;
-                let bd = b.skipped_frames + b.lagged_frames;
+                let ad_rate = (a.skipped_frames + a.lagged_frames) as f64 / (a.frames_tested.max(1) as f64);
+                let bd_rate = (b.skipped_frames + b.lagged_frames) as f64 / (b.frames_tested.max(1) as f64);
                 let aratio = a.encode_ms_avg / a.budget_ms.max(1.0);
                 let bratio = b.encode_ms_avg / b.budget_ms.max(1.0);
-                ad.cmp(&bd).then_with(|| aratio.total_cmp(&bratio)).then_with(|| b.hardware.cmp(&a.hardware))
+                ad_rate
+                    .total_cmp(&bd_rate)
+                    .then_with(|| aratio.total_cmp(&bratio))
+                    .then_with(|| b.hardware.cmp(&a.hardware))
             })
             .ok_or_else(|| "No encoder candidate found.".to_string())?
     };
@@ -507,7 +510,7 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
                 < u64::from(ceil.max_width) * u64::from(ceil.max_height)
                 || out_fps < ceil.max_fps;
             let kbps = if encoder_downgraded {
-                ceil.bitrate_kbps.min(stream_tier_cap(out_short, out_fps)).max(1500)
+                ceil.bitrate_kbps.min(stream_tier_cap(out_short, out_fps)).max(500)
             } else {
                 ceil.bitrate_kbps
             };
@@ -516,7 +519,7 @@ pub fn pick_recommendation(candidates: &[BenchCandidate], input: &PickInput) -> 
         }
         (Some(ceil), false) => {
             let tier_max = stream_tier_cap(out_short, out_fps);
-            (ceil.bitrate_kbps.min(tier_max).max(1500), LimitedBy::Headroom)
+            (ceil.bitrate_kbps.min(tier_max).max(500), LimitedBy::Headroom)
         }
         (None, _) => {
             let why_limit = if !best.passed || out_short < canvas_short.min(2160) || out_fps < cap_fps {
@@ -1034,5 +1037,80 @@ mod tests {
         assert_eq!(rec_4k.scale, None);
         assert_eq!((rec_4k.width, rec_4k.height, rec_4k.fps), (3840, 2160, 60));
         assert!(rec_4k.video_kbps >= 24_000, "4K60 record bitrate should scale above 1440p: {}", rec_4k.video_kbps);
+    }
+
+    #[test]
+    fn m2_low_upload_clamps_to_500_and_all_fail_ranks_by_drop_rate() {
+        let ceil = stream_ceiling(Some(800), &[youtube()], 60, [1920, 1080]);
+        assert_eq!(ceil.bitrate_kbps, 500, "low upload should clamp down to 500 kbps, not force 1500");
+
+        let slow = vec![meas(EncoderFamily::X264, Some("ultrafast"), 852, 480, 30, 38.0, Some(95.0))];
+        let rec_low = pick_recommendation(
+            &slow,
+            &PickInput {
+                mode: AutoConfigMode::Stream,
+                fps_preference: 30,
+                canvas: [1920, 1080],
+                upload_kbps: Some(800),
+                platforms: vec![youtube()],
+            },
+        )
+        .unwrap();
+        assert_eq!(rec_low.video_kbps, 500);
+
+        let a = evaluate_candidate(CandidateMeasurement {
+            encoder_backend: "h264_nvenc".into(),
+            studio_encoder_id: "ffmpeg_hardware".into(),
+            label: "Candidate A".into(),
+            family: EncoderFamily::Nvenc,
+            preset: None,
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate_kbps: 4500,
+            frames_tested: 180,
+            encode_ms_avg: 20.0,
+            encode_ms_p95: 22.0,
+            encode_ms_max: 25.0,
+            fps_achieved: 50.0,
+            skipped_frames: 3, // 1.67% drop rate
+            lagged_frames: 0,
+            cpu_pct: Some(50.0),
+            gpu_pct: Some(80.0),
+            elapsed_ms: 2000,
+        });
+        let b = evaluate_candidate(CandidateMeasurement {
+            encoder_backend: "libx264".into(),
+            studio_encoder_id: "obs_x264".into(),
+            label: "Candidate B".into(),
+            family: EncoderFamily::X264,
+            preset: Some("ultrafast".into()),
+            width: 1280,
+            height: 720,
+            fps: 30,
+            bitrate_kbps: 4500,
+            frames_tested: 20,
+            encode_ms_avg: 40.0,
+            encode_ms_p95: 44.0,
+            encode_ms_max: 50.0,
+            fps_achieved: 25.0,
+            skipped_frames: 2, // 10.0% drop rate (raw count 2 < 3, but 6x worse drop rate!)
+            lagged_frames: 0,
+            cpu_pct: Some(90.0),
+            gpu_pct: None,
+            elapsed_ms: 2000,
+        });
+        let rec_rate = pick_recommendation(
+            &[b, a],
+            &PickInput {
+                mode: AutoConfigMode::Stream,
+                fps_preference: 60,
+                canvas: [1920, 1080],
+                upload_kbps: Some(10_000),
+                platforms: vec![youtube()],
+            },
+        )
+        .unwrap();
+        assert_eq!(rec_rate.label, "Candidate A", "all-fail fallback must rank by drop rate, not raw count");
     }
 }

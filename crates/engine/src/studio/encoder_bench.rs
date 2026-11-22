@@ -1438,6 +1438,7 @@ struct WorkerDone {
     mode: AutoConfigMode,
     candidates: Vec<BenchCandidate>,
     upload_check: Option<UploadCheck>,
+    upload_error: Option<String>,
     picked: BenchRecommendation,
 }
 
@@ -1616,7 +1617,7 @@ impl Engine {
                     mode: done.mode,
                     candidates: done.candidates,
                     upload_check: done.upload_check,
-                    upload_error: None,
+                    upload_error: done.upload_error,
                     picked: done.picked,
                     duration_ms: elapsed_ms,
                 });
@@ -1652,6 +1653,7 @@ impl Engine {
         }
 
         let mut upload_check: Option<UploadCheck> = None;
+        let mut upload_error: Option<String> = None;
         if include_upload && mode == AutoConfigMode::Stream {
             let fut = self.golive_upload_check();
             tokio::pin!(fut);
@@ -1661,7 +1663,10 @@ impl Engine {
             };
             match res {
                 Ok(uc) => upload_check = Some(uc),
-                Err(e) => return WorkerOutcome::Failed(mode, e.to_string(), Vec::new()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "upload check failed during benchmark; continuing encoder benchmark");
+                    upload_error = Some(e.to_string());
+                }
             }
         }
 
@@ -1930,7 +1935,7 @@ impl Engine {
             Err(e) => return WorkerOutcome::Failed(mode, e, candidates),
         };
 
-        WorkerOutcome::Done(WorkerDone { mode, candidates, upload_check, picked })
+        WorkerOutcome::Done(WorkerDone { mode, candidates, upload_check, upload_error, picked })
     }
 
     fn finish_bench_cancelled(&self, job_id: &str) {
@@ -3866,5 +3871,38 @@ mod tests {
             updated.video_encoder, None,
             "switching encoder to software must clear stale hardware video_encoder"
         );
+    }
+
+    #[tokio::test]
+    async fn m2_upload_check_failure_degrades_gracefully_with_upload_error() {
+        let (engine, _host, _dir) = test_engine().await;
+        // Hold the Go live busy lock so `golive_upload_check()` fails deterministically offline.
+        let _busy = engine.golive().busy.lock().await;
+        engine
+            .auto_config_benchmark(BenchmarkReq {
+                mode: Some("stream".into()),
+                fps_preference: Some(60),
+                include_upload: Some(true),
+                max_seconds: Some(3),
+            })
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let final_view = loop {
+            let v = engine.auto_config_status();
+            if v.state != AutoConfigStateKind::Running {
+                break v;
+            }
+            assert!(Instant::now() < deadline, "benchmark did not finish in time");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(
+            final_view.state,
+            AutoConfigStateKind::Done,
+            "upload failure must record upload_error and still complete encoder benchmark: {:?}",
+            final_view.error
+        );
+        assert!(final_view.upload_error.is_some());
+        assert!(final_view.picked.is_some());
     }
 }
