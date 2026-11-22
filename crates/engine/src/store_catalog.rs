@@ -73,6 +73,10 @@ pub const STALE_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 static STORE_SOURCE: Mutex<Option<Source>> = Mutex::new(None);
 static STORE_CACHE: Mutex<Option<CachedCatalog>> = Mutex::new(None);
 
+/// Install, update, uninstall and undo take turns: two at once could both pass the "already
+/// installed?" check and import everything twice.
+static STORE_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Debug, Clone)]
 struct CachedCatalog {
     at: Instant,
@@ -416,16 +420,30 @@ fn check_creator_link(field: &str, raw: &str) -> Result<(), String> {
     let Some(host) = u.host_str() else {
         return Err(format!("{field}: missing host"));
     };
-    let lower = host.to_ascii_lowercase();
-    if lower == "localhost"
-        || lower.ends_with(".local")
-        || lower.parse::<std::net::IpAddr>().is_ok_and(|ip| match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-            }
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        })
-    {
+    let private_v4 = |v4: std::net::Ipv4Addr| {
+        let o = v4.octets();
+        v4.is_loopback()
+            || v4.is_private()
+            || v4.is_link_local()
+            || v4.is_unspecified()
+            || v4.is_broadcast()
+            || (o[0] == 100 && (64..128).contains(&o[1]))
+    };
+    // An IPv6 literal comes back in brackets: the address is what is inside.
+    let bare = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+    let private = match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => private_v4(v4),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let seg = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg & 0xfe00) == 0xfc00 // unique local
+                || (seg & 0xffc0) == 0xfe80 // link-local
+                || v6.to_ipv4_mapped().is_some_and(private_v4)
+        }
+        Err(_) => bare == "localhost" || bare.ends_with(".localhost") || bare.ends_with(".local"),
+    };
+    if private {
         return Err(format!("{field}: private or loopback hosts aren't allowed"));
     }
     Ok(())
@@ -452,6 +470,21 @@ fn check_creator(c: &StoreCreator) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether a file's first bytes are what its declared type says (a catalog's word is not enough
+/// for a file that is served to the page).
+fn asset_matches_mime(mime: &str, b: &[u8]) -> bool {
+    match mime {
+        "image/png" => b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        "image/jpeg" => b.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/gif" => b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a"),
+        "image/webp" => b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP",
+        "audio/mpeg" => b.starts_with(b"ID3") || (b.len() > 2 && b[0] == 0xFF && (b[1] & 0xE0) == 0xE0),
+        "audio/ogg" => b.starts_with(b"OggS"),
+        "audio/wav" => b.len() > 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WAVE",
+        _ => false,
+    }
 }
 
 fn check_asset_mime(mime: &str) -> bool {
@@ -674,6 +707,9 @@ pub fn parse_ferrocast_link(raw: &str) -> Result<ParsedStoreLink, EngineError> {
     let u = reqwest::Url::parse(raw).map_err(|_| EngineError::Invalid("uri: unreadable Ferrocast link.".into()))?;
     if u.scheme() != "ferrocast" || !u.username().is_empty() || u.password().is_some() {
         return Err(EngineError::Invalid("uri: link must start with ferrocast://.".into()));
+    }
+    if u.port().is_some() || u.fragment().is_some() {
+        return Err(EngineError::Invalid("uri: no port or fragment in a Ferrocast link.".into()));
     }
     let host = u.host_str().unwrap_or("");
     let segs: Vec<&str> = u.path().trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
@@ -1057,6 +1093,14 @@ impl Engine {
                 &format!("Asset '{}'", asset.name),
             )
             .await?;
+        if !asset_matches_mime(&asset.mime, &bytes) {
+            return Err(refused(
+                502,
+                "store_asset_tampered",
+                format!("Asset '{}' isn't the kind of file the catalog says it is.", asset.name),
+                "Nothing was shown. Report this item.",
+            ));
+        }
         Ok((asset.mime.clone(), bytes))
     }
 
@@ -1072,6 +1116,17 @@ impl Engine {
                 "Check that the link is current.",
             )
         })?;
+        // A link for one version doesn't quietly offer another.
+        if let Some(v) = &parsed.version
+            && *v != item.version
+        {
+            return Err(refused(
+                409,
+                "store_version_mismatch",
+                format!("The link is for version {v}, and the Store has {} of \"{}\".", item.version, item.title),
+                "Ask for a current link, or open the item in the Store.",
+            ));
+        }
         let creator = cat
             .creators
             .iter()
@@ -1118,23 +1173,13 @@ impl Engine {
         existing: Option<&StoreInstallRecord>,
         action: &str,
     ) -> Result<StoreMutationResult, EngineError> {
-        // 1. Download & SHA-256 verify package + all declared assets BEFORE mutating any state.
+        // 1. Download & SHA-256 verify the package BEFORE mutating any state.
         let max_pkg = max_package_size(item.package.format) as usize;
         let pkg_bytes = self
             .fetch_verified_file(src, &item.package.url, item.package.size, &item.package.sha256, max_pkg, &item.title)
             .await?;
-        for asset in &item.assets {
-            let _ = self
-                .fetch_verified_file(
-                    src,
-                    &asset.url,
-                    asset.size,
-                    &asset.sha256,
-                    MAX_ASSET_BYTES,
-                    &format!("{} ({})", item.title, asset.name),
-                )
-                .await?;
-        }
+        // Preview assets aren't installed: each is fetched and fingerprint-checked when shown
+        // (`store_asset`), so an install doesn't download them.
 
         // 2. Snapshot current state for one-click undo.
         let mut prev_designs = Vec::new();
@@ -1309,6 +1354,7 @@ impl Engine {
 
     /// `POST /api/v1/store/install` `{ id }`
     pub async fn install_store_item(&self, id: &str) -> Result<StoreMutationResult, EngineError> {
+        let _one_at_a_time = STORE_WRITE.lock().await;
         if !good_store_id(id) {
             return Err(EngineError::Invalid("id: invalid store item id.".into()));
         }
@@ -1342,6 +1388,7 @@ impl Engine {
 
     /// `POST /api/v1/store/update` `{ id }`
     pub async fn update_store_item(&self, id: &str) -> Result<StoreMutationResult, EngineError> {
+        let _one_at_a_time = STORE_WRITE.lock().await;
         if !good_store_id(id) {
             return Err(EngineError::Invalid("id: invalid store item id.".into()));
         }
@@ -1381,6 +1428,7 @@ impl Engine {
 
     /// `POST /api/v1/store/uninstall` `{ id }` — works cleanly even without catalog access.
     pub async fn uninstall_store_item(&self, id: &str) -> Result<StoreMutationResult, EngineError> {
+        let _one_at_a_time = STORE_WRITE.lock().await;
         let existing = self
             .db({
                 let id = id.to_string();
@@ -1468,7 +1516,9 @@ impl Engine {
     /// `POST /api/v1/store/undo` `{ token? }` — one-click undo for install, update, or uninstall.
     pub async fn undo_store_action(&self, token: Option<&str>) -> Result<StoreUndoResult, EngineError> {
         let tok = token.map(str::to_string);
-        let entry = self.db(move |s| repo::store_catalog::take_undo(s, tok.as_deref())).await?;
+        let _one_at_a_time = STORE_WRITE.lock().await;
+        // The entry stays until everything is put back: a failed undo can be tried again.
+        let entry = self.db(move |s| repo::store_catalog::peek_undo(s, tok.as_deref())).await?;
         let snap = &entry.snapshot;
 
         // Remove newly created designs from the undone install/update.
@@ -1523,6 +1573,9 @@ impl Engine {
                 let _ = self.db(move |s| repo::store_catalog::delete_install(s, &id_owned)).await;
             }
         }
+        // Everything is back: only now is the undo entry used up.
+        let used = entry.token.clone();
+        self.db(move |s| repo::store_catalog::drop_undo(s, &used)).await?;
         let after = self.store_installed().await?;
         Ok(StoreUndoResult {
             reverted_action: entry.action,
@@ -1742,6 +1795,80 @@ mod tests {
         assert!(plugin_identity_problem("dev.kira.softvignette", "../escape").is_some());
     }
 
+    /// Creator links never point at this machine or the local network, in any address spelling.
+    #[test]
+    fn creator_links_refuse_every_private_or_loopback_spelling() {
+        for bad in [
+            "https://[::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:10.0.0.5]/",
+            "https://[fc00::1]/",
+            "https://[fd12:3456::1]/",
+            "https://[fe80::1]/",
+            "https://[::]/",
+            "https://0.0.0.0/",
+            "https://127.0.0.2/",
+            "https://169.254.169.254/",
+            "https://10.1.2.3/",
+            "https://192.168.1.1/",
+            "https://172.16.0.1/",
+            "https://100.64.0.1/",
+            "https://localhost/",
+            "https://printer.local/",
+            "https://LOCALHOST./",
+        ] {
+            assert!(check_creator_link("link", bad).is_err(), "{bad} was accepted");
+        }
+        for good in ["https://example.com/me", "https://github.com/user", "https://[2606:4700::1111]/"] {
+            assert!(check_creator_link("link", good).is_ok(), "{good} was refused");
+        }
+    }
+
+    #[test]
+    fn an_asset_must_start_like_the_type_it_declares() {
+        assert!(asset_matches_mime("image/png", ASSET_AURORA_PNG));
+        assert!(asset_matches_mime("image/png", ASSET_ARCADE_PNG));
+        assert!(!asset_matches_mime("image/jpeg", ASSET_AURORA_PNG), "png bytes declared as jpeg");
+        assert!(!asset_matches_mime("image/png", b"<svg onload=alert(1)></svg>"), "markup declared as png");
+        assert!(!asset_matches_mime("image/png", b"<!doctype html><script>1</script>"));
+        assert!(!asset_matches_mime("text/html", b"<html>"), "a type nobody serves");
+        assert!(asset_matches_mime("image/gif", b"GIF89a\x01\x00"));
+        assert!(asset_matches_mime("audio/ogg", b"OggS\x00"));
+    }
+
+    #[test]
+    fn a_ferrocast_link_has_no_port_or_fragment_and_only_a_version_parameter() {
+        assert!(parse_ferrocast_link("ferrocast://store/install/aurora-pulse").is_ok());
+        assert!(parse_ferrocast_link("ferrocast://store/install/aurora-pulse?v=1.0.0").is_ok());
+        for bad in [
+            "ferrocast://store:8080/install/aurora-pulse",
+            "ferrocast://store/install/aurora-pulse#frag",
+            "ferrocast://store/install/aurora-pulse?v=1.0.0&x=1",
+            "ferrocast://store/install/aurora-pulse?x=1",
+            "ferrocast://evil/install/aurora-pulse",
+            "ferrocast://store/install/../aurora-pulse",
+            "ferrocast://store/install/aurora-pulse/extra",
+            "ferrocast://user@store/install/aurora-pulse",
+        ] {
+            assert!(parse_ferrocast_link(bad).is_err(), "{bad} was accepted");
+        }
+    }
+
+    /// Two installs of one item at once: exactly one goes through (the second finds it installed),
+    /// and nothing is imported twice.
+    #[tokio::test]
+    async fn two_installs_at_once_install_once() {
+        let _lock = TEST_GUARD.lock().await;
+        let state = Arc::new(StdMutex::new(MockFixtureState::default()));
+        let port = spawn_fixture_server(state.clone()).await;
+        let (engine, _dir, _studio, _chat) = crate::automation::tests::engine().await;
+        set_source(Source { url: format!("http://127.0.0.1:{port}/catalog.json"), key: TEST_KEY.into(), local: true });
+        let (a, b) = tokio::join!(engine.install_store_item("aurora-pulse"), engine.install_store_item("aurora-pulse"));
+        assert_eq!([a.is_ok(), b.is_ok()].iter().filter(|x| **x).count(), 1, "{a:?} {b:?}");
+        let designs = engine.designs(None).await.unwrap();
+        assert_eq!(designs.len(), engine.store_installed().await.unwrap().installed[0].design_ids.len());
+    }
+
     #[tokio::test]
     async fn malicious_item_fields_and_unsafe_html_are_blocked() {
         let _lock = TEST_GUARD.lock().await;
@@ -1810,8 +1937,12 @@ mod tests {
         }
         let asset_err = engine.store_asset("aurora-pulse", "preview.png").await;
         assert!(matches!(asset_err, Err(EngineError::Refused { code: "store_asset_tampered", .. })), "{asset_err:?}");
-        let pkg_err = engine.install_store_item("aurora-pulse").await;
-        assert!(matches!(pkg_err, Err(EngineError::Refused { code: "store_asset_tampered", .. })), "{pkg_err:?}");
+        // A preview asset isn't installed (and so isn't downloaded at install): a changed one blocks
+        // showing it, not installing the package.
+        let installed = engine.install_store_item("aurora-pulse").await;
+        assert!(installed.is_ok(), "{installed:?}");
+        let installed = installed.unwrap();
+        engine.undo_store_action(Some(&installed.undo.token)).await.unwrap();
         assert!(engine.designs(None).await.unwrap().is_empty());
 
         // Restore asset, tamper package zip byte -> rejected cleanly.

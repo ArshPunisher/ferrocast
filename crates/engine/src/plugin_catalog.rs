@@ -164,8 +164,9 @@ fn allowed(u: &reqwest::Url, src: &Source) -> bool {
         return false;
     }
     let same_local_port = || {
+        // No readable catalog address: no local redirects at all.
         let Ok(base) = reqwest::Url::parse(&src.url) else {
-            return src.url.is_empty();
+            return false;
         };
         base.host_str() == Some(host) && base.port_or_known_default() == u.port_or_known_default()
     };
@@ -500,6 +501,13 @@ mod tests {
         let got = entries(json!({ "plugins": list }).to_string().as_bytes(), &src).unwrap_or_default();
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(newer("1.10.0", "1.9.2") && !newer("1.0", "1.0") && newer("2", "1.9") && !newer("1.0.0", "1.2"));
+    }
+
+    #[test]
+    fn an_empty_source_address_allows_no_local_redirect() {
+        let src = Source { url: String::new(), key: String::new(), local: true };
+        let u = reqwest::Url::parse("http://127.0.0.1:9999/x").unwrap();
+        assert!(!allowed(&u, &src), "an empty source let any local port through");
     }
 
     #[test]

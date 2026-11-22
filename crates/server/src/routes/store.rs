@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::extract::Body;
 
 pub fn routes() -> Router<AppState> {
@@ -70,26 +70,74 @@ async fn asset(
         res.headers_mut().insert(header::CONTENT_TYPE, ct);
     }
     res.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    // Served from this origin but never run: no script, no frame, no network if it is opened.
+    res.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("default-src 'none'; sandbox"));
+    res.headers_mut().insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     res.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=300"));
     Ok(res)
 }
 
-async fn install(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<impl IntoResponse> {
+/// Installing, updating, removing and undoing change what runs on this PC (plugins included):
+/// the owner at this computer only. A phone or browser paired over the network holds a session
+/// token too, and doesn't get this.
+fn at_this_pc(
+    connect: &Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    remote: &Option<axum::Extension<crate::remote::RemotePrincipal>>,
+) -> ApiResult<()> {
+    let loopback = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+    };
+    // No peer address: an in-process call (the embedded app, tests), which is this PC.
+    let from_elsewhere = remote.is_some()
+        || connect.as_ref().is_some_and(|axum::Extension(axum::extract::ConnectInfo(a))| !loopback(a.ip()));
+    if from_elsewhere {
+        return Err(ApiError::forbidden("Installing from the Store is done at this computer.")
+            .hint("Open Ferrocast on the PC to install, update or remove Store items."));
+    }
+    Ok(())
+}
+
+async fn install(
+    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    remote: Option<axum::Extension<crate::remote::RemotePrincipal>>,
+    State(app): State<AppState>,
+    Body(b): Body<IdBody>,
+) -> ApiResult<impl IntoResponse> {
+    at_this_pc(&connect, &remote)?;
     let out = app.engine.install_store_item(&b.id).await?;
     Ok((StatusCode::CREATED, Json(json!(out))))
 }
 
-async fn update(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+async fn update(
+    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    remote: Option<axum::Extension<crate::remote::RemotePrincipal>>,
+    State(app): State<AppState>,
+    Body(b): Body<IdBody>,
+) -> ApiResult<Json<Value>> {
+    at_this_pc(&connect, &remote)?;
     let out = app.engine.update_store_item(&b.id).await?;
     Ok(Json(json!(out)))
 }
 
-async fn uninstall(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+async fn uninstall(
+    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    remote: Option<axum::Extension<crate::remote::RemotePrincipal>>,
+    State(app): State<AppState>,
+    Body(b): Body<IdBody>,
+) -> ApiResult<Json<Value>> {
+    at_this_pc(&connect, &remote)?;
     let out = app.engine.uninstall_store_item(&b.id).await?;
     Ok(Json(json!(out)))
 }
 
-async fn undo(State(app): State<AppState>, Body(b): Body<UndoBody>) -> ApiResult<Json<Value>> {
+async fn undo(
+    connect: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    remote: Option<axum::Extension<crate::remote::RemotePrincipal>>,
+    State(app): State<AppState>,
+    Body(b): Body<UndoBody>,
+) -> ApiResult<Json<Value>> {
+    at_this_pc(&connect, &remote)?;
     let out = app.engine.undo_store_action(b.token.as_deref()).await?;
     Ok(Json(json!(out)))
 }

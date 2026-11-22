@@ -104,6 +104,12 @@ async fn store_http_install_undo_uninstall_and_security_errors() {
     let ares = client.get(url("/store/assets/aurora-pulse/preview.png")).bearer_auth(&token).send().await.unwrap();
     assert_eq!(ares.status(), StatusCode::OK);
     assert_eq!(ares.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("image/png"));
+    // Served inert: no script, frame or network if it is opened, no referrer.
+    assert_eq!(
+        ares.headers().get("content-security-policy").and_then(|v| v.to_str().ok()),
+        Some("default-src 'none'; sandbox")
+    );
+    assert_eq!(ares.headers().get("referrer-policy").and_then(|v| v.to_str().ok()), Some("no-referrer"));
 
     // Resolve ferrocast:// link -> 200 requires_confirmation without installing.
     let lres = client
@@ -174,4 +180,51 @@ async fn store_http_install_undo_uninstall_and_security_errors() {
         .await
         .unwrap();
     assert_eq!(unres.status(), StatusCode::OK);
+}
+
+/// Installing, updating, removing and undoing are for the PC itself: a device on the network
+/// holding a (paired) session token is refused, and reading the catalog still works for it.
+#[tokio::test]
+async fn a_device_on_the_network_cannot_install_or_undo() {
+    use axum::extract::ConnectInfo;
+    use tower::ServiceExt;
+    let _guard = SERVER_STORE_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine =
+        Engine::start_with_secrets(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+    let sessions = Arc::new(Sessions::new());
+    let app = router(AppState {
+        engine: engine.clone(),
+        sessions: sessions.clone(),
+        guard: auth::Guard { port: 47820, lan: true, dev_origins: vec![] },
+    });
+    let paired = sessions.new_code();
+    let token = sessions.pair(&paired).unwrap_or_else(|_| panic!("a pairing code is good once"));
+    let send = |peer: &str, path: &str, body: Value| {
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1{path}"))
+            .header("host", "192.168.1.9:47820")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
+        app.clone().oneshot(req)
+    };
+    for (path, body) in [
+        ("/store/install", json!({ "id": "soft-dimmer-shader" })),
+        ("/store/update", json!({ "id": "soft-dimmer-shader" })),
+        ("/store/uninstall", json!({ "id": "soft-dimmer-shader" })),
+        ("/store/undo", json!({})),
+    ] {
+        let r = send("192.168.1.20:50000", path, body.clone()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{path} from the network");
+        // From this PC the same call gets past this check (it then fails on its own merits).
+        let r = send("127.0.0.1:50000", path, body).await.unwrap();
+        assert_ne!(r.status(), StatusCode::FORBIDDEN, "{path} from this PC");
+    }
+    engine.shutdown();
 }

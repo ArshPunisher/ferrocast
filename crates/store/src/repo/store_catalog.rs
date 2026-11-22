@@ -228,7 +228,9 @@ pub fn latest_undo(store: &Store) -> Result<Option<StoreUndoSummary>> {
     })
 }
 
-pub fn take_undo(store: &Store, token: Option<&str>) -> Result<StoreUndoEntry> {
+/// The undo entry (by token, or the newest), left in place: it is dropped by `drop_undo` only
+/// after the undo has been applied, so a failed undo can be tried again.
+pub fn peek_undo(store: &Store, token: Option<&str>) -> Result<StoreUndoEntry> {
     store.write(|tx| {
         let row: Option<(String, String, String, String, String, i64)> = match token {
             Some(tok) => tx
@@ -251,11 +253,26 @@ pub fn take_undo(store: &Store, token: Option<&str>) -> Result<StoreUndoEntry> {
         let Some((tok, action, item_id, item_title, raw_snap, created_at)) = row else {
             return Err(StoreError::NotFound("undo action"));
         };
-        tx.execute("DELETE FROM store_undo WHERE token = ?1", [&tok])?;
         let snapshot: StoreUndoSnapshot =
             serde_json::from_str(&raw_snap).map_err(|e| StoreError::Conflict(format!("corrupt undo snapshot: {e}")))?;
         Ok(StoreUndoEntry { token: tok, action, item_id, item_title, snapshot, created_at })
     })
+}
+
+/// Removes an undo entry (after it was applied).
+pub fn drop_undo(store: &Store, token: &str) -> Result<()> {
+    store.write(|tx| {
+        tx.execute("DELETE FROM store_undo WHERE token = ?1", [token])?;
+        Ok(())
+    })
+}
+
+/// Peeks and drops in one step (the entry is gone even if what it undoes fails: prefer
+/// `peek_undo` then `drop_undo`).
+pub fn take_undo(store: &Store, token: Option<&str>) -> Result<StoreUndoEntry> {
+    let e = peek_undo(store, token)?;
+    drop_undo(store, &e.token)?;
+    Ok(e)
 }
 
 #[cfg(test)]
@@ -278,6 +295,35 @@ mod tests {
             installed_at: 1000,
             updated_at: 1000,
         }
+    }
+
+    #[test]
+    fn peeking_an_undo_leaves_it_until_it_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let undo = StoreUndoEntry {
+            token: "u1".into(),
+            action: "install".into(),
+            item_id: "aurora-pulse".into(),
+            item_title: "Aurora Pulse".into(),
+            snapshot: StoreUndoSnapshot {
+                prev_install: None,
+                created_design_ids: vec![],
+                prev_designs: vec![],
+                prev_active_alert: None,
+                prev_rules: vec![],
+                created_plugin_id: None,
+                prev_plugin: None,
+            },
+            created_at: 1,
+        };
+        save_undo(&store, &undo).unwrap();
+        let first = peek_undo(&store, Some("u1")).unwrap();
+        assert_eq!(first.token, "u1");
+        // A failed undo can be tried again: the entry is still there.
+        assert!(peek_undo(&store, Some("u1")).is_ok());
+        drop_undo(&store, "u1").unwrap();
+        assert!(peek_undo(&store, Some("u1")).is_err());
     }
 
     #[test]
