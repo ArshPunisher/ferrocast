@@ -170,7 +170,9 @@ pub fn upsert_install(store: &Store, rec: &StoreInstallRecord) -> Result<StoreIn
         )?;
         Ok(())
     })?;
-    Ok(saved)
+    // The row keeps the time of the first install (the conflict clause leaves `installed_at`
+    // alone): answer with what is stored, not with what was sent.
+    Ok(get_install(store, &saved.item_id)?.unwrap_or(saved))
 }
 
 pub fn delete_install(store: &Store, item_id: &str) -> Result<()> {
@@ -324,6 +326,29 @@ mod tests {
         assert!(peek_undo(&store, Some("u1")).is_ok());
         drop_undo(&store, "u1").unwrap();
         assert!(peek_undo(&store, Some("u1")).is_err());
+    }
+
+    #[test]
+    fn an_update_answers_with_the_installed_at_that_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        upsert_install(&store, &sample_install()).unwrap();
+        // The caller doesn't know the first install time (0): the row keeps 1000 and so must the answer.
+        let mut again = sample_install();
+        again.installed_at = 0;
+        again.version = "1.1.0".into();
+        let saved = upsert_install(&store, &again).unwrap();
+        let stored = get_install(&store, "aurora-pulse").unwrap().unwrap();
+        assert_eq!(stored.installed_at, 1000);
+        assert_eq!(saved.installed_at, stored.installed_at, "what is returned is what is stored");
+        assert_eq!(saved, stored);
+        // A new row gets the time it was made.
+        let mut fresh = sample_install();
+        fresh.item_id = "other".into();
+        fresh.installed_at = 0;
+        let made = upsert_install(&store, &fresh).unwrap();
+        assert!(made.installed_at > 1000);
+        assert_eq!(made, get_install(&store, "other").unwrap().unwrap());
     }
 
     #[test]
