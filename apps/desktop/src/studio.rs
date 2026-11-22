@@ -5420,4 +5420,10 @@ mod import_tests {
         assert_eq!(doc["transition_matrix"][0]["from"], "Main");
         assert_eq!(doc["transition_matrix"][0]["to"], "BRB");
     }
+
+    #[test]
+    fn desktop_machine_load_reports_valid_cpu_percentage() {
+        let cpu = ferrocast_studio::system::machine_cpu_pct();
+        assert!((0.0..=100.0).contains(&cpu) && cpu > 0.0, "unexpected machine CPU pct: {cpu}");
+    }
 }

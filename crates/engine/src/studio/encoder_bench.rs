@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 use crate::golive::{Canvas, UploadCheck};
 use ferrocast_golive::bench::{
     AutoConfigMode, BenchCandidate, BenchRecommendation, CandidateMeasurement, EncoderFamily, PickInput,
-    PlatformTarget, candidate_ladder, candidate_ladder_for_mode, evaluate_candidate, pick_recommendation,
-    stream_ceiling,
+    PlatformTarget, candidate_ladder_for_mode, evaluate_candidate, pick_recommendation, stream_ceiling,
 };
 use ferrocore::{
     Blend, Bounds, Compositor, Content, Effect, Filter, Item, Picture, Placement, Scene, ffenc,
@@ -3590,7 +3589,7 @@ mod tests {
     #[test]
     fn h5_software_loop_tests_all_presets_at_tier_and_samples_two_when_hw_passes() {
         let sw_encoders: Vec<DiscoveredEncoder> = select_bench_encoders(false, None, true);
-        let ladder = candidate_ladder([1920, 1080], 60);
+        let ladder = ferrocast_golive::bench::candidate_ladder([1920, 1080], 60);
         let cancel = AtomicBool::new(false);
         let deadline = Instant::now() + Duration::from_secs(30);
 
