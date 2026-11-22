@@ -1355,13 +1355,17 @@ impl Engine {
                     .map(String::from)
                     .ok_or_else(|| fail(ST_NOT_FOUND, "No input was found by that name."))?;
                 let settings = self.studio_act(StudioAct::Settings { name }).await.map_err(obs_error)?;
-                Ok(json!({ "inputSettings": settings, "inputKind": input_kind }))
+                // Keys, passwords, tokens and URL credentials never leave over obs-websocket.
+                Ok(json!({ "inputSettings": redact_source_settings(&settings), "inputKind": input_kind }))
             }
             "SetInputSettings" => {
                 let name = self.ows_input_name(d).await?;
                 let settings = field(d, "inputSettings")?.clone();
                 if !settings.is_object() {
                     return Err(fail(ST_BAD_TYPE, "`inputSettings` must be an object."));
+                }
+                if let Some(why) = source_settings_problem(&settings) {
+                    return Err(fail(ST_OUT_OF_RANGE, &why));
                 }
                 let overlay = d.get("overlay").and_then(Value::as_bool).unwrap_or(true);
                 let final_settings = if overlay {
@@ -1389,6 +1393,9 @@ impl Engine {
                 let name = str_field(d, "inputName")?.to_string();
                 let input_kind = str_field(d, "inputKind")?.to_string();
                 let settings = d.get("inputSettings").cloned().unwrap_or_else(|| json!({}));
+                if let Some(why) = source_settings_problem(&settings) {
+                    return Err(fail(ST_OUT_OF_RANGE, &why));
+                }
                 let enabled = d.get("sceneItemEnabled").and_then(Value::as_bool).unwrap_or(true);
                 let added = self
                     .studio_act(StudioAct::AddSource {
@@ -2589,6 +2596,92 @@ async fn close(ws: &mut Ws, code: u16, why: &str) {
     let _ = tokio::time::timeout(Duration::from_secs(2), ws.close(Some(frame))).await;
 }
 
+/// A source's settings as an obs-websocket client may read them: keys, passwords, tokens and
+/// the credentials or secret path parts of a URL are replaced (the same settings stay whole for
+/// the owner in the dashboard).
+fn redact_source_settings(v: &Value) -> Value {
+    const SECRET_KEY_PARTS: &[&str] = &["key", "password", "passwd", "secret", "token", "auth", "credential", "bearer"];
+    fn secret_key(k: &str) -> bool {
+        let k = k.to_ascii_lowercase();
+        SECRET_KEY_PARTS.iter().any(|p| k.contains(p))
+    }
+    fn scrub_text(s: &str) -> String {
+        let mut out = s.to_string();
+        // user:password@ in a URL.
+        if let Some(i) = out.find("://") {
+            let rest = &out[i + 3..];
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            if let Some(at) = rest[..end].rfind('@') {
+                out = format!("{}://{}", &out[..i], &rest[at + 1..]);
+            }
+        }
+        // ?token=…&… : the query's values go.
+        if let Some(q) = out.find('?') {
+            let (head, query) = out.split_at(q);
+            let kept: Vec<String> = query[1..]
+                .split('&')
+                .map(|p| match p.split_once('=') {
+                    Some((k, _)) if secret_key(k) => format!("{k}=***"),
+                    _ => p.to_string(),
+                })
+                .collect();
+            out = format!("{head}?{}", kept.join("&"));
+        }
+        // Overlay and invite links carry their secret in the path (…/o/<token>/…).
+        for marker in ["/o/", "/guest/", "/join/", "/invite/"] {
+            if let Some(i) = out.find(marker) {
+                let start = i + marker.len();
+                let end = out[start..].find(['/', '?', '#']).map_or(out.len(), |e| start + e);
+                out.replace_range(start..end, "***");
+            }
+        }
+        // rtmp://host/app/<key>: the last path part of a stream address.
+        if (out.starts_with("rtmp://") || out.starts_with("rtmps://")) && out.matches('/').count() >= 4 {
+            if let Some(i) = out.rfind('/') {
+                out.replace_range(i + 1.., "***");
+            }
+        }
+        out
+    }
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        if secret_key(k) && !v.is_object() && !v.is_array() {
+                            json!("***")
+                        } else {
+                            redact_source_settings(v)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(redact_source_settings).collect()),
+        Value::String(s) => Value::String(scrub_text(s)),
+        other => other.clone(),
+    }
+}
+
+/// Why settings for a new or changed source are refused over obs-websocket: a local file read
+/// through a URL or a text file switch (a picture of it could be read back with a screenshot).
+fn source_settings_problem(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(m) => {
+            if m.get("read_from_file").and_then(Value::as_bool) == Some(true) {
+                return Some("Reading a text source from a file isn't allowed from obs-websocket.".into());
+            }
+            m.values().find_map(source_settings_problem)
+        }
+        Value::Array(a) => a.iter().find_map(source_settings_problem),
+        Value::String(s) if s.trim_start().to_ascii_lowercase().starts_with("file:") => {
+            Some("file: addresses aren't allowed in a source's settings from obs-websocket.".into())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2603,6 +2696,36 @@ mod tests {
         // A client that knows the password gets the same answer as the server's.
         assert_eq!(client_auth(&a, &salt, "chal"), answer(&secret, "chal"));
         assert_ne!(client_auth("wrong", &salt, "chal"), answer(&secret, "chal"));
+    }
+
+    #[test]
+    fn input_settings_never_show_keys_passwords_tokens_or_credentials_in_urls() {
+        let v = json!({
+            "url": "https://u:pw@example.com/a?token=abc&x=1",
+            "stream_key": "live_123",
+            "password": "p",
+            "nested": { "api_key": "k", "auth_header": "Bearer zzz", "text": "hello" },
+            "overlay": "http://127.0.0.1:47820/o/abcdef123456/alerts",
+            "list": ["rtmp://h/app/KEY123", { "secret": "s" }],
+            "width": 1280
+        });
+        let out = redact_source_settings(&v).to_string();
+        for leaked in
+            ["u:pw", "token=abc", "live_123", "\"p\"", "\"k\"", "Bearer zzz", "abcdef123456", "KEY123", "\"s\""]
+        {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        // What isn't secret is kept.
+        assert!(out.contains("hello") && out.contains("1280") && out.contains("example.com"), "{out}");
+    }
+
+    #[test]
+    fn a_source_cannot_be_pointed_at_local_files_through_obs_websocket() {
+        assert!(source_settings_problem(&json!({ "url": "file:///etc/passwd" })).is_some());
+        assert!(source_settings_problem(&json!({ "a": { "b": "FILE:///x" } })).is_some());
+        assert!(source_settings_problem(&json!({ "read_from_file": true, "file": "/etc/hosts" })).is_some());
+        assert!(source_settings_problem(&json!({ "url": "https://example.com", "width": 100 })).is_none());
+        assert!(source_settings_problem(&json!({ "text": "hello", "read_from_file": false })).is_none());
     }
 
     #[test]
