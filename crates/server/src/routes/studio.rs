@@ -143,8 +143,10 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/vst/plugins", get(engine_vst_plugins))
         .route("/studio/engine/sources/{name}/filters/{filter}/vst", get(engine_vst_status).post(engine_vst_act))
         .route("/studio/engine/obs-collections", get(engine_obs_collections))
+        .route("/studio/engine/obs-collections/preview", post(engine_preview_obs))
         .route("/studio/engine/obs-collections/import", post(engine_import_obs))
         .route("/studio/engine/streamlabs-collections", get(engine_streamlabs_collections))
+        .route("/studio/engine/streamlabs-collections/preview", post(engine_preview_streamlabs))
         .route("/studio/engine/streamlabs-collections/import", post(engine_import_streamlabs))
         .route("/studio/engine/sources/{name}/filters/{filter}/edit", post(engine_edit_filter))
         .route(
@@ -1321,12 +1323,20 @@ struct IdBody {
     id: String,
 }
 
+async fn engine_preview_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_preview_obs(&b.id).await?))
+}
+
 async fn engine_import_obs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_import_obs(&b.id).await?))
 }
 
 async fn engine_streamlabs_collections(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(app.engine.studio_streamlabs_collections().await?))
+}
+
+async fn engine_preview_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
+    Ok(Json(app.engine.studio_preview_streamlabs(&b.id).await?))
 }
 
 async fn engine_import_streamlabs(State(app): State<AppState>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
