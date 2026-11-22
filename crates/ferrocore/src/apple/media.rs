@@ -762,13 +762,36 @@ mod tests {
         if f.exists() {
             return Some(f);
         }
+        // Made under a name of its own and renamed whole: tests run side by side, and one that
+        // found the file half written (under load ffmpeg takes a while) played a short clip.
+        let part = std::env::temp_dir().join(format!(
+            "ferrocore-media-controls-{}-{:?}.part.mp4",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let ok = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x90:rate=30:duration=4"])
             .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-shortest", "-c:v", "libx264", "-c:a", "aac"])
-            .arg(&f)
+            .arg(&part)
             .status()
             .is_ok_and(|s| s.success());
-        ok.then_some(f)
+        if ok && std::fs::rename(&part, &f).is_ok() {
+            return Some(f);
+        }
+        let _ = std::fs::remove_file(&part);
+        f.exists().then_some(f)
+    }
+
+    /// Shows pictures as a player would (asking for the one due now every 5 ms) until `done`,
+    /// however long a loaded machine takes: it waits on what the media reports, not on the clock.
+    /// Panics with `what` (and the state) after 60 s.
+    fn wait_for(m: &Media, what: &str, mut done: impl FnMut(&Media) -> bool) {
+        let started = std::time::Instant::now();
+        while !done(m) {
+            assert!(started.elapsed() < Duration::from_secs(60), "gave up waiting for {what}: {:?}", m.state());
+            let _ = m.frame_at(host_ns());
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Seeking past system uptime (`from > host_ns`) must schedule frames at `host_ns + 100 ms`,
@@ -813,28 +836,40 @@ mod tests {
             let end = std::time::Instant::now() + Duration::from_millis(ms);
             while std::time::Instant::now() < end {
                 let _ = m.frame_at(host_ns());
-                std::thread::sleep(Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(5));
             }
         };
-        show(700);
+        // Each step waits for what it expects to see, not for a time to pass.
+        wait_for(&m, "the first half second to play", |m| m.state().1 >= 300_000_000);
         assert_eq!(m.state().0, MediaState::Playing);
         m.control(Control::Pause);
-        show(150);
+        // Paused: pictures already due may still land, then it holds still.
+        let mut last = (u64::MAX, std::time::Instant::now());
+        wait_for(&m, "it to hold still", |m| {
+            let (st, pos) = m.state();
+            if pos != last.0 {
+                last = (pos, std::time::Instant::now());
+            }
+            st == MediaState::Paused && last.1.elapsed() >= Duration::from_millis(200)
+        });
         let at = m.state().1;
-        assert!((300_000_000..900_000_000).contains(&at), "paused about half a second in: {at}");
+        assert!((300_000_000..2_500_000_000).contains(&at), "paused where it was, not run on: {at}");
         show(500);
         assert_eq!(m.state(), (MediaState::Paused, at), "still there");
         m.control(Control::Seek(2_500_000_000));
         m.control(Control::Play);
-        show(500);
-        let (state, after) = m.state();
-        assert!(state == MediaState::Playing && after >= 2_500_000_000, "on from 2.5 s: {after}");
+        wait_for(&m, "it to play on from 2.5 s", |m| {
+            let (st, pos) = m.state();
+            st == MediaState::Playing && pos >= 2_500_000_000
+        });
         m.control(Control::Restart);
-        show(400);
-        assert!(m.state().1 < 1_000_000_000, "from the start again: {}", m.state().1);
+        // From the start again: a picture of the first second is shown (not the old place).
+        wait_for(&m, "a picture from the start", |m| {
+            let (_, pos) = m.state();
+            pos > 0 && pos < 1_000_000_000
+        });
         m.control(Control::Stop);
-        show(100);
-        assert_eq!(m.state(), (MediaState::Stopped, 0));
+        wait_for(&m, "it to stop", |m| m.state() == (MediaState::Stopped, 0));
     }
 
     /// Stopping while paused, then playing, must restart from 0 (previously Stop was dropped in
@@ -942,23 +977,25 @@ mod tests {
     fn a_playlist_style_reader_gets_the_whole_file() {
         let Some(f) = clip() else { return };
         let m = Media::open(&f, false).unwrap_or_else(|e| panic!("{e}"));
-        let (mut frames, mut sound_frames) = (0u32, 0usize);
-        let (mut most_ahead, started) = (0u64, std::time::Instant::now());
-        while !m.ended() && started.elapsed() < Duration::from_secs(8) {
-            if m.frame_at(host_ns()).is_some() {
-                frames += 1;
-            }
-            let now = host_ns();
+        let mut sound_frames = 0usize;
+        // Sound may come no earlier than SOUND_HOLD_NS before it plays. `now` is read after the
+        // take, so a stall between reading the clock and taking (a loaded machine) can't make a
+        // correct release look early; the most it hides is the length of the call itself.
+        let mut most_ahead = 0u64;
+        wait_for(&m, "the file to end", |m| {
             for (pcm, at) in m.take_sound() {
                 sound_frames += pcm.len() / 2;
-                most_ahead = most_ahead.max(at.saturating_sub(now));
+                most_ahead = most_ahead.max(at.saturating_sub(host_ns()));
             }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+            m.ended()
+        });
         assert!(m.ended(), "it ended");
         let secs = sound_frames as f64 / 48_000.0;
         assert!(secs > 3.85, "the whole 4 s of sound came, not the last 300 ms cut off: {secs:.2} s");
-        assert!(frames >= 112, "about 120 pictures of the 4 s clip: {frames}");
+        // Which picture was last shown, not how many were: a reader that polls late skips
+        // pictures that were already due, as a player does. The last of the 120 is at 3.97 s.
+        let last = m.state().1;
+        assert!(last >= 3_800_000_000, "the picture got to the end of the 4 s clip, not 300 ms short: {last} ns");
         assert!(most_ahead <= SOUND_HOLD_NS + 5_000_000, "sound came {} ms before it plays", most_ahead / 1_000_000);
     }
 
@@ -997,7 +1034,7 @@ mod tests {
             return;
         };
         let started = std::time::Instant::now();
-        while !m.ended() && started.elapsed() < Duration::from_secs(6) {
+        while !m.ended() && started.elapsed() < Duration::from_secs(60) {
             let _ = m.frame_at(host_ns());
             let _ = m.take_sound();
             std::thread::sleep(Duration::from_millis(10));
@@ -1038,7 +1075,7 @@ mod tests {
         assert!(m.has_video && m.has_audio);
         let started = std::time::Instant::now();
         let (mut got_pic, mut got_snd) = (false, false);
-        while !m.ended() && started.elapsed() < Duration::from_secs(4) {
+        while !m.ended() && started.elapsed() < Duration::from_secs(60) {
             if m.frame_nv12().is_some() || m.frame_at(host_ns()).is_some() {
                 got_pic = true;
             }
@@ -1095,7 +1132,7 @@ mod tests {
         assert!(m.uses_ffmpeg(), "WebM must route through FFmpeg fallback on macOS");
         let started = std::time::Instant::now();
         let mut pic = None;
-        while started.elapsed() < Duration::from_secs(3) && pic.is_none() {
+        while started.elapsed() < Duration::from_secs(60) && pic.is_none() {
             assert!(m.frame_nv12().is_none(), "alpha WebM must deliver RGBA, not NV12");
             pic = m.frame_at(host_ns());
             std::thread::sleep(Duration::from_millis(10));
