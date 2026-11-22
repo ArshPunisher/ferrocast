@@ -649,6 +649,30 @@ impl Engine {
         self.start_show_with(ShowStartOpts { force, stream: None }).await
     }
 
+    /// Why a show can't be started now: one is already preparing, starting, counting down or
+    /// live, or the last one is still ending.
+    fn show_busy_conflict(m: &BroadcastMachine) -> Result<(), EngineError> {
+        if matches!(
+            m.phase,
+            BroadcastPhase::Preparing | BroadcastPhase::Starting | BroadcastPhase::Countdown | BroadcastPhase::Live
+        ) {
+            return Err(EngineError::Conflict(
+                "A show is already running. End it first, or cancel the countdown.".into(),
+            ));
+        }
+        if m.ending_in_flight {
+            return Err(EngineError::Conflict("The show is ending. Wait a moment and try again.".into()));
+        }
+        Ok(())
+    }
+
+    /// The 409 for a start that can't go ahead, answered from the machine alone: no lock that a
+    /// running start holds is waited for.
+    fn refuse_if_show_busy(&self) -> Result<(), EngineError> {
+        let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+        Self::show_busy_conflict(&m)
+    }
+
     /// Starts the show with per-run options (e.g. `stream: Some(true)` without rewriting saved
     /// `ShowConfig`). Serialized through the locked `BroadcastMachine`.
     pub async fn start_show_with(&self, opts: ShowStartOpts) -> Result<ShowRun, EngineError> {
@@ -707,23 +731,18 @@ impl Engine {
             }
         }
 
+        // A start while a show is already starting, counting down, live or ending is refused at
+        // once, before waiting for `output_gate`: the first start holds the gate for as long as
+        // the Studio takes to start the stream, and a second click must not queue behind it.
+        self.refuse_if_show_busy()?;
         // Atomically claim `Preparing` under `output_gate` before any `.await` so double-clicks,
-        // racing starts, or concurrent encoder benchmarks can never TOCTOU-overlap (C2).
+        // racing starts, or concurrent encoder benchmarks can never TOCTOU-overlap (C2). Checked
+        // again here: another start may have claimed it while this one waited for the gate.
         let my_gen = {
             let _gate = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
-            if matches!(
-                m.phase,
-                BroadcastPhase::Preparing | BroadcastPhase::Starting | BroadcastPhase::Countdown | BroadcastPhase::Live
-            ) {
-                return Err(EngineError::Conflict(
-                    "A show is already running. End it first, or cancel the countdown.".into(),
-                ));
-            }
-            if m.ending_in_flight {
-                return Err(EngineError::Conflict("The show is ending. Wait a moment and try again.".into()));
-            }
+            Self::show_busy_conflict(&m)?;
             if let Some(h) = m.stop_task.take() {
                 h.abort();
             }

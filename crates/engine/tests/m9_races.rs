@@ -337,6 +337,57 @@ async fn stop_during_starting_cancels_show_and_leaves_no_orphan_stream() {
     assert!(!studio.streaming.load(Ordering::SeqCst), "no orphaned live stream after end_live during Starting");
 }
 
+/// A second Start while the first still holds the output gate (it is inside the Studio's stream
+/// start) is refused with 409 at once: it never queues behind the first. A queued second start
+/// would also stall the dashboard's second click until the stream is up. The timeout makes a
+/// regression fail in seconds instead of hanging the run.
+#[tokio::test]
+async fn a_second_start_while_the_first_holds_the_gate_is_refused_at_once() {
+    let (e, studio, _dir) = setup().await;
+    e.patch_show_config(
+        json!({
+            "starting_scene": "Starting", "live_scene": "Gameplay", "countdown_s": 10,
+            "start_stream": true, "stop_stream": true, "stop_delay_s": 0,
+            "discord": false, "alerts_on": false, "bot_on": false, "recap_message": null,
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    studio.stream_start_barrier.arm();
+    let e_start = e.clone();
+    let first = tokio::spawn(async move { e_start.start_show(true).await });
+    studio.stream_start_barrier.entered.notified().await;
+    assert!(e.is_show_active(), "Preparing is active while stream_start runs");
+
+    // Both entry points answer 409 while the first is parked inside stream_start.
+    for _ in 0..3 {
+        let second = tokio::time::timeout(Duration::from_secs(5), e.start_show(true))
+            .await
+            .expect("a second start must not wait for the gate the first one holds");
+        assert!(matches!(second, Err(EngineError::Conflict(_))), "{second:?}");
+    }
+    let forced = tokio::time::timeout(
+        Duration::from_secs(5),
+        e.start_show_with(ShowStartOpts { force: true, stream: Some(true) }),
+    )
+    .await
+    .expect("start with options must not wait for the gate either");
+    assert!(matches!(forced, Err(EngineError::Conflict(_))), "{forced:?}");
+
+    // Let the first one finish; it is still the only show.
+    studio.stream_start_barrier.release.notify_one();
+    let run = tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .expect("the first start finishes once released")
+        .unwrap();
+    assert!(run.is_ok(), "the first start was not disturbed: {run:?}");
+    assert!(e.is_show_active());
+    e.end_live().await.unwrap();
+}
+
 /// Real-shape end to end: a Show with a starting scene and a live scene puts them on air (the
 /// starting scene when it starts, the live scene at zero), none "skipped as empty".
 #[tokio::test]
