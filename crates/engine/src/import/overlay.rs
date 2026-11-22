@@ -121,6 +121,15 @@ struct UndoRecord {
     overlay_ids: Vec<String>,
 }
 
+/// What the import report says when a scene's Ferrocast overlay couldn't be made: what was left
+/// out, and why, so the missing widgets are never a surprise.
+pub(crate) fn overlay_not_made_note(scene: &str, why: &str) -> String {
+    format!(
+        "Couldn't make the Ferrocast overlay for scene “{scene}”, so its widgets were left out: {}",
+        why.trim_end_matches('.')
+    ) + "."
+}
+
 fn packs_root(data: &Path) -> PathBuf {
     data.join("studio").join("packs")
 }
@@ -360,6 +369,7 @@ impl Engine {
         let mut created_overlays: Vec<Overlay> = Vec::new();
         let mut overlay_urls: BTreeMap<String, String> = BTreeMap::new();
         let mut overlays_summary: Vec<CreatedOverlaySummary> = Vec::new();
+        let mut not_made: Vec<String> = Vec::new();
 
         if req.create_overlays.unwrap_or(true) && !parsed.scene_overlays.is_empty() {
             for planned in &parsed.scene_overlays {
@@ -389,7 +399,9 @@ impl Engine {
                         created_overlays.push(saved);
                     }
                     Err(e) => {
+                        // Said in the report, not only logged: the scene's overlay is missing.
                         tracing::warn!(error = %e, scene = %planned.scene_name, "skipped creating Ferrocast overlay for pack scene");
+                        not_made.push(overlay_not_made_note(&planned.scene_name, &e.to_string()));
                     }
                 }
             }
@@ -471,6 +483,7 @@ impl Engine {
         }
 
         let mut notes = parsed.notes;
+        notes.extend(not_made);
         if offline_font_fallback {
             notes.push(
                 "Some fonts couldn't be downloaded because Google Fonts couldn't be reached. Fallback system fonts will be used until you import while online."

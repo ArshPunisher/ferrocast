@@ -798,19 +798,65 @@ fn map_widget_type(raw: Option<&Value>, raw_name: &str) -> Option<(WidgetKind, &
     }
 }
 
+/// A Streamlabs stream label's kind as a Ferrocast label source and its text. The count kinds are
+/// for this stream, this month or all time as the name says; the rest are the latest of each.
+/// A kind nothing here knows is the latest follower (a label with no source isn't valid).
 fn map_streamlabel_template(label_type: &str) -> (&'static str, String) {
     let key = label_type.trim().to_ascii_lowercase();
-    let tpl = match key.as_str() {
-        k if k.contains("follower") && k.contains("count") => "Followers: {session_followers}",
-        k if k.contains("follower") => "Latest follower: {recent_follow}",
-        k if k.contains("sub") && k.contains("count") => "Subs: {session_subs}",
-        k if k.contains("sub") => "Latest sub: {recent_sub}",
-        k if k.contains("donat") || k.contains("tip") => "Latest tip: {recent_tip}",
-        k if k.contains("cheer") || k.contains("bit") => "Top cheer: {recent_bits}",
-        k if k.contains("raid") => "Latest raid: {recent_raid}",
-        _ => "Latest: {recent_follow}",
+    let has = |w: &str| key.contains(w);
+    let span = if has("total") || has("all_time") || has("alltime") {
+        "alltime"
+    } else if has("month") {
+        "monthly"
+    } else {
+        "session"
     };
-    ("Stream label", tpl.to_string())
+    let counted = has("count") || has("total") || has("session") || has("month");
+    let (source, text): (String, &str) = if has("follower") {
+        if counted {
+            (format!("{span}_follows"), "Followers: {value}")
+        } else {
+            ("latest_follower".into(), "Latest follower: {value}")
+        }
+    } else if has("sub") {
+        if counted { (format!("{span}_subs"), "Subs: {value}") } else { ("latest_sub".into(), "Latest sub: {value}") }
+    } else if has("donat") || has("tip") {
+        if counted { (format!("{span}_tips"), "Tips: {value}") } else { ("latest_tip".into(), "Latest tip: {value}") }
+    } else if has("cheer") || has("bit") {
+        if counted {
+            (format!("{span}_bits"), "Bits: {value}")
+        } else {
+            ("latest_bits".into(), "Latest cheer: {value}")
+        }
+    } else if has("raid") {
+        if counted {
+            (format!("{span}_raids"), "Raids: {value}")
+        } else {
+            ("latest_raid".into(), "Latest raid: {value}")
+        }
+    } else {
+        ("latest_follower".into(), "{value}")
+    };
+    // A source the engine doesn't have (a combination it never offers) falls back to the latest.
+    let source = ferrocast_core::overlay::LabelSource::parse(&source)
+        .map(ferrocast_core::overlay::LabelSource::as_str)
+        .unwrap_or("latest_follower");
+    (source, text.to_string())
+}
+
+/// A label's text as the label engine reads it: the old Streamlabs words for the value are `{value}`
+/// here, and anything that doesn't parse or is too long is the plain value.
+fn label_template(raw: &str) -> String {
+    let mut t = raw.to_string();
+    for old in
+        ["recent_follow", "recent_sub", "recent_tip", "recent_bits", "recent_raid", "session_followers", "session_subs"]
+    {
+        t = t.replace(&format!("{{{old}}}"), "{value}");
+    }
+    if t.chars().count() > 240 || ferrocast_core::template::Template::parse(&t).is_err() {
+        return "{value}".into();
+    }
+    t
 }
 
 #[cfg(test)]
@@ -880,9 +926,13 @@ fn widget_default_config(kind: WidgetKind, label_text: Option<&str>, font_family
             "theme": "molten"
         }),
         WidgetKind::Goal => json!({ "goal_id": "", "theme": "molten" }),
-        WidgetKind::Label => {
-            json!({ "template": label_text.unwrap_or("Latest follower: {recent_follow}"), "theme": "molten" })
-        }
+        // A label needs a source (a config without one fails validation and the whole overlay
+        // was dropped): the latest follower unless the pack's kind says otherwise.
+        WidgetKind::Label => json!({
+            "source": "latest_follower",
+            "template": label_text.map_or_else(|| "Latest follower: {value}".to_string(), label_template),
+            "theme": "molten"
+        }),
         WidgetKind::Viewers => json!({ "theme": "molten" }),
         WidgetKind::Poll => json!({ "theme": "molten" }),
         WidgetKind::Giveaway => json!({ "theme": "molten" }),
@@ -1335,17 +1385,17 @@ fn parse_streamlabs_root(
                     let stat = data.get("labelType").and_then(Value::as_str).unwrap_or("follower");
                     let text_settings = data.pointer("/textSource/data/settings").unwrap_or(&Value::Null);
                     let font_hint = ctx.push_text_font(text_settings);
-                    let (_label_title, template) = map_streamlabel_template(stat);
+                    let (label_source, template) = map_streamlabel_template(stat);
                     if scene_widgets.len() < MAX_WIDGETS {
                         ctx.overlay_counter += 1;
                         let wid = format!("lbl-{}", ctx.overlay_counter);
                         let box_rect = clamp_widget_box(pos_x, pos_y, sc_x, sc_y, canvas, WidgetKind::Label);
-                        scene_widgets.push(Widget::new(
-                            &wid,
-                            WidgetKind::Label,
-                            box_rect,
-                            widget_default_config(WidgetKind::Label, Some(&template), font_hint.as_deref()),
-                        ));
+                        scene_widgets.push(Widget::new(&wid, WidgetKind::Label, box_rect, {
+                            let mut cfg =
+                                widget_default_config(WidgetKind::Label, Some(&template), font_hint.as_deref());
+                            cfg["source"] = json!(label_source);
+                            cfg
+                        }));
                     }
                     widget_count += 1;
                     mapped_count += 1;
