@@ -299,11 +299,19 @@ fn main() {
     crash::test_crash_if_asked();
     // The Store package's startup task can't pass `--minimized`: it's asked instead.
     let minimized = std::env::args().any(|a| a == MINIMIZED_ARG) || store::started_at_login();
+    let startup_deeplink = std::env::args().find(|a| is_ferrocast_deeplink(a));
     if store::packaged() {
         tracing::info!("running from the Microsoft Store package: the Store updates it");
     }
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_window(app)))
+        .manage(PendingDeepLink(std::sync::Mutex::new(startup_deeplink)))
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(uri) = args.iter().find(|a| is_ferrocast_deeplink(a)) {
+                dispatch_deeplink(app, uri);
+            } else {
+                show_window(app);
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::Builder::new().args([MINIMIZED_ARG]).build())
@@ -455,6 +463,14 @@ fn main() {
         // macOS: clicking the Dock icon of a running app brings back the hidden window.
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => show_window(app),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        RunEvent::Opened { urls } => {
+            if let Some(uri) = urls.iter().map(|u| u.as_str()).find(|u| is_ferrocast_deeplink(u)) {
+                dispatch_deeplink(app, uri);
+            } else {
+                show_window(app);
+            }
+        }
         RunEvent::Exit => {
             tracing::info!("Ferrocast quitting");
             let running = app.try_state::<Running>();
@@ -1140,6 +1156,47 @@ fn forward_drop(window: &tauri::Window, drop: &tauri::DragDropEvent) {
 }
 
 /// Shows the main window, creating it if it was never opened.
+struct PendingDeepLink(std::sync::Mutex<Option<String>>);
+
+fn is_ferrocast_deeplink(s: &str) -> bool {
+    let lower = s.get(..11).map(str::to_ascii_lowercase);
+    lower.as_deref() == Some("ferrocast:/")
+        && s.get(11..12) == Some("/")
+        && s.len() <= 512
+        && s.is_ascii()
+        && !s.chars().any(char::is_control)
+        && !s.contains('\\')
+}
+
+fn store_deeplink_route(uri: &str) -> String {
+    let mut encoded = String::with_capacity(uri.len());
+    for b in uri.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(*b as char);
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("#/store?link={encoded}")
+}
+
+fn dispatch_deeplink(app: &AppHandle, uri: &str) {
+    if !is_ferrocast_deeplink(uri) {
+        return;
+    }
+    if let Some(pending) = app.try_state::<PendingDeepLink>() {
+        *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(uri.to_string());
+    }
+    show_window(app);
+    if let Some(w) = app.get_webview_window("main") {
+        let detail = serde_json::json!({ "uri": uri });
+        let _ = w.eval(format!("window.dispatchEvent(new CustomEvent('ferrocast:deeplink', {{ detail: {detail} }}))"));
+        if let Some(pending) = app.try_state::<PendingDeepLink>() {
+            *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+}
+
 pub(crate) fn show_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
@@ -1150,11 +1207,17 @@ pub(crate) fn show_window(app: &AppHandle) {
     let Some(running) = app.try_state::<Running>() else {
         return;
     };
+    let pending_route = app
+        .try_state::<PendingDeepLink>()
+        .and_then(|p| p.0.lock().unwrap_or_else(|e| e.into_inner()).take())
+        .map(|uri| store_deeplink_route(&uri));
     // Dev builds only: FERROCAST_DEBUG_ROUTE (e.g. #/studio/golive) opens there, for testing.
     #[cfg(debug_assertions)]
-    let route = std::env::var("FERROCAST_DEBUG_ROUTE").ok().filter(|r| r.starts_with("#/")).unwrap_or_default();
+    let route = pending_route
+        .or_else(|| std::env::var("FERROCAST_DEBUG_ROUTE").ok().filter(|r| r.starts_with("#/")))
+        .unwrap_or_default();
     #[cfg(not(debug_assertions))]
-    let route = String::new();
+    let route = pending_route.unwrap_or_default();
     let Ok(url) = format!("{}/app/{route}", running.base).parse() else {
         return;
     };
@@ -1735,5 +1798,17 @@ mod update_tests {
         assert!(cur_len <= cap, "active log exceeded cap: {cur_len} > {cap}");
         assert!(bak_len <= cap, "backup log exceeded cap: {bak_len} > {cap}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deeplinks_validate_strictly_and_route_to_store() {
+        assert!(is_ferrocast_deeplink("ferrocast://store/install/aurora-pulse"));
+        assert!(!is_ferrocast_deeplink("https://evil.com/store/install/x"));
+        assert!(!is_ferrocast_deeplink("ferrocast://store/install/x\\y"));
+        assert!(!is_ferrocast_deeplink("ferrocast://store/install/x\ny"));
+        assert_eq!(
+            store_deeplink_route("ferrocast://store/install/aurora-pulse"),
+            "#/store?link=ferrocast%3A%2F%2Fstore%2Finstall%2Faurora-pulse"
+        );
     }
 }
