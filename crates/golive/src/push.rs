@@ -814,6 +814,7 @@ pub(crate) async fn connect(t: &Target, via: Option<&links::Network>) -> Result<
 }
 
 /// One connection: connect, publish, forward until the stream ends, `stop`, or an error.
+#[allow(clippy::too_many_arguments)]
 async fn session(
     dest: &Destination,
     target: &Target,
