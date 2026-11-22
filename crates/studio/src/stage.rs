@@ -1639,17 +1639,19 @@ impl Stage {
             self.item(scene, *id)?;
         }
         let before = self.snapshot();
-        let mut out = Vec::with_capacity(boxes.len());
         for &(id, x, y, w, h) in boxes {
-            match self.set_item_box(scene, id, x, y, w, h) {
-                Ok(i) => out.push(i),
-                Err(e) => {
-                    self.restore_all(&before);
-                    return Err(e);
-                }
+            if let Err(e) = self.set_item_box(scene, id, x, y, w, h) {
+                self.restore_all(&before);
+                return Err(e);
             }
         }
-        Ok(out)
+        // As things ended up (a move inside a group fits the group again), in the order asked;
+        // a source inside a group is read through the scene, in canvas pixels.
+        let list = self.items(scene)?;
+        let found = |id: i64| {
+            list.iter().flat_map(|i| std::iter::once(i).chain(i.children.iter())).find(|i| i.id == id).cloned()
+        };
+        boxes.iter().map(|b| found(b.0).ok_or_else(|| fail(format!("\"{scene}\" has no item {}.", b.0)))).collect()
     }
 
     /// Moves and sizes an item so its picture fills `x, y, w, h` on the canvas (a drag in the
@@ -5990,11 +5992,29 @@ mod tests {
         assert_eq!(s.snapshot(), before, "the first one wasn't moved either");
         // Nothing asked, nothing done.
         assert!(ok(s.set_item_boxes("Main", &[])).is_empty());
+
         // Items of a group move with the group's map applied, as one at a time does.
         let group = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
         let inside = ok(s.set_item_boxes("Main", &[(a.id, 0.0, 0.0, 200.0, 100.0), (b.id, 400.0, 0.0, 50.0, 50.0)]));
         assert_eq!(inside.len(), 2);
         assert!(group.group);
+        // A group listed before its child: what comes back is the final state, after the group
+        // has been fitted round its moved source.
+        let g = group.clone();
+        let before = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap_or_else(|| panic!("the group"));
+        let kid = before.children.first().map(|k| (k.id, k.frame)).unwrap_or((0, [0.0; 6]));
+        let res = ok(s.set_item_boxes(
+            "Main",
+            &[
+                (g.id, before.frame[4], before.frame[5], before.frame[0], before.frame[3]),
+                (kid.0, kid.1[4] + 80.0, kid.1[5], kid.1[0], kid.1[3]),
+            ],
+        ));
+        let after = ok(s.items("Main"));
+        let now =
+            |id| after.iter().flat_map(|i| std::iter::once(i.clone()).chain(i.children.clone())).find(|i| i.id == id);
+        assert_eq!(res[0].frame, now(g.id).map(|i| i.frame).unwrap_or([0.0; 6]), "the group as it ended up");
+        assert_eq!(res[1].frame, now(kid.0).map(|i| i.frame).unwrap_or([0.0; 6]));
     }
 
     #[test]

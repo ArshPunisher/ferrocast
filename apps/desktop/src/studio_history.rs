@@ -141,7 +141,8 @@ impl History {
                 // The same ids in any order are the same drag.
                 let mut ids: Vec<i64> = items.iter().map(|b| b.id).collect();
                 ids.sort_unstable();
-                let key = ("boxes", scene.clone(), ids.iter().fold(7i64, |h, i| h.wrapping_mul(31).wrapping_add(*i)));
+                // The whole sorted list is the key: two sets that happen to hash alike are two drags.
+                let key = ("boxes", format!("{scene}\u{1}{ids:?}"), 0);
                 if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
                 {
                     return Some(joined(*save));
@@ -455,6 +456,40 @@ mod tests {
         run(&mut h, &[a, b], 50.0, true);
         run(&mut h, &[d], 60.0, true);
         assert_eq!(h.list().0, ["Move C", "Move 2 sources", "Move 3 sources"]);
+    }
+
+    /// Two different sets of items moved within a second of each other are two steps, even when
+    /// their ids would hash alike ([1, 34] and [2, 3] do).
+    #[test]
+    fn different_sets_of_items_are_different_steps() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in 0..34 {
+            c.add_source(
+                "Main",
+                "color_source_v3",
+                &format!("S{n}"),
+                &serde_json::json!({ "width": 10, "height": 10 }),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, ids: [i64; 2], x: f32| {
+            let items: Vec<ItemBoxIn> = ids.iter().map(|&id| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 }).collect();
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save: true };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let boxes: Vec<_> = ids.iter().map(|&id| (id, x, 0.0, 10.0, 10.0)).collect();
+            let out: Result<Value, String> =
+                c.set_item_boxes("Main", &boxes).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, [1, 34], 100.0);
+        go(&mut h, [2, 3], 200.0);
+        assert_eq!(h.list().0.len(), 2, "two steps: {:?}", h.list().0);
+        // The same two in the other order are the same drag.
+        go(&mut h, [3, 2], 300.0);
+        assert_eq!(h.list().0.len(), 2, "the same set merges: {:?}", h.list().0);
     }
 
     /// Owner's check, 11 Nov: edits to a group's sources, and moving a source in or out of a
