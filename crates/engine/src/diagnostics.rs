@@ -297,7 +297,7 @@ impl Engine {
 
             let stem = filename.strip_suffix(".zip").unwrap_or(&filename);
             let mut n = 1usize;
-            let result = loop {
+            loop {
                 let cand_name = if n == 1 { filename.clone() } else { format!("{stem}-{n}.zip") };
                 let cand = canonical.join(&cand_name);
                 match std::fs::hard_link(&tmp, &cand) {
@@ -323,8 +323,7 @@ impl Engine {
                         "too many existing diagnostics archives",
                     ));
                 }
-            };
-            result
+            }
         })
         .await
         .map_err(|e| EngineError::Unavailable(e.to_string()))?

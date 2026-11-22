@@ -1430,8 +1430,7 @@ fn collect_url_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
             let trimmed_end = body[..path_part_end].trim_end_matches('/').len();
             let is_rtmp_or_stream =
                 ["rtmp://", "rtmps://", "rtmpt://", "rtmpe://", "rtmpte://", "srt://", "srtla://", "rist://"]
-                    .iter()
-                    .any(|sch| scheme_prefix == *sch);
+                    .contains(&scheme_prefix);
             let is_whip = scheme_prefix == "whip://";
             if is_rtmp_or_stream || is_whip {
                 if let Some(host_slash) = body[..trimmed_end].find('/') {
@@ -1570,7 +1569,7 @@ fn collect_kv_and_json_spans(text: &str, spans: &mut Vec<SensitiveSpan>) {
 
             // HTTP Cookie / Set-Cookie header lines hold semicolon-separated pairs up to EOL/quote.
             if matches!(key_name, "cookie" | "set-cookie") && val_delim == ':' {
-                let end = v_start.find(|c: char| matches!(c, '\r' | '\n' | '"' | '\'')).unwrap_or(v_start.len());
+                let end = v_start.find(['\r', '\n', '"', '\'']).unwrap_or(v_start.len());
                 let val = v_start[..end].trim_end();
                 if !val.is_empty() && !is_placeholder_or_benign(val) {
                     let abs_start = offset + key_len + trim_ws;
