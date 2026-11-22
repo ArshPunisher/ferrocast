@@ -385,7 +385,19 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))?;
             let out = root.join(format!("{stem}.mp4"));
             let part = part_path(&out);
-            run_ffmpeg(&ctx, &ffmpeg, trim_args(&path, start, len, precise, &part), len, &part, &out, None).await?;
+            let first =
+                run_ffmpeg(&ctx, &ffmpeg, trim_args(&path, start, len, precise, &part), len, &part, &out, None).await;
+            match first {
+                Ok(()) => {}
+                // A copy can't go into an .mp4 when the clip's sound or picture isn't a kind .mp4
+                // holds (an .mkv with Opus, say): made again instead, as the exact trim does.
+                Err(e) if !precise && !super::jobs::is_cancelled(&e) => {
+                    tracing::info!(error = %e, "the trim couldn't copy the streams: making them again");
+                    run_ffmpeg(&ctx, &ffmpeg, trim_args(&path, start, len, true, &part), len, &part, &out, None)
+                        .await?;
+                }
+                Err(e) => return Err(e),
+            }
             Ok(Made { output: Some(format!("{stem}.mp4")) })
         }))
     }

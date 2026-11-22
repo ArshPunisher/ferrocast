@@ -378,7 +378,7 @@ fn cancel_note(e: &EngineError) -> Option<JobError> {
     }
 }
 
-fn is_cancelled(e: &EngineError) -> bool {
+pub(crate) fn is_cancelled(e: &EngineError) -> bool {
     matches!(e, EngineError::Refused { code: "job_cancelled", .. })
 }
 
