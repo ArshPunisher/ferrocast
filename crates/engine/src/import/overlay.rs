@@ -150,17 +150,32 @@ fn stage_preview(slot: &OverlayPreviewSlot, id: String, parsed: ParsedPack) -> i
     now().0 + (PREVIEW_TTL.as_millis() as i64)
 }
 
-fn take_staged_preview(slot: &OverlayPreviewSlot, preview_id: &str) -> Result<StagedOverlay, EngineError> {
-    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+/// The suggested name of a staged preview, without taking it (so a bad name can be corrected).
+fn peek_suggested_name(slot: &OverlayPreviewSlot, preview_id: &str) -> Result<String, EngineError> {
+    let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
     let now_inst = Instant::now();
-    guard.retain(|s| s.expires_at > now_inst);
-    let pos = guard.iter().position(|s| s.id == preview_id).ok_or_else(|| EngineError::Refused {
+    guard
+        .iter()
+        .find(|s| s.id == preview_id && s.expires_at > now_inst)
+        .map(|s| s.parsed.suggested_name.clone())
+        .ok_or_else(no_preview)
+}
+
+fn no_preview() -> EngineError {
+    EngineError::Refused {
         status: 404,
         code: "no_preview",
         message: "That theme pack preview has expired or already been imported.".into(),
         hint: "Pick the .overlay file again to preview it.".into(),
         retry_after: None,
-    })?;
+    }
+}
+
+fn take_staged_preview(slot: &OverlayPreviewSlot, preview_id: &str) -> Result<StagedOverlay, EngineError> {
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    let now_inst = Instant::now();
+    guard.retain(|s| s.expires_at > now_inst);
+    let pos = guard.iter().position(|s| s.id == preview_id).ok_or_else(no_preview)?;
     Ok(guard.remove(pos))
 }
 
@@ -262,10 +277,13 @@ impl Engine {
         // Refuse before copying files or switching when live streaming or recording is active.
         self.ensure_idle_for_switch("scene collections").await?;
 
-        let staged = take_staged_preview(&self.inner.overlay_import, req.preview_id.trim())?;
+        // The name is checked before the preview is taken: a typo mustn't cost a 150 MB re-upload.
+        let preview_id = req.preview_id.trim();
+        let suggested = peek_suggested_name(&self.inner.overlay_import, preview_id)?;
+        let clean_name =
+            studio_library::check_name(req.name.as_deref().unwrap_or(&suggested)).map_err(EngineError::Invalid)?;
+        let staged = take_staged_preview(&self.inner.overlay_import, preview_id)?;
         let mut parsed = staged.parsed;
-        let requested_name = req.name.as_deref().unwrap_or(&parsed.suggested_name);
-        let clean_name = studio_library::check_name(requested_name).map_err(EngineError::Invalid)?;
 
         let data = self.store().dir().to_path_buf();
         let pack_id = new_id();

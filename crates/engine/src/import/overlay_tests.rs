@@ -1227,3 +1227,31 @@ fn a_source_for_an_overlay_that_was_not_made_is_left_out_with_its_scene_item() {
     assert_eq!(names, vec!["Main", "Title"]);
     assert_eq!(out["sources"][0]["settings"]["items"].as_array().unwrap().len(), 1);
 }
+
+// ---- Neon review M6: a bad name doesn't cost the preview --------------------------------------
+
+#[tokio::test]
+async fn a_bad_name_leaves_the_preview_to_try_again() {
+    let (e, _dir) = engine().await;
+    let mock = start_mock_google_fonts("ok").await;
+    e.set_google_fonts_api(&mock.base);
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let prev = e.preview_overlay_pack(build_zip(vec![("config.json", &cfg, None)]), "n.overlay".into()).await.unwrap();
+    let bad = e
+        .import_overlay_pack(OverlayPackImportReq {
+            preview_id: prev.preview_id.clone(),
+            name: Some("bad\u{7}name".into()),
+            ..Default::default()
+        })
+        .await;
+    assert!(matches!(bad, Err(EngineError::Invalid(_))), "{:?}", bad.map(|r| r.id));
+    let ok = e
+        .import_overlay_pack(OverlayPackImportReq {
+            preview_id: prev.preview_id,
+            name: Some("Good name".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(ok.name, "Good name");
+}
