@@ -77,13 +77,11 @@ struct SupporterStats {
 
 impl SupporterStats {
     /// Deterministic local contribution score for ranking (subs ≈ 500 pts, 1 bit = 1 pt,
-    /// tip major unit * 100 ≈ cents). Never displayed as converted currency!
+    /// tip normalized via coarse USD cents). Never displayed as converted currency!
     fn score(&self) -> u128 {
         let mut s = u128::from(self.subs) * 500 + u128::from(self.bits);
         for m in &self.tips {
-            let scale = 10_i64.pow(exponent(&m.currency));
-            let cents_equiv =
-                if scale > 0 { (i128::from(m.minor.max(0)) * 100 / i128::from(scale)) as u128 } else { 0 };
+            let cents_equiv = u128::try_from(normalized_cents(m.minor.max(0), &m.currency).max(0)).unwrap_or(0);
             s = s.saturating_add(cents_equiv);
         }
         s
@@ -118,6 +116,8 @@ pub struct PeriodTotals {
     tips_log: Vec<TipRecord>,
     reversed: HashSet<String>,
     supporters: HashMap<String, SupporterStats>,
+    #[serde(default)]
+    next_anon_id: u64,
 }
 
 impl PeriodTotals {
@@ -159,12 +159,21 @@ impl PeriodTotals {
             }
             EventKind::Tip { actor, money, status: PaymentStatus::Captured, .. }
             | EventKind::PaidMessage { actor, money, .. } => {
+                if money.minor <= 0 {
+                    return;
+                }
                 if let Some(src) = &event.source_id
                     && self.reversed.contains(src)
                 {
                     return;
                 }
-                let k = actor_key(event.platform, actor.id.as_deref(), &actor.display_name);
+                let k = if actor.anonymous {
+                    let id = self.next_anon_id;
+                    self.next_anon_id = self.next_anon_id.saturating_add(1);
+                    format!("anon:{id}")
+                } else {
+                    actor_key(event.platform, actor.id.as_deref(), &actor.display_name)
+                };
                 let name = if actor.anonymous { "Anonymous".to_string() } else { actor.display_name.clone() };
                 self.tips_log.push(TipRecord {
                     source_id: event.source_id.clone(),
@@ -322,6 +331,9 @@ impl LatestLabels {
             }
             EventKind::Tip { actor, money, status: PaymentStatus::Captured, .. }
             | EventKind::PaidMessage { actor, money, .. } => {
+                if money.minor <= 0 {
+                    return;
+                }
                 if let Some(src) = &event.source_id
                     && self.reversed_sources.contains(src)
                 {
@@ -595,7 +607,10 @@ fn train_actor(event: &Event) -> Option<(String, String)> {
         EventKind::GiftBatch { gifter, .. } => {
             Some((actor_key(event.platform, gifter.id.as_deref(), &gifter.display_name), gifter.display_name.clone()))
         }
-        EventKind::Tip { actor, status: PaymentStatus::Captured, .. } | EventKind::PaidMessage { actor, .. } => {
+        EventKind::Tip { actor, money, status: PaymentStatus::Captured, .. }
+        | EventKind::PaidMessage { actor, money, .. }
+            if money.minor > 0 =>
+        {
             let name = if actor.anonymous { "Anonymous".to_string() } else { actor.display_name.clone() };
             Some((actor_key(event.platform, actor.id.as_deref(), &name), name))
         }
@@ -662,9 +677,48 @@ fn sub_money(list: &mut Vec<Money>, m: &Money) {
     }
 }
 
+/// Coarse USD-cents equivalent purely for cross-currency ranking (`Top tip` / `Top supporter`).
+/// Rendered currency totals and single tips always stay in their original currency without FX conversion.
 fn normalized_cents(minor: i64, currency: &str) -> i128 {
-    let scale = 10_i64.pow(exponent(currency));
-    if scale > 0 { i128::from(minor) * 100 / i128::from(scale) } else { i128::from(minor) }
+    let scale = 10_i128.pow(exponent(currency));
+    let milli_cents_per_major = match currency {
+        "USD" | "USDC" | "USDT" => 100_000,
+        "EUR" => 108_000,
+        "GBP" => 127_000,
+        "CHF" => 113_000,
+        "CAD" => 72_000,
+        "AUD" => 65_000,
+        "NZD" => 60_000,
+        "SGD" => 74_000,
+        "HKD" => 12_800,
+        "INR" => 1_180,
+        "JPY" => 650,
+        "KRW" => 72,
+        "CNY" => 13_800,
+        "TWD" => 3_100,
+        "BRL" => 17_500,
+        "MXN" => 5_000,
+        "PHP" => 1_720,
+        "TRY" => 2_900,
+        "PLN" => 24_500,
+        "SEK" => 9_200,
+        "NOK" => 9_100,
+        "DKK" => 14_500,
+        "ZAR" => 5_500,
+        "SAR" => 26_700,
+        "AED" => 27_200,
+        "VND" => 4,
+        "IDR" => 6,
+        "CLP" => 105,
+        "ISK" => 720,
+        "BHD" => 265_000,
+        "KWD" => 325_000,
+        "OMR" => 260_000,
+        "JOD" => 141_000,
+        other if exponent(other) == 0 => 100,
+        _ => 100_000,
+    };
+    if scale > 0 { i128::from(minor) * milli_cents_per_major / (1_000 * scale) } else { i128::from(minor) }
 }
 
 #[cfg(test)]
@@ -823,7 +877,7 @@ mod tests {
         assert_eq!(monthly.subs, 5);
         assert_eq!(monthly.formatted_tips(), "₹500 · $600");
         assert_eq!(alltime.formatted_tips(), "₹1,500 · $600");
-        assert!(alltime.top_supporter_display().starts_with("OldPatron"));
+        assert!(alltime.top_supporter_display().starts_with("Frank"));
         assert!(session.top_supporter_display().starts_with("Frank"));
 
         // Refund Frank's $600 tip (`t2`) -> drops Frank from top supporter & removes USD
@@ -839,7 +893,7 @@ mod tests {
         latest.observe(&rev);
 
         assert_eq!(session.formatted_tips(), "₹500");
-        assert!(session.top_supporter_display().starts_with("Eve"));
+        assert!(session.top_supporter_display().starts_with("Carol"));
         assert_eq!(alltime.formatted_tips(), "₹1,500");
 
         // Latest labels
@@ -1033,5 +1087,54 @@ mod tests {
         latest.observe(&late_rev);
         latest.observe(&t3_late);
         assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("FirstTipper $10"));
+    }
+
+    #[test]
+    fn cross_currency_ranking_uses_coarse_usd_without_converting_display() {
+        let mut p = PeriodTotals::default();
+        p.observe(&tip(1_000, "jp1", "TokyoFan", 1_000, "JPY", PaymentStatus::Captured));
+        // Displayed unconverted when alone
+        assert_eq!(p.top_tip_display(), "TokyoFan ¥1,000");
+
+        // $10 USD (1000 cents) beats ¥1,000 JPY (~$6.50) in both top tip and supporter rank
+        p.observe(&tip(2_000, "us1", "AustinFan", 1_000, "USD", PaymentStatus::Captured));
+        assert_eq!(p.top_tip_display(), "AustinFan $10");
+        assert!(p.top_supporter_display().starts_with("AustinFan"));
+    }
+
+    #[test]
+    fn anonymous_tips_do_not_aggregate_and_non_positive_tips_are_ignored() {
+        let mut period = PeriodTotals::default();
+        let mut latest = LatestLabels::default();
+        let mut train = ComboTrain::new(ComboTrainConfig { window_s: 60, step_s: 15, max_s: 90, threshold: 2 });
+
+        let mut anon1 = tip(1_000, "a1", "", 1_000, "USD", PaymentStatus::Captured);
+        if let EventKind::Tip { ref mut actor, .. } = anon1.kind {
+            *actor = Actor::anonymous(Platform::Tips);
+        }
+        let mut anon2 = tip(2_000, "a2", "", 1_000, "USD", PaymentStatus::Captured);
+        if let EventKind::Tip { ref mut actor, .. } = anon2.kind {
+            *actor = Actor::anonymous(Platform::Tips);
+        }
+        let named = tip(3_000, "n1", "NamedFan", 1_500, "USD", PaymentStatus::Captured);
+        let zero_tip = tip(4_000, "z1", "ZeroFan", 0, "USD", PaymentStatus::Captured);
+        let neg_tip = tip(5_000, "neg1", "NegFan", -500, "USD", PaymentStatus::Captured);
+
+        for ev in [&anon1, &anon2] {
+            period.observe(ev);
+        }
+        // Two anonymous $10 tips must NOT combine into "Anonymous $20"
+        assert_eq!(period.top_tip_display(), "Anonymous $10");
+        period.observe(&named);
+        assert_eq!(period.top_tip_display(), "NamedFan $15");
+
+        for ev in [&anon1, &zero_tip, &neg_tip] {
+            period.observe(ev);
+            latest.observe(ev);
+            train.observe(ev);
+        }
+        assert_eq!(latest.label(LabelSource::LatestTip).as_deref(), Some("Anonymous $10"));
+        assert!(!train.view(Millis(5_000)).active, "zero/neg tips must not ignite 2-event train");
+        assert_eq!(train.view(Millis(5_000)).warmup_count, 1);
     }
 }
