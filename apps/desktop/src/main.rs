@@ -1158,6 +1158,24 @@ fn forward_drop(window: &tauri::Window, drop: &tauri::DragDropEvent) {
 /// Shows the main window, creating it if it was never opened.
 struct PendingDeepLink(std::sync::Mutex<Option<String>>);
 
+impl PendingDeepLink {
+    /// The link waiting, left in place.
+    fn peek(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Clears the link, but only if it is still `used`: one that arrived since stays for its own turn.
+    fn clear_if(&self, used: &str) -> bool {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.as_deref() == Some(used) {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn is_ferrocast_deeplink(s: &str) -> bool {
     let lower = s.get(..11).map(str::to_ascii_lowercase);
     lower.as_deref() == Some("ferrocast:/")
@@ -1207,10 +1225,9 @@ pub(crate) fn show_window(app: &AppHandle) {
     let Some(running) = app.try_state::<Running>() else {
         return;
     };
-    let pending_route = app
-        .try_state::<PendingDeepLink>()
-        .and_then(|p| p.0.lock().unwrap_or_else(|e| e.into_inner()).take())
-        .map(|uri| store_deeplink_route(&uri));
+    // Read, not taken: it is cleared below only once the window is really there.
+    let pending_uri = app.try_state::<PendingDeepLink>().and_then(|p| p.peek());
+    let pending_route = pending_uri.as_deref().map(store_deeplink_route);
     // Dev builds only: FERROCAST_DEBUG_ROUTE (e.g. #/studio/golive) opens there, for testing.
     #[cfg(debug_assertions)]
     let route = pending_route
@@ -1249,8 +1266,14 @@ pub(crate) fn show_window(app: &AppHandle) {
             tauri::webview::NewWindowResponse::Deny
         })
         .build();
-    if let Err(e) = built {
-        tracing::error!(error = %e, "couldn't open the window");
+    match built {
+        Ok(_) => {
+            if let (Some(used), Some(pending)) = (&pending_uri, app.try_state::<PendingDeepLink>()) {
+                pending.clear_if(used);
+            }
+        }
+        // The link stays: the next time the window is asked for it opens where the link said.
+        Err(e) => tracing::error!(error = %e, "couldn't open the window"),
     }
 }
 
@@ -1390,6 +1413,24 @@ mod tests {
     use super::*;
 
     const BASE: &str = "http://127.0.0.1:7878";
+
+    /// The link a window is opened for stays until the window is really there, and a newer link
+    /// that arrived meanwhile is never cleared by the older one's success.
+    #[test]
+    fn a_pending_link_is_cleared_only_after_its_window_opened_and_only_that_link() {
+        let p = PendingDeepLink(std::sync::Mutex::new(Some("ferrocast://store/install/a".into())));
+        // Reading it for the route leaves it: if the window fails to build, the next try has it.
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/a"));
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/a"));
+        // A newer link arrives while the window is being built: the older one's success keeps it.
+        *p.0.lock().unwrap() = Some("ferrocast://store/install/b".into());
+        assert!(!p.clear_if("ferrocast://store/install/a"));
+        assert_eq!(p.peek().as_deref(), Some("ferrocast://store/install/b"));
+        // The one that was used is cleared.
+        assert!(p.clear_if("ferrocast://store/install/b"));
+        assert_eq!(p.peek(), None);
+        assert!(!p.clear_if("ferrocast://store/install/b"), "nothing left to clear");
+    }
 
     fn nav(u: &str) -> (bool, bool) {
         navigation(&u.parse().unwrap(), BASE)
