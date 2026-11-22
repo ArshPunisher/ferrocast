@@ -441,7 +441,7 @@ fn pack_design(row: &Map<String, Value>) -> Option<ferrocast_core::design::Desig
 /// Settings that belong to this computer, not to the streamer's setup: a pack (perhaps one
 /// someone else shared) must not open the server to the network, start the app at login,
 /// or point the OBS connection, and with it the OBS password, at another machine.
-const DEVICE_ENGINE_FIELDS: &[&str] = &["lan_access", "launch_at_login", "close_to_tray"];
+const DEVICE_ENGINE_FIELDS: &[&str] = &["lan_access", "api_keys_over_lan", "launch_at_login", "close_to_tray"];
 
 fn keep_device_settings(store: &Store, tables: &mut [(&str, Vec<Map<String, Value>>)]) {
     let Some((_, rows)) = tables.iter_mut().find(|(t, _)| *t == "settings") else {
