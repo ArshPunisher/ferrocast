@@ -356,6 +356,11 @@ mod tests {
         }
         for (m, p) in [
             ("POST", "/chat/send"),
+            // Putting a viewer's words on stream is the owner's call, not a mod's.
+            ("GET", "/chat/highlight"),
+            ("POST", "/chat/highlight"),
+            ("DELETE", "/chat/highlight"),
+            ("GET", "/credits"),
             ("GET", "/settings"),
             ("PUT", "/mod/filters"),
             ("PUT", "/mod/panic/config"),

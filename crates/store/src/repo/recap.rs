@@ -1,7 +1,7 @@
 //! Reads for the end-of-stream recap.
 
 use ferrocast_core::event::{Event, Platform};
-use ferrocast_core::recap::Chatter;
+use ferrocast_core::recap::{Chatter, Person};
 use rusqlite::{OptionalExtension, params};
 
 use crate::Store;
@@ -101,6 +101,29 @@ pub fn chat_between(store: &Store, from: i64, to: i64, top: u32) -> Result<(u64,
     })
 }
 
+/// Unique human moderators (`Roles::MODERATOR` and not `Roles::BOT`) who spoke in `[from, to)`,
+/// used to hydrate End Credits if the app restarts mid-stream or right after stream end.
+pub fn mods_between(store: &Store, from: i64, to: i64, max: usize) -> Result<Vec<Person>> {
+    store.read(|c| {
+        let limit = i64::try_from(max.clamp(1, 200)).unwrap_or(200);
+        let mut st = c.prepare(
+            "SELECT platform, MAX(actor_name) AS name FROM events
+             WHERE kind = 'chat_message' AND origin = 'live' AND hidden = 0
+               AND occurred_at >= ?1 AND occurred_at < ?2
+               AND (COALESCE(json_extract(data, '$.actor.roles'), 0) & 2) != 0
+               AND (COALESCE(json_extract(data, '$.actor.roles'), 0) & 256) = 0
+               AND actor_name IS NOT NULL AND actor_name != ''
+             GROUP BY platform, LOWER(actor_name)
+             ORDER BY LOWER(MAX(actor_name)) ASC LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![from, to, limit], |r| {
+            let platform: String = r.get(0)?;
+            Ok(Person { platform: super::from_json(0, format!("\"{platform}\""))?, name: r.get(1)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +167,20 @@ mod tests {
         assert_eq!(last_online(&s).unwrap(), Some(100));
         assert_eq!(offline_after(&s, 100).unwrap(), None);
         assert!(support_since(&s, 0).unwrap().is_empty());
+
+        // Hidden mod messages and bots must never appear in mods_between.
+        let m_mod = chat("m_mod1", "ModAna", Roles::MODERATOR, 120);
+        let m_dup = chat("m_mod2", "ModAna", Roles::MODERATOR, 125);
+        let m_hidden = chat("m_mod_h", "ModHidden", Roles::MODERATOR, 130);
+        let mut bot_roles = Roles::MODERATOR;
+        bot_roles.insert(Roles::BOT);
+        let m_bot = chat("m_bot", "Nightbot", bot_roles, 135);
+        for m in [&m_mod, &m_dup, &m_hidden, &m_bot] {
+            insert(&s, m).unwrap();
+        }
+        crate::repo::events::hide(&s, Platform::Twitch, "m_mod_h").unwrap();
+        let mods = mods_between(&s, 100, 200, 50).unwrap();
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].name, "ModAna");
     }
 }

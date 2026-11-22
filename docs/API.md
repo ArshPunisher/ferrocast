@@ -62,6 +62,8 @@ type Event = { id: string; seq: number; platform: Platform; channel: { platform:
 type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; variation_id: string; kind: string; platform: Platform;
                        title: string; body: string; image: string | null; sound: string | null; volume: number;
                        duration_ms: number; layout: string; css: string; tts_text: string | null; tts_audio: string | null; test: boolean;
+                       anim?: Anim /* timing and text effect from the winning variation (R25) */;
+                       custom?: { html: string; css: string; fields: Record<string, string | number | boolean>; vars: Record<string, string> } /* set when Variation.custom_enabled is true; overlays render it only inside a sandboxed frame (R25) */;
                        design?: AlertDesignView /* only when an alert design dressed it (§4 Designs); layout is then "design" */ };
 // sound: a media id, or `builtin:<id>` for one of the overlay's built-in sounds (ids as in Sound.builtin below). A new install's
 //   default rules start with one each (core::alert::default_sound: follow glint, subscription cascade, gift_batch bloom,
@@ -81,6 +83,7 @@ type RenderedAlert = { alert_id: string; event_id: string; rule_id: string; vari
 | POST | `/api/v1/setup/complete` | → 204: first run is done, `setup_done` stays true (it's also true once an overlay exists) |
 | GET | `/api/v1/stats/session` | → `{ live, started_at (kept after the stream ends), follows, subs, tips: Money[] (one per currency, refunds taken off), bits, messages, peak_viewers, viewers: { twitch?, youtube?, kick? } }` |
 | GET | `/api/v1/recap?since=<ms>` | → `Recap` (below): this stream so far, or the last one after it ended. `since` (optional, not in the future, else 400 `since: …`) picks the start instead |
+| GET | `/api/v1/credits` | → `Credits` (`{ started_at, followers, subs, gifters, tippers, raiders, mods }`): session end-credits roster (capped at 200 per section; human mods only, bots excluded) |
 | GET | `/api/v1/themes` | → `{ id, name, description, pro }[]`: `molten` (default), `daylight`, `arcade`, `minimal`, `sticker`; unknown ids fall back to `molten` |
 | GET | `/api/v1/updates` | → `UpdateView` (below). Never offer an update while `blocked_while_live` (R-60). `checked_at: null` means not checked yet, which is not "up to date" |
 | POST | `/api/v1/updates/check` | "Check for updates": asks the desktop app to read the feed now and answers 200 `UpdateView` once it has (after 20 s still `checking: true`; the `update` frame brings the rest). A failed check is in `error`, not an HTTP error. 409 `no_updater` (with where to download) in the headless app |
@@ -112,7 +115,7 @@ An overlay is one OBS browser source (a 1920×1080 canvas by default) holding wi
 ```ts
 type Overlay = { id: string; name: string; url: string; width: number; height: number; widgets: Widget[]; updated_at: number;
                  design: { id: string; scene: string; branded: boolean; follows: boolean } | null /* the gallery design it came from (§4 Designs) */ };
-type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll" | "giveaway" | "layer";
+type Widget = { id: string; kind: "alerts" | "chat" | "events" | "goal" | "label" | "viewers" | "poll" | "giveaway" | "end_credits" | "emote_wall" | "chat_highlight" | "layer";
                 x: number; y: number; w: number; h: number; config: object;
                 locked?: boolean; hidden?: boolean; rotation?: number /* degrees, -360…360 */; opacity?: number /* 0…1 */ };
 // locked/hidden/rotation/opacity are left out when false/false/0/1. Widgets are drawn bottom to top in array order.
@@ -136,6 +139,9 @@ Widget `config` per kind:
 - `viewers`: `{ platforms: Platform[], theme: string }`
 - `poll`: `{ theme: string }` (shows the running or last poll; hidden when there's none)
 - `giveaway`: `{ theme: string }` (how to enter while open, then a winner card)
+- `end_credits`: `{ theme: string, title?: string (≤80 chars), sections?: ("followers" | "subs" | "gifters" | "tippers" | "raiders" | "mods")[] (1–6 unique), speed?: number (20–300 px/s), font?: FontFamily, text_color?: Color | null, accent_color?: Color | null, background?: Color | null, loop?: boolean }`
+- `emote_wall`: `{ theme: string, platforms?: Platform[], max_emotes?: number (5–120), size?: number (24–128 px), lifetime_s?: number (1–20), physics?: "bounce" | "rain" | "fountain" }`. Emote images are filtered strictly to trusted platform CDN hosts (`static-cdn.jtvnw.net`, `files.kick.com`, `images.kick.com`, `cdn.7tv.app`, `cdn.betterttv.net`, `cdn.frankerfacez.com`, `yt3.ggpht.com`)
+- `chat_highlight`: `{ theme: string, duration_s?: number | null (5–3600 s or null = until dismissed), font_size?: number (14–48 px), show_badges?: boolean, show_platform?: boolean }`
 - `layer` (a piece of a scene): `{ type: "image" | "text" | "shape" | "frame" | "webcam" | "brand" | "fx" | "music" | "sound", anim?: { in: AnimIn, delay_ms: 0…10000, loop: "none" | "float" | "pulse" | "shimmer" }, css?: string }` plus, by type:
   - `image`: `{ media: MediaRef, fit?: "cover" | "contain" | "fill", radius? }`
   - `text`: `{ text (≤500 chars, shown as is), font?: FontFamily, size? 6…400, weight? 100…900, color?, align?: "left" | "center" | "right", uppercase?, italic?, letter_spacing? -0.2…1, shadow?: "none" | "soft" | "hard" | "glow", outline? 0…20, outline_color? }`
@@ -156,7 +162,7 @@ PUT `/overlays/{id}` can't change `design`. `design.follows` (set by the engine)
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/v1/alert-rules` | → `AlertRule[]` (see `core::alert`) |
-| PUT | `/api/v1/alert-rules/{id}` | `AlertRule` → `AlertRule` (400 with the validation message). `AlertRule.interrupt` (bool, default false): a new alert from this rule ends the one playing (a `hide`, then the new `show` at once, no gap) and goes to the front; while the queue is paused it just waits. `Variation.weight` (0 to 1000, default 1; 400 `variation 'x': weight must be 0 to 1000`): among the matching conditional looks of the highest priority one is picked by weight (a 0 is never picked while another has a weight; all 0 = equal chances); the default look only when no conditional one matches |
+| PUT | `/api/v1/alert-rules/{id}` | `AlertRule` → `AlertRule` (400 with the validation message). `AlertRule.interrupt` (bool, default false): a new alert from this rule ends the one playing (a `hide`, then the new `show` at once, no gap) and goes to the front; while the queue is paused it just waits. `Variation.weight` (0 to 1000, default 1; 400 `variation 'x': weight must be 0 to 1000`): among the matching conditional looks of the highest priority one is picked by weight (a 0 is never picked while another has a weight; all 0 = equal chances); the default look only when no conditional one matches. **Alert box editor v2 (R25):** `Variation.anim` (`{ in, out, text, in_ms /* 0–3000 */, out_ms /* 0–3000 */, text_delay_ms /* 0–10000 */ }`, defaults `{ in: "fade", out: "fade", text: "none", in_ms: 400, out_ms: 350, text_delay_ms: 150 }`; `in_ms + out_ms < duration_ms` and `text_delay_ms < duration_ms`); `Variation.custom_enabled` (bool, default false), `Variation.html` (≤ 20,000 chars), `Variation.css` (`check_css`, ≤ 20,000 chars, no `@import` or external `url()` except `data:image/`), `Variation.fields` (up to 32 schema items `{ key /* [a-z][a-z0-9_]{0,39}, unique, not a built-in var */, label, type: "text" | "number" | "color" | "toggle" | "select", default, min?, max?, options? }`), and `Variation.field_values` (key/value overrides validated against `fields`). `Variation.html` is HTML and CSS only: saving refuses script, meta, base, form, frames, objects, media, `on*` handlers, `javascript:` and non-picture URLs, and checks every `<style>` block and `style` attribute with `check_css`; `{token}`s may fill text and `alt`/`title`/`aria-label`/`aria-description`/`aria-valuetext`/`data-*` attributes only (400 names the reason); at most 20 looks per rule; a paired phone cannot add or change `custom_enabled`, `html` or `fields` (403 `not_allowed_for_role`). Templates in `title`, `body` and `html` reject unknown `{token}` names (`KNOWN_VARS` or declared `fields` keys; 400) |
 | POST | `/api/v1/alert-rules` | `AlertRule` → `AlertRule` |
 | DELETE | `/api/v1/alert-rules/{id}` | → 204 |
 | POST | `/api/v1/test` | `{ kind, platform?, design_id?, amount? }` → 202 `{ ok: true }` (fires a `test` event through the real pipeline). `amount` (major units; bits, gifted subs, raid viewers or sub months for those kinds; above 0, up to 1,000,000,000) changes the sample's amount, else 400 `amount: …`. `design_id` shows it with that alert design instead of the one in use (the designer's "Send test alert"); 404 when unknown, 400 when it isn't an alert design |
@@ -292,6 +298,7 @@ Tips goals are in **major units** of their currency everywhere (API, `goals` fra
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/v1/chat?limit=200` | → `Event[]` (recent chat_message events): this stream's (and the 5 minutes before it), or the last 6 hours while offline; chat overlays' snapshots likewise. When a new stream starts, chat overlays get `clear_chat` (`platform: null`) and dashboards a `resync`, so a stream never opens with the last one's messages |
+| GET / POST / DELETE | `/api/v1/chat/highlight` | GET → `ChatHighlight \| null`. POST `{ event_id, duration_s?: 5..3600 \| null }` → `200 ChatHighlight` (400 names invalid field, 404 `highlight_not_found` when hidden/missing). DELETE → `204` dismisses the pinned message; deleting the message, banning the user, or starting a new stream also clears it |
 | POST | `/api/v1/chat/send` | `{ text, platforms: Platform[] \| "all", reply_to?: { platform, message_id } }` → `{ sent: Platform[], failed: { platform, reason }[] }` |
 | POST | `/api/v1/mod/delete` | `{ platform, message_id }` → 204 |
 | POST | `/api/v1/mod/timeout` | `{ platform, user_id, seconds, reason? }` → 204 |
@@ -563,6 +570,7 @@ The cloud copy wins a conflict: this PC's overlay or design is kept as "… (thi
 | DELETE | `/api/v1/plugins/{id}` | → 204. 404 `plugin_not_found` |
 | GET | `/api/v1/plugins/{id}/panel` | a panel plugin → `{ html, actions }`, for a sandboxed frame. 404 `plugin_not_found` (or not a panel), 422 when it's off |
 | GET | `/plugin-panel/{id}` (not under `/api/v1`, no token: never reached from a phone) | the same page as a page of its own, for the dashboard's frame (`sandbox="allow-scripts"`) when the dashboard is the engine's own: a `srcdoc` frame is held to the dashboard's policy too, which runs no inline scripts. Its policy: `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts`. Same 404 / 422 |
+| GET | `/alert-sandbox` (static HTML page, not under `/api/v1`, no token) | static bootstrap frame for sandboxed custom alert HTML/CSS rendering inside `sandbox="allow-scripts"` (no `allow-same-origin`) when served under `DASHBOARD_CSP` / `OVERLAY_CSP`: receives only a schema-validated `postMessage` payload from its framing window (answered once, to the framing origin given in `?origin=`) and never touches network except allowlisted picture hosts. Custom alerts are HTML and CSS only: the one script is the bootstrap, allowed by a fresh per-response nonce, and it removes script, handlers, navigation and fetches from the template before drawing it. Policy: `default-src 'none'; script-src 'nonce-<random>'; style-src 'unsafe-inline'; img-src data: blob: https://static-cdn.jtvnw.net https://yt3.ggpht.com https://files.kick.com https://cdn.ferrocast.com https://cdn.discordapp.com; font-src data: https://fonts.gstatic.com; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts` |
 | POST | `/api/v1/plugins/{id}/act` | a step (as Automations' `then`) a panel asked for → 204. 403 `plugin_not_allowed` when its `plugin.json` doesn't list that step, 404, 422 when off |
 | DELETE | `/api/v1/media/{id}` | → 204 (409 if an alert still uses it, with which one) |
 
@@ -1051,6 +1059,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `chatter { event_id, kind: "first" } | { event_id, kind: "returning", days }` (after that message's `event` frame; replayed with it on reconnect)
 - `giveaway { giveaway: GiveawayView | null }` (on every change, at most every 250 ms while entries come in)
 - `poll { poll: PollView | null }` (on start, end, removal, and at most every 250 ms while votes come in)
+- `chat_highlight { highlight: ChatHighlight | null }` (when a chat message is pinned, replaced, dismissed, expired, deleted, or cleared)
 - `update UpdateView` (§4): on every change (a check starting or finishing, download progress at most 5 times a second, installing, ready, failed)
 - `account AccountView` (§4 Ferrocast account): on every change (sign-in started, finished, failed or cancelled, signed out, a refresh that changed it). Never sent to phones.
 - `golive { live, stats: StreamStats, vertical_live, vertical_stats: StreamStats, destinations: DestinationView[], cut_state: CutState | null, ffmpeg: FfmpegState }` (§4 Go live everywhere): every second while OBS streams to Ferrocast, and after every change
@@ -1066,11 +1075,11 @@ Page: `GET /o/<token>/` (the overlay bundle). Media: `GET /o/<token>/media/<id>`
 Server → overlay frames `{ v: 1, seq, type, data }`:
 | type | data |
 |---|---|
-| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null, show: { countdown_ends_at: number \| null }, music: MusicNow } }`, always first. `show.countdown_ends_at` is Start show's countdown end (ms): a text layer with `countdown` follows it unless `countdown_show: false`, restarts each time it comes on air unless `countdown_restart: false`, and counts up ("+01:23") past zero with `countdown_up` |
-| `event` | `Event`: chat messages and alertable events the overlay's widgets need (filtered server-side) |
+| `snapshot` | `{ overlay: Overlay, state: { goals: Goal[], labels: { [widget_id]: string }, viewers: { [platform]: number }, events: Event[] (last 25 alertable), chat: Event[] (last 50), poll: PollView \| null, giveaway: GiveawayCard \| null, credits?: Credits \| null, chat_highlight?: ChatHighlight \| null, show: { countdown_ends_at: number \| null }, music: MusicNow } }`, always first. `show.countdown_ends_at` is Start show's countdown end (ms): a text layer with `countdown` follows it unless `countdown_show: false`, restarts each time it comes on air unless `countdown_restart: false`, and counts up ("+01:23") past zero with `countdown_up` |
+| `event` | `Event`: chat messages and alertable events the overlay's widgets need (filtered server-side; `emote_wall`-only overlays receive live `chat_message`/moderation frames without snapshot chat backfill) |
 | `alert` | `RenderedAlert` |
 | `alert_hide` | `{ alert_id }` |
-| `state` | partial `{ goals?, labels?, viewers?, poll?, giveaway?, show? }` (`show` whenever Start show's countdown starts, ends or is cancelled) (`poll` and `giveaway` only to overlays with that widget) |
+| `state` | partial `{ goals?, labels?, viewers?, poll?, giveaway?, credits?, chat_highlight?, show? }` (`show` whenever Start show's countdown starts, ends or is cancelled) (`poll`, `giveaway`, `credits`, `chat_highlight` only to overlays with that widget) |
 | `config` | `Overlay` (re-render without reloading) |
 | `music` | `MusicNow` (§4 Music), `seq: 0` (never replayed): only to overlays with an `fx`, `music` or `sound` layer, when the song or playing changes at once and the loudness at most 15 times a second |
 | `delete_message` | `{ platform, message_id }` |

@@ -242,6 +242,10 @@ mod tests {
         }
         for (m, p) in [
             ("POST", "/chat/send"),
+            ("GET", "/chat/highlight"),
+            ("POST", "/chat/highlight"),
+            ("DELETE", "/chat/highlight"),
+            ("GET", "/credits"),
             ("GET", "/settings"),
             ("PUT", "/mod/filters"),
             ("PUT", "/mod/panic/config"),

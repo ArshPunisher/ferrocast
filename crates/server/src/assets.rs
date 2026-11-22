@@ -84,6 +84,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/app/", get(dashboard_index))
         .route("/app/{*path}", get(dashboard_file))
         .route("/plugin-panel/{id}", get(plugin_panel_page))
+        .route("/alert-sandbox", get(alert_sandbox_page))
         .route("/o/{token}", get(overlay_redirect))
         .route("/o/{token}/", get(overlay_index))
         .route("/o/{token}/{*path}", get(overlay_file))
@@ -131,6 +132,40 @@ async fn plugin_panel_page(State(app): State<AppState>, Path(id): Path<String>) 
         .header(header::REFERRER_POLICY, "no-referrer")
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from(format!("<!doctype html><meta charset=\"utf-8\">{html}")))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// The frame's policy: only the bootstrap runs (by nonce, never 'unsafe-inline' for scripts),
+/// nothing is fetched but pictures from the allowed hosts, and there is no sound.
+fn alert_sandbox_csp(nonce: &str) -> String {
+    format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; \
+        img-src data: blob: https://static-cdn.jtvnw.net https://yt3.ggpht.com https://files.kick.com https://cdn.ferrocast.com https://cdn.discordapp.com; \
+        font-src data: https://fonts.gstatic.com; \
+        connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'self'; sandbox allow-scripts"
+    )
+}
+
+/// Custom alerts are HTML and CSS only. This script cleans the markup (no script, handler,
+/// navigation or fetch) and writes the viewer's words in as text. Same file as the overlay's
+/// srcdoc copy (ferrocast-web `alert-sandbox-bootstrap.js`).
+const ALERT_SANDBOX_BOOTSTRAP: &str = include_str!("../assets/alert-sandbox-bootstrap.js");
+
+/// `GET /alert-sandbox`: bootstrap frame for custom HTML/CSS alert rendering under strict
+/// CSP without `allow-same-origin` (API.md §4 / R25).
+async fn alert_sandbox_page() -> Response {
+    let nonce = crate::auth::random_hex(16);
+    let script = ALERT_SANDBOX_BOOTSTRAP.replace("</script", "<\\/script");
+    let html = format!(
+        "<!doctype html><meta charset=\"utf-8\"><style>html,body{{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:transparent;display:flex;align-items:center;justify-content:center}}#fc-custom-root{{width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative}}</style><style id=\"fc-custom-style\"></style><div id=\"fc-custom-root\" role=\"status\" aria-live=\"polite\"></div><script nonce=\"{nonce}\">{script}</script>"
+    );
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_SECURITY_POLICY, alert_sandbox_csp(&nonce))
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(html))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 

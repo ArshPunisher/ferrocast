@@ -12,6 +12,7 @@ pub mod autoreply;
 pub mod chatbot;
 pub mod cloudbot;
 pub mod command;
+pub mod credits;
 pub mod dedupe;
 pub mod design;
 pub mod discord;

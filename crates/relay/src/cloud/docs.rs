@@ -525,6 +525,9 @@ fn widget_key(k: WidgetKind) -> &'static str {
         WidgetKind::Viewers => "viewers",
         WidgetKind::Poll => "poll",
         WidgetKind::Giveaway => "giveaway",
+        WidgetKind::EndCredits => "end_credits",
+        WidgetKind::EmoteWall => "emote_wall",
+        WidgetKind::ChatHighlight => "chat_highlight",
         WidgetKind::Layer => "layer",
     }
 }

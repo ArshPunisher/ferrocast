@@ -343,6 +343,39 @@ async fn ask(h: &crate::remote::Handler, role: &str, method: &str, path: &str, b
     (res.status, serde_json::from_slice(&res.body).unwrap_or(Value::Null))
 }
 
+/// Custom alert code is installed on the PC only, like plugins: a paired phone may edit
+/// everything else about a rule but cannot add or change its custom HTML or fields.
+#[tokio::test]
+async fn a_phone_cannot_add_or_change_custom_alert_code() {
+    let (h, _dir) = handler().await;
+    let (s, rules) = ask(&h, "owner", "GET", "/api/v1/alert-rules", "").await;
+    assert_eq!(s, 200);
+    let mut rule = rules[0].clone();
+    let id = rule["id"].as_str().unwrap().to_string();
+    // Unchanged custom parts (none) round-trip: a phone can still tune a rule.
+    rule["variations"][0]["volume"] = json!(55);
+    let (s, v) = ask(&h, "owner", "PUT", &format!("/api/v1/alert-rules/{id}"), &rule.to_string()).await;
+    assert_eq!(s, 200, "{v}");
+    // Adding custom code is refused with a plain reason.
+    for change in [
+        json!({ "custom_enabled": true }),
+        json!({ "html": "<p>{name}</p>" }),
+        json!({ "fields": [{ "key": "tag", "label": "Tag", "type": "text", "default": "x" }] }),
+    ] {
+        let mut bad = rule.clone();
+        for (k, val) in change.as_object().unwrap() {
+            bad["variations"][0][k] = val.clone();
+        }
+        let (s, v) = ask(&h, "owner", "PUT", &format!("/api/v1/alert-rules/{id}"), &bad.to_string()).await;
+        assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{change}: {v}");
+    }
+    let mut create = rule.clone();
+    create["id"] = json!("");
+    create["variations"][0]["html"] = json!("<p>x</p>");
+    let (s, v) = ask(&h, "owner", "POST", "/api/v1/alert-rules", &create.to_string()).await;
+    assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{v}");
+}
+
 #[tokio::test]
 async fn the_pc_refuses_what_a_role_may_not_do_even_if_the_relay_let_it_through() {
     let (h, _dir) = handler().await;
