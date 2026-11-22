@@ -3231,6 +3231,10 @@ pub(crate) fn failed(message: String) -> EngineError {
     if message.starts_with("There's no source") {
         return refused(404, "studio_no_source", message, "Refresh the list of sources.");
     }
+    // An item id that isn't in the scene (a box, a crop, a batch): like the other item routes.
+    if message.contains("has no item") {
+        return refused(404, "studio_no_source", message, "Refresh the list of sources.");
+    }
     // Several boxes at once: a group and one of its own sources can't be in one request.
     if message.contains("can't be moved together") {
         return EngineError::Invalid(message);
@@ -4119,6 +4123,12 @@ mod tests {
     /// The preview's holes: the box round several picked sources alone is a dozen, with a few
     /// guide lines and a menu that is more than the old 16 (Neon: the app answered 400 and kept
     /// painting the old holes).
+    #[test]
+    fn an_item_that_is_not_in_the_scene_is_a_404_like_the_other_item_routes() {
+        let e = failed("\"Main\" has no item 999.".into());
+        assert!(matches!(&e, EngineError::Refused { status: 404, code: "studio_no_source", .. }), "{e:?}");
+    }
+
     #[test]
     fn a_group_with_its_own_source_in_one_batch_is_a_400() {
         let e = failed("a group and a source inside it can't be moved together.".into());

@@ -318,6 +318,8 @@ impl History {
             if let Some(top) = self.undo.last_mut() {
                 top.at = Instant::now();
                 top.after = now;
+                // The step's size follows its collection (a drag that added to it grows it).
+                top.bytes = approx_bytes(&top.before) + approx_bytes(&top.after);
                 if b.closes {
                     top.open = false;
                 } else if b.open {
@@ -325,6 +327,7 @@ impl History {
                 }
             }
             self.redo.clear();
+            self.trim();
             return;
         }
         if now == b.doc {
@@ -346,6 +349,11 @@ impl History {
     /// Keeps a step, forgetting the oldest while there are too many or they hold too much.
     fn push_step(&mut self, step: Step) {
         self.undo.push(step);
+        self.trim();
+    }
+
+    /// Forgets the oldest steps while there are too many or they hold too much.
+    fn trim(&mut self) {
         while self.undo.len() > KEEP
             || (self.undo.len() > 1 && self.undo.iter().chain(&self.redo).map(|s| s.bytes).sum::<usize>() > MAX_BYTES)
         {
@@ -566,6 +574,39 @@ mod tests {
         assert_eq!(labels.len(), 4, "{labels:?}");
         assert!(labels.iter().any(|l| l.starts_with("Align 2 sources")), "{labels:?}");
         assert!(labels.iter().any(|l| l.starts_with("Space out 2 sources")), "{labels:?}");
+    }
+
+    /// A step that is joined and grows is counted at its new size, so the memory cap holds.
+    #[test]
+    fn a_joined_step_is_counted_at_its_new_size() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        c.add_source("Main", "color_source_v3", "A", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let go = |h: &mut History, save: bool| {
+            let items = vec![ItemBoxIn { id: 1, x: 5.0, y: 0.0, w: 10.0, h: 10.0 }];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> =
+                c.set_item_box("Main", 1, 5.0, 0.0, 10.0, 10.0).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, false);
+        let first = h.undo.last().map(|s| s.bytes).unwrap_or(0);
+        // The collection grows while the drag is open, then the drag goes on.
+        c.add_source(
+            "Main",
+            "color_source_v3",
+            &"B".repeat(90),
+            &serde_json::json!({ "width": 10, "height": 10 }),
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        go(&mut h, true);
+        let step = h.undo.last().unwrap_or_else(|| panic!("a step"));
+        assert!(step.bytes > first, "{} should be more than {first}", step.bytes);
+        assert_eq!(step.bytes, approx_bytes(&step.before) + approx_bytes(&step.after));
     }
 
     /// A drag that never saved (the pointer was lost, the page closed) leaves its step open; a
