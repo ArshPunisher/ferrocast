@@ -1137,6 +1137,89 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_software_candidates<FProgress, FStep>(
+    sw_encoders: &[DiscoveredEncoder],
+    ladder: &[(u32, u32, u32)],
+    start_tier: (u32, u32, u32),
+    has_passing_hw: bool,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    results: &mut Vec<BenchCandidate>,
+    completed_steps: &mut usize,
+    mut on_progress: FProgress,
+    mut run_step: FStep,
+) -> Result<(), StepAbort>
+where
+    FProgress: FnMut(String, &[BenchCandidate], usize),
+    FStep: FnMut(&DiscoveredEncoder, u32, u32, u32) -> Result<BenchCandidate, StepAbort>,
+{
+    if has_passing_hw {
+        // Sample strictly two representative x264 presets when hardware already passed cleanly.
+        let (w, h, fps) = start_tier;
+        for sw in sw_encoders.iter().filter(|sw| matches!(sw.preset.as_deref(), Some("veryfast" | "superfast"))) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(StepAbort::Cancelled);
+            }
+            if !results.is_empty() && Instant::now() >= deadline {
+                break;
+            }
+            let label = format!("{} ({w}×{h} @ {fps} fps)", sw.label);
+            on_progress(format!("Stress testing {label}…"), results, *completed_steps);
+            match run_step(sw, w, h, fps) {
+                Ok(c) => {
+                    results.push(c);
+                    *completed_steps += 1;
+                }
+                Err(StepAbort::Cancelled) => return Err(StepAbort::Cancelled),
+                Err(StepAbort::Failed(msg)) => {
+                    tracing::debug!(preset = ?sw.preset, error = %msg, "x264 preset benchmark step failed");
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // CPU-only / no passing hardware: exhaust `faster -> veryfast -> superfast -> ultrafast` at
+    // each resolution tier BEFORE stepping resolution/fps down (H5).
+    let mut tiers = vec![start_tier];
+    for &(nw, nh, nf) in ladder {
+        if (u64::from(nw) * u64::from(nh), nf) < (u64::from(start_tier.0) * u64::from(start_tier.1), start_tier.2)
+            && !tiers.contains(&(nw, nh, nf))
+        {
+            tiers.push((nw, nh, nf));
+        }
+    }
+
+    for (w, h, fps) in tiers {
+        for sw in sw_encoders {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(StepAbort::Cancelled);
+            }
+            if !results.is_empty() && Instant::now() >= deadline {
+                return Ok(());
+            }
+            let label = format!("{} ({w}×{h} @ {fps} fps)", sw.label);
+            on_progress(format!("Stress testing {label}…"), results, *completed_steps);
+            match run_step(sw, w, h, fps) {
+                Ok(c) => {
+                    let passed = c.passed;
+                    results.push(c);
+                    *completed_steps += 1;
+                    if passed {
+                        return Ok(());
+                    }
+                }
+                Err(StepAbort::Cancelled) => return Err(StepAbort::Cancelled),
+                Err(StepAbort::Failed(msg)) => {
+                    tracing::debug!(preset = ?sw.preset, error = %msg, "x264 preset benchmark step failed");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_candidate_step(
     compositor: Option<&Compositor>,
     cache: &mut std::collections::HashMap<(u32, u32), BenchFrames>,
@@ -1760,59 +1843,37 @@ impl Engine {
             let has_passing_hw = results.iter().any(|c| c.hardware && c.passed);
             let mut sw_tier = best_viable_tier;
             if let Some(ceil) = &ceil_clone
-                && u64::from(ceil.max_width) * u64::from(ceil.max_height) < u64::from(sw_tier.0) * u64::from(sw_tier.1)
+                && (u64::from(ceil.max_width) * u64::from(ceil.max_height), ceil.max_fps)
+                    < (u64::from(sw_tier.0) * u64::from(sw_tier.1), sw_tier.2)
             {
                 sw_tier = (ceil.max_width, ceil.max_height, ceil.max_fps);
             }
-            for sw in &sw_encoders {
-                if cancel_clone.load(Ordering::Relaxed) {
-                    return Err("cancelled".into());
-                }
-                if !results.is_empty() && Instant::now() >= deadline {
-                    break;
-                }
-                // If hardware already passed easily, sample two representative x264 presets for comparison.
-                if has_passing_hw
-                    && matches!(sw.preset.as_deref(), Some("faster" | "ultrafast"))
-                    && results.iter().any(|c| !c.hardware)
-                {
-                    continue;
-                }
-                let (w, h, fps) = sw_tier;
-                let label = format!("{} ({w}×{h} @ {fps} fps)", sw.label);
-                update_running(format!("Stress testing {label}…"), &results, completed_steps);
-                match run_candidate_step(
-                    compositor.as_ref(),
-                    &mut cache,
-                    sw,
-                    w,
-                    h,
-                    fps,
-                    target_bitrate,
-                    timing,
-                    &cancel_clone,
-                    &sampler,
-                ) {
-                    Ok(c) => {
-                        let passed = c.passed;
-                        results.push(c);
-                        completed_steps += 1;
-                        if !passed && !has_passing_hw {
-                            // Step resolution down when software fails at current tier and no hardware works.
-                            if let Some(next_tier) = ladder
-                                .iter()
-                                .copied()
-                                .find(|&(nw, nh, nf)| (u64::from(nw) * u64::from(nh), nf) < (u64::from(w) * u64::from(h), fps))
-                            {
-                                sw_tier = next_tier;
-                            }
-                        }
-                    }
-                    Err(StepAbort::Cancelled) => return Err("cancelled".into()),
-                    Err(StepAbort::Failed(msg)) => {
-                        tracing::debug!(preset = ?sw.preset, error = %msg, "x264 preset benchmark step failed");
-                    }
-                }
+            if let Err(StepAbort::Cancelled) = run_software_candidates(
+                &sw_encoders,
+                &ladder,
+                sw_tier,
+                has_passing_hw,
+                &cancel_clone,
+                deadline,
+                &mut results,
+                &mut completed_steps,
+                update_running,
+                |sw, w, h, fps| {
+                    run_candidate_step(
+                        compositor.as_ref(),
+                        &mut cache,
+                        sw,
+                        w,
+                        h,
+                        fps,
+                        target_bitrate,
+                        timing,
+                        &cancel_clone,
+                        &sampler,
+                    )
+                },
+            ) {
+                return Err("cancelled".into());
             }
 
             if results.is_empty() {
@@ -3420,5 +3481,127 @@ mod tests {
         let done_flag = sampler.worker_done.clone();
         drop(sampler);
         assert!(done_flag.load(Ordering::Acquire), "Drop must join the BackgroundLoadSampler worker thread");
+    }
+
+    #[test]
+    fn h5_software_loop_tests_all_presets_at_tier_and_samples_two_when_hw_passes() {
+        let sw_encoders: Vec<DiscoveredEncoder> = select_bench_encoders(false, None, true);
+        let ladder = candidate_ladder([1920, 1080], 60);
+        let cancel = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        let fake_cand = |sw: &DiscoveredEncoder, w: u32, h: u32, fps: u32, passed: bool| BenchCandidate {
+            encoder_backend: sw.backend.clone(),
+            studio_encoder_id: sw.studio_encoder_id.clone(),
+            label: sw.label.clone(),
+            hardware: false,
+            family: sw.family,
+            preset: sw.preset.clone(),
+            width: w,
+            height: h,
+            fps,
+            bitrate_kbps: 6000,
+            frames_tested: 45,
+            encode_ms_avg: if passed { 4.0 } else { 20.0 },
+            encode_ms_p95: if passed { 6.0 } else { 24.0 },
+            encode_ms_max: if passed { 8.0 } else { 28.0 },
+            budget_ms: 1000.0 / f64::from(fps),
+            headroom_pct: if passed { 75.0 } else { -20.0 },
+            fps_achieved: if passed { f64::from(fps) } else { 40.0 },
+            skipped_frames: 0,
+            lagged_frames: 0,
+            cpu_pct: Some(50.0),
+            gpu_pct: None,
+            passed,
+            reason: if passed { "ok".into() } else { "too slow".into() },
+            elapsed_ms: 100,
+        };
+
+        // 1. CPU-only: `1080p60 faster` fails, `1080p60 veryfast` passes -> must stay at 1080p60 and test `veryfast`, NOT drop to 720p60.
+        let mut results = Vec::new();
+        let mut steps = 0;
+        let mut tried_a = Vec::new();
+        run_software_candidates(
+            &sw_encoders,
+            &ladder,
+            ladder[0],
+            false,
+            &cancel,
+            deadline,
+            &mut results,
+            &mut steps,
+            |_, _, _| {},
+            |sw, w, h, fps| {
+                let p = sw.preset.clone().unwrap();
+                tried_a.push((w, h, fps, p.clone()));
+                Ok(fake_cand(sw, w, h, fps, w == 1920 && p == "veryfast"))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tried_a,
+            vec![(1920, 1080, 60, "faster".into()), (1920, 1080, 60, "veryfast".into())],
+            "CPU-only must try lighter presets at 1080p60 before stepping resolution down"
+        );
+
+        // 2. CPU-only: all 4 presets fail at 1080p60 -> steps down to 720p60 and finds `veryfast`.
+        let mut results_b = Vec::new();
+        let mut steps_b = 0;
+        let mut tried_b = Vec::new();
+        run_software_candidates(
+            &sw_encoders,
+            &ladder,
+            ladder[0],
+            false,
+            &cancel,
+            deadline,
+            &mut results_b,
+            &mut steps_b,
+            |_, _, _| {},
+            |sw, w, h, fps| {
+                let p = sw.preset.clone().unwrap();
+                tried_b.push((w, h, fps, p.clone()));
+                Ok(fake_cand(sw, w, h, fps, w == 1280 && p == "veryfast"))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tried_b,
+            vec![
+                (1920, 1080, 60, "faster".into()),
+                (1920, 1080, 60, "veryfast".into()),
+                (1920, 1080, 60, "superfast".into()),
+                (1920, 1080, 60, "ultrafast".into()),
+                (1280, 720, 60, "faster".into()),
+                (1280, 720, 60, "veryfast".into()),
+            ]
+        );
+
+        // 3. Hardware passed: sample strictly 2 software comparison presets (`veryfast`, `superfast`), NOT 3 (`faster`, `veryfast`, `superfast`).
+        let mut results_c = Vec::new();
+        let mut steps_c = 0;
+        let mut tried_c = Vec::new();
+        run_software_candidates(
+            &sw_encoders,
+            &ladder,
+            ladder[0],
+            true,
+            &cancel,
+            deadline,
+            &mut results_c,
+            &mut steps_c,
+            |_, _, _| {},
+            |sw, w, h, fps| {
+                let p = sw.preset.clone().unwrap();
+                tried_c.push((w, h, fps, p));
+                Ok(fake_cand(sw, w, h, fps, true))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            tried_c,
+            vec![(1920, 1080, 60, "veryfast".into()), (1920, 1080, 60, "superfast".into())],
+            "when hardware already passed, sample only 2 software presets (veryfast, superfast)"
+        );
     }
 }
