@@ -5701,6 +5701,10 @@ impl Stage {
         if let Some(t) = to {
             self.scene_index(t)?;
         }
+        if transition.is_some() && from.is_some() && from == to {
+            // Going from a scene to itself isn't a switch; the grid has no such cell either.
+            return Err(fail("From and To are the same scene: pick two different scenes."));
+        }
         if let Some(tr) = transition
             && !self.named_transitions().iter().any(|x| x.name == tr)
         {
@@ -6018,6 +6022,7 @@ fn import_and_normalize_transitions(d: &mut Value) {
     let mut deduped: Vec<TransitionMatrixRule> = Vec::new();
     for r in rules {
         if valid_tr.contains(&r.transition)
+            && !(r.from.is_some() && r.from == r.to)
             && r.from.as_ref().is_none_or(|f| valid_scenes.contains(f))
             && r.to.as_ref().is_none_or(|t| valid_scenes.contains(t))
         {
@@ -9593,6 +9598,24 @@ mod tests {
         ok(s.update_named_transition("Slow", None, Some(2500), None, None));
         ok(s.set_matrix_rule(Some("A"), Some("B"), Some("Slow")));
         assert_eq!(s.graph_reloads(), before, "a transition edit must not reload the graph mid-transition");
+    }
+
+    #[test]
+    fn a_rule_from_a_scene_to_itself_is_refused_and_dropped_on_load() {
+        let s = stage();
+        ok(s.add_scene("Other"));
+        let name = s.order()[0].clone();
+        assert!(s.set_matrix_rule(Some(&name), Some(&name), Some("Cut")).is_err());
+        // Clearing is still fine, and Any -> scene is not a self pair.
+        ok(s.set_matrix_rule(Some(&name), Some(&name), None));
+        ok(s.set_matrix_rule(None, Some(&name), Some("Cut")));
+        let mut d = s.snapshot();
+        d["ferrocast"]["transition_matrix"] = json!([
+            { "from": name, "to": name, "transition": "Cut" },
+            { "from": null, "to": "Other", "transition": "Cut" }
+        ]);
+        import_and_normalize_transitions(&mut d);
+        assert_eq!(transition_matrix_from_doc(&d).len(), 1);
     }
 
     #[test]

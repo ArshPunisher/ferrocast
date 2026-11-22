@@ -823,7 +823,7 @@ struct DuplicateTransitionBody {
 async fn engine_duplicate_named_transition(
     State(app): State<AppState>,
     Path(name): Path<String>,
-    Body(b): Body<DuplicateTransitionBody>,
+    OptionalBody(b): OptionalBody<DuplicateTransitionBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let Json(v) = act(&app, StudioAct::DuplicateNamedTransition { name, new_name: b.name }).await?;
     Ok((StatusCode::CREATED, Json(v)))
