@@ -342,7 +342,7 @@ pub(crate) fn create_design(st: &AppState, account: &str, d: Design) -> Result<D
         OriginKind::BuiltIn | OriginKind::Import => OriginKind::Scratch,
     };
     let from = d.origin.from.as_deref().map(|f| short(f, 120));
-    let mine = d.into_user(new_id(), Origin { kind, from }, now_ms());
+    let mine = d.into_user(new_id(), Origin { kind, from, source: None }, now_ms());
     store_design(st, account, &mine)?;
     Ok(mine)
 }
@@ -400,7 +400,7 @@ pub(crate) fn duplicate_design(st: &AppState, account: &str, id: &str, name: Opt
             Err(_) => None,
         };
     }
-    let origin = Origin { kind: OriginKind::Duplicate, from: Some(short(&source.name, 120)) };
+    let origin = Origin { kind: OriginKind::Duplicate, from: Some(short(&source.name, 120)), source: None };
     let mine = copy.into_user(new_id(), origin, now_ms());
     store_design(st, account, &mine)?;
     Ok(mine)

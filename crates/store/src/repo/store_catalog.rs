@@ -71,6 +71,10 @@ pub struct PluginSnapshot {
 pub struct StoreUndoSnapshot {
     pub prev_install: Option<StoreInstallRecord>,
     pub created_design_ids: Vec<String>,
+    /// Designs this action replaced in place (their ids stayed): Undo writes `prev_designs`
+    /// back over them instead of deleting and re-adding.
+    #[serde(default)]
+    pub updated_design_ids: Vec<String>,
     pub prev_designs: Vec<Design>,
     /// The design that was the active alert when this action removed it (so it was cleared).
     /// Undo puts it back only if nothing else has been picked since.
@@ -394,6 +398,7 @@ mod tests {
             snapshot: StoreUndoSnapshot {
                 prev_install: None,
                 created_design_ids: vec![],
+                updated_design_ids: Vec::new(),
                 prev_designs: vec![],
                 cleared_active_alert: None,
                 rule_changes: vec![],
@@ -446,6 +451,7 @@ mod tests {
             snapshot: StoreUndoSnapshot {
                 prev_install: None,
                 created_design_ids: vec!["d1".into()],
+                updated_design_ids: Vec::new(),
                 prev_designs: vec![],
                 cleared_active_alert: None,
                 rule_changes: vec![],
@@ -507,6 +513,7 @@ mod tests {
             snapshot: StoreUndoSnapshot {
                 prev_install: Some(saved),
                 created_design_ids: vec!["d1".into()],
+                updated_design_ids: Vec::new(),
                 prev_designs: vec![],
                 cleared_active_alert: None,
                 rule_changes: vec![],
@@ -536,6 +543,7 @@ mod tests {
             snapshot: StoreUndoSnapshot {
                 prev_install: None,
                 created_design_ids: vec![],
+                updated_design_ids: Vec::new(),
                 prev_designs: vec![],
                 cleared_active_alert: None,
                 rule_changes: vec![],

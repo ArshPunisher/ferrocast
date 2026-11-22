@@ -144,7 +144,7 @@ impl Engine {
             OriginKind::BuiltIn | OriginKind::Import => OriginKind::Scratch,
         };
         let from = d.origin.from.as_deref().map(|f| short(f, 120));
-        let mine = d.into_user(ferrocast_store::new_id(), Origin { kind, from }, now().0);
+        let mine = d.into_user(ferrocast_store::new_id(), Origin { kind, from, source: None }, now().0);
         let saved = mine.clone();
         self.db(move |s| repo::designs::insert(s, &saved)).await.map_err(|e| match e {
             EngineError::Store(s) => store_err(s),
@@ -172,20 +172,30 @@ impl Engine {
 
     /// Overlays made from `design` that still follow it get its new layout (their URLs stay).
     async fn refresh_following(&self, design: &Design) {
+        if let Err(e) = self.refresh_following_checked(design).await {
+            tracing::warn!(error = %e, design = %design.id, "overlays couldn't follow their design");
+        }
+    }
+
+    /// The same, saying so when an overlay couldn't be read or refreshed (every one is still tried).
+    pub(crate) async fn refresh_following_checked(&self, design: &Design) -> Result<(), EngineError> {
         let scenes: Vec<&ferrocast_core::design::Scene> = match &design.content {
             DesignContent::Theme(t) => t.scenes.iter().collect(),
             DesignContent::Scene(s) => vec![s],
-            _ => return,
+            _ => return Ok(()),
         };
-        let Ok(list) = self.db(repo::overlays::list).await else { return };
+        let list = self.db(repo::overlays::list).await?;
+        let mut first: Option<EngineError> = None;
         for o in list {
             let Some(link) = o.design.as_ref().filter(|d| d.follows && d.id == design.id) else { continue };
             let Some(scene) = scenes.iter().find(|s| s.key == link.scene) else { continue };
             let _one_at_a_time = self.config_lock().await;
             if let Err(e) = self.place_scene(design, scene, &o.name, Some(&o.id)).await {
                 tracing::warn!(error = %e, overlay = %o.id, "an overlay couldn't follow its design");
+                first.get_or_insert(e);
             }
         }
+        first.map_or(Ok(()), Err)
     }
 
     /// "Follow the theme again": the overlay takes its design's layout and follows it.
@@ -238,7 +248,7 @@ impl Engine {
                 None => None,
             };
         }
-        let origin = Origin { kind: OriginKind::Duplicate, from: Some(short(&source.name, 120)) };
+        let origin = Origin { kind: OriginKind::Duplicate, from: Some(short(&source.name, 120)), source: None };
         let mine = copy.into_user(ferrocast_store::new_id(), origin, now().0);
         let saved = mine.clone();
         self.db(move |s| repo::designs::insert(s, &saved)).await.map_err(|e| match e {
@@ -453,15 +463,43 @@ impl Engine {
 
     /// Imports a `.ferrodesign` as new designs of the streamer's own.
     pub async fn import_design_file(&self, path: &Path) -> Result<designfile::ImportReport, EngineError> {
+        self.import_design_file_over(path, Vec::new()).await
+    }
+
+    /// Imports a `.ferrodesign`; a design in it that matches one of `existing` replaces it in
+    /// place (the id stays), and what points at it is refreshed (the alert design in use, and
+    /// overlays that follow it).
+    pub(crate) async fn import_design_file_over(
+        &self,
+        path: &Path,
+        existing: Vec<ferrocast_core::design::Design>,
+    ) -> Result<designfile::ImportReport, EngineError> {
         let p = path.to_path_buf();
         let store = self.store();
-        tokio::task::spawn_blocking(move || designfile::import(&store, &p))
+        let report = tokio::task::spawn_blocking(move || designfile::import_into(&store, &p, &existing))
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?
             .map_err(|e| match e {
                 designfile::Error::File(f) => design_file_error(f),
                 designfile::Error::Store(s) => EngineError::from(s),
-            })
+            })?;
+        Ok(report)
+    }
+
+    /// After designs were replaced in place: the alert design in use and the overlays that follow
+    /// them take the new content.
+    pub(crate) async fn refresh_after_replace(&self, designs: &[Design], ids: &[String]) -> Result<(), EngineError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.refresh_active_design().await;
+        let mut first: Option<EngineError> = None;
+        for d in designs.iter().filter(|d| ids.contains(&d.id)) {
+            if let Err(e) = self.refresh_following_checked(d).await {
+                first.get_or_insert(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
     }
 
     /// Designs that use a library file (so deleting it can say where it's used).

@@ -1323,10 +1323,25 @@ impl Engine {
                 let _ = std::fs::create_dir_all(&tmp);
                 let path = tmp.join(format!("store-{}.ferrodesign", ferrocast_store::new_id()));
                 std::fs::write(&path, pkg_bytes).map_err(|e| EngineError::Internal(e.to_string()))?;
-                let res = self.import_design_file(&path).await;
+                // An update replaces the installed designs in place (their ids stay).
+                let mut installed = Vec::new();
+                if action == "update"
+                    && let Some(old) = existing
+                {
+                    for did in &old.design_ids {
+                        if let Ok(d) = self.design(did).await {
+                            installed.push(d);
+                        }
+                    }
+                }
+                let res = self.import_design_file_over(&path, installed).await;
                 let _ = std::fs::remove_file(&path);
                 let report = res?;
-                applied.snap.created_design_ids = report.designs.iter().map(|d| d.id.clone()).collect();
+                applied.snap.updated_design_ids = report.updated.clone();
+                applied.snap.created_design_ids =
+                    report.designs.iter().filter(|d| !report.updated.contains(&d.id)).map(|d| d.id.clone()).collect();
+                // Recorded first: a refresh that fails below is taken back from this record.
+                self.refresh_after_replace(&report.designs, &report.updated).await?;
                 applied.designs = report.designs;
             }
             StorePackageFormat::Ferroalert => {
@@ -1484,7 +1499,7 @@ impl Engine {
         if action == "update"
             && let Some(old) = existing
         {
-            for did in &old.design_ids {
+            for did in old.design_ids.iter().filter(|d| !applied.snap.updated_design_ids.contains(d)) {
                 if self.active_alert_design().await?.as_deref() == Some(did.as_str()) {
                     self.set_active_alert_design(None).await?;
                     applied.snap.cleared_active_alert = Some(did.clone());
@@ -1528,6 +1543,26 @@ impl Engine {
             note(r);
         }
         for d in &snap.prev_designs {
+            if snap.updated_design_ids.contains(&d.id) {
+                // Replaced in place: the earlier content goes back under the same id, so what
+                // points at it never noticed (written again if an earlier try got this far).
+                let (id, d) = (d.id.clone(), d.clone());
+                let r = async {
+                    let back = d.clone();
+                    match self.db(move |s| repo::designs::update(s, &back)).await {
+                        Err(EngineError::Store(ferrocast_store::StoreError::NotFound(_))) => {
+                            self.db(move |s| repo::designs::insert(s, &d)).await.map(|_| ())
+                        }
+                        other => other.map(|_| ()),
+                    }
+                }
+                .await;
+                note(r);
+                if let Ok(now) = self.design(&id).await {
+                    note(self.refresh_after_replace(std::slice::from_ref(&now), std::slice::from_ref(&id)).await);
+                }
+                continue;
+            }
             // Already back (an earlier try got this far): nothing to do.
             if self.design(&d.id).await.is_ok() {
                 continue;
@@ -1656,6 +1691,7 @@ impl Engine {
             snap: StoreUndoSnapshot {
                 prev_install: existing.cloned(),
                 created_design_ids: Vec::new(),
+                updated_design_ids: Vec::new(),
                 prev_designs: Vec::new(),
                 cleared_active_alert: None,
                 rule_changes: Vec::new(),
@@ -1827,6 +1863,7 @@ impl Engine {
         let mut snap = StoreUndoSnapshot {
             prev_install: Some(existing.clone()),
             created_design_ids: Vec::new(),
+            updated_design_ids: Vec::new(),
             prev_designs: Vec::new(),
             cleared_active_alert: None,
             rule_changes: Vec::new(),
@@ -2523,6 +2560,110 @@ mod tests {
         let preview = engine.resolve_store_link("ferrocast://store/install/foundry-goal-widget").await.unwrap();
         assert!(preview.requires_confirmation);
         assert!(preview.installed.is_none());
+    }
+
+    /// An update replaces the installed designs in place: the ids stay, so the alert design in
+    /// use and the overlays made from the theme keep pointing at them; Undo puts the earlier
+    /// content back under the same ids.
+    #[tokio::test]
+    async fn an_update_keeps_the_design_ids_and_what_points_at_them_and_undo_restores() {
+        let _lock = TEST_GUARD.lock().await;
+        let state = Arc::new(StdMutex::new(MockFixtureState::default()));
+        let port = spawn_fixture_server(state.clone()).await;
+        let (engine, _dir, _studio, _chat) = crate::automation::tests::engine().await;
+        set_source(Source { url: format!("http://127.0.0.1:{port}/catalog.json"), key: TEST_KEY.into(), local: true });
+        let installed = engine.install_store_item("aurora-pulse").await.unwrap();
+        let mut ids: Vec<String> = installed.designs.iter().map(|d| d.id.clone()).collect();
+        ids.sort();
+        let alert = installed.designs.iter().find(|d| d.kind() == ferrocast_core::design::DesignKind::Alert).unwrap();
+        let theme = installed.designs.iter().find(|d| d.kind() == ferrocast_core::design::DesignKind::Theme).unwrap();
+        // Things that point at the designs: the alert design in use, and an overlay made from the theme.
+        engine.set_active_alert_design(Some(&alert.id)).await.unwrap();
+        let used = engine
+            .use_design(&theme.id, crate::designs::UseRequest { alert_style: Some(false), ..Default::default() })
+            .await
+            .unwrap();
+        let overlay_id = used.overlays[0].id.clone();
+        let before: Vec<ferrocast_core::design::Design> = {
+            let mut v = engine.designs(None).await.unwrap();
+            v.sort_by(|a, b| a.id.cmp(&b.id));
+            v
+        };
+
+        {
+            let mut st = state.lock().unwrap();
+            st.catalog = CATALOG_V2.to_vec();
+            st.sig = CATALOG_V2_SIG.into();
+        }
+        engine.store_catalog(true).await.unwrap();
+        let upd = engine.update_store_item("aurora-pulse").await.unwrap();
+        let mut after_ids: Vec<String> = upd.designs.iter().map(|d| d.id.clone()).collect();
+        after_ids.sort();
+        assert_eq!(after_ids, ids, "the update kept the design ids");
+        assert_eq!(upd.installed.as_ref().unwrap().version, "1.1.0");
+        let mut now_ids: Vec<String> = engine.designs(None).await.unwrap().into_iter().map(|d| d.id).collect();
+        now_ids.sort();
+        assert_eq!(now_ids, ids, "no design was added or left behind");
+        // The references survived.
+        assert_eq!(engine.active_alert_design().await.unwrap().as_deref(), Some(alert.id.as_str()));
+        let overlay = engine.overlay(&overlay_id).await.unwrap();
+        assert_eq!(overlay.design.as_ref().map(|d| d.id.as_str()), Some(theme.id.as_str()));
+        // The content really is the new version's.
+        let after: Vec<_> = engine.designs(None).await.unwrap();
+        assert!(
+            after.iter().any(|d| d.description.contains("Updated 1.1.0")),
+            "the update replaced the content: {:?}",
+            after.iter().map(|d| &d.description).collect::<Vec<_>>()
+        );
+
+        // Undo: the earlier content, under the same ids, with the references still there.
+        engine.undo_store_action(Some(&upd.undo.token)).await.unwrap();
+        let mut restored = engine.designs(None).await.unwrap();
+        restored.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            restored.iter().map(|d| &d.id).collect::<Vec<_>>(),
+            before.iter().map(|d| &d.id).collect::<Vec<_>>()
+        );
+        for (a, b) in restored.iter().zip(&before) {
+            assert_eq!(a.content, b.content, "{} is as it was", a.id);
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.description, b.description, "{} is as it was", a.id);
+        }
+        assert_eq!(engine.active_alert_design().await.unwrap().as_deref(), Some(alert.id.as_str()));
+        assert_eq!(engine.overlay(&overlay_id).await.unwrap().design.map(|d| d.id), Some(theme.id.clone()));
+    }
+
+    /// CodeRabbit: if putting an updated design back can't refresh the overlays that follow it,
+    /// Undo reports it and stays available (it is tried again and then completes).
+    #[tokio::test]
+    async fn undo_stays_available_when_an_overlay_cannot_be_refreshed() {
+        let _lock = TEST_GUARD.lock().await;
+        let state = Arc::new(StdMutex::new(MockFixtureState::default()));
+        let port = spawn_fixture_server(state.clone()).await;
+        let (engine, _dir, _studio, _chat) = crate::automation::tests::engine().await;
+        set_source(Source { url: format!("http://127.0.0.1:{port}/catalog.json"), key: TEST_KEY.into(), local: true });
+        let installed = engine.install_store_item("aurora-pulse").await.unwrap();
+        let theme = installed.designs.iter().find(|d| d.kind() == ferrocast_core::design::DesignKind::Theme).unwrap();
+        engine
+            .use_design(&theme.id, crate::designs::UseRequest { alert_style: Some(false), ..Default::default() })
+            .await
+            .unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            st.catalog = CATALOG_V2.to_vec();
+            st.sig = CATALOG_V2_SIG.into();
+        }
+        engine.store_catalog(true).await.unwrap();
+        let upd = engine.update_store_item("aurora-pulse").await.unwrap();
+        // The overlays can't be read: undo says so and keeps its token.
+        table(&engine, "overlays", true).await;
+        let failed = engine.undo_store_action(Some(&upd.undo.token)).await;
+        table(&engine, "overlays", false).await;
+        assert!(matches!(failed, Err(EngineError::Refused { code: "store_undo_incomplete", .. })), "{failed:?}");
+        let done = engine.undo_store_action(Some(&upd.undo.token)).await.unwrap();
+        assert_eq!(done.reverted_action, "update");
+        let v = engine.store_installed().await.unwrap();
+        assert_eq!(v.installed.iter().find(|i| i.item_id == "aurora-pulse").unwrap().version, "1.0.0");
     }
 
     // ---- Store actions restore exactly the prior state and touch only what they changed ----
