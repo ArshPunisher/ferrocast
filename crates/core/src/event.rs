@@ -31,6 +31,7 @@ pub enum Platform {
     Twitch,
     Youtube,
     Kick,
+    Facebook,
     /// A tip page payment (the provider is on the `Tip` kind).
     Tips,
     /// Generated inside Ferrocast (bot replies, timers, panic mode notices).
@@ -52,6 +53,7 @@ impl Platform {
             Platform::Twitch => "Twitch",
             Platform::Youtube => "YouTube",
             Platform::Kick => "Kick",
+            Platform::Facebook => "Facebook",
             Platform::Tips => "Tips",
             Platform::Ferrocast => "Ferrocast",
         }

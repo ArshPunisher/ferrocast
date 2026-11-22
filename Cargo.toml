@@ -18,6 +18,7 @@ ferrocast-store = { path = "crates/store" }
 ferrocast-twitch = { path = "crates/twitch" }
 ferrocast-youtube = { path = "crates/youtube" }
 ferrocast-kick = { path = "crates/kick" }
+ferrocast-facebook = { path = "crates/facebook" }
 ferrocast-obs = { path = "crates/obs" }
 ferrocast-golive = { path = "crates/golive" }
 ferrocast-studio = { path = "crates/studio" }

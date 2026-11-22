@@ -680,6 +680,7 @@ fn platform_label(p: Platform) -> &'static str {
         Platform::Twitch => "Twitch",
         Platform::Youtube => "YouTube",
         Platform::Kick => "Kick",
+        Platform::Facebook => "Facebook",
         Platform::Tips => "Tips",
         Platform::Ferrocast => "Ferrocast",
     }
