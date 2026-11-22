@@ -1340,6 +1340,8 @@ impl Engine {
                 applied.snap.updated_design_ids = report.updated.clone();
                 applied.snap.created_design_ids =
                     report.designs.iter().filter(|d| !report.updated.contains(&d.id)).map(|d| d.id.clone()).collect();
+                // Recorded first: a refresh that fails below is taken back from this record.
+                self.refresh_after_replace(&report.designs, &report.updated).await?;
                 applied.designs = report.designs;
             }
             StorePackageFormat::Ferroalert => {
@@ -1557,7 +1559,7 @@ impl Engine {
                 .await;
                 note(r);
                 if let Ok(now) = self.design(&id).await {
-                    self.refresh_after_replace(std::slice::from_ref(&now), std::slice::from_ref(&id)).await;
+                    note(self.refresh_after_replace(std::slice::from_ref(&now), std::slice::from_ref(&id)).await);
                 }
                 continue;
             }
@@ -2629,6 +2631,39 @@ mod tests {
         }
         assert_eq!(engine.active_alert_design().await.unwrap().as_deref(), Some(alert.id.as_str()));
         assert_eq!(engine.overlay(&overlay_id).await.unwrap().design.map(|d| d.id), Some(theme.id.clone()));
+    }
+
+    /// CodeRabbit: if putting an updated design back can't refresh the overlays that follow it,
+    /// Undo reports it and stays available (it is tried again and then completes).
+    #[tokio::test]
+    async fn undo_stays_available_when_an_overlay_cannot_be_refreshed() {
+        let _lock = TEST_GUARD.lock().await;
+        let state = Arc::new(StdMutex::new(MockFixtureState::default()));
+        let port = spawn_fixture_server(state.clone()).await;
+        let (engine, _dir, _studio, _chat) = crate::automation::tests::engine().await;
+        set_source(Source { url: format!("http://127.0.0.1:{port}/catalog.json"), key: TEST_KEY.into(), local: true });
+        let installed = engine.install_store_item("aurora-pulse").await.unwrap();
+        let theme = installed.designs.iter().find(|d| d.kind() == ferrocast_core::design::DesignKind::Theme).unwrap();
+        engine
+            .use_design(&theme.id, crate::designs::UseRequest { alert_style: Some(false), ..Default::default() })
+            .await
+            .unwrap();
+        {
+            let mut st = state.lock().unwrap();
+            st.catalog = CATALOG_V2.to_vec();
+            st.sig = CATALOG_V2_SIG.into();
+        }
+        engine.store_catalog(true).await.unwrap();
+        let upd = engine.update_store_item("aurora-pulse").await.unwrap();
+        // The overlays can't be read: undo says so and keeps its token.
+        table(&engine, "overlays", true).await;
+        let failed = engine.undo_store_action(Some(&upd.undo.token)).await;
+        table(&engine, "overlays", false).await;
+        assert!(matches!(failed, Err(EngineError::Refused { code: "store_undo_incomplete", .. })), "{failed:?}");
+        let done = engine.undo_store_action(Some(&upd.undo.token)).await.unwrap();
+        assert_eq!(done.reverted_action, "update");
+        let v = engine.store_installed().await.unwrap();
+        assert_eq!(v.installed.iter().find(|i| i.item_id == "aurora-pulse").unwrap().version, "1.0.0");
     }
 
     // ---- Store actions restore exactly the prior state and touch only what they changed ----
