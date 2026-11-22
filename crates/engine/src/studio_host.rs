@@ -429,6 +429,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn log(&self, _lines: usize) -> Result<Value, String> {
         Err(NOT_HERE.into())
     }
+    /// Extra Studio hardware/encoder/renderer telemetry for support diagnostics.
+    async fn diagnostics_studio(&self) -> Option<Value> {
+        None
+    }
     /// Shows the log file in Finder or Explorer (OBS's Show Log Files).
     async fn show_log(&self) -> Result<(), String> {
         Err(NOT_HERE.into())
@@ -2460,6 +2464,12 @@ pub(crate) struct Slot {
     host: std::sync::RwLock<Option<Arc<dyn StudioHost>>>,
 }
 
+impl Slot {
+    pub(crate) fn optional(&self) -> Option<Arc<dyn StudioHost>> {
+        self.host.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
 const NONE: &str = "The Studio runs in the Ferrocast app on your computer. Open Ferrocast there.";
 
 impl Engine {
@@ -3142,7 +3152,7 @@ impl Engine {
     /// Refuses scene-collection or profile switches (and imports/new) while a Show or any
     /// live Studio output (stream, recording, source record, replay, virtual camera, NDI) is
     /// active, so outputs can never be orphaned or blacked out mid-broadcast (M9-01).
-    async fn ensure_idle_for_switch(&self, noun: &str) -> Result<(), EngineError> {
+    pub(crate) async fn ensure_idle_for_switch(&self, noun: &str) -> Result<(), EngineError> {
         if self.is_show_active() {
             return Err(EngineError::Refused {
                 status: 409,
@@ -3185,19 +3195,46 @@ impl Engine {
         Ok(())
     }
 
-    /// Scene collections or profiles: one act on that list.
+    /// Scene collections or profiles: one act on that list. Falls back to file-backed storage on
+    /// disk when no desktop [`StudioHost`] is attached (such as in `ferrocast-headless`).
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
+        let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
+        // Swapping what the Studio shows is refused during a show or while it streams or
+        // records; with no desktop host attached (headless) the show itself still counts.
         if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
             let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
             self.ensure_idle_for_switch(noun).await?;
             // A held key's item is in the collection being left: put it back first.
             self.studio_release_holds().await;
         }
-        let out = self.studio_host()?.shelf(kind.to_string(), act).await.map_err(failed)?;
-        // Another collection may have its own vertical picture (or none): the stream follows.
-        self.studio_sync_vertical().await;
-        Ok(out)
+        if let Some(host) = host {
+            let out = host.shelf(kind.to_string(), act).await.map_err(failed)?;
+            // Another collection may have its own vertical picture (or none): the stream follows.
+            self.studio_sync_vertical().await;
+            return Ok(out);
+        }
+
+        let data = self.store().dir().to_path_buf();
+        let kind_owned = kind.to_string();
+        let res = tokio::task::spawn_blocking(move || {
+            use ferrocast_store::studio_library as lib;
+            match act {
+                ShelfAct::List => lib::headless_shelf_list(&data, &kind_owned),
+                ShelfAct::New { name, copy } => lib::headless_shelf_new(&data, &kind_owned, &name, copy),
+                ShelfAct::Switch { id } => lib::headless_shelf_switch(&data, &kind_owned, &id),
+                ShelfAct::Rename { id, name } => lib::headless_shelf_rename(&data, &kind_owned, &id, &name),
+                ShelfAct::Remove { id } => lib::headless_shelf_remove(&data, &kind_owned, &id),
+                ShelfAct::Export { id } => lib::headless_shelf_export(&data, &kind_owned, &id),
+                ShelfAct::Import { name, doc } => {
+                    let (id, _prev, saved_name) = lib::import_collection_doc(&data, &name, doc)?;
+                    Ok(serde_json::json!({ "id": id, "name": saved_name }))
+                }
+            }
+        })
+        .await
+        .map_err(|e| EngineError::Internal(e.to_string()))?;
+        res.map_err(failed)
     }
 
     pub async fn studio_screens(&self) -> Result<Value, EngineError> {

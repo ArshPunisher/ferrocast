@@ -124,6 +124,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/golive/destinations/*"),
     ("*", "/golive/test"),
     ("*", "/golive/networks"),
+    // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.
+    ("*", "/diagnostics"),
+    ("*", "/diagnostics/**"),
 ];
 
 /// One plain path segment: no `.`/`..`, no encoded `/`, `\`, `.` or NUL, nothing outside
@@ -260,6 +263,10 @@ mod tests {
             ("POST", "/mod/held/a/b/drop"),
             ("GET", "/events"),
             ("GET", "/live"),
+            ("GET", "/diagnostics"),
+            ("GET", "/diagnostics/preview"),
+            ("POST", "/diagnostics/report"),
+            ("POST", "/diagnostics/report.zip"),
         ] {
             assert!(!allowed(Role::Mod, m, p), "{m} {p}");
         }
@@ -355,6 +362,13 @@ mod tests {
             ("POST", "/studio/engine/start"),
             ("PUT", "/studio/engine/preview"),
             ("GET", "/studio/engine/kinds/color_source/options"),
+            ("POST", "/studio/engine/library/collections/overlay/preview"),
+            ("POST", "/studio/engine/library/collections/overlay/import"),
+            ("POST", "/studio/engine/library/collections/overlay/undo"),
+            ("GET", "/diagnostics"),
+            ("GET", "/diagnostics/preview"),
+            ("POST", "/diagnostics/report"),
+            ("POST", "/diagnostics/report.zip"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }

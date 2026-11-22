@@ -20,16 +20,19 @@ mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod automation;
 pub mod designs;
+pub mod diagnostics;
 mod discord;
 mod dispatcher;
 mod error;
 mod ferro_account;
 pub mod ffmpeg_get;
+pub mod fonts;
 mod giveaways;
 pub mod golive;
 mod guests;
 mod history;
 pub mod import;
+mod labels;
 mod loyalty;
 pub mod music;
 mod obs;
@@ -120,6 +123,7 @@ pub struct Engine {
 
 #[derive(Debug)]
 struct Inner {
+    data_dir: std::path::PathBuf,
     store: Arc<Store>,
     state: RwLock<State>,
     connectors: RwLock<HashMap<Platform, Arc<dyn Connector>>>,
@@ -168,8 +172,10 @@ struct Inner {
     restart_update: Notify,
     /// The import preview that can be applied, and one import step at a time.
     import: Mutex<import::Slot>,
+    overlay_import: import::overlay::OverlayPreviewSlot,
     import_busy: tokio::sync::Mutex<()>,
     streamelements_api: RwLock<String>,
+    google_fonts_api: RwLock<String>,
     /// Wakes the OBS connection task when its settings change.
     obs_wake: Notify,
     /// Where OBS's own settings are looked for.
@@ -211,6 +217,14 @@ struct Inner {
     plugin_logic: Mutex<plugins::Running>,
     /// Unclean-exit detection and Safe Mode state.
     safe_mode: Mutex<safe_mode::SafeModeState>,
+    /// Local session/monthly/all-time label counts and hype/combo trains.
+    labels: Mutex<labels::LabelRuntime>,
+    /// Current stream health tracker persisted to the last-5 streams store.
+    stream_health: Mutex<diagnostics::ActiveStreamHealth>,
+    /// Serializes support diagnostics bundle creation so concurrent requests don't spike I/O/CPU.
+    diagnostics_busy: tokio::sync::Mutex<()>,
+    /// Short-lived cache of slow OS/GPU/audio hardware enumeration for repeated diagnostics calls.
+    hardware_probe_cache: diagnostics::HardwareProbeCache,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -238,6 +252,7 @@ impl Engine {
         )
         .await?;
         engine.init_safe_mode(data_dir, safe_mode_flag);
+        engine.mark_unclean_stream_health().await;
         // OBS's own settings file in its usual place (`start_with` leaves this empty so
         // tests never read the developer's real OBS).
         engine.set_obs_detect_paths(ferrocast_obs::detect::default_paths());
@@ -283,6 +298,7 @@ impl Engine {
         .await
         .map_err(|e| EngineError::Internal(e.to_string()))??;
         let store = Arc::new(store);
+        ferrocore::fonts::set_extra_fonts_dir(data_dir.join("fonts"));
 
         let loaded = {
             let s = store.clone();
@@ -300,6 +316,7 @@ impl Engine {
         let start_seq = u64::try_from(now().0).unwrap_or(0).saturating_mul(1000);
         let engine = Engine {
             inner: Arc::new(Inner {
+                data_dir: data_dir.to_path_buf(),
                 store,
                 state: RwLock::new(state),
                 connectors: RwLock::new(HashMap::new()),
@@ -338,8 +355,10 @@ impl Engine {
                 check_update: Notify::new(),
                 restart_update: Notify::new(),
                 import: Mutex::new(None),
+                overlay_import: Mutex::new(Vec::new()),
                 import_busy: tokio::sync::Mutex::new(()),
                 streamelements_api: RwLock::new(import::streamelements::DEFAULT_API.into()),
+                google_fonts_api: RwLock::new(fonts::DEFAULT_GOOGLE_FONTS_API.into()),
                 obs_wake: Notify::new(),
                 // Tests never read (or connect to) the developer's real OBS: `start` sets the real places.
                 obs_paths: RwLock::new(Vec::new()),
@@ -362,6 +381,10 @@ impl Engine {
                 automations: Mutex::new(Default::default()),
                 plugin_logic: Mutex::new(Default::default()),
                 safe_mode: Mutex::new(Default::default()),
+                labels: Mutex::new(Default::default()),
+                stream_health: Mutex::new(Default::default()),
+                diagnostics_busy: tokio::sync::Mutex::new(()),
+                hardware_probe_cache: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -390,6 +413,8 @@ impl Engine {
         tokio::spawn(cloud_bot::run(engine.clone()));
         engine.load_smart().await;
         tokio::spawn(smart::run(engine.clone()));
+        engine.hydrate_labels().await;
+        tokio::spawn(labels::run(engine.clone()));
         tokio::spawn(ferro_account::run(engine.clone()));
         engine.guests_at_start();
         tokio::spawn(cloud_sync::run(engine.clone()));
@@ -401,6 +426,11 @@ impl Engine {
     /// Where adapters send events.
     pub fn sink(&self) -> EventSink {
         self.inner.sink.clone()
+    }
+
+    /// Data directory configured when starting this engine.
+    pub fn data_dir(&self) -> &Path {
+        &self.inner.data_dir
     }
 
     /// Submits an event (used by the API for tests and by in-process sources).

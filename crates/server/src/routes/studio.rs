@@ -110,6 +110,8 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/library/{kind}", get(engine_shelf_list).post(engine_shelf_new))
         .route("/studio/engine/library/{kind}/current", put(engine_shelf_switch))
         .route("/studio/engine/library/{kind}/import", post(engine_shelf_import))
+        .route("/studio/engine/library/collections/overlay/import", post(engine_overlay_import))
+        .route("/studio/engine/library/collections/overlay/undo", post(engine_overlay_undo))
         .route("/studio/engine/library/{kind}/{id}", delete(engine_shelf_remove))
         .route("/studio/engine/library/{kind}/{id}/rename", post(engine_shelf_rename))
         .route("/studio/engine/library/{kind}/{id}/export", get(engine_shelf_export))
@@ -1240,6 +1242,63 @@ async fn engine_shelf_import(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let v = app.engine.studio_shelf(&kind, ShelfAct::Import { name: b.name, doc: b.doc }).await?;
     Ok((StatusCode::CREATED, Json(v)))
+}
+
+/// `POST /studio/engine/library/collections/overlay/preview` (multipart `.overlay` zip) → 200 preview.
+pub(crate) async fn engine_overlay_preview(
+    State(app): State<AppState>,
+    mut form: axum::extract::Multipart,
+) -> ApiResult<Json<Value>> {
+    use ferrocast_engine::import::overlay_parse::MAX_OVERLAY_ZIP;
+    let field = loop {
+        match form.next_field().await {
+            Ok(Some(f)) if f.name() == Some("file") => break f,
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err(ApiError::invalid("Attach the .overlay file in a form field named \"file\".")),
+            Err(e) => {
+                if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    return Err(ApiError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "too_large",
+                        format!("Theme packs can be up to {} MB.", MAX_OVERLAY_ZIP / 1024 / 1024),
+                    )
+                    .hint("Trim large videos from the theme pack and try again."));
+                }
+                return Err(ApiError::invalid(format!("The upload couldn't be read: {}", e.body_text())));
+            }
+        }
+    };
+    let filename = field.file_name().unwrap_or("pack.overlay").to_string();
+    let bytes = field.bytes().await.map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                format!("Theme packs can be up to {} MB.", MAX_OVERLAY_ZIP / 1024 / 1024),
+            )
+            .hint("Trim large videos from the theme pack and try again.")
+        } else {
+            ApiError::invalid(format!("The upload couldn't be read: {}", e.body_text()))
+        }
+    })?;
+    let preview = app.engine.preview_overlay_pack(bytes.to_vec(), filename).await?;
+    Ok(Json(serde_json::to_value(preview).unwrap_or_default()))
+}
+
+async fn engine_overlay_import(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::import::overlay::OverlayPackImportReq>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let report = app.engine.import_overlay_pack(b).await?;
+    Ok((StatusCode::CREATED, Json(serde_json::to_value(report).unwrap_or_default())))
+}
+
+async fn engine_overlay_undo(
+    State(app): State<AppState>,
+    Body(b): Body<ferrocast_engine::import::overlay::OverlayPackUndoReq>,
+) -> ApiResult<Json<Value>> {
+    let report = app.engine.undo_overlay_pack(&b.undo_token).await?;
+    Ok(Json(serde_json::to_value(report).unwrap_or_default()))
 }
 
 async fn engine_screens(State(app): State<AppState>) -> ApiResult<Json<Value>> {

@@ -101,7 +101,7 @@ pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server
     // The obs-websocket server, when the owner switched it on.
     engine.start_obsws();
     let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await {
             tracing::error!(error = %e, "the local server stopped");
         }
     });
@@ -193,6 +193,7 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type"));
     h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE"));
+    h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("content-disposition"));
     h.insert(header::VARY, HeaderValue::from_static("Origin"));
 }
 

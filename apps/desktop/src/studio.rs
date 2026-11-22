@@ -786,11 +786,16 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
 }
 
 /// The saved settings, falling back to `.bak` when unreadable, or the defaults.
+/// The saved profile, as is: nothing is applied to the engine (a support report can read it
+/// without changing the sound rate or broadcast timing of a running Studio).
+fn read_settings(data: &std::path::Path) -> StudioSettings {
+    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
+        .map(|l| l.value)
+        .unwrap_or_default()
+}
+
 fn load_settings(data: &std::path::Path) -> StudioSettings {
-    let s =
-        ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
-            .map(|l| l.value)
-            .unwrap_or_default();
+    let s = read_settings(data);
     apply_audio_format(&s);
     s
 }
@@ -4211,6 +4216,40 @@ impl StudioHost for DesktopStudio {
         self.app.opener().reveal_item_in_dir(&file).map_err(|e| format!("The log folder didn't open: {e}"))
     }
 
+    async fn diagnostics_studio(&self) -> Option<Value> {
+        let data = self.data.clone();
+        self.on_main(move |h| {
+            // Read, don't apply: this runs for a support report, which must not change the engine.
+            let s = h.settings.clone().unwrap_or_else(|| read_settings(&data));
+            let stats = h.collection.as_ref().map(|c| c.stats());
+            let encoders: Vec<Value> = ferrocast_studio::kinds::kinds()
+                .encoders
+                .into_iter()
+                .filter_map(|e| {
+                    let mut v = serde_json::to_value(&e).ok()?;
+                    if let Some(obj) = v.as_object_mut() {
+                        let hw = e.id != "obs_x264";
+                        obj.insert("hardware".into(), Value::Bool(hw));
+                    }
+                    Some(v)
+                })
+                .collect();
+            json!({
+                "studio_running": h.collection.is_some(),
+                "renderer": h.renderer,
+                "encoders": encoders,
+                "video_encoder": encode_of(&s).video_encoder,
+                "sample_rate": s.sample_rate,
+                "monitoring": s.monitoring.as_ref().map(|(n, _)| n.clone()),
+                "canvas": format!("{}x{}", s.width, s.height),
+                "fps": s.fps,
+                "stats": stats,
+            })
+        })
+        .await
+        .ok()
+    }
+
     async fn web_window(&self, name: String, url: String) -> Result<(), String> {
         use std::hash::{Hash, Hasher};
         // One window per page, so it keeps its place (the window-state plugin keys on this).
@@ -4813,6 +4852,8 @@ mod budget_tests {
 
         let loaded = load_settings(dir.path());
         assert_eq!((loaded.width, loaded.height, loaded.fps), (1280, 720, 30));
+        let read = read_settings(dir.path());
+        assert_eq!((read.width, read.height, read.fps), (1280, 720, 30), "reads the same profile");
 
         // Corrupt existing settings must not clobber `.bak` on a save_json overwrite.
         save_json(&settings_path, &serde_json::to_value(&second).unwrap_or_else(|e| panic!("{e}")));

@@ -154,6 +154,7 @@ pub(crate) const MENUS: &[Menu] = &[
             item("docs", "Ferrocast Documentation", None, Act::Url(DOCS)),
             item("release-notes", "Release Notes", None, Act::Url(RELEASES)),
             item("help-logs", "Show Log Files", None, Act::Native(Native::ShowLogs)),
+            item("help-support-report", "Create Support Report…", None, Act::Nav("#/settings/advanced")),
             Entry::Sep,
             item("restart-safe", "Restart in Safe Mode…", None, Act::Native(Native::RestartSafeMode)),
         ],

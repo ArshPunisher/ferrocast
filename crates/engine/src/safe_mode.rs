@@ -559,4 +559,61 @@ mod tests {
         engine.clear_running_marker();
         assert!(!has_unclean_exit(dir.path()), "explicit clear after clean close removes running.json");
     }
+
+    #[tokio::test]
+    async fn start_with_mode_marks_live_stream_health_unclean_when_running_marker_left_behind() {
+        struct ResetVsts;
+        impl Drop for ResetVsts {
+            fn drop(&mut self) {
+                ferrocore::afx::set_plugins_disabled(false);
+            }
+        }
+        let _reset_vsts = ResetVsts;
+        let _serial = PLUGINS_FLAG.lock().await;
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let engine1 = Engine::start_with_memory_secrets(dir.path()).await.unwrap_or_else(|e| panic!("{e}"));
+            engine1
+                .record_stream_health(ferrocast_core::diagnostics::StreamHealthRecord {
+                    id: "crashed-live-1".into(),
+                    started_at: ferrocast_core::event::Millis(1_700_000_000_000),
+                    ended_at: None,
+                    duration_s: 120,
+                    platforms: vec![ferrocast_core::event::Platform::Twitch],
+                    live: true,
+                    unclean_end: false,
+                    fps_target: 60,
+                    canvas: "1920x1080".into(),
+                    encoder_id: None,
+                    sample_rate_hz: 48_000,
+                    dropped_frames: 0,
+                    skipped_frames: 0,
+                    lagged_frames: 0,
+                    rendered_frames: 100,
+                    avg_fps: 60.0,
+                    cpu_pct: 12.0,
+                    memory_mb: 500,
+                    frame_ms: 16.0,
+                    destinations: Vec::new(),
+                    issues: Vec::new(),
+                })
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            engine1.shutdown();
+        }
+
+        // Leftover running.json simulates a crash before clean shutdown.
+        std::fs::write(running_marker_path(dir.path()), r#"{"pid":99999,"started_at_ms":1700000000000}"#).unwrap();
+
+        let engine2 = Engine::start_with_mode(dir.path(), false).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(engine2.safe_mode_status().unclean_exit);
+        let history =
+            engine2.db(|s| ferrocast_store::repo::stream_health::last(s, 5)).await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].live, "live row must be closed after unclean exit");
+        assert!(history[0].unclean_end, "start_with_mode must mark live stream health row as unclean_end");
+        engine2.clear_running_marker();
+        engine2.shutdown();
+    }
 }

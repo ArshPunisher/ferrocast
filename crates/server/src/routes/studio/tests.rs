@@ -1143,6 +1143,101 @@ async fn item_filter_routes_forward_item_target_and_validate_queries() {
     assert!(matches!(&acts[10], StudioAct::SourcePicture { filters: true, item, .. } if item == &expected));
 }
 
+#[tokio::test]
+async fn headless_overlay_pack_routes_preview_import_and_undo() {
+    use std::io::{Cursor, Write};
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    let r = start().await;
+
+    // Headless library listing works even with no desktop StudioHost attached.
+    let list_res = r.get("/studio/engine/library/collections").await;
+    assert_eq!(list_res.status(), StatusCode::OK);
+    let list_body: Value = list_res.json().await.unwrap();
+    assert_eq!(list_body["current"], "untitled");
+
+    let cfg = json!({
+        "schemaVersion": 2,
+        "nodeType": "RootNode",
+        "data": {
+            "scenes": {
+                "data": {
+                    "items": [
+                        {
+                            "name": "Starter",
+                            "sceneId": "s1",
+                            "slots": {
+                                "data": {
+                                    "items": [
+                                        {
+                                            "id": "w1",
+                                            "name": "Chat Widget",
+                                            "sceneNodeType": "item",
+                                            "x": 0.02,
+                                            "y": 0.4,
+                                            "scaleX": 1.0 / 1920.0,
+                                            "scaleY": 1.0 / 1080.0,
+                                            "content": { "nodeType": "WidgetNode", "data": { "type": "ChatBox" } }
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+    });
+    let mut zw = ZipWriter::new(Cursor::new(Vec::new()));
+    zw.start_file("config.json", SimpleFileOptions::default()).unwrap();
+    zw.write_all(&serde_json::to_vec(&cfg).unwrap()).unwrap();
+    let zip_bytes = zw.finish().unwrap().into_inner();
+
+    let form = reqwest::multipart::Form::new()
+        .part("file", reqwest::multipart::Part::bytes(zip_bytes).file_name("RoutePack.overlay"));
+    let prev_res = r
+        .client
+        .post(format!("{}/api/v1/studio/engine/library/collections/overlay/preview", r.base))
+        .bearer_auth(&r.token)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(prev_res.status(), StatusCode::OK);
+    let preview: Value = prev_res.json().await.unwrap();
+    let preview_id = preview["preview_id"].as_str().unwrap().to_string();
+    assert_eq!(preview["suggested_name"], "RoutePack");
+
+    let imp_res =
+        r.post("/studio/engine/library/collections/overlay/import", json!({ "preview_id": preview_id })).await;
+    assert_eq!(imp_res.status(), StatusCode::CREATED);
+    let imported: Value = imp_res.json().await.unwrap();
+    let undo_token = imported["undo_token"].as_str().unwrap().to_string();
+    assert_eq!(imported["overlays_created"].as_array().map(Vec::len), Some(1));
+
+    let after_list: Value = r.get("/studio/engine/library/collections").await.json().await.unwrap();
+    assert_eq!(after_list["current"], imported["id"]);
+
+    let undo_res = r.post("/studio/engine/library/collections/overlay/undo", json!({ "undo_token": undo_token })).await;
+    assert_eq!(undo_res.status(), StatusCode::OK);
+    let restored_list: Value = r.get("/studio/engine/library/collections").await.json().await.unwrap();
+    assert_eq!(restored_list["current"], "untitled");
+
+    // Bad upload type returns 415.
+    let bad_form = reqwest::multipart::Form::new()
+        .part("file", reqwest::multipart::Part::bytes(b"not a zip".to_vec()).file_name("broken.overlay"));
+    let bad_res = r
+        .client
+        .post(format!("{}/api/v1/studio/engine/library/collections/overlay/preview", r.base))
+        .bearer_auth(&r.token)
+        .multipart(bad_form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
 /// A Studio that keeps performance mode (the preview paused) and nothing else.
 #[derive(Debug, Default)]
 struct PausedHost {
