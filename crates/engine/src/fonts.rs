@@ -18,6 +18,8 @@ pub const DEFAULT_GOOGLE_FONTS_API: &str = "https://fonts.googleapis.com";
 const GOOGLE_FONTS_CSS_HOST: &str = "fonts.googleapis.com";
 const GOOGLE_FONTS_CDN_HOST: &str = "fonts.gstatic.com";
 const MAX_FONT_FILE_BYTES: usize = 10 * 1024 * 1024;
+/// A font stylesheet is a few hundred bytes per face; this is plenty.
+const MAX_FONT_CSS_BYTES: usize = 256 * 1024;
 const MAX_FILES_PER_FAMILY: usize = 2;
 const MAX_FAMILIES_PER_PACK: usize = 20;
 
@@ -705,6 +707,23 @@ enum FetchError {
     Offline(String),
 }
 
+/// Reads a response body as it arrives and gives up the moment it passes `cap` bytes (a
+/// `Content-Length` can be missing or wrong, so it can't be trusted to bound anything).
+/// `Ok(None)`: too big. `Err`: the connection failed.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Option<Vec<u8>>, String> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return Ok(None);
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if buf.len() + chunk.len() > cap {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Some(buf))
+}
+
 async fn fetch_one_google_font(
     http: &reqwest::Client,
     base: &str,
@@ -723,7 +742,13 @@ async fn fetch_one_google_font(
     if !resp.status().is_success() {
         return Err(FetchError::Offline(format!("Google Fonts replied HTTP {}", resp.status())));
     }
-    let css = resp.text().await.map_err(|e| FetchError::Offline(e.to_string()))?;
+    let css_bytes = match read_capped(resp, MAX_FONT_CSS_BYTES).await {
+        Ok(Some(b)) => b,
+        // A stylesheet this big isn't one: treat the family as not found.
+        Ok(None) => return Err(FetchError::NotFound),
+        Err(e) => return Err(FetchError::Offline(e)),
+    };
+    let css = String::from_utf8_lossy(&css_bytes).into_owned();
     let urls = extract_css_font_urls(&css);
     if urls.is_empty() {
         return Err(FetchError::NotFound);
@@ -744,13 +769,7 @@ async fn fetch_one_google_font(
         if !file_resp.status().is_success() {
             continue;
         }
-        if file_resp.content_length().is_some_and(|n| n > MAX_FONT_FILE_BYTES as u64) {
-            continue;
-        }
-        let Ok(bytes) = file_resp.bytes().await else { continue };
-        if bytes.len() > MAX_FONT_FILE_BYTES {
-            continue;
-        }
+        let Ok(Some(bytes)) = read_capped(file_resp, MAX_FONT_FILE_BYTES).await else { continue };
         let Some((ext, _families)) = detect_font_format(&bytes) else {
             tracing::warn!(url = %asset_url, "rejected downloaded font with invalid header");
             continue;

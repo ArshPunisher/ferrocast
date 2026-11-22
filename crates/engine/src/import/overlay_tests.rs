@@ -1001,3 +1001,88 @@ async fn a_woff_with_only_its_magic_bytes_is_not_installed() {
         .collect();
     assert!(all.is_empty(), "{all:?}");
 }
+
+// ---- Neon review H4: font downloads are read with a cap, as they arrive ----------------------
+
+/// A font server that streams a body of `total` bytes with no Content-Length (chunked), for
+/// `what` = "css" (the stylesheet itself) or "font" (the file the stylesheet names). Counts the
+/// body bytes it got to send.
+async fn start_streaming_font_server(
+    what: &'static str,
+    total: usize,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let sent = Arc::new(AtomicUsize::new(0));
+    let (sent_c, base_c) = (sent.clone(), base.clone());
+    let handle = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let sent = sent_c.clone();
+            let base = base_c.clone();
+            tokio::spawn(async move {
+                let mut req = [0u8; 4096];
+                let n = sock.read(&mut req).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&req[..n]).to_string();
+                let path = req.lines().next().unwrap_or("").split_whitespace().nth(1).unwrap_or("/").to_string();
+                let stream_it =
+                    (path.starts_with("/css2") && what == "css") || (path.starts_with("/big.ttf") && what == "font");
+                if path.starts_with("/css2") && what == "font" {
+                    let css = format!(
+                        "@font-face {{ font-family: 'FerroMockFont'; src: url({base}/big.ttf) format('truetype'); }}"
+                    );
+                    let hdr =
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: {}\r\n\r\n", css.len());
+                    let _ = sock.write_all(hdr.as_bytes()).await;
+                    let _ = sock.write_all(css.as_bytes()).await;
+                } else if stream_it {
+                    if sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![b'a'; 64 * 1024];
+                    let mut left = total;
+                    while left > 0 {
+                        let n = left.min(chunk.len());
+                        let head = format!("{n:x}\r\n");
+                        if sock.write_all(head.as_bytes()).await.is_err()
+                            || sock.write_all(&chunk[..n]).await.is_err()
+                            || sock.write_all(b"\r\n").await.is_err()
+                        {
+                            return;
+                        }
+                        sent.fetch_add(n, Ordering::Relaxed);
+                        left -= n;
+                    }
+                    let _ = sock.write_all(b"0\r\n\r\n").await;
+                }
+            });
+        }
+    });
+    (base, sent, handle)
+}
+
+#[tokio::test]
+async fn an_endless_font_stylesheet_or_file_is_cut_off_as_it_arrives() {
+    for (what, total, cap_hint) in
+        [("css", 64 * 1024 * 1024, 4 * 1024 * 1024), ("font", 64 * 1024 * 1024, 30 * 1024 * 1024)]
+    {
+        let (e, dir) = engine().await;
+        let (base, sent, handle) = start_streaming_font_server(what, total).await;
+        e.set_google_fonts_api(&base);
+        let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+        let rep = import_pack(&e, build_zip(vec![("config.json", &cfg, None)]), "big.overlay").await;
+        assert!(
+            !matches!(rep.fonts[0].status, FontStatus::Cached | FontStatus::Bundled | FontStatus::Downloaded),
+            "{what}: {:?}",
+            rep.fonts[0].status
+        );
+        assert!(
+            files_under(&fonts_dir(dir.path())).iter().all(|p| p.extension().is_none_or(|x| x != "ttf")),
+            "{what}: nothing saved"
+        );
+        // Give the server a moment to notice the closed connection, then see how far it got.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let got = sent.load(Ordering::Relaxed);
+        assert!(got < cap_hint, "{what}: the whole {total} bytes were read ({got} sent), not cut off");
+        handle.abort();
+    }
+}
