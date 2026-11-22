@@ -1502,6 +1502,7 @@ impl Engine {
         let include_upload = req.include_upload.unwrap_or(mode == AutoConfigMode::Stream);
 
         let _op = self.studio().auto_config_op.lock().await;
+        let host = self.studio_host()?;
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_notify = Arc::new(Notify::new());
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
@@ -1518,12 +1519,8 @@ impl Engine {
             }
             self.ensure_benchmark_idle().await?;
 
-            let canvas = if let Ok(host) = self.studio_host() {
-                let s = host.settings().await;
-                [s.width, s.height]
-            } else {
-                [1920, 1080]
-            };
+            let s = host.settings().await;
+            let canvas = [s.width, s.height];
 
             let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
             if slot.is_running() {
@@ -2021,6 +2018,15 @@ impl Engine {
         {
             return Err(EngineError::Invalid("encoder: hardware or software.".into()));
         }
+        let clean_label = if let Some(raw) = &req.label {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() || trimmed.chars().count() > 100 || trimmed.chars().any(char::is_control) {
+                return Err(EngineError::Invalid("label: 1 to 100 characters without control characters.".into()));
+            }
+            Some(trimmed.to_string())
+        } else {
+            None
+        };
 
         self.flush_pending_startup_restore_to_host().await;
         let _op = self.studio().auto_config_op.lock().await;
@@ -2103,7 +2109,7 @@ impl Engine {
         next.check()?;
 
         let summary =
-            AppliedSummary::from_settings(&next, req.label.or_else(|| picked.as_ref().map(|p| p.label.clone())));
+            AppliedSummary::from_settings(&next, clean_label.or_else(|| picked.as_ref().map(|p| p.label.clone())));
         let pending_path = pending_apply_path(self.data_dir());
         let had_pending_before = pending_path.exists();
         let pending = PendingApply {
@@ -3904,5 +3910,54 @@ mod tests {
         );
         assert!(final_view.upload_error.is_some());
         assert!(final_view.picked.is_some());
+    }
+
+    #[tokio::test]
+    async fn m4_benchmark_requires_studio_host_and_apply_rejects_bad_label() {
+        // 1. Engine without attached StudioHost must reject benchmark upfront with 422 studio_unavailable.
+        let dir = tempfile::tempdir().unwrap();
+        let detached = Engine::start(dir.path()).await.unwrap();
+        let err = detached
+            .auto_config_benchmark(BenchmarkReq {
+                mode: Some("record".into()),
+                fps_preference: Some(60),
+                include_upload: Some(false),
+                max_seconds: Some(3),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Refused { status: 422, code: "studio_unavailable", .. }),
+            "detached engine must reject benchmark upfront cleanly: {err:?}"
+        );
+
+        // 2. ApplyReq::label rejects empty, control characters, and > 100 characters.
+        let (engine, _host, _dir) = test_engine().await;
+        for bad in ["", "   ", "bad\nline", &"x".repeat(101)] {
+            let e = engine
+                .auto_config_apply(ApplyReq {
+                    encoder: Some("hardware".into()),
+                    fps: Some(60),
+                    video_kbps: Some(6000),
+                    label: Some(bad.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(e, EngineError::Invalid(_)), "bad label {bad:?} gave {e:?}");
+        }
+
+        // Valid label trims cleanly.
+        let ok_view = engine
+            .auto_config_apply(ApplyReq {
+                encoder: Some("hardware".into()),
+                fps: Some(60),
+                video_kbps: Some(6000),
+                label: Some("  VideoToolbox 1080p60  ".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok_view.applied.unwrap().label, "VideoToolbox 1080p60");
     }
 }
