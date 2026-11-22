@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use ferrocast_engine::studio_host::{ItemEdit as Edit, StudioAct};
+use ferrocast_engine::studio_host::{BoxReason, ItemEdit as Edit, StudioAct};
 use ferrocast_studio::stage::Stage as Collection;
 use serde_json::Value;
 
@@ -23,6 +23,16 @@ const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MERGE: Duration = Duration::from_secs(3);
 /// Arrow-key nudges this close together are one step.
 const NUDGES: Duration = Duration::from_secs(1);
+/// How long a drag that never saved (a lost pointer, a closed page) can keep a step open: after
+/// this a move of the same sources is a step of its own, not folded into hours-old work.
+const OPEN_MAX: Duration = Duration::from_secs(30);
+
+impl Step {
+    /// Still being added to by a drag that hasn't saved.
+    fn live(&self) -> bool {
+        self.open && self.at.elapsed() < OPEN_MAX
+    }
+}
 
 #[derive(Debug)]
 struct Step {
@@ -132,16 +142,46 @@ impl History {
             StudioAct::SetItemBox { scene, id, save, .. } => {
                 let key = ("box", scene.clone(), *id);
                 // A drag's moves, or nudges with the arrow keys in a row, are one step.
-                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && (s.open || s.at.elapsed() < NUDGES))
+                if self
+                    .undo
+                    .last()
+                    .is_some_and(|s| s.key.as_ref() == Some(&key) && (s.live() || s.at.elapsed() < NUDGES))
                 {
-                    return Some(joined(*save));
+                    // An unsaved move joining a step already closed reopens it: the drag goes on.
+                    return Some(Before { open: !*save, ..joined(*save) });
                 }
                 Some(fresh(format!("Move {}", item_name(c, scene, *id)?), Some(key), !*save))
+            }
+            StudioAct::SetItemBoxes { scene, items, save, reason } => {
+                // The same ids in any order are the same drag.
+                let mut ids: Vec<i64> = items.iter().map(|b| b.id).collect();
+                ids.sort_unstable();
+                // The whole sorted list is the key: two sets that happen to hash alike are two drags.
+                // Align and Space out are one click each: their own step, named for what they do,
+                // never joined to a drag before them or an arrow key after them.
+                let key = ("boxes", format!("{scene}\u{1}{ids:?}\u{1}{reason:?}"), 0);
+                let one_shot = *reason != BoxReason::Move;
+                if !one_shot
+                    && self
+                        .undo
+                        .last()
+                        .is_some_and(|s| s.key.as_ref() == Some(&key) && (s.live() || s.at.elapsed() < NUDGES))
+                {
+                    return Some(Before { open: !*save, ..joined(*save) });
+                }
+                let n = ids.len();
+                let label = match (reason, ids.as_slice()) {
+                    (BoxReason::Align, _) => format!("Align {n} sources"),
+                    (BoxReason::Distribute, _) => format!("Space out {n} sources"),
+                    (BoxReason::Move, [one]) => format!("Move {}", item_name(c, scene, *one)?),
+                    (BoxReason::Move, _) => format!("Move {n} sources"),
+                };
+                Some(fresh(label, Some(key), !*save))
             }
             StudioAct::SetItemCrop { scene, id, save, .. } => {
                 let key = ("crop", scene.clone(), *id);
                 // A drag's crops are one step.
-                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.open) {
+                if self.undo.last().is_some_and(|s| s.key.as_ref() == Some(&key) && s.live()) {
                     return Some(joined(*save));
                 }
                 Some(fresh(format!("Crop {}", item_name(c, scene, *id)?), Some(key), !*save))
@@ -278,11 +318,16 @@ impl History {
             if let Some(top) = self.undo.last_mut() {
                 top.at = Instant::now();
                 top.after = now;
+                // The step's size follows its collection (a drag that added to it grows it).
+                top.bytes = approx_bytes(&top.before) + approx_bytes(&top.after);
                 if b.closes {
                     top.open = false;
+                } else if b.open {
+                    top.open = true;
                 }
             }
             self.redo.clear();
+            self.trim();
             return;
         }
         if now == b.doc {
@@ -304,6 +349,11 @@ impl History {
     /// Keeps a step, forgetting the oldest while there are too many or they hold too much.
     fn push_step(&mut self, step: Step) {
         self.undo.push(step);
+        self.trim();
+    }
+
+    /// Forgets the oldest steps while there are too many or they hold too much.
+    fn trim(&mut self) {
         while self.undo.len() > KEEP
             || (self.undo.len() > 1 && self.undo.iter().chain(&self.redo).map(|s| s.bytes).sum::<usize>() > MAX_BYTES)
         {
@@ -414,6 +464,216 @@ mod tests {
         assert_eq!(h.list().0, ["Move Box", "Add scene Two"]);
         assert_eq!(h.undo(&c), Ok(Some("Move Box".into())));
         assert_eq!(c.transform("Main", id).map(|t| t.x).ok(), Some(0.0), "back to before the drag");
+    }
+
+    /// Moving, aligning or spacing out several items is one step however many there are, and a
+    /// drag of them is one step too; undo puts every one of them back.
+    #[test]
+    fn several_items_moved_at_once_are_one_undo_step() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        let add = |name: &str| {
+            c.add_source("Main", "color_source_v3", name, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .id
+        };
+        let (a, b, d) = (add("A"), add("B"), add("C"));
+        let x_of = |id| c.transform("Main", id).map(|t| t.x).ok();
+        let run = |h: &mut History, ids: &[i64], x: f32, save: bool| {
+            let items: Vec<ItemBoxIn> = ids.iter().map(|&id| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 }).collect();
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let boxes: Vec<_> = ids.iter().map(|&id| (id, x, 0.0, 10.0, 10.0)).collect();
+            let out: Result<Value, String> =
+                c.set_item_boxes("Main", &boxes).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        // A drag of three: its moves are one step, labelled by how many.
+        for (x, save) in [(10.0, false), (20.0, false), (30.0, true)] {
+            run(&mut h, &[a, b, d], x, save);
+        }
+        assert_eq!(h.list().0, ["Move 3 sources"]);
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(30.0); 3]);
+        assert_eq!(h.undo(&c), Ok(Some("Move 3 sources".into())));
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(0.0); 3], "all three back");
+        assert_eq!(h.redo(&c), Ok(Some("Move 3 sources".into())));
+        assert_eq!([x_of(a), x_of(b), x_of(d)], [Some(30.0); 3]);
+        // Two of them is its own step; one alone reads as moving that one.
+        run(&mut h, &[a, b], 50.0, true);
+        run(&mut h, &[d], 60.0, true);
+        assert_eq!(h.list().0, ["Move C", "Move 2 sources", "Move 3 sources"]);
+    }
+
+    /// A drag that starts just after a finished move of the same sources is part of that step, and
+    /// stays so however long it is held still (the step is open again until the drag saves).
+    #[test]
+    fn a_drag_joining_a_finished_move_stays_one_step() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        let go = |h: &mut History, x: f32, save: bool| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        c.add_source("Main", "color_source_v3", "A", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        c.add_source("Main", "color_source_v3", "B", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        go(&mut h, 50.0, true); // a finished move
+        go(&mut h, 60.0, false); // a drag starts right after: joins it
+        assert!(h.undo.last().is_some_and(|s| s.open), "an unsaved drag keeps the step open");
+        // Held still past the nudge window: the next move of the drag is still that step.
+        if let Some(s) = h.undo.last_mut() {
+            s.at -= NUDGES * 2;
+        }
+        go(&mut h, 70.0, false);
+        go(&mut h, 80.0, true);
+        assert_eq!(h.list().0.len(), 1, "one step: {:?}", h.list().0);
+        assert!(h.undo.last().is_some_and(|s| !s.open), "the save closes it");
+    }
+
+    /// Align and Space out are steps of their own, named for what they do, even right after a
+    /// drag or another align of the same sources (Neon #6: they merged into "Move 2 sources").
+    #[test]
+    fn align_and_space_out_are_their_own_named_undo_steps() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in ["A", "B"] {
+            c.add_source("Main", "color_source_v3", n, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, x: f32, save: bool, reason: BoxReason| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, 50.0, true, BoxReason::Move); // a drag, saved
+        go(&mut h, 60.0, true, BoxReason::Align); // within a second: still its own step
+        go(&mut h, 70.0, true, BoxReason::Distribute);
+        go(&mut h, 71.0, true, BoxReason::Move); // an arrow key after them: not folded into them
+        let labels: Vec<String> = h.list().0.iter().map(|s| s.to_string()).collect();
+        assert_eq!(labels.len(), 4, "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("Align 2 sources")), "{labels:?}");
+        assert!(labels.iter().any(|l| l.starts_with("Space out 2 sources")), "{labels:?}");
+    }
+
+    /// A step that is joined and grows is counted at its new size, so the memory cap holds.
+    #[test]
+    fn a_joined_step_is_counted_at_its_new_size() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        c.add_source("Main", "color_source_v3", "A", &serde_json::json!({ "width": 10, "height": 10 }), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let go = |h: &mut History, save: bool| {
+            let items = vec![ItemBoxIn { id: 1, x: 5.0, y: 0.0, w: 10.0, h: 10.0 }];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> =
+                c.set_item_box("Main", 1, 5.0, 0.0, 10.0, 10.0).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, false);
+        let first = h.undo.last().map(|s| s.bytes).unwrap_or(0);
+        // The collection grows while the drag is open, then the drag goes on.
+        c.add_source(
+            "Main",
+            "color_source_v3",
+            &"B".repeat(90),
+            &serde_json::json!({ "width": 10, "height": 10 }),
+            false,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        go(&mut h, true);
+        let step = h.undo.last().unwrap_or_else(|| panic!("a step"));
+        assert!(step.bytes > first, "{} should be more than {first}", step.bytes);
+        assert_eq!(step.bytes, approx_bytes(&step.before) + approx_bytes(&step.after));
+    }
+
+    /// A drag that never saved (the pointer was lost, the page closed) leaves its step open; a
+    /// move of the same sources long after must not fold into it (Undo would go back that far).
+    #[test]
+    fn an_abandoned_drags_step_does_not_swallow_later_moves() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in ["A", "B"] {
+            c.add_source("Main", "color_source_v3", n, &serde_json::json!({ "width": 10, "height": 10 }), false)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, x: f32, save: bool| {
+            let items = vec![
+                ItemBoxIn { id: 1, x, y: 0.0, w: 10.0, h: 10.0 },
+                ItemBoxIn { id: 2, x, y: 0.0, w: 10.0, h: 10.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(1, x, 0.0, 10.0, 10.0), (2, x, 0.0, 10.0, 10.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, 50.0, false); // a drag that never saves
+        assert_eq!(h.list().0.len(), 1);
+        if let Some(s) = h.undo.last_mut() {
+            s.at -= OPEN_MAX * 2; // ...and is left for a minute
+        }
+        go(&mut h, 90.0, true); // a later, finished move of the same two
+        assert_eq!(h.list().0.len(), 2, "two steps: {:?}", h.list().0);
+    }
+
+    /// Two different sets of items moved within a second of each other are two steps, even when
+    /// their ids would hash alike ([1, 34] and [2, 3] do).
+    #[test]
+    fn different_sets_of_items_are_different_steps() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        for n in 0..34 {
+            c.add_source(
+                "Main",
+                "color_source_v3",
+                &format!("S{n}"),
+                &serde_json::json!({ "width": 10, "height": 10 }),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let go = |h: &mut History, ids: [i64; 2], x: f32| {
+            let items: Vec<ItemBoxIn> = ids.iter().map(|&id| ItemBoxIn { id, x, y: 0.0, w: 10.0, h: 10.0 }).collect();
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save: true, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let boxes: Vec<_> = ids.iter().map(|&id| (id, x, 0.0, 10.0, 10.0)).collect();
+            let out: Result<Value, String> =
+                c.set_item_boxes("Main", &boxes).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        go(&mut h, [1, 34], 100.0);
+        go(&mut h, [2, 3], 200.0);
+        assert_eq!(h.list().0.len(), 2, "two steps: {:?}", h.list().0);
+        // The same two in the other order are the same drag.
+        go(&mut h, [3, 2], 300.0);
+        assert_eq!(h.list().0.len(), 2, "the same set merges: {:?}", h.list().0);
     }
 
     /// Owner's check, 11 Nov: edits to a group's sources, and moving a source in or out of a

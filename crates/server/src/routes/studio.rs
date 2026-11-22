@@ -45,6 +45,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items", get(engine_items).post(engine_add_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/edit", post(engine_edit_item))
         .route("/studio/engine/scenes/{scene}/items/{id}/box", put(engine_item_box))
+        .route("/studio/engine/scenes/{scene}/items/boxes", put(engine_item_boxes))
         .route("/studio/engine/scenes/{scene}/items/{id}/crop", put(engine_item_crop))
         .route("/studio/engine/scenes/{scene}/thumbnail", get(engine_scene_thumbnail))
         .route(
@@ -704,6 +705,25 @@ async fn engine_item_box(
     Body(b): Body<BoxBody>,
 ) -> ApiResult<Json<Value>> {
     act(&app, StudioAct::SetItemBox { scene, id, x: b.x, y: b.y, w: b.w, h: b.h, save: b.save }).await
+}
+
+#[derive(Deserialize)]
+struct BoxesBody {
+    items: Vec<ferrocast_engine::studio_host::ItemBoxIn>,
+    #[serde(default)]
+    save: bool,
+    #[serde(default)]
+    reason: ferrocast_engine::studio_host::BoxReason,
+}
+
+/// `PUT …/items/boxes` `{ items: [{ id, x, y, w, h }], save?, reason? }`: several items moved and sized at
+/// once (aligned, spaced out, a group of picked ones moved or resized) as one step → the items.
+async fn engine_item_boxes(
+    State(app): State<AppState>,
+    Path(scene): Path<String>,
+    Body(b): Body<BoxesBody>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::SetItemBoxes { scene, items: b.items, save: b.save, reason: b.reason }).await
 }
 
 #[derive(Deserialize)]

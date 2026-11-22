@@ -1820,6 +1820,41 @@ impl Stage {
         Ok(self.info_of(&it))
     }
 
+    /// Moves and sizes several items at once, each as `set_item_box` does → the items, in the
+    /// order given. All of them or none: an id that isn't there is refused before any moves, and
+    /// a failure part way puts the collection back as it was.
+    pub fn set_item_boxes(
+        &self,
+        scene: &str,
+        boxes: &[(i64, f32, f32, f32, f32)],
+    ) -> Result<Vec<ItemInfo>, StudioError> {
+        for (id, ..) in boxes {
+            self.item(scene, *id)?;
+        }
+        // A group with one of its own sources: moving the source fits the group again, and the
+        // group's box then lands on the changed group (the source moves twice). Asked for one at
+        // a time, not both.
+        let asked: std::collections::HashSet<i64> = boxes.iter().map(|b| b.0).collect();
+        if self.items(scene)?.iter().any(|g| asked.contains(&g.id) && g.children.iter().any(|c| asked.contains(&c.id)))
+        {
+            return Err(fail("a group and a source inside it can't be moved together.".to_string()));
+        }
+        let before = self.snapshot();
+        for &(id, x, y, w, h) in boxes {
+            if let Err(e) = self.set_item_box(scene, id, x, y, w, h) {
+                self.restore_all(&before);
+                return Err(e);
+            }
+        }
+        // As things ended up (a move inside a group fits the group again), in the order asked;
+        // a source inside a group is read through the scene, in canvas pixels.
+        let list = self.items(scene)?;
+        let found = |id: i64| {
+            list.iter().flat_map(|i| std::iter::once(i).chain(i.children.iter())).find(|i| i.id == id).cloned()
+        };
+        boxes.iter().map(|b| found(b.0).ok_or_else(|| fail(format!("\"{scene}\" has no item {}.", b.0)))).collect()
+    }
+
     /// Moves and sizes an item so its picture fills `x, y, w, h` on the canvas (a drag in the
     /// preview), keeping its turn and crop.
     pub fn set_item_box(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
@@ -1869,7 +1904,18 @@ impl Stage {
         // The box's top left, whatever the item is aligned by.
         t.alignment = 5;
         (t.x, t.y) = (x, y);
-        self.set_transform(scene, id, &t)
+        let info = self.set_transform(scene, id, &t)?;
+        // A flipped item in bounds is drawn from another corner than `x, y` (the bounds' alignment
+        // and the flip move its origin): the frame's corner is what the caller sees and sends back,
+        // so `x, y` are moved by what they are off, and a nudge of 1 pixel is 1 pixel.
+        if home == scene {
+            let (dx, dy) = (x - info.frame[4], y - info.frame[5]);
+            if dx.abs() > 0.01 || dy.abs() > 0.01 {
+                (t.x, t.y) = (t.x + dx, t.y + dy);
+                return self.set_transform(scene, id, &t);
+            }
+        }
+        Ok(info)
     }
 
     pub fn set_item_crop(&self, scene: &str, id: i64, crop: [i32; 4]) -> Result<ItemInfo, StudioError> {
@@ -6535,6 +6581,113 @@ mod tests {
         ok(s.set_transform("Main", wide.id, &t));
         ok(s.set_item_box("Main", wide.id, 0.0, 0.0, 800.0, 225.0));
         assert_eq!(ok(s.transform("Main", wide.id)).bounds, "fit");
+    }
+
+    /// Several items moved and sized at once (align, distribute, a group moved or resized): all
+    /// of them or none, so one step can be undone whole.
+    /// Sending an item its own box back changes nothing: not for a flipped item in bounds, whose
+    /// drawn corner is not where the item's `x, y` say (Neon #7: a 1 pixel nudge threw it a whole
+    /// width across).
+    #[test]
+    fn an_items_own_box_sent_back_leaves_it_where_it_is() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        for (flip_x, flip_y, bounds, align) in
+            [(-1.0, 1.0, "fit", 0), (1.0, -1.0, "fit", 0), (-1.0, -1.0, "stretch", 5), (-1.0, 1.0, "fit", 5)]
+        {
+            let mut t = ok(s.transform("Main", a.id));
+            t.bounds = bounds.into();
+            (t.bounds_width, t.bounds_height, t.bounds_alignment) = (100.0, 100.0, align);
+            (t.scale_x, t.scale_y) = (flip_x, flip_y);
+            (t.x, t.y, t.alignment) = (100.0, 100.0, 5);
+            ok(s.set_transform("Main", a.id, &t));
+            let frame =
+                |s: &Stage| ok(s.items("Main")).into_iter().find(|i| i.id == a.id).map(|i| i.frame).unwrap_or([0.0; 6]);
+            let f = frame(&s);
+            let (w, h) = (f[0].hypot(f[1]), f[2].hypot(f[3]));
+            ok(s.set_item_box("Main", a.id, f[4], f[5], w, h));
+            let g = frame(&s);
+            for k in 0..6 {
+                assert!((f[k] - g[k]).abs() < 0.01, "{bounds} {flip_x},{flip_y} align {align}: {f:?} became {g:?}");
+            }
+            // And a nudge of 1 pixel moves it by 1.
+            ok(s.set_item_box("Main", a.id, f[4] + 1.0, f[5], w, h));
+            let n = frame(&s);
+            assert!((n[4] - f[4] - 1.0).abs() < 0.01 && (n[5] - f[5]).abs() < 0.01, "{bounds}: nudge {f:?} -> {n:?}");
+        }
+    }
+
+    /// A group and a source inside it can't be asked for together: moving the source fits the
+    /// group again, so the group's own box would then be applied to the changed group and move
+    /// the source a second time (Neon #4).
+    #[test]
+    fn a_group_and_its_own_source_are_never_moved_in_one_batch() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 100, "height": 100 }), false));
+        let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        let before = s.snapshot();
+        let gb = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap_or_else(|| panic!("the group"));
+        let kid = gb.children[0].clone();
+        for order in [[0, 1], [1, 0]] {
+            let asks = [
+                (g.id, gb.frame[4] + 100.0, gb.frame[5], gb.frame[0], gb.frame[3]),
+                (kid.id, kid.frame[4] + 100.0, kid.frame[5], kid.frame[0], kid.frame[3]),
+            ];
+            let asks = [asks[order[0]], asks[order[1]]];
+            let err = s.set_item_boxes("Main", &asks).unwrap_err().to_string();
+            assert!(err.contains("together"), "{err}");
+            assert_eq!(s.snapshot(), before, "nothing moved");
+        }
+        // Each alone is fine, and two sources of the group are too.
+        ok(s.set_item_boxes("Main", &[(g.id, gb.frame[4] + 10.0, gb.frame[5], gb.frame[0], gb.frame[3])]));
+        ok(s.set_item_boxes("Main", &[(kid.id, kid.frame[4], kid.frame[5], kid.frame[0], kid.frame[3])]));
+    }
+
+    #[test]
+    fn several_items_are_moved_together_or_not_at_all() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 100, "height": 100 }), false));
+        let c = ok(s.add_source("Main", "color_source_v3", "C", &json!({ "width": 100, "height": 100 }), false));
+        let frames = |s: &Stage| -> Vec<[f32; 6]> {
+            let list = ok(s.items("Main"));
+            [a.id, b.id, c.id].iter().map(|id| list.iter().find(|i| i.id == *id).map(|i| i.frame).unwrap()).collect()
+        };
+        let boxes = [(a.id, 10.0, 20.0, 200.0, 100.0), (b.id, 300.0, 40.0, 50.0, 50.0), (c.id, 0.0, 0.0, 100.0, 100.0)];
+        let moved = ok(s.set_item_boxes("Main", &boxes));
+        assert_eq!(moved.iter().map(|i| i.id).collect::<Vec<_>>(), [a.id, b.id, c.id], "in the order asked");
+        assert_eq!(
+            frames(&s),
+            [
+                [200.0, 0.0, 0.0, 100.0, 10.0, 20.0],
+                [50.0, 0.0, 0.0, 50.0, 300.0, 40.0],
+                [100.0, 0.0, 0.0, 100.0, 0.0, 0.0]
+            ]
+        );
+        // One that isn't there: nothing moves, and it says which.
+        let before = s.snapshot();
+        let bad = [(a.id, 500.0, 500.0, 10.0, 10.0), (999, 0.0, 0.0, 10.0, 10.0)];
+        let err = s.set_item_boxes("Main", &bad).unwrap_err().to_string();
+        assert!(err.contains("999"), "{err}");
+        assert_eq!(s.snapshot(), before, "the first one wasn't moved either");
+        // Nothing asked, nothing done.
+        assert!(ok(s.set_item_boxes("Main", &[])).is_empty());
+
+        // Items of a group move with the group's map applied, as one at a time does.
+        let group = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        let inside = ok(s.set_item_boxes("Main", &[(a.id, 0.0, 0.0, 200.0, 100.0), (b.id, 400.0, 0.0, 50.0, 50.0)]));
+        assert_eq!(inside.len(), 2);
+        assert!(group.group);
+        // What comes back is the final state, after the group has been fitted round the sources
+        // moved in it (the first one's answer isn't from before the second moved).
+        let after = ok(s.items("Main"));
+        let now = |id: i64| {
+            after.iter().flat_map(|i| std::iter::once(i.clone()).chain(i.children.clone())).find(|i| i.id == id)
+        };
+        for r in &inside {
+            assert_eq!(Some(r.frame), now(r.id).map(|i| i.frame), "item {} as it ended up", r.id);
+        }
     }
 
     /// Each item is shown on the stream, in the recording or both; both is the default, nothing
