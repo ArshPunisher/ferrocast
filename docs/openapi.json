@@ -5752,9 +5752,8 @@
         "tags": [
           "Go Live"
         ],
-        "x-ferrocast-scopes": [
-          "go_live"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/golive/aitum": {
@@ -6408,9 +6407,8 @@
         "tags": [
           "Go Live"
         ],
-        "x-ferrocast-scopes": [
-          "go_live"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/golive/ingest": {
@@ -6671,9 +6669,8 @@
         "tags": [
           "Go Live"
         ],
-        "x-ferrocast-scopes": [
-          "go_live"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/golive/obs/setup": {
@@ -6742,9 +6739,8 @@
         "tags": [
           "Go Live"
         ],
-        "x-ferrocast-scopes": [
-          "go_live"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/golive/picture": {
@@ -7240,9 +7236,8 @@
         "tags": [
           "Go Live"
         ],
-        "x-ferrocast-scopes": [
-          "go_live"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/golive/vertical/obs/setup": {
@@ -7311,9 +7306,8 @@
         "tags": [
           "Go Live"
         ],
-        "x-ferrocast-scopes": [
-          "go_live"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/golive/vertical/source": {
@@ -24615,6 +24609,87 @@
         ]
       }
     },
+    "/api/v1/studio/engine/scenes/{scene}/items/boxes": {
+      "put": {
+        "operationId": "put_studio_engine_scenes__scene__items_boxes",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scene",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Move and size several scene items at once.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [
+          "studio_control"
+        ]
+      }
+    },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/box": {
       "put": {
         "operationId": "put_studio_engine_scenes__scene__items__id__box",
@@ -26843,10 +26918,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "read_only",
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       },
       "put": {
         "operationId": "put_studio_engine_settings",
@@ -26913,9 +26986,8 @@
         "tags": [
           "Studio Engine"
         ],
-        "x-ferrocast-scopes": [
-          "studio_control"
-        ]
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
       }
     },
     "/api/v1/studio/engine/sources": {
@@ -29968,6 +30040,148 @@
         ]
       }
     },
+    "/api/v1/studio/engine/transition-matrix": {
+      "put": {
+        "operationId": "put_studio_engine_transition_matrix",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Set per-scene transition choices.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [
+          "studio_control"
+        ]
+      }
+    },
+    "/api/v1/studio/engine/transitions": {
+      "post": {
+        "operationId": "post_studio_engine_transitions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Add a named transition.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [
+          "studio_control"
+        ]
+      }
+    },
     "/api/v1/studio/engine/transitions/{kind}/settings": {
       "get": {
         "operationId": "get_studio_engine_transitions__kind__settings",
@@ -30112,6 +30326,390 @@
           }
         ],
         "summary": "Update transition kind settings.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [
+          "studio_control"
+        ]
+      }
+    },
+    "/api/v1/studio/engine/transitions/{name}": {
+      "delete": {
+        "operationId": "delete_studio_engine_transitions__name_",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Success (no content)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Remove a named transition.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [
+          "studio_control"
+        ]
+      },
+      "put": {
+        "operationId": "put_studio_engine_transitions__name_",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Update a named transition.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [
+          "studio_control"
+        ]
+      }
+    },
+    "/api/v1/studio/engine/transitions/{name}/default": {
+      "put": {
+        "operationId": "put_studio_engine_transitions__name__default",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Make a named transition the default.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [
+          "studio_control"
+        ]
+      }
+    },
+    "/api/v1/studio/engine/transitions/{name}/duplicate": {
+      "post": {
+        "operationId": "post_studio_engine_transitions__name__duplicate",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Duplicate a named transition.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [
+          "studio_control"
+        ]
+      }
+    },
+    "/api/v1/studio/engine/transitions/{name}/rename": {
+      "post": {
+        "operationId": "post_studio_engine_transitions__name__rename",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Rename a named transition.",
         "tags": [
           "Studio Engine"
         ],
