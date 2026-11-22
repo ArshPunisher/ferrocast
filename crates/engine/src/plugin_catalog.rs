@@ -122,9 +122,22 @@ pub fn file_url(entry: &str, src: &Source) -> Option<reqwest::Url> {
 
 fn allowed(u: &reqwest::Url, src: &Source) -> bool {
     let host = u.host_str().unwrap_or_default();
+    if !u.username().is_empty() || u.password().is_some() {
+        return false;
+    }
+    let same_local_port = || {
+        let Ok(base) = reqwest::Url::parse(&src.url) else {
+            return src.url.is_empty();
+        };
+        base.host_str() == Some(host) && base.port_or_known_default() == u.port_or_known_default()
+    };
     match u.scheme() {
-        "https" => HOSTS.contains(&host) || (src.local && host == "127.0.0.1"),
-        "http" => src.local && host == "127.0.0.1",
+        "https" => {
+            HOSTS.contains(&host)
+                || host == "ferrocast.clearcraftlabs.com"
+                || (src.local && host == "127.0.0.1" && same_local_port())
+        }
+        "http" => src.local && host == "127.0.0.1" && same_local_port(),
         _ => false,
     }
 }
@@ -169,10 +182,11 @@ pub fn newer(new: &str, old: &str) -> bool {
 
 /// A client that follows redirects only to the allowed hosts, over https (or the tests' local
 /// server).
-fn client(src: &Source) -> Result<reqwest::Client, EngineError> {
+pub(crate) fn client(src: &Source) -> Result<reqwest::Client, EngineError> {
+    let base_url = src.url.clone();
     let local = src.local;
     let policy = reqwest::redirect::Policy::custom(move |a| {
-        let s = Source { url: String::new(), key: String::new(), local };
+        let s = Source { url: base_url.clone(), key: String::new(), local };
         if a.previous().len() >= 5 || !allowed(a.url(), &s) { a.stop() } else { a.follow() }
     });
     reqwest::Client::builder()
@@ -183,12 +197,16 @@ fn client(src: &Source) -> Result<reqwest::Client, EngineError> {
 }
 
 /// Reads at most `max` bytes from `url`; more is refused (never all read).
-async fn fetch(http: &reqwest::Client, url: reqwest::Url, max: usize) -> Result<Vec<u8>, EngineError> {
+pub(crate) async fn fetch_capped(
+    http: &reqwest::Client,
+    url: reqwest::Url,
+    max: usize,
+) -> Result<Vec<u8>, EngineError> {
     let unreachable = |e: String| {
         refused(
             502,
             "catalog_unreachable",
-            format!("The plugin catalog didn't answer: {e}"),
+            format!("The catalog server didn't answer: {e}"),
             "Check the internet and try again.",
         )
     };
@@ -211,8 +229,16 @@ async fn fetch(http: &reqwest::Client, url: reqwest::Url, max: usize) -> Result<
     Ok(out)
 }
 
-fn hex(b: &[u8]) -> String {
+async fn fetch(http: &reqwest::Client, url: reqwest::Url, max: usize) -> Result<Vec<u8>, EngineError> {
+    fetch_capped(http, url, max).await
+}
+
+pub(crate) fn hex_bytes(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn hex(b: &[u8]) -> String {
+    hex_bytes(b)
 }
 
 impl Engine {

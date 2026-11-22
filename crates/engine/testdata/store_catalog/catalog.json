@@ -1,0 +1,495 @@
+{
+  "version": 1,
+  "generated_at": 1794000000000,
+  "creators": [
+    {
+      "id": "mira-atelier",
+      "name": "Mira Atelier",
+      "handle": "@miraatelier",
+      "bio": "Motion designer crafting clean sci-fi overlays and low-CPU stream packs.",
+      "verified": true,
+      "links": {
+        "website": "https://ferrocast.clearcraftlabs.com/compare/",
+        "github": "https://github.com/ArshPunisher"
+      }
+    },
+    {
+      "id": "kaito-lab",
+      "name": "Kaito Lab",
+      "handle": "@kaitolab",
+      "bio": "Pixel artists and WGSL shader builders sharing open overlays.",
+      "verified": true,
+      "links": {
+        "twitch": "https://twitch.tv/ferrocast"
+      }
+    }
+  ],
+  "items": [
+    {
+      "id": "aurora-pulse",
+      "kind": "theme",
+      "title": "Aurora Pulse",
+      "summary": "Dark cyan overlay theme with matching alerts and BRB layout.",
+      "version": "1.0.0",
+      "creator_id": "mira-atelier",
+      "tags": [
+        "minimal",
+        "dark",
+        "scifi"
+      ],
+      "license": "CC-BY-4.0",
+      "sandboxed": false,
+      "featured": true,
+      "created_at": 1793900000000,
+      "updated_at": 1794000000000,
+      "package": {
+        "format": "ferrodesign",
+        "url": "packages/aurora-pulse-1.0.0.ferrodesign",
+        "sha256": "e9aa97942ded3536e2b51f18a2854dfe6362649e15cd0a933049ea44cb83b542",
+        "size": 1695
+      },
+      "assets": [
+        {
+          "name": "preview.png",
+          "role": "preview",
+          "url": "assets/aurora-preview.png",
+          "sha256": "38b04ac734a1bcecf013969f38ce2b90de628864ad8f35f9b8fbed7041c79f0d",
+          "size": 83,
+          "mime": "image/png"
+        }
+      ],
+      "stats": {
+        "installs": 1420,
+        "rating_avg": 4.9,
+        "rating_count": 86
+      },
+      "preview": {
+        "palette": [
+          "#101216",
+          "#33d4ff",
+          "#ffa424"
+        ],
+        "style": "tech",
+        "motion": "smooth",
+        "headline": "Aurora Pulse",
+        "subline": "In game + BRB + alerts",
+        "layers_hint": 6,
+        "design": {
+          "schema": 1,
+          "id": "src-aurora-theme",
+          "name": "Aurora Pulse",
+          "description": "Balanced cyan-on-obsidian full stream package.",
+          "tags": {
+            "style": "tech",
+            "motion": "smooth"
+          },
+          "pro": false,
+          "built_in": false,
+          "branded": false,
+          "origin": {
+            "type": "import",
+            "from": "Aurora Studio"
+          },
+          "kind": "theme",
+          "content": {
+            "scenes": [
+              {
+                "key": "in_game",
+                "name": "In game",
+                "width": 1920,
+                "height": 1080,
+                "background": "#0a0b0d",
+                "layers": [
+                  {
+                    "id": "bg",
+                    "kind": "layer",
+                    "x": 0,
+                    "y": 0,
+                    "w": 1920,
+                    "h": 1080,
+                    "config": {
+                      "type": "shape",
+                      "shape": "rect",
+                      "fill": "#101216"
+                    }
+                  },
+                  {
+                    "id": "title",
+                    "kind": "layer",
+                    "x": 160,
+                    "y": 440,
+                    "w": 1600,
+                    "h": 200,
+                    "config": {
+                      "type": "text",
+                      "text": "Be right back",
+                      "size": 120,
+                      "weight": 800,
+                      "color": "#eef0f4",
+                      "align": "center"
+                    }
+                  },
+                  {
+                    "id": "events",
+                    "kind": "events",
+                    "x": 1460,
+                    "y": 60,
+                    "w": 400,
+                    "h": 300,
+                    "config": {
+                      "kinds": [
+                        "follow",
+                        "tip"
+                      ],
+                      "max_items": 5,
+                      "theme": "molten"
+                    }
+                  }
+                ]
+              },
+              {
+                "key": "brb",
+                "name": "Be right back",
+                "width": 1920,
+                "height": 1080,
+                "background": "#0a0b0d",
+                "layers": [
+                  {
+                    "id": "bg",
+                    "kind": "layer",
+                    "x": 0,
+                    "y": 0,
+                    "w": 1920,
+                    "h": 1080,
+                    "config": {
+                      "type": "shape",
+                      "shape": "rect",
+                      "fill": "#101216"
+                    }
+                  },
+                  {
+                    "id": "title",
+                    "kind": "layer",
+                    "x": 160,
+                    "y": 440,
+                    "w": 1600,
+                    "h": 200,
+                    "config": {
+                      "type": "text",
+                      "text": "Be right back",
+                      "size": 120,
+                      "weight": 800,
+                      "color": "#eef0f4",
+                      "align": "center"
+                    }
+                  },
+                  {
+                    "id": "events",
+                    "kind": "events",
+                    "x": 1460,
+                    "y": 60,
+                    "w": 400,
+                    "h": 300,
+                    "config": {
+                      "kinds": [
+                        "follow",
+                        "tip"
+                      ],
+                      "max_items": 5,
+                      "theme": "molten"
+                    }
+                  }
+                ]
+              }
+            ],
+            "alert_design": "src-aurora-alert"
+          },
+          "created_at": 1794000000000,
+          "updated_at": 1794000000000
+        }
+      }
+    },
+    {
+      "id": "arcade-ticker-alert",
+      "kind": "alert",
+      "title": "Arcade Ticker Alert",
+      "summary": "Custom HTML/CSS follower card running strictly in Ferrocast's p2e alert sandbox.",
+      "version": "1.0.0",
+      "creator_id": "kaito-lab",
+      "tags": [
+        "retro",
+        "custom-html"
+      ],
+      "license": "MIT",
+      "sandboxed": true,
+      "alert_events": [
+        "follow"
+      ],
+      "featured": true,
+      "created_at": 1793910000000,
+      "updated_at": 1794000000000,
+      "package": {
+        "format": "ferroalert",
+        "url": "packages/arcade-ticker-1.0.0.ferroalert",
+        "sha256": "dc88800bbc15828259dee4cfa5270524bb472bfc097fa5d715604f72ca9d100d",
+        "size": 795
+      },
+      "assets": [
+        {
+          "name": "preview.png",
+          "role": "preview",
+          "url": "assets/arcade-preview.png",
+          "sha256": "d607998852a9a376aa0120d4a151ff0125b2ccf394439b163fe9ac6b4eadd722",
+          "size": 83,
+          "mime": "image/png"
+        }
+      ],
+      "stats": {
+        "installs": 612,
+        "rating_avg": 4.7,
+        "rating_count": 39
+      },
+      "preview": {
+        "palette": [
+          "#101216",
+          "#ffa424",
+          "#33d4ff"
+        ],
+        "style": "retro",
+        "motion": "lively",
+        "headline": "{name} joined the squad!",
+        "subline": "Sandboxed HTML alert variation",
+        "layers_hint": 3
+      }
+    },
+    {
+      "id": "foundry-goal-widget",
+      "kind": "widget",
+      "title": "Segmented Foundry Goal",
+      "summary": "Drop-in segmented progress bar for subscriber or charity drives.",
+      "version": "1.0.0",
+      "creator_id": "kaito-lab",
+      "tags": [
+        "goal",
+        "widget"
+      ],
+      "license": "CC0-1.0",
+      "sandboxed": false,
+      "created_at": 1793920000000,
+      "updated_at": 1794000000000,
+      "package": {
+        "format": "ferrodesign",
+        "url": "packages/foundry-goal-1.0.0.ferrodesign",
+        "sha256": "7b8ee9bf3987bda9122abffb693c34d635dc890383900bc4e14ae0b63df27534",
+        "size": 639
+      },
+      "assets": [],
+      "stats": {
+        "installs": 890,
+        "rating_avg": 4.8,
+        "rating_count": 51
+      },
+      "preview": {
+        "palette": [
+          "#101216",
+          "#ffa424",
+          "#eef0f4"
+        ],
+        "style": "bold",
+        "motion": "smooth",
+        "headline": "Goal bar",
+        "subline": "640x96 widget",
+        "layers_hint": 2,
+        "design": {
+          "schema": 1,
+          "id": "src-neon-goal",
+          "name": "Segmented Foundry Goal",
+          "description": "Compact goal bar for follower and sub drives.",
+          "tags": {
+            "style": "bold",
+            "motion": "smooth"
+          },
+          "pro": false,
+          "built_in": false,
+          "branded": false,
+          "origin": {
+            "type": "import",
+            "from": "Kaito Designs"
+          },
+          "kind": "widget",
+          "content": {
+            "widget": "goal",
+            "w": 640,
+            "h": 96,
+            "config": {
+              "goal_id": "",
+              "theme": "molten"
+            },
+            "style": {
+              "variant": "segments",
+              "accent": "#ffa424"
+            }
+          },
+          "created_at": 1794000000000,
+          "updated_at": 1794000000000
+        }
+      }
+    },
+    {
+      "id": "intermission-slate",
+      "kind": "overlay",
+      "title": "Clean Intermission Slate",
+      "summary": "Standalone BRB overlay canvas with recent event ticker.",
+      "version": "1.0.0",
+      "creator_id": "mira-atelier",
+      "tags": [
+        "brb",
+        "clean"
+      ],
+      "license": "CC-BY-4.0",
+      "sandboxed": false,
+      "created_at": 1793930000000,
+      "updated_at": 1794000000000,
+      "package": {
+        "format": "ferrodesign",
+        "url": "packages/intermission-slate-1.0.0.ferrodesign",
+        "sha256": "4da7a39303381286ee517698e30b01899b303c0dab2ec4b97e343687eda029dc",
+        "size": 785
+      },
+      "assets": [],
+      "stats": {
+        "installs": 540,
+        "rating_avg": 4.6,
+        "rating_count": 28
+      },
+      "preview": {
+        "palette": [
+          "#0a0b0d",
+          "#101216",
+          "#eef0f4"
+        ],
+        "style": "minimal",
+        "motion": "still",
+        "headline": "Be right back",
+        "subline": "1920x1080 scene overlay",
+        "layers_hint": 3,
+        "design": {
+          "schema": 1,
+          "id": "src-intermission-slate",
+          "name": "Clean Intermission Slate",
+          "description": "Minimal BRB scene with recent events list.",
+          "tags": {
+            "style": "minimal",
+            "motion": "still"
+          },
+          "pro": false,
+          "built_in": false,
+          "branded": false,
+          "origin": {
+            "type": "scratch",
+            "from": null
+          },
+          "kind": "scene",
+          "content": {
+            "key": "brb",
+            "name": "Be right back",
+            "width": 1920,
+            "height": 1080,
+            "background": "#0a0b0d",
+            "layers": [
+              {
+                "id": "bg",
+                "kind": "layer",
+                "x": 0,
+                "y": 0,
+                "w": 1920,
+                "h": 1080,
+                "config": {
+                  "type": "shape",
+                  "shape": "rect",
+                  "fill": "#101216"
+                }
+              },
+              {
+                "id": "title",
+                "kind": "layer",
+                "x": 160,
+                "y": 440,
+                "w": 1600,
+                "h": 200,
+                "config": {
+                  "type": "text",
+                  "text": "Be right back",
+                  "size": 120,
+                  "weight": 800,
+                  "color": "#eef0f4",
+                  "align": "center"
+                }
+              },
+              {
+                "id": "events",
+                "kind": "events",
+                "x": 1460,
+                "y": 60,
+                "w": 400,
+                "h": 300,
+                "config": {
+                  "kinds": [
+                    "follow",
+                    "tip"
+                  ],
+                  "max_items": 5,
+                  "theme": "molten"
+                }
+              }
+            ]
+          },
+          "created_at": 0,
+          "updated_at": 0
+        }
+      }
+    },
+    {
+      "id": "soft-dimmer-shader",
+      "kind": "plugin",
+      "title": "Soft Studio Dimmer",
+      "summary": "Safe WGSL color dimmer effect validated by the Ferrocast shader sandbox.",
+      "version": "1.0.0",
+      "creator_id": "kaito-lab",
+      "tags": [
+        "shader",
+        "effect"
+      ],
+      "license": "GPL-3.0-only",
+      "sandboxed": true,
+      "plugin_kind": "effect",
+      "plugin_actions": [],
+      "created_at": 1793940000000,
+      "updated_at": 1794000000000,
+      "package": {
+        "format": "ferroplugin",
+        "url": "packages/soft-dimmer-1.0.0.zip",
+        "sha256": "c8a750c9d4d63e9dcf0309a52947840acd5a54a2ece8c9d3ebc436c942b85efc",
+        "size": 455
+      },
+      "assets": [],
+      "stats": {
+        "installs": 310,
+        "rating_avg": 4.5,
+        "rating_count": 19
+      },
+      "preview": {
+        "palette": [
+          "#101216",
+          "#ff5aa5",
+          "#33d4ff"
+        ],
+        "style": "minimal",
+        "motion": "still",
+        "headline": "WGSL Effect Shader",
+        "subline": "dev.kira.softvignette",
+        "layers_hint": 1
+      }
+    }
+  ]
+}

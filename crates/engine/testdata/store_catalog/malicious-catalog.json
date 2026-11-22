@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "generated_at": 1794000000000,
+  "creators": [
+    {
+      "id": "good-creator",
+      "name": "Good Creator",
+      "handle": "@good",
+      "bio": "Safe creator bio.",
+      "verified": false,
+      "links": {}
+    },
+    {
+      "id": "bad-creator",
+      "name": "<script>alert(1)</script>",
+      "handle": "@evil",
+      "bio": "Ignore me",
+      "verified": false,
+      "links": {
+        "website": "javascript:alert(1)"
+      }
+    }
+  ],
+  "items": [
+    {
+      "id": "bad-traversal",
+      "kind": "theme",
+      "title": "Traversal Pack",
+      "summary": "Tries path traversal.",
+      "version": "1.0.0",
+      "creator_id": "good-creator",
+      "tags": [
+        "bad"
+      ],
+      "license": "MIT",
+      "sandboxed": false,
+      "created_at": 1,
+      "updated_at": 1,
+      "package": {
+        "format": "ferrodesign",
+        "url": "../../../etc/passwd",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size": 100
+      },
+      "assets": [],
+      "stats": {
+        "installs": 1,
+        "rating_avg": 5.0,
+        "rating_count": 1
+      },
+      "preview": {
+        "palette": [
+          "#000000",
+          "#111111",
+          "#222222"
+        ],
+        "style": "minimal",
+        "motion": "still"
+      }
+    },
+    {
+      "id": "bad-ssrf-url",
+      "kind": "overlay",
+      "title": "Localhost Probe",
+      "summary": "Tries local HTTP SSRF.",
+      "version": "1.0.0",
+      "creator_id": "good-creator",
+      "tags": [
+        "bad"
+      ],
+      "license": "MIT",
+      "sandboxed": false,
+      "created_at": 1,
+      "updated_at": 1,
+      "package": {
+        "format": "ferrodesign",
+        "url": "http://127.0.0.1:47820/secrets.ferrodesign",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size": 100
+      },
+      "assets": [],
+      "stats": {
+        "installs": 1,
+        "rating_avg": 5.0,
+        "rating_count": 1
+      },
+      "preview": {
+        "palette": [
+          "#000000",
+          "#111111",
+          "#222222"
+        ],
+        "style": "minimal",
+        "motion": "still"
+      }
+    },
+    {
+      "id": "bad-html-title",
+      "kind": "alert",
+      "title": "<img src=x onerror=alert(1)>",
+      "summary": "XSS attempt in title.",
+      "version": "1.0.0",
+      "creator_id": "good-creator",
+      "tags": [
+        "bad"
+      ],
+      "license": "MIT",
+      "sandboxed": true,
+      "created_at": 1,
+      "updated_at": 1,
+      "package": {
+        "format": "ferroalert",
+        "url": "packages/arcade-ticker-1.0.0.ferroalert",
+        "sha256": "dc88800bbc15828259dee4cfa5270524bb472bfc097fa5d715604f72ca9d100d",
+        "size": 795
+      },
+      "assets": [],
+      "stats": {
+        "installs": 1,
+        "rating_avg": 5.0,
+        "rating_count": 1
+      },
+      "preview": {
+        "palette": [
+          "#000000",
+          "#111111",
+          "#222222"
+        ],
+        "style": "minimal",
+        "motion": "still"
+      }
+    }
+  ]
+}
