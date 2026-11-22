@@ -1289,6 +1289,7 @@ impl Engine {
                             removed: merged.removed,
                             added: merged.added,
                             created: from_defaults,
+                            restored: Vec::new(),
                         },
                     ));
                 }
@@ -1777,7 +1778,13 @@ impl Engine {
                 continue;
             }
             r.variations.retain(|v| !v.id.starts_with(&prefix));
-            let mut change = RuleChange { rule_id: r.id.clone(), removed: taken, added: Vec::new(), created: false };
+            let mut change = RuleChange {
+                rule_id: r.id.clone(),
+                removed: taken,
+                added: Vec::new(),
+                created: false,
+                restored: Vec::new(),
+            };
             if !r.variations.iter().any(|v| v.condition.is_none()) {
                 // The look the pack took the place of goes back; with none kept, the built-in default.
                 let back = existing
@@ -1795,6 +1802,7 @@ impl Engine {
                     .unwrap_or_else(|| Variation::new("default", "{name}"));
                 if !r.variations.iter().any(|v| v.id == back.id) {
                     change.added.push(back.id.clone());
+                    change.restored.push(back.clone());
                     r.variations.insert(0, back);
                 }
             }
@@ -1861,6 +1869,26 @@ impl Engine {
         // The entry stays until everything is put back: a failed undo can be tried again.
         let tok = latest.token.clone();
         let entry = self.db(move |s| repo::store_catalog::peek_undo(s, Some(&tok))).await?;
+        // A default look the action put back is the person's: if they edited it since, undoing
+        // would overwrite their edit. Refuse before anything is touched; the entry stays.
+        for c in &entry.snapshot.rule_changes {
+            let Some(rule) = self.rules().into_iter().find(|r| r.id == c.rule_id) else { continue };
+            for back in &c.restored {
+                if let Some(now) = rule.variations.iter().find(|v| v.id == back.id)
+                    && now != back
+                {
+                    return Err(refused(
+                        409,
+                        "store_undo_conflict",
+                        format!(
+                            "You changed the alert look \"{}\" after the Store put it back, so undo would overwrite your change.",
+                            now.name
+                        ),
+                        "Change it back, or leave it as it is. Undo stays available.",
+                    ));
+                }
+            }
+        }
         self.restore_snapshot(&entry.item_id, &entry.snapshot).await.map_err(|e| {
             refused(
                 500,
@@ -2435,6 +2463,38 @@ mod tests {
         let default: Vec<_> = back.variations.iter().filter(|v| v.condition.is_none()).collect();
         assert_eq!(default.len(), 1, "one default");
         assert_eq!(default[0], &mine, "the person's own title, sound and volume, not a built-in one");
+    }
+
+    #[tokio::test]
+    async fn undoing_a_removal_is_refused_over_a_default_look_edited_since() {
+        let _lock = TEST_GUARD.lock().await;
+        let (engine, _state, _dir) = fixture().await;
+        let mine = my_own_follow_look(&engine).await;
+        engine.install_store_item("arcade-ticker-alert").await.unwrap();
+        let removed = engine.uninstall_store_item("arcade-ticker-alert").await.unwrap();
+        // The person's own look is back; they edit it.
+        let mut rule = follow_rule(&engine);
+        let d = rule.variations.iter_mut().find(|v| v.condition.is_none()).unwrap();
+        assert_eq!(d.id, mine.id);
+        d.title = "edited after the removal".into();
+        engine.save_rule(rule).await.unwrap();
+        let err = engine.undo_store_action(Some(&removed.undo.token)).await.unwrap_err();
+        match err {
+            EngineError::Refused { status, code, .. } => {
+                assert_eq!((status, code), (409, "store_undo_conflict"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        // Nothing changed, the edit stands, and the entry is still there.
+        let now = follow_rule(&engine);
+        assert_eq!(now.variations.iter().find(|v| v.condition.is_none()).unwrap().title, "edited after the removal");
+        assert!(engine.store_installed().await.unwrap().installed.is_empty());
+        // With the edit put back the same token goes through.
+        let mut rule = follow_rule(&engine);
+        rule.variations.iter_mut().find(|v| v.condition.is_none()).unwrap().title = mine.title.clone();
+        engine.save_rule(rule).await.unwrap();
+        engine.undo_store_action(Some(&removed.undo.token)).await.unwrap();
+        assert_eq!(engine.store_installed().await.unwrap().installed.len(), 1);
     }
 
     #[tokio::test]

@@ -52,6 +52,10 @@ pub struct RuleChange {
     /// the look it was made with.
     #[serde(default)]
     pub created: bool,
+    /// Default looks this action put back (the person's own, or the built-in one). Undo leaves a
+    /// restored look alone, and refuses, if it was edited since: that edit is theirs.
+    #[serde(default)]
+    pub restored: Vec<Variation>,
 }
 
 /// Snapshot of plugin zip bytes + active toggle before a store change.
