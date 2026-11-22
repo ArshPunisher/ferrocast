@@ -1130,3 +1130,78 @@ fn what_is_left_of_the_total_limit_bounds_each_read() {
     assert_eq!(entry_read_limit(60, 10), 10, "near the total limit the read is cut there");
     assert_eq!(entry_read_limit(60, 0), 0);
 }
+
+// ---- Neon review H5: nothing swaps the scene collection while a show is on --------------------
+
+fn start_show(e: &Engine) {
+    e.studio().machine.lock().unwrap_or_else(|p| p.into_inner()).phase = crate::studio::show::BroadcastPhase::Live;
+}
+
+#[tokio::test]
+async fn a_headless_engine_refuses_to_change_collections_during_a_show() {
+    let (e, _dir) = engine().await;
+    start_show(&e);
+    for act in [
+        ShelfAct::Switch { id: "untitled".into() },
+        ShelfAct::New { name: "X".into(), copy: false },
+        ShelfAct::Import { name: "Y".into(), doc: json!({ "name": "Y", "sources": [] }) },
+    ] {
+        match e.studio_shelf("collections", act).await {
+            Err(EngineError::Refused { status: 409, code: "studio_busy", .. }) => {}
+            other => panic!("expected 409 studio_busy, got {:?}", other.map(|v| v.to_string())),
+        }
+    }
+}
+
+/// A font server that answers the stylesheet after `delay_ms`, with "not found".
+async fn start_slow_font_server(delay_ms: u64) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_c = hits.clone();
+    let handle = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let hits = hits_c.clone();
+            tokio::spawn(async move {
+                let mut req = [0u8; 2048];
+                let _ = sock.read(&mut req).await;
+                hits.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
+            });
+        }
+    });
+    (base, hits, handle)
+}
+
+#[tokio::test]
+async fn a_show_that_starts_while_an_import_downloads_fonts_stops_the_import() {
+    let (e, dir) = engine().await;
+    let (base, hits, handle) = start_slow_font_server(500).await;
+    e.set_google_fonts_api(&base);
+    let png = make_tiny_png();
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let zip = build_zip(vec![("config.json", &cfg, None), ("assets/frame.png", &png, None)]);
+    let prev = e.preview_overlay_pack(zip, "slow.overlay".into()).await.unwrap();
+    let before = studio_library::load(dir.path()).collections.current;
+    let e2 = e.clone();
+    let importing = tokio::spawn(async move {
+        e2.import_overlay_pack(OverlayPackImportReq { preview_id: prev.preview_id, ..Default::default() }).await
+    });
+    // The import is now waiting on the font server: a show goes live.
+    for _ in 0..100 {
+        if hits.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(hits.load(Ordering::Relaxed) > 0, "the import reached the font download");
+    start_show(&e);
+    match importing.await.unwrap() {
+        Err(EngineError::Refused { status: 409, code: "studio_busy", .. }) => {}
+        other => panic!("expected 409 studio_busy, got {:?}", other.map(|r| r.id)),
+    }
+    assert_eq!(studio_library::load(dir.path()).collections.current, before, "the collection was not swapped");
+    assert!(files_under(&dir.path().join("studio").join("packs")).is_empty(), "the copied media was removed");
+    handle.abort();
+}

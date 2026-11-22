@@ -2952,11 +2952,13 @@ impl Engine {
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
         let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
+        // Swapping what the Studio shows is refused during a show or while it streams or
+        // records; with no desktop host attached (headless) the show itself still counts.
+        if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
+            let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
+            self.ensure_idle_for_switch(noun).await?;
+        }
         if let Some(host) = host {
-            if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
-                let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
-                self.ensure_idle_for_switch(noun).await?;
-            }
             let out = host.shelf(kind.to_string(), act).await.map_err(failed)?;
             // Another collection may have its own vertical picture (or none): the stream follows.
             self.studio_sync_vertical().await;

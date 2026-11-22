@@ -369,6 +369,13 @@ impl Engine {
             }
         };
 
+        // The checks at the start were a while ago (media copied, fonts downloaded): a show or a
+        // recording may have started since, and the collection mustn't be swapped under it.
+        if let Err(e) = self.ensure_idle_for_switch("scene collections").await {
+            rollback_media_and_overlays().await;
+            return Err(e);
+        }
+
         let host_opt = self.inner.studio_host.optional();
         let (col_id, saved_name, previous_id) = if let Some(host) = host_opt {
             let data_prev = data.clone();
