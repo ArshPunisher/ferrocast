@@ -329,6 +329,8 @@ mod api_keys_tests;
 #[cfg(test)]
 mod automations_tests;
 #[cfg(test)]
+mod clips_exposure_tests;
+#[cfg(test)]
 mod designs_tests;
 #[cfg(test)]
 mod obsws_tests;

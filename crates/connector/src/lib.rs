@@ -11,6 +11,29 @@ use ferrocast_core::event::{Event, Platform};
 use ferrocast_core::moderation::{Capabilities, ModeChange};
 use tokio::sync::mpsc;
 
+/// What a video sent to a platform is called and who can see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoUpload {
+    pub title: String,
+    pub description: String,
+    pub tags: Vec<String>,
+    /// "private", "unlisted" or "public".
+    pub privacy: String,
+    /// A video category's number (YouTube), when chosen.
+    pub category_id: Option<String>,
+    pub made_for_kids: bool,
+}
+
+/// The bytes of a file, read piece by piece (so a big video is never held whole).
+pub trait UploadSource: Send {
+    fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Up to `len` bytes from `offset` (fewer only at the end).
+    fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
+}
+
 /// Where adapters send events. Bounded so a flood applies backpressure instead of memory.
 pub type EventSink = mpsc::Sender<Event>;
 
@@ -102,6 +125,17 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     /// chapters put there before.
     async fn set_chapters(&self, _video: &str, _chapters: &str) -> Result<()> {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "add chapters to a video" })
+    }
+
+    /// Sends a video file to the platform's library (YouTube) → its id. `progress` is told the
+    /// bytes sent so far and the total.
+    async fn upload_video(
+        &self,
+        _meta: &VideoUpload,
+        _source: &mut dyn UploadSource,
+        _progress: &(dyn Fn(u64, u64) + Send + Sync),
+    ) -> Result<String> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "upload videos" })
     }
 
     /// When `login` followed the channel, if the platform says (Unix ms).

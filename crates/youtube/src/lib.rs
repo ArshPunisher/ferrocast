@@ -69,7 +69,13 @@ pub enum YoutubeError {
 
 impl YoutubeError {
     pub(crate) fn network(e: impl std::fmt::Display) -> Self {
-        YoutubeError::Network(e.to_string())
+        YoutubeError::Network(scrub_secrets(&e.to_string()))
+    }
+
+    /// A failed request, said without the address it went to: a resumable upload's address is a
+    /// capability to write into that upload, and reqwest puts the whole URL in its message.
+    pub(crate) fn from_reqwest(e: reqwest::Error) -> Self {
+        YoutubeError::network(e.without_url())
     }
 
     /// Maps a non-success REST response, recognising quota and auth problems.
@@ -87,7 +93,7 @@ impl YoutubeError {
         match (status, reason) {
             (401, _) => YoutubeError::SignInNeeded,
             // The day's units are gone: nothing works until midnight Pacific.
-            (_, "quotaExceeded" | "dailyLimitExceeded") => YoutubeError::QuotaExceeded,
+            (_, "quotaExceeded" | "dailyLimitExceeded" | "uploadLimitExceeded") => YoutubeError::QuotaExceeded,
             // Too many requests in a burst: it passes in seconds (5 s unless YouTube says, at most a minute).
             (403 | 429, "rateLimitExceeded" | "userRateLimitExceeded") | (429, _) => {
                 YoutubeError::RateLimited(rate_wait(retry_after))
@@ -193,11 +199,36 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Replaces the values of the parameters that make an address a capability (`upload_id`, `key`,
+/// `access_token`, `token`) wherever they appear in a message.
+pub(crate) fn scrub_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    'outer: while !rest.is_empty() {
+        for name in ["upload_id=", "access_token=", "token=", "key="] {
+            if let Some(after) = rest.strip_prefix(name) {
+                let end = after.find(['&', ')', '"', '\'', ' ', '\n', '>']).unwrap_or(after.len());
+                out.push_str(name);
+                out.push_str("...");
+                rest = &after[end..];
+                continue 'outer;
+            }
+        }
+        let c = rest.chars().next().unwrap_or(' ');
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
 pub fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .user_agent(concat!("Ferrocast/", env!("CARGO_PKG_VERSION")))
+        // Never follow a redirect: an upload chunk (or a token) would go wherever it points,
+        // past the host check on the upload address.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default()
 }

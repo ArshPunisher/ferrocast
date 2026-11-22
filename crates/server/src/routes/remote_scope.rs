@@ -136,6 +136,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Community Theme Store packages and installs stay on the PC only.
     ("*", "/store"),
     ("*", "/store/**"),
+    // Clips are files on the PC: browsing, editing, deleting and sending them to YouTube stay here.
+    ("*", "/clips"),
+    ("*", "/clips/**"),
 ];
 
 /// One plain path segment: no `.`/`..`, no encoded `/`, `\`, `.` or NUL, nothing outside
@@ -764,6 +767,11 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/clips"),
+            ("GET", "/clips/jobs"),
+            ("DELETE", "/clips/a.mp4"),
+            ("POST", "/clips/compile"),
+            ("POST", "/clips/a.mp4/upload"),
             ("GET", "/studio/engine/auto-config"),
             ("POST", "/studio/engine/auto-config/benchmark"),
             ("POST", "/studio/engine/auto-config/cancel"),
@@ -881,6 +889,11 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/clips"),
+            ("GET", "/clips/jobs"),
+            ("DELETE", "/clips/a.mp4"),
+            ("POST", "/clips/compile"),
+            ("POST", "/clips/a.mp4/upload"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }

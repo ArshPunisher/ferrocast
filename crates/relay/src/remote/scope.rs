@@ -135,6 +135,9 @@ pub const OWNER_DENIED: &[Rule] = &[
     // Community Theme Store packages and installs stay on the PC only.
     ("*", "/store"),
     ("*", "/store/**"),
+    // Clips are files on the PC: browsing, editing, deleting and sending them to YouTube stay here.
+    ("*", "/clips"),
+    ("*", "/clips/**"),
 ];
 
 /// The dashboard API's routes with a variable part, for the audit log's action names:
@@ -388,6 +391,11 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/clips"),
+            ("GET", "/clips/jobs"),
+            ("DELETE", "/clips/a.mp4"),
+            ("POST", "/clips/compile"),
+            ("POST", "/clips/a.mp4/upload"),
         ] {
             assert!(!allowed(Role::Mod, m, p), "{m} {p}");
         }
@@ -455,6 +463,11 @@ mod tests {
             ("GET", "/diagnostics/preview"),
             ("POST", "/diagnostics/report"),
             ("POST", "/diagnostics/report.zip"),
+            ("GET", "/clips"),
+            ("GET", "/clips/jobs"),
+            ("DELETE", "/clips/a.mp4"),
+            ("POST", "/clips/compile"),
+            ("POST", "/clips/a.mp4/upload"),
         ] {
             assert!(!allowed(Role::Owner, m, p), "{m} {p}");
         }

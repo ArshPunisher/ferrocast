@@ -2092,3 +2092,463 @@ async fn a_key_the_vertical_canvas_sends_to_is_never_the_normal_streams() {
     assert!(own.key.starts_with("var-key-"), "{}", own.key);
     assert_eq!(own.note.as_deref(), Some("Ferrocast · variable"));
 }
+
+// ---------------------------------------------------------------- video upload (clips)
+
+struct Bytes(Vec<u8>);
+
+impl ferrocast_connector::UploadSource for Bytes {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+    fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let a = (offset as usize).min(self.0.len());
+        Ok(self.0[a..(a + len).min(self.0.len())].to_vec())
+    }
+}
+
+#[derive(Default)]
+struct UploadLog {
+    opened: Vec<(String, serde_json::Value, Option<String>, Option<String>)>,
+    ranges: Vec<String>,
+    got: usize,
+    /// Answers to give for the next pieces: a status per request (200 when none are left).
+    fail_next: Vec<u16>,
+    /// Where the session address points ("" = this server).
+    location: String,
+    seen_auth: Vec<String>,
+    /// The final piece's answer is cut off (a body that isn't JSON), though YouTube took it.
+    cut_final: bool,
+    completed: bool,
+    /// Answers 308 with no Range header, forever (a server that takes nothing).
+    take_nothing: bool,
+    /// How many of the next questions about where it stands are not answered (a 500).
+    status_fail: usize,
+    /// Every question about where it stands is answered with this status (a 401, a 404...), when set.
+    status_code: Option<u16>,
+    /// The same, but only this many times (then it is answered as usual).
+    status_code_times: usize,
+    /// How many pieces (not questions) were sent.
+    pieces: usize,
+    token_hits: usize,
+}
+
+/// A fake resumable-upload server: opens a session, takes pieces, answers 308 until the end.
+async fn fake_upload(log: Arc<Mutex<UploadLog>>) -> Endpoints {
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    let base_cell = Arc::new(Mutex::new(String::new()));
+    let (l1, l2, b1, b2) = (log.clone(), log.clone(), base_cell.clone(), base_cell.clone());
+    let l3 = log.clone();
+    let app = axum::Router::new()
+        .route(
+            "/token",
+            axum::routing::post(move || {
+                let l = l3.clone();
+                async move {
+                    l.lock().unwrap().token_hits += 1;
+                    axum::Json(json!({ "access_token": "fresh", "refresh_token": "refresh-0", "expires_in": 3600 }))
+                }
+            }),
+        )
+        .route(
+            "/api/upload/videos",
+            axum::routing::post(
+                move |axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+                      h: HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let (l, b) = (l1.clone(), b1.clone());
+                    async move {
+                        let mut l = l.lock().unwrap();
+                        let hv = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(String::from);
+                        l.opened.push((
+                            format!(
+                                "{}|{}",
+                                q.get("uploadType").cloned().unwrap_or_default(),
+                                q.get("part").cloned().unwrap_or_default()
+                            ),
+                            body,
+                            hv("x-upload-content-length"),
+                            hv("authorization"),
+                        ));
+                        let loc = if l.location.is_empty() {
+                            format!("{}/api/session/abc", b.lock().unwrap())
+                        } else {
+                            l.location.clone()
+                        };
+                        let mut out = HeaderMap::new();
+                        out.insert("location", HeaderValue::from_str(&loc).unwrap());
+                        (StatusCode::OK, out, String::new())
+                    }
+                },
+            ),
+        )
+        .route(
+            "/api/session/abc",
+            axum::routing::put(move |h: HeaderMap, body: axum::body::Bytes| {
+                let l = l2.clone();
+                let _ = &b2;
+                async move {
+                    let mut l = l.lock().unwrap();
+                    let range = h.get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                    l.seen_auth.push(h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string());
+                    l.ranges.push(range.clone());
+                    // Failures are for pieces; a question about where it stands is always answered.
+                    if !range.starts_with("bytes */") && !l.fail_next.is_empty() {
+                        let s = l.fail_next.remove(0);
+                        return (StatusCode::from_u16(s).unwrap(), HeaderMap::new(), "{}".to_string());
+                    }
+                    let mut out = HeaderMap::new();
+                    if l.take_nothing {
+                        return (StatusCode::PERMANENT_REDIRECT, out, String::new());
+                    }
+                    // "bytes */N": a question about how much is there.
+                    if range.starts_with("bytes */") {
+                        if let Some(code) = l.status_code
+                            && (l.status_code_times == 0 || {
+                                l.status_code_times -= 1;
+                                if l.status_code_times == 0 {
+                                    l.status_code = None;
+                                }
+                                true
+                            })
+                        {
+                            return (StatusCode::from_u16(code).unwrap(), out, String::new());
+                        }
+                        if l.status_fail > 0 {
+                            l.status_fail -= 1;
+                            return (StatusCode::INTERNAL_SERVER_ERROR, out, String::new());
+                        }
+                        if l.completed {
+                            return (StatusCode::OK, out, "{\"id\":\"vid-new\"}".to_string());
+                        }
+                        if l.got > 0 {
+                            out.insert("range", HeaderValue::from_str(&format!("bytes=0-{}", l.got - 1)).unwrap());
+                        }
+                        return (StatusCode::PERMANENT_REDIRECT, out, String::new());
+                    }
+                    l.pieces += 1;
+                    let (span, total) = range.trim_start_matches("bytes ").split_once('/').unwrap();
+                    let (a, b) = span.split_once('-').unwrap();
+                    let (a, b, total): (usize, usize, usize) =
+                        (a.parse().unwrap(), b.parse().unwrap(), total.parse().unwrap());
+                    assert_eq!(body.len(), b - a + 1);
+                    l.got = b + 1;
+                    if b + 1 == total {
+                        if l.cut_final {
+                            l.completed = true;
+                            return (StatusCode::OK, out, "{\"id\":".to_string());
+                        }
+                        (StatusCode::OK, out, "{\"id\":\"vid-new\"}".to_string())
+                    } else {
+                        out.insert("range", HeaderValue::from_str(&format!("bytes=0-{b}")).unwrap());
+                        (StatusCode::PERMANENT_REDIRECT, out, String::new())
+                    }
+                }
+            }),
+        );
+    // The pieces are 8 MB: past axum's default 2 MB.
+    let app = app.layer(axum::extract::DefaultBodyLimit::disable());
+    let rest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", rest.local_addr().unwrap());
+    *base_cell.lock().unwrap() = base.clone();
+    tokio::spawn(async move { axum::serve(rest, app).await });
+    Endpoints {
+        authorize: format!("{base}/auth"),
+        token: format!("{base}/token"),
+        api: format!("{base}/api"),
+        grpc: "http://127.0.0.1:9".into(),
+    }
+}
+
+fn clip_meta() -> ferrocast_connector::VideoUpload {
+    ferrocast_connector::VideoUpload {
+        title: "Best play".into(),
+        description: "from the stream".into(),
+        tags: vec!["fps".into()],
+        privacy: "unlisted".into(),
+        category_id: Some("20".into()),
+        made_for_kids: false,
+    }
+}
+
+#[tokio::test]
+async fn a_video_is_sent_in_pieces_with_its_details_and_reports_progress() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    let api = video_api(fake_upload(log.clone()).await);
+    // A bit over two pieces.
+    let size = 2 * super::api::UPLOAD_CHUNK_FOR_TEST + 1000;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let id = api
+        .upload_video(&clip_meta(), &mut Bytes(vec![7u8; size]), &move |a, b| s2.lock().unwrap().push((a, b)))
+        .await
+        .unwrap();
+    assert_eq!(id, "vid-new");
+    let l = log.lock().unwrap();
+    let (kind, body, len, auth) = &l.opened[0];
+    assert_eq!(kind, "resumable|snippet,status");
+    assert_eq!(len.as_deref(), Some(size.to_string().as_str()));
+    assert_eq!(auth.as_deref(), Some("Bearer a"));
+    assert_eq!(body["snippet"]["title"], "Best play");
+    assert_eq!(body["snippet"]["categoryId"], "20");
+    assert_eq!(body["status"]["privacyStatus"], "unlisted");
+    assert_eq!(body["status"]["selfDeclaredMadeForKids"], false);
+    assert_eq!(l.ranges.len(), 3, "{:?}", l.ranges);
+    assert!(l.ranges[0].starts_with("bytes 0-") && l.ranges[2].ends_with(&format!("/{size}")));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.first(), Some(&(0, size as u64)));
+    assert_eq!(seen.last(), Some(&(size as u64, size as u64)));
+    assert!(seen.windows(2).all(|w| w[0].0 <= w[1].0), "progress only goes forward: {seen:?}");
+}
+
+#[tokio::test]
+async fn an_unknown_privacy_is_private_never_public() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    let api = video_api(fake_upload(log.clone()).await);
+    let mut m = clip_meta();
+    m.privacy = "everyone".into();
+    api.upload_video(&m, &mut Bytes(vec![1; 10]), &|_, _| {}).await.unwrap();
+    assert_eq!(log.lock().unwrap().opened[0].1["status"]["privacyStatus"], "private");
+}
+
+#[tokio::test]
+async fn a_dropped_piece_resumes_where_youtube_left_off() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().fail_next = vec![503];
+    let api = video_api(fake_upload(log.clone()).await);
+    let size = super::api::UPLOAD_CHUNK_FOR_TEST + 500;
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; size]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    let l = log.lock().unwrap();
+    // The first piece failed once (503), the question "how much do you have" got 0, and it went again.
+    assert!(l.ranges.iter().any(|r| r.starts_with("bytes */")), "{:?}", l.ranges);
+    assert_eq!(l.got, size);
+}
+
+#[tokio::test]
+async fn too_many_failures_give_up_in_words() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().fail_next = vec![503; 20];
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    // The only piece was the last: YouTube may have it, and the words say to look.
+    assert!(matches!(err, YoutubeError::Refused(ref m) if m.contains("check YouTube Studio")), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_refused_upload_says_why_and_an_empty_file_isnt_sent() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().fail_next = vec![403];
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    assert!(matches!(err, YoutubeError::Refused(_)), "{err:?}");
+    assert!(matches!(
+        api.upload_video(&clip_meta(), &mut Bytes(Vec::new()), &|_, _| {}).await,
+        Err(YoutubeError::Refused(_))
+    ));
+    assert_eq!(log.lock().unwrap().opened.len(), 1, "an empty file never opens a session");
+}
+
+#[tokio::test]
+async fn the_file_and_sign_in_only_go_to_youtubes_upload_host() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().location = "https://evil.example.com/steal".into();
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    assert!(matches!(err, YoutubeError::Protocol(_)), "{err:?}");
+    assert!(log.lock().unwrap().ranges.is_empty(), "nothing was sent");
+    assert!(super::api::upload_host_ok_for_test(
+        "https://www.googleapis.com/upload/youtube/v3/videos?upload_id=x",
+        "https://www.googleapis.com/youtube/v3"
+    ));
+    assert!(!super::api::upload_host_ok_for_test(
+        "https://googleapis.com.evil.com/x",
+        "https://www.googleapis.com/youtube/v3"
+    ));
+    assert!(!super::api::upload_host_ok_for_test(
+        "http://www.googleapis.com/x",
+        "https://www.googleapis.com/youtube/v3"
+    ));
+    assert!(!super::api::upload_host_ok_for_test("file:///etc/passwd", "https://www.googleapis.com/youtube/v3"));
+}
+
+#[tokio::test]
+async fn a_server_that_takes_nothing_is_given_up_on_not_asked_forever() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().take_nothing = true;
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    assert!(matches!(err, YoutubeError::Refused(ref m) if m.contains("isn't taking")), "{err:?}");
+    // The first try and the retries, a handful, not a loop.
+    assert!(log.lock().unwrap().ranges.len() <= 6, "{:?}", log.lock().unwrap().ranges);
+}
+
+#[tokio::test]
+async fn a_cut_off_answer_to_the_last_piece_still_finds_the_new_video() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    log.lock().unwrap().cut_final = true;
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    assert!(log.lock().unwrap().ranges.iter().any(|r| r.starts_with("bytes */")), "it asked the session");
+}
+
+#[tokio::test]
+async fn a_failed_piece_does_not_use_up_the_one_sign_in_refresh() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    // The piece fails (503), its retry is told the sign-in ran out (401), then goes through.
+    log.lock().unwrap().fail_next = vec![503, 401];
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    assert_eq!(log.lock().unwrap().token_hits, 1, "the sign-in was refreshed");
+}
+
+#[tokio::test]
+async fn a_piece_is_never_sent_again_until_youtube_says_where_it_stands() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        // The piece fails, and the first two questions about where it stands fail too.
+        l.fail_next = vec![503];
+        l.status_fail = 2;
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    let l = log.lock().unwrap();
+    // One failed send (a 503, not counted by the mock's piece counter) and the one that worked: the
+    // questions were asked again, the piece wasn't sent in between.
+    assert_eq!(l.pieces, 1, "{:?}", l.ranges);
+    let asked = l.ranges.iter().filter(|r| r.starts_with("bytes */")).count();
+    assert_eq!(asked, 3, "{:?}", l.ranges);
+    let first_question = l.ranges.iter().position(|r| r.starts_with("bytes */")).unwrap();
+    assert!(
+        l.ranges[first_question..first_question + 3].iter().all(|r| r.starts_with("bytes */")),
+        "no piece between the questions: {:?}",
+        l.ranges
+    );
+}
+
+#[tokio::test]
+async fn a_final_piece_that_went_in_but_never_answered_is_found_when_retries_run_out() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        // Every send of the piece is answered 503, but YouTube has the whole file (a lost answer).
+        l.fail_next = vec![503; 20];
+        l.completed = true;
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new", "the question found it");
+}
+
+/// The resumable session address is a capability to write into the upload: no error, log line
+/// or job message ever carries it.
+#[tokio::test]
+async fn a_failed_upload_request_never_shows_the_session_address() {
+    let secret = "AEnB2Uo_SECRET_SESSION_TOKEN_123";
+    // A real request that fails (nothing listens), whose URL carries the secret.
+    let url = format!("http://127.0.0.1:1/upload/youtube/v3/videos?uploadType=resumable&upload_id={secret}");
+    let e = reqwest::Client::new().put(&url).send().await.unwrap_err();
+    assert!(e.to_string().contains(secret), "the premise: reqwest puts the URL in its message");
+    let mapped = YoutubeError::from_reqwest(e).to_string();
+    assert!(!mapped.contains(secret), "{mapped}");
+    // And a message that already carries the address (any other path) is scrubbed too.
+    let text = format!("error sending request for url ({url}): timed out");
+    let scrubbed = YoutubeError::network(text).to_string();
+    assert!(!scrubbed.contains(secret), "{scrubbed}");
+}
+
+#[test]
+fn an_upload_address_has_no_credentials_and_no_odd_port() {
+    let api = "https://www.googleapis.com/youtube/v3";
+    for bad in [
+        "https://user:pass@www.googleapis.com/upload/x",
+        "https://www.googleapis.com:8443/upload/x",
+        "https://www.googleapis.com:444/upload/x",
+    ] {
+        assert!(!super::api::upload_host_ok_for_test(bad, api), "{bad}");
+    }
+    assert!(super::api::upload_host_ok_for_test("https://www.googleapis.com:443/upload/x", api));
+}
+
+/// A redirect is not followed: the video chunk would go wherever it points, past the host check.
+#[tokio::test]
+async fn the_upload_client_does_not_follow_a_redirect() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_port = first.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = first.accept().await {
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf).await;
+            let _ = s
+                .write_all(
+                    format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:{other_port}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await;
+        }
+    });
+    let res = super::http_client().put(format!("http://127.0.0.1:{first_port}/up")).body("chunk").send().await.unwrap();
+    assert_eq!(res.status().as_u16(), 307, "the redirect was followed");
+    let reached = tokio::time::timeout(std::time::Duration::from_millis(300), other.accept()).await;
+    assert!(reached.is_err(), "the second host was contacted");
+}
+
+/// A dead upload session (404 or 410) is given up on at once and said, not asked about five times
+/// and then called "YouTube stopped answering".
+#[tokio::test]
+async fn a_gone_upload_session_fails_fast_with_its_own_reason() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        l.fail_next = vec![503];
+        l.status_code = Some(404);
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let err = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap_err();
+    let YoutubeError::Refused(m) = &err else { panic!("{err:?}") };
+    assert!(m.contains("session") && m.to_lowercase().contains("start"), "{m}");
+    let asked = log.lock().unwrap().ranges.iter().filter(|r| r.starts_with("bytes */")).count();
+    assert_eq!(asked, 1, "asked more than once about a dead session");
+}
+
+/// An expired sign-in while asking where the upload stands is refreshed, not retried as is.
+#[tokio::test]
+async fn a_401_on_the_question_refreshes_the_sign_in_and_the_upload_goes_on() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        l.fail_next = vec![503];
+        l.status_code = Some(401);
+        l.status_code_times = 1;
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    assert!(log.lock().unwrap().token_hits >= 1, "the sign-in wasn't refreshed");
+}
+
+/// CodeRabbit: the final answer is cut off AND the first question about where it stands fails
+/// (a 503): the question is asked again, not given up, and the video's id comes back without
+/// sending the media a second time.
+#[tokio::test]
+async fn a_cut_off_final_answer_keeps_asking_when_the_first_question_fails() {
+    let log = Arc::new(Mutex::new(UploadLog::default()));
+    {
+        let mut l = log.lock().unwrap();
+        l.cut_final = true;
+        l.status_fail = 2;
+    }
+    let api = video_api(fake_upload(log.clone()).await);
+    let id = api.upload_video(&clip_meta(), &mut Bytes(vec![3u8; 100]), &|_, _| {}).await.unwrap();
+    assert_eq!(id, "vid-new");
+    let l = log.lock().unwrap();
+    assert_eq!(l.pieces, 1, "the media was sent once: {:?}", l.ranges);
+    assert_eq!(l.ranges.iter().filter(|r| r.starts_with("bytes */")).count(), 3, "{:?}", l.ranges);
+}
