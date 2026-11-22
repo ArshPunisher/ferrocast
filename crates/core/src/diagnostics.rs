@@ -783,54 +783,14 @@ pub fn redact_with(text: &str, known_secrets: &[&str], known_usernames: &[&str],
     out
 }
 
-/// Scrubs both ASCII and UTF-16LE representations of secrets, emails, IPs, and path usernames
-/// in-place inside a raw binary buffer (such as a Windows `.dmp` minidump), overwriting matched
-/// sensitive bytes with `*` (`0x2a` ASCII or `0x2a 0x00` UTF-16LE) to preserve fixed offsets.
+/// Scrubs both UTF-8/ASCII and UTF-16LE representations of secrets, emails, IPs, and path
+/// usernames in-place inside a raw binary buffer (such as a Windows `.dmp` minidump), overwriting
+/// matched sensitive bytes with `*` (`0x2a` ASCII or `0x2a 0x00` UTF-16LE) to preserve fixed
+/// offsets and RVA layout.
 pub fn redact_bytes_in_place(buf: &mut [u8], known_secrets: &[&str], known_usernames: &[&str]) {
     if buf.is_empty() {
         return;
     }
-
-    // Helper: overwrite every occurrence of needle (exact + lowercase) with `*`.
-    let scrub_ascii_needle = |data: &mut [u8], needle: &[u8]| {
-        if needle.is_empty() || needle.len() > data.len() {
-            return;
-        }
-        let mut i = 0;
-        while i + needle.len() <= data.len() {
-            if data[i..i + needle.len()].eq_ignore_ascii_case(needle) {
-                data[i..i + needle.len()].fill(b'*');
-                i += needle.len();
-            } else {
-                i += 1;
-            }
-        }
-    };
-
-    let scrub_utf16le_needle = |data: &mut [u8], s: &str| {
-        let units: Vec<u16> = s.encode_utf16().collect();
-        let blen = units.len() * 2;
-        if blen == 0 || blen > data.len() {
-            return;
-        }
-        let pattern: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
-        let lower_pattern: Vec<u8> = s.to_lowercase().encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        let mut i = 0;
-        while i + blen <= data.len() {
-            let slice = &data[i..i + blen];
-            if slice == pattern.as_slice()
-                || (lower_pattern.len() == blen && slice.eq_ignore_ascii_case_utf16(&lower_pattern))
-            {
-                for j in (0..blen).step_by(2) {
-                    data[i + j] = b'*';
-                    data[i + j + 1] = 0;
-                }
-                i += blen;
-            } else {
-                i += 1;
-            }
-        }
-    };
 
     for s in known_secrets.iter().copied().filter(|s| s.len() >= 4) {
         scrub_ascii_needle(buf, s.as_bytes());
@@ -841,47 +801,200 @@ pub fn redact_bytes_in_place(buf: &mut [u8], known_secrets: &[&str], known_usern
         scrub_utf16le_needle(buf, u);
     }
 
-    // Generic ASCII runs (emails, IPs, path usernames, key=val, Bearer tokens, live_, eyJ...).
+    redact_utf8_runs_in_place(buf, known_secrets, known_usernames);
+    redact_utf16le_runs_in_place(buf, known_secrets, known_usernames);
+}
+
+fn scrub_ascii_needle(data: &mut [u8], needle: &[u8]) {
+    if needle.is_empty() || needle.len() > data.len() {
+        return;
+    }
+    let mut i = 0;
+    while i + needle.len() <= data.len() {
+        if data[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            data[i..i + needle.len()].fill(b'*');
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn scrub_utf16le_needle(data: &mut [u8], s: &str) {
+    let units: Vec<u16> = s.encode_utf16().collect();
+    let blen = units.len() * 2;
+    if blen == 0 || blen > data.len() {
+        return;
+    }
+    let pattern: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let lower_pattern: Vec<u8> = s.to_lowercase().encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let upper_pattern: Vec<u8> = s.to_uppercase().encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let mut i = 0;
+    while i + blen <= data.len() {
+        let slice = &data[i..i + blen];
+        if slice == pattern.as_slice()
+            || (lower_pattern.len() == blen && slice.eq_ignore_ascii_case_utf16(&lower_pattern))
+            || (upper_pattern.len() == blen && slice.eq_ignore_ascii_case_utf16(&upper_pattern))
+        {
+            for j in (0..blen).step_by(2) {
+                data[i + j] = b'*';
+                data[i + j + 1] = 0;
+            }
+            i += blen;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn redact_utf8_runs_in_place(buf: &mut [u8], known_secrets: &[&str], known_usernames: &[&str]) {
     let mut i = 0;
     while i < buf.len() {
-        if is_printable_ascii_text(buf[i]) {
+        if let Some(first_len) = next_utf8_text_char_len(buf, i) {
             let start = i;
-            while i < buf.len() && is_printable_ascii_text(buf[i]) {
-                i += 1;
+            i += first_len;
+            while i < buf.len() {
+                if let Some(len) = next_utf8_text_char_len(buf, i) {
+                    i += len;
+                } else {
+                    break;
+                }
             }
-            if i - start >= 6 {
-                let s = String::from_utf8_lossy(&buf[start..i]).into_owned();
-                let red = redact_text(&s, known_secrets, known_usernames);
-                if red != s {
-                    scrub_ascii_span(&mut buf[start..i], &s);
+            if i - start >= 6
+                && let Ok(text) = std::str::from_utf8(&buf[start..i])
+            {
+                let spans = collect_sensitive_spans(text, known_secrets, known_usernames);
+                for sp in spans {
+                    for p in (start + sp.start)..(start + sp.end).min(buf.len()) {
+                        if !matches!(buf[p], b'\r' | b'\n') {
+                            buf[p] = b'*';
+                        }
+                    }
                 }
             }
         } else {
             i += 1;
         }
     }
+}
 
-    // Generic UTF-16LE runs (Windows minidumps store environment blocks & file paths in UTF-16LE).
+fn next_utf8_text_char_len(buf: &[u8], i: usize) -> Option<usize> {
+    let b = buf[i];
+    if b < 0x80 {
+        return ((0x20..=0x7e).contains(&b) || matches!(b, b'\t' | b'\r' | b'\n')).then_some(1);
+    }
+    let expected = match b {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    let slice = buf.get(i..i + expected)?;
+    let s = std::str::from_utf8(slice).ok()?;
+    let ch = s.chars().next()?;
+    if ch.len_utf8() != expected || ch.is_control() {
+        return None;
+    }
+    Some(expected)
+}
+
+fn redact_utf16le_runs_in_place(buf: &mut [u8], known_secrets: &[&str], known_usernames: &[&str]) {
     for offset in [0usize, 1usize] {
         let mut idx = offset;
         while idx + 1 < buf.len() {
-            if is_utf16le_printable_ascii(buf[idx], buf[idx + 1]) {
-                let start = idx;
-                let mut text = String::new();
-                while idx + 1 < buf.len() && is_utf16le_printable_ascii(buf[idx], buf[idx + 1]) {
-                    text.push(buf[idx] as char);
-                    idx += 2;
+            let Some((first_ch, first_len, first_lat1)) = decode_utf16le_text_char(buf, idx) else {
+                idx += 2;
+                continue;
+            };
+            if !first_lat1 {
+                idx += first_len;
+                continue;
+            }
+            let mut text = String::new();
+            let mut raw_ranges: Vec<(usize, usize)> = Vec::new();
+            push_utf16_mapped_char(&mut text, &mut raw_ranges, first_ch, idx, idx + first_len);
+            idx += first_len;
+            let mut non_lat1_streak = 0usize;
+
+            while idx + 1 < buf.len() {
+                let Some((ch, clen, is_lat1)) = decode_utf16le_text_char(buf, idx) else {
+                    break;
+                };
+                if is_lat1 {
+                    non_lat1_streak = 0;
+                } else {
+                    if non_lat1_streak >= 64 {
+                        break;
+                    }
+                    non_lat1_streak += 1;
                 }
-                if text.len() >= 6 {
-                    let red = redact_text(&text, known_secrets, known_usernames);
-                    if red != text {
-                        scrub_utf16le_span(&mut buf[start..idx], &text, known_secrets, known_usernames);
+                push_utf16_mapped_char(&mut text, &mut raw_ranges, ch, idx, idx + clen);
+                idx += clen;
+            }
+
+            if text.len() >= 6 {
+                let spans = collect_sensitive_spans(&text, known_secrets, known_usernames);
+                for sp in spans {
+                    let Some(&(raw_start, _)) = raw_ranges.get(sp.start) else {
+                        continue;
+                    };
+                    let Some(&(_, raw_end)) = raw_ranges.get(sp.end - 1) else {
+                        continue;
+                    };
+                    for p in (raw_start..raw_end).step_by(2) {
+                        if p + 1 < buf.len() && !(buf[p + 1] == 0 && matches!(buf[p], b'\r' | b'\n')) {
+                            buf[p] = b'*';
+                            buf[p + 1] = 0;
+                        }
                     }
                 }
-            } else {
-                idx += 2;
             }
+            idx += 2;
         }
+    }
+}
+
+fn decode_utf16le_text_char(buf: &[u8], idx: usize) -> Option<(char, usize, bool)> {
+    let lo = buf[idx];
+    let hi = buf[idx + 1];
+    let u = u16::from_le_bytes([lo, hi]);
+    if u == 0 {
+        return None;
+    }
+    if hi == 0 && (matches!(lo, b'\t' | b'\r' | b'\n') || (0x20..=0x7e).contains(&lo) || lo >= 0xa0) {
+        return Some((char::from(lo), 2, true));
+    }
+    if (0xd800..=0xdbff).contains(&u) {
+        let u2 = u16::from_le_bytes([*buf.get(idx + 2)?, *buf.get(idx + 3)?]);
+        if !(0xdc00..=0xdfff).contains(&u2) {
+            return None;
+        }
+        let ch = char::decode_utf16([u, u2]).next()?.ok()?;
+        if ch.is_control() || ('\u{f0000}'..='\u{10fffd}').contains(&ch) {
+            return None;
+        }
+        return Some((ch, 4, false));
+    }
+    if (0xdc00..=0xdfff).contains(&u) {
+        return None;
+    }
+    let ch = char::from_u32(u as u32)?;
+    if ch.is_control() || ('\u{e000}'..='\u{f8ff}').contains(&ch) {
+        return None;
+    }
+    Some((ch, 2, false))
+}
+
+fn push_utf16_mapped_char(
+    text: &mut String,
+    raw_ranges: &mut Vec<(usize, usize)>,
+    ch: char,
+    raw_start: usize,
+    raw_end: usize,
+) {
+    text.push(ch);
+    for _ in 0..ch.len_utf8() {
+        raw_ranges.push((raw_start, raw_end));
     }
 }
 
@@ -900,163 +1013,6 @@ impl EqUtf16AsciiCi for [u8] {
             .zip(other.as_chunks::<2>().0.iter())
             .all(|(a, b)| a[1] == b[1] && (a[1] != 0 || a[0].eq_ignore_ascii_case(&b[0])))
     }
-}
-
-fn is_printable_ascii_text(b: u8) -> bool {
-    (0x20..=0x7e).contains(&b)
-}
-
-fn is_utf16le_printable_ascii(lo: u8, hi: u8) -> bool {
-    hi == 0 && (0x20..=0x7e).contains(&lo)
-}
-
-/// Masks tokens inside an ASCII run in place using byte length preservation where detected.
-fn scrub_ascii_span(bytes: &mut [u8], s: &str) {
-    for (a, b) in sensitive_byte_ranges(s) {
-        if a < b && b <= bytes.len() {
-            bytes[a..b].fill(b'*');
-        }
-    }
-}
-
-fn scrub_utf16le_span(bytes: &mut [u8], s: &str, secrets: &[&str], users: &[&str]) {
-    let mut ranges = sensitive_byte_ranges(s);
-    for pat in secrets.iter().chain(users.iter()).filter(|x| x.len() >= 3) {
-        let mut pos = 0;
-        let low_s = s.to_ascii_lowercase();
-        let low_p = pat.to_ascii_lowercase();
-        while let Some(found) = low_s[pos..].find(&low_p) {
-            ranges.push((pos + found, pos + found + pat.len()));
-            pos += found + pat.len();
-        }
-    }
-    for (a, b) in ranges {
-        for char_i in a..b {
-            let byte_i = char_i * 2;
-            if byte_i + 1 < bytes.len() {
-                bytes[byte_i] = b'*';
-                bytes[byte_i + 1] = 0;
-            }
-        }
-    }
-}
-
-/// Identifies `(start, end)` byte offsets of sensitive spans inside pure-ASCII `s` for fixed-width
-/// binary buffer scrubbing.
-fn sensitive_byte_ranges(s: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let lower = s.to_ascii_lowercase();
-
-    // Path usernames
-    for prefix in ["/users/", "/home/", "\\users\\", "/Users/", "/home/", "\\Users\\"] {
-        let mut pos = 0;
-        let low_pref = prefix.to_ascii_lowercase();
-        while let Some(idx) = lower[pos..].find(&low_pref) {
-            let u_start = pos + idx + low_pref.len();
-            let u_end = s[u_start..]
-                .find(['/', '\\', ' ', '\t', '\r', '\n', '"', '\'', ',', ';'])
-                .map_or(s.len(), |n| u_start + n);
-            if u_end > u_start {
-                ranges.push((u_start, u_end));
-            }
-            pos = u_end.max(u_start + 1);
-        }
-    }
-
-    // Stream URLs & KV secrets
-    for marker in [
-        "key=",
-        "stream_key=",
-        "streamkey=",
-        "token=",
-        "access_token=",
-        "refresh_token=",
-        "id_token=",
-        "passphrase=",
-        "streamid=",
-        "password=",
-        "passwd=",
-        "secret=",
-        "client_secret=",
-        "apikey=",
-        "api_key=",
-        "pass=",
-        "auth=",
-        "authorization=",
-        "webhook=",
-        "bearer=",
-        "bearer:",
-        "bearer ",
-        "basic ",
-        "oauth:",
-        "live_",
-        "sk_live_",
-        "whsec_",
-        "ghp_",
-        "aiza",
-        "xoxb-",
-        "eyj",
-    ] {
-        let mut pos = 0;
-        while let Some(idx) = lower[pos..].find(marker) {
-            let v_start = pos + idx + marker.len();
-            let v_end = s[v_start..]
-                .find(|c: char| c.is_ascii_whitespace() || matches!(c, '&' | '"' | '\'' | ',' | ';' | ')'))
-                .map_or(s.len(), |n| v_start + n);
-            if marker.starts_with("eyj")
-                || marker == "live_"
-                || marker == "oauth:"
-                || marker == "ghp_"
-                || marker == "sk_live_"
-                || marker == "whsec_"
-                || marker == "aiza"
-                || marker == "xoxb-"
-            {
-                if v_end > pos + idx {
-                    ranges.push((pos + idx, v_end));
-                }
-            } else if v_end > v_start {
-                ranges.push((v_start, v_end));
-            }
-            pos = v_end.max(v_start + 1);
-        }
-    }
-
-    // Emails & IPv4/IPv6 tokens & rtmp trailing path
-    for (idx, _) in s.match_indices('@') {
-        let a = s[..idx]
-            .rfind(|c: char| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '%' | '+' | '-'))
-            .map_or(0, |p| p + 1);
-        let b = s[idx + 1..]
-            .find(|c: char| !matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '-'))
-            .map_or(s.len(), |p| idx + 1 + p);
-        if a < idx && idx + 1 < b && s[idx + 1..b].contains('.') {
-            ranges.push((a, b));
-        }
-    }
-
-    for (start, end, _) in find_ip_spans(s) {
-        ranges.push((start, end));
-    }
-
-    for scheme in ["rtmp://", "rtmps://", "srt://", "rist://", "whip://"] {
-        let mut pos = 0;
-        while let Some(idx) = lower[pos..].find(scheme) {
-            let rest = &s[pos + idx..];
-            let url_end = rest
-                .find(|c: char| c.is_ascii_whitespace() || matches!(c, '"' | '\'' | ',' | ')' | '>' | '<'))
-                .unwrap_or(rest.len());
-            if let Some(slash) = rest[..url_end].rfind('/')
-                && slash > scheme.len()
-                && slash + 1 < url_end
-            {
-                ranges.push((pos + idx + slash + 1, pos + idx + url_end));
-            }
-            pos += idx + url_end.max(1);
-        }
-    }
-
-    ranges
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -2223,6 +2179,80 @@ mod tests {
         for u16_forbidden in ["DumpUser", "myDumpPassword!", "u16_generic_bearer_99", "2001:db8::42"] {
             let pat: Vec<u8> = u16_forbidden.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
             assert!(!blob.windows(pat.len()).any(|w| w == pat.as_slice()), "UTF-16LE secret {u16_forbidden} survived");
+        }
+    }
+
+    #[test]
+    fn binary_dump_redaction_covers_json_url_kv_prefixed_and_unicode_utf16_runs() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"MDMP\x93\xa7\x00\x00");
+        // ASCII runs with JSON OAuth, webhook, URL userinfo, colon KV, new prefixes, RTMP query, UTF-8 path.
+        blob.extend_from_slice(
+            concat!(
+                r#"{"access_token":"dmp_json_acc_1","refresh_token":"dmp_json_ref_2"} "#,
+                "https://discord.com/api/webhooks/123456/dmp_discord_hook_tok ",
+                "https://user:dmp_userinfo_pw@example.com/ingest ",
+                "password: \"dmp_colon_pw\" ",
+                "fca_dmp_tok_11 AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ ",
+                "rtmp://live.twitch.tv/app/dmp_rtmp_cb_key?cb=a/b ",
+                "/Users/José/Library/Application Support/Ferrocast ",
+            )
+            .as_bytes(),
+        );
+        blob.push(0x00);
+
+        // Even-aligned UTF-16LE run with JSON, colon KV, prefix, RTMP query, and non-ASCII username.
+        let u16_even = concat!(
+            r#"{"access_token":"u16_json_acc_1"} "#,
+            "session_id: u16_sess_99 fca_u16_tok_88 ",
+            "rtmp://live.twitch.tv/app/u16_rtmp_key?cb=a/b ",
+            r"C:\Users\José\AppData password: u16_after_latin1_pw",
+        );
+        for u in u16_even.encode_utf16() {
+            blob.extend_from_slice(&u.to_le_bytes());
+        }
+        blob.extend_from_slice(&[0x00, 0x00, 0x7f]); // odd-align next UTF-16LE run
+
+        // Odd-aligned UTF-16LE run with BMP non-Latin1 CJK username and Discord webhook.
+        let u16_odd = r"C:\Users\太郎\AppData https://discord.com/api/webhooks/999/u16_odd_hook_tok";
+        for u in u16_odd.encode_utf16() {
+            blob.extend_from_slice(&u.to_le_bytes());
+        }
+        let orig_len = blob.len();
+
+        redact_bytes_in_place(&mut blob, &[], &[]);
+        assert_eq!(blob.len(), orig_len, "binary RVA layout preserved");
+
+        let as_utf8 = String::from_utf8_lossy(&blob);
+        for forbidden in [
+            "dmp_json_acc_1",
+            "dmp_json_ref_2",
+            "dmp_discord_hook_tok",
+            "dmp_userinfo_pw",
+            "dmp_colon_pw",
+            "fca_dmp_tok_11",
+            "AGE-SECRET-KEY-1",
+            "dmp_rtmp_cb_key",
+            "José",
+        ] {
+            assert!(!as_utf8.contains(forbidden), "ASCII/UTF-8 secret {forbidden} survived in dump");
+        }
+
+        for u16_forbidden in [
+            "u16_json_acc_1",
+            "u16_sess_99",
+            "fca_u16_tok_88",
+            "u16_rtmp_key",
+            "José",
+            "u16_after_latin1_pw",
+            "太郎",
+            "u16_odd_hook_tok",
+        ] {
+            let pat: Vec<u8> = u16_forbidden.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            assert!(
+                !blob.windows(pat.len()).any(|w| w == pat.as_slice()),
+                "UTF-16LE secret {u16_forbidden} survived in dump"
+            );
         }
     }
 
