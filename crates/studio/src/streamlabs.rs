@@ -27,7 +27,7 @@ pub fn scenes_dir() -> Option<PathBuf> {
 }
 
 /// A Streamlabs collection file: its root says so.
-fn is_streamlabs(doc: &Value) -> bool {
+pub(crate) fn is_streamlabs(doc: &Value) -> bool {
     doc.get("nodeType").and_then(Value::as_str) == Some("RootNode")
 }
 
@@ -157,7 +157,7 @@ fn filters(v: &Value) -> Value {
 
 /// Streamlabs' one Screen Capture (game, display or window, picked in `capture_source_list`)
 /// as the OBS kind it stands for.
-fn screen_capture(settings: &mut Map<String, Value>) -> &'static str {
+pub(crate) fn screen_capture(settings: &mut Map<String, Value>) -> &'static str {
     let list = settings.get("capture_source_list").and_then(Value::as_str).unwrap_or("").to_string();
     let kind = list.split(':').next().unwrap_or("");
     let out = match kind {

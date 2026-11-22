@@ -3063,6 +3063,23 @@ fn failed(message: String) -> EngineError {
     if message.starts_with("There's no filter called") {
         return refused(404, "studio_no_filter", message, "Refresh the list of filters.");
     }
+    // A collection's own name is in these messages: it must not decide the answer ("in use now").
+    if message.contains("is damaged and can't be read") && message.contains("scene collection") {
+        return refused(
+            422,
+            "studio_collection_broken",
+            message,
+            "Pick another scene collection or start fresh in Ferrocast.",
+        );
+    }
+    if message.contains("is too large to import") {
+        return refused(
+            413,
+            "studio_collection_too_large",
+            message,
+            "Split very large collections in OBS or Streamlabs, or start fresh.",
+        );
+    }
     if message.contains("already a scene collection called") || message.contains("already a profile called") {
         return refused(409, "studio_name_taken", message, "Pick another name.");
     }
@@ -3073,6 +3090,7 @@ fn failed(message: String) -> EngineError {
         return refused(404, "studio_no_such", message, "Refresh the list.");
     }
     if (message.contains("scene collection") && message.contains("isn't there any more"))
+        || message.contains("scene collections aren't on this computer")
         || message.contains("has no such scene collection")
     {
         return refused(404, "studio_no_obs_collection", message, "Pick one from the list.");
@@ -3713,7 +3731,10 @@ mod tests {
                 422,
                 "studio_collection_broken",
             ),
+            ("OBS's scene collections aren't on this computer.", 404, "studio_no_obs_collection"),
+            ("Streamlabs' scene collections aren't on this computer.", 404, "studio_no_obs_collection"),
             ("OBS's scene collection \"x\" is too large to import.", 413, "studio_collection_too_large"),
+            ("OBS's scene collection \"in use now\" is too large to import.", 413, "studio_collection_too_large"),
         ] {
             assert!(
                 matches!(failed(m.into()), EngineError::Refused { status: s, code: c, .. } if s == status && c == code),

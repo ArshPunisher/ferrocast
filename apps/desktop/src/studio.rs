@@ -4990,7 +4990,9 @@ mod import_tests {
     #[tokio::test]
     async fn real_importer_preview_import_and_undo_with_ferrocast_home() {
         let scratch = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
-        let from_env = std::env::var_os("FERROCAST_HOME").filter(|v| !v.is_empty()).and_then(|_| {
+        // Only with a variable made for it: the test writes a collection and removes it again, so it
+        // never runs on the real home just because FERROCAST_HOME happens to be set.
+        let from_env = std::env::var_os("FERROCAST_IMPORT_TEST_USE_HOME").filter(|v| !v.is_empty()).and_then(|_| {
             let obs = ferrocast_studio::import_preview::obs_dir()?;
             let sl = ferrocast_studio::import_preview::streamlabs_dir()?;
             Some((crate::data_dir(), obs, sl))
@@ -5024,7 +5026,8 @@ mod import_tests {
             ferrocast_studio::import_preview::preview_obs(&obs_dir, "main_setup", web, Some(&inputs), Some(&filters))
                 .unwrap_or_else(|e| panic!("obs preview: {e}"));
         assert_eq!(obs_preview.name, "Main OBS Fixture");
-        assert!(obs_preview.web_pages >= 1, "{obs_preview:?}");
+        // Browser sources only become Web page sources where the Studio has them (a Mac).
+        assert_eq!(obs_preview.web_pages >= 1, web.is_some(), "{obs_preview:?}");
         assert!(obs_preview.skipped.iter().any(|s| s.kind == "spout_capture"), "{obs_preview:?}");
         assert!(obs_preview.skipped.iter().any(|s| s.kind == "vst_filter"), "{obs_preview:?}");
 
@@ -5072,7 +5075,7 @@ mod import_tests {
         let reloaded = crate::studio_library::load(&home);
         assert_eq!(reloaded.shelf(crate::studio_library::Kind::Collections).current, imported_id);
         assert!(imported_path.is_file());
-        assert_eq!(obs_report.web_pages, 1);
+        assert_eq!(obs_report.web_pages, usize::from(web.is_some()));
 
         // Undo the import: restore previous_id and remove imported file and library entry.
         let mut undone = crate::studio_library::load(&home);
@@ -5100,14 +5103,15 @@ mod import_tests {
             Some(&filters),
         )
         .unwrap_or_else(|e| panic!("sl preview: {e}"));
-        assert_eq!(sl_preview.web_pages, 1);
-        assert!(!sl_preview.device_resets.is_empty());
+        assert_eq!(sl_preview.web_pages, usize::from(web.is_some()));
+        // Cameras and sound devices are only asked for again where the import resets them (a Mac).
+        assert_eq!(!sl_preview.device_resets.is_empty(), cfg!(target_os = "macos"));
         assert!(sl_preview.skipped.iter().any(|s| s.kind == "streamlabs_spin_wheel"));
 
         let mut sl_doc =
             ferrocast_studio::streamlabs::read(&sl_dir, "sl_neon").unwrap_or_else(|e| panic!("sl read: {e}"));
         let sl_report = ferrocast_studio::import::convert(&mut sl_doc, web, Some(&inputs));
-        assert_eq!(sl_report.web_pages, 1);
+        assert_eq!(sl_report.web_pages, usize::from(web.is_some()));
         let sl_path = crate::studio_library::file(&home, crate::studio_library::Kind::Collections, "sl-neon");
         if let Err(e) = std::fs::write(&sl_path, sl_doc.to_string()) {
             panic!("write sl imported: {e}");

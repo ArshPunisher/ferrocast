@@ -123,7 +123,7 @@ pub fn read(dir: &Path, id: &str) -> Result<Value, StudioError> {
 
 /// A file path as a `file://` address (spaces and the few characters that would end or
 /// change one are escaped).
-fn file_url(path: &str) -> String {
+pub(crate) fn file_url(path: &str) -> String {
     let mut out = String::from("file://");
     for c in path.replace('\\', "/").chars() {
         match c {

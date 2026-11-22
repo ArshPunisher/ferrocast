@@ -86,6 +86,11 @@ pub struct ImportPreview {
     pub scene_names: Vec<String>,
     pub truncated_scenes: usize,
     pub device_resets: Vec<ImportSkip>,
+    /// How many devices need picking again (the list above is cut at a limit).
+    pub device_resets_total: usize,
+    /// Browser sources whose page address the import will leave empty (not an `http(s)` page or a
+    /// plain local file).
+    pub blocked_pages: Vec<String>,
     pub skipped: Vec<ImportSkip>,
     pub skipped_total: usize,
     pub missing: Vec<String>,
@@ -270,23 +275,46 @@ pub fn preview_obs_doc(
     let mut skipped = Vec::new();
     let mut skipped_total = 0usize;
     let mut missing = BTreeSet::new();
+    let mut blocked_pages: Vec<String> = Vec::new();
+    // OBS keeps the mic and desktop sound on channels of their own, outside the source list.
+    const CHANNELS: [&str; 6] = [
+        "DesktopAudioDevice1",
+        "DesktopAudioDevice2",
+        "AuxAudioDevice1",
+        "AuxAudioDevice2",
+        "AuxAudioDevice3",
+        "AuxAudioDevice4",
+    ];
+    let channels: Vec<&Value> = CHANNELS.iter().filter_map(|k| doc.get(*k)).filter(|v| v.is_object()).collect();
 
-    for entry in list {
+    for entry in list.iter().chain(channels) {
         let kind = entry.get("id").and_then(Value::as_str).unwrap_or_default();
         let entry_name = entry.get("name").and_then(Value::as_str).unwrap_or("Source").to_string();
 
-        if kind == "scene" {
+        let is_scene = kind == "scene";
+        if is_scene {
             scenes += 1;
             if scene_names.len() < MAX_SCENE_NAMES {
-                scene_names.push(entry_name);
+                scene_names.push(entry_name.clone());
             }
-            continue;
+        } else {
+            sources += 1;
         }
-        sources += 1;
 
         let effective_kind = if kind == "browser_source" {
             if let Some(wk) = web_kind {
                 web_pages += 1;
+                let set = entry.get("settings");
+                let local = set.and_then(|v| v.get("is_local_file")).and_then(Value::as_bool).unwrap_or(false);
+                let file = set.and_then(|v| v.get("local_file")).and_then(Value::as_str).unwrap_or_default();
+                let url = if local && !file.is_empty() {
+                    crate::import::file_url(file)
+                } else {
+                    set.and_then(|v| v.get("url")).and_then(Value::as_str).unwrap_or_default().to_string()
+                };
+                if !crate::import::page_url_ok(&url, local && !file.is_empty()) {
+                    blocked_pages.push(entry_name.clone());
+                }
                 wk
             } else {
                 kind
@@ -296,6 +324,7 @@ pub fn preview_obs_doc(
         };
 
         if let Some(known) = known_inputs
+            && !is_scene
             && kind != "group"
             && !known.contains(effective_kind)
             && !known.contains(kind)
@@ -345,6 +374,8 @@ pub fn preview_obs_doc(
         truncated_scenes: scenes.saturating_sub(scene_names.len()),
         scene_names,
         device_resets: Vec::new(),
+        device_resets_total: 0,
+        blocked_pages,
         skipped,
         skipped_total,
         missing: missing.into_iter().collect(),
@@ -413,6 +444,9 @@ pub fn preview_streamlabs(
         "That Streamlabs scene collection isn't there any more.",
         "Streamlabs' scene collection couldn't be read because the JSON is damaged.",
     )?;
+    if !crate::streamlabs::is_streamlabs(&doc) {
+        return Err(StudioError::Failed("That file isn't a Streamlabs scene collection.".into()));
+    }
     let (Some(raw_sources), Some(raw_scenes)) =
         (doc.is_object().then(|| streamlabs_array(&doc, "sources")).flatten(), streamlabs_array(&doc, "scenes"))
     else {
@@ -421,6 +455,7 @@ pub fn preview_streamlabs(
 
     let name = streamlabs_collection_name(dir, id);
     let mut device_resets = Vec::new();
+    let mut device_resets_total = 0usize;
     let mut source_ids = HashSet::with_capacity(raw_sources.len());
 
     for src in raw_sources {
@@ -429,8 +464,13 @@ pub fn preview_streamlabs(
         }
         let kind = src.get("type").and_then(Value::as_str).unwrap_or_default();
         let src_name = src.get("name").and_then(Value::as_str).unwrap_or("Source").to_string();
+        // The import turns a screen capture into the kind its settings choose, then asks this
+        // computer: the preview asks the same way.
+        let mut settings = src.get("settings").and_then(Value::as_object).cloned().unwrap_or_default();
+        let kind = if kind == "screen_capture" { crate::streamlabs::screen_capture(&mut settings) } else { kind };
         let (_, keep_settings) = crate::streamlabs::for_this_computer(kind);
         if !keep_settings {
+            device_resets_total += 1;
             push_limited(
                 &mut device_resets,
                 None,
@@ -473,6 +513,7 @@ pub fn preview_streamlabs(
     let mut preview = preview_obs_doc(id, &obs_doc, web_kind, known_inputs, known_filters)?;
     preview.source = "streamlabs";
     preview.device_resets = device_resets;
+    preview.device_resets_total = device_resets_total;
     preview.skipped_total += extra_skips_total;
     for skip in extra_skips {
         if preview.skipped.len() >= MAX_SKIP_ITEMS {
@@ -485,6 +526,50 @@ pub fn preview_streamlabs(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_preview_looks_at_scene_filters_global_audio_and_dangerous_pages() {
+        let doc = json!({
+            "name": "C",
+            "DesktopAudioDevice1": { "id": "coreaudio_output_capture", "name": "Desktop", "filters": [{ "id": "vst_filter", "name": "Verb" }] },
+            "sources": [
+                { "id": "scene", "name": "Main", "filters": [{ "id": "alien_filter", "name": "Odd" }] },
+                { "id": "browser_source", "name": "Alerts", "settings": { "url": "javascript:alert(1)" } },
+                { "id": "browser_source", "name": "Chat", "settings": { "url": "https://chat.test" } },
+            ],
+        });
+        let inputs: BTreeSet<String> = ["coreaudio_output_capture".to_string(), "ferrocast_web".to_string()].into();
+        let filters: BTreeSet<String> = BTreeSet::new();
+        let p = preview_obs_doc("c", &doc, Some("ferrocast_web"), Some(&inputs), Some(&filters)).unwrap();
+        assert_eq!((p.scenes, p.sources), (1, 3), "the channel counts as a source, the scene does not");
+        let names: Vec<&str> = p.skipped.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Main / Odd"), "a scene's filter: {names:?}");
+        assert!(names.contains(&"Desktop / Verb"), "a global channel's filter: {names:?}");
+        assert_eq!(p.blocked_pages, vec!["Alerts".to_string()]);
+    }
+
+    #[test]
+    fn the_streamlabs_preview_needs_the_same_format_as_the_import_and_counts_every_reset() {
+        let d = tempfile::tempdir().unwrap();
+        let sources: Vec<Value> = (0..80)
+            .map(
+                |i| json!({ "id": format!("s{i}"), "name": format!("Cam {i}"), "type": "dshow_input", "settings": {} }),
+            )
+            .collect();
+        let doc = json!({ "nodeType": "RootNode", "sources": { "items": sources }, "scenes": { "items": [] } });
+        std::fs::write(d.path().join("sl.json"), doc.to_string()).unwrap();
+        let p = preview_streamlabs(d.path(), "sl", None, None, None).unwrap();
+        if cfg!(not(target_os = "macos")) {
+            // other computers keep these settings: nothing to count
+            return;
+        }
+        assert!(p.device_resets.len() <= MAX_SKIP_ITEMS);
+        assert_eq!(p.device_resets_total, 80, "the count is not cut with the list");
+        // No RootNode: the import refuses it, so the preview does too.
+        let bad = json!({ "sources": { "items": [] }, "scenes": { "items": [] } });
+        std::fs::write(d.path().join("bad.json"), bad.to_string()).unwrap();
+        assert!(preview_streamlabs(d.path(), "bad", None, None, None).is_err());
+    }
+
     #[test]
     fn a_plain_file_is_read_and_a_link_a_folder_or_a_big_file_is_not() {
         let d = tempfile::tempdir().unwrap();
@@ -591,6 +676,7 @@ mod tests {
             }));
         }
         json!({
+            "nodeType": "RootNode",
             "scenes": { "items": sc_items },
             "sources": { "items": src_items },
             "transitions": { "items": [], "defaultTransitionId": "" }
@@ -715,6 +801,7 @@ mod tests {
 
         // Rich Streamlabs collection: widgets, unknown source/filter, missing scene item, cross-OS devices
         let rich = json!({
+            "nodeType": "RootNode",
             "scenes": {
                 "items": [
                     {
