@@ -1261,42 +1261,16 @@ impl Engine {
         self.studio_frame("auto_config", view);
     }
 
-    /// Refuses with HTTP 409 when streaming, recording, or replay is live.
+    /// Refuses with HTTP 409 when a Show or any live output (stream, recording, replay,
+    /// virtual camera, NDI, delayed drain) is active, failing closed on status errors.
     async fn ensure_benchmark_idle(&self) -> Result<(), EngineError> {
-        let busy_error = || EngineError::Refused {
-            status: 409,
-            code: "studio_busy",
-            message: "Stop streaming and recording before testing the encoder.".into(),
-            hint:
-                "End your active stream, recording, or replay buffer first so the benchmark never affects live viewers."
-                    .into(),
-            retry_after: None,
-        };
-
-        let gl = self.golive();
-        if gl.hub.live().borrow().on || gl.vhub.live().borrow().on || gl.lhub.live().borrow().on {
-            return Err(busy_error());
-        }
-
-        if let Ok(host) = self.studio_host() {
-            if host.stream_stats().await.ok().is_some_and(|v| v["active"].as_bool() == Some(true)) {
-                return Err(busy_error());
-            }
-            if host.record_stats().await.ok().is_some_and(|v| v["active"].as_bool() == Some(true)) {
-                return Err(busy_error());
-            }
-            if let Ok(stats) = host.stats().await {
-                let source_rec = stats["source_records"].as_array().is_some_and(|a| !a.is_empty());
-                if stats["stream"]["active"].as_bool() == Some(true)
-                    || stats["record"]["active"].as_bool() == Some(true)
-                    || stats["replay"]["active"].as_bool() == Some(true)
-                    || source_rec
-                {
-                    return Err(busy_error());
-                }
-            }
-        }
-        Ok(())
+        self.ensure_outputs_idle(
+            "testing the encoder",
+            "Stop streaming and recording before testing the encoder.".into(),
+            "End your active stream, recording, replay buffer, virtual camera, or NDI output first so the benchmark never affects live viewers."
+                .into(),
+        )
+        .await
     }
 
     /// Starts an encoder stress benchmark (and upload test in `stream` mode unless skipped).
@@ -2099,6 +2073,10 @@ mod tests {
         lagged: AtomicU64,
         skipped: AtomicU64,
         save_count: AtomicU64,
+        stats_override: Mutex<Option<Result<Value, String>>>,
+        stream_stats_override: Mutex<Option<Result<Value, String>>>,
+        record_stats_override: Mutex<Option<Result<Value, String>>>,
+        delay_drain_val: Mutex<Option<(f64, f64)>>,
     }
 
     impl Default for BenchMockHost {
@@ -2111,12 +2089,19 @@ mod tests {
                 lagged: AtomicU64::new(0),
                 skipped: AtomicU64::new(0),
                 save_count: AtomicU64::new(0),
+                stats_override: Mutex::new(None),
+                stream_stats_override: Mutex::new(None),
+                record_stats_override: Mutex::new(None),
+                delay_drain_val: Mutex::new(None),
             }
         }
     }
 
     #[async_trait]
     impl StudioHost for BenchMockHost {
+        fn delay_drain(&self) -> Option<(f64, f64)> {
+            *self.delay_drain_val.lock().unwrap()
+        }
         async fn status(&self) -> crate::studio_host::StudioStatus {
             crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
         }
@@ -2142,6 +2127,9 @@ mod tests {
             Ok(Value::Null)
         }
         async fn stats(&self) -> Result<Value, String> {
+            if let Some(res) = self.stats_override.lock().unwrap().clone() {
+                return res;
+            }
             Ok(serde_json::json!({
                 "engine": {
                     "cpu": 12.0,
@@ -2163,6 +2151,12 @@ mod tests {
                 },
                 "record": { "active": self.recording.load(Ordering::Relaxed) }
             }))
+        }
+        async fn record_stats(&self) -> Result<Value, String> {
+            if let Some(res) = self.record_stats_override.lock().unwrap().clone() {
+                return res;
+            }
+            Ok(Value::Null)
         }
         async fn settings(&self) -> StudioSettings {
             self.settings.lock().unwrap().clone()
@@ -2191,6 +2185,9 @@ mod tests {
             Ok(())
         }
         async fn stream_stats(&self) -> Result<Value, String> {
+            if let Some(res) = self.stream_stats_override.lock().unwrap().clone() {
+                return res;
+            }
             if self.streaming.load(Ordering::Relaxed) {
                 Ok(serde_json::json!({ "active": true, "dropped": self.dropped.load(Ordering::Relaxed) }))
             } else {
@@ -2254,6 +2251,96 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn benchmark_refuses_every_live_output_and_fails_closed_on_error() {
+        let (engine, host, _dir) = test_engine().await;
+        let bench_req = || BenchmarkReq {
+            mode: Some("record".into()),
+            fps_preference: Some(60),
+            include_upload: Some(false),
+            max_seconds: Some(4),
+        };
+
+        // 1. Virtual camera active.
+        *host.stats_override.lock().unwrap() = Some(Ok(serde_json::json!({ "virtualcam": { "active": true } })));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "virtualcam: {err:?}");
+
+        // 2. NDI active using DesktopStudio shape `{ "name": "Ferrocast" }` (no "active" field).
+        *host.stats_override.lock().unwrap() = Some(Ok(serde_json::json!({ "ndi": { "name": "Ferrocast" } })));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }),
+            "ndi desktop shape: {err:?}"
+        );
+
+        // And `ndi: { "active": false }` is NOT treated as active.
+        *host.stats_override.lock().unwrap() = Some(Ok(serde_json::json!({ "ndi": { "active": false } })));
+        engine.ensure_benchmark_idle().await.expect("inactive ndi object must allow idle check");
+
+        // 3. Reconnecting main stream, vertical stream, and light stream.
+        *host.stats_override.lock().unwrap() = Some(Ok(serde_json::json!({ "stream": { "reconnecting": true } })));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "reconnecting: {err:?}");
+
+        *host.stats_override.lock().unwrap() = Some(Ok(serde_json::json!({ "vertical_stream": { "active": true } })));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }),
+            "vertical_stream: {err:?}"
+        );
+
+        *host.stats_override.lock().unwrap() = Some(Ok(serde_json::json!({ "light_stream": { "active": true } })));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "light_stream: {err:?}");
+
+        // 4. Delayed stream tail still draining.
+        *host.stats_override.lock().unwrap() = None;
+        *host.delay_drain_val.lock().unwrap() = Some((4.0, 2.5));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "delay_drain: {err:?}");
+        *host.delay_drain_val.lock().unwrap() = None;
+
+        // 5. Show countdown active.
+        engine.studio().machine.lock().unwrap().phase = crate::studio::show::BroadcastPhase::Countdown;
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }),
+            "show countdown: {err:?}"
+        );
+        engine.studio().machine.lock().unwrap().phase = crate::studio::show::BroadcastPhase::Idle;
+
+        // 6. Fail CLOSED when stats / stream_stats / record_stats error out while Studio is running.
+        *host.stats_override.lock().unwrap() = Some(Err("studio thread timed out".into()));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "stats err: {err:?}");
+        *host.stats_override.lock().unwrap() = None;
+
+        *host.stream_stats_override.lock().unwrap() = Some(Err("stream stats unavailable".into()));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }),
+            "stream_stats err: {err:?}"
+        );
+        *host.stream_stats_override.lock().unwrap() = None;
+
+        *host.record_stats_override.lock().unwrap() = Some(Err("record stats unavailable".into()));
+        let err = engine.auto_config_benchmark(bench_req()).await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }),
+            "record_stats err: {err:?}"
+        );
+        *host.record_stats_override.lock().unwrap() = None;
+
+        // Shared `ensure_idle_for_switch` also catches DesktopStudio NDI shape and fails closed.
+        *host.stats_override.lock().unwrap() = Some(Ok(serde_json::json!({ "ndi": { "name": "Studio Out" } })));
+        let err = engine.ensure_idle_for_switch("profiles").await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "switch ndi: {err:?}");
+        *host.stats_override.lock().unwrap() = Some(Err("studio unresponsive".into()));
+        let err = engine.ensure_idle_for_switch("profiles").await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "switch err: {err:?}");
     }
 
     #[tokio::test]

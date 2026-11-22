@@ -3173,7 +3173,7 @@ impl StudioHost for DesktopStudio {
                     "every_app": c.every_app(),
                     "source": h.virtualcam_source,
                 })),
-                "ndi": h.ndi.as_ref().filter(|n| n.active()).map(|n| json!({ "name": n.name() })),
+                "ndi": h.ndi.as_ref().filter(|n| n.active()).map(|n| json!({ "active": true, "name": n.name() })),
                 // Captures on air that show nothing (the black screen fixer).
                 "captures": h.collection.as_ref().map(|c| c.capture_problems()).unwrap_or_default(),
                 // Pictures each source has sent to the card, and their size: the page works out
