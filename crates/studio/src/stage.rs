@@ -1944,10 +1944,31 @@ impl Stage {
         Ok(info)
     }
 
+    /// Sets how many of the source's pixels are cut from each side (left, top, right, bottom).
+    /// The picture that stays visible stays where it is on the canvas, as OBS's crop drag does:
+    /// cutting the left or the top moves the item's box in by as much, never the picture with it
+    /// (owner, 25 Nov: dragging an edge in moved the whole source).
     pub fn set_item_crop(&self, scene: &str, id: i64, crop: [i32; 4]) -> Result<ItemInfo, StudioError> {
-        let mut t = self.transform(scene, id)?;
-        [t.crop_left, t.crop_top, t.crop_right, t.crop_bottom] = crop.map(|c| c.max(0));
-        self.set_transform(scene, id, &t)
+        let crop = crop.map(|c| c.max(0));
+        let before = self.transform(scene, id)?;
+        // Where the box's top-left corner has to be, in the box's own 0..1 terms of the old
+        // box: the old visible picture's top-left plus what is newly cut from the left and top.
+        let (w, h) = (before.width.max(1) as f32, before.height.max(1) as f32);
+        let seen = (
+            (w - before.crop_left as f32 - before.crop_right as f32).max(1.0),
+            (h - before.crop_top as f32 - before.crop_bottom as f32).max(1.0),
+        );
+        let corner = ((crop[0] - before.crop_left) as f32 / seen.0, (crop[1] - before.crop_top) as f32 / seen.1);
+        let target = self.item_point(scene, id, corner)?;
+        let mut t = before;
+        [t.crop_left, t.crop_top, t.crop_right, t.crop_bottom] = crop;
+        self.set_transform(scene, id, &t)?;
+        // Inside bounds (fit, stretch, ...) the picture is fitted to the box, so it can't stay.
+        if t.bounds == "none" {
+            self.settle_point(scene, id, (0.0, 0.0), target)?;
+        }
+        let it = self.item(scene, id)?;
+        Ok(self.info_of(&it))
     }
 
     /// Where an item is in its scene (0 is the top) and the scene's name.
@@ -1969,8 +1990,10 @@ impl Stage {
         })
     }
 
-    /// Where the middle of an item's box is on the canvas (through its group inside one).
-    fn item_centre(&self, scene: &str, id: i64) -> Result<(f32, f32), StudioError> {
+    /// Where the point `at` of an item's box (0..1 across and down it, its own orientation
+    /// before any flip: the picture's top-left is (0, 0)) is on the canvas, through its group
+    /// inside one.
+    fn item_point(&self, scene: &str, id: i64, at: (f32, f32)) -> Result<(f32, f32), StudioError> {
         let it = self.item(scene, id)?;
         let mut f = self.info_of(&it).frame;
         if let Some(gi) = self.group_of(scene, id) {
@@ -1978,37 +2001,48 @@ impl Stage {
             let on = unit.then(&self.group_map(&gi));
             f = [on.a, on.b, on.c, on.d, on.e, on.f];
         }
-        Ok((f[4] + (f[0] + f[2]) / 2.0, f[5] + (f[1] + f[3]) / 2.0))
+        Ok((f[4] + f[0] * at.0 + f[2] * at.1, f[5] + f[1] * at.0 + f[3] * at.1))
+    }
+
+    /// Where the middle of an item's box is on the canvas.
+    fn item_centre(&self, scene: &str, id: i64) -> Result<(f32, f32), StudioError> {
+        self.item_point(scene, id, (0.5, 0.5))
+    }
+
+    /// Moves an item (changing its position only) until the point `at` of its box is on the
+    /// canvas at `target`. Inside a group the group fits itself round its sources again after
+    /// every write, so its map changes under the item: the move is measured again after each
+    /// write until the point is there (one round outside a group, a few inside).
+    fn settle_point(&self, scene: &str, id: i64, at: (f32, f32), target: (f32, f32)) -> Result<(), StudioError> {
+        for _ in 0..6 {
+            let now = self.item_point(scene, id, at)?;
+            if (target.0 - now.0).abs() < 0.01 && (target.1 - now.1).abs() < 0.01 {
+                break;
+            }
+            let (dx, dy) = match self.group_of(scene, id).and_then(|gi| self.group_map(&gi).inverse()) {
+                Some(back) => {
+                    let (a, b) = (back.apply(target.0, target.1), back.apply(now.0, now.1));
+                    (a.0 - b.0, a.1 - b.1)
+                }
+                None => (target.0 - now.0, target.1 - now.1),
+            };
+            let mut t = self.transform(scene, id)?;
+            (t.x, t.y) = (t.x + dx, t.y + dy);
+            self.set_transform(scene, id, &t)?;
+        }
+        Ok(())
     }
 
     /// Changes an item's transform with `change`, then moves it so the middle of its box is
     /// where it was on the canvas: a flip or a turn happens in place, not about its alignment
     /// point (which, for the default top-left one, swung the picture away, partly out of the
-    /// canvas). Inside a group the group fits itself round its sources again after every write,
-    /// so its map changes under the item: the move is measured again after each write until the
-    /// middle is back (it takes one round outside a group, a few inside).
+    /// canvas).
     fn change_in_place(&self, scene: &str, id: i64, change: impl FnOnce(&mut Transform)) -> Result<(), StudioError> {
         let from = self.item_centre(scene, id)?;
         let mut t = self.transform(scene, id)?;
         change(&mut t);
         self.set_transform(scene, id, &t)?;
-        for _ in 0..6 {
-            let to = self.item_centre(scene, id)?;
-            if (from.0 - to.0).abs() < 0.01 && (from.1 - to.1).abs() < 0.01 {
-                break;
-            }
-            let (dx, dy) = match self.group_of(scene, id).and_then(|gi| self.group_map(&gi).inverse()) {
-                Some(back) => {
-                    let (a, b) = (back.apply(from.0, from.1), back.apply(to.0, to.1));
-                    (a.0 - b.0, a.1 - b.1)
-                }
-                None => (from.0 - to.0, from.1 - to.1),
-            };
-            let mut now = self.transform(scene, id)?;
-            (now.x, now.y) = (now.x + dx, now.y + dy);
-            self.set_transform(scene, id, &now)?;
-        }
-        Ok(())
+        self.settle_point(scene, id, (0.5, 0.5), from)
     }
 
     pub fn edit_item(&self, scene: &str, id: i64, edit: ItemEdit) -> Result<(), StudioError> {
@@ -8702,6 +8736,55 @@ mod tests {
         // A flip still flips and a turn still turns.
         let t = ok(s.transform("Main", ok(s.items("Main"))[0].id));
         assert!(t.scale_x.abs() > 0.0);
+    }
+
+    /// Owner, 25 Nov: dragging a crop handle (Alt) from the left towards the right, or from the
+    /// top down, moved the whole source: the engine wrote the crop and left the box where it was,
+    /// so the picture slid with it. The picture that stays visible stays where it is.
+    #[test]
+    fn cropping_keeps_the_visible_picture_where_it_is_on_the_canvas() {
+        let s = stage();
+        let (w, h) = (200.0f32, 100.0f32);
+        // Where source pixel (sx, sy) is on the canvas, with the crop the item has now.
+        let canvas_of = |s: &Stage, scene: &str, id: i64, sx: f32, sy: f32| {
+            let t = ok(s.transform(scene, id));
+            let seen = (w - t.crop_left as f32 - t.crop_right as f32, h - t.crop_top as f32 - t.crop_bottom as f32);
+            ok(s.item_point(scene, id, ((sx - t.crop_left as f32) / seen.0, (sy - t.crop_top as f32) / seen.1)))
+        };
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 0.05 && (a.1 - b.1).abs() < 0.05;
+        // (flip x, flip y, rotation): a plain item, a mirrored one and a turned one.
+        for (i, (fx, fy, rot)) in
+            [(1.0f32, 1.0f32, 0.0f32), (-1.0, 1.0, 0.0), (1.0, -1.0, 90.0), (-1.0, -1.0, 270.0)].into_iter().enumerate()
+        {
+            let name = format!("Crop{i}");
+            let it = ok(s.add_source("Main", "color_source_v3", &name, &json!({ "width": 200, "height": 100 }), false));
+            let mut t = ok(s.transform("Main", it.id));
+            (t.x, t.y, t.scale_x, t.scale_y, t.rotation) = (300.0, 200.0, 1.5 * fx, 0.75 * fy, rot);
+            ok(s.set_transform("Main", it.id, &t));
+            // Crops that move every side, one side at a time and several together, in and out.
+            for crop in [[40, 0, 0, 0], [40, 10, 0, 0], [40, 10, 20, 5], [0, 10, 20, 5], [60, 30, 30, 30], [0, 0, 0, 0]]
+            {
+                let probes = [(100.0, 50.0), (80.0, 40.0), (150.0, 60.0)];
+                // Pixels in the part that stays visible both before and now.
+                let (now, then) = (ok(s.transform("Main", it.id)), crop);
+                let keeps = |sx: f32, sy: f32| {
+                    sx >= now.crop_left.max(then[0]) as f32
+                        && sx <= w - now.crop_right.max(then[2]) as f32
+                        && sy >= now.crop_top.max(then[1]) as f32
+                        && sy <= h - now.crop_bottom.max(then[3]) as f32
+                };
+                let before: Vec<_> = probes.iter().map(|p| canvas_of(&s, "Main", it.id, p.0, p.1)).collect();
+                ok(s.set_item_crop("Main", it.id, crop));
+                for (p, was) in probes.iter().zip(&before) {
+                    if keeps(p.0, p.1) {
+                        assert!(
+                            near(canvas_of(&s, "Main", it.id, p.0, p.1), *was),
+                            "{name} crop {crop:?}: source pixel {p:?} moved on the canvas"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
