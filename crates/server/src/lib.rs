@@ -15,6 +15,7 @@ mod ws;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -71,24 +72,96 @@ impl Server {
     }
 }
 
-/// Binds and starts serving. Tries `opts.port`, then the next 20 ports.
-pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server> {
-    let ip = if opts.lan { Ipv4Addr::UNSPECIFIED } else { Ipv4Addr::LOCALHOST };
+/// The OS's "not now" errors from opening a socket: out of network buffers (ENOBUFS, os error 55
+/// on a Mac, 105 on Linux, 10055 on Windows), out of memory or file handles, or "try again".
+/// They pass by themselves, so binding waits and tries again; an address already in use does
+/// not (it moves to the next port).
+fn is_transient_bind_error(e: &std::io::Error) -> bool {
+    #[cfg(target_os = "macos")]
+    const CODES: [i32; 5] = [55, 12, 23, 24, 35];
+    #[cfg(target_os = "windows")]
+    const CODES: [i32; 3] = [10055, 10024, 8];
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    const CODES: [i32; 5] = [105, 12, 23, 24, 11];
+    e.kind() == std::io::ErrorKind::OutOfMemory || e.raw_os_error().is_some_and(|c| CODES.contains(&c))
+}
+
+/// What the person sees when the computer stays out of network resources for the whole wait.
+fn out_of_network_resources(e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        e.kind(),
+        format!(
+            "Your computer has run out of network resources ({e}). Close apps that use the network \
+             (a VPN, a download manager, many browser tabs), wait a minute and open Ferrocast again; \
+             if it keeps happening, restart your computer."
+        ),
+    )
+}
+
+/// How one round of opening the listener ended.
+enum Round {
+    Bound(TcpListener),
+    /// The computer is short of a resource for now (see [`is_transient_bind_error`]).
+    Transient(std::io::Error),
+    Failed(std::io::Error),
+}
+
+/// One round: `port`, then the next 20 ports when one is taken, and any free port when all are.
+async fn bind_round<B, F>(ip: Ipv4Addr, port: u16, bind: &mut B) -> Round
+where
+    B: FnMut(SocketAddr) -> F,
+    F: std::future::Future<Output = std::io::Result<TcpListener>>,
+{
     let mut last_err = None;
-    let mut listener = None;
-    for port in opts.port..opts.port.saturating_add(20) {
-        match TcpListener::bind((ip, port)).await {
-            Ok(l) => {
-                listener = Some(l);
-                break;
-            }
+    for p in port..port.saturating_add(20) {
+        match bind(SocketAddr::from((ip, p))).await {
+            Ok(l) => return Round::Bound(l),
+            Err(e) if is_transient_bind_error(&e) => return Round::Transient(e),
             Err(e) => last_err = Some(e),
         }
     }
-    let listener = match listener {
-        Some(l) => l,
-        None => TcpListener::bind((ip, 0)).await.map_err(|e| last_err.unwrap_or(e))?,
-    };
+    match bind(SocketAddr::from((ip, 0))).await {
+        Ok(l) => Round::Bound(l),
+        Err(e) if is_transient_bind_error(&e) => Round::Transient(e),
+        Err(e) => Round::Failed(last_err.unwrap_or(e)),
+    }
+}
+
+/// Opens the listener. A transient resource error waits `pause`, doubling up to 2 s, and tries
+/// the whole round again, up to `rounds` times; any other failure ends it at once.
+async fn bind_listener<B, F>(
+    ip: Ipv4Addr,
+    port: u16,
+    rounds: u32,
+    pause: Duration,
+    mut bind: B,
+) -> std::io::Result<TcpListener>
+where
+    B: FnMut(SocketAddr) -> F,
+    F: std::future::Future<Output = std::io::Result<TcpListener>>,
+{
+    let rounds = rounds.max(1);
+    let mut wait = pause;
+    for round in 1..=rounds {
+        match bind_round(ip, port, &mut bind).await {
+            Round::Bound(l) => return Ok(l),
+            Round::Failed(e) => return Err(e),
+            Round::Transient(e) if round == rounds => return Err(out_of_network_resources(&e)),
+            Round::Transient(e) => {
+                tracing::warn!(error = %e, round, "the local server waits for network resources");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+    unreachable!("the last round returns")
+}
+
+/// Binds and starts serving. Tries `opts.port`, then the next 20 ports.
+pub async fn serve(engine: Engine, opts: ServeOptions) -> std::io::Result<Server> {
+    let ip = if opts.lan { Ipv4Addr::UNSPECIFIED } else { Ipv4Addr::LOCALHOST };
+    // About 20 s of patience for a computer short of network buffers (os error 55) before giving up.
+    let listener = bind_listener(ip, opts.port, 12, Duration::from_millis(250), TcpListener::bind).await?;
     let addr = listener.local_addr()?;
     let sessions = Arc::new(Sessions::new());
     let state = AppState {
@@ -328,6 +401,8 @@ fn add_cors(res: &mut Response, origin: Option<&str>) {
 mod api_keys_tests;
 #[cfg(test)]
 mod automations_tests;
+#[cfg(test)]
+mod bind_tests;
 #[cfg(test)]
 mod clips_exposure_tests;
 #[cfg(test)]
