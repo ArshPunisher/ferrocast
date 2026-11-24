@@ -4285,8 +4285,16 @@ impl Stage {
     // ------------------------------------------------------------------ meters and channels
 
     /// Each named source's sound now (dBFS; -100 is silence): the mixer's meters.
+    ///
+    /// Asking for a source's level starts the engine when it isn't running: the sources' sound
+    /// is only opened by the engine, and the first-run setup's "Camera and mic check" asks for
+    /// the mic's level with no preview on screen to have started it, so the meter never moved
+    /// (owner, 24 Nov: "mic doesnt show here on setup when i talk").
     pub fn levels(&self, names: &[String]) -> std::collections::HashMap<String, crate::collection::LevelInfo> {
-        let Some(e) = self.engine.borrow().clone() else { return Default::default() };
+        let running = self.engine.borrow().clone();
+        let Some(e) = running.or_else(|| if names.is_empty() { None } else { self.engine().ok() }) else {
+            return Default::default();
+        };
         read_levels(&e, names, false)
     }
 
@@ -8784,6 +8792,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The first-run setup reads the mic's level with no preview on screen: asking for a level
+    /// starts the engine that opens the sound (it never started, and the meter stayed flat).
+    #[test]
+    fn asking_for_a_level_starts_the_engine_that_hears_the_source() {
+        let s = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        assert!(s.engine.borrow().is_none(), "no engine until something asks for one");
+        // No names: nothing to measure, nothing started.
+        assert!(s.levels(&[]).is_empty());
+        assert!(s.engine.borrow().is_none(), "an empty ask starts nothing");
+        let _ = s.levels(&["Mic".to_string()]);
+        if s.engine.borrow().is_none() {
+            // Where no engine can start at all (no graphics adapter), there is nothing to check.
+            assert!(s.engine().is_err(), "an engine could start, but the level ask did not start it");
         }
     }
 
