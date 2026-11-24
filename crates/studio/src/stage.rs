@@ -1969,6 +1969,48 @@ impl Stage {
         })
     }
 
+    /// Where the middle of an item's box is on the canvas (through its group inside one).
+    fn item_centre(&self, scene: &str, id: i64) -> Result<(f32, f32), StudioError> {
+        let it = self.item(scene, id)?;
+        let mut f = self.info_of(&it).frame;
+        if let Some(gi) = self.group_of(scene, id) {
+            let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
+            let on = unit.then(&self.group_map(&gi));
+            f = [on.a, on.b, on.c, on.d, on.e, on.f];
+        }
+        Ok((f[4] + (f[0] + f[2]) / 2.0, f[5] + (f[1] + f[3]) / 2.0))
+    }
+
+    /// Changes an item's transform with `change`, then moves it so the middle of its box is
+    /// where it was on the canvas: a flip or a turn happens in place, not about its alignment
+    /// point (which, for the default top-left one, swung the picture away, partly out of the
+    /// canvas). Inside a group the group fits itself round its sources again after every write,
+    /// so its map changes under the item: the move is measured again after each write until the
+    /// middle is back (it takes one round outside a group, a few inside).
+    fn change_in_place(&self, scene: &str, id: i64, change: impl FnOnce(&mut Transform)) -> Result<(), StudioError> {
+        let from = self.item_centre(scene, id)?;
+        let mut t = self.transform(scene, id)?;
+        change(&mut t);
+        self.set_transform(scene, id, &t)?;
+        for _ in 0..6 {
+            let to = self.item_centre(scene, id)?;
+            if (from.0 - to.0).abs() < 0.01 && (from.1 - to.1).abs() < 0.01 {
+                break;
+            }
+            let (dx, dy) = match self.group_of(scene, id).and_then(|gi| self.group_map(&gi).inverse()) {
+                Some(back) => {
+                    let (a, b) = (back.apply(from.0, from.1), back.apply(to.0, to.1));
+                    (a.0 - b.0, a.1 - b.1)
+                }
+                None => (from.0 - to.0, from.1 - to.1),
+            };
+            let mut now = self.transform(scene, id)?;
+            (now.x, now.y) = (now.x + dx, now.y + dy);
+            self.set_transform(scene, id, &now)?;
+        }
+        Ok(())
+    }
+
     pub fn edit_item(&self, scene: &str, id: i64, edit: ItemEdit) -> Result<(), StudioError> {
         use ItemEdit as E;
         let (cw, ch) = (self.canvas.width as f32, self.canvas.height as f32);
@@ -2054,24 +2096,20 @@ impl Stage {
                 (t.crop_left, t.crop_top, t.crop_right, t.crop_bottom) = (0, 0, 0, 0);
                 self.set_transform(scene, id, &t).map(drop)
             }
-            E::FlipH | E::FlipV => {
-                let mut t = self.transform(scene, id)?;
+            E::FlipH | E::FlipV => self.change_in_place(scene, id, |t| {
                 if edit == E::FlipH {
                     t.scale_x = -t.scale_x;
                 } else {
                     t.scale_y = -t.scale_y;
                 }
-                self.set_transform(scene, id, &t).map(drop)
-            }
+            }),
             E::RotateCw | E::RotateCcw | E::Rotate180 => {
                 let by = match edit {
                     E::RotateCw => 90.0,
                     E::RotateCcw => -90.0,
                     _ => 180.0,
                 };
-                let mut t = self.transform(scene, id)?;
-                t.rotation = (t.rotation + by).rem_euclid(360.0);
-                self.set_transform(scene, id, &t).map(drop)
+                self.change_in_place(scene, id, |t| t.rotation = (t.rotation + by).rem_euclid(360.0))
             }
             E::Duplicate => {
                 let it = self.item(scene, id)?;
@@ -8624,6 +8662,46 @@ mod tests {
         // The rest as OBS adds them.
         let it = new_item(&json!({ "id": "color_source_v3", "name": "C" }), 1);
         assert_eq!(it["scale_filter"], "disable");
+    }
+
+    /// Owner, 24 Nov: Flip sideways, Flip upside down and Turn left or right swung the picture
+    /// away (out of the canvas): they turned it about its top-left corner. Each now turns it in
+    /// place, about its own middle, whatever its size, scale, crop or group.
+    #[test]
+    fn flips_and_turns_keep_the_item_where_it_is() {
+        let s = stage();
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 0.05 && (a.1 - b.1).abs() < 0.05;
+        let centre = |s: &Stage, scene: &str, id: i64| ok(s.item_centre(scene, id));
+        let edits = [ItemEdit::FlipH, ItemEdit::FlipV, ItemEdit::RotateCw, ItemEdit::RotateCcw, ItemEdit::Rotate180];
+        // A wide picture away from the corner, scaled, and one that is also cropped.
+        for (name, crop) in [("Plain", 0), ("Cropped", 20)] {
+            let it = ok(s.add_source("Main", "color_source_v3", name, &json!({ "width": 200, "height": 100 }), false));
+            let mut t = ok(s.transform("Main", it.id));
+            (t.x, t.y, t.scale_x, t.scale_y) = (300.0, 120.0, 1.5, 0.75);
+            (t.crop_left, t.crop_top) = (crop, crop / 2);
+            ok(s.set_transform("Main", it.id, &t));
+            let before = centre(&s, "Main", it.id);
+            for edit in edits {
+                // Twice: the second one turns it back or on again, from a changed state.
+                for _ in 0..2 {
+                    ok(s.edit_item("Main", it.id, edit));
+                    assert!(near(centre(&s, "Main", it.id), before), "{name}: {edit:?} moved it off its place");
+                }
+            }
+        }
+        // Inside a group the same, through the group's own map.
+        let a = ok(s.add_source("Main", "color_source_v3", "GA", &json!({ "width": 80, "height": 40 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "GB", &json!({ "width": 60, "height": 60 }), false));
+        ok(s.set_item_boxes("Main", &[(a.id, 10.0, 10.0, 80.0, 40.0), (b.id, 200.0, 150.0, 60.0, 60.0)]));
+        ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        let before = centre(&s, "Main", a.id);
+        for edit in edits {
+            ok(s.edit_item("Main", a.id, edit));
+            assert!(near(centre(&s, "Main", a.id), before), "in a group: {edit:?} moved it off its place");
+        }
+        // A flip still flips and a turn still turns.
+        let t = ok(s.transform("Main", ok(s.items("Main"))[0].id));
+        assert!(t.scale_x.abs() > 0.0);
     }
 
     #[test]
