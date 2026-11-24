@@ -30027,6 +30027,94 @@
         "x-pc-only": true
       }
     },
+    "/api/v1/studio/engine/scenes/{scene}/items/{id}/screenshot": {
+      "post": {
+        "operationId": "post_studio_engine_scenes__scene__items__id__screenshot",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scene",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": [
+                    "object",
+                    "array"
+                  ]
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Save a PNG screenshot of a scene item with its filters and transform.",
+        "tags": [
+          "Studio Engine"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
     "/api/v1/studio/engine/scenes/{scene}/items/{id}/transform": {
       "get": {
         "operationId": "get_studio_engine_scenes__scene__items__id__transform",

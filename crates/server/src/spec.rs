@@ -891,6 +891,14 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         None,
     ),
     doc(
+        "POST",
+        "/studio/engine/scenes/{scene}/items/{id}/screenshot",
+        "Studio Engine",
+        "Save a PNG screenshot of a scene item with its filters and transform.",
+        None,
+        None,
+    ),
+    doc(
         "PUT",
         "/studio/engine/sources/{name}/deinterlace",
         "Studio Engine",

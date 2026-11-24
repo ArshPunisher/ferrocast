@@ -2900,7 +2900,12 @@ impl StudioHost for DesktopStudio {
                     let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
                     let (px, size) = match &shot {
-                        StudioAct::Screenshot { name } => c.screenshot_pixels(name),
+                        StudioAct::Screenshot { name, item: Some(target) } => c.screenshot_item_pixels_for(
+                            (!name.is_empty()).then_some(name.as_str()),
+                            &target.scene,
+                            target.id,
+                        ),
+                        StudioAct::Screenshot { name, item: None } => c.screenshot_pixels(name),
                         _ => c.screenshot_program_pixels(),
                     }
                     .map_err(|e| e.to_string())?;

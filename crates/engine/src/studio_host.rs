@@ -1760,9 +1760,12 @@ pub enum StudioAct {
         id: i64,
         own: bool,
     },
-    /// A PNG of a scene or source, saved where recordings go → `{ file }`.
+    /// A PNG of a scene, source, or scene item (with its filters and transform), saved where
+    /// recordings go → `{ file }`.
     Screenshot {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item: Option<ItemTarget>,
     },
     /// A PNG of exactly what's on air (black when faded, mid-transition as it is) → `{ file }`.
     ScreenshotProgram,
@@ -2233,7 +2236,8 @@ impl StudioAct {
                 object(settings)
             }
             A::SetItemFilterScope { scene, .. } => check_source_name(scene),
-            A::Web { name, .. } | A::Screenshot { name } => check_source_name(name),
+            A::Web { name, .. } => check_source_name(name),
+            A::Screenshot { name, item } => check_filter_target(name, item.as_ref()),
             A::PasteFilters { name, from, item, from_item } => {
                 check_filter_target(name, item.as_ref())?;
                 check_filter_target(from, from_item.as_ref())?;
@@ -5035,6 +5039,20 @@ mod tests {
         assert!(good[2].changes());
         assert!(good[3].changes());
         assert!(good[5].changes());
+
+        for mut shot in [
+            StudioAct::Screenshot { name: "Cam".into(), item: Some(tgt.clone()) },
+            StudioAct::Screenshot { name: String::new(), item: Some(tgt.clone()) },
+            StudioAct::Screenshot { name: "Main".into(), item: None },
+        ] {
+            assert!(shot.check().is_ok(), "{shot:?}");
+            assert!(!shot.changes());
+        }
+        let mut bad_shot = StudioAct::Screenshot { name: String::new(), item: None };
+        assert!(matches!(bad_shot.check(), Err(EngineError::Invalid(_))));
+        let mut bad_shot_name =
+            StudioAct::Screenshot { name: "bad\nname".into(), item: Some(ItemTarget { scene: "Main".into(), id: 1 }) };
+        assert!(matches!(bad_shot_name.check(), Err(EngineError::Invalid(_))));
 
         let mut bad_scope = StudioAct::SetItemFilterScope { scene: "bad\nscene".into(), id: 2, own: true };
         assert!(matches!(bad_scope.check(), Err(EngineError::Invalid(_))));

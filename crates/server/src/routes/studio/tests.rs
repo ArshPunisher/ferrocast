@@ -1718,3 +1718,52 @@ async fn l1_ws_live_snapshot_emits_auto_config_when_non_idle() {
     assert_eq!(ac["data"]["state"], "applied");
     assert_eq!(ac["data"]["applied"]["video_kbps"], 6500);
 }
+
+#[tokio::test]
+async fn screenshot_route_accepts_optional_item_and_rejects_unpaired() {
+    use ferrocast_engine::studio_host::{ItemTarget, StudioAct};
+
+    let r = start().await;
+    let host = Arc::new(ItemFilterHost::default());
+    r.engine.set_studio_host(host.clone());
+
+    // Existing callers passing empty `{}` keep working with `item: None`.
+    assert_eq!(r.post("/studio/engine/sources/Gameplay/screenshot", json!({})).await.status(), StatusCode::OK);
+    // POST with JSON `{ scene, item }` and query string `?scene=...&item=...` both work compatibly.
+    assert_eq!(
+        r.post("/studio/engine/sources/Cam/screenshot", json!({ "scene": "Main", "item": 5 })).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.post("/studio/engine/sources/Cam/screenshot?scene=Vertical&item=3", json!({})).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(r.post("/studio/engine/scenes/Vertical/items/3/screenshot", json!({})).await.status(), StatusCode::OK);
+
+    // Unpaired or conflicting scene/item must be rejected with 400 BAD_REQUEST.
+    assert_eq!(
+        r.post("/studio/engine/sources/Cam/screenshot?scene=Vertical", json!({})).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.post("/studio/engine/sources/Cam/screenshot", json!({ "item": 3 })).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        r.post("/studio/engine/sources/Cam/screenshot?scene=Main&item=3", json!({ "scene": "Other", "item": 3 }),)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let acts = host.acts.lock().unwrap().clone();
+    assert_eq!(
+        acts,
+        vec![
+            StudioAct::Screenshot { name: "Gameplay".into(), item: None },
+            StudioAct::Screenshot { name: "Cam".into(), item: Some(ItemTarget { scene: "Main".into(), id: 5 }) },
+            StudioAct::Screenshot { name: "Cam".into(), item: Some(ItemTarget { scene: "Vertical".into(), id: 3 }) },
+            StudioAct::Screenshot { name: String::new(), item: Some(ItemTarget { scene: "Vertical".into(), id: 3 }) },
+        ]
+    );
+}

@@ -3600,6 +3600,147 @@ impl Engine {
         })
     }
 
+    /// Whether a scene item's picture is already uploaded (or doesn't need an upload, such as a
+    /// scene/group); `None` when `(scene, item_id)` isn't in `scene` or any group inside it.
+    pub fn item_picture_ready(&self, scene: &str, item_id: i64) -> Option<bool> {
+        let st = self.lock();
+        let (it, _) = find_scene_item(&st, scene, item_id)?;
+        Some(if it.scene.is_some() { true } else { st.sources.get(&it.source).is_some_and(|s| s.size.is_some()) })
+    }
+
+    /// One scene item rendered on its own exactly as the scene render draws it: its active
+    /// video filters (`ferrocast_filters` override or source filters), crop, scale, rotation,
+    /// flips, scale filter, blend and opacity (including any enclosing group chain's transform and
+    /// filter expansion).
+    ///
+    /// Sized to the item's 1:1 transformed bounding box clipped to `canvas` when it overlaps the
+    /// canvas, or the full transformed box capped to `4096` px when completely off-canvas.
+    pub fn snapshot_item_transformed(
+        &self,
+        scene: &str,
+        item_id: i64,
+        canvas: (u32, u32),
+    ) -> Result<(Vec<u8>, (u32, u32)), AvError> {
+        const MAX_OFFSCREEN_SHOT: u32 = 4096;
+        let canvas = (canvas.0.max(1), canvas.1.max(1));
+        let (built, scale_to) = {
+            let mut st = self.lock();
+            send_pending(&mut st, &self.gpu);
+            let ts = now_ns();
+            let ms = scene_ms(&st, scene, ts);
+            let (it, ancestors) = find_scene_item(&st, scene, item_id)
+                .ok_or_else(|| AvError::Source(format!("item {item_id} isn't in scene \"{scene}\"")))?;
+            let (it_effects, it_base) = active_item_effects_and_base(&st, it, ms, canvas)?;
+            let (mut it_placement, it_opacity) = animated(it, ms);
+            let (m_local, (cw, ch)) = item_draw_affine_and_crop(&it_placement, &it_effects, it_base)?;
+
+            let mut pts = [
+                m_local.apply(0.0, 0.0),
+                m_local.apply(cw as f32, 0.0),
+                m_local.apply(cw as f32, ch as f32),
+                m_local.apply(0.0, ch as f32),
+            ];
+            let mut group_chain = Vec::with_capacity(ancestors.len());
+            for g in ancestors {
+                let (g_effects, g_base) = active_item_effects_and_base(&st, g, ms, canvas)?;
+                let (gp, g_opacity) = animated(g, ms);
+                let (m_group, (gcw, gch)) = item_draw_affine_and_crop(&gp, &g_effects, g_base)?;
+                let (gow, goh) = g_effects.iter().fold(g_base, |(w, h), e| e.out_size(w, h));
+                let [gl, gt, gr, gb] = Effect::outside_sides(&g_effects, g_base.0, g_base.1);
+                let has_crop = gp.crop.iter().any(|c| *c > 0);
+                let has_outside = gl + gt + gr + gb > 0;
+                if has_outside || has_crop {
+                    let (mut tx0, mut ty0, mut tx1, mut ty1) = pts_aabb(&pts);
+                    if has_outside {
+                        // In post-effect texture coords [0..gow, 0..goh], input (0..gw) sits at
+                        // (+gl, +gt) and outside effects spread [-gl, -gt, +gr, +gb], yielding
+                        // [lx0 .. lx1 + gl + gr] clamped to the rendered group target.
+                        tx0 = tx0.max(0.0);
+                        ty0 = ty0.max(0.0);
+                        tx1 = (tx1 + (gl + gr) as f32).min(gow as f32);
+                        ty1 = (ty1 + (gt + gb) as f32).min(goh as f32);
+                    }
+                    if has_crop {
+                        tx0 = (tx0 - gp.crop[0] as f32).max(0.0);
+                        ty0 = (ty0 - gp.crop[1] as f32).max(0.0);
+                        tx1 = (tx1 - gp.crop[0] as f32).min(gcw as f32);
+                        ty1 = (ty1 - gp.crop[1] as f32).min(gch as f32);
+                    }
+                    if tx1 <= tx0 || ty1 <= ty0 {
+                        return Err(AvError::Source("the item is cropped out by its group".into()));
+                    }
+                    pts = [
+                        m_group.apply(tx0, ty0),
+                        m_group.apply(tx1, ty0),
+                        m_group.apply(tx1, ty1),
+                        m_group.apply(tx0, ty1),
+                    ];
+                } else {
+                    pts = pts.map(|(x, y)| m_group.apply(x, y));
+                }
+                group_chain.push((g.clone(), g_effects, g_base, gp, g_opacity));
+            }
+
+            let (bx0, by0, bx1, by1) = snap_pts_bbox(&pts);
+            if bx1 <= bx0 || by1 <= by0 {
+                return Err(AvError::Source("the item has zero size".into()));
+            }
+            let (cx0, cy0, cx1, cy1) =
+                (bx0.max(0), by0.max(0), bx1.min(i64::from(canvas.0)), by1.min(i64::from(canvas.1)));
+            let ((off_x, off_y), (render_w, render_h), scale_to) = if cx1 > cx0 && cy1 > cy0 {
+                ((cx0 as f32, cy0 as f32), ((cx1 - cx0) as u32, (cy1 - cy0) as u32), None)
+            } else {
+                let raw_w = u32::try_from(bx1 - bx0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
+                let raw_h = u32::try_from(by1 - by0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
+                let scale_to = if raw_w > MAX_OFFSCREEN_SHOT || raw_h > MAX_OFFSCREEN_SHOT {
+                    Some(fit_within(raw_w, raw_h, MAX_OFFSCREEN_SHOT))
+                } else {
+                    None
+                };
+                ((bx0 as f32, by0 as f32), (raw_w, raw_h), scale_to)
+            };
+
+            let mut solo = it.clone();
+            if group_chain.is_empty() {
+                it_placement.x -= off_x;
+                it_placement.y -= off_y;
+            }
+            solo.placement = it_placement;
+            solo.opacity = it_opacity;
+            solo.animation.clear();
+            solo.visible = true;
+            solo.show = Show::Both;
+            let depth = u32::try_from(group_chain.len()).unwrap_or(MAX_NESTING);
+            let mut comp_item = item_at(&st, &solo, ms, depth, canvas, Audience::Everyone)
+                .ok_or_else(|| AvError::Source("the item couldn't be rendered".into()))?;
+            let last = group_chain.len().saturating_sub(1);
+            for (idx, (g, g_effects, g_base, mut gp, g_opacity)) in group_chain.into_iter().enumerate() {
+                if idx == last {
+                    gp.x -= off_x;
+                    gp.y -= off_y;
+                }
+                comp_item = Item {
+                    content: Content::Group { width: g_base.0, height: g_base.1, items: vec![comp_item] },
+                    effects: g_effects,
+                    placement: gp,
+                    filter: g.filter,
+                    blend: g.blend,
+                    srgb_off: false,
+                    linear: true,
+                    opacity: g_opacity,
+                };
+            }
+            (Scene { width: render_w, height: render_h, items: vec![comp_item] }, scale_to)
+        };
+        let scene = match scale_to {
+            Some((tw, th)) => scaled(built, tw, th, Filter::Bicubic),
+            None => built,
+        };
+        let out_size = (scene.width, scene.height);
+        let px = self.gpu.render(&scene)?;
+        Ok((px, out_size))
+    }
+
     fn snapshot_with_effects(
         &self,
         id: u64,
@@ -3654,6 +3795,127 @@ fn shared_source_effects<'a>(items: impl Iterator<Item = &'a SceneItem>, id: u64
         .map(|i| i.effects.clone())
         .next()
         .unwrap_or_default()
+}
+
+fn find_scene_item<'a>(st: &'a State, scene: &str, item_id: i64) -> Option<(&'a SceneItem, Vec<&'a SceneItem>)> {
+    fn walk<'a>(
+        st: &'a State,
+        scene: &str,
+        item_id: i64,
+        depth: u32,
+        chain_outer_first: &mut Vec<&'a SceneItem>,
+    ) -> Option<&'a SceneItem> {
+        let items = st.scenes.get(scene)?;
+        if let Some(direct) = items.iter().find(|it| it.item_id == item_id) {
+            return Some(direct);
+        }
+        if depth >= MAX_NESTING {
+            return None;
+        }
+        for g in items.iter().filter(|g| g.group.is_some()) {
+            let Some(gname) = g.scene.as_deref() else { continue };
+            chain_outer_first.push(g);
+            if let Some(found) = walk(st, gname, item_id, depth + 1, chain_outer_first) {
+                return Some(found);
+            }
+            chain_outer_first.pop();
+        }
+        None
+    }
+    let mut ancestors = Vec::new();
+    let leaf = walk(st, scene, item_id, 0, &mut ancestors)?;
+    ancestors.reverse();
+    Some((leaf, ancestors))
+}
+
+fn active_item_effects_and_base(
+    st: &State,
+    it: &SceneItem,
+    ms: u64,
+    canvas: (u32, u32),
+) -> Result<(Vec<Effect>, (u32, u32)), AvError> {
+    let base = match (&it.scene, it.group) {
+        (Some(_), Some((0, _)) | Some((_, 0))) => return Err(AvError::Source("the group is empty".into())),
+        (Some(_), Some(size)) => size,
+        (Some(_), None) => canvas,
+        (None, _) => {
+            let (w, h, _) = st
+                .sources
+                .get(&it.source)
+                .and_then(|s| s.size)
+                .ok_or_else(|| AvError::Source("the source has no picture yet".into()))?;
+            (w, h)
+        }
+    };
+    let effects = it
+        .effects
+        .iter()
+        .filter(|e| match e {
+            Effect::Mask { image, .. } | Effect::Cutout { mask: image, .. } => {
+                st.sources.get(image).is_some_and(|s| s.size.is_some())
+            }
+            _ => true,
+        })
+        .map(|e| {
+            let mut e = e.clone();
+            if let Effect::Scroll { elapsed_ms, .. } | Effect::Custom { elapsed_ms, .. } = &mut e {
+                *elapsed_ms = ms;
+            }
+            e
+        })
+        .collect();
+    Ok((effects, base))
+}
+
+fn item_draw_affine_and_crop(
+    placement: &Placement,
+    effects: &[Effect],
+    base: (u32, u32),
+) -> Result<(crate::transform::Affine, (u32, u32)), AvError> {
+    let (ow, oh) = effects.iter().fold(base, |(w, h), e| e.out_size(w, h));
+    let (cw, ch) = crate::transform::cropped(ow, oh, placement.crop);
+    if cw == 0 || ch == 0 {
+        return Err(AvError::Source("the item is cropped to nothing".into()));
+    }
+    let [l, t, r, b] = Effect::outside_sides(effects, base.0, base.1);
+    let m = if l + r + t + b > 0 && ow > l + r && oh > t + b {
+        crate::transform::Affine::translate(-(l as f32), -(t as f32)).then(&crate::transform::draw_transform(
+            placement,
+            ow - l - r,
+            oh - t - b,
+        ))
+    } else {
+        crate::transform::draw_transform(placement, ow, oh)
+    };
+    Ok((m, (cw, ch)))
+}
+
+fn pts_aabb(pts: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for &(x, y) in pts {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    (x0, y0, x1, y1)
+}
+
+fn snap_pts_bbox(pts: &[(f32, f32); 4]) -> (i64, i64, i64, i64) {
+    let (x0, y0, x1, y1) = pts_aabb(pts);
+    // Snap negligible float rotation error (e.g. cos(90°) ~= -4.37e-8) away from outward padding.
+    const EPS: f32 = 1e-4;
+    ((x0 + EPS).floor() as i64, (y0 + EPS).floor() as i64, (x1 - EPS).ceil() as i64, (y1 - EPS).ceil() as i64)
+}
+
+fn fit_within(w: u32, h: u32, max_side: u32) -> (u32, u32) {
+    if w >= h {
+        let th = ((u64::from(h) * u64::from(max_side)) / u64::from(w.max(1))).max(1) as u32;
+        (max_side, th)
+    } else {
+        let tw = ((u64::from(w) * u64::from(max_side)) / u64::from(h.max(1))).max(1) as u32;
+        (tw, max_side)
+    }
 }
 
 fn find_item_effects(st: &State, scene: &str, item_id: i64, source_id: u64, depth: u8) -> Option<Vec<Effect>> {
@@ -10241,5 +10503,54 @@ mod tests {
         watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 60_000_000_000);
         wait_idle();
         assert_eq!(backend.open_attempts.load(Ordering::Acquire), final_attempts);
+    }
+
+    #[test]
+    fn snapshot_item_transformed_handles_offscreen_and_missing_items() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 40, height: 20, rgba: [10, 200, 30, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let mut off =
+            SceneItem::new(1, Placement { x: -300.0, y: -200.0, scale_x: -1.0, rotation: 90.0, ..Default::default() });
+        off.item_id = 7;
+        e.set_scene("Main", vec![off]);
+
+        let (px, size) = e.snapshot_item_transformed("Main", 7, (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(size, (20, 40), "completely off-canvas item preserves its 1:1 rotated box");
+        assert!(px.as_chunks::<4>().0.iter().any(|p| p[1] > 150 && p[3] > 200));
+
+        assert!(e.snapshot_item_transformed("Main", 999, (640, 360)).is_err());
+
+        // Nested groups (Main > Outer > Inner > Child) + parent outside shadow expansion.
+        let mut child = SceneItem::new(1, Placement { x: 10.0, y: 10.0, ..Default::default() });
+        child.item_id = 11;
+        e.set_scene("Inner", vec![child]);
+
+        let mut inner =
+            SceneItem::new(0, Placement { x: 20.0, y: 20.0, scale_x: 0.5, scale_y: 0.5, ..Default::default() });
+        inner.scene = Some("Inner".into());
+        inner.group = Some((60, 40));
+        inner.item_id = 12;
+        inner.effects = vec![Effect::Shadow { rgba: [0.0, 0.0, 0.0, 1.0], blur: 8.0, x: 0.0, y: 0.0, outside: true }];
+        e.set_scene("Outer", vec![inner]);
+
+        let mut outer = SceneItem::new(0, Placement { x: 50.0, y: 50.0, ..Default::default() });
+        outer.scene = Some("Outer".into());
+        outer.group = Some((120, 100));
+        outer.item_id = 13;
+        e.set_scene("Main", vec![outer]);
+
+        let (nested_px, nested_size) =
+            e.snapshot_item_transformed("Main", 11, (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        // Child (40x20) at (10,10) inside Inner (60x40) with 8px outside shadow -> [2..58, 2..38] -> 56x36;
+        // Inner scaled 0.5 at (20,20) inside Outer at (50,50) -> canvas x in [71..99], y in [71..89] (28x18).
+        assert_eq!(nested_size, (28, 18), "nested group keeps child transform and parent shadow margin");
+        let full_scene = e.snapshot_scene_at("Main", (640, 360), (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        let mut expected_nested = Vec::with_capacity((28 * 18 * 4) as usize);
+        for y in 71..89usize {
+            let start = (y * 640 + 71) * 4;
+            expected_nested.extend_from_slice(&full_scene[start..start + 28 * 4]);
+        }
+        assert_eq!(nested_px, expected_nested, "nested group screenshot matches scene render pixel-for-pixel");
     }
 }

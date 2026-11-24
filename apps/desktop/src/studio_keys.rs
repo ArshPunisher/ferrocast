@@ -395,7 +395,7 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
         "vertical:screenshot" => {
             let scenes = engine.studio_act(StudioAct::Scenes).await?;
             if let Some(name) = scenes["vertical"]["current"].as_str().filter(|s| !s.is_empty()) {
-                engine.studio_act(StudioAct::Screenshot { name: name.to_string() }).await?;
+                engine.studio_act(StudioAct::Screenshot { name: name.to_string(), item: None }).await?;
             }
         }
         "performance_mode" => {
@@ -451,7 +451,7 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                     })
                     .await?;
             } else if let Some(name) = a.strip_prefix("screenshot:") {
-                engine.studio_act(StudioAct::Screenshot { name: name.to_string() }).await?;
+                engine.studio_act(StudioAct::Screenshot { name: name.to_string(), item: None }).await?;
             } else if let Some((what, name)) = a.strip_prefix("media_").and_then(|r| r.split_once(':')) {
                 let what = match what {
                     "play_pause" => MediaAct::PlayPause,
@@ -957,7 +957,10 @@ mod tests {
         *host.vertical_current.lock().unwrap_or_else(|p| p.into_inner()) = Some("Tall".into());
 
         run(&engine, "vertical:screenshot", true).await.unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(host.take_acts(), vec![StudioAct::Scenes, StudioAct::Screenshot { name: "Tall".into() }]);
+        assert_eq!(
+            host.take_acts(),
+            vec![StudioAct::Scenes, StudioAct::Screenshot { name: "Tall".into(), item: None }]
+        );
         engine.shutdown();
     }
 

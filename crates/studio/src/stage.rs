@@ -4434,6 +4434,42 @@ impl Stage {
         write_png(path, &px, size)
     }
 
+    /// A scene item on its own as the owner sees it on the canvas (filters, crop, scale,
+    /// rotation and flips at 1:1 canvas pixels inside the canvas).
+    pub fn screenshot_item_pixels(&self, scene: &str, id: i64) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
+        self.screenshot_item_pixels_for(None, scene, id)
+    }
+
+    /// Like [`Self::screenshot_item_pixels`], checking `expected_source` matches the item when
+    /// given.
+    pub fn screenshot_item_pixels_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+    ) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
+        let it = self.item(scene, id)?;
+        let src = name_of(&it);
+        if let Some(want) = expected_source
+            && want != src
+        {
+            return Err(fail(format!("There's no source called \"{want}\" for item {id} in \"{scene}\".")));
+        }
+        let canvas = if self.vertical_order().iter().any(|n| n == scene) {
+            crate::collection::VERTICAL_SIZE
+        } else {
+            (self.canvas.width, self.canvas.height)
+        };
+        let e = self.engine()?;
+        let started = std::time::Instant::now();
+        while e.engine.item_picture_ready(scene, id) == Some(false)
+            && started.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        e.engine.snapshot_item_transformed(scene, id, canvas).map_err(|x| fail(x.to_string()))
+    }
+
     /// A scene (or vertical scene) at its picture's full size, as RGBA pixels: saving them as a
     /// PNG ([`write_png`]) can happen off this thread.
     pub fn screenshot_pixels(&self, name: &str) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
@@ -10305,5 +10341,149 @@ mod tests {
             !problems.iter().any(|p| p.source == "iPhone Cam" && p.problem == "no_picture"),
             "must not classify waiting camera as dead no_picture: {problems:?}"
         );
+    }
+
+    #[test]
+    fn a_source_item_screenshot_keeps_crop_flip_rotation_and_filters() {
+        let s = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ferrocast-item-shot-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // Asymmetric 4-quadrant 120x80 card: crop, flip, 90° CW rotation and colour filter are each visible.
+        let (w, h) = (120u32, 80u32);
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let c = match (x < 60, y < 40) {
+                    (true, true) => [255, 0, 0, 255],
+                    (false, true) => [0, 255, 0, 255],
+                    (true, false) => [0, 0, 255, 255],
+                    (false, false) => [255, 255, 0, 255],
+                };
+                px.extend_from_slice(&c);
+            }
+        }
+        let file = dir.join("card.png");
+        ok(write_png(&file, &px, (w, h)));
+
+        // Another source on the canvas must not appear in the isolated item screenshot.
+        let bg = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Bg",
+            &json!({ "width": 640, "height": 360, "color": 0xFFFF_FFFFu32 }),
+            false,
+        ));
+        let card = ok(s.add_source("Main", "image_source", "Card", &json!({ "file": file.to_string_lossy() }), false));
+        for _ in 0..40 {
+            if s.screenshot_pixels("Card").is_ok_and(|r| r.1 == (w, h)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Crop [20, 0, 0, 20] -> 100x60; scale (-2.0, 1.0) -> horizontal flip + 200x60;
+        // 90° CW round top-left at (200, 250) -> x in [140..200] (60 wide), y in [50..250] (200 tall).
+        let mut t = ok(s.transform("Main", card.id));
+        t.crop_left = 20;
+        t.crop_bottom = 20;
+        t.scale_x = -2.0;
+        t.scale_y = 1.0;
+        t.rotation = 90.0;
+        t.alignment = 5;
+        t.x = 200.0;
+        t.y = 250.0;
+        ok(s.set_transform("Main", card.id, &t));
+
+        // Colour filter zeroing red channel (ABGR multiply = 0xFFFF_FF00).
+        ok(s.add_filter("Card", "color_filter_v2", "NoRed", &json!({ "color_multiply": 0xFFFF_FF00u32 })));
+
+        let (shot, size) = ok(s.screenshot_item_pixels("Main", card.id));
+        assert_eq!(size, (60, 200), "item screenshot uses 1:1 transformed bounding box");
+
+        // Compare pixel-for-pixel with the scene render (with Bg hidden so no backdrop mixes).
+        ok(s.edit_item("Main", bg.id, ItemEdit::Hide));
+        let (scene_px, scene_size) = ok(s.screenshot_pixels("Main"));
+        assert_eq!(scene_size, (640, 360));
+        let mut expected = Vec::with_capacity((60 * 200 * 4) as usize);
+        for y in 50..250usize {
+            let start = (y * 640 + 140) * 4;
+            expected.extend_from_slice(&scene_px[start..start + 60 * 4]);
+        }
+        assert_eq!(shot, expected, "source item screenshot must match scene render pixel-for-pixel");
+
+        // Red channel must be 0 throughout because of color_multiply = 0xFFFF_FF00.
+        assert!(shot.as_chunks::<4>().0.iter().all(|p| p[0] <= 2), "red channel zeroed by colour filter");
+
+        // Calling screenshot_pixels with source name alone keeps existing raw uncropped/unfiltered behavior.
+        let (raw, raw_size) = ok(s.screenshot_pixels("Card"));
+        assert_eq!(raw_size, (120, 80));
+        assert_eq!(&raw[0..4], &[255, 0, 0, 255], "raw source screenshot preserves unfiltered top-left red");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_source_item_screenshot_honors_item_override_group_and_canvas_bounds() {
+        let s = Stage::new(Canvas { width: 640, height: 360, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        if s.engine().is_err() {
+            return;
+        }
+        // Source colour: pure white (0xFFFF_FFFF).
+        let a = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Swatch",
+            &json!({ "width": 80, "height": 60, "color": 0xFFFF_FFFFu32 }),
+            false,
+        ));
+        let b = ok(s.add_existing("Main", "Swatch"));
+        // Item `a` keeps source filter (zero blue), item `b` overrides with its own filter (zero green).
+        ok(s.add_filter("Swatch", "color_filter_v2", "NoBlue", &json!({ "color_multiply": 0xFF00_FFFFu32 })));
+        ok(s.set_item_filter_scope("Main", b.id, true));
+        ok(s.update_item_filter("Main", b.id, "NoBlue", &json!({ "color_multiply": 0xFFFF_00FFu32 })));
+
+        let (pa, sa) = ok(s.screenshot_item_pixels("Main", a.id));
+        let (pb, sb) = ok(s.screenshot_item_pixels("Main", b.id));
+        assert_eq!(sa, (80, 60));
+        assert_eq!(sb, (80, 60));
+        assert!(pa[0] > 200 && pa[1] > 200 && pa[2] <= 2, "item A uses source filter (yellow): {:?}", &pa[0..4]);
+        assert!(
+            pb[0] > 200 && pb[1] <= 2 && pb[2] > 200,
+            "item B uses ferrocast_filters override (magenta): {:?}",
+            &pb[0..4]
+        );
+
+        // Grouped item inside a half-scale rotated group renders at its canvas transformed box.
+        let mut tb = ok(s.transform("Main", b.id));
+        tb.x = 100.0;
+        tb.y = 40.0;
+        ok(s.set_transform("Main", b.id, &tb));
+        let g = ok(s.group_together("Main", &[b.id], "G"));
+        let mut tg = ok(s.transform("Main", g.id));
+        tg.scale_x = 0.5;
+        tg.scale_y = 0.5;
+        ok(s.set_transform("Main", g.id, &tg));
+        let b_in_g = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap().children[0].id;
+        let (pg, sg) = ok(s.screenshot_item_pixels("Main", b_in_g));
+        assert_eq!(sg, (40, 30), "grouped child screenshot reflects parent group 0.5x scale on canvas");
+        assert!(pg[0] > 200 && pg[1] <= 2 && pg[2] > 200, "grouped child keeps ferrocast_filters override");
+
+        // Item zoomed larger than canvas clips cleanly to visible canvas portion (640x360).
+        let big = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Big",
+            &json!({ "width": 800, "height": 600, "color": 0xFF00_FF00u32 }),
+            false,
+        ));
+        let mut tbig = ok(s.transform("Main", big.id));
+        tbig.x = -50.0;
+        tbig.y = -40.0;
+        ok(s.set_transform("Main", big.id, &tbig));
+        let (_, sbig) = ok(s.screenshot_item_pixels("Main", big.id));
+        assert_eq!(sbig, (640, 360), "overflowing item clips to visible canvas bounds");
     }
 }
