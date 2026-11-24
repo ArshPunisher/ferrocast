@@ -1075,12 +1075,29 @@ async fn notify_when_hidden(app: AppHandle, engine: Engine) {
 }
 
 async fn start(dir: &std::path::Path, safe_mode: bool) -> Result<Running, String> {
+    start_with(dir, safe_mode, |engine, opts| async move { ferrocast_server::serve(engine, opts).await }).await
+}
+
+/// [`start`] with the server's opening handed in (so a failure of it can be tested). When the
+/// server can't open, the launch is over: the engine is closed and the "running" notes it wrote
+/// are cleared, as a clean quit does. Left behind, the next launch took this for a crash and
+/// offered Safe Mode (a computer short of network buffers, os error 55, made that happen).
+async fn start_with<F, Fut>(dir: &std::path::Path, safe_mode: bool, serve: F) -> Result<Running, String>
+where
+    F: FnOnce(Engine, ferrocast_server::ServeOptions) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<ferrocast_server::Server>>,
+{
     let engine = Engine::start_with_mode(dir, safe_mode).await.map_err(|e| e.to_string())?;
     // LAN access is read once here: changing it takes effect the next time Ferrocast starts.
     let opts = ferrocast_server::ServeOptions { lan: engine.settings().lan_access, ..Default::default() };
-    let server = ferrocast_server::serve(engine.clone(), opts)
-        .await
-        .map_err(|e| format!("The local server couldn't start: {e}"))?;
+    let server = match serve(engine.clone(), opts).await {
+        Ok(server) => server,
+        Err(e) => {
+            engine.shutdown();
+            clear_run_markers(Some(&engine));
+            return Err(format!("The local server couldn't start: {e}"));
+        }
+    };
     let token = server.sessions.desktop_token().to_string();
     // Dev builds only: tests drive this window's engine from outside (never in a release).
     #[cfg(debug_assertions)]
@@ -1759,6 +1776,23 @@ mod update_tests {
         let cut = release_notes(Some(&long)).unwrap();
         assert_eq!(cut.chars().count(), NOTES_MAX + 1);
         assert!(cut.ends_with('…'));
+    }
+
+    /// A launch whose server can't open (os error 55 on a Mac short of network buffers) is not a
+    /// crash: its "running" notes are cleared, so the next launch is a normal one and not Safe Mode.
+    #[tokio::test]
+    async fn a_launch_whose_server_cannot_open_leaves_no_crash_marker() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let failed =
+            start_with(dir.path(), false, |_, _| async { Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory)) })
+                .await;
+        let said = failed.err().unwrap_or_else(|| panic!("the launch should have failed"));
+        assert!(said.starts_with("The local server couldn't start"), "{said}");
+        assert!(!dir.path().join("running.json").exists(), "no note of a running launch is left");
+        assert!(
+            !ferrocast_engine::safe_mode::has_unclean_exit(dir.path()),
+            "the next launch must not take this for a crash"
+        );
     }
 
     /// The Windows updater ends the process after its `on_before_exit` hook, which calls this: with
