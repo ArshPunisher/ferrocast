@@ -46,6 +46,7 @@ pub use linux::screen;
 pub mod afx;
 pub mod audio;
 pub mod audio_thread;
+pub mod camera_retry;
 mod compose;
 pub mod delay;
 pub mod diagnostics_probe;

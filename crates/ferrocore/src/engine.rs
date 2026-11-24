@@ -557,6 +557,19 @@ pub struct SourceLoad {
     pub sent: u64,
     pub width: u32,
     pub height: u32,
+    /// Waiting for an interrupted, stopped, or disconnected camera to return.
+    pub waiting: bool,
+}
+
+/// Live connectivity state for a camera source (`Engine::camera_status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraStatus {
+    /// `"live"` when receiving or connecting cleanly; `"waiting"` when reconnecting.
+    pub state: &'static str,
+    /// Human-facing message (`"Waiting for the camera"`) while waiting.
+    pub message: Option<&'static str>,
+    /// Consecutive reconnect attempts since the last stable picture.
+    pub tries: u32,
 }
 
 /// The loop's stats and error as of its last frame (see `Engine::stats`).
@@ -575,6 +588,10 @@ struct Shown {
     /// Captures shown with no picture, not opening: name, whether it's the screen, and since
     /// when it's had none (`Engine::quiet_captures`).
     quiet: Vec<(String, bool, u64)>,
+    /// Camera sources currently waiting to reconnect while shown or on air.
+    waiting_cameras: Vec<String>,
+    /// Snapshot of every camera source's availability status for nonblocking polling.
+    camera_statuses: HashMap<String, CameraStatus>,
 }
 
 impl Shown {
@@ -585,6 +602,8 @@ impl Shown {
             outputs: st.outputs.iter().map(|(id, pipe, ..)| (*id, record_state(pipe), pipe.encoder())).collect(),
             loads: loads_of(st),
             quiet: quiet_of(st),
+            waiting_cameras: waiting_cameras_of(st),
+            camera_statuses: camera_statuses_of(st),
         }
     }
 }
@@ -596,10 +615,60 @@ fn loads_of(st: &State) -> Vec<SourceLoad> {
         .filter_map(|(name, (id, _))| {
             let s = st.sources.get(id)?;
             let (width, height) = s.size.map_or((0, 0), |(w, h, _)| (w, h));
-            Some(SourceLoad { name: name.clone(), sent: s.sent, width, height })
+            Some(SourceLoad { name: name.clone(), sent: s.sent, width, height, waiting: s.is_waiting_for_camera() })
         })
         .collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn active_or_empty(st: &State) -> std::collections::HashSet<u64> {
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        active(st)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = st;
+        std::collections::HashSet::new()
+    }
+}
+
+fn camera_status_of_src(src: &Src) -> Option<CameraStatus> {
+    let retry = src.camera_retry.as_ref()?;
+    Some(CameraStatus {
+        state: if retry.is_waiting() { "waiting" } else { "live" },
+        message: retry.waiting_message(),
+        tries: retry.tries(),
+    })
+}
+
+fn camera_status_of(st: &State, name: &str) -> Option<CameraStatus> {
+    let (id, _) = st.opened.get(name)?;
+    camera_status_of_src(st.sources.get(id)?)
+}
+
+fn camera_statuses_of(st: &State) -> HashMap<String, CameraStatus> {
+    st.opened
+        .iter()
+        .filter_map(|(name, (id, _))| Some((name.clone(), camera_status_of_src(st.sources.get(id)?)?)))
+        .collect()
+}
+
+fn waiting_cameras_of(st: &State) -> Vec<String> {
+    let shown = seen(st).0;
+    let act = active_or_empty(st);
+    let has_scenes = !st.scenes.is_empty() || !st.opened.is_empty();
+    let mut out: Vec<String> = st
+        .opened
+        .iter()
+        .filter_map(|(name, (id, _))| {
+            let s = st.sources.get(id)?;
+            let visible = !has_scenes || shown.contains(id) || act.contains(id);
+            (visible && s.is_waiting_for_camera()).then(|| name.clone())
+        })
+        .collect();
+    out.sort();
     out
 }
 
@@ -820,6 +889,87 @@ enum Live {
     Visualizer(Box<crate::source::visualizer::VisualizerLive>),
     #[cfg(test)]
     PanicOnDrop(#[allow(dead_code)] PanicDrop),
+    #[cfg(test)]
+    FakeCamera(FakeCapture),
+}
+
+#[cfg(test)]
+struct FakeCameraBackend {
+    online: AtomicBool,
+    interrupted: AtomicBool,
+    streaming: AtomicBool,
+    color: Mutex<[u8; 4]>,
+    frames_sent: AtomicU64,
+    open_attempts: AtomicU64,
+    active_sessions: std::sync::atomic::AtomicUsize,
+    max_active_sessions: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl FakeCameraBackend {
+    fn new(color: [u8; 4]) -> Arc<Self> {
+        Arc::new(Self {
+            online: AtomicBool::new(true),
+            interrupted: AtomicBool::new(false),
+            streaming: AtomicBool::new(true),
+            color: Mutex::new(color),
+            frames_sent: AtomicU64::new(0),
+            open_attempts: AtomicU64::new(0),
+            active_sessions: std::sync::atomic::AtomicUsize::new(0),
+            max_active_sessions: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn open(self: &Arc<Self>) -> Result<Live, AvError> {
+        self.open_attempts.fetch_add(1, Ordering::SeqCst);
+        if !self.online.load(Ordering::Acquire) {
+            return Err(AvError::Source("the camera isn't connected".into()));
+        }
+        let now_active = self.active_sessions.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active_sessions.fetch_max(now_active, Ordering::SeqCst);
+        Ok(Live::FakeCamera(FakeCapture { state: Arc::clone(self) }))
+    }
+}
+
+#[cfg(test)]
+struct FakeCapture {
+    state: Arc<FakeCameraBackend>,
+}
+
+#[cfg(test)]
+impl FakeCapture {
+    fn received(&self) -> u64 {
+        self.state.frames_sent.load(Ordering::Acquire)
+    }
+
+    fn ended(&self) -> Option<String> {
+        if !self.state.online.load(Ordering::Acquire) {
+            return Some("the camera was disconnected".into());
+        }
+        if self.state.interrupted.load(Ordering::Acquire) {
+            return Some("the camera was interrupted".into());
+        }
+        None
+    }
+
+    fn take_frame(&self) -> Option<(Picture, u64)> {
+        if !self.state.online.load(Ordering::Acquire)
+            || self.state.interrupted.load(Ordering::Acquire)
+            || !self.state.streaming.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let c = *self.state.color.lock().unwrap_or_else(|e| e.into_inner());
+        self.state.frames_sent.fetch_add(1, Ordering::SeqCst);
+        Some((Picture::solid(16, 16, c), now_ns()))
+    }
+}
+
+#[cfg(test)]
+impl Drop for FakeCapture {
+    fn drop(&mut self) {
+        self.state.active_sessions.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -839,6 +989,8 @@ struct Src {
     /// What it was started as, when the watchdog can start it again (captures).
     kind: Option<SourceKind>,
     watch: Watch,
+    /// Camera reconnect policy and "waiting for the camera" status (`None` for non-cameras).
+    camera_retry: Option<crate::camera_retry::CameraRetry>,
     /// Its newest picture while nothing drawn shows it: kept, not sent to the GPU, until it is.
     pending: Option<Fresh>,
     /// Clock time (`now_ns`) when `pending` was stored (idle hidden surfaces unpin once after [`PENDING_UNPIN_NS`]).
@@ -940,14 +1092,29 @@ impl Fresh {
     }
 }
 
+fn is_camera_kind(kind: Option<&SourceKind>) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        matches!(kind, Some(SourceKind::Camera(_)))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = kind;
+        false
+    }
+}
+
 impl Src {
     fn new(live: Live, size: Option<(u32, u32, bool)>, kind: Option<SourceKind>) -> Self {
-        let watch = Watch::for_kind(kind.as_ref(), now_ns());
+        let now = now_ns();
+        let watch = Watch::for_kind(kind.as_ref(), now);
+        let camera_retry = is_camera_kind(kind.as_ref()).then(|| crate::camera_retry::CameraRetry::new(now));
         Src {
             live,
             size,
             kind,
             watch,
+            camera_retry,
             pending: None,
             pending_since: 0,
             opening: None,
@@ -958,6 +1125,22 @@ impl Src {
             audio_delay: None,
             delay_cap: None,
         }
+    }
+
+    fn waiting_camera(kind: SourceKind, now: u64, reason: &str) -> Self {
+        let mut src = Self::new(Live::Still, None, Some(kind));
+        src.watch.tries = 1;
+        src.watch.next_try = now.saturating_add(crate::camera_retry::CAMERA_BACKOFF_INITIAL_NS);
+        src.camera_retry = Some(crate::camera_retry::CameraRetry::waiting(
+            now,
+            crate::camera_retry::CAMERA_BACKOFF_INITIAL_NS,
+            reason,
+        ));
+        src
+    }
+
+    fn is_waiting_for_camera(&self) -> bool {
+        self.camera_retry.as_ref().is_some_and(crate::camera_retry::CameraRetry::is_waiting)
     }
 }
 
@@ -1040,14 +1223,11 @@ struct Watch {
     next_try: u64,
     /// True once this source has delivered at least one frame since creation or last edit.
     ever_sent: bool,
-    /// True for camera/capture-card sources that pause auto-retries after [`NO_SIGNAL_MAX_TRIES`]
-    /// zero-frame attempts until USB hotplug or a user edit/retry.
-    cap_no_signal: bool,
+    /// True for cameras (always `1, 2, 4, 5 s` backoff via `camera_retry`).
+    camera_backoff: bool,
     /// A camera or microphone: one that has worked is looked for again within seconds when it
     /// goes (a USB mic bumped out and back in, where Windows has no hotplug wake).
     quick_retry: bool,
-    /// Set once `cap_no_signal && !ever_sent` reaches [`NO_SIGNAL_MAX_TRIES`].
-    no_signal: bool,
     /// It panicked in the loop (and was stopped there).
     faulted: bool,
     /// Ended because the system turned its permission off (Screen Recording): not tried again
@@ -1062,27 +1242,23 @@ struct Watch {
 }
 
 impl Watch {
-    /// The wait before try `n` at starting this source again. A capture card that has sent a
-    /// picture before is looked for again within a few seconds (its HDMI may come back at any
-    /// moment); anything else waits the long backoff.
+    /// The wait before try `n` at starting this source again. Cameras always retry within
+    /// `1, 2, 4, 5 s`; a microphone that has worked before waits at most [`CARD_RETRY_MAX_NS`].
     fn backoff(&self, n: u32) -> u64 {
+        if self.camera_backoff {
+            return crate::camera_retry::backoff_ns(n);
+        }
         let wait = backoff_ns(n);
         if self.quick_retry && self.ever_sent { wait.min(CARD_RETRY_MAX_NS) } else { wait }
     }
 
     fn for_kind(kind: Option<&SourceKind>, now: u64) -> Self {
-        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-        let cap_no_signal = matches!(kind, Some(SourceKind::Camera(_)));
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-        let cap_no_signal = {
-            let _ = kind;
-            false
-        };
+        let camera_backoff = is_camera_kind(kind);
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let quick_retry = matches!(kind, Some(SourceKind::Camera(_) | SourceKind::Microphone(_)));
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         let quick_retry = false;
-        Self { since: now, cap_no_signal, quick_retry, ..Self::default() }
+        Self { since: now, camera_backoff, quick_retry, ..Self::default() }
     }
 }
 
@@ -1090,8 +1266,6 @@ impl Watch {
 const STALL_NS: u64 = 5_000_000_000;
 /// Grace period for a freshly opened steady capture to deliver its first frame before restarting.
 const FIRST_FRAME_NS: u64 = 10_000_000_000;
-/// Maximum fruitless zero-frame tries for a capture card/camera before waiting in "no signal".
-const NO_SIGNAL_MAX_TRIES: u32 = 3;
 /// How long a capture must keep sending before its failed tries are forgotten.
 const STABLE_NS: u64 = 10_000_000_000;
 /// The longest wait between tries at a capture card that has worked before.
@@ -1839,6 +2013,8 @@ impl Engine {
                     src.opening_since = 0;
                     src.audio_tx = None;
                     src.watch = Watch::for_kind(src.kind.as_ref(), now_ns());
+                    src.camera_retry =
+                        is_camera_kind(src.kind.as_ref()).then(|| crate::camera_retry::CameraRetry::new(now_ns()));
                     // Its sound into the mix (a file with sound), under the same lock so a
                     // removal can't slip in between.
                     if heard || oc.is_some() || matches!(src.live, Live::Screen(_)) {
@@ -1859,8 +2035,12 @@ impl Engine {
                     leftover = Some(std::mem::replace(&mut src.live, Live::Still));
                     src.size = None;
                     if src.kind.is_some() {
-                        // A capture: the watchdog tries again later, waiting longer each time.
-                        src.watch.next_try = now_ns() + backoff_ns(0);
+                        // A capture: the watchdog tries again later (cameras on 1..5 s backoff).
+                        let now = now_ns();
+                        if let Some(retry) = src.camera_retry.as_mut() {
+                            retry.on_reopen_finished(0, false, now, Some(&e.to_string()));
+                        }
+                        src.watch.next_try = now + src.watch.backoff(0);
                         src.watch.tries = 1;
                     } else {
                         // Nothing restarts a file: let it go, so the next opening of the
@@ -1936,9 +2116,11 @@ impl Engine {
                 // A running, healthy camera is parked a moment (see `State::parked`).
                 Some(src)
                     if src.opening.is_none()
-                        && matches!(src.kind, Some(SourceKind::Camera(_)))
-                        && !is_live_ended(&src.live) =>
+                        && is_camera_kind(src.kind.as_ref())
+                        && !is_live_ended(&src.live)
+                        && !src.is_waiting_for_camera() =>
                 {
+                    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
                     if let (Some(kind), live @ Live::Camera(_)) = (src.kind, src.live) {
                         st.parked.push((kind, live, now_ns()));
                     }
@@ -2238,6 +2420,14 @@ impl Engine {
                     }
                     opened.insert(s.name.clone(), (s.id, s.kind));
                 }
+                Err(e) if is_camera_kind(Some(&s.kind)) => {
+                    // Selected or saved camera unavailable now (e.g. Continuity Camera sleeping):
+                    // keep it alive in `sources` marked "waiting for the camera" so the watchdog
+                    // keeps checking with backoff rather than stranding it in `missing`.
+                    let why = e.to_string();
+                    self.lock().sources.insert(s.id, Src::waiting_camera(s.kind.clone(), now_ns(), &why));
+                    opened.insert(s.name.clone(), (s.id, s.kind));
+                }
                 Err(e) => {
                     let why = format!("{}: {e}", s.name);
                     skipped.push(why.clone());
@@ -2499,6 +2689,17 @@ impl Engine {
     /// size. Read twice, the difference is each one's rate (what keeps the engine busiest).
     pub fn source_load(&self) -> Vec<SourceLoad> {
         self.now_or_last(loads_of, |s| s.loads.clone())
+    }
+
+    /// Shown or on-air camera sources currently waiting for their device to return.
+    pub fn waiting_cameras(&self) -> Vec<String> {
+        self.now_or_last(waiting_cameras_of, |s| s.waiting_cameras.clone())
+    }
+
+    /// Live status of a named camera source (`None` when not an open camera source), read
+    /// non-blockingly from `Shown` when the render loop holds `State`.
+    pub fn camera_status(&self, name: &str) -> Option<CameraStatus> {
+        self.now_or_last(|st| camera_status_of(st, name), |s| s.camera_statuses.get(name).cloned())
     }
 
     /// Captures shown somewhere (on air, a preview, an output) that have had no picture for at
@@ -3399,6 +3600,147 @@ impl Engine {
         })
     }
 
+    /// Whether a scene item's picture is already uploaded (or doesn't need an upload, such as a
+    /// scene/group); `None` when `(scene, item_id)` isn't in `scene` or any group inside it.
+    pub fn item_picture_ready(&self, scene: &str, item_id: i64) -> Option<bool> {
+        let st = self.lock();
+        let (it, _) = find_scene_item(&st, scene, item_id)?;
+        Some(if it.scene.is_some() { true } else { st.sources.get(&it.source).is_some_and(|s| s.size.is_some()) })
+    }
+
+    /// One scene item rendered on its own exactly as the scene render draws it: its active
+    /// video filters (`ferrocast_filters` override or source filters), crop, scale, rotation,
+    /// flips, scale filter, blend and opacity (including any enclosing group chain's transform and
+    /// filter expansion).
+    ///
+    /// Sized to the item's 1:1 transformed bounding box clipped to `canvas` when it overlaps the
+    /// canvas, or the full transformed box capped to `4096` px when completely off-canvas.
+    pub fn snapshot_item_transformed(
+        &self,
+        scene: &str,
+        item_id: i64,
+        canvas: (u32, u32),
+    ) -> Result<(Vec<u8>, (u32, u32)), AvError> {
+        const MAX_OFFSCREEN_SHOT: u32 = 4096;
+        let canvas = (canvas.0.max(1), canvas.1.max(1));
+        let (built, scale_to) = {
+            let mut st = self.lock();
+            send_pending(&mut st, &self.gpu);
+            let ts = now_ns();
+            let ms = scene_ms(&st, scene, ts);
+            let (it, ancestors) = find_scene_item(&st, scene, item_id)
+                .ok_or_else(|| AvError::Source(format!("item {item_id} isn't in scene \"{scene}\"")))?;
+            let (it_effects, it_base) = active_item_effects_and_base(&st, it, ms, canvas)?;
+            let (mut it_placement, it_opacity) = animated(it, ms);
+            let (m_local, (cw, ch)) = item_draw_affine_and_crop(&it_placement, &it_effects, it_base)?;
+
+            let mut pts = [
+                m_local.apply(0.0, 0.0),
+                m_local.apply(cw as f32, 0.0),
+                m_local.apply(cw as f32, ch as f32),
+                m_local.apply(0.0, ch as f32),
+            ];
+            let mut group_chain = Vec::with_capacity(ancestors.len());
+            for g in ancestors {
+                let (g_effects, g_base) = active_item_effects_and_base(&st, g, ms, canvas)?;
+                let (gp, g_opacity) = animated(g, ms);
+                let (m_group, (gcw, gch)) = item_draw_affine_and_crop(&gp, &g_effects, g_base)?;
+                let (gow, goh) = g_effects.iter().fold(g_base, |(w, h), e| e.out_size(w, h));
+                let [gl, gt, gr, gb] = Effect::outside_sides(&g_effects, g_base.0, g_base.1);
+                let has_crop = gp.crop.iter().any(|c| *c > 0);
+                let has_outside = gl + gt + gr + gb > 0;
+                if has_outside || has_crop {
+                    let (mut tx0, mut ty0, mut tx1, mut ty1) = pts_aabb(&pts);
+                    if has_outside {
+                        // In post-effect texture coords [0..gow, 0..goh], input (0..gw) sits at
+                        // (+gl, +gt) and outside effects spread [-gl, -gt, +gr, +gb], yielding
+                        // [lx0 .. lx1 + gl + gr] clamped to the rendered group target.
+                        tx0 = tx0.max(0.0);
+                        ty0 = ty0.max(0.0);
+                        tx1 = (tx1 + (gl + gr) as f32).min(gow as f32);
+                        ty1 = (ty1 + (gt + gb) as f32).min(goh as f32);
+                    }
+                    if has_crop {
+                        tx0 = (tx0 - gp.crop[0] as f32).max(0.0);
+                        ty0 = (ty0 - gp.crop[1] as f32).max(0.0);
+                        tx1 = (tx1 - gp.crop[0] as f32).min(gcw as f32);
+                        ty1 = (ty1 - gp.crop[1] as f32).min(gch as f32);
+                    }
+                    if tx1 <= tx0 || ty1 <= ty0 {
+                        return Err(AvError::Source("the item is cropped out by its group".into()));
+                    }
+                    pts = [
+                        m_group.apply(tx0, ty0),
+                        m_group.apply(tx1, ty0),
+                        m_group.apply(tx1, ty1),
+                        m_group.apply(tx0, ty1),
+                    ];
+                } else {
+                    pts = pts.map(|(x, y)| m_group.apply(x, y));
+                }
+                group_chain.push((g.clone(), g_effects, g_base, gp, g_opacity));
+            }
+
+            let (bx0, by0, bx1, by1) = snap_pts_bbox(&pts);
+            if bx1 <= bx0 || by1 <= by0 {
+                return Err(AvError::Source("the item has zero size".into()));
+            }
+            let (cx0, cy0, cx1, cy1) =
+                (bx0.max(0), by0.max(0), bx1.min(i64::from(canvas.0)), by1.min(i64::from(canvas.1)));
+            let ((off_x, off_y), (render_w, render_h), scale_to) = if cx1 > cx0 && cy1 > cy0 {
+                ((cx0 as f32, cy0 as f32), ((cx1 - cx0) as u32, (cy1 - cy0) as u32), None)
+            } else {
+                let raw_w = u32::try_from(bx1 - bx0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
+                let raw_h = u32::try_from(by1 - by0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
+                let scale_to = if raw_w > MAX_OFFSCREEN_SHOT || raw_h > MAX_OFFSCREEN_SHOT {
+                    Some(fit_within(raw_w, raw_h, MAX_OFFSCREEN_SHOT))
+                } else {
+                    None
+                };
+                ((bx0 as f32, by0 as f32), (raw_w, raw_h), scale_to)
+            };
+
+            let mut solo = it.clone();
+            if group_chain.is_empty() {
+                it_placement.x -= off_x;
+                it_placement.y -= off_y;
+            }
+            solo.placement = it_placement;
+            solo.opacity = it_opacity;
+            solo.animation.clear();
+            solo.visible = true;
+            solo.show = Show::Both;
+            let depth = u32::try_from(group_chain.len()).unwrap_or(MAX_NESTING);
+            let mut comp_item = item_at(&st, &solo, ms, depth, canvas, Audience::Everyone)
+                .ok_or_else(|| AvError::Source("the item couldn't be rendered".into()))?;
+            let last = group_chain.len().saturating_sub(1);
+            for (idx, (g, g_effects, g_base, mut gp, g_opacity)) in group_chain.into_iter().enumerate() {
+                if idx == last {
+                    gp.x -= off_x;
+                    gp.y -= off_y;
+                }
+                comp_item = Item {
+                    content: Content::Group { width: g_base.0, height: g_base.1, items: vec![comp_item] },
+                    effects: g_effects,
+                    placement: gp,
+                    filter: g.filter,
+                    blend: g.blend,
+                    srgb_off: false,
+                    linear: true,
+                    opacity: g_opacity,
+                };
+            }
+            (Scene { width: render_w, height: render_h, items: vec![comp_item] }, scale_to)
+        };
+        let scene = match scale_to {
+            Some((tw, th)) => scaled(built, tw, th, Filter::Bicubic),
+            None => built,
+        };
+        let out_size = (scene.width, scene.height);
+        let px = self.gpu.render(&scene)?;
+        Ok((px, out_size))
+    }
+
     fn snapshot_with_effects(
         &self,
         id: u64,
@@ -3453,6 +3795,127 @@ fn shared_source_effects<'a>(items: impl Iterator<Item = &'a SceneItem>, id: u64
         .map(|i| i.effects.clone())
         .next()
         .unwrap_or_default()
+}
+
+fn find_scene_item<'a>(st: &'a State, scene: &str, item_id: i64) -> Option<(&'a SceneItem, Vec<&'a SceneItem>)> {
+    fn walk<'a>(
+        st: &'a State,
+        scene: &str,
+        item_id: i64,
+        depth: u32,
+        chain_outer_first: &mut Vec<&'a SceneItem>,
+    ) -> Option<&'a SceneItem> {
+        let items = st.scenes.get(scene)?;
+        if let Some(direct) = items.iter().find(|it| it.item_id == item_id) {
+            return Some(direct);
+        }
+        if depth >= MAX_NESTING {
+            return None;
+        }
+        for g in items.iter().filter(|g| g.group.is_some()) {
+            let Some(gname) = g.scene.as_deref() else { continue };
+            chain_outer_first.push(g);
+            if let Some(found) = walk(st, gname, item_id, depth + 1, chain_outer_first) {
+                return Some(found);
+            }
+            chain_outer_first.pop();
+        }
+        None
+    }
+    let mut ancestors = Vec::new();
+    let leaf = walk(st, scene, item_id, 0, &mut ancestors)?;
+    ancestors.reverse();
+    Some((leaf, ancestors))
+}
+
+fn active_item_effects_and_base(
+    st: &State,
+    it: &SceneItem,
+    ms: u64,
+    canvas: (u32, u32),
+) -> Result<(Vec<Effect>, (u32, u32)), AvError> {
+    let base = match (&it.scene, it.group) {
+        (Some(_), Some((0, _)) | Some((_, 0))) => return Err(AvError::Source("the group is empty".into())),
+        (Some(_), Some(size)) => size,
+        (Some(_), None) => canvas,
+        (None, _) => {
+            let (w, h, _) = st
+                .sources
+                .get(&it.source)
+                .and_then(|s| s.size)
+                .ok_or_else(|| AvError::Source("the source has no picture yet".into()))?;
+            (w, h)
+        }
+    };
+    let effects = it
+        .effects
+        .iter()
+        .filter(|e| match e {
+            Effect::Mask { image, .. } | Effect::Cutout { mask: image, .. } => {
+                st.sources.get(image).is_some_and(|s| s.size.is_some())
+            }
+            _ => true,
+        })
+        .map(|e| {
+            let mut e = e.clone();
+            if let Effect::Scroll { elapsed_ms, .. } | Effect::Custom { elapsed_ms, .. } = &mut e {
+                *elapsed_ms = ms;
+            }
+            e
+        })
+        .collect();
+    Ok((effects, base))
+}
+
+fn item_draw_affine_and_crop(
+    placement: &Placement,
+    effects: &[Effect],
+    base: (u32, u32),
+) -> Result<(crate::transform::Affine, (u32, u32)), AvError> {
+    let (ow, oh) = effects.iter().fold(base, |(w, h), e| e.out_size(w, h));
+    let (cw, ch) = crate::transform::cropped(ow, oh, placement.crop);
+    if cw == 0 || ch == 0 {
+        return Err(AvError::Source("the item is cropped to nothing".into()));
+    }
+    let [l, t, r, b] = Effect::outside_sides(effects, base.0, base.1);
+    let m = if l + r + t + b > 0 && ow > l + r && oh > t + b {
+        crate::transform::Affine::translate(-(l as f32), -(t as f32)).then(&crate::transform::draw_transform(
+            placement,
+            ow - l - r,
+            oh - t - b,
+        ))
+    } else {
+        crate::transform::draw_transform(placement, ow, oh)
+    };
+    Ok((m, (cw, ch)))
+}
+
+fn pts_aabb(pts: &[(f32, f32); 4]) -> (f32, f32, f32, f32) {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for &(x, y) in pts {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    (x0, y0, x1, y1)
+}
+
+fn snap_pts_bbox(pts: &[(f32, f32); 4]) -> (i64, i64, i64, i64) {
+    let (x0, y0, x1, y1) = pts_aabb(pts);
+    // Snap negligible float rotation error (e.g. cos(90°) ~= -4.37e-8) away from outward padding.
+    const EPS: f32 = 1e-4;
+    ((x0 + EPS).floor() as i64, (y0 + EPS).floor() as i64, (x1 - EPS).ceil() as i64, (y1 - EPS).ceil() as i64)
+}
+
+fn fit_within(w: u32, h: u32, max_side: u32) -> (u32, u32) {
+    if w >= h {
+        let th = ((u64::from(h) * u64::from(max_side)) / u64::from(w.max(1))).max(1) as u32;
+        (max_side, th)
+    } else {
+        let tw = ((u64::from(w) * u64::from(max_side)) / u64::from(h.max(1))).max(1) as u32;
+        (tw, max_side)
+    }
 }
 
 fn find_item_effects(st: &State, scene: &str, item_id: i64, source_id: u64, depth: u8) -> Option<Vec<Effect>> {
@@ -4702,6 +5165,8 @@ fn signs(live: &Live) -> Option<(u64, bool, Option<String>)> {
         Live::Camera(c) | Live::Microphone(c) => Some((c.received(), c.steady(), c.ended())),
         #[cfg(test)]
         Live::PanicOnDrop(_) => Some((0, false, Some("dead".into()))),
+        #[cfg(test)]
+        Live::FakeCamera(c) => Some((c.received(), true, c.ended())),
         _ => None,
     }
 }
@@ -4727,37 +5192,12 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
         w.denied = true;
         return None;
     }
-    if w.cap_no_signal && !w.ever_sent && w.tries >= NO_SIGNAL_MAX_TRIES {
-        // Waiting for a signal, with the session left open: a picture that comes now (a console
-        // switched on) lets go of the wait, as USB hotplug does. Nothing else is tried.
-        let gone = signs.as_ref().is_some_and(|(_, _, ended)| ended.is_some());
-        match signs {
-            Some((count, ..)) if running && count > 0 => {
-                w.ever_sent = true;
-                w.no_signal = false;
-                w.count = count;
-                w.since = now;
-                w.tries = 0;
-                w.next_try = 0;
-            }
-            // No session to see the signal come with (the last try failed to open, or it ended
-            // with an error): a slow try (the backoff, a minute at most) puts one back. Windows
-            // has no hotplug wake, so this is what wakes it there.
-            _ if !running || gone => {
-                w.no_signal = true;
-                return Some("its session is gone while it waits for a signal".into());
-            }
-            _ => w.no_signal = true,
-        }
-        return None;
-    }
     if !running {
         return Some("it didn't start again last time".into());
     }
     let (count, steady, ended) = signs?;
     if count > 0 {
         w.ever_sent = true;
-        w.no_signal = false;
     }
     if count != w.count {
         w.count = count;
@@ -4862,7 +5302,10 @@ fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[Strin
         if src.opening.is_some() {
             continue;
         }
-        let dead = matches!(src.live, Live::Still) || src.watch.faulted || is_live_ended(&src.live);
+        let dead = matches!(src.live, Live::Still)
+            || src.watch.faulted
+            || is_live_ended(&src.live)
+            || src.is_waiting_for_camera();
         if !dead {
             continue;
         }
@@ -4878,9 +5321,11 @@ fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[Strin
             _ => false,
         };
         if matches_device {
+            if let Some(r) = src.camera_retry.as_mut() {
+                r.on_hotplug(now);
+            }
             src.watch.next_try = now;
             src.watch.tries = 0;
-            src.watch.no_signal = false;
             woke += 1;
         }
     }
@@ -4899,6 +5344,9 @@ fn watchdog_step(
     connected: Option<&[String]>,
     now: u64,
 ) {
+    use crate::camera_retry::{CameraAction, CameraObservation};
+
+    let step_started = Instant::now();
     let mut todo = Vec::new();
     let mut expired = Vec::new();
     {
@@ -4915,6 +5363,9 @@ fn watchdog_step(
                 i += 1;
             }
         }
+        let shown_ids = seen(&st).0;
+        let active_ids = active_or_empty(&st);
+        let has_scenes = !st.scenes.is_empty() || !st.opened.is_empty();
         let mut in_flight = 0usize;
         let mut ready: Vec<(u32, u64, String)> = Vec::new();
         let mut said: Vec<crate::notices::Notice> = Vec::new();
@@ -4939,18 +5390,31 @@ fn watchdog_step(
                 said.push(n);
             }
             let live_signs = signs(&src.live);
+            if let Some(retry) = src.camera_retry.as_mut() {
+                let visible_or_on_air = !has_scenes || shown_ids.contains(id) || active_ids.contains(id);
+                let (frames, ended) = match live_signs {
+                    Some((count, _, e)) => (count, e.is_some()),
+                    None => (0, false),
+                };
+                let ended = ended || src.watch.faulted;
+                src.watch.count = frames;
+                let action = retry.step(CameraObservation {
+                    running,
+                    frames,
+                    ended,
+                    opening: false,
+                    visible_or_on_air,
+                    now_ns: now,
+                });
+                if let CameraAction::Reopen(why) = action {
+                    ready.push((retry.tries(), *id, why.to_string()));
+                }
+                continue;
+            }
             let w = &mut src.watch;
             #[cfg(target_os = "macos")]
             retry_if_permission_back(w, crate::apple::screen::screen_access_granted);
-            let was_no_signal = w.no_signal;
             let why = look(w, running, live_signs, now);
-            if !was_no_signal && w.no_signal {
-                tracing::warn!(
-                    source = *id,
-                    tries = NO_SIGNAL_MAX_TRIES,
-                    "capture didn't deliver a picture (no signal); waiting for reconnect or edit"
-                );
-            }
             if let Some(why) = why
                 && now >= w.next_try
             {
@@ -4966,9 +5430,17 @@ fn watchdog_step(
             let Some(src) = st.sources.get_mut(&id) else { continue };
             let Some(kind) = src.kind.clone() else { continue };
             let token = next_open_token();
-            let prev_tries = src.watch.tries;
-            src.watch.next_try = now + src.watch.backoff(prev_tries);
-            src.watch.tries = prev_tries.saturating_add(1);
+            let prev_tries = if let Some(retry) = src.camera_retry.as_mut() {
+                let prev = retry.on_reopen_started(now);
+                src.watch.next_try = retry.next_try_ns();
+                src.watch.tries = retry.tries();
+                prev
+            } else {
+                let prev = src.watch.tries;
+                src.watch.next_try = now + src.watch.backoff(prev);
+                src.watch.tries = prev.saturating_add(1);
+                prev
+            };
             src.watch.faulted = false;
             src.watch.since = now;
             src.opening = Some(token);
@@ -5011,6 +5483,7 @@ fn watchdog_step(
                 let mut leftover = None;
                 {
                     let mut st = state_w.lock().unwrap_or_else(|e| e.into_inner());
+                    let finished_at = now.saturating_add(step_started.elapsed().as_nanos() as u64);
                     let Some(src) =
                         st.sources.get_mut(&id).filter(|s| s.opening == Some(token) && s.kind.as_ref() == Some(&kind))
                     else {
@@ -5035,12 +5508,22 @@ fn watchdog_step(
                             src.delay_cap = None;
                             src.watch.count = 0;
                             src.watch.since = now_ns();
-                            src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
+                            if let Some(retry) = src.camera_retry.as_mut() {
+                                retry.on_reopen_finished(prev_tries, true, finished_at, None);
+                                src.watch.next_try = retry.next_try_ns();
+                            } else {
+                                src.watch.next_try = finished_at + src.watch.backoff(prev_tries);
+                            }
                             st.stats.restarts += 1;
                             let _ = audio_w.send(AudioCmd::SetOutputCapture { id, capture: oc });
                         }
                         Some(Err(e)) => {
-                            src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
+                            if let Some(retry) = src.camera_retry.as_mut() {
+                                retry.on_reopen_finished(prev_tries, false, finished_at, Some(&e.to_string()));
+                                src.watch.next_try = retry.next_try_ns();
+                            } else {
+                                src.watch.next_try = finished_at + src.watch.backoff(prev_tries);
+                            }
                             tracing::warn!(source = id, error = %e, "the source didn't start again; it's tried later");
                         }
                         None => {}
@@ -5051,20 +5534,32 @@ fn watchdog_step(
             if let Err(p) = worker_res {
                 tracing::error!(source = id, error = %panic_text(&*p), "watchdog reopen worker panicked");
                 let mut st = state_panic.lock().unwrap_or_else(|e| e.into_inner());
+                let finished_at = now.saturating_add(step_started.elapsed().as_nanos() as u64);
                 if let Some(src) = st.sources.get_mut(&id).filter(|s| s.opening == Some(token)) {
                     src.opening = None;
                     src.opening_since = 0;
-                    src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
+                    if let Some(retry) = src.camera_retry.as_mut() {
+                        retry.on_reopen_finished(prev_tries, false, finished_at, Some("reopen panicked"));
+                        src.watch.next_try = retry.next_try_ns();
+                    } else {
+                        src.watch.next_try = finished_at + src.watch.backoff(prev_tries);
+                    }
                 }
             }
         });
         if let Err(e) = spawned {
             tracing::error!(source = id, error = %e, "couldn't start watchdog reopen thread");
             let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            let finished_at = now.saturating_add(step_started.elapsed().as_nanos() as u64);
             if let Some(src) = st.sources.get_mut(&id).filter(|s| s.opening == Some(token)) {
                 src.opening = None;
                 src.opening_since = 0;
-                src.watch.next_try = now_ns() + src.watch.backoff(prev_tries);
+                if let Some(retry) = src.camera_retry.as_mut() {
+                    retry.on_reopen_finished(prev_tries, false, finished_at, Some(&e.to_string()));
+                    src.watch.next_try = retry.next_try_ns();
+                } else {
+                    src.watch.next_try = finished_at + src.watch.backoff(prev_tries);
+                }
             }
         }
     }
@@ -5416,6 +5911,12 @@ fn frame(
             Live::Still | Live::Visualizer(_) => {}
             #[cfg(test)]
             Live::PanicOnDrop(_) => {}
+            #[cfg(test)]
+            Live::FakeCamera(cap) => {
+                if let Some((p, _)) = cap.take_frame() {
+                    uploads.push((*id, Fresh::Pic(p)));
+                }
+            }
             Live::Image { src: img, since, last } => {
                 if img.animated() {
                     let p = img.frame_at(since.elapsed());
@@ -5643,6 +6144,9 @@ fn frame(
         if f.send(gpu, id) {
             s.size = Some(f.info());
             s.sent += 1;
+            if let Some(retry) = s.camera_retry.as_mut() {
+                retry.on_frame_uploaded(now);
+            }
         }
     }
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -6266,37 +6770,48 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_caps_no_signal_camera_restarts_until_hotplug() {
+    fn camera_source_keeps_retrying_past_three_tries_and_wakes_on_hotplug() {
+        use crate::camera_retry::{CameraAction, CameraObservation};
+
         let sec = 1_000_000_000;
         let mut sources = BTreeMap::new();
-        sources.insert(1, Src::new(Live::Still, None, Some(SourceKind::Camera("capture-card".into()))));
-        let w = &mut sources.get_mut(&1).unwrap_or_else(|| panic!("src")).watch;
+        sources.insert(1, Src::new(Live::Still, None, Some(SourceKind::Camera("continuity-cam".into()))));
+        let retry = sources.get_mut(&1).and_then(|s| s.camera_retry.as_mut()).unwrap_or_else(|| panic!("retry"));
 
-        // First 3 fruitless attempts (`tries` 0, 1, 2) request reopening.
-        for tries in 0..NO_SIGNAL_MAX_TRIES {
-            w.tries = tries;
-            assert!(look(w, false, None, (tries as u64 + 1) * sec).is_some());
+        // Retries past 3 attempts on 1 s, 2 s, 4 s, 5 s backoff forever while visible/on air.
+        let mut t = sec;
+        for wait in [sec, 2 * sec, 4 * sec, 5 * sec, 5 * sec] {
+            let act = retry.step(CameraObservation {
+                running: false,
+                frames: 0,
+                ended: false,
+                opening: false,
+                visible_or_on_air: true,
+                now_ns: t,
+            });
+            assert!(matches!(act, CameraAction::Reopen(_)), "camera keeps retrying past 3 attempts");
+            assert!(retry.is_waiting());
+            let prev = retry.on_reopen_started(t);
+            retry.on_reopen_finished(prev, false, t, Some("still sleeping"));
+            t += wait;
         }
-        // After 3 zero-frame tries with no signal ever seen, a card whose session is open waits
-        // (see a_no_signal_wait_without_a_session_is_retried_slowly for the one without).
-        w.tries = NO_SIGNAL_MAX_TRIES;
-        assert_eq!(look(w, true, Some((0, true, None)), 10 * sec), None);
-        assert!(w.no_signal);
+        assert!(retry.tries() >= 5);
 
-        // Once frames flow at least once (`ever_sent`), disconnects keep retrying past 3 tries.
-        w.ever_sent = true;
-        w.no_signal = false;
-        assert!(look(w, false, None, 11 * sec).is_some());
-
-        // Reset back to never-sent exhausted state and confirm hotplug wakes it.
-        w.ever_sent = false;
-        w.no_signal = true;
-        w.tries = NO_SIGNAL_MAX_TRIES;
-        assert_eq!(apply_hotplug_reconnects(&mut sources, &["capture-card".into()], 20 * sec), 1);
+        // Hotplug reconnect clears backoff and triggers immediate reopen.
+        assert_eq!(apply_hotplug_reconnects(&mut sources, &["continuity-cam".into()], t + sec), 1);
         let src = sources.get_mut(&1).unwrap_or_else(|| panic!("src"));
-        assert!(!src.watch.no_signal);
         assert_eq!(src.watch.tries, 0);
-        assert!(look(&mut src.watch, false, None, 20 * sec).is_some());
+        let retry = src.camera_retry.as_mut().unwrap_or_else(|| panic!("retry"));
+        assert_eq!(retry.tries(), 0);
+        let act = retry.step(CameraObservation {
+            running: false,
+            frames: 0,
+            ended: false,
+            opening: false,
+            visible_or_on_air: true,
+            now_ns: t + sec,
+        });
+        assert!(matches!(act, CameraAction::Reopen(_)));
     }
 
     /// A capture that ended because macOS turned its permission off isn't started again every few
@@ -6325,65 +6840,14 @@ mod tests {
         assert!(look(&mut crashed, true, Some((0, false, Some("it crashed".into()))), s).is_some());
     }
 
-    /// The wait for a signal needs a session open to see it come: without one (the last try failed
-    /// to open, or it ended with an error) the watchdog still tries, slowly (review R9).
-    #[test]
-    fn a_no_signal_wait_without_a_session_is_retried_slowly() {
-        let s = 1_000_000_000;
-        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
-        w.tries = NO_SIGNAL_MAX_TRIES;
-        assert!(look(&mut w, false, None, 40 * s).is_some(), "not running: try again");
-        let err = Some((0, true, Some("runtime error".to_string())));
-        assert!(look(&mut w, true, err, 41 * s).is_some(), "ended with an error: try again");
-        // With a healthy session it still just waits.
-        assert_eq!(look(&mut w, true, Some((0, true, None)), 42 * s), None);
-        assert!(w.no_signal);
-    }
-
-    /// A capture card nobody has plugged anything into yet (a PS5 turned on later): once it
-    /// sends, the "no signal" wait ends by itself, with no unplugging or editing (GAPS #6).
-    #[test]
-    fn a_no_signal_card_wakes_when_its_picture_comes() {
-        let s = 1_000_000_000;
-        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
-        w.tries = NO_SIGNAL_MAX_TRIES;
-        assert_eq!(look(&mut w, true, Some((0, true, None)), 40 * s), None);
-        assert!(w.no_signal, "waiting for a signal");
-        // The console is switched on: frames flow on the session that was open all along.
-        assert_eq!(look(&mut w, true, Some((30, true, None)), 90 * s), None);
-        assert!(!w.no_signal && w.ever_sent, "the latch let go");
-        assert_eq!(w.tries, 0);
-        // And it's watched as a working card again: if it stops, it's restarted.
-        assert!(look(&mut w, true, Some((30, true, None)), 97 * s).is_some());
-    }
-
-    /// An HDMI link that flaps (one frame, then nothing, again and again) keeps its tries, so the
-    /// backoff grows instead of a restart every few seconds for ever (review R8).
-    #[test]
-    fn a_flapping_link_does_not_reset_its_backoff() {
-        let s = 1_000_000_000;
-        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
-        w.ever_sent = true;
-        let mut count = 0;
-        let mut now = 100 * s;
-        for _ in 0..5 {
-            count += 1;
-            assert_eq!(look(&mut w, true, Some((count, true, None)), now), None, "one frame");
-            now += 6 * s;
-            assert!(look(&mut w, true, Some((count, true, None)), now).is_some(), "stalled again");
-            w.tries += 1; // the watchdog's reopen
-        }
-        assert_eq!(w.tries, 5, "the failed tries were kept");
-    }
-
-    /// A card that has worked is looked for again within a few seconds when its HDMI comes back
-    /// from a long drop, not up to 30-60 s later; other sources keep the longer wait.
+    /// A camera/card that has worked and one that has not yet sent both retry quickly within 5 s;
+    /// microphones that worked keep their short retry, while other sources keep the 60 s wait.
     #[test]
     fn a_card_that_worked_is_retried_quickly_not_after_a_minute() {
         let s = 1_000_000_000;
         let mut card = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
         card.ever_sent = true;
-        assert!(card.backoff(0) <= 3 * s && card.backoff(9) <= 3 * s);
+        assert!(card.backoff(0) <= 5 * s && card.backoff(9) <= 5 * s);
         let mut mic = Watch::for_kind(Some(&SourceKind::Microphone("usb".into())), 0);
         assert_eq!(mic.backoff(9), 60 * s, "a mic that never sent keeps the slow wait");
         mic.ever_sent = true;
@@ -6392,7 +6856,7 @@ mod tests {
         media.ever_sent = true;
         assert_eq!(media.backoff(9), 60 * s, "other sources keep it");
         let unseen = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
-        assert_eq!(unseen.backoff(9), 60 * s, "a card that never sent keeps the slow wait");
+        assert_eq!((unseen.backoff(0), unseen.backoff(2), unseen.backoff(9)), (s, 4 * s, 5 * s));
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -9896,5 +10360,197 @@ mod tests {
             vert_px[center],
             vert_after[center]
         );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn offline_camera_stays_in_sources_and_keeps_retrying_within_5s() {
+        let Some(e) = engine() else { return };
+        let doc = serde_json::json!({
+            "current_program_scene": "Main",
+            "sources": [
+                {
+                    "id": "av_capture_input_v2",
+                    "name": "iPhone",
+                    "settings": { "device": "/no/such/iphone" }
+                },
+                {
+                    "id": "scene",
+                    "name": "Main",
+                    "settings": { "items": [{ "id": 1, "name": "iPhone", "visible": true }] }
+                }
+            ]
+        });
+        let _ = e.load_obs(&doc);
+        let (id, _) = e.source_named("iPhone").expect("selected camera kept in engine sources while waiting");
+        assert!(e.lock().sources.contains_key(&id), "camera source stays registered for watchdog retries");
+
+        let w = Watch::for_kind(Some(&SourceKind::Camera(CameraSpec::from("iphone-1"))), 0);
+        assert!(
+            w.backoff(0) <= 5_000_000_000 && w.backoff(9) <= 5_000_000_000,
+            "unseen camera backoff must cap at 5 s, got {} ns",
+            w.backoff(9)
+        );
+        // Second load once AVFoundation cache is warm fails within OPEN_WAIT; camera still stays
+        // tracked in `sources` and marked waiting for the camera.
+        let _ = e.load_obs(&doc);
+        let (id2, _) = e.source_named("iPhone").expect("warm offline camera stays in opened");
+        assert!(e.lock().sources.contains_key(&id2));
+        assert_eq!(e.waiting_cameras(), vec!["iPhone".to_string()]);
+        assert_eq!(
+            e.camera_status("iPhone"),
+            Some(CameraStatus { state: "waiting", message: Some("Waiting for the camera"), tries: 1 })
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn fake_camera_backend_recovers_through_drop_backoff_visibility_and_removal() {
+        let Some(e) = engine() else { return };
+        let backend = FakeCameraBackend::new([255, 0, 0, 255]);
+        {
+            let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(live, None, Some(SourceKind::Camera("fake-iphone".into()))));
+            st.opened.insert("iPhone".into(), (1, SourceKind::Camera("fake-iphone".into())));
+            st.scenes.insert("Main".into(), vec![SceneItem::new(1, Placement::default())]);
+            st.scenes.insert("Other".into(), Vec::new());
+            st.on_air = Some("Main".into());
+        }
+        // Initial stream delivers red frames to the scene.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if e.lock().sources.get(&1).and_then(|s| s.size).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let px_before = e.snapshot_scene_at("Main", (16, 16), (16, 16)).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(&px_before[0..4], &[255, 0, 0, 255]);
+        assert_eq!(backend.active_sessions.load(Ordering::Acquire), 1);
+
+        let reopen_b = Arc::clone(&backend);
+        let reopen: Reopener = Arc::new(move |kind| match kind {
+            SourceKind::Camera(spec) if spec.id == "fake-iphone" => Some(reopen_b.open()),
+            _ => None,
+        });
+        let cmd = e.audio.cmd_sender();
+        let wait_idle = || {
+            let dl = Instant::now() + Duration::from_secs(2);
+            while e.lock().sources.get(&1).is_some_and(|s| s.opening.is_some()) && Instant::now() < dl {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Simulate iPhone locking / Continuity interruption while offline.
+        backend.interrupted.store(true, Ordering::Release);
+        backend.online.store(false, Ordering::Release);
+        *backend.color.lock().unwrap_or_else(|x| x.into_inner()) = [0, 255, 0, 255];
+
+        let mut t = now_ns();
+        let attempts0 = backend.open_attempts.load(Ordering::Acquire);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+        wait_idle();
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), attempts0 + 1);
+        assert_eq!(backend.active_sessions.load(Ordering::Acquire), 0, "old session dropped without leak");
+        assert_eq!(e.waiting_cameras(), vec!["iPhone".to_string()]);
+        assert_eq!(e.source_load().into_iter().find(|l| l.name == "iPhone").map(|l| l.waiting), Some(true));
+
+        // Drive past 3 failures confirming 1 s -> 2 s -> 4 s -> 5 s backoff (never hammering, never stopping).
+        for step_ns in [1_050_000_000u64, 2_050_000_000, 4_050_000_000, 5_050_000_000, 5_050_000_000] {
+            let before = backend.open_attempts.load(Ordering::Acquire);
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 200_000_000);
+            assert_eq!(backend.open_attempts.load(Ordering::Acquire), before, "must not hammer before backoff");
+            t += step_ns;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+            wait_idle();
+            assert_eq!(backend.open_attempts.load(Ordering::Acquire), before + 1);
+            assert_eq!(backend.active_sessions.load(Ordering::Acquire), 0);
+        }
+
+        // Switching off-air pauses retries completely.
+        e.go("Other").unwrap_or_else(|x| panic!("{x}"));
+        let attempts_off_air = backend.open_attempts.load(Ordering::Acquire);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 30_000_000_000);
+        wait_idle();
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), attempts_off_air);
+
+        // Bringing iPhone back online + switching back on air resumes picture automatically.
+        backend.interrupted.store(false, Ordering::Release);
+        backend.online.store(true, Ordering::Release);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 30_000_000_000);
+        wait_idle();
+        assert_eq!(backend.active_sessions.load(Ordering::Acquire), 1);
+        assert_eq!(backend.max_active_sessions.load(Ordering::Acquire), 1, "at most 1 live session at once");
+
+        let dl2 = Instant::now() + Duration::from_secs(2);
+        let mut px_after = vec![0; 4];
+        while Instant::now() < dl2 {
+            px_after = e.snapshot_scene_at("Main", (16, 16), (16, 16)).unwrap_or_default();
+            if px_after.get(0..4) == Some(&[0, 255, 0, 255]) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(&px_after[0..4], &[0, 255, 0, 255], "resumed green frames automatically");
+        assert!(e.waiting_cameras().is_empty(), "waiting state clears once frames resume");
+
+        // Removing the source drops the session and stops retrying permanently.
+        e.remove_source(1);
+        assert_eq!(backend.active_sessions.load(Ordering::Acquire), 0);
+        let final_attempts = backend.open_attempts.load(Ordering::Acquire);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 60_000_000_000);
+        wait_idle();
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), final_attempts);
+    }
+
+    #[test]
+    fn snapshot_item_transformed_handles_offscreen_and_missing_items() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 40, height: 20, rgba: [10, 200, 30, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        let mut off =
+            SceneItem::new(1, Placement { x: -300.0, y: -200.0, scale_x: -1.0, rotation: 90.0, ..Default::default() });
+        off.item_id = 7;
+        e.set_scene("Main", vec![off]);
+
+        let (px, size) = e.snapshot_item_transformed("Main", 7, (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(size, (20, 40), "completely off-canvas item preserves its 1:1 rotated box");
+        assert!(px.as_chunks::<4>().0.iter().any(|p| p[1] > 150 && p[3] > 200));
+
+        assert!(e.snapshot_item_transformed("Main", 999, (640, 360)).is_err());
+
+        // Nested groups (Main > Outer > Inner > Child) + parent outside shadow expansion.
+        let mut child = SceneItem::new(1, Placement { x: 10.0, y: 10.0, ..Default::default() });
+        child.item_id = 11;
+        e.set_scene("Inner", vec![child]);
+
+        let mut inner =
+            SceneItem::new(0, Placement { x: 20.0, y: 20.0, scale_x: 0.5, scale_y: 0.5, ..Default::default() });
+        inner.scene = Some("Inner".into());
+        inner.group = Some((60, 40));
+        inner.item_id = 12;
+        inner.effects = vec![Effect::Shadow { rgba: [0.0, 0.0, 0.0, 1.0], blur: 8.0, x: 0.0, y: 0.0, outside: true }];
+        e.set_scene("Outer", vec![inner]);
+
+        let mut outer = SceneItem::new(0, Placement { x: 50.0, y: 50.0, ..Default::default() });
+        outer.scene = Some("Outer".into());
+        outer.group = Some((120, 100));
+        outer.item_id = 13;
+        e.set_scene("Main", vec![outer]);
+
+        let (nested_px, nested_size) =
+            e.snapshot_item_transformed("Main", 11, (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        // Child (40x20) at (10,10) inside Inner (60x40) with 8px outside shadow -> [2..58, 2..38] -> 56x36;
+        // Inner scaled 0.5 at (20,20) inside Outer at (50,50) -> canvas x in [71..99], y in [71..89] (28x18).
+        assert_eq!(nested_size, (28, 18), "nested group keeps child transform and parent shadow margin");
+        let full_scene = e.snapshot_scene_at("Main", (640, 360), (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        let mut expected_nested = Vec::with_capacity((28 * 18 * 4) as usize);
+        for y in 71..89usize {
+            let start = (y * 640 + 71) * 4;
+            expected_nested.extend_from_slice(&full_scene[start..start + 28 * 4]);
+        }
+        assert_eq!(nested_px, expected_nested, "nested group screenshot matches scene render pixel-for-pixel");
     }
 }

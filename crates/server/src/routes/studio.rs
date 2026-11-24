@@ -85,6 +85,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/studio/engine/scenes/{scene}/items/{id}/filters/{filter}/options", get(engine_item_filter_options))
         .route("/studio/engine/scenes/{scene}/items/{id}/paste-filters", post(engine_paste_item_filters))
         .route("/studio/engine/scenes/{scene}/items/{id}/picture", get(engine_item_picture))
+        .route("/studio/engine/scenes/{scene}/items/{id}/screenshot", post(engine_item_screenshot))
         .route("/studio/engine/sources/{name}/deinterlace", put(engine_deinterlace))
         .route("/studio/engine/quick-transitions", put(engine_quick_transitions))
         .route("/studio/engine/undo", post(engine_undo))
@@ -1636,8 +1637,41 @@ async fn engine_source_status(State(app): State<AppState>, Path(name): Path<Stri
     act(&app, StudioAct::SourceStatus { name }).await
 }
 
-async fn engine_screenshot(State(app): State<AppState>, Path(name): Path<String>) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::Screenshot { name }).await
+#[derive(Default, Deserialize)]
+struct ScreenshotTarget {
+    #[serde(default)]
+    scene: Option<String>,
+    #[serde(default)]
+    item: Option<i64>,
+}
+
+async fn engine_screenshot(
+    State(app): State<AppState>,
+    Path(name): Path<String>,
+    Query(q): Query<ScreenshotTarget>,
+    OptionalBody(b): OptionalBody<ScreenshotTarget>,
+) -> ApiResult<Json<Value>> {
+    let scene = match (q.scene, b.scene) {
+        (Some(qs), Some(bs)) if qs != bs => return Err(ApiError::invalid("scene: query and body do not match.")),
+        (qs, bs) => bs.or(qs),
+    };
+    let item = match (q.item, b.item) {
+        (Some(qi), Some(bi)) if qi != bi => return Err(ApiError::invalid("item: query and body do not match.")),
+        (qi, bi) => bi.or(qi),
+    };
+    let target = match (scene, item) {
+        (Some(scene), Some(id)) => Some(ItemTarget { scene, id }),
+        (None, None) => None,
+        _ => return Err(ApiError::invalid("scene, item: give both or neither.")),
+    };
+    act(&app, StudioAct::Screenshot { name, item: target }).await
+}
+
+async fn engine_item_screenshot(
+    State(app): State<AppState>,
+    Path((scene, id)): Path<(String, i64)>,
+) -> ApiResult<Json<Value>> {
+    act(&app, StudioAct::Screenshot { name: String::new(), item: Some(ItemTarget { scene, id }) }).await
 }
 
 async fn engine_web(

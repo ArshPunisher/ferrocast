@@ -3,8 +3,8 @@
 //! host clock in nanoseconds, the same as screen capture's, so everything lines up.
 
 use std::collections::{HashSet, VecDeque};
-use std::ffi::CStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::{CStr, c_void};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
@@ -16,9 +16,10 @@ use objc2_av_foundation::{
     AVCaptureDeviceDiscoverySession, AVCaptureDeviceInput, AVCaptureDevicePosition, AVCaptureDeviceType,
     AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeDeskViewCamera,
     AVCaptureDeviceWasConnectedNotification, AVCaptureDeviceWasDisconnectedNotification, AVCaptureOutput,
-    AVCaptureSession, AVCaptureSessionErrorKey, AVCaptureSessionPresetInputPriority,
-    AVCaptureSessionRuntimeErrorNotification, AVCaptureVideoDataOutput, AVCaptureVideoDataOutputSampleBufferDelegate,
-    AVMediaTypeAudio, AVMediaTypeMuxed, AVMediaTypeVideo,
+    AVCaptureSession, AVCaptureSessionDidStopRunningNotification, AVCaptureSessionErrorKey,
+    AVCaptureSessionInterruptionEndedNotification, AVCaptureSessionPresetInputPriority,
+    AVCaptureSessionRuntimeErrorNotification, AVCaptureSessionWasInterruptedNotification, AVCaptureVideoDataOutput,
+    AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaTypeAudio, AVMediaTypeMuxed, AVMediaTypeVideo,
 };
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::{
@@ -63,8 +64,8 @@ fn dynamic_device_type(symbol: &CStr) -> Option<&'static AVCaptureDeviceType> {
     }
 }
 
-fn discover_cameras() -> Vec<Device> {
-    // SAFETY: querying AVFoundation discovery sessions with valid constant device types.
+fn camera_device_types() -> Vec<&'static AVCaptureDeviceType> {
+    // SAFETY: static AVFoundation constants + optional runtime Continuity/External device types.
     unsafe {
         let mut device_types: Vec<&AVCaptureDeviceType> =
             vec![AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeDeskViewCamera];
@@ -77,15 +78,34 @@ fn discover_cameras() -> Vec<Device> {
                 device_types.push(dt);
             }
         }
-        let types = NSArray::from_slice(&device_types);
-        let mut seen = HashSet::new();
-        let mut out = Vec::new();
-        for kind in [AVMediaTypeVideo, AVMediaTypeMuxed].into_iter().flatten() {
-            let session = AVCaptureDeviceDiscoverySession::discoverySessionWithDeviceTypes_mediaType_position(
-                &types,
-                Some(kind),
-                AVCaptureDevicePosition::Unspecified,
-            );
+        device_types
+    }
+}
+
+fn camera_discovery_sessions() -> Vec<Retained<AVCaptureDeviceDiscoverySession>> {
+    // SAFETY: querying AVFoundation discovery sessions with valid constant device types.
+    unsafe {
+        let types = NSArray::from_slice(&camera_device_types());
+        [AVMediaTypeVideo, AVMediaTypeMuxed]
+            .into_iter()
+            .flatten()
+            .map(|kind| {
+                AVCaptureDeviceDiscoverySession::discoverySessionWithDeviceTypes_mediaType_position(
+                    &types,
+                    Some(kind),
+                    AVCaptureDevicePosition::Unspecified,
+                )
+            })
+            .collect()
+    }
+}
+
+fn discover_cameras() -> Vec<Device> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    // SAFETY: reading `.devices()` and device metadata from live discovery sessions.
+    unsafe {
+        for session in camera_discovery_sessions() {
             for d in session.devices().iter() {
                 let id = d.uniqueID().to_string();
                 if seen.insert(id.clone()) {
@@ -93,8 +113,8 @@ fn discover_cameras() -> Vec<Device> {
                 }
             }
         }
-        out
     }
+    out
 }
 
 fn list(video: bool) -> Vec<Device> {
@@ -128,12 +148,21 @@ fn is_default(id: &str) -> bool {
 
 /// Cameras connected now.
 pub fn cameras() -> Vec<Device> {
+    ensure_hotplug_listener();
     list(true)
 }
 
 /// Microphones and other sound inputs connected now.
 pub fn microphones() -> Vec<Device> {
+    ensure_hotplug_listener();
     list(false)
+}
+
+/// Monotonic counter bumped whenever any camera or microphone connects, disconnects, or changes
+/// in Continuity Camera discovery so device option caches refresh immediately.
+pub fn hotplug_epoch() -> u64 {
+    ensure_hotplug_listener();
+    HOTPLUG_EPOCH.load(Ordering::Acquire)
 }
 
 /// What a capture's delegate keeps.
@@ -142,7 +171,11 @@ struct Shared {
     device_id: String,
     label: &'static str,
     /// The "staying off the Bluetooth microphone" line has been logged.
-    bluetooth_noted: std::sync::atomic::AtomicBool,
+    bluetooth_noted: AtomicBool,
+    /// Set by `AVCaptureSessionWasInterruptedNotification` and cleared on `InterruptionEnded`.
+    interrupted: AtomicBool,
+    /// Suppresses stop notifications triggered intentionally during `Capture::drop`.
+    dropping: AtomicBool,
     /// Something to say on the dashboard about how this capture opened (taken once).
     pending_notice: Mutex<Option<crate::notices::Notice>>,
     frame: Mutex<Option<(Picture, u64)>>,
@@ -150,23 +183,42 @@ struct Shared {
     surface: Mutex<Option<(super::screen::Surface, u64)>>,
     sound: Mutex<VecDeque<(Vec<f32>, u64)>>,
     count: AtomicU64,
-    /// Why AVFoundation reported this capture ended (device disconnected or session runtime error).
+    /// Why AVFoundation reported this capture ended (device disconnected, stopped running, or error).
     stopped: Mutex<Option<String>>,
 }
 
 /// Process-wide hotplug sequence + recently connected unique device ids for `engine::watchdog`.
 static HOTPLUG_SEQ: AtomicU64 = AtomicU64::new(0);
+static HOTPLUG_EPOCH: AtomicU64 = AtomicU64::new(1);
 static HOTPLUG_RECENT: Mutex<VecDeque<(u64, String)>> = Mutex::new(VecDeque::new());
 const MAX_HOTPLUG_RECENT: usize = 64;
 
+fn bump_hotplug_epoch() {
+    HOTPLUG_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 fn record_hotplug_connected(id: String) {
     let seq = HOTPLUG_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+    bump_hotplug_epoch();
     if let Ok(mut q) = HOTPLUG_RECENT.lock() {
         q.push_back((seq, id));
         while q.len() > MAX_HOTPLUG_RECENT {
             q.pop_front();
         }
     }
+}
+
+fn record_hotplug_disconnected(id: &str) {
+    clear_own(id);
+    bump_hotplug_epoch();
+}
+
+fn diff_device_sets(prev: &HashSet<String>, next: &HashSet<String>) -> (Vec<String>, Vec<String>) {
+    let mut added: Vec<String> = next.iter().filter(|id| !prev.contains(*id)).cloned().collect();
+    let mut removed: Vec<String> = prev.iter().filter(|id| !next.contains(*id)).cloned().collect();
+    added.sort();
+    removed.sort();
+    (added, removed)
 }
 
 fn clear_own(id: &str) {
@@ -324,6 +376,24 @@ define_class!(
             let detail = runtime_error_detail(note);
             record_stopped(self.ivars(), format!("the {} stopped ({detail})", self.ivars().label));
         }
+
+        #[unsafe(method(sessionInterrupted:))]
+        fn session_interrupted(&self, _note: &NSNotification) {
+            self.ivars().interrupted.store(true, Ordering::Release);
+        }
+
+        #[unsafe(method(interruptionEnded:))]
+        fn interruption_ended(&self, _note: &NSNotification) {
+            self.ivars().interrupted.store(false, Ordering::Release);
+            record_hotplug_connected(self.ivars().device_id.clone());
+        }
+
+        #[unsafe(method(didStopRunning:))]
+        fn did_stop_running(&self, _note: &NSNotification) {
+            if !self.ivars().dropping.load(Ordering::Acquire) {
+                record_stopped(self.ivars(), format!("the {} stopped running", self.ivars().label));
+            }
+        }
     }
 );
 
@@ -361,6 +431,24 @@ impl NotificationGuard {
                 Some(AVCaptureSessionRuntimeErrorNotification),
                 Some(session),
             );
+            center.addObserver_selector_name_object(
+                &obs,
+                sel!(sessionInterrupted:),
+                Some(AVCaptureSessionWasInterruptedNotification),
+                Some(session),
+            );
+            center.addObserver_selector_name_object(
+                &obs,
+                sel!(interruptionEnded:),
+                Some(AVCaptureSessionInterruptionEndedNotification),
+                Some(session),
+            );
+            center.addObserver_selector_name_object(
+                &obs,
+                sel!(didStopRunning:),
+                Some(AVCaptureSessionDidStopRunningNotification),
+                Some(session),
+            );
         }
         Self(obs)
     }
@@ -376,9 +464,10 @@ impl Drop for NotificationGuard {
 }
 
 define_class!(
-    // SAFETY: NSObject may be subclassed; zero ivars.
+    // SAFETY: NSObject may be subclassed; the ivars are a Mutex dropped with the observer.
     #[unsafe(super(NSObject))]
     #[name = "FerrocastHotplugObserver"]
+    #[ivars = Mutex<HashSet<String>>]
     struct HotplugObserver;
 
     unsafe impl NSObjectProtocol for HotplugObserver {}
@@ -391,6 +480,9 @@ define_class!(
             {
                 // SAFETY: reading uniqueID from a live AVCaptureDevice in notification.
                 let id = unsafe { dev.uniqueID() }.to_string();
+                if let Ok(mut known) = self.ivars().lock() {
+                    known.insert(id.clone());
+                }
                 record_hotplug_connected(id);
             }
         }
@@ -402,7 +494,33 @@ define_class!(
             {
                 // SAFETY: reading uniqueID from a live AVCaptureDevice in notification.
                 let id = unsafe { dev.uniqueID() }.to_string();
-                clear_own(&id);
+                if let Ok(mut known) = self.ivars().lock() {
+                    known.remove(&id);
+                }
+                record_hotplug_disconnected(&id);
+            }
+        }
+
+        #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
+        fn observe_value(
+            &self,
+            _key_path: Option<&NSString>,
+            _object: Option<&AnyObject>,
+            _change: Option<&AnyObject>,
+            _context: *mut c_void,
+        ) {
+            let next: HashSet<String> = discover_cameras().into_iter().map(|d| d.id).collect();
+            let (added, removed) = {
+                let Ok(mut known) = self.ivars().lock() else { return };
+                let diff = diff_device_sets(&known, &next);
+                *known = next;
+                diff
+            };
+            for id in added {
+                record_hotplug_connected(id);
+            }
+            for id in removed {
+                record_hotplug_disconnected(&id);
             }
         }
     }
@@ -410,6 +528,7 @@ define_class!(
 
 struct HotplugGuard {
     _observer: Retained<HotplugObserver>,
+    _discovery: Vec<Retained<AVCaptureDeviceDiscoverySession>>,
 }
 
 // SAFETY: `HotplugGuard` lives forever in a `OnceLock` and only touches atomics/mutexes.
@@ -420,10 +539,24 @@ unsafe impl Sync for HotplugGuard {}
 fn ensure_hotplug_listener() {
     static ONCE: OnceLock<HotplugGuard> = OnceLock::new();
     ONCE.get_or_init(|| {
+        let discovery = camera_discovery_sessions();
+        let mut initial = HashSet::new();
+        // SAFETY: reading `.devices()` from newly created discovery sessions before installing KVO.
+        unsafe {
+            for s in &discovery {
+                for d in s.devices().iter() {
+                    initial.insert(d.uniqueID().to_string());
+                }
+            }
+        }
         let this: Allocated<HotplugObserver> = HotplugObserver::alloc();
-        // SAFETY: NSObject's init on freshly allocated stateless observer, registered for process lifetime.
-        let obs: Retained<HotplugObserver> = unsafe { msg_send![this, init] };
-        // SAFETY: observer stays alive for the lifetime of the process via `OnceLock`.
+        let this = this.set_ivars(Mutex::new(initial));
+        // SAFETY: NSObject's init on freshly allocated observer, registered for process lifetime.
+        let obs: Retained<HotplugObserver> = unsafe { msg_send![super(this), init] };
+        let key_path = NSString::from_str("devices");
+        let null_ctx: *mut c_void = std::ptr::null_mut();
+        // SAFETY: observer and discovery sessions both stay alive for the process lifetime via
+        // `OnceLock`, so notifications and KVO registrations never outlive either object.
         unsafe {
             let center = NSNotificationCenter::defaultCenter();
             center.addObserver_selector_name_object(
@@ -438,8 +571,12 @@ fn ensure_hotplug_listener() {
                 Some(AVCaptureDeviceWasDisconnectedNotification),
                 None,
             );
+            for s in &discovery {
+                let _: () =
+                    msg_send![&**s, addObserver: &*obs, forKeyPath: &*key_path, options: 0usize, context: null_ctx];
+            }
         }
-        HotplugGuard { _observer: obs }
+        HotplugGuard { _observer: obs, _discovery: discovery }
     });
 }
 
@@ -1011,13 +1148,21 @@ impl Capture {
         true
     }
 
-    /// Why it ended, if it did: reported immediately on disconnect or session runtime error
-    /// instead of waiting for `STALL_NS`.
+    /// Why it ended, if it did: reported immediately on disconnect, interruption, stop running, or
+    /// session runtime error instead of waiting for `STALL_NS`.
     pub fn ended(&self) -> Option<String> {
         if let Ok(stopped) = self.shared.stopped.lock()
             && let Some(reason) = stopped.as_ref()
         {
             return Some(reason.clone());
+        }
+        // SAFETY: checking whether the capture session was interrupted or stopped running.
+        if self.shared.interrupted.load(Ordering::Acquire) || unsafe { self.session.isInterrupted() } {
+            return Some(format!("the {} was interrupted", self.shared.label));
+        }
+        // SAFETY: checking whether the capture session is still running.
+        if unsafe { !self.session.isRunning() } {
+            return Some(format!("the {} stopped running", self.shared.label));
         }
         // SAFETY: checking whether the capture device is still physically connected.
         if unsafe { !self.device.isConnected() } {
@@ -1041,6 +1186,7 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        self.shared.dropping.store(true, Ordering::Release);
         // SAFETY: the session is live; stopping it ends the callbacks.
         unsafe { self.session.stopRunning() };
     }
@@ -1400,16 +1546,90 @@ mod tests {
         );
     }
 
+    fn hotplug_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn hotplug_tracker_records_connected_devices() {
         use super::{HOTPLUG_SEQ, record_hotplug_connected, take_hotplug_connected};
         use std::sync::atomic::Ordering;
 
+        let _guard = hotplug_test_lock();
         let mut seq = HOTPLUG_SEQ.load(Ordering::Acquire);
         assert_eq!(take_hotplug_connected(&mut seq), None);
         record_hotplug_connected("cam-usb-replugged".into());
         let connected = take_hotplug_connected(&mut seq).unwrap_or_default();
         assert!(connected.iter().any(|id| id == "cam-usb-replugged"));
         assert_eq!(take_hotplug_connected(&mut seq), None);
+    }
+
+    #[test]
+    fn session_interruption_and_stop_running_end_capture() {
+        use super::{Observer, Shared};
+        use objc2::{AnyThread, msg_send, sel};
+        use objc2_foundation::{NSNotification, NSObjectProtocol, NSString};
+        use std::sync::Arc;
+
+        let _guard = hotplug_test_lock();
+        let shared = Arc::new(Shared { device_id: "cam-iphone".into(), label: "camera", ..Shared::default() });
+        let obs = Observer::new(shared.clone());
+        assert!(obs.respondsToSelector(sel!(sessionInterrupted:)), "must observe WasInterrupted");
+        assert!(obs.respondsToSelector(sel!(interruptionEnded:)), "must observe InterruptionEnded");
+        assert!(obs.respondsToSelector(sel!(didStopRunning:)), "must observe DidStopRunning");
+
+        let note_int = NSString::from_str("AVCaptureSessionWasInterruptedNotification");
+        // SAFETY: creating synthetic NSNotification for sessionInterrupted: handler.
+        let int_note =
+            unsafe { NSNotification::initWithName_object_userInfo(NSNotification::alloc(), &note_int, None, None) };
+        // SAFETY: invoking sessionInterrupted: on live `Observer`.
+        let _: () = unsafe { msg_send![&*obs, sessionInterrupted: &*int_note] };
+        assert!(shared.interrupted.load(std::sync::atomic::Ordering::Acquire), "WasInterrupted must flag interrupted");
+
+        let seq_before = super::HOTPLUG_SEQ.load(std::sync::atomic::Ordering::Acquire);
+        let note_end = NSString::from_str("AVCaptureSessionInterruptionEndedNotification");
+        // SAFETY: creating synthetic NSNotification for interruptionEnded: handler.
+        let end_note =
+            unsafe { NSNotification::initWithName_object_userInfo(NSNotification::alloc(), &note_end, None, None) };
+        // SAFETY: invoking interruptionEnded: on live `Observer`.
+        let _: () = unsafe { msg_send![&*obs, interruptionEnded: &*end_note] };
+        assert!(
+            !shared.interrupted.load(std::sync::atomic::Ordering::Acquire),
+            "InterruptionEnded must clear interrupted"
+        );
+        assert!(super::HOTPLUG_SEQ.load(std::sync::atomic::Ordering::Acquire) > seq_before);
+
+        let name = NSString::from_str("AVCaptureSessionDidStopRunningNotification");
+        // SAFETY: creating synthetic NSNotification for didStopRunning: handler.
+        let note = unsafe { NSNotification::initWithName_object_userInfo(NSNotification::alloc(), &name, None, None) };
+        // SAFETY: invoking didStopRunning: on live `Observer`.
+        let _: () = unsafe { msg_send![&*obs, didStopRunning: &*note] };
+        assert!(
+            shared.stopped.lock().ok().and_then(|s| s.clone()).is_some(),
+            "DidStopRunning must immediately mark capture ended"
+        );
+    }
+
+    #[test]
+    fn hotplug_epoch_bumps_on_disconnect_and_discovery_diff() {
+        use super::{diff_device_sets, hotplug_epoch, record_hotplug_connected, record_hotplug_disconnected};
+        use std::collections::HashSet;
+
+        let _guard = hotplug_test_lock();
+        let e0 = hotplug_epoch();
+        record_hotplug_connected("cam-continuity".into());
+        let e1 = hotplug_epoch();
+        assert!(e1 > e0, "connect must bump hotplug_epoch");
+
+        record_hotplug_disconnected("cam-continuity");
+        let e2 = hotplug_epoch();
+        assert!(e2 > e1, "disconnect must bump hotplug_epoch so device lists refresh");
+
+        let prev: HashSet<String> = ["builtin".into(), "iphone".into()].into_iter().collect();
+        let next: HashSet<String> = ["builtin".into(), "deskview".into()].into_iter().collect();
+        let (added, removed) = diff_device_sets(&prev, &next);
+        assert_eq!(added, vec!["deskview"]);
+        assert_eq!(removed, vec!["iphone"]);
     }
 }
