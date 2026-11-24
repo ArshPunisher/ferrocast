@@ -52,6 +52,11 @@ pub fn microphones() -> Vec<Device> {
     crate::sound_in::inputs().into_iter().map(|n| Device { id: n.clone(), name: n }).collect()
 }
 
+/// Monotonic counter bumped when connected devices change (no background monitor on Windows).
+pub fn hotplug_epoch() -> u64 {
+    0
+}
+
 /// A running camera or microphone; dropping it stops.
 #[derive(Debug)]
 pub struct Capture {

@@ -2730,15 +2730,29 @@ impl StudioHost for DesktopStudio {
         // address tried off it (the app's web client, its time limit).
         if let StudioAct::SourceStatus { name } = &act {
             let n = name.clone();
-            let (kind, settings) = self
-                .on_main(move |h| -> Result<(String, Value), String> {
+            let (kind, settings, camera_status) = self
+                .on_main(move |h| -> Result<(String, Value, Option<ferrocore::engine::CameraStatus>), String> {
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
-                    Ok((c.kind(&n).map_err(|e| e.to_string())?, c.settings(&n).map_err(|e| e.to_string())?))
+                    Ok((
+                        c.kind(&n).map_err(|e| e.to_string())?,
+                        c.settings(&n).map_err(|e| e.to_string())?,
+                        c.camera_status(&n),
+                    ))
                 })
                 .await??;
             // Trimmed, as the engine keeps them (a Web text's reads are noted under these).
             let text = |k: &str| settings.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
             return Ok(match kind.as_str() {
+                "av_capture_input" | "av_capture_input_v2" | "dshow_input" | "v4l2_input" => match camera_status {
+                    Some(st) => json!({
+                        "camera": {
+                            "state": st.state,
+                            "message": st.message,
+                            "tries": st.tries,
+                        }
+                    }),
+                    None => json!({}),
+                },
                 "ferrocast_web_text" => match ferrocore::source::webtext::status(&text("url"), &text("path")) {
                     Some(s) => json!({ "web_text": { "at_ms": s.at_ms, "value": s.value, "error": s.error } }),
                     None => json!({ "web_text": null }),
@@ -3179,7 +3193,13 @@ impl StudioHost for DesktopStudio {
                 // Pictures each source has sent to the card, and their size: the page works out
                 // each one's rate between two reads ("What's slowing my stream?").
                 "sources": h.collection.as_ref().map(|c| c.source_load()).unwrap_or_default().into_iter()
-                    .map(|l| json!({ "name": l.name, "sent": l.sent, "width": l.width, "height": l.height }))
+                    .map(|l| json!({
+                        "name": l.name,
+                        "sent": l.sent,
+                        "width": l.width,
+                        "height": l.height,
+                        "waiting": l.waiting,
+                    }))
                     .collect::<Vec<_>>(),
                 // The last remux (OBS's Remux, or MKV made into MP4 after recording).
                 "remux": REMUX.lock().unwrap_or_else(|p| p.into_inner()).clone(),

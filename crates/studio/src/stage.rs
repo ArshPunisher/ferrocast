@@ -5389,25 +5389,47 @@ impl Stage {
         self.engine.borrow().as_ref().map(|e| e.engine.source_load()).unwrap_or_default()
     }
 
-    /// Captures on air that have shown nothing for a few seconds (the black screen fixer):
-    /// a screen, window or app capture without Screen Recording allowed (macOS), or one with no
-    /// picture (nothing picked, the window gone, a camera that never sent). The status bar and
-    /// the Ready check say why and what to do.
+    /// Captures on air that have shown nothing (the black screen fixer): a screen, window or app
+    /// capture without Screen Recording allowed (macOS), a camera waiting to connect or recover
+    /// (`waiting`), or one with no picture (`no_picture`). The status bar and Ready check say why
+    /// and what to do.
     pub fn capture_problems(&self) -> Vec<crate::collection::CaptureProblem> {
         let Some(e) = self.engine.borrow().clone() else { return Vec::new() };
         let quiet = e.engine.quiet_captures(3_000_000_000);
-        if quiet.is_empty() {
+        let waiting: std::collections::HashSet<String> = e.engine.waiting_cameras().into_iter().collect();
+        if quiet.is_empty() && waiting.is_empty() {
             return Vec::new();
         }
         let allowed = crate::screen_access();
-        quiet
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<crate::collection::CaptureProblem> = quiet
             .into_iter()
             .map(|(source, screen)| {
+                seen.insert(source.clone());
                 let kind = self.source(&source).map(|s| kind_of(&s).to_string()).unwrap_or_default();
-                let problem = if screen && !allowed { "permission" } else { "no_picture" };
+                let problem = if waiting.contains(&source) {
+                    "waiting"
+                } else if screen && !allowed {
+                    "permission"
+                } else {
+                    "no_picture"
+                };
                 crate::collection::CaptureProblem { source, kind, problem }
             })
-            .collect()
+            .collect();
+        for source in waiting {
+            if seen.insert(source.clone()) {
+                let kind = self.source(&source).map(|s| kind_of(&s).to_string()).unwrap_or_default();
+                out.push(crate::collection::CaptureProblem { source, kind, problem: "waiting" });
+            }
+        }
+        out.sort_by(|a, b| a.source.cmp(&b.source));
+        out
+    }
+
+    /// Live camera availability state (`waiting` or `live`) for a named source.
+    pub fn camera_status(&self, name: &str) -> Option<ferrocore::engine::CameraStatus> {
+        self.engine.borrow().as_ref().and_then(|e| e.engine.camera_status(name))
     }
 
     // ------------------------------------------------------------------ transitions
@@ -10240,5 +10262,48 @@ mod tests {
             assert_eq!(s.current(), "Two");
             assert_eq!(px(), [0, 0, 255], "T-bar release used resolved cut transition");
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn waiting_camera_reports_waiting_status_instead_of_no_picture() {
+        let doc = json!({
+            "sources": [
+                {
+                    "id": "av_capture_input_v2",
+                    "versioned_id": "av_capture_input_v2",
+                    "name": "iPhone Cam",
+                    "settings": { "device": "/no/such/continuity-cam" },
+                    "filters": []
+                },
+                {
+                    "id": "scene",
+                    "name": "Main",
+                    "settings": {
+                        "items": [{ "id": 1, "name": "iPhone Cam", "visible": true }]
+                    }
+                }
+            ],
+            "current_program_scene": "Main",
+            "scene_order": [{ "name": "Main" }]
+        });
+        let s = ok(Stage::load(Canvas { width: 320, height: 180, fps: 30 }, &doc, "Main"));
+        // Trigger engine load even if cache is cold first.
+        let Ok(_) = s.engine() else { return };
+        // Warm second reopen guarantees synchronous open failure reaches waiting camera path.
+        s.edit(|_| ());
+        assert_eq!(
+            s.camera_status("iPhone Cam").map(|st| (st.state, st.message)),
+            Some(("waiting", Some("Waiting for the camera")))
+        );
+        let problems = s.capture_problems();
+        assert!(
+            problems.iter().any(|p| p.source == "iPhone Cam" && p.problem == "waiting"),
+            "expected waiting problem, got {problems:?}"
+        );
+        assert!(
+            !problems.iter().any(|p| p.source == "iPhone Cam" && p.problem == "no_picture"),
+            "must not classify waiting camera as dead no_picture: {problems:?}"
+        );
     }
 }

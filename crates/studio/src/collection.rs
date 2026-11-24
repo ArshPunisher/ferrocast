@@ -501,7 +501,8 @@ pub fn ask_captions_access() {
 }
 
 /// A capture on air that shows nothing (`capture_problems`): `problem` is `permission`
-/// (macOS's Screen Recording is off for this app), `no_picture` or `black`.
+/// (macOS's Screen Recording is off for this app), `waiting` (waiting for an interrupted or
+/// disconnected camera to return), `no_picture` or `black`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CaptureProblem {
     pub source: String,

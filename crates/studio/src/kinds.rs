@@ -71,7 +71,7 @@ pub fn lists_devices(kind: &str) -> bool {
 /// camera plugged in shows the next time you look.
 const FRESH: Duration = Duration::from_millis(1500);
 
-type Slot = Arc<Mutex<Option<(Instant, Option<Vec<OptionInfo>>)>>>;
+type Slot = Arc<Mutex<Option<(Instant, u64, Option<Vec<OptionInfo>>)>>>;
 
 fn slot(kind: &str) -> Slot {
     static SLOTS: Mutex<Option<HashMap<String, Slot>>> = Mutex::new(None);
@@ -79,24 +79,45 @@ fn slot(kind: &str) -> Slot {
     all.get_or_insert_with(HashMap::new).entry(kind.to_string()).or_default().clone()
 }
 
-/// `options`, with device lists read at most once per [`FRESH`]: two asks at once (the
-/// dialog reading ahead while you click) wait for the same read instead of each starting one.
-/// Call it off the window's thread for device kinds.
-pub fn options_cached(kind: &str) -> Option<Vec<OptionInfo>> {
+fn hotplug_epoch() -> u64 {
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    {
+        ferrocore::camera::hotplug_epoch()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        0
+    }
+}
+
+fn options_cached_with(
+    kind: &str,
+    epoch: u64,
+    fetch: impl FnOnce(&str) -> Option<Vec<OptionInfo>>,
+) -> Option<Vec<OptionInfo>> {
     if !lists_devices(kind) {
-        return options(kind);
+        return fetch(kind);
     }
     let slot = slot(kind);
     // Held while reading, so a second ask waits for this read and takes its answer.
     let mut held = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, got)) = held.as_ref()
+    if let Some((at, cached_epoch, got)) = held.as_ref()
         && at.elapsed() < FRESH
+        && *cached_epoch == epoch
     {
         return got.clone();
     }
-    let got = options(kind);
-    *held = Some((Instant::now(), got.clone()));
+    let got = fetch(kind);
+    *held = Some((Instant::now(), epoch, got.clone()));
     got
+}
+
+/// `options`, with device lists read at most once per [`FRESH`] (and refreshed immediately on
+/// hot-plug connect/disconnect epoch changes): two asks at once (the dialog reading ahead while
+/// you click) wait for the same read instead of each starting one. Call it off the window's thread
+/// for device kinds.
+pub fn options_cached(kind: &str) -> Option<Vec<OptionInfo>> {
+    options_cached_with(kind, hotplug_epoch(), options)
 }
 
 /// Each display's name as macOS shows it ("VG271U M3"), read on the main thread by the app
@@ -1303,5 +1324,29 @@ mod tests {
             effects.iter().all(|s| s.contains("mask_filter") || s.contains("clut_filter") || s.contains("VST plugin")),
             "left out: {effects:?}"
         );
+    }
+
+    #[test]
+    fn device_list_cache_refreshes_immediately_when_hotplug_epoch_changes() {
+        let mut fetches = 0u32;
+        let _ = options_cached_with("av_capture_input_v2", 10, |_| {
+            fetches += 1;
+            Some(Vec::new())
+        });
+        assert_eq!(fetches, 1);
+
+        // Same hotplug epoch hits the cache without re-querying AVFoundation.
+        let _ = options_cached_with("av_capture_input_v2", 10, |_| {
+            fetches += 1;
+            Some(Vec::new())
+        });
+        assert_eq!(fetches, 1);
+
+        // Continuity Camera appear/disappear bumps the epoch -> immediate refresh before FRESH expires.
+        let _ = options_cached_with("av_capture_input_v2", 11, |_| {
+            fetches += 1;
+            Some(Vec::new())
+        });
+        assert_eq!(fetches, 2);
     }
 }

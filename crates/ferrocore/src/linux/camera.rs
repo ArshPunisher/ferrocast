@@ -56,6 +56,11 @@ pub fn microphones() -> Vec<Device> {
     parse_sources(&super::output_of("pactl", &["list", "short", "sources"]))
 }
 
+/// Monotonic counter bumped when connected devices change (no background monitor on Linux).
+pub fn hotplug_epoch() -> u64 {
+    0
+}
+
 /// A running camera or microphone; dropping it stops.
 #[derive(Debug)]
 pub struct Capture {
