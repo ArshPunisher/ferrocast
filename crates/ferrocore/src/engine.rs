@@ -1223,11 +1223,16 @@ struct Watch {
     next_try: u64,
     /// True once this source has delivered at least one frame since creation or last edit.
     ever_sent: bool,
+    /// True for camera/capture-card sources that pause auto-retries after [`NO_SIGNAL_MAX_TRIES`]
+    /// healthy zero-frame attempts until signal arrives, disconnect, or USB hotplug.
+    cap_no_signal: bool,
     /// True for cameras (always `1, 2, 4, 5 s` backoff via `camera_retry`).
     camera_backoff: bool,
     /// A camera or microphone: one that has worked is looked for again within seconds when it
     /// goes (a USB mic bumped out and back in, where Windows has no hotplug wake).
     quick_retry: bool,
+    /// Set once `cap_no_signal && !ever_sent` reaches [`NO_SIGNAL_MAX_TRIES`] with an open session.
+    no_signal: bool,
     /// It panicked in the loop (and was stopped there).
     faulted: bool,
     /// Ended because the system turned its permission off (Screen Recording): not tried again
@@ -1253,12 +1258,13 @@ impl Watch {
     }
 
     fn for_kind(kind: Option<&SourceKind>, now: u64) -> Self {
-        let camera_backoff = is_camera_kind(kind);
+        let cap_no_signal = is_camera_kind(kind);
+        let camera_backoff = cap_no_signal;
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let quick_retry = matches!(kind, Some(SourceKind::Camera(_) | SourceKind::Microphone(_)));
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         let quick_retry = false;
-        Self { since: now, camera_backoff, quick_retry, ..Self::default() }
+        Self { since: now, cap_no_signal, camera_backoff, quick_retry, ..Self::default() }
     }
 }
 
@@ -1266,6 +1272,8 @@ impl Watch {
 const STALL_NS: u64 = 5_000_000_000;
 /// Grace period for a freshly opened steady capture to deliver its first frame before restarting.
 const FIRST_FRAME_NS: u64 = 10_000_000_000;
+/// Maximum fruitless zero-frame tries for a capture card/camera before waiting in "no signal".
+const NO_SIGNAL_MAX_TRIES: u32 = crate::camera_retry::NO_SIGNAL_MAX_TRIES;
 /// How long a capture must keep sending before its failed tries are forgotten.
 const STABLE_NS: u64 = 10_000_000_000;
 /// The longest wait between tries at a capture card that has worked before.
@@ -5192,12 +5200,36 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
         w.denied = true;
         return None;
     }
+    if w.cap_no_signal && !w.ever_sent && w.tries >= NO_SIGNAL_MAX_TRIES {
+        // Waiting for a signal, with the session left open: a picture that comes now (a console
+        // switched on) lets go of the wait, as USB hotplug does. Nothing else is tried.
+        let gone = signs.as_ref().is_some_and(|(_, _, ended)| ended.is_some());
+        match signs {
+            Some((count, ..)) if running && count > 0 => {
+                w.ever_sent = true;
+                w.no_signal = false;
+                w.count = count;
+                w.since = now;
+                w.tries = 0;
+                w.next_try = 0;
+            }
+            // No session to see the signal come with (the last try failed to open, or it ended
+            // with an error): retry on backoff until a healthy open session is listening.
+            _ if !running || gone => {
+                w.no_signal = true;
+                return Some("its session is gone while it waits for a signal".into());
+            }
+            _ => w.no_signal = true,
+        }
+        return None;
+    }
     if !running {
         return Some("it didn't start again last time".into());
     }
     let (count, steady, ended) = signs?;
     if count > 0 {
         w.ever_sent = true;
+        w.no_signal = false;
     }
     if count != w.count {
         w.count = count;
@@ -5326,6 +5358,7 @@ fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[Strin
             }
             src.watch.next_try = now;
             src.watch.tries = 0;
+            src.watch.no_signal = false;
             woke += 1;
         }
     }
@@ -5397,6 +5430,7 @@ fn watchdog_step(
                     None => (0, false),
                 };
                 let ended = ended || src.watch.faulted;
+                let was_no_signal = retry.is_no_signal();
                 src.watch.count = frames;
                 let action = retry.step(CameraObservation {
                     running,
@@ -5406,6 +5440,15 @@ fn watchdog_step(
                     visible_or_on_air,
                     now_ns: now,
                 });
+                src.watch.no_signal = retry.is_no_signal();
+                src.watch.ever_sent = retry.ever_sent();
+                if !was_no_signal && retry.is_no_signal() {
+                    tracing::warn!(
+                        source = *id,
+                        tries = NO_SIGNAL_MAX_TRIES,
+                        "capture didn't deliver a picture (no signal); leaving session open until signal or disconnect"
+                    );
+                }
                 if let CameraAction::Reopen(why) = action {
                     ready.push((retry.tries(), *id, why.to_string()));
                 }
@@ -6838,6 +6881,57 @@ mod tests {
         // An ordinary crash is still restarted as before.
         let mut crashed = Watch::for_kind(None, 0);
         assert!(look(&mut crashed, true, Some((0, false, Some("it crashed".into()))), s).is_some());
+    }
+
+    /// The wait for a signal needs a session open to see it come: without one (the last try failed
+    /// to open, or it ended with an error) the watchdog still tries.
+    #[test]
+    fn a_no_signal_wait_without_a_session_is_retried_slowly() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert!(look(&mut w, false, None, 40 * s).is_some(), "not running: try again");
+        let err = Some((0, true, Some("runtime error".to_string())));
+        assert!(look(&mut w, true, err, 41 * s).is_some(), "ended with an error: try again");
+        // With a healthy session it still just waits.
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 42 * s), None);
+        assert!(w.no_signal);
+    }
+
+    /// A capture card nobody has plugged anything into yet (a console turned on later): once it
+    /// sends, the "no signal" wait ends by itself, with no unplugging or editing.
+    #[test]
+    fn a_no_signal_card_wakes_when_its_picture_comes() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 40 * s), None);
+        assert!(w.no_signal, "waiting for a signal");
+        // The console is switched on: frames flow on the session that was open all along.
+        assert_eq!(look(&mut w, true, Some((30, true, None)), 90 * s), None);
+        assert!(!w.no_signal && w.ever_sent, "the latch let go");
+        assert_eq!(w.tries, 0);
+        // And it's watched as a working card again: if it stops, it's restarted.
+        assert!(look(&mut w, true, Some((30, true, None)), 97 * s).is_some());
+    }
+
+    /// An HDMI link that flaps (one frame, then nothing, again and again) keeps its tries, so the
+    /// backoff grows instead of restarting on every drop.
+    #[test]
+    fn a_flapping_link_does_not_reset_its_backoff() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.ever_sent = true;
+        let mut count = 0;
+        let mut now = 100 * s;
+        for _ in 0..5 {
+            count += 1;
+            assert_eq!(look(&mut w, true, Some((count, true, None)), now), None, "one frame");
+            now += 6 * s;
+            assert!(look(&mut w, true, Some((count, true, None)), now).is_some(), "stalled again");
+            w.tries += 1; // the watchdog's reopen
+        }
+        assert_eq!(w.tries, 5, "the failed tries were kept");
     }
 
     /// A camera/card that has worked and one that has not yet sent both retry quickly within 5 s;
@@ -10503,6 +10597,70 @@ mod tests {
         watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 60_000_000_000);
         wait_idle();
         assert_eq!(backend.open_attempts.load(Ordering::Acquire), final_attempts);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn no_signal_capture_card_keeps_healthy_session_open_and_wakes_on_signal() {
+        let Some(e) = engine() else { return };
+        let backend = FakeCameraBackend::new([0, 200, 100, 255]);
+        backend.streaming.store(false, Ordering::Release);
+        {
+            let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(live, None, Some(SourceKind::Camera("capture-card".into()))));
+            st.opened.insert("Card".into(), (1, SourceKind::Camera("capture-card".into())));
+            st.scenes.insert("Main".into(), vec![SceneItem::new(1, Placement::default())]);
+            st.on_air = Some("Main".into());
+        }
+        let reopen_b = Arc::clone(&backend);
+        let reopen: Reopener = Arc::new(move |kind| match kind {
+            SourceKind::Camera(spec) if spec.id == "capture-card" => Some(reopen_b.open()),
+            _ => None,
+        });
+        let cmd = e.audio.cmd_sender();
+        let wait_idle = || {
+            let dl = Instant::now() + Duration::from_secs(2);
+            while e.lock().sources.get(&1).is_some_and(|s| s.opening.is_some()) && Instant::now() < dl {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        let mut t = now_ns();
+        for _ in 0..3 {
+            t += 10_500_000_000;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+            wait_idle();
+        }
+        let settled_attempts = backend.open_attempts.load(Ordering::Acquire);
+        assert_eq!(backend.active_sessions.load(Ordering::Acquire), 1);
+
+        // Past 3 zero-frame tries, a healthy open session stays open without 10 s teardown churn.
+        for _ in 0..5 {
+            t += 11_000_000_000;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+            wait_idle();
+            assert_eq!(
+                backend.open_attempts.load(Ordering::Acquire),
+                settled_attempts,
+                "healthy 0-frame capture session must not be torn down every 10 s"
+            );
+            assert_eq!(backend.active_sessions.load(Ordering::Acquire), 1);
+        }
+
+        // Turning the console on delivers frames on the existing open session with no extra reopen.
+        backend.streaming.store(true, Ordering::Release);
+        let dl = Instant::now() + Duration::from_secs(2);
+        let mut px = vec![0; 4];
+        while Instant::now() < dl {
+            px = e.snapshot_scene_at("Main", (16, 16), (16, 16)).unwrap_or_default();
+            if px.get(0..4) == Some(&[0, 200, 100, 255]) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(&px[0..4], &[0, 200, 100, 255]);
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), settled_attempts);
     }
 
     #[test]
