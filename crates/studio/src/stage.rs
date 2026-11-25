@@ -218,6 +218,20 @@ fn write_transform(i: &mut Value, t: &Transform, bounds: usize) {
     }
 }
 
+/// Clamps opposing crops along one axis so at least one pixel remains and a stationary edge stays fixed.
+fn clamp_crop_axis(len: i32, before: (i32, i32), req: (i32, i32)) -> (i32, i32) {
+    let max_crop = (len - 1).max(0);
+    let (a, b) = (req.0.clamp(0, max_crop), req.1.clamp(0, max_crop));
+    if a + b <= max_crop {
+        return (a, b);
+    }
+    match (a > before.0, b > before.1) {
+        (true, false) => (max_crop - b, b),
+        (false, true) => (a, max_crop - a),
+        _ => (a.min(max_crop - b), b),
+    }
+}
+
 fn name_of(s: &Value) -> &str {
     s.get("name").and_then(Value::as_str).unwrap_or_default()
 }
@@ -1962,13 +1976,18 @@ impl Stage {
     /// (owner, 25 Nov: dragging an edge in moved the whole source).
     pub fn set_item_crop(&self, scene: &str, id: i64, crop: [i32; 4]) -> Result<ItemInfo, StudioError> {
         let before = self.transform(scene, id)?;
-        let (w, h) = (before.width.max(1) as i32, before.height.max(1) as i32);
-        // At least one pixel stays each way: the opposite side wins when the two would meet.
-        let mut crop = crop.map(|c| c.max(0));
-        crop[2] = crop[2].min(w - 1);
-        crop[0] = crop[0].min(w - 1 - crop[2]);
-        crop[3] = crop[3].min(h - 1);
-        crop[1] = crop[1].min(h - 1 - crop[3]);
+        if before.width == 0 || before.height == 0 {
+            // Unready sources (such as a waiting camera) have a 0x0 frame, so scaling `bounds`
+            // from `info_of(&it).frame` would collapse a fitted box to 0x0.
+            let mut t = before;
+            [t.crop_left, t.crop_top, t.crop_right, t.crop_bottom] = crop.map(|c| c.max(0));
+            return self.set_transform(scene, id, &t);
+        }
+        let (w, h) = (before.width as i32, before.height as i32);
+        // At least one pixel stays each way; clamp whichever side grew against the stationary side.
+        let (left, right) = clamp_crop_axis(w, (before.crop_left, before.crop_right), (crop[0], crop[2]));
+        let (top, bottom) = clamp_crop_axis(h, (before.crop_top, before.crop_bottom), (crop[1], crop[3]));
+        let crop = [left, top, right, bottom];
         let seen = (
             (w - before.crop_left - before.crop_right).max(1) as f32,
             (h - before.crop_top - before.crop_bottom).max(1) as f32,
@@ -9174,6 +9193,74 @@ mod tests {
                 actual.frame
             );
         }
+    }
+
+    /// A 0x0 source (such as a waiting camera before its first frame) must keep its fitted/
+    /// stretched bounds box across `set_item_crop`.
+    #[test]
+    fn set_item_crop_preserves_bounds_on_zero_size_waiting_source() {
+        let s = stage();
+        let cam = ok(s.add_source("Main", "av_capture_input_v2", "Cam", &json!({ "device": "cam-1" }), true));
+        let before = ok(s.transform("Main", cam.id));
+        assert_eq!((before.width, before.height), (0, 0));
+        assert_eq!(before.bounds, "fit");
+        assert!((before.bounds_width - 1920.0).abs() < 1e-3);
+        assert!((before.bounds_height - 1080.0).abs() < 1e-3);
+
+        ok(s.set_item_crop("Main", cam.id, [0, 0, 0, 0]));
+        let after_zero = ok(s.transform("Main", cam.id));
+        assert_eq!(after_zero.bounds, "fit");
+        assert_eq!(after_zero.bounds_width, before.bounds_width);
+        assert_eq!(after_zero.bounds_height, before.bounds_height);
+
+        ok(s.set_item_crop("Main", cam.id, [10, 20, 30, 40]));
+        let after_nonzero = ok(s.transform("Main", cam.id));
+        assert_eq!(after_nonzero.bounds, "fit");
+        assert_eq!(after_nonzero.bounds_width, before.bounds_width);
+        assert_eq!(after_nonzero.bounds_height, before.bounds_height);
+    }
+
+    /// Dragging one crop edge past the opposite edge must clamp the moving edge and keep the
+    /// stationary opposite edge fixed (mirrored across left/right and top/bottom).
+    #[test]
+    fn set_item_crop_symmetric_clamp_keeps_stationary_edge_fixed() {
+        let s = stage();
+        let it = ok(s.add_source("Main", "color_source_v3", "Box", &json!({ "width": 200, "height": 100 }), false));
+
+        // Right edge dragged past left edge: left stays at 100, right clamps to 99.
+        ok(s.set_item_crop("Main", it.id, [100, 0, 0, 0]));
+        let left_anchor = ok(s.item_point("Main", it.id, (0.0, 0.0))).0;
+        ok(s.set_item_crop("Main", it.id, [100, 0, 150, 0]));
+        let t = ok(s.transform("Main", it.id));
+        assert_eq!((t.crop_left, t.crop_right), (100, 99), "left edge must stay fixed: {t:?}");
+        assert!((ok(s.item_point("Main", it.id, (0.0, 0.0))).0 - left_anchor).abs() < 0.01);
+
+        // Mirrored: left edge dragged past right edge: right stays at 100, left clamps to 99.
+        ok(s.set_item_crop("Main", it.id, [0, 0, 0, 0]));
+        ok(s.set_item_crop("Main", it.id, [0, 0, 100, 0]));
+        let right_anchor = ok(s.item_point("Main", it.id, (1.0, 0.0))).0;
+        ok(s.set_item_crop("Main", it.id, [150, 0, 100, 0]));
+        let t = ok(s.transform("Main", it.id));
+        assert_eq!((t.crop_left, t.crop_right), (99, 100), "right edge must stay fixed: {t:?}");
+        assert!((ok(s.item_point("Main", it.id, (1.0, 0.0))).0 - right_anchor).abs() < 0.01);
+
+        // Bottom edge dragged past top edge: top stays at 60, bottom clamps to 39.
+        ok(s.set_item_crop("Main", it.id, [0, 0, 0, 0]));
+        ok(s.set_item_crop("Main", it.id, [0, 60, 0, 0]));
+        let top_anchor = ok(s.item_point("Main", it.id, (0.0, 0.0))).1;
+        ok(s.set_item_crop("Main", it.id, [0, 60, 0, 80]));
+        let t = ok(s.transform("Main", it.id));
+        assert_eq!((t.crop_top, t.crop_bottom), (60, 39), "top edge must stay fixed: {t:?}");
+        assert!((ok(s.item_point("Main", it.id, (0.0, 0.0))).1 - top_anchor).abs() < 0.01);
+
+        // Mirrored: top edge dragged past bottom edge: bottom stays at 60, top clamps to 39.
+        ok(s.set_item_crop("Main", it.id, [0, 0, 0, 0]));
+        ok(s.set_item_crop("Main", it.id, [0, 0, 0, 60]));
+        let bottom_anchor = ok(s.item_point("Main", it.id, (0.0, 1.0))).1;
+        ok(s.set_item_crop("Main", it.id, [0, 80, 0, 60]));
+        let t = ok(s.transform("Main", it.id));
+        assert_eq!((t.crop_top, t.crop_bottom), (39, 60), "bottom edge must stay fixed: {t:?}");
+        assert!((ok(s.item_point("Main", it.id, (0.0, 1.0))).1 - bottom_anchor).abs() < 0.01);
     }
 
     /// An engine that cannot start (no graphics adapter) must not be tried thirty times a second
