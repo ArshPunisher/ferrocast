@@ -1767,3 +1767,70 @@ async fn screenshot_route_accepts_optional_item_and_rejects_unpaired() {
         ]
     );
 }
+
+#[tokio::test]
+async fn screen_and_source_still_routes_forward_fresh_query_param() {
+    use ferrocast_engine::studio_host::StudioAct;
+
+    let r = start().await;
+    let host = Arc::new(PausedHost::default());
+    r.engine.set_studio_host(host.clone());
+
+    assert_eq!(r.get("/studio/engine/screens/1/still").await.status(), StatusCode::OK);
+    assert_eq!(r.get("/studio/engine/screens/2/still?window=true&w=160&fresh=1").await.status(), StatusCode::OK);
+    assert_eq!(r.get("/studio/engine/screens/3/still?fresh=true").await.status(), StatusCode::OK);
+    assert_eq!(
+        r.get("/studio/engine/still?kind=av_capture_input_v2&key=device&value=cam1").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.get("/studio/engine/still?kind=av_capture_input_v2&key=device&value=cam1&w=180&fresh=1").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.get("/studio/engine/still?kind=av_capture_input_v2&key=device&value=cam1&fresh=true").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        r.get("/studio/engine/still?kind=av_capture_input_v2&key=device&value=cam1&fresh=0").await.status(),
+        StatusCode::OK
+    );
+
+    let acts = host.acts.lock().unwrap().clone();
+    assert_eq!(
+        acts,
+        vec![
+            StudioAct::ScreenStill { id: 1, window: false, width: 240, fresh: false },
+            StudioAct::ScreenStill { id: 2, window: true, width: 160, fresh: true },
+            StudioAct::ScreenStill { id: 3, window: false, width: 240, fresh: true },
+            StudioAct::SourceStill {
+                kind: "av_capture_input_v2".into(),
+                key: "device".into(),
+                value: json!("cam1"),
+                width: 240,
+                fresh: false,
+            },
+            StudioAct::SourceStill {
+                kind: "av_capture_input_v2".into(),
+                key: "device".into(),
+                value: json!("cam1"),
+                width: 180,
+                fresh: true,
+            },
+            StudioAct::SourceStill {
+                kind: "av_capture_input_v2".into(),
+                key: "device".into(),
+                value: json!("cam1"),
+                width: 240,
+                fresh: true,
+            },
+            StudioAct::SourceStill {
+                kind: "av_capture_input_v2".into(),
+                key: "device".into(),
+                value: json!("cam1"),
+                width: 240,
+                fresh: false,
+            },
+        ]
+    );
+}

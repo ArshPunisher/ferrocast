@@ -592,6 +592,8 @@ struct Shown {
     waiting_cameras: Vec<String>,
     /// Snapshot of every camera source's availability status for nonblocking polling.
     camera_statuses: HashMap<String, CameraStatus>,
+    /// Camera sources still holding an open session while waiting or in `no_signal`.
+    holding_sessions: std::collections::HashSet<String>,
 }
 
 impl Shown {
@@ -604,6 +606,7 @@ impl Shown {
             quiet: quiet_of(st),
             waiting_cameras: waiting_cameras_of(st),
             camera_statuses: camera_statuses_of(st),
+            holding_sessions: holding_sessions_of(st),
         }
     }
 }
@@ -652,6 +655,25 @@ fn camera_statuses_of(st: &State) -> HashMap<String, CameraStatus> {
     st.opened
         .iter()
         .filter_map(|(name, (id, _))| Some((name.clone(), camera_status_of_src(st.sources.get(id)?)?)))
+        .collect()
+}
+
+fn camera_holding_session_of_src(src: &Src) -> bool {
+    !matches!(src.live, Live::Still) && src.camera_retry.as_ref().is_some_and(|r| r.is_waiting() || r.is_no_signal())
+}
+
+fn camera_holding_session_of(st: &State, name: &str) -> bool {
+    let Some((id, _)) = st.opened.get(name) else {
+        return false;
+    };
+    st.sources.get(id).is_some_and(camera_holding_session_of_src)
+}
+
+fn holding_sessions_of(st: &State) -> std::collections::HashSet<String> {
+    st.opened
+        .iter()
+        .filter(|(_, (id, _))| st.sources.get(id).is_some_and(camera_holding_session_of_src))
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
@@ -1387,8 +1409,11 @@ struct State {
     sleep_epoch: u64,
     /// Live or wedged open/reopen worker threads currently active across all sources.
     reopen_workers: Arc<AtomicUsize>,
-    /// Per-source open/reopen worker counters preserved across `Src` replacement or removal.
-    source_reopen_workers: HashMap<u64, Arc<AtomicUsize>>,
+    /// Per-source open/reopen worker counters preserved across `Src` replacement, tagged with
+    /// the device kind so reusing a numeric ID for a different camera stays isolated.
+    source_reopen_workers: HashMap<u64, (Option<SourceKind>, Arc<AtomicUsize>)>,
+    /// Worker counters for removed sources that still have stalled opens running in the background.
+    draining_workers: Vec<(Option<SourceKind>, Arc<AtomicUsize>)>,
 }
 
 fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
@@ -1396,6 +1421,60 @@ fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
         OutputKind::Stream(_) => true,
         OutputKind::Record(_) => pipe.recording(),
         OutputKind::Replay { .. } => false,
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn camera_identity_key(id: &str) -> std::borrow::Cow<'_, str> {
+    if let Some((_, path)) = id.split_once(":\\\\")
+        && !path.is_empty()
+    {
+        return std::borrow::Cow::Owned(format!(r"\\{}", path.to_ascii_lowercase()));
+    }
+    if id.as_bytes().get(..12).is_some_and(|p| p.eq_ignore_ascii_case(b"@device_pnp_"))
+        && let Some(rest) = id.get(12..).filter(|r| r.starts_with(r"\\"))
+    {
+        return std::borrow::Cow::Owned(rest.to_ascii_lowercase());
+    }
+    if id.starts_with('@') {
+        return std::borrow::Cow::Owned(id.to_ascii_lowercase());
+    }
+    std::borrow::Cow::Borrowed(id)
+}
+
+fn same_reopen_device(a: &Option<SourceKind>, b: &Option<SourceKind>) -> bool {
+    match (a, b) {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        (Some(SourceKind::Camera(x)), Some(SourceKind::Camera(y))) => {
+            camera_identity_key(&x.id) == camera_identity_key(&y.id)
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        (Some(SourceKind::Microphone(x)), Some(SourceKind::Microphone(y))) => x == y,
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        (
+            Some(SourceKind::Screen { display: d1, uuid: u1, .. }),
+            Some(SourceKind::Screen { display: d2, uuid: u2, .. }),
+        ) => match (u1, u2) {
+            (Some(x), Some(y)) => x == y,
+            _ => d1 == d2,
+        },
+        #[cfg(target_os = "macos")]
+        (
+            Some(SourceKind::App { display: d1, uuid: u1, app: a1, .. }),
+            Some(SourceKind::App { display: d2, uuid: u2, app: a2, .. }),
+        ) => {
+            let same_screen = match (u1, u2) {
+                (Some(x), Some(y)) => x == y,
+                _ => d1 == d2,
+            };
+            same_screen && a1 == a2
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        (
+            Some(SourceKind::Window { id: w1, app: a1, title: t1, .. }),
+            Some(SourceKind::Window { id: w2, app: a2, title: t2, .. }),
+        ) => (w1, a1, t1) == (w2, a2, t2),
+        _ => a == b,
     }
 }
 
@@ -1410,12 +1489,77 @@ impl State {
         Some((self.sleep_epoch, want))
     }
 
-    fn source_workers_for(&mut self, id: u64) -> Arc<AtomicUsize> {
-        if let Some(w) = self.sources.get(&id).map(|s| s.reopen_workers.clone()) {
-            self.source_reopen_workers.insert(id, w.clone());
-            return w;
+    fn peek_source_workers(&self, id: u64, kind: Option<&SourceKind>) -> Option<Arc<AtomicUsize>> {
+        let wanted = kind.cloned();
+        if let Some((tracked, workers)) = self.source_reopen_workers.get(&id)
+            && same_reopen_device(tracked, &wanted)
+        {
+            return Some(workers.clone());
         }
-        self.source_reopen_workers.entry(id).or_insert_with(|| Arc::new(AtomicUsize::new(0))).clone()
+        self.draining_workers
+            .iter()
+            .find(|(tracked, workers)| workers.load(Ordering::Acquire) > 0 && same_reopen_device(tracked, &wanted))
+            .map(|(_, workers)| workers.clone())
+    }
+
+    fn source_workers_for(&mut self, id: u64, kind: Option<&SourceKind>) -> Arc<AtomicUsize> {
+        let wanted = kind.cloned();
+        if let Some((tracked, workers)) = self.source_reopen_workers.get(&id) {
+            if same_reopen_device(tracked, &wanted) {
+                return workers.clone();
+            }
+            if workers.load(Ordering::Acquire) > 0 {
+                self.draining_workers.push((tracked.clone(), workers.clone()));
+            }
+            self.source_reopen_workers.remove(&id);
+        }
+        if let Some(pos) = self
+            .draining_workers
+            .iter()
+            .position(|(tracked, workers)| workers.load(Ordering::Acquire) > 0 && same_reopen_device(tracked, &wanted))
+        {
+            let entry = self.draining_workers.swap_remove(pos);
+            let workers = entry.1.clone();
+            self.source_reopen_workers.insert(id, entry);
+            return workers;
+        }
+        let workers = Arc::new(AtomicUsize::new(0));
+        self.source_reopen_workers.insert(id, (wanted, workers.clone()));
+        workers
+    }
+
+    fn attach_workers_if_tracked(&mut self, id: u64, src: &mut Src) {
+        if let Some((tracked, workers)) = self.source_reopen_workers.get(&id) {
+            if same_reopen_device(tracked, &src.kind) {
+                src.reopen_workers = workers.clone();
+                return;
+            }
+            if workers.load(Ordering::Acquire) > 0 {
+                self.draining_workers.push((tracked.clone(), workers.clone()));
+            }
+            self.source_reopen_workers.remove(&id);
+        }
+        if let Some(pos) = self.draining_workers.iter().position(|(tracked, workers)| {
+            workers.load(Ordering::Acquire) > 0 && same_reopen_device(tracked, &src.kind)
+        }) {
+            let entry = self.draining_workers.swap_remove(pos);
+            src.reopen_workers = entry.1.clone();
+            self.source_reopen_workers.insert(id, entry);
+        }
+    }
+
+    fn prune_source_workers(&mut self) {
+        let State { sources, source_reopen_workers, draining_workers, .. } = self;
+        source_reopen_workers.retain(|id, (kind, workers)| {
+            if sources.contains_key(id) {
+                return true;
+            }
+            if workers.load(Ordering::Acquire) > 0 {
+                draining_workers.push((kind.clone(), workers.clone()));
+            }
+            false
+        });
+        draining_workers.retain(|(_, workers)| workers.load(Ordering::Acquire) > 0);
     }
 }
 
@@ -1697,6 +1841,7 @@ impl Engine {
             sleep_epoch: 0,
             reopen_workers: Arc::new(AtomicUsize::new(0)),
             source_reopen_workers: HashMap::new(),
+            draining_workers: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let seen: Arc<Seen> = Arc::default();
@@ -1845,8 +1990,11 @@ impl Engine {
                     tracing::info!(source = id, "a camera taken out a moment ago came back without opening again");
                     let gone = {
                         let mut st = self.lock();
+                        let src_workers = st.source_workers_for(id, Some(&kind));
                         self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
-                        let prev = st.sources.insert(id, Src::new(live, None, Some(kind)));
+                        let mut src = Src::new(live, None, Some(kind));
+                        src.reopen_workers = src_workers;
+                        let prev = st.sources.insert(id, src);
                         sync_heard(&mut st, &self.audio.cmd_sender());
                         prev
                     };
@@ -1878,8 +2026,9 @@ impl Engine {
                     let gone = {
                         let mut st = self.lock();
                         self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
-                        let prev =
-                            st.sources.insert(id, Src::new(Live::Media(MediaSlot::closed(path, options)), None, None));
+                        let mut src = Src::new(Live::Media(MediaSlot::closed(path, options)), None, None);
+                        st.attach_workers_if_tracked(id, &mut src);
+                        let prev = st.sources.insert(id, src);
                         sync_heard(&mut st, &self.audio.cmd_sender());
                         prev
                     };
@@ -1958,7 +2107,9 @@ impl Engine {
             // A capture opened in place (an App capture handed over) keeps the old picture on
             // the card until its first one comes.
             let size = size.or_else(|| restart.as_ref().and(st.sources.get(&id).and_then(|s| s.size)));
-            let prev = st.sources.insert(id, Src::new(live, size, restart));
+            let mut src = Src::new(live, size, restart);
+            st.attach_workers_if_tracked(id, &mut src);
+            let prev = st.sources.insert(id, src);
             sync_heard(&mut st, &self.audio.cmd_sender());
             prev
         };
@@ -2016,14 +2167,19 @@ impl Engine {
         let mut gone = None;
         let worker_guard = {
             let mut st = self.lock();
-            let src_workers = st.source_workers_for(id);
-            let worker_guard = if restart.is_some() {
+            if restart.is_some() {
                 if st.reopen_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
                     return Err(AvError::Source("too many stalled device opens in progress".into()));
                 }
-                if src_workers.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS {
+                if st
+                    .peek_source_workers(id, restart.as_ref())
+                    .is_some_and(|w| w.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS)
+                {
                     return Err(AvError::Source("too many stalled opens for this device".into()));
                 }
+            }
+            let src_workers = st.source_workers_for(id, restart.as_ref());
+            let worker_guard = if restart.is_some() {
                 Some(ReopenWorkerGuard::new(src_workers.clone(), st.reopen_workers.clone()))
             } else {
                 None
@@ -2126,6 +2282,7 @@ impl Engine {
             };
             if discard {
                 st.sources.remove(&id);
+                st.prune_source_workers();
                 levels.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 let _ = audio_cmd.send(AudioCmd::RemoveSource(id));
                 sync_heard(&mut st, &audio_cmd);
@@ -2144,6 +2301,7 @@ impl Engine {
         if let Err(e) = spawned {
             let mut st = self.lock();
             st.sources.remove(&id);
+            st.prune_source_workers();
             self.levels.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.audio.send(AudioCmd::RemoveSource(id));
             sync_heard(&mut st, &self.audio.cmd_sender());
@@ -2157,6 +2315,7 @@ impl Engine {
                 let mut st = self.lock();
                 if st.sources.get(&id).is_some_and(|s| matches!(s.live, Live::Still) && s.opening.is_none()) {
                     st.sources.remove(&id);
+                    st.prune_source_workers();
                     self.levels.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
                     self.audio.send(AudioCmd::RemoveSource(id));
                     sync_heard(&mut st, &self.audio.cmd_sender());
@@ -2196,6 +2355,7 @@ impl Engine {
                 }
                 other => other,
             };
+            st.prune_source_workers();
             self.levels.write().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.audio.send(AudioCmd::RemoveSource(id));
             sync_heard(&mut st, &self.audio.cmd_sender());
@@ -2493,7 +2653,10 @@ impl Engine {
                     // keep it alive in `sources` marked "waiting for the camera" so the watchdog
                     // keeps checking with backoff rather than stranding it in `missing`.
                     let why = e.to_string();
-                    self.lock().sources.insert(s.id, Src::waiting_camera(s.kind.clone(), now_ns(), &why));
+                    let mut st = self.lock();
+                    let mut src = Src::waiting_camera(s.kind.clone(), now_ns(), &why);
+                    src.reopen_workers = st.source_workers_for(s.id, Some(&s.kind));
+                    st.sources.insert(s.id, src);
                     opened.insert(s.name.clone(), (s.id, s.kind));
                 }
                 Err(e) => {
@@ -2774,13 +2937,7 @@ impl Engine {
     /// waiting state (e.g. interruption grace or healthy 0-frame card), so picker probes avoid
     /// opening a competing session against it.
     pub fn is_camera_holding_session(&self, name: &str) -> bool {
-        let st = self.lock();
-        let Some((id, _)) = st.opened.get(name) else {
-            return false;
-        };
-        st.sources
-            .get(id)
-            .is_some_and(|s| !matches!(s.live, Live::Still) && s.camera_retry.as_ref().is_some_and(|r| r.is_waiting()))
+        self.now_or_last(|st| camera_holding_session_of(st, name), |s| s.holding_sessions.contains(name))
     }
 
     /// Captures shown somewhere (on air, a preview, an output) that have had no picture for at
@@ -5553,7 +5710,9 @@ fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[Strin
         let dead = matches!(src.live, Live::Still)
             || src.watch.faulted
             || is_live_ended(&src.live)
-            || src.is_waiting_for_camera();
+            || src.is_waiting_for_camera()
+            || src.watch.no_signal
+            || src.camera_retry.as_ref().is_some_and(crate::camera_retry::CameraRetry::is_no_signal);
         if !dead {
             continue;
         }
@@ -5733,13 +5892,16 @@ fn watchdog_step(
             src.watch.since = now;
             src.opening = Some(token);
             src.opening_since = now;
-            let worker_guard = ReopenWorkerGuard::new(src.reopen_workers.clone(), total_workers.clone());
+            let workers = src.reopen_workers.clone();
+            let worker_guard = ReopenWorkerGuard::new(workers.clone(), total_workers.clone());
             // Taken out now (a camera is let go before it's opened again), dropped on its
             // own reopen worker outside the lock.
             let old = std::mem::replace(&mut src.live, Live::Still);
+            st.source_reopen_workers.entry(id).or_insert_with(|| (Some(kind.clone()), workers));
             todo.push((id, kind, why, old, token, prev_tries, worker_guard));
             launched += 1;
         }
+        st.prune_source_workers();
     }
     for (id, kind, why, old, token, prev_tries, worker_guard) in todo {
         if stop.load(Ordering::Acquire) {
@@ -10172,6 +10334,52 @@ mod tests {
         assert_eq!(sources[&3].watch.next_try, now);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn hotplug_reconnect_wakes_no_signal_capture_card() {
+        use crate::camera_retry::{CAMERA_FIRST_FRAME_NS, CameraObservation, NO_SIGNAL_MAX_TRIES};
+
+        let backend = FakeCameraBackend::new([0, 200, 100, 255]);
+        backend.streaming.store(false, Ordering::Release);
+        let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+        let mut src = Src::new(live, None, Some(SourceKind::Camera(CameraSpec::from("card-hdmi-1"))));
+
+        let mut t = now_ns();
+        let retry = src.camera_retry.as_mut().unwrap();
+        for _ in 0..=NO_SIGNAL_MAX_TRIES {
+            t += CAMERA_FIRST_FRAME_NS.max(20_000_000_000);
+            let act = retry.step(CameraObservation {
+                running: true,
+                frames: 0,
+                ended: false,
+                interrupted: false,
+                opening: false,
+                visible_or_on_air: true,
+                now_ns: t,
+            });
+            if matches!(act, crate::camera_retry::CameraAction::Reopen(_)) {
+                let prev = retry.on_reopen_started(t);
+                retry.on_reopen_finished(prev, true, t, None);
+            }
+        }
+        assert!(retry.is_no_signal(), "setup must reach no_signal state");
+        src.watch.no_signal = true;
+        src.watch.tries = 3;
+        src.watch.next_try = t + 16_000_000_000;
+
+        let mut sources = BTreeMap::new();
+        sources.insert(1, src);
+
+        let woke_at = t + 1_000_000_000;
+        let woke = apply_hotplug_reconnects(&mut sources, &["card-hdmi-1".into()], woke_at);
+        assert_eq!(woke, 1, "hotplug reconnect must wake a no_signal capture card");
+        let woken = &sources[&1];
+        assert!(!woken.watch.no_signal, "hotplug wake must clear watch.no_signal");
+        assert_eq!(woken.watch.next_try, woke_at);
+        assert_eq!(woken.watch.tries, 0);
+        assert!(woken.camera_retry.as_ref().is_some_and(|r| !r.is_no_signal()), "must clear CameraRetry::no_signal");
+    }
+
     #[test]
     fn sleep_inhibit_follows_streaming_and_recording_lifetime() {
         if !encodes_here() {
@@ -10927,6 +11135,65 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     #[test]
+    fn is_camera_holding_session_tracks_no_signal_and_uses_shown_when_render_lock_held() {
+        let Some(e) = engine() else { return };
+        let backend = FakeCameraBackend::new([0, 200, 100, 255]);
+        backend.streaming.store(false, Ordering::Release);
+        {
+            let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(live, None, Some(SourceKind::Camera("capture-card".into()))));
+            st.opened.insert("Card".into(), (1, SourceKind::Camera("capture-card".into())));
+            st.scenes.insert("Main".into(), vec![SceneItem::new(1, Placement::default())]);
+            st.on_air = Some("Main".into());
+        }
+        let reopen_b = Arc::clone(&backend);
+        let reopen: Reopener = Arc::new(move |kind| match kind {
+            SourceKind::Camera(spec) if spec.id == "capture-card" => Some(reopen_b.open()),
+            _ => None,
+        });
+        let cmd = e.audio.cmd_sender();
+        let wait_idle = || {
+            while e.lock().sources.get(&1).is_some_and(|s| s.opening.is_some()) {
+                std::thread::yield_now();
+            }
+        };
+
+        let mut t = now_ns();
+        for _ in 0..=crate::camera_retry::NO_SIGNAL_MAX_TRIES {
+            t += crate::camera_retry::CAMERA_FIRST_FRAME_NS + 1_000_000_000;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+            wait_idle();
+        }
+        assert_eq!(e.camera_status("Card").map(|s| s.state), Some("live"));
+        assert!(
+            e.is_camera_holding_session("Card"),
+            "healthy no_signal capture card holds an open session and must block competing probes"
+        );
+
+        // Publish Shown snapshot, then hold the State lock on this thread and mutate State:
+        // is_camera_holding_session must read Shown non-blockingly without taking self.lock().
+        {
+            let st = e.lock();
+            e.show(&st);
+        }
+        {
+            let mut guard = e.lock();
+            guard.sources.remove(&1);
+            assert!(
+                e.is_camera_holding_session("Card"),
+                "must read Shown snapshot without blocking when State lock is held"
+            );
+        }
+        {
+            let st = e.lock();
+            e.show(&st);
+        }
+        assert!(!e.is_camera_holding_session("Card"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
     fn interrupted_camera_keeps_session_open_during_grace_and_resumes_without_reopen() {
         let Some(e) = engine() else { return };
         let backend = FakeCameraBackend::new([255, 0, 0, 255]);
@@ -11465,5 +11732,208 @@ mod tests {
         while e.lock().reopen_workers.load(Ordering::Acquire) > 0 {
             std::thread::yield_now();
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn load_obs_waiting_camera_and_unpark_preserve_worker_cap() {
+        let Some(e) = engine() else { return };
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+
+        for _ in 0..MAX_SOURCE_REOPEN_WORKERS {
+            let g = gate.clone();
+            let etx = entered_tx.clone();
+            let xtx = exited_tx.clone();
+            e.open_soon(
+                1,
+                Some(SourceKind::Camera(CameraSpec::from("wedged-cam"))),
+                Box::new(move || {
+                    let _ = etx.send(());
+                    let (lk, cv) = &*g;
+                    let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                    while !*open {
+                        open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                    }
+                    let _ = xtx.send(());
+                    Err(AvError::Source("wedged".into()))
+                }),
+            )
+            .unwrap();
+            entered_rx.recv().unwrap();
+        }
+
+        // Remove source 1 while both wedged workers remain alive, then reload a collection
+        // assigning id 1 to a camera whose open_soon rejects at MAX_SOURCE_REOPEN_WORKERS.
+        e.remove_source(1);
+        let doc = serde_json::json!({
+            "current_program_scene": "Main",
+            "sources": [
+                { "id": "av_capture_input_v2", "name": "WedgedCam", "settings": { "device": "wedged-cam" } },
+                { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "WedgedCam" }] } }
+            ]
+        });
+        assert!(e.load_obs(&doc).is_empty(), "waiting camera stays in opened instead of missing");
+        assert_eq!(
+            e.lock().sources.get(&1).map(|s| s.reopen_workers.load(Ordering::Acquire)),
+            Some(MAX_SOURCE_REOPEN_WORKERS),
+            "load_obs waiting_camera must reuse existing source worker counter"
+        );
+        let cam_kind = SourceKind::Camera(CameraSpec::from("wedged-cam"));
+        assert_eq!(
+            e.lock().source_workers_for(1, Some(&cam_kind)).load(Ordering::Acquire),
+            MAX_SOURCE_REOPEN_WORKERS,
+            "source_workers_for must not overwrite counter with fresh Src atomic"
+        );
+
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_c = attempts.clone();
+        let reopen: Reopener = Arc::new(move |_| {
+            attempts_c.fetch_add(1, Ordering::SeqCst);
+            Some(Err(AvError::Source("must not launch past cap".into())))
+        });
+        let cmd = e.audio.cmd_sender();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now_ns() + 120_000_000_000);
+        assert_eq!(attempts.load(Ordering::SeqCst), 0, "watchdog must honor existing wedged worker cap after load_obs");
+
+        // Now verify unpark path preserves existing worker counter for the same camera.
+        e.lock().parked.push((cam_kind.clone(), Live::Still, now_ns()));
+        e.set_source(1, cam_kind.clone()).unwrap();
+        assert_eq!(
+            e.lock().sources.get(&1).map(|s| s.reopen_workers.load(Ordering::Acquire)),
+            Some(MAX_SOURCE_REOPEN_WORKERS),
+            "unpark path must reuse existing source worker counter"
+        );
+        let ran_post_unpark = Arc::new(AtomicBool::new(false));
+        let ran_c = ran_post_unpark.clone();
+        let post_unpark_err = e
+            .open_soon(
+                1,
+                Some(cam_kind),
+                Box::new(move || {
+                    ran_c.store(true, Ordering::Release);
+                    Err(AvError::Source("must not run".into()))
+                }),
+            )
+            .unwrap_err();
+        assert!(
+            post_unpark_err.to_string().contains("too many stalled opens") && !ran_post_unpark.load(Ordering::Acquire),
+            "open_soon after unpark must reject on per-source cap without spawning: {post_unpark_err}"
+        );
+
+        // Removing the wedged camera and loading an unrelated camera even with reused numeric ID 1
+        // must not charge the new camera with the old camera's stalled workers.
+        e.remove_source(1);
+        let other_cam = SourceKind::Camera(CameraSpec::from("fresh-other-cam"));
+        e.open_soon(1, Some(other_cam), Box::new(|| Ok((Live::Still, false))))
+            .expect("reusing numeric ID for an unrelated camera must not inherit old worker cap");
+        e.remove_source(1);
+
+        // Equivalent Windows selectors (OBS friendly:\\?\... vs DirectShow @device_pnp_\\?\...)
+        // share one device budget, and changing display capture cursor keeps its display cap.
+        let obs_cam2 = SourceKind::Camera(CameraSpec::from(r"USB Video:\\?\usb#vid_046d&pid_082d#cam2"));
+        let pnp_cam2 = SourceKind::Camera(CameraSpec::from(r"@device_pnp_\\?\USB#VID_046D&PID_082D#CAM2"));
+        let obs_cam1 = SourceKind::Camera(CameraSpec::from(r"USB Video:\\?\usb#vid_046d&pid_082d#cam1"));
+        assert!(same_reopen_device(&Some(obs_cam2), &Some(pnp_cam2.clone())));
+        assert!(!same_reopen_device(&Some(obs_cam1), &Some(pnp_cam2)));
+        let scr_no_cursor =
+            SourceKind::Screen { display: 1, uuid: Some("disp-1".into()), sound: false, hide: vec![], cursor: false };
+        let scr_with_cursor =
+            SourceKind::Screen { display: 1, uuid: Some("disp-1".into()), sound: true, hide: vec![], cursor: true };
+        assert!(same_reopen_device(&Some(scr_no_cursor), &Some(scr_with_cursor)));
+
+        // Rejecting an open due to global cap must never overwrite the registered counter on slot 5.
+        let cam_kept = SourceKind::Camera(CameraSpec::from("kept-slot-5"));
+        let cam_rejected = SourceKind::Camera(CameraSpec::from("rejected-slot-5"));
+        {
+            let mut st = e.lock();
+            let prev = Arc::new(AtomicUsize::new(1));
+            st.source_reopen_workers.insert(5, (Some(cam_kept.clone()), prev.clone()));
+            let saved_total = st.reopen_workers.swap(MAX_TOTAL_REOPEN_WORKERS, Ordering::AcqRel);
+            drop(st);
+            let rejected = e.open_soon(5, Some(cam_rejected.clone()), Box::new(|| Ok((Live::Still, false))));
+            assert!(rejected.is_err());
+            let mut st = e.lock();
+            st.reopen_workers.store(saved_total, Ordering::Release);
+            assert!(
+                same_reopen_device(&st.source_reopen_workers.get(&5).unwrap().0, &Some(cam_kept)),
+                "rejected global-cap open must leave existing slot registration intact"
+            );
+            assert!(st.peek_source_workers(5, Some(&cam_rejected)).is_none());
+            st.source_reopen_workers.remove(&5);
+        }
+
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        for _ in 0..MAX_SOURCE_REOPEN_WORKERS {
+            exited_rx.recv().unwrap();
+        }
+        while e.lock().reopen_workers.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
+        e.remove_source(1);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn remove_source_and_watchdog_prune_idle_source_reopen_workers() {
+        let Some(e) = engine() else { return };
+        let kind = SourceKind::Camera(CameraSpec::from("cam-prune"));
+        e.open_soon(77, Some(kind.clone()), Box::new(|| Ok((Live::Still, false)))).unwrap();
+        while e.lock().source_reopen_workers.get(&77).is_some_and(|(_, w)| w.load(Ordering::Acquire) > 0) {
+            std::thread::yield_now();
+        }
+        e.remove_source(77);
+        assert!(
+            !e.lock().source_reopen_workers.contains_key(&77) && e.lock().draining_workers.is_empty(),
+            "remove_source must prune zero-count worker map entries"
+        );
+
+        // If removed while wedged, entry moves to draining_workers until worker drains, then watchdog_step prunes it.
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let g = gate.clone();
+        e.open_soon(
+            88,
+            Some(kind),
+            Box::new(move || {
+                let _ = entered_tx.send(());
+                let (lk, cv) = &*g;
+                let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                while !*open {
+                    open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                }
+                let _ = exited_tx.send(());
+                Err(AvError::Source("wedged".into()))
+            }),
+        )
+        .unwrap();
+        entered_rx.recv().unwrap();
+        e.remove_source(88);
+        assert!(
+            !e.lock().source_reopen_workers.contains_key(&88) && e.lock().draining_workers.len() == 1,
+            "remove_source must move active wedged worker counter to draining_workers"
+        );
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        exited_rx.recv().unwrap();
+        while e.lock().reopen_workers.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
+        let reopen: Reopener = Arc::new(|_| None);
+        let cmd = e.audio.cmd_sender();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now_ns());
+        assert!(
+            !e.lock().source_reopen_workers.contains_key(&88) && e.lock().draining_workers.is_empty(),
+            "watchdog_step must prune drained worker entries for removed sources"
+        );
     }
 }

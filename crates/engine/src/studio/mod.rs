@@ -97,6 +97,8 @@ pub(crate) struct Studio {
     pub output_lock: tokio::sync::Mutex<()>,
     /// Mutual exclusion gate between starting any output and claiming a benchmark run (C2).
     pub output_gate: tokio::sync::Mutex<()>,
+    /// Set once `request_update_restart` admits restart under `output_gate` so late recordings cannot start before exit.
+    pub update_committing: std::sync::atomic::AtomicBool,
     /// Serializes `auto_config_benchmark` / `cancel` / `apply` / `undo` state transitions (C2/H7).
     pub auto_config_op: tokio::sync::Mutex<()>,
     /// Monotonic origin for Show timers (`away`, `live_watch`) so wall-clock jumps never fire them.
@@ -166,6 +168,7 @@ impl Default for Studio {
             machine: Mutex::default(),
             output_lock: tokio::sync::Mutex::new(()),
             output_gate: tokio::sync::Mutex::new(()),
+            update_committing: std::sync::atomic::AtomicBool::new(false),
             auto_config_op: tokio::sync::Mutex::new(()),
             mono_origin: std::time::Instant::now(),
             last_watch_mono: Mutex::default(),

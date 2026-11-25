@@ -1593,26 +1593,58 @@ struct PictureQuery {
     item: Option<i64>,
 }
 
+fn deserialize_query_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoolVisitor;
+    impl serde::de::Visitor<'_> for BoolVisitor {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a boolean query parameter (1, 0, true, false)")
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<bool, E> {
+            Ok(v)
+        }
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<bool, E> {
+            Ok(v != 0)
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<bool, E> {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" => Ok(true),
+                "" | "0" | "false" | "no" => Ok(false),
+                other => Err(serde::de::Error::custom(format!("invalid boolean query value: {other}"))),
+            }
+        }
+    }
+    deserializer.deserialize_any(BoolVisitor)
+}
+
 #[derive(Deserialize)]
 struct StillQuery {
     #[serde(default)]
     window: bool,
     #[serde(default = "still_width")]
     w: u32,
+    #[serde(default, deserialize_with = "deserialize_query_bool")]
+    fresh: bool,
 }
 
 fn still_width() -> u32 {
     240
 }
 
-/// `GET …/screens/{id}/still?w=320&window=false` → `{ image }`: a still of a screen or window
-/// for the cards a capture is picked from (null where it can't be taken).
+/// `GET …/screens/{id}/still?w=320&window=false&fresh=1` → `{ image }`: a still of a screen or
+/// window for the cards a capture is picked from (null where it can't be taken).
 async fn engine_screen_still(
     State(app): State<AppState>,
     Path(id): Path<u32>,
     Query(q): Query<StillQuery>,
 ) -> ApiResult<Json<Value>> {
-    act(&app, StudioAct::ScreenStill { id, window: q.window, width: q.w.min(320) }).await
+    act(&app, StudioAct::ScreenStill { id, window: q.window, width: q.w.min(320), fresh: q.fresh }).await
 }
 
 #[derive(Deserialize)]
@@ -1622,13 +1654,15 @@ struct SourceStillQuery {
     value: String,
     #[serde(default = "still_width")]
     w: u32,
+    #[serde(default, deserialize_with = "deserialize_query_bool")]
+    fresh: bool,
 }
 
-/// `GET …/still?kind=&key=&value=&w=240` → `{ image }`: a single low-res JPEG still of a window,
-/// display, camera, or capture card, aborted automatically when the HTTP client disconnects.
+/// `GET …/still?kind=&key=&value=&w=240&fresh=1` → `{ image }`: a single low-res JPEG still of a
+/// window, display, camera, or capture card, aborted automatically when the HTTP client disconnects.
 async fn engine_source_still(State(app): State<AppState>, Query(q): Query<SourceStillQuery>) -> ApiResult<Json<Value>> {
     let value = q.value.parse::<i64>().map_or_else(|_| Value::String(q.value.clone()), |n| json!(n));
-    act(&app, StudioAct::SourceStill { kind: q.kind, key: q.key, value, width: q.w.min(320) }).await
+    act(&app, StudioAct::SourceStill { kind: q.kind, key: q.key, value, width: q.w.min(320), fresh: q.fresh }).await
 }
 
 /// `GET …/sources/{name}/status` → how the source is doing (a Web text's last read, whether a

@@ -1,12 +1,13 @@
 //! Cameras (DirectShow, read by FFmpeg) and microphones (WASAPI, through cpal) on Windows.
 
-use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::ffsrc::{Live, Nv12Picture, OpenFail, ProbeFail, ffmpeg, stderr_within};
 use crate::sound_in::{SoundIn, Which};
 use crate::win_logic::{
-    DshowListStatus, DshowOption, dshow_attempts, dshow_matches_id, parse_dshow_options, resolve_dshow_list,
+    DshowCameraCache, DshowListStatus, DshowOption, dshow_attempts, dshow_matches_id, parse_dshow_options,
+    resolve_dshow_list, resolve_dshow_open_target,
 };
 use crate::{AvError, Picture};
 
@@ -38,38 +39,8 @@ pub fn parse_dshow(text: &str) -> Vec<Device> {
     out
 }
 
-/// Cameras connected now (FFmpeg asks DirectShow; bounded by a timeout and shared across
-/// overlapping callers so concurrent checks do not spawn redundant FFmpeg processes).
-pub fn cameras() -> Vec<Device> {
-    struct ProbeFlight {
-        in_flight: bool,
-        last: Vec<Device>,
-    }
-    static FLIGHT: OnceLock<(Mutex<ProbeFlight>, Condvar)> = OnceLock::new();
-    let (lock, cv) =
-        FLIGHT.get_or_init(|| (Mutex::new(ProbeFlight { in_flight: false, last: Vec::new() }), Condvar::new()));
-    let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.in_flight {
-        while guard.in_flight {
-            guard = cv.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        return guard.last.clone();
-    }
-    guard.in_flight = true;
-    drop(guard);
-
-    struct ResetFlight<'a>(&'a Mutex<ProbeFlight>, &'a Condvar);
-    impl Drop for ResetFlight<'_> {
-        fn drop(&mut self) {
-            if let Ok(mut g) = self.0.lock() {
-                g.in_flight = false;
-                self.1.notify_all();
-            }
-        }
-    }
-    let _reset = ResetFlight(lock, cv);
-
-    let list = ffmpeg()
+fn probe_dshow_devices() -> Option<Vec<Device>> {
+    ffmpeg()
         .ok()
         .and_then(|ff| {
             let args: Vec<String> = ["-hide_banner", "-nostdin", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
@@ -79,13 +50,42 @@ pub fn cameras() -> Vec<Device> {
             stderr_within(&ff, &args, Duration::from_secs(4)).ok()
         })
         .map(|text| parse_dshow(&text))
-        .unwrap_or_default();
+}
 
-    let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.last = list.clone();
-    guard.in_flight = false;
-    cv.notify_all();
-    list
+fn dshow_cache() -> &'static DshowCameraCache<Device> {
+    static CACHE: OnceLock<DshowCameraCache<Device>> = OnceLock::new();
+    CACHE.get_or_init(DshowCameraCache::default)
+}
+
+/// Cameras connected now (FFmpeg asks DirectShow; bounded by a timeout and shared across
+/// overlapping callers so concurrent checks do not spawn redundant FFmpeg processes).
+pub fn cameras() -> Vec<Device> {
+    dshow_cache().get_or_probe(Instant::now, probe_dshow_devices)
+}
+
+fn cameras_fresh() -> Vec<Device> {
+    dshow_cache().get_or_probe_fresh(Instant::now, probe_dshow_devices)
+}
+
+fn resolve_camera_dev(id: &str) -> Result<String, AvError> {
+    if id.starts_with('@') {
+        return Ok(id.to_string());
+    }
+    if id.contains(":\\\\") {
+        let lookup = |devs: &[Device]| {
+            let pairs: Vec<(&str, &str)> = devs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
+            resolve_dshow_open_target(&pairs, id)
+        };
+        let (devs, from_cache) = dshow_cache().get_or_probe_status(Instant::now, probe_dshow_devices);
+        if let Some(dev) = lookup(&devs) {
+            return Ok(dev);
+        }
+        if from_cache && let Some(dev) = lookup(&cameras_fresh()) {
+            return Ok(dev);
+        }
+        return Err(AvError::Source("that camera isn't connected".into()));
+    }
+    Ok(id.to_string())
 }
 
 /// Returns `true` when the camera matching `id` (alternative id, friendly name, or OBS combined
@@ -146,13 +146,13 @@ impl Capture {
         None
     }
 
-    /// A camera by its id (an OBS-style "Name:\\?\usb#…" works too: its name is used).
-    /// Queries DirectShow options first so USB2 capture cards pick high-fps MJPEG (e.g.
-    /// 1080p60) instead of throttled uncompressed YUY2, falling back through MJPEG + asked,
+    /// A camera by its id (`@alt_id`, OBS `"Name:\\?\usb#…"`, or friendly name), resolving
+    /// OBS-style IDs against the enumerated alternative names so duplicate USB cameras open the
+    /// matching device. Queries DirectShow options first so USB2 capture cards pick high-fps MJPEG
+    /// (e.g. 1080p60) instead of throttled uncompressed YUY2, falling back through MJPEG + asked,
     /// asked, and device default, and reading NV12 through the pipe.
     pub fn camera(spec: &crate::engine::CameraSpec) -> Result<Self, AvError> {
-        let id = spec.id.as_str();
-        let dev = if id.starts_with('@') { id.to_string() } else { id.split(":\\\\").next().unwrap_or(id).to_string() };
+        let dev = resolve_camera_dev(&spec.id)?;
         let options = resolve_dshow_options(list_dshow_options(&dev), &dev)?;
         let max = spec.size.unwrap_or((1920, 1080));
         let mut last_err = AvError::Source("FFmpeg couldn't open it".into());

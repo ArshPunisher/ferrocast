@@ -182,6 +182,13 @@ impl PreviewRect {
     }
 }
 
+/// Local Studio capture state inspected synchronously by update guards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalCaptureBlock {
+    pub recording: bool,
+    pub replay: bool,
+}
+
 /// The desktop app's side of the Studio (it owns libobs and the window).
 #[async_trait::async_trait]
 pub trait StudioHost: Send + Sync + std::fmt::Debug {
@@ -242,6 +249,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// and no action runs from it. Asked again within seconds, it keeps them off; it puts them
     /// back by itself if the page goes away without saying so. Not queued behind other work.
     fn capture_keys(&self, _on: bool) {}
+    /// Active local Studio capture state checked synchronously before installing/restarting updates.
+    fn local_capture_block(&self) -> LocalCaptureBlock {
+        LocalCaptureBlock::default()
+    }
     /// The Studio's settings (saved by the host; defaults the first time).
     async fn settings(&self) -> StudioSettings;
     /// Saves and applies them (checked before they get here) → what applies only after
@@ -1931,6 +1942,8 @@ pub enum StudioAct {
         #[serde(default)]
         window: bool,
         width: u32,
+        #[serde(default)]
+        fresh: bool,
     },
     /// A still of a display, window, camera, or capture card for Add-source picker cards, at most
     /// `width` wide -> `{ image: data URL | null }`.
@@ -1939,6 +1952,8 @@ pub enum StudioAct {
         key: String,
         value: Value,
         width: u32,
+        #[serde(default)]
+        fresh: bool,
     },
     /// The VST plugins on this computer → `{ available, why, plugins: [{ path, cid, name,
     /// vendor, kinds }] }` (looked for once; `rescan` looks again).
@@ -2293,7 +2308,7 @@ impl StudioAct {
                 Err(EngineError::Invalid("width: 64 to 1280.".into()))
             }
             A::ScreenStill { .. } => Ok(()),
-            A::SourceStill { kind, key, value, width } => {
+            A::SourceStill { kind, key, value, width, .. } => {
                 if kind.trim().is_empty() || kind.len() > 64 {
                     return Err(EngineError::Invalid("kind: a source kind id.".into()));
                 }
@@ -2652,7 +2667,9 @@ impl Engine {
             *crate::golive::lock_enhanced(self) = None;
             self.set_studio_live(false);
         }
-        host.stop().await.map_err(failed)
+        let status = host.stop().await.map_err(failed)?;
+        self.send_update_frame();
+        Ok(status)
     }
 
     pub async fn studio_kinds(&self) -> Result<Value, EngineError> {
@@ -2756,18 +2773,34 @@ impl Engine {
         Ok(v)
     }
 
+    /// Refuses once `request_update_restart` has admitted restart under `output_gate` so a late
+    /// capture or stream cannot race ahead of clean exit.
+    pub(crate) fn ensure_not_restarting_for_update(&self) -> Result<(), EngineError> {
+        if self.studio().update_committing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::golive::refused_pub(
+                "updating",
+                "Ferrocast is restarting to finish an update.",
+                "Try again once Ferrocast reopens.",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn studio_record(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
+            self.ensure_not_restarting_for_update()?;
             let s = host.settings().await;
             self.ffmpeg_first(s.record_needs_ffmpeg()).await?;
             Some(g)
         } else {
             None
         };
-        host.record(on).await.map_err(failed)
+        let out = host.record(on).await.map_err(failed)?;
+        self.send_update_frame();
+        Ok(out)
     }
 
     /// Refuses (and starts fetching FFmpeg) when x264 is `needed` and FFmpeg isn't here yet.
@@ -2790,11 +2823,14 @@ impl Engine {
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
+            self.ensure_not_restarting_for_update()?;
             Some(g)
         } else {
             None
         };
-        self.studio_host()?.record_source(name.to_string(), on).await.map_err(failed)
+        let out = self.studio_host()?.record_source(name.to_string(), on).await.map_err(failed)?;
+        self.send_update_frame();
+        Ok(out)
     }
 
     pub async fn studio_record_pause(&self, on: bool) -> Result<(), EngineError> {
@@ -2805,11 +2841,14 @@ impl Engine {
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
+            self.ensure_not_restarting_for_update()?;
             Some(g)
         } else {
             None
         };
-        self.studio_host()?.replay(on).await.map_err(failed)
+        let out = self.studio_host()?.replay(on).await.map_err(failed)?;
+        self.send_update_frame();
+        Ok(out)
     }
 
     pub async fn studio_replay_save(&self) -> Result<Value, EngineError> {
@@ -3032,6 +3071,7 @@ impl Engine {
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
+            self.ensure_not_restarting_for_update()?;
             Some(g)
         } else {
             None

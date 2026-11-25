@@ -14,6 +14,7 @@ mod ndi_io;
 mod netmedia;
 pub use ndi_io::NdiOut;
 mod own;
+pub use own::matching_camera_holds_session;
 // Remove background: Vision through objc2 on a Mac (the same unsafe calls as ffi's), RVM on Windows.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod cutout;

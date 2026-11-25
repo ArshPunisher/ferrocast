@@ -281,6 +281,7 @@ fn init_tracing(dir: &std::path::Path) {
 }
 
 fn main() {
+    let _ = MAIN_THREAD_ID.get_or_init(|| std::thread::current().id());
     let dir = data_dir();
     init_tracing(&dir);
     let safe_mode = std::env::args().any(|a| a == SAFE_MODE_ARG);
@@ -651,6 +652,37 @@ fn clean_exit_sequence(
     closed
 }
 
+fn updater_before_exit(
+    mark_quitting: impl FnOnce(),
+    close_studio: impl FnOnce() -> bool,
+    shutdown_engine: impl FnOnce(),
+    clear_markers: impl FnOnce(),
+    flush_logs: impl FnOnce(),
+) -> bool {
+    let clean = clean_exit_sequence(mark_quitting, close_studio, shutdown_engine, clear_markers);
+    flush_logs();
+    clean
+}
+
+static MAIN_THREAD_ID: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+fn close_studio_for_exit<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
+    if MAIN_THREAD_ID.get().copied() == Some(std::thread::current().id()) {
+        return studio::close();
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+    if app
+        .run_on_main_thread(move || {
+            let _ = tx.send(studio::close());
+        })
+        .is_err()
+    {
+        return false;
+    }
+    // Wait past Studio's Windows drain bound (3 s) + durable scene flush (6 s) before timing out.
+    rx.recv_timeout(Duration::from_secs(15)).unwrap_or(false)
+}
+
 fn shortcut_of(s: &str) -> Shortcut {
     s.parse().unwrap_or_else(|_| Shortcut::new(None, tauri_plugin_global_shortcut::Code::F24))
 }
@@ -703,8 +735,23 @@ async fn check_update<R: tauri::Runtime>(
     // nothing on the other systems, where the restart goes through the clean exit.)
     let handle = app.clone();
     builder = builder.on_before_exit(move || {
+        tracing::info!("Ferrocast quitting for update");
         let running = handle.try_state::<Running>();
-        clear_run_markers(running.as_ref().map(|r| &r.engine));
+        updater_before_exit(
+            studio::mark_quitting,
+            || close_studio_for_exit(&handle),
+            || {
+                if let Some(r) = running.as_ref() {
+                    r.engine.shutdown();
+                }
+            },
+            || clear_run_markers(running.as_ref().map(|r| &r.engine)),
+            || {
+                if let Some(l) = LOG_FILE.get() {
+                    l.flush(Duration::from_secs(2));
+                }
+            },
+        );
     });
     builder.timeout(timeout).configure_client(|c| c.connect_timeout(CONNECT_TIMEOUT)).build()?.check().await
 }
@@ -890,13 +937,17 @@ async fn install_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
         };
         let size = bytes.len() as u64;
         engine.update_progress(&version, size, Some(size));
-        // A stream may have started during the download: check again right before applying.
+        // A stream or local capture may have started during the download: check again before applying.
         if engine.update_blocked() {
-            engine.update_install_failed(ferrocast_engine::UpdateProblem::new(
-                "went_live",
-                "You went live during the download, so it waits.",
-                "Press Update now again after your stream.",
-            ));
+            let (msg, hint) = if engine.is_live() {
+                ("You went live during the download, so it waits.", "Press Update now again after your stream.")
+            } else {
+                (
+                    "Recording or replay buffer started during the download, so it waits.",
+                    "Press Update now again after it stops.",
+                )
+            };
+            engine.update_install_failed(ferrocast_engine::UpdateProblem::new("went_live", msg, hint));
             continue;
         }
         engine.update_installing(&version);
@@ -1895,6 +1946,40 @@ mod update_tests {
         );
         assert!(!failed);
         assert_eq!(*partial.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine"]);
+    }
+
+    #[test]
+    fn windows_update_before_exit_closes_studio_and_engine_before_clearing_markers() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let ok = updater_before_exit(
+            || log.borrow_mut().push("mark_quitting"),
+            || {
+                log.borrow_mut().push("close_studio");
+                true
+            },
+            || log.borrow_mut().push("shutdown_engine"),
+            || log.borrow_mut().push("clear_markers"),
+            || log.borrow_mut().push("flush_logs"),
+        );
+        assert!(ok);
+        assert_eq!(
+            *log.borrow(),
+            vec!["mark_quitting", "close_studio", "shutdown_engine", "clear_markers", "flush_logs"]
+        );
+
+        let partial = std::cell::RefCell::new(Vec::new());
+        let failed = updater_before_exit(
+            || partial.borrow_mut().push("mark_quitting"),
+            || {
+                partial.borrow_mut().push("close_studio");
+                false
+            },
+            || partial.borrow_mut().push("shutdown_engine"),
+            || partial.borrow_mut().push("clear_markers"),
+            || partial.borrow_mut().push("flush_logs"),
+        );
+        assert!(!failed);
+        assert_eq!(*partial.borrow(), vec!["mark_quitting", "close_studio", "shutdown_engine", "flush_logs"]);
     }
 
     /// A log writer whose disk is slow (or locked, or rotating) must not slow the threads that log:
