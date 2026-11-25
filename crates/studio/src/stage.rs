@@ -79,6 +79,14 @@ fn publish_engine(shared: Option<&Arc<own::Shared>>) {
     *LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()) = shared.map_or_else(std::sync::Weak::new, Arc::downgrade);
 }
 
+/// How long a level ask leaves the engine alone after it failed to start.
+const LEVELS_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether a level ask may try to start the engine now.
+fn levels_may_start(retry_at: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    retry_at.is_none_or(|at| now >= at)
+}
+
 /// The meters (the long window, or `fast` over a few blocks), read without the Studio's main thread. None when no engine
 /// is running (the caller then asks the main thread, which says why).
 pub fn levels_now(
@@ -99,6 +107,9 @@ pub struct Stage {
     /// straight to the engine's item, not through opening the whole collection again).
     quiet: std::cell::Cell<bool>,
     reloads: std::cell::Cell<usize>,
+    /// When a level ask may try to start the engine again after one failed (no graphics
+    /// adapter, a broken driver): the meters ask thirty times a second and each try is heavy.
+    levels_retry_at: std::cell::Cell<Option<std::time::Instant>>,
     /// Keys held down (push to show, hide, filter on or off): how the engine sees an item or a
     /// filter while they are down. Never in `doc`, so never saved, never in an undo snapshot or
     /// an export, and gone with this stage (a crash or quit shows the collection as it was).
@@ -620,6 +631,7 @@ impl Stage {
             doc: RefCell::new(doc),
             quiet: std::cell::Cell::new(false),
             reloads: std::cell::Cell::new(0),
+            levels_retry_at: std::cell::Cell::new(None),
             holds: RefCell::default(),
             monitor_device: RefCell::new(None),
             true_peak: std::cell::Cell::new(false),
@@ -653,6 +665,7 @@ impl Stage {
             doc: RefCell::new(doc),
             quiet: std::cell::Cell::new(false),
             reloads: std::cell::Cell::new(0),
+            levels_retry_at: std::cell::Cell::new(None),
             holds: RefCell::default(),
             monitor_device: RefCell::new(None),
             true_peak: std::cell::Cell::new(false),
@@ -4347,10 +4360,29 @@ impl Stage {
     /// (owner, 24 Nov: "mic doesnt show here on setup when i talk").
     pub fn levels(&self, names: &[String]) -> std::collections::HashMap<String, crate::collection::LevelInfo> {
         let running = self.engine.borrow().clone();
-        let Some(e) = running.or_else(|| if names.is_empty() { None } else { self.engine().ok() }) else {
+        let Some(e) = running.or_else(|| if names.is_empty() { None } else { self.start_for_levels() }) else {
             return Default::default();
         };
         read_levels(&e, names, false)
+    }
+
+    /// Starts the engine for a level ask, but not again for a while after it failed to.
+    fn start_for_levels(&self) -> Option<Arc<own::Shared>> {
+        let now = std::time::Instant::now();
+        if !levels_may_start(self.levels_retry_at.get(), now) {
+            return None;
+        }
+        match self.engine() {
+            Ok(e) => {
+                self.levels_retry_at.set(None);
+                Some(e)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the engine could not start for the level meters; trying again in a while");
+                self.levels_retry_at.set(Some(now + LEVELS_RETRY));
+                None
+            }
+        }
     }
 
     /// Ferrocast's sound care: `{ ducking: { voices, music, depth_db } | null, loudness_lufs:
@@ -8977,6 +9009,18 @@ mod tests {
         let t = ok(s.transform("Main", it.id));
         assert!(t.crop_left + t.crop_right <= 199 && t.crop_top + t.crop_bottom <= 99, "{t:?}");
         assert!(ok(s.item_point("Main", it.id, (0.5, 0.5))).0.is_finite());
+    }
+
+    /// An engine that cannot start (no graphics adapter) must not be tried thirty times a second
+    /// by the level meters: after a failed try the next one waits.
+    #[test]
+    fn level_asks_leave_a_failed_engine_start_alone_for_a_while() {
+        let now = std::time::Instant::now();
+        assert!(levels_may_start(None, now), "never tried: try");
+        let retry = Some(now + LEVELS_RETRY);
+        assert!(!levels_may_start(retry, now), "just failed: wait");
+        assert!(!levels_may_start(retry, now + LEVELS_RETRY / 2), "still waiting");
+        assert!(levels_may_start(retry, now + LEVELS_RETRY), "after the wait: try again");
     }
 
     #[test]
