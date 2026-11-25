@@ -218,6 +218,20 @@ fn write_transform(i: &mut Value, t: &Transform, bounds: usize) {
     }
 }
 
+/// Clamps opposing crops along one axis so at least one pixel remains and a stationary edge stays fixed.
+fn clamp_crop_axis(len: i32, before: (i32, i32), req: (i32, i32)) -> (i32, i32) {
+    let max_crop = (len - 1).max(0);
+    let (a, b) = (req.0.clamp(0, max_crop), req.1.clamp(0, max_crop));
+    if a + b <= max_crop {
+        return (a, b);
+    }
+    match (a > before.0, b > before.1) {
+        (true, false) => (max_crop - b, b),
+        (false, true) => (a, max_crop - a),
+        _ => (a.min(max_crop - b), b),
+    }
+}
+
 fn name_of(s: &Value) -> &str {
     s.get("name").and_then(Value::as_str).unwrap_or_default()
 }
@@ -1438,10 +1452,7 @@ impl Stage {
                 .rev()
                 .map(|c| {
                     let mut ci = self.info_with(c, false);
-                    let f = ci.frame;
-                    let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
-                    let on = unit.then(&a);
-                    ci.frame = [on.a, on.b, on.c, on.d, on.e, on.f];
+                    ci.frame = Self::compose_frame(ci.frame, &a);
                     ci
                 })
                 .collect()
@@ -1843,10 +1854,7 @@ impl Stage {
             let it = self.item(scene, id)?;
             let mut info = self.info_of(&it);
             if let Some(gi) = gid.and_then(|g| self.item(scene, g).ok()) {
-                let f = info.frame;
-                let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
-                let on = unit.then(&self.group_map(&gi));
-                info.frame = [on.a, on.b, on.c, on.d, on.e, on.f];
+                info.frame = Self::compose_frame(info.frame, &self.group_map(&gi));
             }
             return Ok(info);
         }
@@ -1902,6 +1910,7 @@ impl Stage {
     /// Moves and sizes an item so its picture fills `x, y, w, h` on the canvas (a drag in the
     /// preview), keeping its turn and crop.
     pub fn set_item_box(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
+        let canvas_pos = (x, y);
         // In a group: the canvas box into the group's own pixels.
         let home = self.home(scene, id);
         let (x, y, w, h) = match (home != scene)
@@ -1952,12 +1961,14 @@ impl Stage {
         // A flipped item in bounds is drawn from another corner than `x, y` (the bounds' alignment
         // and the flip move its origin): the frame's corner is what the caller sees and sends back,
         // so `x, y` are moved by what they are off, and a nudge of 1 pixel is 1 pixel.
-        if home == scene {
-            let (dx, dy) = (x - info.frame[4], y - info.frame[5]);
-            if dx.abs() > 0.01 || dy.abs() > 0.01 {
+        let (dx, dy) = (canvas_pos.0 - info.frame[4], canvas_pos.1 - info.frame[5]);
+        if dx.abs() > 0.01 || dy.abs() > 0.01 {
+            if home == scene {
                 (t.x, t.y) = (t.x + dx, t.y + dy);
                 return self.set_transform(scene, id, &t);
             }
+            self.settle_point(scene, id, (0.0, 0.0), canvas_pos)?;
+            return self.canvas_info(scene, id);
         }
         Ok(info)
     }
@@ -1968,13 +1979,18 @@ impl Stage {
     /// (owner, 25 Nov: dragging an edge in moved the whole source).
     pub fn set_item_crop(&self, scene: &str, id: i64, crop: [i32; 4]) -> Result<ItemInfo, StudioError> {
         let before = self.transform(scene, id)?;
-        let (w, h) = (before.width.max(1) as i32, before.height.max(1) as i32);
-        // At least one pixel stays each way: the opposite side wins when the two would meet.
-        let mut crop = crop.map(|c| c.max(0));
-        crop[2] = crop[2].min(w - 1);
-        crop[0] = crop[0].min(w - 1 - crop[2]);
-        crop[3] = crop[3].min(h - 1);
-        crop[1] = crop[1].min(h - 1 - crop[3]);
+        if before.width == 0 || before.height == 0 {
+            // Unready sources (such as a waiting camera) have a 0x0 frame, so scaling `bounds`
+            // from `info_of(&it).frame` would collapse a fitted box to 0x0.
+            let mut t = before;
+            [t.crop_left, t.crop_top, t.crop_right, t.crop_bottom] = crop.map(|c| c.max(0));
+            return self.set_transform(scene, id, &t);
+        }
+        let (w, h) = (before.width as i32, before.height as i32);
+        // At least one pixel stays each way; clamp whichever side grew against the stationary side.
+        let (left, right) = clamp_crop_axis(w, (before.crop_left, before.crop_right), (crop[0], crop[2]));
+        let (top, bottom) = clamp_crop_axis(h, (before.crop_top, before.crop_bottom), (crop[1], crop[3]));
+        let crop = [left, top, right, bottom];
         let seen = (
             (w - before.crop_left - before.crop_right).max(1) as f32,
             (h - before.crop_top - before.crop_bottom).max(1) as f32,
@@ -1999,8 +2015,23 @@ impl Stage {
             (t.bounds_width, t.bounds_height, t.alignment, t.bounds_alignment) = (nw, nh, 5, 5);
         }
         self.set_transform_placing(scene, id, t, (0.0, 0.0), target)?;
+        self.canvas_info(scene, id)
+    }
+
+    fn compose_frame(f: [f32; 6], map: &ferrocore::Affine) -> [f32; 6] {
+        let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
+        let on = unit.then(map);
+        [on.a, on.b, on.c, on.d, on.e, on.f]
+    }
+
+    /// An item's info with `frame` in canvas coordinates (composed with any enclosing group).
+    fn canvas_info(&self, scene: &str, id: i64) -> Result<ItemInfo, StudioError> {
         let it = self.item(scene, id)?;
-        Ok(self.info_of(&it))
+        let mut info = self.info_of(&it);
+        if let Some(gi) = self.group_of(scene, id) {
+            info.frame = Self::compose_frame(info.frame, &self.group_map(&gi));
+        }
+        Ok(info)
     }
 
     /// Where an item is in its scene (0 is the top) and the scene's name.
@@ -2026,13 +2057,7 @@ impl Stage {
     /// before any flip: the picture's top-left is (0, 0)) is on the canvas, through its group
     /// inside one.
     fn item_point(&self, scene: &str, id: i64, at: (f32, f32)) -> Result<(f32, f32), StudioError> {
-        let it = self.item(scene, id)?;
-        let mut f = self.info_of(&it).frame;
-        if let Some(gi) = self.group_of(scene, id) {
-            let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
-            let on = unit.then(&self.group_map(&gi));
-            f = [on.a, on.b, on.c, on.d, on.e, on.f];
-        }
+        let f = self.canvas_info(scene, id)?.frame;
         Ok((f[4] + f[0] * at.0 + f[2] * at.1, f[5] + f[1] * at.0 + f[3] * at.1))
     }
 
@@ -7989,6 +8014,62 @@ mod tests {
         }
     }
 
+    /// The same origin stability applies inside an offset and scaled group (`home != scene`).
+    #[test]
+    fn flipped_bounded_item_inside_group_keeps_origin_and_nudges_by_one_pixel() {
+        for (flip_x, flip_y, bounds, align) in
+            [(-1.0, 1.0, "fit", 0), (1.0, -1.0, "fit", 0), (-1.0, -1.0, "stretch", 5), (-1.0, 1.0, "fit", 5)]
+        {
+            let s = stage();
+            let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+            let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 80, "height": 80 }), false));
+            ok(s.set_item_boxes("Main", &[(a.id, 100.0, 100.0, 100.0, 100.0), (b.id, 300.0, 220.0, 80.0, 80.0)]));
+            let mut t = ok(s.transform("Main", a.id));
+            t.bounds = bounds.into();
+            (t.bounds_width, t.bounds_height, t.bounds_alignment) = (100.0, 100.0, align);
+            (t.scale_x, t.scale_y) = (flip_x, flip_y);
+            (t.x, t.y, t.alignment) = (100.0, 100.0, 5);
+            ok(s.set_transform("Main", a.id, &t));
+
+            let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+            let gb = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap_or_else(|| panic!("group missing"));
+            let (gw, gh) = (gb.frame[0].hypot(gb.frame[1]), gb.frame[2].hypot(gb.frame[3]));
+            ok(s.set_item_box("Main", g.id, 250.0, 120.0, gw * 1.5, gh * 0.8));
+
+            let frame = |s: &Stage| -> [f32; 6] {
+                ok(s.items("Main"))
+                    .into_iter()
+                    .find(|i| i.id == g.id)
+                    .and_then(|grp| grp.children.into_iter().find(|c| c.id == a.id))
+                    .map(|c| c.frame)
+                    .unwrap_or([0.0; 6])
+            };
+            let f = frame(&s);
+            let (w, h) = (f[0].hypot(f[1]), f[2].hypot(f[3]));
+            let ret = ok(s.set_item_box("Main", a.id, f[4], f[5], w, h));
+            let after = frame(&s);
+            for k in 0..6 {
+                assert!(
+                    (f[k] - after[k]).abs() < 0.02,
+                    "{bounds} ({flip_x},{flip_y}) align {align}: moved from {f:?} to {after:?}"
+                );
+                assert!(
+                    (ret.frame[k] - after[k]).abs() < 0.02,
+                    "{bounds} ({flip_x},{flip_y}) align {align}: returned frame {:?} != {after:?}",
+                    ret.frame
+                );
+            }
+
+            let ret_nudge = ok(s.set_item_box("Main", a.id, f[4] + 1.0, f[5] + 2.0, w, h));
+            let n = frame(&s);
+            assert!(
+                (n[4] - f[4] - 1.0).abs() < 0.02 && (n[5] - f[5] - 2.0).abs() < 0.02,
+                "{bounds} ({flip_x},{flip_y}) align {align}: nudge {f:?} -> {n:?}"
+            );
+            assert!((ret_nudge.frame[4] - n[4]).abs() < 0.02 && (ret_nudge.frame[5] - n[5]).abs() < 0.02);
+        }
+    }
+
     /// A group and a source inside it can't be asked for together: moving the source fits the
     /// group again, so the group's own box would then be applied to the changed group and move
     /// the source a second time (Neon #4).
@@ -9142,6 +9223,103 @@ mod tests {
         let t = ok(s.transform("Main", it.id));
         assert!(t.crop_left + t.crop_right <= 199 && t.crop_top + t.crop_bottom <= 99, "{t:?}");
         assert!(ok(s.item_point("Main", it.id, (0.5, 0.5))).0.is_finite());
+    }
+
+    /// `set_item_crop` on a grouped source must return the same canvas-space frame that `items()`
+    /// reports, including the enclosing group's offset and scale.
+    #[test]
+    fn set_item_crop_returns_canvas_frame_for_grouped_item() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "GA", &json!({ "width": 200, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "GB", &json!({ "width": 60, "height": 60 }), false));
+        ok(s.set_item_boxes("Main", &[(a.id, 100.0, 100.0, 200.0, 100.0), (b.id, 400.0, 200.0, 60.0, 60.0)]));
+        let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        let gb = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap_or_else(|| panic!("group missing"));
+        let (gw, gh) = (gb.frame[0].hypot(gb.frame[1]), gb.frame[2].hypot(gb.frame[3]));
+        ok(s.set_item_box("Main", g.id, 300.0, 150.0, gw * 2.0, gh * 0.5));
+
+        let returned = ok(s.set_item_crop("Main", a.id, [40, 10, 20, 5]));
+        let actual = ok(s.items("Main"))
+            .into_iter()
+            .find(|i| i.id == g.id)
+            .and_then(|grp| grp.children.into_iter().find(|c| c.id == a.id))
+            .unwrap_or_else(|| panic!("grouped child missing"));
+        for k in 0..6 {
+            assert!(
+                (returned.frame[k] - actual.frame[k]).abs() < 1e-3,
+                "frame[{k}] mismatch: returned={:?}, actual={:?}",
+                returned.frame,
+                actual.frame
+            );
+        }
+    }
+
+    /// A 0x0 source (such as a waiting camera before its first frame) must keep its fitted/
+    /// stretched bounds box across `set_item_crop`.
+    #[test]
+    fn set_item_crop_preserves_bounds_on_zero_size_waiting_source() {
+        let s = stage();
+        let cam = ok(s.add_source("Main", "av_capture_input_v2", "Cam", &json!({ "device": "cam-1" }), true));
+        let before = ok(s.transform("Main", cam.id));
+        assert_eq!((before.width, before.height), (0, 0));
+        assert_eq!(before.bounds, "fit");
+        assert!((before.bounds_width - 1920.0).abs() < 1e-3);
+        assert!((before.bounds_height - 1080.0).abs() < 1e-3);
+
+        ok(s.set_item_crop("Main", cam.id, [0, 0, 0, 0]));
+        let after_zero = ok(s.transform("Main", cam.id));
+        assert_eq!(after_zero.bounds, "fit");
+        assert_eq!(after_zero.bounds_width, before.bounds_width);
+        assert_eq!(after_zero.bounds_height, before.bounds_height);
+
+        ok(s.set_item_crop("Main", cam.id, [10, 20, 30, 40]));
+        let after_nonzero = ok(s.transform("Main", cam.id));
+        assert_eq!(after_nonzero.bounds, "fit");
+        assert_eq!(after_nonzero.bounds_width, before.bounds_width);
+        assert_eq!(after_nonzero.bounds_height, before.bounds_height);
+    }
+
+    /// Dragging one crop edge past the opposite edge must clamp the moving edge and keep the
+    /// stationary opposite edge fixed (mirrored across left/right and top/bottom).
+    #[test]
+    fn set_item_crop_symmetric_clamp_keeps_stationary_edge_fixed() {
+        let s = stage();
+        let it = ok(s.add_source("Main", "color_source_v3", "Box", &json!({ "width": 200, "height": 100 }), false));
+
+        // Right edge dragged past left edge: left stays at 100, right clamps to 99.
+        ok(s.set_item_crop("Main", it.id, [100, 0, 0, 0]));
+        let left_anchor = ok(s.item_point("Main", it.id, (0.0, 0.0))).0;
+        ok(s.set_item_crop("Main", it.id, [100, 0, 150, 0]));
+        let t = ok(s.transform("Main", it.id));
+        assert_eq!((t.crop_left, t.crop_right), (100, 99), "left edge must stay fixed: {t:?}");
+        assert!((ok(s.item_point("Main", it.id, (0.0, 0.0))).0 - left_anchor).abs() < 0.01);
+
+        // Mirrored: left edge dragged past right edge: right stays at 100, left clamps to 99.
+        ok(s.set_item_crop("Main", it.id, [0, 0, 0, 0]));
+        ok(s.set_item_crop("Main", it.id, [0, 0, 100, 0]));
+        let right_anchor = ok(s.item_point("Main", it.id, (1.0, 0.0))).0;
+        ok(s.set_item_crop("Main", it.id, [150, 0, 100, 0]));
+        let t = ok(s.transform("Main", it.id));
+        assert_eq!((t.crop_left, t.crop_right), (99, 100), "right edge must stay fixed: {t:?}");
+        assert!((ok(s.item_point("Main", it.id, (1.0, 0.0))).0 - right_anchor).abs() < 0.01);
+
+        // Bottom edge dragged past top edge: top stays at 60, bottom clamps to 39.
+        ok(s.set_item_crop("Main", it.id, [0, 0, 0, 0]));
+        ok(s.set_item_crop("Main", it.id, [0, 60, 0, 0]));
+        let top_anchor = ok(s.item_point("Main", it.id, (0.0, 0.0))).1;
+        ok(s.set_item_crop("Main", it.id, [0, 60, 0, 80]));
+        let t = ok(s.transform("Main", it.id));
+        assert_eq!((t.crop_top, t.crop_bottom), (60, 39), "top edge must stay fixed: {t:?}");
+        assert!((ok(s.item_point("Main", it.id, (0.0, 0.0))).1 - top_anchor).abs() < 0.01);
+
+        // Mirrored: top edge dragged past bottom edge: bottom stays at 60, top clamps to 39.
+        ok(s.set_item_crop("Main", it.id, [0, 0, 0, 0]));
+        ok(s.set_item_crop("Main", it.id, [0, 0, 0, 60]));
+        let bottom_anchor = ok(s.item_point("Main", it.id, (0.0, 1.0))).1;
+        ok(s.set_item_crop("Main", it.id, [0, 80, 0, 60]));
+        let t = ok(s.transform("Main", it.id));
+        assert_eq!((t.crop_top, t.crop_bottom), (39, 60), "bottom edge must stay fixed: {t:?}");
+        assert!((ok(s.item_point("Main", it.id, (0.0, 1.0))).1 - bottom_anchor).abs() < 0.01);
     }
 
     /// An engine that cannot start (no graphics adapter) must not be tried thirty times a second

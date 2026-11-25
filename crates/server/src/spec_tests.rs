@@ -469,3 +469,59 @@ fn engine_stats_schema_documents_capture_problem_waiting_enum() {
         serde_json::json!(["permission", "waiting", "no_picture", "black"])
     );
 }
+
+#[test]
+fn screenshot_screen_still_and_source_status_contracts_match_runtime() {
+    let o = spec::openapi();
+    let schemas = &o["components"]["schemas"];
+    fn resolve<'a>(schemas: &'a Value, node: &'a Value) -> &'a Value {
+        if let Some(name) = node["$ref"].as_str().and_then(|r| r.strip_prefix("#/components/schemas/")) {
+            &schemas[name]
+        } else {
+            node
+        }
+    }
+    let find_query = |path: &str, method: &str, name: &str| -> Option<Value> {
+        op(o, path, method)["parameters"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["in"] == "query" && p["name"] == name).cloned())
+    };
+
+    // 1. POST /studio/engine/sources/{name}/screenshot: optional scene+item query & body, {file} response.
+    for param in ["scene", "item"] {
+        let q = find_query("/studio/engine/sources/{name}/screenshot", "post", param)
+            .unwrap_or_else(|| panic!("screenshot query param `{param}` missing"));
+        assert_eq!(q["required"], json!(false), "{param} query must be optional");
+    }
+    let shot_op = op(o, "/studio/engine/sources/{name}/screenshot", "post");
+    assert_eq!(shot_op["requestBody"]["required"], json!(false), "screenshot body is optional");
+    let shot_req = resolve(schemas, &shot_op["requestBody"]["content"]["application/json"]["schema"]);
+    assert_eq!(shot_req["properties"]["scene"]["type"], "string");
+    assert_eq!(shot_req["properties"]["item"]["type"], "integer");
+    let shot_resp = resolve(schemas, &shot_op["responses"]["200"]["content"]["application/json"]["schema"]);
+    assert_eq!(shot_resp["required"], json!(["file"]));
+    assert_eq!(shot_resp["properties"]["file"]["type"], "string");
+
+    // 2. GET /studio/engine/screens/{id}/still uses StudioSourceStill, and both still endpoints document ?fresh=1.
+    assert_eq!(
+        op(o, "/studio/engine/screens/{id}/still", "get")["responses"]["200"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/StudioSourceStill"
+    );
+    for path in ["/studio/engine/still", "/studio/engine/screens/{id}/still"] {
+        let fresh = find_query(path, "get", "fresh")
+            .unwrap_or_else(|| panic!("{path} must document optional `fresh` query param"));
+        assert_eq!(fresh["required"], json!(false), "{path}: fresh must be optional");
+    }
+
+    // 3. GET /studio/engine/sources/{name}/status documents the `camera` field.
+    let status_resp = resolve(
+        schemas,
+        &op(o, "/studio/engine/sources/{name}/status", "get")["responses"]["200"]["content"]["application/json"]["schema"],
+    );
+    let cam = &status_resp["properties"]["camera"];
+    assert_eq!(cam["type"], "object", "camera field missing: {status_resp}");
+    assert_eq!(cam["properties"]["state"]["enum"], json!(["live", "waiting"]));
+    assert_eq!(cam["properties"]["message"]["type"], json!(["string", "null"]));
+    assert_eq!(cam["properties"]["tries"]["type"], "integer");
+}

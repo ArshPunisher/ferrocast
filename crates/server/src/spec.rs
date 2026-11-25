@@ -1236,9 +1236,9 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         "POST",
         "/studio/engine/sources/{name}/screenshot",
         "Studio Engine",
-        "Save a PNG screenshot of a source.",
+        "Save a PNG screenshot of a source, or a scene item when `scene` and `item` are given.",
         None,
-        None,
+        Some("StudioScreenshotResponse"),
     ),
     doc(
         "GET",
@@ -1254,7 +1254,7 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         "Studio Engine",
         "Playback/health status of a source.",
         None,
-        None,
+        Some("StudioSourceStatus"),
     ),
     doc(
         "GET",
@@ -1262,7 +1262,7 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         "Studio Engine",
         "Capture a static preview frame of a display.",
         None,
-        None,
+        Some("StudioSourceStill"),
     ),
     doc(
         "GET",
@@ -2076,6 +2076,98 @@ fn file_response(method: &str, rel_path: &str) -> Option<Value> {
     }))
 }
 
+fn fresh_still_param() -> Value {
+    json!({
+        "name": "fresh",
+        "in": "query",
+        "required": false,
+        "description": "Pass `1` (or `true`) to bypass the 15 s still cache and probe a fresh frame.",
+        "schema": { "type": ["string", "integer", "boolean"] }
+    })
+}
+
+fn still_width_param(default: u32) -> Value {
+    json!({
+        "name": "w",
+        "in": "query",
+        "required": false,
+        "description": format!("Requested thumbnail width in pixels (default {default}, max 320)."),
+        "schema": { "type": "integer", "default": default, "minimum": 1, "maximum": 320 }
+    })
+}
+
+fn query_params(method: &str, rel_path: &str) -> Vec<Value> {
+    match (method, rel_path) {
+        ("GET", "/store/catalog") => vec![json!({
+            "name": "fresh",
+            "in": "query",
+            "required": false,
+            "description": "`true` fetches and verifies the catalog again instead of using the one kept.",
+            "schema": { "type": "boolean", "default": false }
+        })],
+        ("POST", "/studio/engine/sources/{name}/screenshot") => vec![
+            json!({
+                "name": "scene",
+                "in": "query",
+                "required": false,
+                "description": "Scene name holding `item` when capturing a scene item with transforms and filters (must be paired with `item`).",
+                "schema": { "type": "string" }
+            }),
+            json!({
+                "name": "item",
+                "in": "query",
+                "required": false,
+                "description": "Scene item id in `scene` to capture with transforms and filters (must be paired with `scene`).",
+                "schema": { "type": "integer" }
+            }),
+        ],
+        ("GET", "/studio/engine/screens/{id}/still") => vec![
+            json!({
+                "name": "window",
+                "in": "query",
+                "required": false,
+                "description": "`true` treats `{id}` as a window id instead of a display id.",
+                "schema": { "type": "boolean", "default": false }
+            }),
+            still_width_param(240),
+            fresh_still_param(),
+        ],
+        ("GET", "/studio/engine/still") => vec![
+            json!({
+                "name": "kind",
+                "in": "query",
+                "required": true,
+                "description": "Source input kind id (for example `av_capture_input_v2`).",
+                "schema": { "type": "string" }
+            }),
+            json!({
+                "name": "key",
+                "in": "query",
+                "required": true,
+                "description": "Device setting key (for example `device`).",
+                "schema": { "type": "string" }
+            }),
+            json!({
+                "name": "value",
+                "in": "query",
+                "required": true,
+                "description": "Selected device setting value.",
+                "schema": { "type": "string" }
+            }),
+            still_width_param(240),
+            fresh_still_param(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn optional_req_schema(method: &str, rel_path: &str) -> Option<&'static str> {
+    match (method, rel_path) {
+        ("POST", "/studio/engine/sources/{name}/screenshot") => Some("StudioSourceScreenshotRequest"),
+        _ => None,
+    }
+}
+
 fn build_openapi() -> Value {
     let mut paths: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
     for r in all_rest_routes() {
@@ -2094,15 +2186,7 @@ fn build_openapi() -> Value {
         }
 
         let mut params = path_params(r.rel_path);
-        if (r.method, r.rel_path) == ("GET", "/store/catalog") {
-            params.push(json!({
-                "name": "fresh",
-                "in": "query",
-                "required": false,
-                "description": "`true` fetches and verifies the catalog again instead of using the one kept.",
-                "schema": { "type": "boolean", "default": false }
-            }));
-        }
+        params.extend(query_params(r.method, r.rel_path));
         if !params.is_empty() {
             op.insert("parameters".into(), Value::Array(params));
         }
@@ -2118,6 +2202,18 @@ fn build_openapi() -> Value {
                 "requestBody".into(),
                 json!({
                     "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": { "$ref": format!("#/components/schemas/{req_ref}") }
+                        }
+                    }
+                }),
+            );
+        } else if let Some(req_ref) = optional_req_schema(r.method, r.rel_path) {
+            op.insert(
+                "requestBody".into(),
+                json!({
+                    "required": false,
                     "content": {
                         "application/json": {
                             "schema": { "$ref": format!("#/components/schemas/{req_ref}") }
@@ -2931,8 +3027,23 @@ fn schemas() -> Value {
         "SettingsPatch": {
             "type": "object",
             "description": "Partial update of non-sensitive local application preferences."
-        },
-        "StudioSourceStill": {
+        }
+    });
+    if let Some(map) = doc.as_object_mut() {
+        map.extend(studio_source_schemas());
+        map.extend(studio_stats_schemas());
+        map.extend(auto_config_schemas());
+        map.extend(store_schemas());
+        map.extend(schedule_schemas());
+    }
+    doc
+}
+
+fn studio_source_schemas() -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "StudioSourceStill".into(),
+        json!({
             "type": "object",
             "description": "Picker thumbnail response for a display, window, or camera.",
             "required": ["image"],
@@ -2944,15 +3055,70 @@ fn schemas() -> Value {
                 },
                 "error": { "type": ["string", "null"] }
             }
-        }
-    });
-    if let Some(map) = doc.as_object_mut() {
-        map.extend(studio_stats_schemas());
-        map.extend(auto_config_schemas());
-        map.extend(store_schemas());
-        map.extend(schedule_schemas());
-    }
-    doc
+        }),
+    );
+    m.insert(
+        "StudioSourceScreenshotRequest".into(),
+        json!({
+            "type": "object",
+            "description": "Optional scene-item target. Provide both `scene` and `item` (here or as query parameters; omit both to capture the raw source).",
+            "properties": {
+                "scene": { "type": "string", "description": "Scene name holding `item`." },
+                "item": { "type": "integer", "description": "Scene item id in `scene`." }
+            }
+        }),
+    );
+    m.insert(
+        "StudioScreenshotResponse".into(),
+        json!({
+            "type": "object",
+            "description": "Saved screenshot file result.",
+            "required": ["file"],
+            "properties": {
+                "file": { "type": "string", "description": "Full local path of the saved PNG screenshot." }
+            }
+        }),
+    );
+    m.insert(
+        "StudioSourceStatus".into(),
+        json!({
+            "type": "object",
+            "description": "Live health/status details for a source (`{}` when the source kind reports no live status).",
+            "properties": {
+                "camera": {
+                    "type": "object",
+                    "description": "Present for open camera/capture sources.",
+                    "required": ["state", "tries"],
+                    "properties": {
+                        "state": { "type": "string", "enum": ["live", "waiting"] },
+                        "message": { "type": ["string", "null"] },
+                        "tries": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "web_text": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "at_ms": { "type": "integer", "minimum": 0 },
+                        "value": { "type": ["string", "null"] },
+                        "error": { "type": ["string", "null"] }
+                    }
+                },
+                "page": {
+                    "type": "object",
+                    "required": ["ok"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "error": { "type": ["string", "null"] }
+                    }
+                },
+                "app_on": {
+                    "type": "array",
+                    "items": { "type": "integer" }
+                }
+            }
+        }),
+    );
+    m
 }
 
 fn studio_stats_schemas() -> Map<String, Value> {

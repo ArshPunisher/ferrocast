@@ -3046,6 +3046,7 @@ impl Engine {
             self.set_studio_live(false);
             // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
             *crate::golive::lock_enhanced(self) = None;
+            crate::golive::clear_applied_cap(self);
             host.stream_stop().await.map_err(failed)?;
             // A countdown (or a show waiting for its live scene) with no stream is over: Go
             // live again must start a new show, not say one is running.

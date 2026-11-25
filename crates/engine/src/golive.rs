@@ -583,6 +583,9 @@ pub(crate) struct GoLive {
     /// The cap the Studio's running encode was given when it started: what the encode really
     /// is, whatever the destinations say now (only a new stream gets a new one).
     applied_cap: Mutex<Option<crate::studio_host::StreamCap>>,
+    /// The platform ceiling behind `applied_cap`, kept beside it so `view_with` names the
+    /// platform whose limit holds the running stream even after it is unticked mid-stream.
+    applied_limit: Mutex<Option<PlatformLimit>>,
     /// Names by id of destinations that sent, for the session record (a deleted one keeps its name).
     dest_names: Mutex<std::collections::HashMap<String, String>>,
     /// A platform said the stream ended while the hub still runs (every destination was
@@ -680,6 +683,7 @@ impl Default for GoLive {
             studio_live: std::sync::atomic::AtomicBool::new(false),
             cap_failed: std::sync::atomic::AtomicBool::new(false),
             applied_cap: Mutex::new(None),
+            applied_limit: Mutex::new(None),
             dest_names: Mutex::new(std::collections::HashMap::new()),
             health_end_pending: std::sync::atomic::AtomicBool::new(false),
         }
@@ -697,6 +701,45 @@ struct Running {
 /// Twitch Enhanced Broadcasting's plan for the Studio stream on now (None: none).
 pub(crate) fn lock_enhanced(e: &Engine) -> std::sync::MutexGuard<'_, Option<ferrocast_golive::twitch_eb::Plan>> {
     lock(&e.golive().enhanced)
+}
+
+pub(crate) fn clear_applied_cap(e: &Engine) {
+    *lock(&e.golive().applied_cap) = None;
+    *lock(&e.golive().applied_limit) = None;
+}
+
+/// Whether `d` should send on the stream (a standby backup only sends while its primary fails).
+fn destination_sends(cfg: &GoLiveConfig, failing: &std::collections::HashSet<String>, d: &DestinationConfig) -> bool {
+    match backs_up(cfg, &d.id) {
+        Some(p) if p.enabled => failing.contains(&p.id),
+        _ => d.enabled,
+    }
+}
+
+fn limit_from_cap(c: crate::studio_host::StreamCap) -> Option<PlatformLimit> {
+    match c.max_kbps? {
+        6_000 => Some(PlatformLimit {
+            service: Service::Twitch,
+            name: "Twitch",
+            max_kbps: 6_000,
+            keyframe_secs: c.keyframe_secs,
+            h264_only: c.h264_only,
+        }),
+        8_000 => Some(PlatformLimit {
+            service: Service::Kick,
+            name: "Kick",
+            max_kbps: 8_000,
+            keyframe_secs: c.keyframe_secs,
+            h264_only: c.h264_only,
+        }),
+        other => Some(PlatformLimit {
+            service: Service::Custom,
+            name: "Stream",
+            max_kbps: other,
+            keyframe_secs: c.keyframe_secs,
+            h264_only: c.h264_only,
+        }),
+    }
 }
 
 /// The destination `id` backs up, if any.
@@ -1020,6 +1063,31 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn seed_backup_failing_for_test(&self, id: &str, failing: bool) {
+        let mut b = lock(&self.golive().backup);
+        if failing {
+            b.failing.insert(id.to_string());
+        } else {
+            b.failing.remove(id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_light_route_for_test(&self, id: &str) {
+        use ferrocast_golive::protect::Sample;
+        let t0 = std::time::Instant::now();
+        let mut q = lock(&self.golive().quality);
+        for n in 0..=ferrocast_golive::quality::LIGHTEN_AFTER as u64 {
+            let at = t0 + std::time::Duration::from_secs(n);
+            let samples = [
+                Sample { id: "__healthy__", kbps: 6000, want_kbps: 6000, dropped: 0, live_ms: 60_000 },
+                Sample { id, kbps: 1000, want_kbps: 6000, dropped: 0, live_ms: 60_000 },
+            ];
+            q.tick(at, &samples, 70);
+        }
+    }
+
     /// Whether a stream is running that a destination change would be applied to.
     pub(crate) fn health_end_deferred(&self) {
         self.golive().health_end_pending.store(true, std::sync::atomic::Ordering::Release);
@@ -1049,6 +1117,37 @@ impl Engine {
         self.golive().studio_live.store(on, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn applied_cap(&self) -> Option<crate::studio_host::StreamCap> {
+        *lock(&self.golive().applied_cap)
+    }
+
+    /// Whether `d` has what it needs to start (account connector for platforms; valid URL and
+    /// non-empty stream key for custom RTMP; valid host URL for direct SRT/RIST/WHIP) and was not
+    /// blocked when starting.
+    pub(crate) fn can_start_destination(&self, d: &DestinationConfig, blocked: &HashMap<String, String>) -> bool {
+        if blocked.contains_key(&d.id) {
+            return false;
+        }
+        match platform_of(d.kind) {
+            Some(p) => self.connector(p).is_some(),
+            None => match d.url.as_deref() {
+                Some(url) if direct_kind(url).is_some() => direct_host(url).is_some(),
+                Some(url) => {
+                    Target::parse(url).is_ok()
+                        && self
+                            .inner
+                            .secrets
+                            .get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id))
+                            .ok()
+                            .flatten()
+                            .is_some_and(|k| !k.is_empty())
+                }
+                None => false,
+            },
+        }
+    }
+
     /// Active platform ceiling for Studio's shared main stream (Twitch 6,000 kbps / Kick
     /// 8,000 kbps H.264 2 s), or `None` when disabled by `ignore_service_limits`, Enhanced
     /// Broadcasting, manual light routing, or when only uncapped destinations are enabled.
@@ -1057,18 +1156,19 @@ impl Engine {
         if cfg.advanced.ignore_service_limits {
             return None;
         }
-        // One that can't start (no account, no key) isn't on this stream, so it sets no limit: a
-        // YouTube stream was held to 6,000 kbps by a Twitch switch with nobody signed in.
+        // One that can't start (no account, no key/URL, or blocked), or one only standing by for
+        // another destination, isn't on this stream, so it sets no limit.
         let blocked = lock(&self.golive().blocked).clone();
+        let failing = lock(&self.golive().backup).failing.clone();
         probe::effective_limit(
             cfg.destinations
                 .iter()
                 .filter(|d| {
-                    d.enabled
+                    destination_sends(&cfg, &failing, d)
                         && d.canvas == Canvas::Main
                         && d.url.as_deref().and_then(direct_kind).is_none()
                         && !self.wants_light_now(d)
-                        && !blocked.contains_key(&d.id)
+                        && self.can_start_destination(d, &blocked)
                 })
                 .map(|d| (d.kind, d.enhanced)),
         )
@@ -1082,7 +1182,7 @@ impl Engine {
         cfg.destinations.iter().any(|d| {
             d.canvas == Canvas::Main
                 && d.url.as_deref().and_then(direct_kind) == Some("whip")
-                && !blocked.contains_key(&d.id)
+                && self.can_start_destination(d, &blocked)
                 && (d.enabled || backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
         })
     }
@@ -1115,6 +1215,7 @@ impl Engine {
             Ok(()) => {
                 failed.store(false, std::sync::atomic::Ordering::Release);
                 *lock(&self.golive().applied_cap) = cap;
+                *lock(&self.golive().applied_limit) = limit;
             }
             Err(e) => {
                 tracing::warn!(error = %e, "couldn't update the Studio's stream cap");
@@ -1158,15 +1259,32 @@ impl Engine {
         let cfg = self.golive_config();
         let running = lock(&g.running);
         let paused = lock(&g.paused);
-        // Before `blocked` is held: the limit reads it too.
-        let eff_limit = self.studio_limit();
+        let studio_streaming = live && g.studio_live.load(std::sync::atomic::Ordering::Acquire);
+        let cap_held = !g.cap_failed.load(std::sync::atomic::Ordering::Acquire);
+        let applied_cap = *lock(&g.applied_cap);
+        let applied_limit = *lock(&g.applied_limit);
+        let eff_limit = if studio_streaming {
+            applied_limit.or_else(|| applied_cap.and_then(limit_from_cap))
+        } else {
+            self.studio_limit()
+        };
         let failed = lock(&g.failed);
         let blocked = lock(&g.blocked);
         let st = self.state();
         let failing = lock(&g.backup).failing.clone();
         let studio_cfg = *lock(&g.studio_video);
-        let studio_streaming = live && g.studio_live.load(std::sync::atomic::Ordering::Acquire);
-        let cap_held = !g.cap_failed.load(std::sync::atomic::Ordering::Acquire);
+        let limiter_still_active = !studio_streaming
+            || eff_limit.is_some_and(|limit| {
+                cfg.destinations.iter().any(|x| {
+                    destination_sends(&cfg, &failing, x)
+                        && x.canvas == Canvas::Main
+                        && x.url.as_deref().and_then(direct_kind).is_none()
+                        && x.kind == limit.service
+                        && !x.enhanced
+                        && !self.wants_light_now(x)
+                        && self.can_start_destination(x, &blocked)
+                })
+            });
         let destinations = cfg
             .destinations
             .iter()
@@ -1187,12 +1305,17 @@ impl Engine {
                 let dest_stats = self.hub_of(d).stats();
                 let mut issues =
                     if d.enabled { probe::rules_structured(&dest_stats, d.kind, d.enhanced) } else { Vec::new() };
+                let sends = destination_sends(&cfg, &failing, d);
                 let is_whip = d.url.as_deref().and_then(direct_kind) == Some("whip");
+                let can_start = self.can_start_destination(d, &blocked);
+                let whip_active = !studio_streaming || applied_cap.is_some_and(|c| c.no_bframes);
                 let capped = if is_whip
-                    && d.enabled
+                    && sends
                     && d.canvas == Canvas::Main
+                    && can_start
                     && cap_held
                     && (!live || studio_streaming)
+                    && whip_active
                     && let Some(sv) = studio_cfg
                     && sv.bframes
                 {
@@ -1205,18 +1328,33 @@ impl Engine {
                         detail: "B-frames are turned off for this stream because WebRTC (WHIP) can't carry them."
                             .into(),
                     })
-                } else if d.enabled
+                } else if sends
                     && d.canvas == Canvas::Main
                     && d.url.as_deref().and_then(direct_kind).is_none()
+                    && can_start
                     && !d.enhanced
-                    && !d.wants_light()
+                    && !self.wants_light_now(d)
                     && cap_held
                     && (!live || studio_streaming)
                     && let Some(limit) = eff_limit
-                    && probe::ceiling(d.kind, d.enhanced).is_some()
+                    && (probe::ceiling(d.kind, d.enhanced).is_some() || !limiter_still_active)
                     && let Some(sv) = studio_cfg
                 {
-                    probe::capped_info(limit, sv.video_kbps, sv.is_hevc, sv.keyframe_s, sv.vbr)
+                    probe::capped_info(limit, sv.video_kbps, sv.is_hevc, sv.keyframe_s, sv.vbr).map(|mut c| {
+                        if studio_streaming && !limiter_still_active {
+                            let for_name = format!(" for {}", limit.name);
+                            if sv.video_kbps > limit.max_kbps {
+                                c.summary = c
+                                    .summary
+                                    .replacen("Capped at ", "Held at ", 1)
+                                    .replace(&for_name, " until next stream");
+                            } else {
+                                c.summary = c.summary.replace(&for_name, " until next stream");
+                            }
+                            c.detail = format!("{} Kept until you start a new stream.", c.detail);
+                        }
+                        c
+                    })
                 } else {
                     None
                 };
@@ -2499,12 +2637,8 @@ impl Engine {
         };
         let cfg = self.golive_config();
         let failing = lock(&g.backup).failing.clone();
-        // A backup sends while the one it backs up fails, and waits otherwise.
-        let sends = |d: &DestinationConfig| match backs_up(&cfg, &d.id) {
-            Some(p) if p.enabled => failing.contains(&p.id),
-            _ => d.enabled,
-        };
-        let want: Vec<DestinationConfig> = cfg.destinations.iter().filter(|d| sends(d) && on(d)).cloned().collect();
+        let want: Vec<DestinationConfig> =
+            cfg.destinations.iter().filter(|d| destination_sends(&cfg, &failing, d) && on(d)).cloned().collect();
         // One whose stream changed (the lighter one started or stopped) starts again on the other.
         for d in &want {
             let moved = lock(&g.running).get(&d.id).is_some_and(|r| r.light != self.on_light(d));
@@ -2535,6 +2669,13 @@ impl Engine {
         }
         for d in want {
             if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {
+                continue;
+            }
+            if backs_up(&cfg, &d.id).is_some_and(|p| p.enabled)
+                && let Some(why) = self.midstream_misfit(&cfg.destinations, &d)
+            {
+                tracing::info!(dest = %d.id, %why, "Go live: standby backup cannot join live encode");
+                lock(&g.blocked).insert(d.id.clone(), why);
                 continue;
             }
             self.start_destination(&d).await;
@@ -3291,6 +3432,8 @@ pub(crate) async fn run(engine: Engine) {
                     engine.clear_golive_failures(Canvas::Main);
                 } else {
                     g.studio_live.store(false, std::sync::atomic::Ordering::Release);
+                    *lock(&g.applied_cap) = None;
+                    *lock(&g.applied_limit) = None;
                 }
             }
             if now.1 != was.1 {
