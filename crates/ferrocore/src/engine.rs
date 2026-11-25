@@ -1409,8 +1409,11 @@ struct State {
     sleep_epoch: u64,
     /// Live or wedged open/reopen worker threads currently active across all sources.
     reopen_workers: Arc<AtomicUsize>,
-    /// Per-source open/reopen worker counters preserved across `Src` replacement or removal.
-    source_reopen_workers: HashMap<u64, Arc<AtomicUsize>>,
+    /// Per-source open/reopen worker counters preserved across `Src` replacement, tagged with
+    /// the device kind so reusing a numeric ID for a different camera stays isolated.
+    source_reopen_workers: HashMap<u64, (Option<SourceKind>, Arc<AtomicUsize>)>,
+    /// Worker counters for removed sources that still have stalled opens running in the background.
+    draining_workers: Vec<(Option<SourceKind>, Arc<AtomicUsize>)>,
 }
 
 fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
@@ -1418,6 +1421,16 @@ fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
         OutputKind::Stream(_) => true,
         OutputKind::Record(_) => pipe.recording(),
         OutputKind::Replay { .. } => false,
+    }
+}
+
+fn same_reopen_device(a: &Option<SourceKind>, b: &Option<SourceKind>) -> bool {
+    match (a, b) {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        (Some(SourceKind::Camera(x)), Some(SourceKind::Camera(y))) => x.id == y.id,
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        (Some(SourceKind::Microphone(x)), Some(SourceKind::Microphone(y))) => x == y,
+        _ => a == b,
     }
 }
 
@@ -1432,20 +1445,64 @@ impl State {
         Some((self.sleep_epoch, want))
     }
 
-    fn source_workers_for(&mut self, id: u64) -> Arc<AtomicUsize> {
-        self.source_reopen_workers.entry(id).or_insert_with(|| Arc::new(AtomicUsize::new(0))).clone()
+    fn source_workers_for(&mut self, id: u64, kind: Option<&SourceKind>) -> Arc<AtomicUsize> {
+        let wanted = kind.cloned();
+        if let Some((tracked, workers)) = self.source_reopen_workers.get(&id) {
+            if same_reopen_device(tracked, &wanted) {
+                return workers.clone();
+            }
+            if workers.load(Ordering::Acquire) > 0 {
+                self.draining_workers.push((tracked.clone(), workers.clone()));
+            }
+            self.source_reopen_workers.remove(&id);
+        }
+        if let Some(pos) = self
+            .draining_workers
+            .iter()
+            .position(|(tracked, workers)| workers.load(Ordering::Acquire) > 0 && same_reopen_device(tracked, &wanted))
+        {
+            let entry = self.draining_workers.swap_remove(pos);
+            let workers = entry.1.clone();
+            self.source_reopen_workers.insert(id, entry);
+            return workers;
+        }
+        let workers = Arc::new(AtomicUsize::new(0));
+        self.source_reopen_workers.insert(id, (wanted, workers.clone()));
+        workers
     }
 
-    fn attach_workers_if_tracked(&self, id: u64, src: &mut Src) {
-        if let Some(workers) = self.source_reopen_workers.get(&id) {
-            src.reopen_workers = workers.clone();
+    fn attach_workers_if_tracked(&mut self, id: u64, src: &mut Src) {
+        if let Some((tracked, workers)) = self.source_reopen_workers.get(&id) {
+            if same_reopen_device(tracked, &src.kind) {
+                src.reopen_workers = workers.clone();
+                return;
+            }
+            if workers.load(Ordering::Acquire) > 0 {
+                self.draining_workers.push((tracked.clone(), workers.clone()));
+            }
+            self.source_reopen_workers.remove(&id);
+        }
+        if let Some(pos) = self.draining_workers.iter().position(|(tracked, workers)| {
+            workers.load(Ordering::Acquire) > 0 && same_reopen_device(tracked, &src.kind)
+        }) {
+            let entry = self.draining_workers.swap_remove(pos);
+            src.reopen_workers = entry.1.clone();
+            self.source_reopen_workers.insert(id, entry);
         }
     }
 
     fn prune_source_workers(&mut self) {
-        let sources = &self.sources;
-        self.source_reopen_workers
-            .retain(|id, workers| sources.contains_key(id) || workers.load(Ordering::Acquire) > 0);
+        let State { sources, source_reopen_workers, draining_workers, .. } = self;
+        source_reopen_workers.retain(|id, (kind, workers)| {
+            if sources.contains_key(id) {
+                return true;
+            }
+            if workers.load(Ordering::Acquire) > 0 {
+                draining_workers.push((kind.clone(), workers.clone()));
+            }
+            false
+        });
+        draining_workers.retain(|(_, workers)| workers.load(Ordering::Acquire) > 0);
     }
 }
 
@@ -1727,6 +1784,7 @@ impl Engine {
             sleep_epoch: 0,
             reopen_workers: Arc::new(AtomicUsize::new(0)),
             source_reopen_workers: HashMap::new(),
+            draining_workers: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let seen: Arc<Seen> = Arc::default();
@@ -1875,7 +1933,7 @@ impl Engine {
                     tracing::info!(source = id, "a camera taken out a moment ago came back without opening again");
                     let gone = {
                         let mut st = self.lock();
-                        let src_workers = st.source_workers_for(id);
+                        let src_workers = st.source_workers_for(id, Some(&kind));
                         self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
                         let mut src = Src::new(live, None, Some(kind));
                         src.reopen_workers = src_workers;
@@ -2052,7 +2110,7 @@ impl Engine {
         let mut gone = None;
         let worker_guard = {
             let mut st = self.lock();
-            let src_workers = st.source_workers_for(id);
+            let src_workers = st.source_workers_for(id, restart.as_ref());
             let worker_guard = if restart.is_some() {
                 if st.reopen_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
                     return Err(AvError::Source("too many stalled device opens in progress".into()));
@@ -2535,7 +2593,7 @@ impl Engine {
                     let why = e.to_string();
                     let mut st = self.lock();
                     let mut src = Src::waiting_camera(s.kind.clone(), now_ns(), &why);
-                    src.reopen_workers = st.source_workers_for(s.id);
+                    src.reopen_workers = st.source_workers_for(s.id, Some(&s.kind));
                     st.sources.insert(s.id, src);
                     opened.insert(s.name.clone(), (s.id, s.kind));
                 }
@@ -5777,7 +5835,7 @@ fn watchdog_step(
             // Taken out now (a camera is let go before it's opened again), dropped on its
             // own reopen worker outside the lock.
             let old = std::mem::replace(&mut src.live, Live::Still);
-            st.source_reopen_workers.entry(id).or_insert(workers);
+            st.source_reopen_workers.entry(id).or_insert_with(|| (Some(kind.clone()), workers));
             todo.push((id, kind, why, old, token, prev_tries, worker_guard));
             launched += 1;
         }
@@ -11660,8 +11718,9 @@ mod tests {
             Some(MAX_SOURCE_REOPEN_WORKERS),
             "load_obs waiting_camera must reuse existing source worker counter"
         );
+        let cam_kind = SourceKind::Camera(CameraSpec::from("wedged-cam"));
         assert_eq!(
-            e.lock().source_workers_for(1).load(Ordering::Acquire),
+            e.lock().source_workers_for(1, Some(&cam_kind)).load(Ordering::Acquire),
             MAX_SOURCE_REOPEN_WORKERS,
             "source_workers_for must not overwrite counter with fresh Src atomic"
         );
@@ -11676,8 +11735,7 @@ mod tests {
         watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now_ns() + 120_000_000_000);
         assert_eq!(attempts.load(Ordering::SeqCst), 0, "watchdog must honor existing wedged worker cap after load_obs");
 
-        // Now verify unpark path preserves existing worker counter too.
-        let cam_kind = SourceKind::Camera(CameraSpec::from("unparked-cam"));
+        // Now verify unpark path preserves existing worker counter for the same camera.
         e.lock().parked.push((cam_kind.clone(), Live::Still, now_ns()));
         e.set_source(1, cam_kind.clone()).unwrap();
         assert_eq!(
@@ -11685,10 +11743,30 @@ mod tests {
             Some(MAX_SOURCE_REOPEN_WORKERS),
             "unpark path must reuse existing source worker counter"
         );
+        let ran_post_unpark = Arc::new(AtomicBool::new(false));
+        let ran_c = ran_post_unpark.clone();
+        let post_unpark_err = e
+            .open_soon(
+                1,
+                Some(cam_kind),
+                Box::new(move || {
+                    ran_c.store(true, Ordering::Release);
+                    Err(AvError::Source("must not run".into()))
+                }),
+            )
+            .unwrap_err();
         assert!(
-            e.open_soon(1, Some(cam_kind), Box::new(|| Err(AvError::Source("must not run".into())))).is_err(),
-            "open_soon after unpark must still honor MAX_SOURCE_REOPEN_WORKERS"
+            post_unpark_err.to_string().contains("too many stalled opens") && !ran_post_unpark.load(Ordering::Acquire),
+            "open_soon after unpark must reject on per-source cap without spawning: {post_unpark_err}"
         );
+
+        // Removing the wedged camera and loading an unrelated camera even with reused numeric ID 1
+        // must not charge the new camera with the old camera's stalled workers.
+        e.remove_source(1);
+        let other_cam = SourceKind::Camera(CameraSpec::from("fresh-other-cam"));
+        e.open_soon(1, Some(other_cam), Box::new(|| Ok((Live::Still, false))))
+            .expect("reusing numeric ID for an unrelated camera must not inherit old worker cap");
+        e.remove_source(1);
 
         {
             let (lk, cv) = &*gate;
@@ -11710,16 +11788,16 @@ mod tests {
         let Some(e) = engine() else { return };
         let kind = SourceKind::Camera(CameraSpec::from("cam-prune"));
         e.open_soon(77, Some(kind.clone()), Box::new(|| Ok((Live::Still, false)))).unwrap();
-        while e.lock().source_reopen_workers.get(&77).is_some_and(|w| w.load(Ordering::Acquire) > 0) {
+        while e.lock().source_reopen_workers.get(&77).is_some_and(|(_, w)| w.load(Ordering::Acquire) > 0) {
             std::thread::yield_now();
         }
         e.remove_source(77);
         assert!(
-            !e.lock().source_reopen_workers.contains_key(&77),
+            !e.lock().source_reopen_workers.contains_key(&77) && e.lock().draining_workers.is_empty(),
             "remove_source must prune zero-count worker map entries"
         );
 
-        // If removed while wedged, entry stays active until worker drains, then watchdog_step prunes it.
+        // If removed while wedged, entry moves to draining_workers until worker drains, then watchdog_step prunes it.
         let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (exited_tx, exited_rx) = std::sync::mpsc::channel();
@@ -11742,8 +11820,8 @@ mod tests {
         entered_rx.recv().unwrap();
         e.remove_source(88);
         assert!(
-            e.lock().source_reopen_workers.contains_key(&88),
-            "remove_source must keep live worker counter while worker is still blocked"
+            !e.lock().source_reopen_workers.contains_key(&88) && e.lock().draining_workers.len() == 1,
+            "remove_source must move active wedged worker counter to draining_workers"
         );
         {
             let (lk, cv) = &*gate;
@@ -11758,7 +11836,7 @@ mod tests {
         let cmd = e.audio.cmd_sender();
         watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now_ns());
         assert!(
-            !e.lock().source_reopen_workers.contains_key(&88),
+            !e.lock().source_reopen_workers.contains_key(&88) && e.lock().draining_workers.is_empty(),
             "watchdog_step must prune drained worker entries for removed sources"
         );
     }
