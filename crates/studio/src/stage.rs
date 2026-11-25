@@ -188,6 +188,25 @@ fn fail(msg: impl Into<String>) -> StudioError {
     StudioError::Failed(msg.into())
 }
 
+/// Writes a transform's fields into an item of the collection.
+fn write_transform(i: &mut Value, t: &Transform, bounds: usize) {
+    i["pos"] = json!({ "x": t.x, "y": t.y });
+    i["rot"] = json!(t.rotation);
+    i["scale"] = json!({ "x": t.scale_x, "y": t.scale_y });
+    i["align"] = json!(t.alignment);
+    i["bounds_type"] = json!(bounds);
+    i["bounds_align"] = json!(t.bounds_alignment);
+    i["bounds"] = json!({ "x": t.bounds_width, "y": t.bounds_height });
+    for (k, v) in [
+        ("crop_left", t.crop_left),
+        ("crop_top", t.crop_top),
+        ("crop_right", t.crop_right),
+        ("crop_bottom", t.crop_bottom),
+    ] {
+        i[k] = json!(v.max(0));
+    }
+}
+
 fn name_of(s: &Value) -> &str {
     s.get("name").and_then(Value::as_str).unwrap_or_default()
 }
@@ -1785,21 +1804,7 @@ impl Stage {
         // being opened again for each step. Anything it can't find takes the long way.
         self.quiet.set(true);
         let it = self.with_item(scene, id, |i| {
-            i["pos"] = json!({ "x": t.x, "y": t.y });
-            i["rot"] = json!(t.rotation);
-            i["scale"] = json!({ "x": t.scale_x, "y": t.scale_y });
-            i["align"] = json!(t.alignment);
-            i["bounds_type"] = json!(bounds);
-            i["bounds_align"] = json!(t.bounds_alignment);
-            i["bounds"] = json!({ "x": t.bounds_width, "y": t.bounds_height });
-            for (k, v) in [
-                ("crop_left", t.crop_left),
-                ("crop_top", t.crop_top),
-                ("crop_right", t.crop_right),
-                ("crop_bottom", t.crop_bottom),
-            ] {
-                i[k] = json!(v.max(0));
-            }
+            write_transform(i, t, bounds);
             i.clone()
         });
         self.quiet.set(false);
@@ -1949,24 +1954,38 @@ impl Stage {
     /// cutting the left or the top moves the item's box in by as much, never the picture with it
     /// (owner, 25 Nov: dragging an edge in moved the whole source).
     pub fn set_item_crop(&self, scene: &str, id: i64, crop: [i32; 4]) -> Result<ItemInfo, StudioError> {
-        let crop = crop.map(|c| c.max(0));
         let before = self.transform(scene, id)?;
-        // Where the box's top-left corner has to be, in the box's own 0..1 terms of the old
-        // box: the old visible picture's top-left plus what is newly cut from the left and top.
-        let (w, h) = (before.width.max(1) as f32, before.height.max(1) as f32);
+        let (w, h) = (before.width.max(1) as i32, before.height.max(1) as i32);
+        // At least one pixel stays each way: the opposite side wins when the two would meet.
+        let mut crop = crop.map(|c| c.max(0));
+        crop[2] = crop[2].min(w - 1);
+        crop[0] = crop[0].min(w - 1 - crop[2]);
+        crop[3] = crop[3].min(h - 1);
+        crop[1] = crop[1].min(h - 1 - crop[3]);
         let seen = (
-            (w - before.crop_left as f32 - before.crop_right as f32).max(1.0),
-            (h - before.crop_top as f32 - before.crop_bottom as f32).max(1.0),
+            (w - before.crop_left - before.crop_right).max(1) as f32,
+            (h - before.crop_top - before.crop_bottom).max(1) as f32,
         );
+        let next = ((w - crop[0] - crop[2]).max(1) as f32, (h - crop[1] - crop[3]).max(1) as f32);
+        // The old visible picture's top-left, moved in by what is newly cut from the left and top:
+        // where the new visible picture's top-left has to be.
         let corner = ((crop[0] - before.crop_left) as f32 / seen.0, (crop[1] - before.crop_top) as f32 / seen.1);
         let target = self.item_point(scene, id, corner)?;
+        let it = self.item(scene, id)?;
+        let local = self.info_of(&it).frame;
         let mut t = before;
         [t.crop_left, t.crop_top, t.crop_right, t.crop_bottom] = crop;
-        self.set_transform(scene, id, &t)?;
-        // Inside bounds (fit, stretch, ...) the picture is fitted to the box, so it can't stay.
-        if t.bounds == "none" {
-            self.settle_point(scene, id, (0.0, 0.0), target)?;
+        if t.bounds != "none" {
+            // A fitted or stretched item draws its picture into a box: the box shrinks by what
+            // is cut, as the picture it holds (fit keeps its shape only when the shape is the
+            // same, otherwise the box is stretched to the cut picture, which is what was seen).
+            let (lu, lv) = (local[0].hypot(local[1]), local[2].hypot(local[3]));
+            let (nw, nh) = (lu * next.0 / seen.0, lv * next.1 / seen.1);
+            let same_shape = (next.0 / next.1) / (seen.0 / seen.1);
+            t.bounds = if t.bounds == "fit" && (same_shape - 1.0).abs() < 0.005 { "fit" } else { "stretch" }.into();
+            (t.bounds_width, t.bounds_height, t.alignment, t.bounds_alignment) = (nw, nh, 5, 5);
         }
+        self.set_transform_placing(scene, id, t, (0.0, 0.0), target)?;
         let it = self.item(scene, id)?;
         Ok(self.info_of(&it))
     }
@@ -2009,6 +2028,43 @@ impl Stage {
         self.item_point(scene, id, (0.5, 0.5))
     }
 
+    /// The item's frame (its unit square onto its own space: the canvas, or inside a group the
+    /// group's pixels) as it would be with the transform `t`, without writing anything.
+    fn frame_with(&self, scene: &str, id: i64, t: &Transform) -> Result<[f32; 6], StudioError> {
+        let bounds =
+            BOUNDS.iter().position(|b| *b == t.bounds).ok_or_else(|| fail(format!("bounds: one of {BOUNDS:?}.")))?;
+        let mut it = self.item(scene, id)?;
+        write_transform(&mut it, t, bounds);
+        let (w, h) = self.item_size_of(name_of(&it), Some(&it));
+        let p = ferrocore::obs::placement_of(&it);
+        let a = ferrocore::draw_transform(&p, w, h);
+        let (cw, ch) = ferrocore::cropped(w, h, p.crop);
+        let (cw, ch) = (cw as f32, ch as f32);
+        Ok([a.a * cw, a.b * cw, a.c * ch, a.d * ch, a.e, a.f])
+    }
+
+    /// Writes `t` with its position moved so the point `at` of the item's box ends up on the
+    /// canvas at `target`. Outside a group that is worked out first and written once (a live
+    /// stream never sees the item jump to a place in between); inside one the group fits itself
+    /// round its sources after each write, so it writes, then measures again until it is there.
+    fn set_transform_placing(
+        &self,
+        scene: &str,
+        id: i64,
+        mut t: Transform,
+        at: (f32, f32),
+        target: (f32, f32),
+    ) -> Result<(), StudioError> {
+        if self.group_of(scene, id).is_none() {
+            let f = self.frame_with(scene, id, &t)?;
+            let now = (f[4] + f[0] * at.0 + f[2] * at.1, f[5] + f[1] * at.0 + f[3] * at.1);
+            (t.x, t.y) = (t.x + target.0 - now.0, t.y + target.1 - now.1);
+            return self.set_transform(scene, id, &t).map(drop);
+        }
+        self.set_transform(scene, id, &t)?;
+        self.settle_point(scene, id, at, target)
+    }
+
     /// Moves an item (changing its position only) until the point `at` of its box is on the
     /// canvas at `target`. Inside a group the group fits itself round its sources again after
     /// every write, so its map changes under the item: the move is measured again after each
@@ -2041,8 +2097,7 @@ impl Stage {
         let from = self.item_centre(scene, id)?;
         let mut t = self.transform(scene, id)?;
         change(&mut t);
-        self.set_transform(scene, id, &t)?;
-        self.settle_point(scene, id, (0.5, 0.5), from)
+        self.set_transform_placing(scene, id, t, (0.5, 0.5), from)
     }
 
     pub fn edit_item(&self, scene: &str, id: i64, edit: ItemEdit) -> Result<(), StudioError> {
@@ -8867,6 +8922,61 @@ mod tests {
             // Where no engine can start at all (no graphics adapter), there is nothing to check.
             assert!(s.engine().is_err(), "an engine could start, but the level ask did not start it");
         }
+    }
+
+    /// The crop also keeps the picture put for an item drawn into a fit or stretch box (every
+    /// camera and screen added to a scene is one), for an item inside a group, and it never cuts
+    /// the picture away entirely.
+    #[test]
+    fn cropping_a_fitted_or_grouped_item_keeps_its_picture_and_never_cuts_it_all() {
+        let s = stage();
+        let (w, h) = (200.0f32, 100.0f32);
+        let canvas_of = |s: &Stage, id: i64, sx: f32, sy: f32| {
+            let t = ok(s.transform("Main", id));
+            let seen = (w - t.crop_left as f32 - t.crop_right as f32, h - t.crop_top as f32 - t.crop_bottom as f32);
+            ok(s.item_point("Main", id, ((sx - t.crop_left as f32) / seen.0, (sy - t.crop_top as f32) / seen.1)))
+        };
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 0.1 && (a.1 - b.1).abs() < 0.1;
+        let check = |s: &Stage, id: i64, what: &str| {
+            for crop in [[40, 0, 0, 0], [40, 10, 20, 5], [0, 10, 20, 5], [0, 0, 0, 0]] {
+                let probes = [(100.0, 50.0), (80.0, 40.0)];
+                let now = ok(s.transform("Main", id));
+                let keeps = |sx: f32, sy: f32| {
+                    sx >= now.crop_left.max(crop[0]) as f32
+                        && sx <= w - now.crop_right.max(crop[2]) as f32
+                        && sy >= now.crop_top.max(crop[1]) as f32
+                        && sy <= h - now.crop_bottom.max(crop[3]) as f32
+                };
+                let before: Vec<_> = probes.iter().map(|p| canvas_of(s, id, p.0, p.1)).collect();
+                ok(s.set_item_crop("Main", id, crop));
+                for (p, was) in probes.iter().zip(&before) {
+                    if keeps(p.0, p.1) {
+                        assert!(near(canvas_of(s, id, p.0, p.1), *was), "{what} crop {crop:?}: {p:?} moved");
+                    }
+                }
+            }
+        };
+        // Fitted into the canvas, as a camera is when it is added.
+        let fit = ok(s.add_source("Main", "color_source_v3", "Fit", &json!({ "width": 200, "height": 100 }), false));
+        ok(s.edit_item("Main", fit.id, ItemEdit::Fit));
+        assert_eq!(ok(s.transform("Main", fit.id)).bounds, "fit");
+        check(&s, fit.id, "fit");
+        // Stretched to the canvas.
+        let st = ok(s.add_source("Main", "color_source_v3", "Stretch", &json!({ "width": 200, "height": 100 }), false));
+        ok(s.edit_item("Main", st.id, ItemEdit::Stretch));
+        check(&s, st.id, "stretch");
+        // Inside a group.
+        let a = ok(s.add_source("Main", "color_source_v3", "GA", &json!({ "width": 200, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "GB", &json!({ "width": 60, "height": 60 }), false));
+        ok(s.set_item_boxes("Main", &[(a.id, 10.0, 10.0, 200.0, 100.0), (b.id, 300.0, 150.0, 60.0, 60.0)]));
+        ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        check(&s, a.id, "in a group");
+        // More than there is: a pixel stays each way, nothing breaks.
+        let it = ok(s.add_source("Main", "color_source_v3", "Whole", &json!({ "width": 200, "height": 100 }), false));
+        ok(s.set_item_crop("Main", it.id, [150, 90, 100, 60]));
+        let t = ok(s.transform("Main", it.id));
+        assert!(t.crop_left + t.crop_right <= 199 && t.crop_top + t.crop_bottom <= 99, "{t:?}");
+        assert!(ok(s.item_point("Main", it.id, (0.5, 0.5))).0.is_finite());
     }
 
     #[test]
