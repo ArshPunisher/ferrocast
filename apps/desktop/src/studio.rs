@@ -2578,21 +2578,9 @@ impl StudioHost for DesktopStudio {
                     let kn = key_name.clone();
                     let vj = val_json.clone();
                     async move {
-                        self.on_main(move |h| {
-                            let Some(c) = h.collection.as_ref() else {
-                                return (ferrocast_studio::stage::MatchingCameraWait::LiveOrAbsent, None);
-                            };
-                            let wait = c.matching_camera_wait(&tk, &kn, &vj);
-                            if !matches!(wait, ferrocast_studio::stage::MatchingCameraWait::LiveOrAbsent) {
-                                return (wait, None);
-                            }
-                            let job = c
-                                .matching_device_picture_job(&tk, &kn, &vj, width)
-                                .map(|j| Box::new(j) as source_still::ReuseJob);
-                            (ferrocast_studio::stage::MatchingCameraWait::LiveOrAbsent, job)
-                        })
-                        .await
-                        .unwrap_or((ferrocast_studio::stage::MatchingCameraWait::LiveOrAbsent, None))
+                        self.on_main(move |h| stage_still_check(h.collection.as_ref(), &tk, &kn, &vj, width))
+                            .await
+                            .unwrap_or((ferrocast_studio::stage::MatchingCameraWait::LiveOrAbsent, None))
                     }
                 },
                 ferrocore::camera::hotplug_epoch,
@@ -4517,6 +4505,27 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+fn stage_still_check(
+    collection: Option<&ferrocast_studio::stage::Stage>,
+    tk: &str,
+    kn: &str,
+    vj: &Value,
+    width: u32,
+) -> (ferrocast_studio::stage::MatchingCameraWait, Option<source_still::ReuseJob>) {
+    let Some(c) = collection else {
+        return (ferrocast_studio::stage::MatchingCameraWait::LiveOrAbsent, None);
+    };
+    let wait = c.matching_camera_wait(tk, kn, vj);
+    if !matches!(wait, ferrocast_studio::stage::MatchingCameraWait::LiveOrAbsent) {
+        return (wait, None);
+    }
+    if ferrocast_studio::matching_camera_holds_session(c, tk, kn, vj) {
+        return (ferrocast_studio::stage::MatchingCameraWait::WaitingWithSession, None);
+    }
+    let job = c.matching_device_picture_job(tk, kn, vj, width).map(|j| Box::new(j) as source_still::ReuseJob);
+    (ferrocast_studio::stage::MatchingCameraWait::LiveOrAbsent, job)
 }
 
 mod source_still {

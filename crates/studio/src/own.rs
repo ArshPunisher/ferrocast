@@ -24,6 +24,53 @@ use ferrocore::video::{PixelFormat, RateControl, VideoCodec, VideoConfig};
 use crate::collection::VERTICAL_SIZE;
 use crate::{EncodeSettings, RecordPlan, RecordStats, StreamSettings, StreamStats, StudioError};
 
+const CAMERA_PICKER_KINDS: [&str; 6] =
+    ["av_capture_input", "av_capture_input_v2", "macos-avcapture", "macos-avcapture-fast", "dshow_input", "v4l2_input"];
+
+fn matching_camera_holds_session_with(
+    stage: &crate::stage::Stage,
+    kind: &str,
+    key: &str,
+    value: &serde_json::Value,
+    holds_session: impl Fn(&str) -> bool,
+) -> bool {
+    if !CAMERA_PICKER_KINDS.contains(&kind) || value.as_str().is_some_and(|s| s.trim().is_empty()) {
+        return false;
+    }
+    for src in stage.sources() {
+        if !CAMERA_PICKER_KINDS.contains(&src.kind.as_str()) {
+            continue;
+        }
+        let Ok(settings) = stage.settings(&src.name) else {
+            continue;
+        };
+        let matched = settings.get(key).is_some_and(|v| v == value)
+            || ["device", "uid", "video_device_id", "device_id"]
+                .iter()
+                .any(|k| settings.get(*k).is_some_and(|v| v == value));
+        if matched && holds_session(&src.name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when any staged camera matching `(kind, key, value)` still owns an open capture session
+/// while waiting or in `no_signal`, so picker stills avoid opening a competing capture session.
+pub fn matching_camera_holds_session(
+    stage: &crate::stage::Stage,
+    kind: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> bool {
+    matching_camera_holds_session_with(stage, kind, key, value, |name| {
+        // Gate on `camera_status` before reading `stage.engine()` so unstarted stages do not
+        // initialize an engine just to answer a picker check.
+        stage.camera_status(name).is_some()
+            && stage.engine().is_ok_and(|shared| shared.engine.is_camera_holding_session(name))
+    })
+}
+
 /// Our encoder's settings for `e` at a picture of this size and rate.
 /// A frame rate as a number (29.97 for 30 with broadcast timing).
 fn fps_f32(fps: u32, ntsc: bool) -> f32 {
@@ -2186,5 +2233,60 @@ mod tests {
         cq.encode.video_encoder = "obs_x264".into();
         cq.encode.quality = Some(0);
         assert_eq!(rate_of(&cq.encode), RateControl::Crf(0));
+    }
+
+    #[test]
+    fn matching_camera_holds_session_detects_no_signal_devices_without_starting_engine() {
+        let stage = crate::stage::Stage::new(crate::Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap();
+        let _ = stage
+            .add_source("Main", "av_capture_input_v2", "Card", &serde_json::json!({ "device": "hdmi-card-0" }), false)
+            .unwrap();
+        let _ = stage
+            .add_source(
+                "Main",
+                "color_source_v3",
+                "Color",
+                &serde_json::json!({ "width": 16, "height": 16, "color": 0xFF00_00FFu32 }),
+                false,
+            )
+            .unwrap();
+
+        // Must never start an engine lazily when none is running.
+        assert!(!super::matching_camera_holds_session(
+            &stage,
+            "av_capture_input_v2",
+            "device",
+            &serde_json::json!("hdmi-card-0"),
+        ));
+        assert!(stage.camera_status("Card").is_none());
+
+        assert!(super::matching_camera_holds_session_with(
+            &stage,
+            "macos-avcapture",
+            "uid",
+            &serde_json::json!("hdmi-card-0"),
+            |n| n == "Card",
+        ));
+        assert!(!super::matching_camera_holds_session_with(
+            &stage,
+            "av_capture_input_v2",
+            "device",
+            &serde_json::json!("other-card"),
+            |_| true,
+        ));
+        assert!(!super::matching_camera_holds_session_with(
+            &stage,
+            "av_capture_input_v2",
+            "device",
+            &serde_json::json!(""),
+            |_| true,
+        ));
+        assert!(!super::matching_camera_holds_session_with(
+            &stage,
+            "color_source_v3",
+            "device",
+            &serde_json::json!("hdmi-card-0"),
+            |_| true,
+        ));
     }
 }

@@ -592,6 +592,8 @@ struct Shown {
     waiting_cameras: Vec<String>,
     /// Snapshot of every camera source's availability status for nonblocking polling.
     camera_statuses: HashMap<String, CameraStatus>,
+    /// Camera sources still holding an open session while waiting or in `no_signal`.
+    holding_sessions: std::collections::HashSet<String>,
 }
 
 impl Shown {
@@ -604,6 +606,7 @@ impl Shown {
             quiet: quiet_of(st),
             waiting_cameras: waiting_cameras_of(st),
             camera_statuses: camera_statuses_of(st),
+            holding_sessions: holding_sessions_of(st),
         }
     }
 }
@@ -652,6 +655,25 @@ fn camera_statuses_of(st: &State) -> HashMap<String, CameraStatus> {
     st.opened
         .iter()
         .filter_map(|(name, (id, _))| Some((name.clone(), camera_status_of_src(st.sources.get(id)?)?)))
+        .collect()
+}
+
+fn camera_holding_session_of_src(src: &Src) -> bool {
+    !matches!(src.live, Live::Still) && src.camera_retry.as_ref().is_some_and(|r| r.is_waiting() || r.is_no_signal())
+}
+
+fn camera_holding_session_of(st: &State, name: &str) -> bool {
+    let Some((id, _)) = st.opened.get(name) else {
+        return false;
+    };
+    st.sources.get(id).is_some_and(camera_holding_session_of_src)
+}
+
+fn holding_sessions_of(st: &State) -> std::collections::HashSet<String> {
+    st.opened
+        .iter()
+        .filter(|(_, (id, _))| st.sources.get(id).is_some_and(camera_holding_session_of_src))
+        .map(|(name, _)| name.clone())
         .collect()
 }
 
@@ -2795,13 +2817,7 @@ impl Engine {
     /// waiting state (e.g. interruption grace or healthy 0-frame card), so picker probes avoid
     /// opening a competing session against it.
     pub fn is_camera_holding_session(&self, name: &str) -> bool {
-        let st = self.lock();
-        let Some((id, _)) = st.opened.get(name) else {
-            return false;
-        };
-        st.sources
-            .get(id)
-            .is_some_and(|s| !matches!(s.live, Live::Still) && s.camera_retry.as_ref().is_some_and(|r| r.is_waiting()))
+        self.now_or_last(|st| camera_holding_session_of(st, name), |s| s.holding_sessions.contains(name))
     }
 
     /// Captures shown somewhere (on air, a preview, an output) that have had no picture for at
@@ -5574,7 +5590,9 @@ fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[Strin
         let dead = matches!(src.live, Live::Still)
             || src.watch.faulted
             || is_live_ended(&src.live)
-            || src.is_waiting_for_camera();
+            || src.is_waiting_for_camera()
+            || src.watch.no_signal
+            || src.camera_retry.as_ref().is_some_and(crate::camera_retry::CameraRetry::is_no_signal);
         if !dead {
             continue;
         }
@@ -10196,6 +10214,52 @@ mod tests {
         assert_eq!(sources[&3].watch.next_try, now);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn hotplug_reconnect_wakes_no_signal_capture_card() {
+        use crate::camera_retry::{CAMERA_FIRST_FRAME_NS, CameraObservation, NO_SIGNAL_MAX_TRIES};
+
+        let backend = FakeCameraBackend::new([0, 200, 100, 255]);
+        backend.streaming.store(false, Ordering::Release);
+        let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+        let mut src = Src::new(live, None, Some(SourceKind::Camera(CameraSpec::from("card-hdmi-1"))));
+
+        let mut t = now_ns();
+        let retry = src.camera_retry.as_mut().unwrap();
+        for _ in 0..=NO_SIGNAL_MAX_TRIES {
+            t += CAMERA_FIRST_FRAME_NS.max(20_000_000_000);
+            let act = retry.step(CameraObservation {
+                running: true,
+                frames: 0,
+                ended: false,
+                interrupted: false,
+                opening: false,
+                visible_or_on_air: true,
+                now_ns: t,
+            });
+            if matches!(act, crate::camera_retry::CameraAction::Reopen(_)) {
+                let prev = retry.on_reopen_started(t);
+                retry.on_reopen_finished(prev, true, t, None);
+            }
+        }
+        assert!(retry.is_no_signal(), "setup must reach no_signal state");
+        src.watch.no_signal = true;
+        src.watch.tries = 3;
+        src.watch.next_try = t + 16_000_000_000;
+
+        let mut sources = BTreeMap::new();
+        sources.insert(1, src);
+
+        let woke_at = t + 1_000_000_000;
+        let woke = apply_hotplug_reconnects(&mut sources, &["card-hdmi-1".into()], woke_at);
+        assert_eq!(woke, 1, "hotplug reconnect must wake a no_signal capture card");
+        let woken = &sources[&1];
+        assert!(!woken.watch.no_signal, "hotplug wake must clear watch.no_signal");
+        assert_eq!(woken.watch.next_try, woke_at);
+        assert_eq!(woken.watch.tries, 0);
+        assert!(woken.camera_retry.as_ref().is_some_and(|r| !r.is_no_signal()), "must clear CameraRetry::no_signal");
+    }
+
     #[test]
     fn sleep_inhibit_follows_streaming_and_recording_lifetime() {
         if !encodes_here() {
@@ -10947,6 +11011,65 @@ mod tests {
         }
         assert_eq!(&px[0..4], &[0, 200, 100, 255]);
         assert_eq!(backend.open_attempts.load(Ordering::Acquire), settled_attempts);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn is_camera_holding_session_tracks_no_signal_and_uses_shown_when_render_lock_held() {
+        let Some(e) = engine() else { return };
+        let backend = FakeCameraBackend::new([0, 200, 100, 255]);
+        backend.streaming.store(false, Ordering::Release);
+        {
+            let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(live, None, Some(SourceKind::Camera("capture-card".into()))));
+            st.opened.insert("Card".into(), (1, SourceKind::Camera("capture-card".into())));
+            st.scenes.insert("Main".into(), vec![SceneItem::new(1, Placement::default())]);
+            st.on_air = Some("Main".into());
+        }
+        let reopen_b = Arc::clone(&backend);
+        let reopen: Reopener = Arc::new(move |kind| match kind {
+            SourceKind::Camera(spec) if spec.id == "capture-card" => Some(reopen_b.open()),
+            _ => None,
+        });
+        let cmd = e.audio.cmd_sender();
+        let wait_idle = || {
+            while e.lock().sources.get(&1).is_some_and(|s| s.opening.is_some()) {
+                std::thread::yield_now();
+            }
+        };
+
+        let mut t = now_ns();
+        for _ in 0..=crate::camera_retry::NO_SIGNAL_MAX_TRIES {
+            t += crate::camera_retry::CAMERA_FIRST_FRAME_NS + 1_000_000_000;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+            wait_idle();
+        }
+        assert_eq!(e.camera_status("Card").map(|s| s.state), Some("live"));
+        assert!(
+            e.is_camera_holding_session("Card"),
+            "healthy no_signal capture card holds an open session and must block competing probes"
+        );
+
+        // Publish Shown snapshot, then hold the State lock on this thread and mutate State:
+        // is_camera_holding_session must read Shown non-blockingly without taking self.lock().
+        {
+            let st = e.lock();
+            e.show(&st);
+        }
+        {
+            let mut guard = e.lock();
+            guard.sources.remove(&1);
+            assert!(
+                e.is_camera_holding_session("Card"),
+                "must read Shown snapshot without blocking when State lock is held"
+            );
+        }
+        {
+            let st = e.lock();
+            e.show(&st);
+        }
+        assert!(!e.is_camera_holding_session("Card"));
     }
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
