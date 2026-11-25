@@ -3700,40 +3700,7 @@ impl Engine {
             for g in ancestors {
                 let (g_effects, g_base) = active_item_effects_and_base(&st, g, ms, canvas)?;
                 let (gp, g_opacity) = animated(g, ms);
-                let (m_group, (gcw, gch)) = item_draw_affine_and_crop(&gp, &g_effects, g_base)?;
-                let (gow, goh) = g_effects.iter().fold(g_base, |(w, h), e| e.out_size(w, h));
-                let [gl, gt, gr, gb] = Effect::outside_sides(&g_effects, g_base.0, g_base.1);
-                let has_crop = gp.crop.iter().any(|c| *c > 0);
-                let has_outside = gl + gt + gr + gb > 0;
-                if has_outside || has_crop {
-                    let (mut tx0, mut ty0, mut tx1, mut ty1) = pts_aabb(&pts);
-                    if has_outside {
-                        // In post-effect texture coords [0..gow, 0..goh], input (0..gw) sits at
-                        // (+gl, +gt) and outside effects spread [-gl, -gt, +gr, +gb], yielding
-                        // [lx0 .. lx1 + gl + gr] clamped to the rendered group target.
-                        tx0 = tx0.max(0.0);
-                        ty0 = ty0.max(0.0);
-                        tx1 = (tx1 + (gl + gr) as f32).min(gow as f32);
-                        ty1 = (ty1 + (gt + gb) as f32).min(goh as f32);
-                    }
-                    if has_crop {
-                        tx0 = (tx0 - gp.crop[0] as f32).max(0.0);
-                        ty0 = (ty0 - gp.crop[1] as f32).max(0.0);
-                        tx1 = (tx1 - gp.crop[0] as f32).min(gcw as f32);
-                        ty1 = (ty1 - gp.crop[1] as f32).min(gch as f32);
-                    }
-                    if tx1 <= tx0 || ty1 <= ty0 {
-                        return Err(AvError::Source("the item is cropped out by its group".into()));
-                    }
-                    pts = [
-                        m_group.apply(tx0, ty0),
-                        m_group.apply(tx1, ty0),
-                        m_group.apply(tx1, ty1),
-                        m_group.apply(tx0, ty1),
-                    ];
-                } else {
-                    pts = pts.map(|(x, y)| m_group.apply(x, y));
-                }
+                pts = project_pts_through_group(pts, g, &g_effects, g_base, &gp, g_opacity)?;
                 group_chain.push((g.clone(), g_effects, g_base, gp, g_opacity));
             }
 
@@ -3921,6 +3888,77 @@ fn active_item_effects_and_base(
         })
         .collect();
     Ok((effects, base))
+}
+
+fn project_pts_through_group(
+    pts: [(f32, f32); 4],
+    g: &SceneItem,
+    g_effects: &[Effect],
+    g_base: (u32, u32),
+    gp: &Placement,
+    g_opacity: f32,
+) -> Result<[(f32, f32); 4], AvError> {
+    let (m_group, (gcw, gch)) = item_draw_affine_and_crop(gp, g_effects, g_base)?;
+    let has_crop = gp.crop.iter().any(|c| *c > 0);
+    // Compositor allocates an offscreen `g_base` texture (clipping children to `0..g_base`)
+    // whenever effects, placement crop, scale filter, blend mode, or group opacity apply.
+    let group_renders_to_texture =
+        !g_effects.is_empty() || has_crop || g.filter != Filter::Disable || g.blend != Blend::Normal || g_opacity < 1.0;
+    if !group_renders_to_texture {
+        return Ok(pts.map(|(x, y)| m_group.apply(x, y)));
+    }
+    let (mut tx0, mut ty0, mut tx1, mut ty1) = pts_aabb(&pts);
+    // Clip to the base group texture before any effects run, so off-group items don't smear into pads.
+    tx0 = tx0.max(0.0);
+    ty0 = ty0.max(0.0);
+    tx1 = tx1.min(g_base.0 as f32);
+    ty1 = ty1.min(g_base.1 as f32);
+    if tx1 <= tx0 || ty1 <= ty0 {
+        return Err(AvError::Source("the item is cropped out by its group".into()));
+    }
+    let (mut cur_w, mut cur_h) = g_base;
+    for e in g_effects {
+        let (nw, nh) = e.out_size(cur_w, cur_h);
+        match e {
+            Effect::Crop { left, top, .. } => {
+                tx0 = (tx0 - *left as f32).max(0.0);
+                ty0 = (ty0 - *top as f32).max(0.0);
+                tx1 = (tx1 - *left as f32).min(nw as f32);
+                ty1 = (ty1 - *top as f32).min(nh as f32);
+                if tx1 <= tx0 || ty1 <= ty0 {
+                    return Err(AvError::Source("the item is cropped out by its group".into()));
+                }
+            }
+            Effect::Scroll { speed_x, speed_y, width, height, .. }
+                if *speed_x != 0.0 || *speed_y != 0.0 || width.is_some() || height.is_some() =>
+            {
+                tx0 = 0.0;
+                ty0 = 0.0;
+                tx1 = nw as f32;
+                ty1 = nh as f32;
+            }
+            _ => {
+                let pad = e.pad();
+                if pad > 0 {
+                    tx0 = tx0.max(0.0);
+                    ty0 = ty0.max(0.0);
+                    tx1 = (tx1 + (2 * pad) as f32).min(nw as f32);
+                    ty1 = (ty1 + (2 * pad) as f32).min(nh as f32);
+                }
+            }
+        }
+        (cur_w, cur_h) = (nw, nh);
+    }
+    if has_crop {
+        tx0 = (tx0 - gp.crop[0] as f32).max(0.0);
+        ty0 = (ty0 - gp.crop[1] as f32).max(0.0);
+        tx1 = (tx1 - gp.crop[0] as f32).min(gcw as f32);
+        ty1 = (ty1 - gp.crop[1] as f32).min(gch as f32);
+        if tx1 <= tx0 || ty1 <= ty0 {
+            return Err(AvError::Source("the item is cropped out by its group".into()));
+        }
+    }
+    Ok([m_group.apply(tx0, ty0), m_group.apply(tx1, ty0), m_group.apply(tx1, ty1), m_group.apply(tx0, ty1)])
 }
 
 fn item_draw_affine_and_crop(
@@ -11056,5 +11094,67 @@ mod tests {
         while e.lock().reopen_workers.load(Ordering::Acquire) > 0 {
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn snapshot_item_transformed_clips_outside_group_and_tracks_crop_filter() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 40, height: 20, rgba: [20, 180, 240, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+
+        // 1. Children sitting completely left (-50..-10) or right (65..105) of a 60x40 group with an
+        // outside shadow must be rejected as cropped out instead of clamping into a bogus sliver.
+        for bad_x in [-50.0f32, 65.0f32] {
+            let mut off = SceneItem::new(1, Placement { x: bad_x, y: 10.0, ..Default::default() });
+            off.item_id = 21;
+            e.set_scene("ShadowGroup", vec![off]);
+
+            let mut grp = SceneItem::new(0, Placement { x: 100.0, y: 100.0, ..Default::default() });
+            grp.scene = Some("ShadowGroup".into());
+            grp.group = Some((60, 40));
+            grp.item_id = 22;
+            grp.effects = vec![Effect::Shadow { rgba: [0.0, 0.0, 0.0, 1.0], blur: 8.0, x: 0.0, y: 0.0, outside: true }];
+            e.set_scene("Main", vec![grp]);
+
+            assert!(
+                e.snapshot_item_transformed("Main", 21, (640, 360)).is_err(),
+                "item at x={bad_x} outside 60x40 group must be cropped out before shadow padding"
+            );
+        }
+
+        // 2. Effect::Crop on the enclosing group must shift & clip the child's transformed box to match the scene.
+        let mut inside = SceneItem::new(1, Placement { x: 20.0, y: 20.0, ..Default::default() });
+        inside.item_id = 31;
+        e.set_scene("CropGroup", vec![inside]);
+
+        let mut cropped_grp = SceneItem::new(0, Placement { x: 50.0, y: 40.0, ..Default::default() });
+        cropped_grp.scene = Some("CropGroup".into());
+        cropped_grp.group = Some((100, 80));
+        cropped_grp.item_id = 32;
+        cropped_grp.effects = vec![Effect::Crop { left: 10, top: 8, right: 0, bottom: 0, size: Some((70, 50)) }];
+        e.set_scene("Main", vec![cropped_grp]);
+
+        let (px, size) = e.snapshot_item_transformed("Main", 31, (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(size, (40, 20), "child [20..60, 20..40] cropped by (10,8) remains 40x20");
+        let full_scene = e.snapshot_scene_at("Main", (640, 360), (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        let mut expected = Vec::with_capacity((40 * 20 * 4) as usize);
+        // Group placed at (50, 40); child starts at (20-10, 20-8) = (10, 12) inside cropped group -> (60, 52).
+        for y in 52..72usize {
+            let start = (y * 640 + 60) * 4;
+            expected.extend_from_slice(&full_scene[start..start + 40 * 4]);
+        }
+        assert_eq!(px, expected, "group with Effect::Crop screenshot must match scene render pixel-for-pixel");
+
+        // 3. Item completely cut away by Effect::Crop on its enclosing group must return an error.
+        let mut wiped_grp = SceneItem::new(0, Placement { x: 50.0, y: 40.0, ..Default::default() });
+        wiped_grp.scene = Some("CropGroup".into());
+        wiped_grp.group = Some((100, 80));
+        wiped_grp.item_id = 33;
+        wiped_grp.effects = vec![Effect::Crop { left: 70, top: 0, right: 0, bottom: 0, size: None }];
+        e.set_scene("Main", vec![wiped_grp]);
+        assert!(
+            e.snapshot_item_transformed("Main", 31, (640, 360)).is_err(),
+            "child completely removed by Effect::Crop must error cleanly"
+        );
     }
 }
