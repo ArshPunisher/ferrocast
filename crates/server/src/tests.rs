@@ -1435,6 +1435,8 @@ async fn updates_refuse_install_and_restart_while_studio_recording_or_replay_act
     struct CaptureStateHost {
         recording: AtomicBool,
         replay: AtomicBool,
+        hold_replay: tokio::sync::Mutex<()>,
+        replay_entered: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -1472,11 +1474,24 @@ async fn updates_refuse_install_and_restart_while_studio_recording_or_replay_act
         async fn stats(&self) -> Result<Value, String> {
             Ok(Value::Null)
         }
-        async fn record(&self, _on: bool) -> Result<Value, String> {
+        async fn record(&self, on: bool) -> Result<Value, String> {
+            self.recording.store(on, Ordering::Release);
+            Ok(Value::Null)
+        }
+        async fn record_source(&self, _name: String, on: bool) -> Result<Value, String> {
+            self.recording.store(on, Ordering::Release);
             Ok(Value::Null)
         }
         async fn record_pause(&self, _on: bool) -> Result<(), String> {
             Ok(())
+        }
+        async fn replay(&self, on: bool) -> Result<Value, String> {
+            if on {
+                self.replay_entered.notify_one();
+                let _hold = self.hold_replay.lock().await;
+            }
+            self.replay.store(on, Ordering::Release);
+            Ok(Value::Null)
         }
         async fn monitoring(&self) -> Result<Value, String> {
             Ok(json!({ "devices": [] }))
@@ -1565,7 +1580,42 @@ async fn updates_refuse_install_and_restart_while_studio_recording_or_replay_act
     );
 
     host.replay.store(false, Ordering::Release);
+    // An in-flight replay/recording start holding `output_gate` must block restart admission too.
+    let hold_replay = host.hold_replay.lock().await;
+    let entered = host.replay_entered.notified();
+    let starting_rep = tokio::spawn({
+        let eng = r.engine.clone();
+        async move { eng.studio_replay(true).await }
+    });
+    entered.await;
+    let starting_restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(starting_restart.status(), StatusCode::CONFLICT);
+    assert_eq!(starting_restart.json::<Value>().await.unwrap()["error"]["code"], "live");
+    drop(hold_replay);
+    starting_rep.await.unwrap().unwrap();
+    r.engine.studio_replay(false).await.unwrap();
+
     assert_eq!(r.post("/api/v1/updates/restart", json!({})).await.status(), StatusCode::ACCEPTED);
+    // Once restart is admitted under `output_gate`, late recording/replay starts are refused until failure/reset.
+    let late_rec = r.engine.studio_record(true).await.unwrap_err();
+    assert!(
+        matches!(late_rec, ferrocast_engine::EngineError::Refused { code: "updating", .. }),
+        "expected updating refusal after restart admission, got {late_rec:?}"
+    );
+    let late_rep = r.engine.studio_replay(true).await.unwrap_err();
+    assert!(
+        matches!(late_rep, ferrocast_engine::EngineError::Refused { code: "updating", .. }),
+        "expected updating refusal on replay after restart admission, got {late_rep:?}"
+    );
+    let late_src_rec = r.engine.studio_record_source("Cam", true).await.unwrap_err();
+    assert!(
+        matches!(late_src_rec, ferrocast_engine::EngineError::Refused { code: "updating", .. }),
+        "expected updating refusal on isolated record after restart admission, got {late_src_rec:?}"
+    );
+
+    r.engine.update_failed("restart aborted");
+    r.engine.studio_replay(true).await.expect("failure resets update_committing lock");
+    r.engine.studio_replay(false).await.unwrap();
 }
 
 #[tokio::test]

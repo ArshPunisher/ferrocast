@@ -7,6 +7,7 @@
 //! The headless app has no updater: nothing attaches one, so `can_install` stays false and
 //! every request that needs the shell answers 409 `no_updater` with where to download.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -259,6 +260,7 @@ impl Engine {
 
     /// The desktop shell has an updater: the dashboard may offer checks and installs.
     pub fn attach_updater(&self) {
+        self.studio().update_committing.store(false, Ordering::Release);
         self.with_update(|s| s.updater = true);
     }
 
@@ -336,6 +338,7 @@ impl Engine {
 
     /// Installed: it runs after a restart, which waits for the streamer (never automatic).
     pub fn update_ready(&self, version: &str) {
+        self.studio().update_committing.store(false, Ordering::Release);
         self.with_update(|s| {
             s.install.phase = InstallPhase::Ready;
             s.install.version = Some(version.into());
@@ -350,6 +353,7 @@ impl Engine {
 
     /// The shell couldn't download or install: say why on the dashboard.
     pub fn update_install_failed(&self, problem: UpdateProblem) {
+        self.studio().update_committing.store(false, Ordering::Release);
         let detail = format!("{} {}", problem.message, problem.hint);
         self.with_update(|s| {
             s.install.phase = InstallPhase::Failed;
@@ -472,10 +476,19 @@ impl Engine {
                 "Install the update first (Update now), then restart.",
             ));
         }
+        let _gate = self.studio().output_gate.try_lock().map_err(|_| {
+            refused(
+                409,
+                "live",
+                "Recording or streaming is starting, so Ferrocast won't restart yet.",
+                "Try again once it finishes starting.",
+            )
+        })?;
         if let Some(reason) = self.update_block_reason() {
             let (msg, hint) = reason.restart_message();
             return Err(refused(409, "live", msg, hint));
         }
+        self.studio().update_committing.store(true, Ordering::Release);
         self.inner.restart_update.notify_one();
         Ok(install.version.unwrap_or_default())
     }

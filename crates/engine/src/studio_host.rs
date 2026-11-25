@@ -2773,11 +2773,25 @@ impl Engine {
         Ok(v)
     }
 
+    /// Refuses once `request_update_restart` has admitted restart under `output_gate` so a late
+    /// capture or stream cannot race ahead of clean exit.
+    pub(crate) fn ensure_not_restarting_for_update(&self) -> Result<(), EngineError> {
+        if self.studio().update_committing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(crate::golive::refused_pub(
+                "updating",
+                "Ferrocast is restarting to finish an update.",
+                "Try again once Ferrocast reopens.",
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn studio_record(&self, on: bool) -> Result<Value, EngineError> {
         let host = self.studio_host()?;
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
+            self.ensure_not_restarting_for_update()?;
             let s = host.settings().await;
             self.ffmpeg_first(s.record_needs_ffmpeg()).await?;
             Some(g)
@@ -2809,6 +2823,7 @@ impl Engine {
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
+            self.ensure_not_restarting_for_update()?;
             Some(g)
         } else {
             None
@@ -2826,6 +2841,7 @@ impl Engine {
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
+            self.ensure_not_restarting_for_update()?;
             Some(g)
         } else {
             None
@@ -3055,6 +3071,7 @@ impl Engine {
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
+            self.ensure_not_restarting_for_update()?;
             Some(g)
         } else {
             None
