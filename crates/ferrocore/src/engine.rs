@@ -3679,7 +3679,7 @@ impl Engine {
     ) -> Result<(Vec<u8>, (u32, u32)), AvError> {
         const MAX_OFFSCREEN_SHOT: u32 = 4096;
         let canvas = (canvas.0.max(1), canvas.1.max(1));
-        let (built, scale_to) = {
+        let scene = {
             let mut st = self.lock();
             send_pending(&mut st, &self.gpu);
             let ts = now_ns();
@@ -3710,17 +3710,23 @@ impl Engine {
             }
             let (cx0, cy0, cx1, cy1) =
                 (bx0.max(0), by0.max(0), bx1.min(i64::from(canvas.0)), by1.min(i64::from(canvas.1)));
-            let ((off_x, off_y), (render_w, render_h), scale_to) = if cx1 > cx0 && cy1 > cy0 {
-                ((cx0 as f32, cy0 as f32), ((cx1 - cx0) as u32, (cy1 - cy0) as u32), None)
+            let (off_x, off_y, raw_w, raw_h, target_size) = if cx1 > cx0 && cy1 > cy0 {
+                let rw = u64::try_from(cx1 - cx0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
+                let rh = u64::try_from(cy1 - cy0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
+                let target = (
+                    u32::try_from(rw).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?,
+                    u32::try_from(rh).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?,
+                );
+                (cx0 as f32, cy0 as f32, rw, rh, target)
             } else {
-                let raw_w = u32::try_from(bx1 - bx0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
-                let raw_h = u32::try_from(by1 - by0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
-                let scale_to = if raw_w > MAX_OFFSCREEN_SHOT || raw_h > MAX_OFFSCREEN_SHOT {
-                    Some(fit_within(raw_w, raw_h, MAX_OFFSCREEN_SHOT))
+                let rw = u64::try_from(i128::from(bx1) - i128::from(bx0)).unwrap_or(u64::MAX).max(1);
+                let rh = u64::try_from(i128::from(by1) - i128::from(by0)).unwrap_or(u64::MAX).max(1);
+                let target = if rw > u64::from(MAX_OFFSCREEN_SHOT) || rh > u64::from(MAX_OFFSCREEN_SHOT) {
+                    fit_within_u64(rw, rh, MAX_OFFSCREEN_SHOT)
                 } else {
-                    None
+                    (rw as u32, rh as u32)
                 };
-                ((bx0 as f32, by0 as f32), (raw_w, raw_h), scale_to)
+                (bx0 as f32, by0 as f32, rw, rh, target)
             };
 
             let mut solo = it.clone();
@@ -3753,11 +3759,28 @@ impl Engine {
                     opacity: g_opacity,
                 };
             }
-            (Scene { width: render_w, height: render_h, items: vec![comp_item] }, scale_to)
-        };
-        let scene = match scale_to {
-            Some((tw, th)) => scaled(built, tw, th, Filter::Bicubic),
-            None => built,
+            // Scale oversized offscreen items via an unfiltered Group transform directly into the
+            // bounded target instead of wrapping in `Content::Scene(raw_w, raw_h)`, which would
+            // allocate a full `raw_w * raw_h` intermediate GPU texture before downscaling.
+            let items = if u64::from(target_size.0) != raw_w || u64::from(target_size.1) != raw_h {
+                vec![Item {
+                    content: Content::Group { width: target_size.0, height: target_size.1, items: vec![comp_item] },
+                    effects: Vec::new(),
+                    placement: Placement {
+                        scale_x: (target_size.0 as f64 / raw_w as f64) as f32,
+                        scale_y: (target_size.1 as f64 / raw_h as f64) as f32,
+                        ..Default::default()
+                    },
+                    filter: Filter::Disable,
+                    blend: crate::Blend::Normal,
+                    srgb_off: false,
+                    linear: true,
+                    opacity: 1.0,
+                }]
+            } else {
+                vec![comp_item]
+            };
+            Scene { width: target_size.0, height: target_size.1, items }
         };
         let out_size = (scene.width, scene.height);
         let px = self.gpu.render(&scene)?;
@@ -4002,13 +4025,14 @@ fn snap_pts_bbox(pts: &[(f32, f32); 4]) -> (i64, i64, i64, i64) {
     ((x0 + EPS).floor() as i64, (y0 + EPS).floor() as i64, (x1 - EPS).ceil() as i64, (y1 - EPS).ceil() as i64)
 }
 
-fn fit_within(w: u32, h: u32, max_side: u32) -> (u32, u32) {
+fn fit_within_u64(w: u64, h: u64, max_side: u32) -> (u32, u32) {
+    let cap = u128::from(max_side.max(1));
     if w >= h {
-        let th = ((u64::from(h) * u64::from(max_side)) / u64::from(w.max(1))).max(1) as u32;
-        (max_side, th)
+        let th = ((u128::from(h) * cap) / u128::from(w.max(1))).clamp(1, cap) as u32;
+        (max_side.max(1), th)
     } else {
-        let tw = ((u64::from(w) * u64::from(max_side)) / u64::from(h.max(1))).max(1) as u32;
-        (tw, max_side)
+        let tw = ((u128::from(w) * cap) / u128::from(h.max(1))).clamp(1, cap) as u32;
+        (tw, max_side.max(1))
     }
 }
 
@@ -11156,5 +11180,45 @@ mod tests {
             e.snapshot_item_transformed("Main", 31, (640, 360)).is_err(),
             "child completely removed by Effect::Crop must error cleanly"
         );
+    }
+
+    #[test]
+    fn snapshot_item_transformed_downscales_oversized_offscreen_item_without_raw_target() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 1000, height: 500, rgba: [40, 190, 90, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+
+        let mut big = SceneItem::new(
+            1,
+            Placement { x: -30_000.0, y: -20_000.0, scale_x: 20.0, scale_y: 20.0, ..Default::default() },
+        );
+        big.item_id = 41;
+        e.set_scene("Main", vec![big]);
+
+        let (px, size) = e
+            .snapshot_item_transformed("Main", 41, (1920, 1080))
+            .expect("oversized 20000x10000 offscreen item must downscale without allocating raw target");
+        assert_eq!(size, (4096, 2048));
+        assert_eq!(px.len(), 4096 * 2048 * 4);
+        let center = (1024 * 4096 + 2048) * 4;
+        assert_eq!(&px[center..center + 4], &[40, 190, 90, 255]);
+
+        // Rotated 90 deg and scaled past u32::MAX also downscales without raw texture allocation.
+        let mut rot = SceneItem::new(
+            1,
+            Placement {
+                x: -20_000_000_000.0,
+                y: -20_000_000_000.0,
+                scale_x: 10_000_000.0,
+                scale_y: 10_000_000.0,
+                rotation: 90.0,
+                ..Default::default()
+            },
+        );
+        rot.item_id = 42;
+        e.set_scene("Main", vec![rot]);
+        let (rpx, rsize) = e.snapshot_item_transformed("Main", 42, (1920, 1080)).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(rsize, (2048, 4096));
+        assert_eq!(rpx.len(), 2048 * 4096 * 4);
     }
 }
