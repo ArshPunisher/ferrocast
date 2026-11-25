@@ -4528,8 +4528,20 @@ impl Stage {
         scene: &str,
         id: i64,
     ) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
+        self.screenshot_item_job_for(expected_source, scene, id)?()
+    }
+
+    /// Reads the item metadata and engine handle on the Stage thread so the caller can run the
+    /// readiness wait, GPU render, and readback off the main thread.
+    #[allow(clippy::type_complexity)]
+    pub fn screenshot_item_job_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+    ) -> Result<impl FnOnce() -> Result<(Vec<u8>, (u32, u32)), StudioError> + Send + 'static + use<>, StudioError> {
         let it = self.item(scene, id)?;
-        let src = name_of(&it);
+        let src = name_of(&it).to_string();
         if let Some(want) = expected_source
             && want != src
         {
@@ -4541,34 +4553,61 @@ impl Stage {
             (self.canvas.width, self.canvas.height)
         };
         let e = self.engine()?;
-        let started = std::time::Instant::now();
-        while e.engine.item_picture_ready(scene, id) == Some(false)
-            && started.elapsed() < std::time::Duration::from_secs(2)
-        {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        e.engine.snapshot_item_transformed(scene, id, canvas).map_err(|x| fail(x.to_string()))
+        let scene = scene.to_string();
+        Ok(move || {
+            let started = std::time::Instant::now();
+            while e.engine.item_picture_ready(&scene, id) == Some(false)
+                && should_wait_for_item_picture(&e.engine, &src)
+                && started.elapsed() < std::time::Duration::from_secs(2)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            e.engine.snapshot_item_transformed(&scene, id, canvas).map_err(|x| fail(x.to_string()))
+        })
     }
 
     /// A scene (or vertical scene) at its picture's full size, as RGBA pixels: saving them as a
     /// PNG ([`write_png`]) can happen off this thread.
     pub fn screenshot_pixels(&self, name: &str) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
-        let size = if self.vertical_order().iter().any(|n| n == name) {
-            crate::collection::VERTICAL_SIZE
-        } else if self.scene_index(name).is_ok() {
-            (self.canvas.width, self.canvas.height)
-        } else {
-            // A source (OBS's Screenshot (Source)): drawn on its own, at its own size.
-            self.source(name)?;
+        self.screenshot_job(name)?()
+    }
+
+    /// Splits [`Self::screenshot_pixels`] so only scene/source resolution touches the Stage thread
+    /// while GPU snapshot runs on a worker thread.
+    #[allow(clippy::type_complexity)]
+    pub fn screenshot_job(
+        &self,
+        name: &str,
+    ) -> Result<impl FnOnce() -> Result<(Vec<u8>, (u32, u32)), StudioError> + Send + 'static + use<>, StudioError> {
+        if self.vertical_order().iter().any(|n| n == name) {
+            let size = crate::collection::VERTICAL_SIZE;
             let e = self.engine()?;
-            let (scene, w, h) = crate::own::show_alone(&e.engine, name, (self.canvas.width, self.canvas.height))?;
-            e.keep_alone(name);
-            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()));
-            e.release_alone(name);
-            return px.map(|px| (px, (w, h)));
-        };
-        let px = self.engine()?.engine.snapshot_scene_at(name, size, size).map_err(|e| fail(e.to_string()))?;
-        Ok((px, size))
+            let name = name.to_string();
+            return Ok(Box::new(move || {
+                let px = e.engine.snapshot_scene_at(&name, size, size).map_err(|x| fail(x.to_string()))?;
+                Ok((px, size))
+            }) as Box<dyn FnOnce() -> Result<(Vec<u8>, (u32, u32)), StudioError> + Send>);
+        }
+        if self.scene_index(name).is_ok() {
+            let size = (self.canvas.width, self.canvas.height);
+            let e = self.engine()?;
+            let name = name.to_string();
+            return Ok(Box::new(move || {
+                let px = e.engine.snapshot_scene_at(&name, size, size).map_err(|x| fail(x.to_string()))?;
+                Ok((px, size))
+            }));
+        }
+        // A source (OBS's Screenshot (Source)): drawn on its own, at its own size.
+        self.source(name)?;
+        let e = self.engine()?;
+        let (scene, w, h) = crate::own::show_alone(&e.engine, name, (self.canvas.width, self.canvas.height))?;
+        e.keep_alone(name);
+        let src_name = name.to_string();
+        Ok(Box::new(move || {
+            let _release = AloneGuard { engine: e.clone(), name: src_name };
+            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()))?;
+            Ok((px, (w, h)))
+        }))
     }
 
     /// A picture of what's on air exactly, as a PNG at `path`.
@@ -4579,10 +4618,40 @@ impl Stage {
 
     /// What's on air as RGBA pixels and their size.
     pub fn screenshot_program_pixels(&self) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
-        let px = self.engine()?.engine.snapshot().map_err(|e| fail(e.to_string()))?;
-        Ok((px, (self.canvas.width, self.canvas.height)))
+        self.screenshot_program_job()?()
     }
 
+    /// Captures the program canvas size and engine handle on the Stage thread so GPU snapshot and
+    /// readback can run on a background worker thread.
+    #[allow(clippy::type_complexity)]
+    pub fn screenshot_program_job(
+        &self,
+    ) -> Result<impl FnOnce() -> Result<(Vec<u8>, (u32, u32)), StudioError> + Send + 'static + use<>, StudioError> {
+        let size = (self.canvas.width, self.canvas.height);
+        let e = self.engine()?;
+        Ok(move || {
+            let px = e.engine.snapshot().map_err(|x| fail(x.to_string()))?;
+            Ok((px, size))
+        })
+    }
+}
+
+struct AloneGuard {
+    engine: Arc<own::Shared>,
+    name: String,
+}
+
+impl Drop for AloneGuard {
+    fn drop(&mut self) {
+        self.engine.release_alone(&self.name);
+    }
+}
+
+fn should_wait_for_item_picture(engine: &ferrocore::engine::Engine, source: &str) -> bool {
+    !(engine.opening() == 0 && engine.camera_status(source).is_some_and(|s| s.state == "waiting"))
+}
+
+impl Stage {
     // ------------------------------------------------------------------ the vertical picture
 
     fn vertical_doc(&self) -> Option<Value> {
@@ -10677,5 +10746,44 @@ mod tests {
         ok(s.set_transform("Main", big.id, &tbig));
         let (_, sbig) = ok(s.screenshot_item_pixels("Main", big.id));
         assert_eq!(sbig, (640, 360), "overflowing item clips to visible canvas bounds");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn screenshot_jobs_run_off_stage_thread_and_skip_wait_for_waiting_camera() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        let sw = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Color",
+            &json!({ "width": 64, "height": 32, "color": 0xFF00_FF00u32 }),
+            false,
+        ));
+        let item_job = ok(s.screenshot_item_job_for(Some("Color"), "Main", sw.id));
+        let scene_job = ok(s.screenshot_job("Main"));
+        let source_job = ok(s.screenshot_job("Color"));
+        let prog_job = ok(s.screenshot_program_job());
+
+        let (_, isize) = std::thread::spawn(item_job).join().unwrap().unwrap();
+        let (_, ssize) = std::thread::spawn(scene_job).join().unwrap().unwrap();
+        let (_, rsize) = std::thread::spawn(source_job).join().unwrap().unwrap();
+        let (_, psize) = std::thread::spawn(prog_job).join().unwrap().unwrap();
+        assert_eq!(isize, (64, 32));
+        assert_eq!(ssize, (320, 180));
+        assert_eq!(rsize, (64, 32));
+        assert_eq!(psize, (320, 180));
+
+        // Waiting camera (disconnected, opening() == 0) skips the 2 s sleep loop.
+        let (cam_kind, cam_key) = ferrocore::obs::native_camera_kind_and_key();
+        let mut cam_settings = serde_json::Map::new();
+        cam_settings.insert(cam_key.to_string(), serde_json::Value::String("fc-missing-cam-h5".into()));
+        let cam = ok(s.add_source("Main", cam_kind, "MissingCam", &serde_json::Value::Object(cam_settings), false));
+        while e.engine.opening() > 0 {
+            std::thread::yield_now();
+        }
+        assert!(!super::should_wait_for_item_picture(&e.engine, "MissingCam"));
+        let cam_job = ok(s.screenshot_item_job_for(Some("MissingCam"), "Main", cam.id));
+        assert!(std::thread::spawn(cam_job).join().unwrap().is_err());
     }
 }

@@ -3661,7 +3661,11 @@ impl Engine {
     pub fn item_picture_ready(&self, scene: &str, item_id: i64) -> Option<bool> {
         let st = self.lock();
         let (it, _) = find_scene_item(&st, scene, item_id)?;
-        Some(if it.scene.is_some() { true } else { st.sources.get(&it.source).is_some_and(|s| s.size.is_some()) })
+        Some(if it.scene.is_some() {
+            true
+        } else {
+            st.sources.get(&it.source).is_some_and(|s| s.size.is_some() || s.pending.is_some())
+        })
     }
 
     /// One scene item rendered on its own exactly as the scene render draws it: its active
@@ -11220,5 +11224,32 @@ mod tests {
         let (rpx, rsize) = e.snapshot_item_transformed("Main", 42, (1920, 1080)).unwrap_or_else(|x| panic!("{x}"));
         assert_eq!(rsize, (2048, 4096));
         assert_eq!(rpx.len(), 2048 * 4096 * 4);
+    }
+
+    #[test]
+    fn item_picture_ready_counts_pending_frame_for_unshown_source() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            let mut no_pic = Src::new(Live::Still, None, None);
+            no_pic.pending = None;
+            st.sources.insert(1, no_pic);
+
+            let mut with_pending = Src::new(Live::Still, None, None);
+            with_pending.pending = Some(Fresh::Pic(Picture::solid(16, 16, [10, 20, 30, 255])));
+            st.sources.insert(2, with_pending);
+        }
+        let mut a = SceneItem::new(1, Placement::default());
+        a.item_id = 10;
+        let mut b = SceneItem::new(2, Placement::default());
+        b.item_id = 11;
+        e.set_scene("Unshown", vec![a, b]);
+
+        assert_eq!(e.item_picture_ready("Unshown", 10), Some(false));
+        assert_eq!(
+            e.item_picture_ready("Unshown", 11),
+            Some(true),
+            "pending frame waiting for GPU upload on an unshown source must report ready immediately"
+        );
     }
 }

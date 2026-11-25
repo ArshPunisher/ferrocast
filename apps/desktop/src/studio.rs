@@ -2894,50 +2894,36 @@ impl StudioHost for DesktopStudio {
         if matches!(act, StudioAct::Screenshot { .. } | StudioAct::ScreenshotProgram) {
             let data = self.data.clone();
             let shot = act.clone();
-            let (path, px, size) = self
-                .on_main(move |h| -> Result<_, String> {
-                    // Next to the recordings, as OBS does.
+            let (folder, job) = self
+                .on_main(move |h| -> Result<(PathBuf, ScreenshotJob), String> {
+                    // Next to the recordings, as OBS does; only capture folder + job handle on
+                    // the main thread so sleep, GPU render/readback, and file I/O run on a worker.
                     let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
-                    let (px, size) = match &shot {
-                        StudioAct::Screenshot { name, item: Some(target) } => c.screenshot_item_pixels_for(
-                            (!name.is_empty()).then_some(name.as_str()),
-                            &target.scene,
-                            target.id,
-                        ),
-                        StudioAct::Screenshot { name, item: None } => c.screenshot_pixels(name),
-                        _ => c.screenshot_program_pixels(),
-                    }
-                    .map_err(|e| e.to_string())?;
-                    std::fs::create_dir_all(&folder)
-                        .map_err(|e| format!("The screenshot folder couldn't be made: {e}"))?;
-                    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
-                    // Two in the same second get their own files: the name is taken here (the
-                    // file made empty), so a second shot before this one is written can't pick it.
-                    let mut n = 1;
-                    loop {
-                        let path = if n == 1 {
-                            folder.join(format!("Screenshot {stamp}.png"))
-                        } else {
-                            folder.join(format!("Screenshot {stamp} ({n}).png"))
-                        };
-                        match std::fs::File::create_new(&path) {
-                            Ok(_) => return Ok((path, px, size)),
-                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
-                            Err(e) => return Err(format!("The screenshot couldn't be saved: {e}")),
+                    let job: ScreenshotJob = match &shot {
+                        StudioAct::Screenshot { name, item: Some(target) } => {
+                            let j = c
+                                .screenshot_item_job_for(
+                                    (!name.is_empty()).then_some(name.as_str()),
+                                    &target.scene,
+                                    target.id,
+                                )
+                                .map_err(|e| e.to_string())?;
+                            Box::new(move || j().map_err(|e| e.to_string()))
                         }
-                    }
+                        StudioAct::Screenshot { name, item: None } => {
+                            let j = c.screenshot_job(name).map_err(|e| e.to_string())?;
+                            Box::new(move || j().map_err(|e| e.to_string()))
+                        }
+                        _ => {
+                            let j = c.screenshot_program_job().map_err(|e| e.to_string())?;
+                            Box::new(move || j().map_err(|e| e.to_string()))
+                        }
+                    };
+                    Ok((folder, job))
                 })
                 .await??;
-            let at = path.clone();
-            let written = tokio::task::spawn_blocking(move || ferrocast_studio::stage::write_png(&at, &px, size))
-                .await
-                .map_err(|e| e.to_string())?;
-            if let Err(e) = written {
-                let _ = std::fs::remove_file(&path);
-                return Err(e.to_string());
-            }
-            return Ok(json!({ "file": path.display().to_string() }));
+            return finish_screenshot_job(folder, job).await;
         }
         let data = self.data.clone();
         let app = self.app.clone();
@@ -4649,6 +4635,45 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+type ScreenshotJob = Box<dyn FnOnce() -> Result<(Vec<u8>, (u32, u32)), String> + Send>;
+
+fn write_unique_screenshot(
+    folder: &std::path::Path,
+    px: &[u8],
+    size: (u32, u32),
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(folder).map_err(|e| format!("The screenshot folder couldn't be made: {e}"))?;
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+    let mut n = 1;
+    let path = loop {
+        let candidate = if n == 1 {
+            folder.join(format!("Screenshot {stamp}.png"))
+        } else {
+            folder.join(format!("Screenshot {stamp} ({n}).png"))
+        };
+        match std::fs::File::create_new(&candidate) {
+            Ok(_) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(format!("The screenshot couldn't be saved: {e}")),
+        }
+    };
+    if let Err(e) = ferrocast_studio::stage::write_png(&path, px, size) {
+        let _ = std::fs::remove_file(&path);
+        return Err(e.to_string());
+    }
+    Ok(path)
+}
+
+async fn finish_screenshot_job(folder: std::path::PathBuf, job: ScreenshotJob) -> Result<Value, String> {
+    let path = tokio::task::spawn_blocking(move || -> Result<std::path::PathBuf, String> {
+        let (px, size) = job()?;
+        write_unique_screenshot(&folder, &px, size)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(json!({ "file": path.display().to_string() }))
+}
+
 #[cfg(test)]
 mod log_tests {
     use super::*;
@@ -5444,6 +5469,43 @@ mod import_tests {
         assert_eq!(doc["transition_matrix"][0]["transition"], "Quick Swipe");
         assert_eq!(doc["transition_matrix"][0]["from"], "Main");
         assert_eq!(doc["transition_matrix"][0]["to"], "BRB");
+    }
+
+    #[test]
+    fn screenshot_job_runs_on_worker_thread_and_skips_empty_file_on_error() {
+        let dir = std::env::temp_dir().join(format!("fc-shot-job-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let caller = std::thread::current().id();
+
+        let dir_err = dir.clone();
+        let err_res = rt.block_on(super::finish_screenshot_job(
+            dir_err,
+            Box::new(move || {
+                assert_ne!(std::thread::current().id(), caller, "screenshot job must not run on caller thread");
+                Err("item missing".into())
+            }),
+        ));
+        assert!(err_res.is_err());
+        assert!(!dir.exists(), "failed screenshot job must not leave an empty png or directory");
+
+        let first = rt
+            .block_on(super::finish_screenshot_job(
+                dir.clone(),
+                Box::new(move || {
+                    assert_ne!(std::thread::current().id(), caller);
+                    Ok((vec![255u8; 4 * 4 * 4], (4, 4)))
+                }),
+            ))
+            .unwrap();
+        let second = rt
+            .block_on(super::finish_screenshot_job(dir.clone(), Box::new(|| Ok((vec![255u8; 4 * 4 * 4], (4, 4))))))
+            .unwrap();
+        let p1 = std::path::PathBuf::from(first["file"].as_str().unwrap());
+        let p2 = std::path::PathBuf::from(second["file"].as_str().unwrap());
+        assert_ne!(p1, p2);
+        assert!(p1.exists() && p2.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
