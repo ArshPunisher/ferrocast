@@ -128,6 +128,11 @@ impl Capture {
             (None, None) => None,
         }
     }
+
+    /// V4L2/PulseAudio has no separate suspended-interruption state.
+    pub fn interrupted(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

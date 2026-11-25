@@ -946,10 +946,11 @@ impl FakeCapture {
         if !self.state.online.load(Ordering::Acquire) {
             return Some("the camera was disconnected".into());
         }
-        if self.state.interrupted.load(Ordering::Acquire) {
-            return Some("the camera was interrupted".into());
-        }
         None
+    }
+
+    fn interrupted(&self) -> bool {
+        self.state.online.load(Ordering::Acquire) && self.state.interrupted.load(Ordering::Acquire)
     }
 
     fn take_frame(&self) -> Option<(Picture, u64)> {
@@ -5314,6 +5315,16 @@ fn is_live_ended(live: &Live) -> bool {
     signs(live).is_some_and(|(_, _, e)| e.is_some())
 }
 
+fn is_live_interrupted(live: &Live) -> bool {
+    match live {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        Live::Camera(c) => c.interrupted(),
+        #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        Live::FakeCamera(c) => c.interrupted(),
+        _ => false,
+    }
+}
+
 fn poll_hotplug(seq: &mut u64) -> Option<Vec<String>> {
     #[cfg(target_os = "macos")]
     {
@@ -5436,6 +5447,7 @@ fn watchdog_step(
                     running,
                     frames,
                     ended,
+                    interrupted: is_live_interrupted(&src.live),
                     opening: false,
                     visible_or_on_air,
                     now_ns: now,
@@ -6828,6 +6840,7 @@ mod tests {
                 running: false,
                 frames: 0,
                 ended: false,
+                interrupted: false,
                 opening: false,
                 visible_or_on_air: true,
                 now_ns: t,
@@ -6850,6 +6863,7 @@ mod tests {
             running: false,
             frames: 0,
             ended: false,
+            interrupted: false,
             opening: false,
             visible_or_on_air: true,
             now_ns: t + sec,
@@ -10669,6 +10683,75 @@ mod tests {
         }
         assert_eq!(&px[0..4], &[0, 200, 100, 255]);
         assert_eq!(backend.open_attempts.load(Ordering::Acquire), settled_attempts);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn interrupted_camera_keeps_session_open_during_grace_and_resumes_without_reopen() {
+        let Some(e) = engine() else { return };
+        let backend = FakeCameraBackend::new([255, 0, 0, 255]);
+        {
+            let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(live, None, Some(SourceKind::Camera("fake-iphone".into()))));
+            st.opened.insert("iPhone".into(), (1, SourceKind::Camera("fake-iphone".into())));
+            st.scenes.insert("Main".into(), vec![SceneItem::new(1, Placement::default())]);
+            st.on_air = Some("Main".into());
+        }
+        let dl = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < dl && e.lock().sources.get(&1).and_then(|s| s.size).is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(e.lock().sources.get(&1).and_then(|s| s.size).is_some());
+
+        let reopen_b = Arc::clone(&backend);
+        let reopen: Reopener = Arc::new(move |kind| match kind {
+            SourceKind::Camera(spec) if spec.id == "fake-iphone" => Some(reopen_b.open()),
+            _ => None,
+        });
+        let cmd = e.audio.cmd_sender();
+        let wait_idle = || {
+            let dl = Instant::now() + Duration::from_secs(5);
+            while e.lock().sources.get(&1).is_some_and(|s| s.opening.is_some()) && Instant::now() < dl {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Session interrupted while device stays connected: surfaces Waiting without destroying session.
+        backend.interrupted.store(true, Ordering::Release);
+        *backend.color.lock().unwrap_or_else(|x| x.into_inner()) = [0, 255, 0, 255];
+        let attempts0 = backend.open_attempts.load(Ordering::Acquire);
+        let t = now_ns();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 6_000_000_000);
+        wait_idle();
+        assert_eq!(backend.active_sessions.load(Ordering::Acquire), 1, "must keep interrupted session alive");
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), attempts0, "must not reopen during grace");
+        assert_eq!(e.waiting_cameras(), vec!["iPhone".to_string()]);
+
+        // Interruption ends: same session resumes delivering green frames with zero reopen churn.
+        backend.interrupted.store(false, Ordering::Release);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 7_000_000_000);
+        let dl2 = Instant::now() + Duration::from_secs(5);
+        let mut px = vec![0; 4];
+        while Instant::now() < dl2 {
+            px = e.snapshot_scene_at("Main", (16, 16), (16, 16)).unwrap_or_default();
+            if px.get(0..4) == Some(&[0, 255, 0, 255]) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(&px[0..4], &[0, 255, 0, 255]);
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), attempts0);
+        assert!(e.waiting_cameras().is_empty());
+
+        // An interruption that never ends past the grace window falls back to reopening cleanly.
+        backend.interrupted.store(true, Ordering::Release);
+        let t2 = t + 8_000_000_000;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t2);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t2 + crate::camera_retry::CAMERA_INTERRUPTION_GRACE_NS);
+        wait_idle();
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), attempts0 + 1);
     }
 
     #[test]

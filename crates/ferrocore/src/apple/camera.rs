@@ -379,13 +379,17 @@ define_class!(
 
         #[unsafe(method(sessionInterrupted:))]
         fn session_interrupted(&self, _note: &NSNotification) {
-            self.ivars().interrupted.store(true, Ordering::Release);
+            if !self.ivars().dropping.load(Ordering::Acquire) {
+                self.ivars().interrupted.store(true, Ordering::Release);
+            }
         }
 
         #[unsafe(method(interruptionEnded:))]
         fn interruption_ended(&self, _note: &NSNotification) {
             self.ivars().interrupted.store(false, Ordering::Release);
-            record_hotplug_connected(self.ivars().device_id.clone());
+            if !self.ivars().dropping.load(Ordering::Acquire) {
+                record_hotplug_connected(self.ivars().device_id.clone());
+            }
         }
 
         #[unsafe(method(didStopRunning:))]
@@ -1148,25 +1152,37 @@ impl Capture {
         true
     }
 
-    /// Why it ended, if it did: reported immediately on disconnect, interruption, stop running, or
-    /// session runtime error instead of waiting for `STALL_NS`.
-    pub fn ended(&self) -> Option<String> {
+    /// True while an AVFoundation session is temporarily interrupted on a still-connected device.
+    pub fn interrupted(&self) -> bool {
         if let Ok(stopped) = self.shared.stopped.lock()
-            && let Some(reason) = stopped.as_ref()
+            && stopped.is_some()
         {
-            return Some(reason.clone());
+            return false;
         }
-        // SAFETY: checking whether the capture session was interrupted or stopped running.
-        if self.shared.interrupted.load(Ordering::Acquire) || unsafe { self.session.isInterrupted() } {
-            return Some(format!("the {} was interrupted", self.shared.label));
+        // SAFETY: checking whether the capture device is still connected and session is interrupted.
+        unsafe {
+            self.device.isConnected()
+                && (self.shared.interrupted.load(Ordering::Acquire) || self.session.isInterrupted())
         }
-        // SAFETY: checking whether the capture session is still running.
-        if unsafe { !self.session.isRunning() } {
-            return Some(format!("the {} stopped running", self.shared.label));
-        }
-        // SAFETY: checking whether the capture device is still physically connected.
-        if unsafe { !self.device.isConnected() } {
-            return Some("the capture device was disconnected".into());
+    }
+
+    /// Why it ended, if it did: reported immediately on disconnect, permanent stop running, or
+    /// session runtime error instead of waiting for `STALL_NS`. Temporary interruptions on a
+    /// still-connected device return `None` so [`Self::interrupted`] keeps the session alive for
+    /// `AVCaptureSessionInterruptionEndedNotification`.
+    pub fn ended(&self) -> Option<String> {
+        let stopped = self.shared.stopped.lock().ok().and_then(|s| s.clone());
+        // SAFETY: reading interruption, running, and device connection flags from live AVFoundation handles.
+        let (interrupted, running, connected) = unsafe {
+            (
+                self.shared.interrupted.load(Ordering::Acquire) || self.session.isInterrupted(),
+                self.session.isRunning(),
+                self.device.isConnected(),
+            )
+        };
+        if let Some(why) = session_ended_reason(stopped.as_deref(), interrupted, running, connected, self.shared.label)
+        {
+            return Some(why);
         }
         // Following the system's microphone, and it changed (headphones with a mic plugged
         // in, another input picked in System Settings): this one is done, the new one opens.
@@ -1182,6 +1198,25 @@ impl Capture {
         }
         moved
     }
+}
+
+fn session_ended_reason(
+    stopped: Option<&str>,
+    interrupted: bool,
+    running: bool,
+    connected: bool,
+    label: &'static str,
+) -> Option<String> {
+    if let Some(reason) = stopped {
+        return Some(reason.to_string());
+    }
+    if !connected {
+        return Some("the capture device was disconnected".into());
+    }
+    if !interrupted && !running {
+        return Some(format!("the {label} stopped running"));
+    }
+    None
 }
 
 impl Drop for Capture {
@@ -1609,6 +1644,44 @@ mod tests {
             shared.stopped.lock().ok().and_then(|s| s.clone()).is_some(),
             "DidStopRunning must immediately mark capture ended"
         );
+    }
+
+    #[test]
+    fn dropping_observer_suppresses_interruption_ended_hotplug_bump() {
+        use super::{Observer, Shared};
+        use objc2::{AnyThread, msg_send};
+        use objc2_foundation::{NSNotification, NSString};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let _guard = hotplug_test_lock();
+        let shared = Arc::new(Shared { device_id: "cam-iphone".into(), label: "camera", ..Shared::default() });
+        shared.dropping.store(true, Ordering::Release);
+        let obs = Observer::new(shared.clone());
+
+        let seq_before = super::HOTPLUG_SEQ.load(Ordering::Acquire);
+        let epoch_before = super::HOTPLUG_EPOCH.load(Ordering::Acquire);
+        let note_end = NSString::from_str("AVCaptureSessionInterruptionEndedNotification");
+        // SAFETY: creating synthetic NSNotification for interruptionEnded: handler.
+        let end_note =
+            unsafe { NSNotification::initWithName_object_userInfo(NSNotification::alloc(), &note_end, None, None) };
+        // SAFETY: invoking interruptionEnded: on live `Observer` while dropping is set.
+        let _: () = unsafe { msg_send![&*obs, interruptionEnded: &*end_note] };
+        assert_eq!(super::HOTPLUG_SEQ.load(Ordering::Acquire), seq_before);
+        assert_eq!(super::HOTPLUG_EPOCH.load(Ordering::Acquire), epoch_before);
+    }
+
+    #[test]
+    fn interrupted_connected_session_keeps_running_while_disconnect_or_stop_ends_it() {
+        use super::session_ended_reason;
+
+        // Temporary interruption with device still connected stays alive for interruptionEnded:.
+        assert_eq!(session_ended_reason(None, true, true, true, "camera"), None);
+        assert_eq!(session_ended_reason(None, true, false, true, "camera"), None);
+        // Physical disconnect or permanent stop/error still ends immediately even if interrupted.
+        assert!(session_ended_reason(None, true, false, false, "camera").is_some());
+        assert!(session_ended_reason(Some("the camera stopped running"), true, false, true, "camera").is_some());
+        assert!(session_ended_reason(None, false, false, true, "camera").is_some());
     }
 
     #[test]

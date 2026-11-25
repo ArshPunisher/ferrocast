@@ -163,6 +163,11 @@ impl Capture {
     pub fn ended(&self) -> Option<String> {
         self.live.as_ref().and_then(Live::ended).or_else(|| self.sound.as_ref()?.ended())
     }
+
+    /// DirectShow/WASAPI has no separate suspended-interruption state.
+    pub fn interrupted(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
