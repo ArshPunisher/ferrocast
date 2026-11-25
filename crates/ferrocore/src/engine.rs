@@ -1424,12 +1424,56 @@ fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn camera_identity_key(id: &str) -> std::borrow::Cow<'_, str> {
+    if let Some((_, path)) = id.split_once(":\\\\")
+        && !path.is_empty()
+    {
+        return std::borrow::Cow::Owned(format!(r"\\{}", path.to_ascii_lowercase()));
+    }
+    if id.as_bytes().get(..12).is_some_and(|p| p.eq_ignore_ascii_case(b"@device_pnp_"))
+        && let Some(rest) = id.get(12..).filter(|r| r.starts_with(r"\\"))
+    {
+        return std::borrow::Cow::Owned(rest.to_ascii_lowercase());
+    }
+    if id.starts_with('@') {
+        return std::borrow::Cow::Owned(id.to_ascii_lowercase());
+    }
+    std::borrow::Cow::Borrowed(id)
+}
+
 fn same_reopen_device(a: &Option<SourceKind>, b: &Option<SourceKind>) -> bool {
     match (a, b) {
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-        (Some(SourceKind::Camera(x)), Some(SourceKind::Camera(y))) => x.id == y.id,
+        (Some(SourceKind::Camera(x)), Some(SourceKind::Camera(y))) => {
+            camera_identity_key(&x.id) == camera_identity_key(&y.id)
+        }
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         (Some(SourceKind::Microphone(x)), Some(SourceKind::Microphone(y))) => x == y,
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        (
+            Some(SourceKind::Screen { display: d1, uuid: u1, .. }),
+            Some(SourceKind::Screen { display: d2, uuid: u2, .. }),
+        ) => match (u1, u2) {
+            (Some(x), Some(y)) => x == y,
+            _ => d1 == d2,
+        },
+        #[cfg(target_os = "macos")]
+        (
+            Some(SourceKind::App { display: d1, uuid: u1, app: a1, .. }),
+            Some(SourceKind::App { display: d2, uuid: u2, app: a2, .. }),
+        ) => {
+            let same_screen = match (u1, u2) {
+                (Some(x), Some(y)) => x == y,
+                _ => d1 == d2,
+            };
+            same_screen && a1 == a2
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        (
+            Some(SourceKind::Window { id: w1, app: a1, title: t1, .. }),
+            Some(SourceKind::Window { id: w2, app: a2, title: t2, .. }),
+        ) => (w1, a1, t1) == (w2, a2, t2),
         _ => a == b,
     }
 }
@@ -1443,6 +1487,19 @@ impl State {
         self.sleep_want = want;
         self.sleep_epoch += 1;
         Some((self.sleep_epoch, want))
+    }
+
+    fn peek_source_workers(&self, id: u64, kind: Option<&SourceKind>) -> Option<Arc<AtomicUsize>> {
+        let wanted = kind.cloned();
+        if let Some((tracked, workers)) = self.source_reopen_workers.get(&id)
+            && same_reopen_device(tracked, &wanted)
+        {
+            return Some(workers.clone());
+        }
+        self.draining_workers
+            .iter()
+            .find(|(tracked, workers)| workers.load(Ordering::Acquire) > 0 && same_reopen_device(tracked, &wanted))
+            .map(|(_, workers)| workers.clone())
     }
 
     fn source_workers_for(&mut self, id: u64, kind: Option<&SourceKind>) -> Arc<AtomicUsize> {
@@ -2110,14 +2167,19 @@ impl Engine {
         let mut gone = None;
         let worker_guard = {
             let mut st = self.lock();
-            let src_workers = st.source_workers_for(id, restart.as_ref());
-            let worker_guard = if restart.is_some() {
+            if restart.is_some() {
                 if st.reopen_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
                     return Err(AvError::Source("too many stalled device opens in progress".into()));
                 }
-                if src_workers.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS {
+                if st
+                    .peek_source_workers(id, restart.as_ref())
+                    .is_some_and(|w| w.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS)
+                {
                     return Err(AvError::Source("too many stalled opens for this device".into()));
                 }
+            }
+            let src_workers = st.source_workers_for(id, restart.as_ref());
+            let worker_guard = if restart.is_some() {
                 Some(ReopenWorkerGuard::new(src_workers.clone(), st.reopen_workers.clone()))
             } else {
                 None
@@ -11767,6 +11829,40 @@ mod tests {
         e.open_soon(1, Some(other_cam), Box::new(|| Ok((Live::Still, false))))
             .expect("reusing numeric ID for an unrelated camera must not inherit old worker cap");
         e.remove_source(1);
+
+        // Equivalent Windows selectors (OBS friendly:\\?\... vs DirectShow @device_pnp_\\?\...)
+        // share one device budget, and changing display capture cursor keeps its display cap.
+        let obs_cam2 = SourceKind::Camera(CameraSpec::from(r"USB Video:\\?\usb#vid_046d&pid_082d#cam2"));
+        let pnp_cam2 = SourceKind::Camera(CameraSpec::from(r"@device_pnp_\\?\USB#VID_046D&PID_082D#CAM2"));
+        let obs_cam1 = SourceKind::Camera(CameraSpec::from(r"USB Video:\\?\usb#vid_046d&pid_082d#cam1"));
+        assert!(same_reopen_device(&Some(obs_cam2), &Some(pnp_cam2.clone())));
+        assert!(!same_reopen_device(&Some(obs_cam1), &Some(pnp_cam2)));
+        let scr_no_cursor =
+            SourceKind::Screen { display: 1, uuid: Some("disp-1".into()), sound: false, hide: vec![], cursor: false };
+        let scr_with_cursor =
+            SourceKind::Screen { display: 1, uuid: Some("disp-1".into()), sound: true, hide: vec![], cursor: true };
+        assert!(same_reopen_device(&Some(scr_no_cursor), &Some(scr_with_cursor)));
+
+        // Rejecting an open due to global cap must never overwrite the registered counter on slot 5.
+        let cam_kept = SourceKind::Camera(CameraSpec::from("kept-slot-5"));
+        let cam_rejected = SourceKind::Camera(CameraSpec::from("rejected-slot-5"));
+        {
+            let mut st = e.lock();
+            let prev = Arc::new(AtomicUsize::new(1));
+            st.source_reopen_workers.insert(5, (Some(cam_kept.clone()), prev.clone()));
+            let saved_total = st.reopen_workers.swap(MAX_TOTAL_REOPEN_WORKERS, Ordering::AcqRel);
+            drop(st);
+            let rejected = e.open_soon(5, Some(cam_rejected.clone()), Box::new(|| Ok((Live::Still, false))));
+            assert!(rejected.is_err());
+            let mut st = e.lock();
+            st.reopen_workers.store(saved_total, Ordering::Release);
+            assert!(
+                same_reopen_device(&st.source_reopen_workers.get(&5).unwrap().0, &Some(cam_kept)),
+                "rejected global-cap open must leave existing slot registration intact"
+            );
+            assert!(st.peek_source_workers(5, Some(&cam_rejected)).is_none());
+            st.source_reopen_workers.remove(&5);
+        }
 
         {
             let (lk, cv) = &*gate;
