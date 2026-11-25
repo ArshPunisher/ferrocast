@@ -40,6 +40,11 @@ pub fn cameras() -> Vec<Device> {
     cameras_in(Path::new("/sys/class/video4linux"))
 }
 
+/// Returns `true` when V4L2 device `id` is currently connected.
+pub fn is_connected(id: &str) -> bool {
+    cameras().into_iter().any(|d| d.id == id)
+}
+
 /// PulseAudio's sources from `pactl list short sources` (index, name, driver…), without the
 /// speakers' monitors (that's what the computer plays, not a microphone).
 pub fn parse_sources(text: &str) -> Vec<Device> {

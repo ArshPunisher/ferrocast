@@ -152,6 +152,13 @@ pub fn cameras() -> Vec<Device> {
     list(true)
 }
 
+/// Returns `true` when the camera with unique id `id` is currently connected in AVFoundation.
+pub fn is_connected(id: &str) -> bool {
+    ensure_hotplug_listener();
+    // SAFETY: looking up an AVCaptureDevice by uniqueID and querying its connection state.
+    unsafe { AVCaptureDevice::deviceWithUniqueID(&NSString::from_str(id)).is_some_and(|d| d.isConnected()) }
+}
+
 /// Microphones and other sound inputs connected now.
 pub fn microphones() -> Vec<Device> {
     ensure_hotplug_listener();

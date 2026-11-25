@@ -434,3 +434,21 @@ fn the_schedule_routes_and_a_destinations_brand_are_described() {
     // A stream's category is `{ name, ids? }`, not a string.
     assert_eq!(schemas["ScheduleCreate"]["properties"]["info"]["properties"]["category"]["type"][0], "object");
 }
+
+#[test]
+fn source_still_response_documents_optional_waiting_boolean() {
+    let o = spec::openapi();
+    let schema = &op(o, "/studio/engine/still", "get")["responses"]["200"]["content"]["application/json"]["schema"];
+    let ref_path = schema["$ref"].as_str().expect("/studio/engine/still must reference a response schema");
+    let name = ref_path.strip_prefix("#/components/schemas/").expect("schema ref");
+    let def = &o["components"]["schemas"][name];
+    let required = def["required"].as_array().expect("required fields");
+    assert!(required.iter().any(|r| r == "image"), "{def}");
+    assert!(
+        !required.iter().any(|r| r == "waiting" || r == "error"),
+        "waiting and error must be optional properties, not always required: {def}"
+    );
+    assert_eq!(def["properties"]["image"], serde_json::json!({ "type": ["string", "null"] }));
+    assert_eq!(def["properties"]["waiting"]["type"], "boolean");
+    assert_eq!(def["properties"]["error"], serde_json::json!({ "type": ["string", "null"] }));
+}

@@ -3572,6 +3572,18 @@ impl Stage {
         }))
     }
 
+    /// Returns true when any stage camera source matching `(kind, key, value)` is currently in
+    /// `"waiting"` state so picker stills never serve a frozen texture or stale cache entry.
+    pub fn is_matching_camera_waiting(&self, kind: &str, key: &str, value: &Value) -> bool {
+        if !PICTURE_ONLY_DEVICES.contains(&kind) {
+            return false;
+        }
+        self.sources_list().into_iter().any(|s| {
+            device_source_matches(&s, kind, key, value, true)
+                && self.camera_status(name_of(&s)).is_some_and(|st| st.state == "waiting")
+        })
+    }
+
     /// Reuses an already-open capture source matching `(kind, key, value)` for a picker
     /// thumbnail so the picker never opens a second camera session or grabs hardware unnecessarily.
     #[allow(clippy::type_complexity)]
@@ -3582,37 +3594,11 @@ impl Stage {
         value: &Value,
         width: u32,
     ) -> Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32)> + Send + 'static + use<>> {
-        let want_camera = PICTURE_ONLY_DEVICES.contains(&kind);
-        let want_screen = matches!(
-            kind,
-            "screen_capture" | "display_capture" | "window_capture" | "monitor_capture" | "xshm_input" | "game_capture"
-        );
-        if !want_camera && !want_screen {
-            return None;
-        }
-        let matched = self.sources_list().into_iter().find(|s| {
-            let sk = kind_of(s);
-            let kind_matches = if want_camera {
-                PICTURE_ONLY_DEVICES.contains(&sk)
-            } else {
-                sk == kind
-                    || (matches!(sk, "screen_capture" | "display_capture" | "monitor_capture")
-                        && matches!(kind, "screen_capture" | "display_capture" | "monitor_capture"))
-            };
-            if !kind_matches {
-                return false;
-            }
-            let set = s.get("settings").and_then(Value::as_object);
-            let Some(set) = set else { return false };
-            if let Some(v) = set.get(key) {
-                return v == value;
-            }
-            if want_camera {
-                return ["device", "uid", "video_device_id"].iter().any(|k| set.get(*k).is_some_and(|v| v == value));
-            }
-            false
-        })?;
-        let name = name_of(&matched).to_string();
+        let sources = self.sources_list();
+        let name = select_matching_device_source(&sources, kind, key, value, |n| {
+            self.camera_status(n).is_some_and(|st| st.state == "waiting")
+        })?
+        .to_string();
         let job = self.source_picture_job(&name, width.clamp(64, 320), false).ok().flatten()?;
         Some(move || {
             let (px, pw, ph, _) = job()?;
@@ -4649,6 +4635,53 @@ impl Drop for AloneGuard {
 
 fn should_wait_for_item_picture(engine: &ferrocore::engine::Engine, source: &str) -> bool {
     !(engine.opening() == 0 && engine.camera_status(source).is_some_and(|s| s.state == "waiting"))
+}
+
+fn device_source_matches(source: &Value, kind: &str, key: &str, value: &Value, want_camera: bool) -> bool {
+    let sk = kind_of(source);
+    let kind_matches = if want_camera {
+        PICTURE_ONLY_DEVICES.contains(&sk)
+    } else {
+        sk == kind
+            || (matches!(sk, "screen_capture" | "display_capture" | "monitor_capture")
+                && matches!(kind, "screen_capture" | "display_capture" | "monitor_capture"))
+    };
+    if !kind_matches {
+        return false;
+    }
+    let Some(set) = source.get("settings").and_then(Value::as_object) else {
+        return false;
+    };
+    if let Some(v) = set.get(key) {
+        return v == value;
+    }
+    if want_camera {
+        return ["device", "uid", "video_device_id"].iter().any(|k| set.get(*k).is_some_and(|v| v == value));
+    }
+    false
+}
+
+fn select_matching_device_source<'a>(
+    sources: &'a [Value],
+    kind: &str,
+    key: &str,
+    value: &Value,
+    is_camera_waiting: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    let want_camera = PICTURE_ONLY_DEVICES.contains(&kind);
+    let want_screen = matches!(
+        kind,
+        "screen_capture" | "display_capture" | "window_capture" | "monitor_capture" | "xshm_input" | "game_capture"
+    );
+    if !want_camera && !want_screen {
+        return None;
+    }
+    sources
+        .iter()
+        .find(|s| {
+            device_source_matches(s, kind, key, value, want_camera) && !(want_camera && is_camera_waiting(name_of(s)))
+        })
+        .map(name_of)
 }
 
 impl Stage {
@@ -10785,5 +10818,38 @@ mod tests {
         assert!(!super::should_wait_for_item_picture(&e.engine, "MissingCam"));
         let cam_job = ok(s.screenshot_item_job_for(Some("MissingCam"), "Main", cam.id));
         assert!(std::thread::spawn(cam_job).join().unwrap().is_err());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn matching_device_picture_job_skips_waiting_camera() {
+        let (cam_kind, cam_key) = ferrocore::obs::native_camera_kind_and_key();
+        let val = Value::String("fc-c6-wait-cam".into());
+        let mut settings = serde_json::Map::new();
+        settings.insert(cam_key.to_string(), val.clone());
+        let sources = vec![json!({
+            "name": "iPhone Cam",
+            "id": cam_kind,
+            "settings": Value::Object(settings.clone()),
+        })];
+
+        assert_eq!(
+            super::select_matching_device_source(&sources, cam_kind, cam_key, &val, |_| false),
+            Some("iPhone Cam")
+        );
+        assert_eq!(
+            super::select_matching_device_source(&sources, cam_kind, cam_key, &val, |_| true),
+            None,
+            "matching camera in waiting state must skip the fast-path reuse"
+        );
+
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        ok(s.add_source("Main", cam_kind, "WaitingCam", &Value::Object(settings), false));
+        while e.engine.opening() > 0 {
+            std::thread::yield_now();
+        }
+        assert!(s.is_matching_camera_waiting(cam_kind, cam_key, &val));
+        assert!(s.matching_device_picture_job(cam_kind, cam_key, &val, 160).is_none());
     }
 }

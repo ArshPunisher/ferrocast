@@ -1264,7 +1264,14 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         None,
         None,
     ),
-    doc("GET", "/studio/engine/still", "Studio Engine", "Fetch a static frame thumbnail.", None, None),
+    doc(
+        "GET",
+        "/studio/engine/still",
+        "Studio Engine",
+        "Fetch a static frame thumbnail.",
+        None,
+        Some("StudioSourceStill"),
+    ),
     doc("GET", "/studio/engine/vst/plugins", "Studio Engine", "Discover installed VST audio plugins.", None, None),
     doc(
         "GET",
@@ -2924,6 +2931,19 @@ fn schemas() -> Value {
         "SettingsPatch": {
             "type": "object",
             "description": "Partial update of non-sensitive local application preferences."
+        },
+        "StudioSourceStill": {
+            "type": "object",
+            "description": "Picker thumbnail response for a display, window, or camera.",
+            "required": ["image"],
+            "properties": {
+                "image": { "type": ["string", "null"] },
+                "waiting": {
+                    "type": "boolean",
+                    "description": "Present and true only when a camera is temporarily disconnected or waiting for its first frame."
+                },
+                "error": { "type": ["string", "null"] }
+            }
         }
     });
     if let Some(map) = doc.as_object_mut() {

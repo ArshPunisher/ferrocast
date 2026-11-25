@@ -2525,44 +2525,21 @@ impl StudioHost for DesktopStudio {
             return serde_json::to_value(opts).map_err(|e| e.to_string());
         }
         // Unified picker still (screen, window, camera, capture card) on every platform:
-        // 1) reuses an already-open stage source (zero hardware contention / camera LED flash);
-        // 2) serves 15s cached JPEG stills and deduplicates concurrent asks;
-        // 3) cancels queued/in-flight captures via Drop guard when the dialog closes.
+        // 1) skips fast-path reuse and invalidates 15 s cache when a camera is waiting or gone;
+        // 2) reuses an already-open live stage source (zero hardware contention / camera LED flash);
+        // 3) deduplicates concurrent asks and returns `{ image: null, waiting: true }` for
+        //    transient camera disconnects/timeouts while keeping `error` for permission/in-use.
         if matches!(&act, StudioAct::ScreenStill { .. } | StudioAct::SourceStill { .. }) {
-            use std::collections::HashMap;
-            use std::sync::atomic::{AtomicBool, Ordering};
-            use std::sync::{Arc, Mutex, OnceLock};
-            use std::time::{Duration, Instant};
-            use tokio::sync::{Notify, Semaphore};
-
-            struct CancelOnDrop(Arc<AtomicBool>);
-            impl Drop for CancelOnDrop {
-                fn drop(&mut self) {
-                    self.0.store(true, Ordering::Release);
-                }
-            }
-
-            #[derive(Clone, Hash, PartialEq, Eq)]
-            enum StillTarget {
-                Display(u32, u32),
-                Window(u32, u32),
-                Camera(String, u32),
-            }
-
-            type Kept = HashMap<StillTarget, (Instant, String)>;
-            type FlightMap = HashMap<StillTarget, Arc<(Notify, Mutex<Option<Option<String>>>)>>;
-            static TURNS: OnceLock<Semaphore> = OnceLock::new();
-            static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
-            static IN_FLIGHT: Mutex<Option<FlightMap>> = Mutex::new(None);
-            const KEEP: Duration = Duration::from_secs(15);
-            const MAX_KEPT: usize = 128;
-
             let (target_kind, key_name, val_json, target, width) = match &act {
                 StudioAct::ScreenStill { id, window, width } => {
                     let w = (*width).clamp(64, 320);
                     let tk = if *window { "window_capture" } else { "screen_capture" }.to_string();
                     let kn = if *window { "window" } else { "display" }.to_string();
-                    let tgt = if *window { StillTarget::Window(*id, w) } else { StillTarget::Display(*id, w) };
+                    let tgt = if *window {
+                        source_still::StillTarget::Window(*id, w)
+                    } else {
+                        source_still::StillTarget::Display(*id, w)
+                    };
                     (tk, kn, json!(*id), tgt, w)
                 }
                 StudioAct::SourceStill { kind, key, value, width } => {
@@ -2571,7 +2548,7 @@ impl StudioHost for DesktopStudio {
                         let Some(id) = value.as_u64().and_then(|n| u32::try_from(n).ok()) else {
                             return Ok(json!({ "image": null }));
                         };
-                        StillTarget::Window(id, w)
+                        source_still::StillTarget::Window(id, w)
                     } else if matches!(key.as_str(), "display" | "monitor_id")
                         || kind.contains("screen")
                         || kind.contains("monitor")
@@ -2580,151 +2557,54 @@ impl StudioHost for DesktopStudio {
                         let Some(id) = value.as_u64().and_then(|n| u32::try_from(n).ok()) else {
                             return Ok(json!({ "image": null }));
                         };
-                        StillTarget::Display(id, w)
+                        source_still::StillTarget::Display(id, w)
                     } else {
                         let Some(id) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
                             return Ok(json!({ "image": null }));
                         };
-                        StillTarget::Camera(id.to_string(), w)
+                        source_still::StillTarget::Camera(id.to_string(), w)
                     };
                     (kind.clone(), key.clone(), value.clone(), tgt, w)
                 }
                 _ => unreachable!(),
             };
-
-            let read_kept = |k: &StillTarget| {
-                KEPT.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get_or_insert_default()
-                    .get(k)
-                    .filter(|(at, _)| at.elapsed() < KEEP)
-                    .map(|(_, img)| img.clone())
-            };
-            if let Some(image) = read_kept(&target) {
-                return Ok(json!({ "image": image }));
-            }
-
-            // Fast path: reuse an already-open stage source on the GPU (zero hardware contend).
-            let reuse_job = self
-                .on_main(move |h| {
-                    h.collection
-                        .as_ref()
-                        .and_then(|c| c.matching_device_picture_job(&target_kind, &key_name, &val_json, width))
-                })
-                .await
-                .ok()
-                .flatten();
-            if let Some(job) = reuse_job {
-                let image = tokio::task::spawn_blocking(move || {
-                    job().and_then(|(px, pw, ph)| ferrocast_studio::jpeg_data_url(&px, pw, ph, true, "picker").ok())
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-                if let Some(img) = &image {
-                    let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let map = all.get_or_insert_default();
-                    map.retain(|_, (at, _)| at.elapsed() < KEEP);
-                    if map.len() >= MAX_KEPT {
-                        map.clear();
-                    }
-                    map.insert(target, (Instant::now(), img.clone()));
-                    return Ok(json!({ "image": image }));
-                }
-            }
-
-            // Single-flight deduplication + early cancellation if caller disconnects.
-            let (flight, is_leader) = {
-                let mut map_guard = IN_FLIGHT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let map = map_guard.get_or_insert_default();
-                if let Some(existing) = map.get(&target) {
-                    (existing.clone(), false)
-                } else {
-                    let created = Arc::new((Notify::new(), Mutex::new(None)));
-                    map.insert(target.clone(), created.clone());
-                    (created, true)
-                }
-            };
-            if !is_leader {
-                let notified = flight.0.notified();
-                let cached_before = flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-                if let Some(res) = cached_before {
-                    return Ok(json!({ "image": res }));
-                }
-                notified.await;
-                let res = flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().flatten();
-                return Ok(json!({ "image": res }));
-            }
-
-            struct FlightCleanup {
-                target: StillTarget,
-                flight: Arc<(Notify, Mutex<Option<Option<String>>>)>,
-            }
-            impl Drop for FlightCleanup {
-                fn drop(&mut self) {
-                    let mut done = self.flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if done.is_none() {
-                        *done = Some(None);
-                    }
-                    drop(done);
-                    if let Ok(mut map) = IN_FLIGHT.lock()
-                        && let Some(m) = map.as_mut()
-                    {
-                        m.remove(&self.target);
-                    }
-                    self.flight.0.notify_waiters();
-                }
-            }
-            let _flight_cleanup = FlightCleanup { target: target.clone(), flight: flight.clone() };
-            let cancel_flag = Arc::new(AtomicBool::new(false));
-            let _cancel_guard = CancelOnDrop(cancel_flag.clone());
-
-            let _turn = TURNS.get_or_init(|| Semaphore::new(2)).acquire().await.map_err(|e| e.to_string())?;
-            if let Some(image) = read_kept(&target) {
-                *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Some(image.clone()));
-                return Ok(json!({ "image": image }));
-            }
-
-            let capture_target = target.clone();
-            let flag = cancel_flag.clone();
-            let (image, problem) = tokio::task::spawn_blocking(move || {
-                let mut problem: Option<String> = None;
-                let pic = match capture_target {
-                    StillTarget::Display(id, w) => {
-                        ferrocore::screen_still_cancel(ferrocore::screen::Target::Display(id), w, &flag).ok()
-                    }
-                    StillTarget::Window(id, w) => {
-                        ferrocore::screen_still_cancel(ferrocore::screen::Target::Window(id), w, &flag).ok()
-                    }
-                    // A camera says why it gave nothing (permission off, in use): the page shows it.
-                    StillTarget::Camera(id, w) => match ferrocore::camera_still_cancel(&id, w, &flag) {
-                        Ok(p) => Some(p),
-                        Err(e) => {
-                            if !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                problem = Some(e.to_string());
+            return source_still::resolve(
+                source_still::global_cache(),
+                source_still::global_flights(),
+                source_still::global_turns(),
+                target,
+                || {
+                    let tk = target_kind.clone();
+                    let kn = key_name.clone();
+                    let vj = val_json.clone();
+                    async move {
+                        self.on_main(move |h| {
+                            let Some(c) = h.collection.as_ref() else {
+                                return (false, None);
+                            };
+                            if c.is_matching_camera_waiting(&tk, &kn, &vj) {
+                                return (true, None);
                             }
-                            None
-                        }
-                    },
-                };
-                let image = pic.and_then(|p| {
-                    ferrocast_studio::jpeg_data_url(&p.rgba, p.width, p.height, p.premultiplied, "picker").ok()
-                });
-                (image, problem)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-
-            if let Some(img) = &image {
-                let mut all = KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let map = all.get_or_insert_default();
-                map.retain(|_, (at, _)| at.elapsed() < KEEP);
-                if map.len() >= MAX_KEPT {
-                    map.clear();
-                }
-                map.insert(target, (Instant::now(), img.clone()));
-            }
-            *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(image.clone());
-            return Ok(json!({ "image": image, "error": problem }));
+                            let job = c
+                                .matching_device_picture_job(&tk, &kn, &vj, width)
+                                .map(|j| Box::new(j) as source_still::ReuseJob);
+                            (false, job)
+                        })
+                        .await
+                        .unwrap_or((false, None))
+                    }
+                },
+                ferrocore::camera::hotplug_epoch,
+                |cam_id| async move {
+                    tokio::task::spawn_blocking(move || ferrocore::camera::is_connected(&cam_id)).await.unwrap_or(false)
+                },
+                |capture_target, flag| async move {
+                    tokio::task::spawn_blocking(move || source_still::probe_still(capture_target, &flag))
+                        .await
+                        .unwrap_or_else(|e| source_still::StillAnswer::error(e.to_string()))
+                },
+            )
+            .await;
         }
         // How a source is doing: its settings read on the main thread, a Browser source's
         // address tried off it (the app's web client, its time limit).
@@ -4635,6 +4515,315 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+mod source_still {
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use ferrocore::CameraStill;
+    use serde_json::{Value, json};
+    use tokio::sync::{Notify, Semaphore};
+
+    const KEEP: Duration = Duration::from_secs(15);
+    const MAX_KEPT: usize = 128;
+
+    #[derive(Clone, Debug, Hash, PartialEq, Eq)]
+    pub(super) enum StillTarget {
+        Display(u32, u32),
+        Window(u32, u32),
+        Camera(String, u32),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct StillAnswer {
+        pub image: Option<String>,
+        pub waiting: bool,
+        pub error: Option<String>,
+    }
+
+    impl StillAnswer {
+        pub(super) fn image(image: String) -> Self {
+            Self { image: Some(image), waiting: false, error: None }
+        }
+        pub(super) fn waiting() -> Self {
+            Self { image: None, waiting: true, error: None }
+        }
+        pub(super) fn error(error: String) -> Self {
+            Self { image: None, waiting: false, error: Some(error) }
+        }
+        pub(super) fn blank() -> Self {
+            Self { image: None, waiting: false, error: None }
+        }
+        pub(super) fn into_json(self) -> Value {
+            let mut obj = serde_json::Map::new();
+            obj.insert("image".into(), json!(self.image));
+            if self.waiting {
+                obj.insert("waiting".into(), json!(true));
+            }
+            if let Some(err) = self.error {
+                obj.insert("error".into(), json!(err));
+            }
+            Value::Object(obj)
+        }
+    }
+
+    #[derive(Clone)]
+    struct KeptEntry {
+        at: Instant,
+        epoch: u64,
+        image: String,
+    }
+
+    #[derive(Default)]
+    pub(super) struct StillCache {
+        kept: Mutex<Option<HashMap<StillTarget, KeptEntry>>>,
+    }
+
+    impl StillCache {
+        pub(super) fn evict(&self, target: &StillTarget) {
+            if let Ok(mut guard) = self.kept.lock()
+                && let Some(map) = guard.as_mut()
+            {
+                map.remove(target);
+            }
+        }
+
+        pub(super) fn insert(&self, target: StillTarget, epoch: u64, image: String) {
+            let mut guard = self.kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = guard.get_or_insert_default();
+            map.retain(|_, e| e.at.elapsed() < KEEP);
+            if map.len() >= MAX_KEPT {
+                map.clear();
+            }
+            map.insert(target, KeptEntry { at: Instant::now(), epoch, image });
+        }
+
+        fn take_candidate(&self, target: &StillTarget, current_epoch: u64) -> Option<String> {
+            let mut guard = self.kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = guard.get_or_insert_default();
+            let entry = map.get(target)?;
+            if entry.at.elapsed() >= KEEP {
+                map.remove(target);
+                return None;
+            }
+            if matches!(target, StillTarget::Camera(..)) && entry.epoch != current_epoch {
+                map.remove(target);
+                return None;
+            }
+            Some(entry.image.clone())
+        }
+
+        pub(super) async fn get_if_fresh<ConnectFut>(
+            &self,
+            target: &StillTarget,
+            current_epoch: u64,
+            stage_waiting: bool,
+            camera_connected: impl FnOnce(String) -> ConnectFut,
+        ) -> Option<String>
+        where
+            ConnectFut: Future<Output = bool>,
+        {
+            if matches!(target, StillTarget::Camera(..)) && stage_waiting {
+                self.evict(target);
+                return None;
+            }
+            let img = self.take_candidate(target, current_epoch)?;
+            if let StillTarget::Camera(id, _) = target
+                && !camera_connected(id.clone()).await
+            {
+                self.evict(target);
+                return None;
+            }
+            Some(img)
+        }
+    }
+
+    pub(super) type FlightMap = HashMap<StillTarget, Arc<(Notify, Mutex<Option<StillAnswer>>)>>;
+    pub(super) type ReuseJob = Box<dyn FnOnce() -> Option<(Vec<u8>, u32, u32)> + Send>;
+
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) fn global_cache() -> &'static StillCache {
+        static KEPT: OnceLock<StillCache> = OnceLock::new();
+        KEPT.get_or_init(StillCache::default)
+    }
+
+    pub(super) fn global_flights() -> &'static Mutex<Option<FlightMap>> {
+        static IN_FLIGHT: OnceLock<Mutex<Option<FlightMap>>> = OnceLock::new();
+        IN_FLIGHT.get_or_init(|| Mutex::new(None))
+    }
+
+    pub(super) fn global_turns() -> &'static Semaphore {
+        static TURNS: OnceLock<Semaphore> = OnceLock::new();
+        TURNS.get_or_init(|| Semaphore::new(2))
+    }
+
+    pub(super) fn probe_still(capture_target: StillTarget, flag: &AtomicBool) -> StillAnswer {
+        match capture_target {
+            StillTarget::Display(id, w) => {
+                ferrocore::screen_still_cancel(ferrocore::screen::Target::Display(id), w, flag)
+                    .ok()
+                    .and_then(|p| {
+                        ferrocast_studio::jpeg_data_url(&p.rgba, p.width, p.height, p.premultiplied, "picker").ok()
+                    })
+                    .map_or_else(StillAnswer::blank, StillAnswer::image)
+            }
+            StillTarget::Window(id, w) => {
+                ferrocore::screen_still_cancel(ferrocore::screen::Target::Window(id), w, flag)
+                    .ok()
+                    .and_then(|p| {
+                        ferrocast_studio::jpeg_data_url(&p.rgba, p.width, p.height, p.premultiplied, "picker").ok()
+                    })
+                    .map_or_else(StillAnswer::blank, StillAnswer::image)
+            }
+            StillTarget::Camera(id, w) => match ferrocore::camera_still_status_cancel(&id, w, flag) {
+                CameraStill::Picture(p) => {
+                    ferrocast_studio::jpeg_data_url(&p.rgba, p.width, p.height, p.premultiplied, "picker")
+                        .ok()
+                        .map_or_else(StillAnswer::blank, StillAnswer::image)
+                }
+                CameraStill::Waiting => {
+                    if flag.load(Ordering::Relaxed) {
+                        StillAnswer::blank()
+                    } else {
+                        StillAnswer::waiting()
+                    }
+                }
+                CameraStill::Error(e) => {
+                    if flag.load(Ordering::Relaxed) {
+                        StillAnswer::blank()
+                    } else {
+                        StillAnswer::error(e)
+                    }
+                }
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn resolve<StageFut, ConnectFut, ProbeFut>(
+        cache: &StillCache,
+        flights: &Mutex<Option<FlightMap>>,
+        turns: &Semaphore,
+        target: StillTarget,
+        mut stage_check: impl FnMut() -> StageFut,
+        hotplug_epoch: impl Fn() -> u64,
+        camera_connected: impl Fn(String) -> ConnectFut,
+        probe: impl FnOnce(StillTarget, Arc<AtomicBool>) -> ProbeFut,
+    ) -> Result<Value, String>
+    where
+        StageFut: Future<Output = (bool, Option<ReuseJob>)>,
+        ConnectFut: Future<Output = bool>,
+        ProbeFut: Future<Output = StillAnswer>,
+    {
+        if !matches!(target, StillTarget::Camera(..))
+            && let Some(image) = cache.get_if_fresh(&target, 0, false, |_| async { true }).await
+        {
+            return Ok(StillAnswer::image(image).into_json());
+        }
+
+        let (stage_waiting, reuse_job) = stage_check().await;
+        if stage_waiting {
+            cache.evict(&target);
+        } else if let Some(job) = reuse_job {
+            let epoch = hotplug_epoch();
+            let image = tokio::task::spawn_blocking(move || {
+                job().and_then(|(px, pw, ph)| ferrocast_studio::jpeg_data_url(&px, pw, ph, true, "picker").ok())
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            if let Some(img) = image {
+                cache.insert(target, epoch, img.clone());
+                return Ok(StillAnswer::image(img).into_json());
+            }
+        } else if matches!(target, StillTarget::Camera(..))
+            && let Some(image) = cache.get_if_fresh(&target, hotplug_epoch(), false, &camera_connected).await
+        {
+            return Ok(StillAnswer::image(image).into_json());
+        }
+
+        // Single-flight deduplication + early cancellation if caller disconnects.
+        let (flight, is_leader) = {
+            let mut map_guard = flights.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = map_guard.get_or_insert_default();
+            if let Some(existing) = map.get(&target) {
+                (existing.clone(), false)
+            } else {
+                let created = Arc::new((Notify::new(), Mutex::new(None)));
+                map.insert(target.clone(), created.clone());
+                (created, true)
+            }
+        };
+        if !is_leader {
+            let notified = flight.0.notified();
+            let cached_before = flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            if let Some(ans) = cached_before {
+                return Ok(ans.into_json());
+            }
+            notified.await;
+            let ans = flight
+                .1
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or_else(StillAnswer::blank);
+            return Ok(ans.into_json());
+        }
+
+        struct FlightCleanup<'a> {
+            flights: &'a Mutex<Option<FlightMap>>,
+            target: StillTarget,
+            flight: Arc<(Notify, Mutex<Option<StillAnswer>>)>,
+        }
+        impl Drop for FlightCleanup<'_> {
+            fn drop(&mut self) {
+                let mut done = self.flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if done.is_none() {
+                    *done = Some(StillAnswer::blank());
+                }
+                drop(done);
+                if let Ok(mut map) = self.flights.lock()
+                    && let Some(m) = map.as_mut()
+                {
+                    m.remove(&self.target);
+                }
+                self.flight.0.notify_waiters();
+            }
+        }
+        let _flight_cleanup = FlightCleanup { flights, target: target.clone(), flight: flight.clone() };
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let _cancel_guard = CancelOnDrop(cancel_flag.clone());
+
+        let _turn = turns.acquire().await.map_err(|e| e.to_string())?;
+        if !stage_waiting
+            && let Some(image) = cache.get_if_fresh(&target, hotplug_epoch(), false, &camera_connected).await
+        {
+            let ans = StillAnswer::image(image);
+            *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ans.clone());
+            return Ok(ans.into_json());
+        }
+
+        let probe_epoch = hotplug_epoch();
+        let ans = probe(target.clone(), cancel_flag).await;
+        if let Some(img) = &ans.image {
+            if !stage_waiting && (!matches!(target, StillTarget::Camera(..)) || hotplug_epoch() == probe_epoch) {
+                cache.insert(target, probe_epoch, img.clone());
+            }
+        } else {
+            cache.evict(&target);
+        }
+        *flight.1.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ans.clone());
+        Ok(ans.into_json())
+    }
+}
+
 type ScreenshotJob = Box<dyn FnOnce() -> Result<(Vec<u8>, (u32, u32)), String> + Send>;
 
 fn write_unique_screenshot(
@@ -5506,6 +5695,159 @@ mod import_tests {
         assert_ne!(p1, p2);
         assert!(p1.exists() && p2.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_still_cache_evicts_waiting_or_gone_camera_and_returns_structured_waiting() {
+        use super::source_still::{FlightMap, ReuseJob, StillAnswer, StillCache, StillTarget, resolve};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::Semaphore;
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let cache = StillCache::default();
+        let flights = Mutex::new(None::<FlightMap>);
+        let turns = Semaphore::new(2);
+        let target = StillTarget::Camera("iphone-cam".into(), 240);
+
+        // Connected camera caches picture and serves it while same epoch, connected, and not waiting.
+        cache.insert(target.clone(), 1, "data:image/jpeg;base64,FRESH".into());
+        let hit = rt
+            .block_on(resolve(
+                &cache,
+                &flights,
+                &turns,
+                target.clone(),
+                || async { (false, None::<ReuseJob>) },
+                || 1,
+                |_| async { true },
+                |_, _| async { panic!("must not probe on connected cache hit") },
+            ))
+            .unwrap();
+        assert_eq!(hit, json!({ "image": "data:image/jpeg;base64,FRESH" }));
+
+        // (a)+(b) Waiting camera on stage skips reuse fast path, evicts KEPT, and returns `{ image: null, waiting: true }` with no error.
+        let fast_path_ignored = AtomicBool::new(false);
+        let waiting_res = rt
+            .block_on(resolve(
+                &cache,
+                &flights,
+                &turns,
+                target.clone(),
+                || async { (true, None::<ReuseJob>) },
+                || 1,
+                |_| async { true },
+                |_, _| async {
+                    fast_path_ignored.store(true, Ordering::Release);
+                    StillAnswer::waiting()
+                },
+            ))
+            .unwrap();
+        assert!(fast_path_ignored.load(Ordering::Acquire));
+        assert_eq!(waiting_res, json!({ "image": null, "waiting": true }));
+        assert!(waiting_res.get("error").is_none(), "transient wait must omit error: {waiting_res}");
+
+        // (a) Gone camera (disconnected or hotplug_epoch bumped) must NOT serve stale KEPT picture.
+        cache.insert(target.clone(), 1, "data:image/jpeg;base64,STALE".into());
+        let epoch = AtomicU64::new(2);
+        let gone_res = rt
+            .block_on(resolve(
+                &cache,
+                &flights,
+                &turns,
+                target.clone(),
+                || async { (false, None::<ReuseJob>) },
+                || epoch.load(Ordering::Acquire),
+                |_| async { false },
+                |_, _| async { StillAnswer::waiting() },
+            ))
+            .unwrap();
+        assert_eq!(gone_res, json!({ "image": null, "waiting": true }));
+
+        // Even with unchanged epoch (Windows/Linux), `camera_connected == false` evicts KEPT.
+        cache.insert(target.clone(), 2, "data:image/jpeg;base64,STALE2".into());
+        let unplugged_res = rt
+            .block_on(resolve(
+                &cache,
+                &flights,
+                &turns,
+                target.clone(),
+                || async { (false, None::<ReuseJob>) },
+                || 2,
+                |_| async { false },
+                |_, _| async { StillAnswer::waiting() },
+            ))
+            .unwrap();
+        assert_eq!(unplugged_res, json!({ "image": null, "waiting": true }));
+
+        // (c) Hard error (permission / in use) preserves `error` and omits `waiting`.
+        let err_res = rt
+            .block_on(resolve(
+                &cache,
+                &flights,
+                &turns,
+                target.clone(),
+                || async { (false, None::<ReuseJob>) },
+                || 2,
+                |_| async { true },
+                |_, _| async { StillAnswer::error("the camera couldn't open (in use)".into()) },
+            ))
+            .unwrap();
+        assert_eq!(err_res, json!({ "image": null, "error": "the camera couldn't open (in use)" }));
+        assert!(err_res.get("waiting").is_none());
+
+        // Single-flight concurrent follower receives `{ image: null, waiting: true }` when leader is waiting.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let follower_ready = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let entered_l = entered.clone();
+        let gate_l = gate.clone();
+        let follower_ready_f = follower_ready.clone();
+        let (r1, r2, ()) = rt.block_on(async {
+            let t1 = resolve(
+                &cache,
+                &flights,
+                &turns,
+                target.clone(),
+                || async { (false, None::<ReuseJob>) },
+                || 2,
+                |_| async { true },
+                |_, _| async move {
+                    entered_l.notify_one();
+                    gate_l.notified().await;
+                    StillAnswer::waiting()
+                },
+            );
+            let t2 = async {
+                entered.notified().await;
+                resolve(
+                    &cache,
+                    &flights,
+                    &turns,
+                    target.clone(),
+                    || {
+                        let f = follower_ready_f.clone();
+                        async move {
+                            f.notify_one();
+                            (false, None::<ReuseJob>)
+                        }
+                    },
+                    || 2,
+                    |_| async { true },
+                    |_, _| async { panic!("follower must share leader flight") },
+                )
+                .await
+            };
+            let releaser = async {
+                follower_ready.notified().await;
+                tokio::task::yield_now().await;
+                gate.notify_one();
+            };
+            tokio::join!(t1, t2, releaser)
+        });
+        assert_eq!(r1.unwrap(), json!({ "image": null, "waiting": true }));
+        assert_eq!(r2.unwrap(), json!({ "image": null, "waiting": true }));
     }
 
     #[test]

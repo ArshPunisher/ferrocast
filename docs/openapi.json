@@ -1994,6 +1994,31 @@
         ],
         "type": "object"
       },
+      "StudioSourceStill": {
+        "description": "Picker thumbnail response for a display, window, or camera.",
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "waiting": {
+            "description": "Present and true only when a camera is temporarily disconnected or waiting for its first frame.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "image"
+        ],
+        "type": "object"
+      },
       "TestAlertRequest": {
         "properties": {
           "amount": {
@@ -33075,10 +33100,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/StudioSourceStill"
                 }
               }
             },

@@ -47,6 +47,11 @@ pub fn cameras() -> Vec<Device> {
     cmd.output().map(|o| parse_dshow(&String::from_utf8_lossy(&o.stderr))).unwrap_or_default()
 }
 
+/// Returns `true` when the camera with id `id` is currently enumerated by DirectShow.
+pub fn is_connected(id: &str) -> bool {
+    cameras().into_iter().any(|d| d.id == id)
+}
+
 /// Microphones and other inputs connected now.
 pub fn microphones() -> Vec<Device> {
     crate::sound_in::inputs().into_iter().map(|n| Device { id: n.clone(), name: n }).collect()
