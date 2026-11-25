@@ -76,9 +76,14 @@ fn resolve_camera_dev(id: &str) -> Result<String, AvError> {
             let pairs: Vec<(&str, &str)> = devs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
             resolve_dshow_open_target(&pairs, id)
         };
-        return lookup(&cameras())
-            .or_else(|| lookup(&cameras_fresh()))
-            .ok_or_else(|| AvError::Source("that camera isn't connected".into()));
+        let (devs, from_cache) = dshow_cache().get_or_probe_status(Instant::now, probe_dshow_devices);
+        if let Some(dev) = lookup(&devs) {
+            return Ok(dev);
+        }
+        if from_cache && let Some(dev) = lookup(&cameras_fresh()) {
+            return Ok(dev);
+        }
+        return Err(AvError::Source("that camera isn't connected".into()));
     }
     Ok(id.to_string())
 }

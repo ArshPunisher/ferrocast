@@ -56,11 +56,21 @@ impl<T> DshowCameraCache<T> {
 
 impl<T: Clone> DshowCameraCache<T> {
     pub fn get_or_probe(&self, now: impl Fn() -> Instant, probe: impl FnOnce() -> Option<Vec<T>>) -> Vec<T> {
+        self.get_or_probe_status(now, probe).0
+    }
+
+    /// Returns `(devices, from_warm_cache)` so callers can refresh only when a miss came from the
+    /// TTL cache rather than re-probing immediately after a just-finished enumeration.
+    pub fn get_or_probe_status(
+        &self,
+        now: impl Fn() -> Instant,
+        probe: impl FnOnce() -> Option<Vec<T>>,
+    ) -> (Vec<T>, bool) {
         self.get_or_probe_inner(false, now, probe)
     }
 
     pub fn get_or_probe_fresh(&self, now: impl Fn() -> Instant, probe: impl FnOnce() -> Option<Vec<T>>) -> Vec<T> {
-        self.get_or_probe_inner(true, now, probe)
+        self.get_or_probe_inner(true, now, probe).0
     }
 
     fn get_or_probe_inner(
@@ -68,7 +78,7 @@ impl<T: Clone> DshowCameraCache<T> {
         force_refresh: bool,
         now: impl Fn() -> Instant,
         probe: impl FnOnce() -> Option<Vec<T>>,
-    ) -> Vec<T> {
+    ) -> (Vec<T>, bool) {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let seen_seq = guard.probe_seq;
         let mut waited_for_inflight = false;
@@ -84,17 +94,17 @@ impl<T: Clone> DshowCameraCache<T> {
             }
             waited_for_inflight = true;
         }
-        // Only share the in-flight probe's snapshot if a probe actually completed while we waited;
-        // if the leader panicked, fall through so this caller can run a recovery probe.
-        if waited_for_inflight && !force_refresh && guard.probe_seq != seen_seq {
-            return guard.last.clone();
-        }
-        let check_at = now();
-        if !force_refresh
+        if waited_for_inflight {
+            if guard.probe_seq != seen_seq {
+                // Share the just-completed enumeration with any waiter (including forced callers).
+                return (guard.last.clone(), false);
+            }
+            // Leader panicked before publishing: skip any stale TTL entry and run a recovery probe.
+        } else if !force_refresh
             && let Some(at) = guard.cached_at
-            && check_at.saturating_duration_since(at) < self.ttl
+            && now().saturating_duration_since(at) < self.ttl
         {
-            return guard.last.clone();
+            return (guard.last.clone(), true);
         }
         guard.in_flight = true;
         drop(guard);
@@ -103,32 +113,33 @@ impl<T: Clone> DshowCameraCache<T> {
         impl<T> Drop for ResetFlight<'_, T> {
             fn drop(&mut self) {
                 let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-                g.in_flight = false;
-                self.1.notify_all();
+                if g.in_flight {
+                    g.in_flight = false;
+                    self.1.notify_all();
+                }
             }
         }
         let _reset = ResetFlight(&self.state, &self.cv);
 
         let probed = probe();
         let done_at = now();
-        let out = {
-            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            guard.probe_seq = guard.probe_seq.wrapping_add(1);
-            match probed {
-                Some(list) => {
-                    guard.last = list.clone();
-                    guard.cached_at = Some(done_at);
-                    list
-                }
-                None => {
-                    guard.cached_at = None;
-                    guard.last.clear();
-                    Vec::new()
-                }
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.probe_seq = guard.probe_seq.wrapping_add(1);
+        let out = match probed {
+            Some(list) => {
+                guard.last = list.clone();
+                guard.cached_at = Some(done_at);
+                list
+            }
+            None => {
+                guard.cached_at = None;
+                guard.last.clear();
+                Vec::new()
             }
         };
-        // Release `guard` above before `_reset` drops so `in_flight` clears exactly once per probe.
-        out
+        guard.in_flight = false;
+        self.cv.notify_all();
+        (out, false)
     }
 }
 
@@ -278,12 +289,6 @@ pub fn strip_exe_suffix(name: &str) -> &str {
     }
 }
 
-fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
-    !needle.is_empty()
-        && haystack.len() >= needle.len()
-        && haystack.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
 fn ends_with_ascii_ci(haystack: &str, suffix: &str) -> bool {
     !suffix.is_empty()
         && haystack.len() >= suffix.len()
@@ -295,10 +300,7 @@ fn find_exact_dshow_path_index(devices: &[(&str, &str)], path: &str) -> Option<u
         return None;
     }
     let path_with_prefix = format!(r"\\{path}");
-    if let Some(i) = devices.iter().position(|(id, _)| !id.is_empty() && ends_with_ascii_ci(id, &path_with_prefix)) {
-        return Some(i);
-    }
-    devices.iter().position(|(id, _)| !id.is_empty() && contains_ascii_ci(id, path))
+    devices.iter().position(|(id, _)| !id.is_empty() && ends_with_ascii_ci(id, &path_with_prefix))
 }
 
 fn find_dshow_device_index(devices: &[(&str, &str)], query: &str) -> Option<usize> {
@@ -900,6 +902,9 @@ mod tests {
         assert_eq!(resolve_dshow_open_target(&devs, r"USB Video:\\"), None);
         assert_eq!(resolve_dshow_open_target(&devs, r"Sony Cam:\\?\usb#other_port"), None);
         assert_eq!(resolve_dshow_open_target(&devs, r"OBS Virtual Camera:\\?\usb#other"), None);
+        // Complete path match only: `?...\cam1` must never match `?...\cam10` via substring.
+        let ten = [(r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam10", "USB Video")];
+        assert_eq!(resolve_dshow_open_target(&ten, r"USB Video:\\?\usb#vid_046d&pid_082d#cam1"), None);
         // Plain friendly-name selections without an OBS hardware path still open by friendly name.
         assert_eq!(resolve_dshow_open_target(&devs, "USB Video"), Some("USB Video".to_string()));
         assert_eq!(resolve_dshow_open_target(&devs, ""), None);
@@ -916,20 +921,22 @@ mod tests {
         let probes = AtomicUsize::new(0);
 
         let now = || *clock.lock().unwrap_or_else(PoisonError::into_inner);
-        let first = cache.get_or_probe(now, || {
+        let (first, from_cache) = cache.get_or_probe_status(now, || {
             probes.fetch_add(1, Ordering::AcqRel);
             Some(vec!["cam-1".to_string()])
         });
         assert_eq!(first, vec!["cam-1"]);
+        assert!(!from_cache);
         assert_eq!(probes.load(Ordering::Acquire), 1);
 
         // Within 2 s TTL: cached snapshot is returned with zero FFmpeg/probe spawns.
         *clock.lock().unwrap() = start + Duration::from_millis(1999);
-        let hit = cache.get_or_probe(now, || {
+        let (hit, hit_cached) = cache.get_or_probe_status(now, || {
             probes.fetch_add(1, Ordering::AcqRel);
             Some(vec!["cam-unexpected".to_string()])
         });
         assert_eq!(hit, vec!["cam-1"]);
+        assert!(hit_cached);
         assert_eq!(probes.load(Ordering::Acquire), 1);
 
         // Forced fresh probe bypasses warm cache and refreshes it for subsequent callers.
@@ -1040,9 +1047,60 @@ mod tests {
         assert_eq!(follower.join().unwrap(), vec!["cam-shared"]);
         assert_eq!(probes.load(Ordering::Acquire), 1, "overlapping callers must share one probe");
 
-        // Now advance past TTL and let a leader panic while a waiter is blocked on it:
-        // the waiter must run a fresh recovery probe rather than returning stale cached data.
-        *clock.lock().unwrap() = start + Duration::from_secs(5);
+        // Overlapping forced callers share one completed fresh enumeration instead of probing twice in series.
+        *gate.0.lock().unwrap() = false;
+        let (fresh_tx, fresh_rx) = std::sync::mpsc::channel();
+        let fresh_leader = {
+            let cache = cache.clone();
+            let clock = clock.clone();
+            let probes = probes.clone();
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                cache.get_or_probe_fresh(
+                    || *clock.lock().unwrap_or_else(PoisonError::into_inner),
+                    || {
+                        probes.fetch_add(1, Ordering::AcqRel);
+                        let _ = fresh_tx.send(());
+                        let (lk, cv) = &*gate;
+                        let mut open = lk.lock().unwrap_or_else(PoisonError::into_inner);
+                        while !*open {
+                            open = cv.wait(open).unwrap_or_else(PoisonError::into_inner);
+                        }
+                        Some(vec!["cam-fresh-shared".to_string()])
+                    },
+                )
+            })
+        };
+        fresh_rx.recv().unwrap();
+
+        let fresh_waiter = {
+            let cache = cache.clone();
+            let clock = clock.clone();
+            let probes = probes.clone();
+            std::thread::spawn(move || {
+                cache.get_or_probe_fresh(
+                    || *clock.lock().unwrap_or_else(PoisonError::into_inner),
+                    || {
+                        probes.fetch_add(1, Ordering::AcqRel);
+                        Some(vec!["cam-fresh-unexpected".to_string()])
+                    },
+                )
+            })
+        };
+        while cache.waiter_count() < 1 {
+            std::thread::yield_now();
+        }
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            cv.notify_all();
+        }
+        assert_eq!(fresh_leader.join().unwrap(), vec!["cam-fresh-shared"]);
+        assert_eq!(fresh_waiter.join().unwrap(), vec!["cam-fresh-shared"]);
+        assert_eq!(probes.load(Ordering::Acquire), 2, "concurrent forced refreshes must coalesce");
+
+        // Keep clock within TTL (< 2s) and let a forced leader panic while a normal waiter blocks:
+        // waiter must still run a recovery probe rather than returning the prior warm TTL entry.
         *gate.0.lock().unwrap() = false;
         let (panic_tx, panic_rx) = std::sync::mpsc::channel();
         let panicking_leader = {
@@ -1051,7 +1109,7 @@ mod tests {
             let gate = gate.clone();
             std::thread::spawn(move || {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    cache.get_or_probe(
+                    cache.get_or_probe_fresh(
                         || *clock.lock().unwrap_or_else(PoisonError::into_inner),
                         || {
                             let _ = panic_tx.send(());
@@ -1092,6 +1150,6 @@ mod tests {
         }
         panicking_leader.join().unwrap();
         assert_eq!(waiter.join().unwrap(), vec!["cam-after-panic"]);
-        assert_eq!(probes.load(Ordering::Acquire), 2);
+        assert_eq!(probes.load(Ordering::Acquire), 3);
     }
 }
