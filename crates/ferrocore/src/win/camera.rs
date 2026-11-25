@@ -1,13 +1,13 @@
 //! Cameras (DirectShow, read by FFmpeg) and microphones (WASAPI, through cpal) on Windows.
 
-use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::ffsrc::{Live, Nv12Picture, OpenFail, ProbeFail, ffmpeg, stderr_within};
 use crate::sound_in::{SoundIn, Which};
 use crate::win_logic::{
-    DshowListStatus, DshowOption, dshow_attempts, dshow_matches_id, parse_dshow_options, resolve_dshow_list,
-    resolve_dshow_open_target,
+    DshowCameraCache, DshowListStatus, DshowOption, dshow_attempts, dshow_matches_id, parse_dshow_options,
+    resolve_dshow_list, resolve_dshow_open_target,
 };
 use crate::{AvError, Picture};
 
@@ -42,50 +42,21 @@ pub fn parse_dshow(text: &str) -> Vec<Device> {
 /// Cameras connected now (FFmpeg asks DirectShow; bounded by a timeout and shared across
 /// overlapping callers so concurrent checks do not spawn redundant FFmpeg processes).
 pub fn cameras() -> Vec<Device> {
-    struct ProbeFlight {
-        in_flight: bool,
-        last: Vec<Device>,
-    }
-    static FLIGHT: OnceLock<(Mutex<ProbeFlight>, Condvar)> = OnceLock::new();
-    let (lock, cv) =
-        FLIGHT.get_or_init(|| (Mutex::new(ProbeFlight { in_flight: false, last: Vec::new() }), Condvar::new()));
-    let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.in_flight {
-        while guard.in_flight {
-            guard = cv.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        return guard.last.clone();
-    }
-    guard.in_flight = true;
-    drop(guard);
-
-    struct ResetFlight<'a>(&'a Mutex<ProbeFlight>, &'a Condvar);
-    impl Drop for ResetFlight<'_> {
-        fn drop(&mut self) {
-            let mut g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.in_flight = false;
-            self.1.notify_all();
-        }
-    }
-    let _reset = ResetFlight(lock, cv);
-
-    let list = ffmpeg()
-        .ok()
-        .and_then(|ff| {
-            let args: Vec<String> = ["-hide_banner", "-nostdin", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
-                .into_iter()
-                .map(String::from)
-                .collect();
-            stderr_within(&ff, &args, Duration::from_secs(4)).ok()
-        })
-        .map(|text| parse_dshow(&text))
-        .unwrap_or_default();
-
-    let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard.last = list.clone();
-    guard.in_flight = false;
-    cv.notify_all();
-    list
+    static CACHE: OnceLock<DshowCameraCache<Device>> = OnceLock::new();
+    let cache = CACHE.get_or_init(DshowCameraCache::default);
+    cache.get_or_probe(Instant::now, || {
+        ffmpeg()
+            .ok()
+            .and_then(|ff| {
+                let args: Vec<String> =
+                    ["-hide_banner", "-nostdin", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                stderr_within(&ff, &args, Duration::from_secs(4)).ok()
+            })
+            .map(|text| parse_dshow(&text))
+    })
 }
 
 /// Returns `true` when the camera matching `id` (alternative id, friendly name, or OBS combined

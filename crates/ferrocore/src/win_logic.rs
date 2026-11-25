@@ -1,9 +1,92 @@
 //! Pure-logic helpers for Windows capture (format negotiation, pacing, monitor matching),
 //! compiled unconditionally in tests so `cargo test` on Mac exercises them directly.
 
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::engine::CameraSpec;
+
+/// How long DirectShow device enumeration results are reused so 1 s polling does not respawn FFmpeg.
+pub const DSHOW_CAMERA_CACHE_TTL: Duration = Duration::from_secs(2);
+
+struct CachedDshowProbe<T> {
+    in_flight: bool,
+    cached_at: Option<Instant>,
+    last: Vec<T>,
+}
+
+/// Coalesces concurrent DirectShow enumerations and serves recent device snapshots for
+/// [`DSHOW_CAMERA_CACHE_TTL`], recovering cleanly if a worker panics while probing.
+pub struct DshowCameraCache<T> {
+    state: Mutex<CachedDshowProbe<T>>,
+    cv: Condvar,
+    ttl: Duration,
+}
+
+impl<T> Default for DshowCameraCache<T> {
+    fn default() -> Self {
+        Self::new(DSHOW_CAMERA_CACHE_TTL)
+    }
+}
+
+impl<T> DshowCameraCache<T> {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            state: Mutex::new(CachedDshowProbe { in_flight: false, cached_at: None, last: Vec::new() }),
+            cv: Condvar::new(),
+            ttl,
+        }
+    }
+}
+
+impl<T: Clone> DshowCameraCache<T> {
+    pub fn get_or_probe(&self, now: impl Fn() -> Instant, probe: impl FnOnce() -> Option<Vec<T>>) -> Vec<T> {
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.in_flight {
+            while guard.in_flight {
+                guard = self.cv.wait(guard).unwrap_or_else(PoisonError::into_inner);
+            }
+            return guard.last.clone();
+        }
+        let check_at = now();
+        if let Some(at) = guard.cached_at
+            && check_at.saturating_duration_since(at) < self.ttl
+        {
+            return guard.last.clone();
+        }
+        guard.in_flight = true;
+        drop(guard);
+
+        struct ResetFlight<'a, T>(&'a Mutex<CachedDshowProbe<T>>, &'a Condvar);
+        impl<T> Drop for ResetFlight<'_, T> {
+            fn drop(&mut self) {
+                let mut g = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+                g.in_flight = false;
+                self.1.notify_all();
+            }
+        }
+        let _reset = ResetFlight(&self.state, &self.cv);
+
+        let probed = probe();
+        let done_at = now();
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let out = match probed {
+            Some(list) => {
+                guard.last = list.clone();
+                guard.cached_at = Some(done_at);
+                list
+            }
+            None => {
+                guard.cached_at = None;
+                guard.last.clear();
+                Vec::new()
+            }
+        };
+        guard.in_flight = false;
+        self.cv.notify_all();
+        out
+    }
+}
 
 /// Frame-arrival pacing for Windows.Graphics.Capture.
 ///
@@ -768,5 +851,65 @@ mod tests {
         // Unique device with empty alt id falls back to friendly name.
         assert_eq!(resolve_dshow_open_target(&devs, r"OBS Virtual Camera:\\?\usb#other"), "OBS Virtual Camera");
         assert_eq!(resolve_dshow_open_target(&devs, "USB Video"), "USB Video");
+    }
+
+    #[test]
+    fn dshow_camera_cache_serves_within_ttl_reprobes_on_expiry_and_recovers_from_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let start = Instant::now();
+        let clock = Arc::new(Mutex::new(start));
+        let cache = DshowCameraCache::new(DSHOW_CAMERA_CACHE_TTL);
+        let probes = AtomicUsize::new(0);
+
+        let now = || *clock.lock().unwrap_or_else(PoisonError::into_inner);
+        let first = cache.get_or_probe(now, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            Some(vec!["cam-1".to_string()])
+        });
+        assert_eq!(first, vec!["cam-1"]);
+        assert_eq!(probes.load(Ordering::Acquire), 1);
+
+        // Within 2 s TTL: cached snapshot is returned with zero FFmpeg/probe spawns.
+        *clock.lock().unwrap() = start + Duration::from_millis(1999);
+        let hit = cache.get_or_probe(now, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            Some(vec!["cam-unexpected".to_string()])
+        });
+        assert_eq!(hit, vec!["cam-1"]);
+        assert_eq!(probes.load(Ordering::Acquire), 1);
+
+        // At TTL expiry: re-probes cleanly.
+        *clock.lock().unwrap() = start + Duration::from_secs(2);
+        let refreshed = cache.get_or_probe(now, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            Some(vec!["cam-2".to_string()])
+        });
+        assert_eq!(refreshed, vec!["cam-2"]);
+        assert_eq!(probes.load(Ordering::Acquire), 2);
+
+        // Transient probe failure invalidates cache cleanly instead of pinning stale snapshot after expiry.
+        *clock.lock().unwrap() = start + Duration::from_secs(5);
+        let failed = cache.get_or_probe(now, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            None
+        });
+        assert!(failed.is_empty());
+        assert_eq!(probes.load(Ordering::Acquire), 3);
+
+        // Poisoned mutex recovery: panicking inside probe still clears `in_flight` for subsequent callers.
+        *clock.lock().unwrap() = start + Duration::from_secs(6);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.get_or_probe(now, || panic!("simulated probe panic"));
+        }));
+        assert!(panicked.is_err());
+
+        let recovered = cache.get_or_probe(now, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            Some(vec!["cam-recovered".to_string()])
+        });
+        assert_eq!(recovered, vec!["cam-recovered"]);
+        assert_eq!(probes.load(Ordering::Acquire), 4);
     }
 }

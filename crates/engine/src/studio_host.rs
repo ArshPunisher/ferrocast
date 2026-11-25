@@ -1931,6 +1931,8 @@ pub enum StudioAct {
         #[serde(default)]
         window: bool,
         width: u32,
+        #[serde(default)]
+        fresh: bool,
     },
     /// A still of a display, window, camera, or capture card for Add-source picker cards, at most
     /// `width` wide -> `{ image: data URL | null }`.
@@ -1939,6 +1941,8 @@ pub enum StudioAct {
         key: String,
         value: Value,
         width: u32,
+        #[serde(default)]
+        fresh: bool,
     },
     /// The VST plugins on this computer → `{ available, why, plugins: [{ path, cid, name,
     /// vendor, kinds }] }` (looked for once; `rescan` looks again).
@@ -2293,7 +2297,7 @@ impl StudioAct {
                 Err(EngineError::Invalid("width: 64 to 1280.".into()))
             }
             A::ScreenStill { .. } => Ok(()),
-            A::SourceStill { kind, key, value, width } => {
+            A::SourceStill { kind, key, value, width, .. } => {
                 if kind.trim().is_empty() || kind.len() > 64 {
                     return Err(EngineError::Invalid("kind: a source kind id.".into()));
                 }

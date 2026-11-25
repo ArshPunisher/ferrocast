@@ -2530,8 +2530,8 @@ impl StudioHost for DesktopStudio {
         // 3) deduplicates concurrent asks and returns `{ image: null, waiting: true }` for
         //    transient camera disconnects/timeouts while keeping `error` for permission/in-use.
         if matches!(&act, StudioAct::ScreenStill { .. } | StudioAct::SourceStill { .. }) {
-            let (target_kind, key_name, val_json, target, width) = match &act {
-                StudioAct::ScreenStill { id, window, width } => {
+            let (target_kind, key_name, val_json, target, width, fresh) = match &act {
+                StudioAct::ScreenStill { id, window, width, fresh } => {
                     let w = (*width).clamp(64, 320);
                     let tk = if *window { "window_capture" } else { "screen_capture" }.to_string();
                     let kn = if *window { "window" } else { "display" }.to_string();
@@ -2540,9 +2540,9 @@ impl StudioHost for DesktopStudio {
                     } else {
                         source_still::StillTarget::Display(*id, w)
                     };
-                    (tk, kn, json!(*id), tgt, w)
+                    (tk, kn, json!(*id), tgt, w, *fresh)
                 }
-                StudioAct::SourceStill { kind, key, value, width } => {
+                StudioAct::SourceStill { kind, key, value, width, fresh } => {
                     let w = (*width).clamp(64, 320);
                     let tgt = if matches!(key.as_str(), "window") || kind.contains("window") {
                         let Some(id) = value.as_u64().and_then(|n| u32::try_from(n).ok()) else {
@@ -2564,15 +2564,16 @@ impl StudioHost for DesktopStudio {
                         };
                         source_still::StillTarget::Camera(id.to_string(), w)
                     };
-                    (kind.clone(), key.clone(), value.clone(), tgt, w)
+                    (kind.clone(), key.clone(), value.clone(), tgt, w, *fresh)
                 }
                 _ => unreachable!(),
             };
-            return source_still::resolve(
+            return source_still::resolve_fresh(
                 source_still::global_cache(),
                 source_still::global_flights(),
                 source_still::global_turns(),
                 target,
+                fresh,
                 || {
                     let tk = target_kind.clone();
                     let kn = key_name.clone();
@@ -4752,6 +4753,7 @@ mod source_still {
         }
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn resolve<StageFut, ConnectFut, ProbeFut>(
         cache: &StillCache,
@@ -4768,16 +4770,71 @@ mod source_still {
         ConnectFut: Future<Output = bool>,
         ProbeFut: Future<Output = StillAnswer>,
     {
-        resolve_with_hook(cache, flights, turns, target, stage_check, hotplug_epoch, camera_connected, probe, || {})
+        resolve_inner(cache, flights, turns, target, false, stage_check, hotplug_epoch, camera_connected, probe, || {})
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn resolve_fresh<StageFut, ConnectFut, ProbeFut>(
+        cache: &StillCache,
+        flights: &Mutex<Option<FlightMap>>,
+        turns: &Arc<Semaphore>,
+        target: StillTarget,
+        fresh: bool,
+        stage_check: impl FnMut() -> StageFut,
+        hotplug_epoch: impl Fn() -> u64,
+        camera_connected: impl Fn(String) -> ConnectFut,
+        probe: impl FnMut(StillTarget, Arc<AtomicBool>, OwnedSemaphorePermit) -> ProbeFut,
+    ) -> Result<Value, String>
+    where
+        StageFut: Future<Output = (MatchingCameraWait, Option<ReuseJob>)>,
+        ConnectFut: Future<Output = bool>,
+        ProbeFut: Future<Output = StillAnswer>,
+    {
+        resolve_inner(cache, flights, turns, target, fresh, stage_check, hotplug_epoch, camera_connected, probe, || {})
+            .await
+    }
+
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn resolve_with_hook<StageFut, ConnectFut, ProbeFut>(
         cache: &StillCache,
         flights: &Mutex<Option<FlightMap>>,
         turns: &Arc<Semaphore>,
         target: StillTarget,
+        stage_check: impl FnMut() -> StageFut,
+        hotplug_epoch: impl Fn() -> u64,
+        camera_connected: impl Fn(String) -> ConnectFut,
+        probe: impl FnMut(StillTarget, Arc<AtomicBool>, OwnedSemaphorePermit) -> ProbeFut,
+        before_follower_await: impl FnMut(),
+    ) -> Result<Value, String>
+    where
+        StageFut: Future<Output = (MatchingCameraWait, Option<ReuseJob>)>,
+        ConnectFut: Future<Output = bool>,
+        ProbeFut: Future<Output = StillAnswer>,
+    {
+        resolve_inner(
+            cache,
+            flights,
+            turns,
+            target,
+            false,
+            stage_check,
+            hotplug_epoch,
+            camera_connected,
+            probe,
+            before_follower_await,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_inner<StageFut, ConnectFut, ProbeFut>(
+        cache: &StillCache,
+        flights: &Mutex<Option<FlightMap>>,
+        turns: &Arc<Semaphore>,
+        target: StillTarget,
+        fresh: bool,
         mut stage_check: impl FnMut() -> StageFut,
         hotplug_epoch: impl Fn() -> u64,
         camera_connected: impl Fn(String) -> ConnectFut,
@@ -4791,7 +4848,8 @@ mod source_still {
     {
         loop {
             let is_camera = matches!(target, StillTarget::Camera(..));
-            if !is_camera
+            if !fresh
+                && !is_camera
                 && let Some(image) = cache.get_if_fresh(&target, &hotplug_epoch, false, |_| async { true }).await
             {
                 return Ok(StillAnswer::image(image).into_json());
@@ -4825,7 +4883,8 @@ mod source_still {
                             }
                             cache.evict(&target);
                         }
-                    } else if is_camera
+                    } else if !fresh
+                        && is_camera
                         && let Some(image) = cache.get_if_fresh(&target, &hotplug_epoch, false, &camera_connected).await
                     {
                         return Ok(StillAnswer::image(image).into_json());
@@ -4910,7 +4969,8 @@ mod source_still {
             let _cancel_guard = CancelOnDrop(cancel_flag.clone());
 
             let permit = turns.clone().acquire_owned().await.map_err(|e| e.to_string())?;
-            if !stage_waiting
+            if !fresh
+                && !stage_waiting
                 && let Some(image) = cache.get_if_fresh(&target, &hotplug_epoch, false, &camera_connected).await
             {
                 let ep = hotplug_epoch();
@@ -6336,6 +6396,140 @@ mod import_tests {
             assert_eq!(super::camera_source_status_json(kind, None), Some(json!({})));
         }
         assert_eq!(super::camera_source_status_json("color_source", Some(waiting)), None);
+    }
+
+    #[test]
+    fn source_still_fresh_bypasses_cache_but_keeps_single_flight_and_permit() {
+        use super::source_still::{FlightMap, ReuseJob, StillAnswer, StillCache, StillTarget, resolve_fresh};
+        use ferrocast_studio::stage::MatchingCameraWait;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::{Notify, Semaphore};
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let cache = StillCache::default();
+        let flights = Mutex::new(None::<FlightMap>);
+        let turns = Arc::new(Semaphore::new(2));
+
+        // 1. Camera: warm cache serves cached frame on fresh=false, bypasses cache on fresh=true,
+        // deduplicates overlapping fresh=true callers through single-flight, and holds semaphore permit.
+        let cam = StillTarget::Camera("iphone-fresh".into(), 240);
+        cache.insert(cam.clone(), 1, "data:image/jpeg;base64,CACHED".into());
+
+        let hit = rt
+            .block_on(resolve_fresh(
+                &cache,
+                &flights,
+                &turns,
+                cam.clone(),
+                false,
+                || async { (MatchingCameraWait::LiveOrAbsent, None::<ReuseJob>) },
+                || 1,
+                |_| async { true },
+                |_, _, _| async { panic!("fresh=false must hit warm cache") },
+            ))
+            .unwrap();
+        assert_eq!(hit, json!({ "image": "data:image/jpeg;base64,CACHED" }));
+
+        let bypassed = rt
+            .block_on(resolve_fresh(
+                &cache,
+                &flights,
+                &turns,
+                cam.clone(),
+                true,
+                || async { (MatchingCameraWait::LiveOrAbsent, None::<ReuseJob>) },
+                || 1,
+                |_| async { true },
+                |_, _, _| async { StillAnswer::image("data:image/jpeg;base64,FRESH_FIRST".into()) },
+            ))
+            .unwrap();
+        assert_eq!(bypassed, json!({ "image": "data:image/jpeg;base64,FRESH_FIRST" }));
+
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let follower_ready = Arc::new(Notify::new());
+        let gate = Arc::new(Notify::new());
+        let (r1, r2, ()) = rt.block_on(async {
+            let calls = probe_calls.clone();
+            let ent = entered.clone();
+            let gt = gate.clone();
+            let t_permits = turns.clone();
+            let t1 = resolve_fresh(
+                &cache,
+                &flights,
+                &turns,
+                cam.clone(),
+                true,
+                || async { (MatchingCameraWait::LiveOrAbsent, None::<ReuseJob>) },
+                || 1,
+                |_| async { true },
+                move |_, _, permit| {
+                    let calls = calls.clone();
+                    let ent = ent.clone();
+                    let gt = gt.clone();
+                    let t_permits = t_permits.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::AcqRel);
+                        assert_eq!(t_permits.available_permits(), 1, "fresh probe must acquire permit");
+                        ent.notify_one();
+                        gt.notified().await;
+                        drop(permit);
+                        StillAnswer::image("data:image/jpeg;base64,FRESH_CAM".into())
+                    }
+                },
+            );
+            let fr = follower_ready.clone();
+            let t2 = async {
+                entered.notified().await;
+                resolve_fresh(
+                    &cache,
+                    &flights,
+                    &turns,
+                    cam.clone(),
+                    true,
+                    || {
+                        let fr = fr.clone();
+                        async move {
+                            fr.notify_one();
+                            (MatchingCameraWait::LiveOrAbsent, None::<ReuseJob>)
+                        }
+                    },
+                    || 1,
+                    |_| async { true },
+                    |_, _, _| async { panic!("concurrent fresh follower must join single-flight") },
+                )
+                .await
+            };
+            let releaser = async {
+                follower_ready.notified().await;
+                tokio::task::yield_now().await;
+                gate.notify_one();
+            };
+            tokio::join!(t1, t2, releaser)
+        });
+        assert_eq!(probe_calls.load(Ordering::Acquire), 1);
+        assert_eq!(r1.unwrap(), json!({ "image": "data:image/jpeg;base64,FRESH_CAM" }));
+        assert_eq!(r2.unwrap(), json!({ "image": "data:image/jpeg;base64,FRESH_CAM" }));
+
+        // 2. Display target also bypasses StillCache upfront check when fresh=true.
+        let disp = StillTarget::Display(1, 240);
+        cache.insert(disp.clone(), 0, "data:image/jpeg;base64,CACHED_DISP".into());
+        let disp_res = rt
+            .block_on(resolve_fresh(
+                &cache,
+                &flights,
+                &turns,
+                disp,
+                true,
+                || async { (MatchingCameraWait::LiveOrAbsent, None::<ReuseJob>) },
+                || 0,
+                |_| async { true },
+                |_, _, _| async { StillAnswer::image("data:image/jpeg;base64,FRESH_DISP".into()) },
+            ))
+            .unwrap();
+        assert_eq!(disp_res, json!({ "image": "data:image/jpeg;base64,FRESH_DISP" }));
     }
 
     #[test]
