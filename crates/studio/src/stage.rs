@@ -3572,16 +3572,32 @@ impl Stage {
         }))
     }
 
+    /// Classifies whether any stage camera source matching `(kind, key, value)` is currently in
+    /// `"waiting"` state and whether one of those waiting sources still holds an open session.
+    pub fn matching_camera_wait(&self, kind: &str, key: &str, value: &Value) -> MatchingCameraWait {
+        if !PICTURE_ONLY_DEVICES.contains(&kind) {
+            return MatchingCameraWait::LiveOrAbsent;
+        }
+        let mut waiting = false;
+        let engine = self.engine.borrow();
+        for s in self.sources_list() {
+            if device_source_matches(&s, kind, key, value, true) {
+                let name = name_of(&s);
+                if self.camera_status(name).is_some_and(|st| st.state == "waiting") {
+                    waiting = true;
+                    if engine.as_ref().is_some_and(|e| e.engine.is_camera_holding_session(name)) {
+                        return MatchingCameraWait::WaitingWithSession;
+                    }
+                }
+            }
+        }
+        if waiting { MatchingCameraWait::WaitingWithoutSession } else { MatchingCameraWait::LiveOrAbsent }
+    }
+
     /// Returns true when any stage camera source matching `(kind, key, value)` is currently in
     /// `"waiting"` state so picker stills never serve a frozen texture or stale cache entry.
     pub fn is_matching_camera_waiting(&self, kind: &str, key: &str, value: &Value) -> bool {
-        if !PICTURE_ONLY_DEVICES.contains(&kind) {
-            return false;
-        }
-        self.sources_list().into_iter().any(|s| {
-            device_source_matches(&s, kind, key, value, true)
-                && self.camera_status(name_of(&s)).is_some_and(|st| st.state == "waiting")
-        })
+        !matches!(self.matching_camera_wait(kind, key, value), MatchingCameraWait::LiveOrAbsent)
     }
 
     /// Reuses an already-open capture source matching `(kind, key, value)` for a picker
@@ -4589,8 +4605,10 @@ impl Stage {
         let (scene, w, h) = crate::own::show_alone(&e.engine, name, (self.canvas.width, self.canvas.height))?;
         e.keep_alone(name);
         let src_name = name.to_string();
+        // Capture `AloneGuard` when creating the job so dropping an uncalled job still releases it.
+        let alone = AloneGuard { engine: e.clone(), name: src_name };
         Ok(Box::new(move || {
-            let _release = AloneGuard { engine: e.clone(), name: src_name };
+            let _release = alone;
             let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()))?;
             Ok((px, (w, h)))
         }))
@@ -4631,6 +4649,19 @@ impl Drop for AloneGuard {
     fn drop(&mut self) {
         self.engine.release_alone(&self.name);
     }
+}
+
+/// How an already-staged camera matching a picker still request behaves right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchingCameraWait {
+    /// No matching staged camera is waiting (either absent or streaming live).
+    LiveOrAbsent,
+    /// A matching staged camera is waiting while still owning a live capture session
+    /// (e.g. interrupted Continuity Camera or healthy 0-frame card), so probes must not open a
+    /// competing capture stream.
+    WaitingWithSession,
+    /// A matching staged camera is waiting without an open capture session (disconnected/offline).
+    WaitingWithoutSession,
 }
 
 fn should_wait_for_item_picture(engine: &ferrocore::engine::Engine, source: &str) -> bool {
@@ -10807,6 +10838,11 @@ mod tests {
         assert_eq!(rsize, (64, 32));
         assert_eq!(psize, (320, 180));
 
+        // Dropping an uncalled source screenshot_job still releases its temporary solo scene.
+        let uncalled = ok(s.screenshot_job("Color"));
+        drop(uncalled);
+        assert_eq!(e.alone_count(), 0, "dropping an uncalled screenshot_job must still release keep_alone ownership");
+
         // Waiting camera (disconnected, opening() == 0) skips the 2 s sleep loop.
         let (cam_kind, cam_key) = ferrocore::obs::native_camera_kind_and_key();
         let mut cam_settings = serde_json::Map::new();
@@ -10849,6 +10885,11 @@ mod tests {
         while e.engine.opening() > 0 {
             std::thread::yield_now();
         }
+        assert_eq!(s.matching_camera_wait(cam_kind, cam_key, &val), super::MatchingCameraWait::WaitingWithoutSession);
+        assert_eq!(
+            s.matching_camera_wait(cam_kind, cam_key, &Value::String("other-cam".into())),
+            super::MatchingCameraWait::LiveOrAbsent
+        );
         assert!(s.is_matching_camera_waiting(cam_kind, cam_key, &val));
         assert!(s.matching_device_picture_job(cam_kind, cam_key, &val, 160).is_none());
     }
