@@ -799,6 +799,32 @@
         },
         "type": "object"
       },
+      "CaptureProblem": {
+        "description": "Active capture source on air showing no usable picture.",
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "problem": {
+            "enum": [
+              "permission",
+              "waiting",
+              "no_picture",
+              "black"
+            ],
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "kind",
+          "problem"
+        ],
+        "type": "object"
+      },
       "ChatSendRequest": {
         "properties": {
           "platforms": {
@@ -1957,6 +1983,190 @@
           "item_id",
           "item_title",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "StudioEngineStats": {
+        "description": "Compositor metrics, active capture issues, output status, and per-source frame load.",
+        "properties": {
+          "canvas": {
+            "properties": {
+              "fps": {
+                "type": "integer"
+              },
+              "height": {
+                "type": "integer"
+              },
+              "width": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "captures": {
+            "items": {
+              "$ref": "#/components/schemas/CaptureProblem"
+            },
+            "type": "array"
+          },
+          "disk_free_mb": {
+            "type": "integer"
+          },
+          "engine": {
+            "properties": {
+              "cpu": {
+                "type": "number"
+              },
+              "encode_ms": {
+                "type": "number"
+              },
+              "encoded": {
+                "type": "integer"
+              },
+              "encoding_ms": {
+                "type": "integer"
+              },
+              "fps": {
+                "type": "number"
+              },
+              "frame_ms": {
+                "type": "number"
+              },
+              "frames": {
+                "type": "integer"
+              },
+              "lagged": {
+                "type": "integer"
+              },
+              "memory_mb": {
+                "type": "integer"
+              },
+              "recovered": {
+                "type": "integer"
+              },
+              "restarts": {
+                "type": "integer"
+              },
+              "skipped": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "history": {
+            "properties": {
+              "redo": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "undo": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "ndi": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "record": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "remux": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "replay": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "scene": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sidechain_cycles": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "source_records": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "sources": {
+            "items": {
+              "properties": {
+                "height": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "name": {
+                  "type": "string"
+                },
+                "sent": {
+                  "type": "integer"
+                },
+                "waiting": {
+                  "type": "boolean"
+                },
+                "width": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "name",
+                "sent",
+                "waiting"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "stream": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "virtualcam": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "engine",
+          "scene",
+          "history",
+          "canvas",
+          "disk_free_mb",
+          "captures",
+          "sources"
         ],
         "type": "object"
       },
@@ -33036,10 +33246,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/StudioEngineStats"
                 }
               }
             },
