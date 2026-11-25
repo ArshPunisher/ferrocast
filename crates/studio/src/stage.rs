@@ -1910,6 +1910,7 @@ impl Stage {
     /// Moves and sizes an item so its picture fills `x, y, w, h` on the canvas (a drag in the
     /// preview), keeping its turn and crop.
     pub fn set_item_box(&self, scene: &str, id: i64, x: f32, y: f32, w: f32, h: f32) -> Result<ItemInfo, StudioError> {
+        let canvas_pos = (x, y);
         // In a group: the canvas box into the group's own pixels.
         let home = self.home(scene, id);
         let (x, y, w, h) = match (home != scene)
@@ -1960,12 +1961,14 @@ impl Stage {
         // A flipped item in bounds is drawn from another corner than `x, y` (the bounds' alignment
         // and the flip move its origin): the frame's corner is what the caller sees and sends back,
         // so `x, y` are moved by what they are off, and a nudge of 1 pixel is 1 pixel.
-        if home == scene {
-            let (dx, dy) = (x - info.frame[4], y - info.frame[5]);
-            if dx.abs() > 0.01 || dy.abs() > 0.01 {
+        let (dx, dy) = (canvas_pos.0 - info.frame[4], canvas_pos.1 - info.frame[5]);
+        if dx.abs() > 0.01 || dy.abs() > 0.01 {
+            if home == scene {
                 (t.x, t.y) = (t.x + dx, t.y + dy);
                 return self.set_transform(scene, id, &t);
             }
+            self.settle_point(scene, id, (0.0, 0.0), canvas_pos)?;
+            return self.canvas_info(scene, id);
         }
         Ok(info)
     }
@@ -8008,6 +8011,62 @@ mod tests {
             ok(s.set_item_box("Main", a.id, f[4] + 1.0, f[5], w, h));
             let n = frame(&s);
             assert!((n[4] - f[4] - 1.0).abs() < 0.01 && (n[5] - f[5]).abs() < 0.01, "{bounds}: nudge {f:?} -> {n:?}");
+        }
+    }
+
+    /// The same origin stability applies inside an offset and scaled group (`home != scene`).
+    #[test]
+    fn flipped_bounded_item_inside_group_keeps_origin_and_nudges_by_one_pixel() {
+        for (flip_x, flip_y, bounds, align) in
+            [(-1.0, 1.0, "fit", 0), (1.0, -1.0, "fit", 0), (-1.0, -1.0, "stretch", 5), (-1.0, 1.0, "fit", 5)]
+        {
+            let s = stage();
+            let a = ok(s.add_source("Main", "color_source_v3", "A", &json!({ "width": 100, "height": 100 }), false));
+            let b = ok(s.add_source("Main", "color_source_v3", "B", &json!({ "width": 80, "height": 80 }), false));
+            ok(s.set_item_boxes("Main", &[(a.id, 100.0, 100.0, 100.0, 100.0), (b.id, 300.0, 220.0, 80.0, 80.0)]));
+            let mut t = ok(s.transform("Main", a.id));
+            t.bounds = bounds.into();
+            (t.bounds_width, t.bounds_height, t.bounds_alignment) = (100.0, 100.0, align);
+            (t.scale_x, t.scale_y) = (flip_x, flip_y);
+            (t.x, t.y, t.alignment) = (100.0, 100.0, 5);
+            ok(s.set_transform("Main", a.id, &t));
+
+            let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+            let gb = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap_or_else(|| panic!("group missing"));
+            let (gw, gh) = (gb.frame[0].hypot(gb.frame[1]), gb.frame[2].hypot(gb.frame[3]));
+            ok(s.set_item_box("Main", g.id, 250.0, 120.0, gw * 1.5, gh * 0.8));
+
+            let frame = |s: &Stage| -> [f32; 6] {
+                ok(s.items("Main"))
+                    .into_iter()
+                    .find(|i| i.id == g.id)
+                    .and_then(|grp| grp.children.into_iter().find(|c| c.id == a.id))
+                    .map(|c| c.frame)
+                    .unwrap_or([0.0; 6])
+            };
+            let f = frame(&s);
+            let (w, h) = (f[0].hypot(f[1]), f[2].hypot(f[3]));
+            let ret = ok(s.set_item_box("Main", a.id, f[4], f[5], w, h));
+            let after = frame(&s);
+            for k in 0..6 {
+                assert!(
+                    (f[k] - after[k]).abs() < 0.02,
+                    "{bounds} ({flip_x},{flip_y}) align {align}: moved from {f:?} to {after:?}"
+                );
+                assert!(
+                    (ret.frame[k] - after[k]).abs() < 0.02,
+                    "{bounds} ({flip_x},{flip_y}) align {align}: returned frame {:?} != {after:?}",
+                    ret.frame
+                );
+            }
+
+            let ret_nudge = ok(s.set_item_box("Main", a.id, f[4] + 1.0, f[5] + 2.0, w, h));
+            let n = frame(&s);
+            assert!(
+                (n[4] - f[4] - 1.0).abs() < 0.02 && (n[5] - f[5] - 2.0).abs() < 0.02,
+                "{bounds} ({flip_x},{flip_y}) align {align}: nudge {f:?} -> {n:?}"
+            );
+            assert!((ret_nudge.frame[4] - n[4]).abs() < 0.02 && (ret_nudge.frame[5] - n[5]).abs() < 0.02);
         }
     }
 
