@@ -39,24 +39,48 @@ pub fn parse_dshow(text: &str) -> Vec<Device> {
     out
 }
 
+fn probe_dshow_devices() -> Option<Vec<Device>> {
+    ffmpeg()
+        .ok()
+        .and_then(|ff| {
+            let args: Vec<String> = ["-hide_banner", "-nostdin", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            stderr_within(&ff, &args, Duration::from_secs(4)).ok()
+        })
+        .map(|text| parse_dshow(&text))
+}
+
+fn dshow_cache() -> &'static DshowCameraCache<Device> {
+    static CACHE: OnceLock<DshowCameraCache<Device>> = OnceLock::new();
+    CACHE.get_or_init(DshowCameraCache::default)
+}
+
 /// Cameras connected now (FFmpeg asks DirectShow; bounded by a timeout and shared across
 /// overlapping callers so concurrent checks do not spawn redundant FFmpeg processes).
 pub fn cameras() -> Vec<Device> {
-    static CACHE: OnceLock<DshowCameraCache<Device>> = OnceLock::new();
-    let cache = CACHE.get_or_init(DshowCameraCache::default);
-    cache.get_or_probe(Instant::now, || {
-        ffmpeg()
-            .ok()
-            .and_then(|ff| {
-                let args: Vec<String> =
-                    ["-hide_banner", "-nostdin", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
-                        .into_iter()
-                        .map(String::from)
-                        .collect();
-                stderr_within(&ff, &args, Duration::from_secs(4)).ok()
-            })
-            .map(|text| parse_dshow(&text))
-    })
+    dshow_cache().get_or_probe(Instant::now, probe_dshow_devices)
+}
+
+fn cameras_fresh() -> Vec<Device> {
+    dshow_cache().get_or_probe_fresh(Instant::now, probe_dshow_devices)
+}
+
+fn resolve_camera_dev(id: &str) -> Result<String, AvError> {
+    if id.starts_with('@') {
+        return Ok(id.to_string());
+    }
+    if id.contains(":\\\\") {
+        let lookup = |devs: &[Device]| {
+            let pairs: Vec<(&str, &str)> = devs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
+            resolve_dshow_open_target(&pairs, id)
+        };
+        return lookup(&cameras())
+            .or_else(|| lookup(&cameras_fresh()))
+            .ok_or_else(|| AvError::Source("that camera isn't connected".into()));
+    }
+    Ok(id.to_string())
 }
 
 /// Returns `true` when the camera matching `id` (alternative id, friendly name, or OBS combined
@@ -123,16 +147,7 @@ impl Capture {
     /// (e.g. 1080p60) instead of throttled uncompressed YUY2, falling back through MJPEG + asked,
     /// asked, and device default, and reading NV12 through the pipe.
     pub fn camera(spec: &crate::engine::CameraSpec) -> Result<Self, AvError> {
-        let id = spec.id.as_str();
-        let dev = if id.starts_with('@') {
-            id.to_string()
-        } else if id.contains(":\\\\") {
-            let devs = cameras();
-            let pairs: Vec<(&str, &str)> = devs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
-            resolve_dshow_open_target(&pairs, id)
-        } else {
-            id.to_string()
-        };
+        let dev = resolve_camera_dev(&spec.id)?;
         let options = resolve_dshow_options(list_dshow_options(&dev), &dev)?;
         let max = spec.size.unwrap_or((1920, 1080));
         let mut last_err = AvError::Source("FFmpeg couldn't open it".into());

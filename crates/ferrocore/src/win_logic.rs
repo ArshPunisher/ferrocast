@@ -11,6 +11,9 @@ pub const DSHOW_CAMERA_CACHE_TTL: Duration = Duration::from_secs(2);
 
 struct CachedDshowProbe<T> {
     in_flight: bool,
+    probe_seq: u64,
+    #[cfg(test)]
+    waiters: usize,
     cached_at: Option<Instant>,
     last: Vec<T>,
 }
@@ -32,24 +35,63 @@ impl<T> Default for DshowCameraCache<T> {
 impl<T> DshowCameraCache<T> {
     pub fn new(ttl: Duration) -> Self {
         Self {
-            state: Mutex::new(CachedDshowProbe { in_flight: false, cached_at: None, last: Vec::new() }),
+            state: Mutex::new(CachedDshowProbe {
+                in_flight: false,
+                probe_seq: 0,
+                #[cfg(test)]
+                waiters: 0,
+                cached_at: None,
+                last: Vec::new(),
+            }),
             cv: Condvar::new(),
             ttl,
         }
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).waiters
     }
 }
 
 impl<T: Clone> DshowCameraCache<T> {
     pub fn get_or_probe(&self, now: impl Fn() -> Instant, probe: impl FnOnce() -> Option<Vec<T>>) -> Vec<T> {
+        self.get_or_probe_inner(false, now, probe)
+    }
+
+    pub fn get_or_probe_fresh(&self, now: impl Fn() -> Instant, probe: impl FnOnce() -> Option<Vec<T>>) -> Vec<T> {
+        self.get_or_probe_inner(true, now, probe)
+    }
+
+    fn get_or_probe_inner(
+        &self,
+        force_refresh: bool,
+        now: impl Fn() -> Instant,
+        probe: impl FnOnce() -> Option<Vec<T>>,
+    ) -> Vec<T> {
         let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.in_flight {
-            while guard.in_flight {
-                guard = self.cv.wait(guard).unwrap_or_else(PoisonError::into_inner);
+        let seen_seq = guard.probe_seq;
+        let mut waited_for_inflight = false;
+        while guard.in_flight {
+            #[cfg(test)]
+            {
+                guard.waiters += 1;
             }
+            guard = self.cv.wait(guard).unwrap_or_else(PoisonError::into_inner);
+            #[cfg(test)]
+            {
+                guard.waiters -= 1;
+            }
+            waited_for_inflight = true;
+        }
+        // Only share the in-flight probe's snapshot if a probe actually completed while we waited;
+        // if the leader panicked, fall through so this caller can run a recovery probe.
+        if waited_for_inflight && !force_refresh && guard.probe_seq != seen_seq {
             return guard.last.clone();
         }
         let check_at = now();
-        if let Some(at) = guard.cached_at
+        if !force_refresh
+            && let Some(at) = guard.cached_at
             && check_at.saturating_duration_since(at) < self.ttl
         {
             return guard.last.clone();
@@ -69,21 +111,23 @@ impl<T: Clone> DshowCameraCache<T> {
 
         let probed = probe();
         let done_at = now();
-        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let out = match probed {
-            Some(list) => {
-                guard.last = list.clone();
-                guard.cached_at = Some(done_at);
-                list
-            }
-            None => {
-                guard.cached_at = None;
-                guard.last.clear();
-                Vec::new()
+        let out = {
+            let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.probe_seq = guard.probe_seq.wrapping_add(1);
+            match probed {
+                Some(list) => {
+                    guard.last = list.clone();
+                    guard.cached_at = Some(done_at);
+                    list
+                }
+                None => {
+                    guard.cached_at = None;
+                    guard.last.clear();
+                    Vec::new()
+                }
             }
         };
-        guard.in_flight = false;
-        self.cv.notify_all();
+        // Release `guard` above before `_reset` drops so `in_flight` clears exactly once per probe.
         out
     }
 }
@@ -246,6 +290,17 @@ fn ends_with_ascii_ci(haystack: &str, suffix: &str) -> bool {
         && haystack.as_bytes()[haystack.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
 }
 
+fn find_exact_dshow_path_index(devices: &[(&str, &str)], path: &str) -> Option<usize> {
+    if path.is_empty() {
+        return None;
+    }
+    let path_with_prefix = format!(r"\\{path}");
+    if let Some(i) = devices.iter().position(|(id, _)| !id.is_empty() && ends_with_ascii_ci(id, &path_with_prefix)) {
+        return Some(i);
+    }
+    devices.iter().position(|(id, _)| !id.is_empty() && contains_ascii_ci(id, path))
+}
+
 fn find_dshow_device_index(devices: &[(&str, &str)], query: &str) -> Option<usize> {
     if query.is_empty() {
         return None;
@@ -259,16 +314,8 @@ fn find_dshow_device_index(devices: &[(&str, &str)], query: &str) -> Option<usiz
     if let Some((friendly, path)) = query.split_once(":\\\\") {
         // OBS stores `Name:\\?\usb#...`; prefer matching the unique non-empty path suffix inside
         // `alt_id`, falling back to friendly name only when unambiguous with a non-empty id.
-        if !path.is_empty() {
-            let path_with_prefix = format!(r"\\{path}");
-            if let Some(i) =
-                devices.iter().position(|(id, _)| !id.is_empty() && ends_with_ascii_ci(id, &path_with_prefix))
-            {
-                return Some(i);
-            }
-            if let Some(i) = devices.iter().position(|(id, _)| !id.is_empty() && contains_ascii_ci(id, path)) {
-                return Some(i);
-            }
+        if let Some(i) = find_exact_dshow_path_index(devices, path) {
+            return Some(i);
         }
         let mut matches = devices.iter().enumerate().filter(|(_, (_, name))| *name == friendly);
         if let Some((idx, (id, _))) = matches.next()
@@ -290,24 +337,28 @@ pub fn dshow_matches_id(devices: &[(&str, &str)], query: &str) -> bool {
 }
 
 /// Resolves a configured camera id (`@alt_id`, OBS `"Friendly:\\\\?\\path"`, or friendly name) to
-/// the enumerated DirectShow alternative name when possible so duplicate USB cameras open the
-/// matching device instead of colliding on the first friendly-name match.
-pub fn resolve_dshow_open_target(devices: &[(&str, &str)], query: &str) -> String {
+/// the DirectShow input string to open.
+///
+/// For OBS `"Friendly:\\\\?\\path"` identifiers, returns `None` when `path` is empty or does not
+/// match any currently connected device's alternative name so we never open an unrelated same-name
+/// device by falling back to the friendly name.
+pub fn resolve_dshow_open_target(devices: &[(&str, &str)], query: &str) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
     if query.starts_with('@') {
-        return find_dshow_device_index(devices, query)
-            .map(|i| devices[i].0)
-            .filter(|id| !id.is_empty())
-            .unwrap_or(query)
-            .to_string();
+        return Some(
+            find_dshow_device_index(devices, query)
+                .map(|i| devices[i].0)
+                .filter(|id| !id.is_empty())
+                .unwrap_or(query)
+                .to_string(),
+        );
     }
-    if let Some((friendly, _)) = query.split_once(":\\\\") {
-        return find_dshow_device_index(devices, query)
-            .map(|i| devices[i].0)
-            .filter(|id| !id.is_empty())
-            .unwrap_or(friendly)
-            .to_string();
+    if let Some((_, path)) = query.split_once(":\\\\") {
+        return find_exact_dshow_path_index(devices, path).map(|i| devices[i].0.to_string());
     }
-    query.to_string()
+    Some(query.to_string())
 }
 
 /// DirectShow format/codec family parsed from `ffmpeg -list_options true`.
@@ -833,24 +884,25 @@ mod tests {
         // Second identical USB camera resolves to its own @device_pnp alternative name, never the first.
         assert_eq!(
             resolve_dshow_open_target(&devs, r"USB Video:\\?\usb#vid_046d&pid_082d#cam2"),
-            r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam2"
+            Some(r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam2".to_string())
         );
         // Case-insensitive PnP match still resolves to the enumerated alt name.
         assert_eq!(
             resolve_dshow_open_target(&devs, r"USB Video:\\?\USB#VID_046D&PID_082D#CAM2"),
-            r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam2"
+            Some(r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam2".to_string())
         );
-        // Absent duplicate falls back cleanly to friendly name instead of an unrelated camera's alt id.
-        assert_eq!(resolve_dshow_open_target(&devs, r"USB Video:\\?\usb#missing_port"), "USB Video");
-        assert_eq!(resolve_dshow_open_target(&devs, r"USB Video:\\"), "USB Video");
-        // Unique camera with moved USB port falls back to its own alt id even when virtual cam has empty id.
         assert_eq!(
-            resolve_dshow_open_target(&devs, r"Sony Cam:\\?\usb#other_port"),
-            r"@device_pnp_\\?\usb#vid_054c&pid_0001#solo"
+            resolve_dshow_open_target(&devs, r"@device_pnp_\\?\USB#VID_046D&PID_082D#CAM2"),
+            Some(r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam2".to_string())
         );
-        // Unique device with empty alt id falls back to friendly name.
-        assert_eq!(resolve_dshow_open_target(&devs, r"OBS Virtual Camera:\\?\usb#other"), "OBS Virtual Camera");
-        assert_eq!(resolve_dshow_open_target(&devs, "USB Video"), "USB Video");
+        // Absent or empty hardware paths refuse instead of falling back to friendly name (would open wrong cam).
+        assert_eq!(resolve_dshow_open_target(&devs, r"USB Video:\\?\usb#missing_port"), None);
+        assert_eq!(resolve_dshow_open_target(&devs, r"USB Video:\\"), None);
+        assert_eq!(resolve_dshow_open_target(&devs, r"Sony Cam:\\?\usb#other_port"), None);
+        assert_eq!(resolve_dshow_open_target(&devs, r"OBS Virtual Camera:\\?\usb#other"), None);
+        // Plain friendly-name selections without an OBS hardware path still open by friendly name.
+        assert_eq!(resolve_dshow_open_target(&devs, "USB Video"), Some("USB Video".to_string()));
+        assert_eq!(resolve_dshow_open_target(&devs, ""), None);
     }
 
     #[test]
@@ -880,26 +932,40 @@ mod tests {
         assert_eq!(hit, vec!["cam-1"]);
         assert_eq!(probes.load(Ordering::Acquire), 1);
 
+        // Forced fresh probe bypasses warm cache and refreshes it for subsequent callers.
+        let forced = cache.get_or_probe_fresh(now, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            Some(vec!["cam-fresh".to_string()])
+        });
+        assert_eq!(forced, vec!["cam-fresh"]);
+        assert_eq!(probes.load(Ordering::Acquire), 2);
+        let hit_after_fresh = cache.get_or_probe(now, || {
+            probes.fetch_add(1, Ordering::AcqRel);
+            Some(vec!["cam-unexpected".to_string()])
+        });
+        assert_eq!(hit_after_fresh, vec!["cam-fresh"]);
+        assert_eq!(probes.load(Ordering::Acquire), 2);
+
         // At TTL expiry: re-probes cleanly.
-        *clock.lock().unwrap() = start + Duration::from_secs(2);
+        *clock.lock().unwrap() = start + Duration::from_secs(4);
         let refreshed = cache.get_or_probe(now, || {
             probes.fetch_add(1, Ordering::AcqRel);
             Some(vec!["cam-2".to_string()])
         });
         assert_eq!(refreshed, vec!["cam-2"]);
-        assert_eq!(probes.load(Ordering::Acquire), 2);
+        assert_eq!(probes.load(Ordering::Acquire), 3);
 
         // Transient probe failure invalidates cache cleanly instead of pinning stale snapshot after expiry.
-        *clock.lock().unwrap() = start + Duration::from_secs(5);
+        *clock.lock().unwrap() = start + Duration::from_secs(7);
         let failed = cache.get_or_probe(now, || {
             probes.fetch_add(1, Ordering::AcqRel);
             None
         });
         assert!(failed.is_empty());
-        assert_eq!(probes.load(Ordering::Acquire), 3);
+        assert_eq!(probes.load(Ordering::Acquire), 4);
 
         // Poisoned mutex recovery: panicking inside probe still clears `in_flight` for subsequent callers.
-        *clock.lock().unwrap() = start + Duration::from_secs(6);
+        *clock.lock().unwrap() = start + Duration::from_secs(8);
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             cache.get_or_probe(now, || panic!("simulated probe panic"));
         }));
@@ -910,6 +976,122 @@ mod tests {
             Some(vec!["cam-recovered".to_string()])
         });
         assert_eq!(recovered, vec!["cam-recovered"]);
-        assert_eq!(probes.load(Ordering::Acquire), 4);
+        assert_eq!(probes.load(Ordering::Acquire), 5);
+    }
+
+    #[test]
+    fn dshow_camera_cache_coalesces_concurrent_waiters_and_recovers_waiter_after_leader_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let start = Instant::now();
+        let clock = Arc::new(Mutex::new(start));
+        let cache = Arc::new(DshowCameraCache::new(DSHOW_CAMERA_CACHE_TTL));
+        let probes = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+
+        let leader = {
+            let cache = cache.clone();
+            let clock = clock.clone();
+            let probes = probes.clone();
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                cache.get_or_probe(
+                    || *clock.lock().unwrap_or_else(PoisonError::into_inner),
+                    || {
+                        probes.fetch_add(1, Ordering::AcqRel);
+                        let _ = entered_tx.send(());
+                        let (lk, cv) = &*gate;
+                        let mut open = lk.lock().unwrap_or_else(PoisonError::into_inner);
+                        while !*open {
+                            open = cv.wait(open).unwrap_or_else(PoisonError::into_inner);
+                        }
+                        Some(vec!["cam-shared".to_string()])
+                    },
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let follower = {
+            let cache = cache.clone();
+            let clock = clock.clone();
+            let probes = probes.clone();
+            std::thread::spawn(move || {
+                cache.get_or_probe(
+                    || *clock.lock().unwrap_or_else(PoisonError::into_inner),
+                    || {
+                        probes.fetch_add(1, Ordering::AcqRel);
+                        Some(vec!["cam-follower-unexpected".to_string()])
+                    },
+                )
+            })
+        };
+        while cache.waiter_count() < 1 {
+            std::thread::yield_now();
+        }
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            cv.notify_all();
+        }
+        assert_eq!(leader.join().unwrap(), vec!["cam-shared"]);
+        assert_eq!(follower.join().unwrap(), vec!["cam-shared"]);
+        assert_eq!(probes.load(Ordering::Acquire), 1, "overlapping callers must share one probe");
+
+        // Now advance past TTL and let a leader panic while a waiter is blocked on it:
+        // the waiter must run a fresh recovery probe rather than returning stale cached data.
+        *clock.lock().unwrap() = start + Duration::from_secs(5);
+        *gate.0.lock().unwrap() = false;
+        let (panic_tx, panic_rx) = std::sync::mpsc::channel();
+        let panicking_leader = {
+            let cache = cache.clone();
+            let clock = clock.clone();
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cache.get_or_probe(
+                        || *clock.lock().unwrap_or_else(PoisonError::into_inner),
+                        || {
+                            let _ = panic_tx.send(());
+                            let (lk, cv) = &*gate;
+                            let mut open = lk.lock().unwrap_or_else(PoisonError::into_inner);
+                            while !*open {
+                                open = cv.wait(open).unwrap_or_else(PoisonError::into_inner);
+                            }
+                            panic!("leader panicked");
+                        },
+                    )
+                }));
+            })
+        };
+        panic_rx.recv().unwrap();
+
+        let waiter = {
+            let cache = cache.clone();
+            let clock = clock.clone();
+            let probes = probes.clone();
+            std::thread::spawn(move || {
+                cache.get_or_probe(
+                    || *clock.lock().unwrap_or_else(PoisonError::into_inner),
+                    || {
+                        probes.fetch_add(1, Ordering::AcqRel);
+                        Some(vec!["cam-after-panic".to_string()])
+                    },
+                )
+            })
+        };
+        while cache.waiter_count() < 1 {
+            std::thread::yield_now();
+        }
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            cv.notify_all();
+        }
+        panicking_leader.join().unwrap();
+        assert_eq!(waiter.join().unwrap(), vec!["cam-after-panic"]);
+        assert_eq!(probes.load(Ordering::Acquire), 2);
     }
 }
