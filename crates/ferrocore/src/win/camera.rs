@@ -7,6 +7,7 @@ use crate::ffsrc::{Live, Nv12Picture, OpenFail, ProbeFail, ffmpeg, stderr_within
 use crate::sound_in::{SoundIn, Which};
 use crate::win_logic::{
     DshowListStatus, DshowOption, dshow_attempts, dshow_matches_id, parse_dshow_options, resolve_dshow_list,
+    resolve_dshow_open_target,
 };
 use crate::{AvError, Picture};
 
@@ -61,10 +62,9 @@ pub fn cameras() -> Vec<Device> {
     struct ResetFlight<'a>(&'a Mutex<ProbeFlight>, &'a Condvar);
     impl Drop for ResetFlight<'_> {
         fn drop(&mut self) {
-            if let Ok(mut g) = self.0.lock() {
-                g.in_flight = false;
-                self.1.notify_all();
-            }
+            let mut g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.in_flight = false;
+            self.1.notify_all();
         }
     }
     let _reset = ResetFlight(lock, cv);
@@ -146,13 +146,22 @@ impl Capture {
         None
     }
 
-    /// A camera by its id (an OBS-style "Name:\\?\usb#…" works too: its name is used).
-    /// Queries DirectShow options first so USB2 capture cards pick high-fps MJPEG (e.g.
-    /// 1080p60) instead of throttled uncompressed YUY2, falling back through MJPEG + asked,
+    /// A camera by its id (`@alt_id`, OBS `"Name:\\?\usb#…"`, or friendly name), resolving
+    /// OBS-style IDs against the enumerated alternative names so duplicate USB cameras open the
+    /// matching device. Queries DirectShow options first so USB2 capture cards pick high-fps MJPEG
+    /// (e.g. 1080p60) instead of throttled uncompressed YUY2, falling back through MJPEG + asked,
     /// asked, and device default, and reading NV12 through the pipe.
     pub fn camera(spec: &crate::engine::CameraSpec) -> Result<Self, AvError> {
         let id = spec.id.as_str();
-        let dev = if id.starts_with('@') { id.to_string() } else { id.split(":\\\\").next().unwrap_or(id).to_string() };
+        let dev = if id.starts_with('@') {
+            id.to_string()
+        } else if id.contains(":\\\\") {
+            let devs = cameras();
+            let pairs: Vec<(&str, &str)> = devs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
+            resolve_dshow_open_target(&pairs, id)
+        } else {
+            id.to_string()
+        };
         let options = resolve_dshow_options(list_dshow_options(&dev), &dev)?;
         let max = spec.size.unwrap_or((1920, 1080));
         let mut last_err = AvError::Source("FFmpeg couldn't open it".into());

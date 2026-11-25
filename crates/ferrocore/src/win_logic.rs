@@ -151,30 +151,80 @@ pub fn strip_exe_suffix(name: &str) -> &str {
     }
 }
 
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+fn ends_with_ascii_ci(haystack: &str, suffix: &str) -> bool {
+    !suffix.is_empty()
+        && haystack.len() >= suffix.len()
+        && haystack.as_bytes()[haystack.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
+fn find_dshow_device_index(devices: &[(&str, &str)], query: &str) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+    if let Some(i) = devices.iter().position(|(id, _)| *id == query) {
+        return Some(i);
+    }
+    if query.starts_with('@') {
+        return devices.iter().position(|(id, _)| id.eq_ignore_ascii_case(query));
+    }
+    if let Some((friendly, path)) = query.split_once(":\\\\") {
+        // OBS stores `Name:\\?\usb#...`; prefer matching the unique non-empty path suffix inside
+        // `alt_id`, falling back to friendly name only when unambiguous with a non-empty id.
+        if !path.is_empty() {
+            let path_with_prefix = format!(r"\\{path}");
+            if let Some(i) =
+                devices.iter().position(|(id, _)| !id.is_empty() && ends_with_ascii_ci(id, &path_with_prefix))
+            {
+                return Some(i);
+            }
+            if let Some(i) = devices.iter().position(|(id, _)| !id.is_empty() && contains_ascii_ci(id, path)) {
+                return Some(i);
+            }
+        }
+        let mut matches = devices.iter().enumerate().filter(|(_, (_, name))| *name == friendly);
+        if let Some((idx, (id, _))) = matches.next()
+            && matches.next().is_none()
+            && !id.is_empty()
+        {
+            return Some(idx);
+        }
+        return None;
+    }
+    devices.iter().position(|(_, name)| *name == query)
+}
+
 /// Resolves a DirectShow identifier (`@alt_id`, `"Friendly Name"`, or OBS `"Friendly:\\\\?\\path"`)
 /// against enumerated `(alt_id, friendly_name)` pairs while preserving exact alt-ID matching when
 /// multiple devices share a friendly name.
 pub fn dshow_matches_id(devices: &[(&str, &str)], query: &str) -> bool {
-    if query.is_empty() {
-        return false;
-    }
+    find_dshow_device_index(devices, query).is_some()
+}
+
+/// Resolves a configured camera id (`@alt_id`, OBS `"Friendly:\\\\?\\path"`, or friendly name) to
+/// the enumerated DirectShow alternative name when possible so duplicate USB cameras open the
+/// matching device instead of colliding on the first friendly-name match.
+pub fn resolve_dshow_open_target(devices: &[(&str, &str)], query: &str) -> String {
     if query.starts_with('@') {
-        return devices.iter().any(|(id, _)| *id == query);
+        return find_dshow_device_index(devices, query)
+            .map(|i| devices[i].0)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(query)
+            .to_string();
     }
-    if devices.iter().any(|(id, _)| *id == query) {
-        return true;
+    if let Some((friendly, _)) = query.split_once(":\\\\") {
+        return find_dshow_device_index(devices, query)
+            .map(|i| devices[i].0)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(friendly)
+            .to_string();
     }
-    if let Some((friendly, path)) = query.split_once(":\\\\") {
-        // OBS stores `Name:\\?\usb#...`; prefer matching the unique path suffix inside `alt_id`
-        // when present, falling back to friendly name only if unambiguous.
-        let path_with_prefix = format!(r"\\{path}");
-        if devices.iter().any(|(id, _)| id.ends_with(&path_with_prefix) || id.contains(path)) {
-            return true;
-        }
-        return devices.iter().filter(|(_, name)| *name == friendly).count() == 1
-            && devices.iter().all(|(id, _)| !id.is_empty());
-    }
-    devices.iter().any(|(_, name)| *name == query)
+    query.to_string()
 }
 
 /// DirectShow format/codec family parsed from `ffmpeg -list_options true`.
@@ -666,5 +716,57 @@ mod tests {
         assert!(!dshow_matches_id(&devs, r"USB Camera:\\?\usb#vid_999#mi_00"));
         assert!(dshow_matches_id(&devs, r"Sony Cam:\\?\usb#other_path"));
         assert!(!dshow_matches_id(&devs, "Missing Cam"));
+    }
+
+    #[test]
+    fn dshow_matches_id_rejects_empty_path_wildcard_handles_case_and_unrelated_empty_id() {
+        let devs = [
+            (r"@device_pnp_\\?\usb#vid_04f2&pid_b6bf#mi_00", "USB Camera"),
+            (r"@device_pnp_\\?\usb#vid_04f2&pid_b6c0#mi_00", "USB Camera"),
+            (r"@device_pnp_\\?\usb#vid_1234&pid_5678#mi_00", "Sony Cam"),
+            ("", "OBS Virtual Camera"),
+        ];
+        // Empty path after `:\\` must never act as a wildcard across devices.
+        assert!(!dshow_matches_id(&devs, r"Missing Cam:\\"));
+        assert!(!dshow_matches_id(&devs, r"USB Camera:\\"));
+        // Windows PnP hex/prefix case differences must still match.
+        assert!(dshow_matches_id(&devs, r"USB Camera:\\?\USB#VID_04F2&PID_B6C0#MI_00"));
+        assert!(dshow_matches_id(&devs, r"@device_pnp_\\?\USB#VID_04F2&PID_B6BF#MI_00"));
+        // An unrelated empty-alt virtual device must not block unique friendly-name fallback for Sony Cam,
+        // while a unique empty-alt virtual device itself refuses ambiguous `:\\` fallback.
+        assert!(dshow_matches_id(&devs, r"Sony Cam:\\?\usb#other_path"));
+        assert!(!dshow_matches_id(&devs, r"OBS Virtual Camera:\\?\usb#other_path"));
+        assert!(dshow_matches_id(&devs, "OBS Virtual Camera"));
+    }
+
+    #[test]
+    fn resolve_dshow_open_target_selects_matching_duplicate_camera_alt_name() {
+        let devs = [
+            (r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam1", "USB Video"),
+            (r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam2", "USB Video"),
+            (r"@device_pnp_\\?\usb#vid_054c&pid_0001#solo", "Sony Cam"),
+            ("", "OBS Virtual Camera"),
+        ];
+        // Second identical USB camera resolves to its own @device_pnp alternative name, never the first.
+        assert_eq!(
+            resolve_dshow_open_target(&devs, r"USB Video:\\?\usb#vid_046d&pid_082d#cam2"),
+            r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam2"
+        );
+        // Case-insensitive PnP match still resolves to the enumerated alt name.
+        assert_eq!(
+            resolve_dshow_open_target(&devs, r"USB Video:\\?\USB#VID_046D&PID_082D#CAM2"),
+            r"@device_pnp_\\?\usb#vid_046d&pid_082d#cam2"
+        );
+        // Absent duplicate falls back cleanly to friendly name instead of an unrelated camera's alt id.
+        assert_eq!(resolve_dshow_open_target(&devs, r"USB Video:\\?\usb#missing_port"), "USB Video");
+        assert_eq!(resolve_dshow_open_target(&devs, r"USB Video:\\"), "USB Video");
+        // Unique camera with moved USB port falls back to its own alt id even when virtual cam has empty id.
+        assert_eq!(
+            resolve_dshow_open_target(&devs, r"Sony Cam:\\?\usb#other_port"),
+            r"@device_pnp_\\?\usb#vid_054c&pid_0001#solo"
+        );
+        // Unique device with empty alt id falls back to friendly name.
+        assert_eq!(resolve_dshow_open_target(&devs, r"OBS Virtual Camera:\\?\usb#other"), "OBS Virtual Camera");
+        assert_eq!(resolve_dshow_open_target(&devs, "USB Video"), "USB Video");
     }
 }
