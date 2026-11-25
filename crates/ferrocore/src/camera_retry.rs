@@ -79,6 +79,7 @@ pub struct CameraRetry {
     was_visible: bool,
     ever_sent: bool,
     no_signal: bool,
+    no_signal_tries: u32,
 }
 
 impl CameraRetry {
@@ -96,6 +97,7 @@ impl CameraRetry {
             was_visible: true,
             ever_sent: false,
             no_signal: false,
+            no_signal_tries: 0,
         }
     }
 
@@ -113,6 +115,7 @@ impl CameraRetry {
             was_visible: true,
             ever_sent: false,
             no_signal: false,
+            no_signal_tries: 0,
         }
     }
 
@@ -161,16 +164,22 @@ impl CameraRetry {
         self.next_try_ns = now_ns;
         self.tries = 0;
         self.no_signal = false;
+        self.no_signal_tries = 0;
         self.interrupted_since_ns = 0;
         self.since_ns = now_ns;
     }
 
     /// Clears waiting state once a fresh video frame renders on the source.
     pub fn on_frame_uploaded(&mut self, now_ns: u64) {
+        if self.no_signal {
+            self.tries = 0;
+            self.next_try_ns = now_ns;
+        }
         self.state = CameraState::Live;
         self.reason = None;
         self.ever_sent = true;
         self.no_signal = false;
+        self.no_signal_tries = 0;
         self.interrupted_since_ns = 0;
         self.since_ns = now_ns;
     }
@@ -261,6 +270,7 @@ impl CameraRetry {
             if self.state == CameraState::Waiting || !obs.running || obs.ended {
                 self.next_try_ns = obs.now_ns;
                 self.tries = 0;
+                self.no_signal_tries = 0;
                 self.since_ns = obs.now_ns;
             }
         }
@@ -291,6 +301,7 @@ impl CameraRetry {
                 let woke_from_no_signal = self.no_signal;
                 self.ever_sent = true;
                 self.no_signal = false;
+                self.no_signal_tries = 0;
                 self.interrupted_since_ns = 0;
                 self.state = CameraState::Live;
                 self.reason = None;
@@ -346,7 +357,7 @@ impl CameraRetry {
         let limit = if obs.frames > 0 { CAMERA_STALL_NS } else { CAMERA_FIRST_FRAME_NS };
         if obs.now_ns.saturating_sub(self.since_ns) > limit {
             self.flowing_since_ns = 0;
-            if !self.ever_sent && self.tries >= NO_SIGNAL_MAX_TRIES {
+            if !self.ever_sent && self.no_signal_tries >= NO_SIGNAL_MAX_TRIES {
                 // Keep a healthy 0-frame capture session open quietly (e.g. powered-off console
                 // on an HDMI capture card) until a signal arrives or the device disconnects.
                 self.no_signal = true;
@@ -359,7 +370,14 @@ impl CameraRetry {
                 self.reason = Some(WAITING_MESSAGE.into());
             }
             let why = if obs.frames > 0 { "the camera stopped sending" } else { "the camera hasn't sent a frame yet" };
-            return if obs.now_ns >= self.next_try_ns { CameraAction::Reopen(why) } else { CameraAction::Keep };
+            return if obs.now_ns >= self.next_try_ns {
+                if !self.ever_sent && obs.frames == 0 {
+                    self.no_signal_tries = self.no_signal_tries.saturating_add(1);
+                }
+                CameraAction::Reopen(why)
+            } else {
+                CameraAction::Keep
+            };
         }
 
         CameraAction::Keep
@@ -533,5 +551,42 @@ mod tests {
         // Stuck interrupted past grace window triggers a single reopen.
         assert_eq!(policy.step(int_obs(11, 20 * SEC)), CameraAction::Keep);
         assert!(matches!(policy.step(int_obs(11, 20 * SEC + CAMERA_INTERRUPTION_GRACE_NS)), CameraAction::Reopen(_)));
+    }
+
+    #[test]
+    fn failed_opens_do_not_exhaust_no_signal_startup_tries_and_render_wake_resets_backoff() {
+        let mut policy = CameraRetry::new(0);
+        let mut t = 0;
+        // Three failed offline opens (`running = false`) advance `tries` to 3 without counting as
+        // zero-frame startup windows on an actually open session.
+        for _ in 0..3 {
+            t += CAMERA_BACKOFF_MAX_NS + SEC;
+            assert!(matches!(policy.step(obs(false, 0, false, t)), CameraAction::Reopen(_)));
+            let p = policy.on_reopen_started(t);
+            policy.on_reopen_finished(p, false, t, Some("disconnected"));
+        }
+        assert_eq!(policy.tries(), 3);
+
+        // Once the card finally opens, it still gets all 3 zero-frame startup windows before latching no_signal.
+        let p = policy.on_reopen_started(t);
+        policy.on_reopen_finished(p, true, t, None);
+        for _ in 0..NO_SIGNAL_MAX_TRIES {
+            t += CAMERA_BACKOFF_MAX_NS + CAMERA_FIRST_FRAME_NS + SEC;
+            assert!(matches!(policy.step(obs(true, 0, false, t)), CameraAction::Reopen(_)));
+            let p = policy.on_reopen_started(t);
+            policy.on_reopen_finished(p, true, t, None);
+        }
+        assert!(!policy.is_no_signal());
+
+        t += CAMERA_BACKOFF_MAX_NS + CAMERA_FIRST_FRAME_NS + SEC;
+        assert_eq!(policy.step(obs(true, 0, false, t)), CameraAction::Keep);
+        assert!(policy.is_no_signal());
+
+        // When the render loop calls on_frame_uploaded before the next watchdog tick, tries and
+        // next_try_ns reset immediately so subsequent recovery doesn't carry stale no-signal backoff.
+        policy.on_frame_uploaded(t + SEC);
+        assert!(!policy.is_no_signal());
+        assert_eq!(policy.tries(), 0);
+        assert_eq!(policy.next_try_ns(), t + SEC);
     }
 }
