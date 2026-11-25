@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{AllocAnyThread, DefinedClass, define_class, msg_send, sel};
+use objc2::{AllocAnyThread, ClassType, DefinedClass, define_class, msg_send, sel};
 use objc2_av_foundation::{
     AVCaptureAudioDataOutput, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureConnection, AVCaptureDevice,
     AVCaptureDeviceDiscoverySession, AVCaptureDeviceInput, AVCaptureDevicePosition, AVCaptureDeviceType,
@@ -363,7 +363,7 @@ define_class!(
         #[unsafe(method(deviceDisconnected:))]
         fn device_disconnected(&self, note: &NSNotification) {
             if let Some(obj) = note.object()
-                && let Ok(dev) = obj.downcast::<AVCaptureDevice>()
+                && let Some(dev) = as_av_capture_device(&obj)
             {
                 // SAFETY: reading uniqueID from a live AVCaptureDevice in notification.
                 let id = unsafe { dev.uniqueID() }.to_string();
@@ -467,11 +467,63 @@ impl Drop for NotificationGuard {
     }
 }
 
+/// Checks `AVCaptureDevice` inheritance via Objective-C class pointers rather than
+/// `isKindOfClass:`, because `AVCaptureHALDevice` exposes a malformed `"b@:#"` encoding on
+/// `isKindOfClass:` that triggers `objc2`'s debug signature check panic.
+fn as_av_capture_device(obj: &AnyObject) -> Option<&AVCaptureDevice> {
+    let target = AVCaptureDevice::class();
+    let mut cur = Some(obj.class());
+    while let Some(cls) = cur {
+        if std::ptr::eq(cls, target) {
+            // SAFETY: runtime class hierarchy confirms `obj` is an `AVCaptureDevice` subclass.
+            return Some(unsafe { &*(std::ptr::from_ref(obj).cast::<AVCaptureDevice>()) });
+        }
+        cur = cls.superclass();
+    }
+    None
+}
+
+fn is_video_or_muxed(dev: &AVCaptureDevice) -> bool {
+    // SAFETY: checking static AVFoundation media-type constants on a live AVCaptureDevice.
+    unsafe {
+        AVMediaTypeVideo.is_some_and(|t| dev.hasMediaType(t)) || AVMediaTypeMuxed.is_some_and(|t| dev.hasMediaType(t))
+    }
+}
+
+fn is_audio_device(dev: &AVCaptureDevice) -> bool {
+    // SAFETY: checking static AVFoundation media-type constant on a live AVCaptureDevice.
+    unsafe { AVMediaTypeAudio.is_some_and(|t| dev.hasMediaType(t)) }
+}
+
+fn is_devices_key_path(key_path: Option<&NSString>) -> bool {
+    key_path.is_some_and(|kp| kp.to_string() == "devices")
+}
+
+fn discovery_device_ids(sessions: &[Retained<AVCaptureDeviceDiscoverySession>]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    // SAFETY: reading `.devices()` from live retained discovery sessions owned by the caller.
+    unsafe {
+        for s in sessions {
+            for d in s.devices().iter() {
+                ids.insert(d.uniqueID().to_string());
+            }
+        }
+    }
+    ids
+}
+
+struct HotplugIvars {
+    /// Video/muxed device IDs last observed across the retained discovery sessions.
+    known: Mutex<HashSet<String>>,
+    /// Retained discovery sessions observed via KVO (`AVMediaTypeVideo` and `AVMediaTypeMuxed`).
+    sessions: Vec<Retained<AVCaptureDeviceDiscoverySession>>,
+}
+
 define_class!(
-    // SAFETY: NSObject may be subclassed; the ivars are a Mutex dropped with the observer.
+    // SAFETY: NSObject may be subclassed; ivars are a Mutex + Retained ObjC discovery sessions.
     #[unsafe(super(NSObject))]
     #[name = "FerrocastHotplugObserver"]
-    #[ivars = Mutex<HashSet<String>>]
+    #[ivars = HotplugIvars]
     struct HotplugObserver;
 
     unsafe impl NSObjectProtocol for HotplugObserver {}
@@ -480,13 +532,11 @@ define_class!(
         #[unsafe(method(hotplugConnected:))]
         fn hotplug_connected(&self, note: &NSNotification) {
             if let Some(obj) = note.object()
-                && let Ok(dev) = obj.downcast::<AVCaptureDevice>()
+                && let Some(dev) = as_av_capture_device(&obj)
+                && (is_video_or_muxed(dev) || is_audio_device(dev))
             {
                 // SAFETY: reading uniqueID from a live AVCaptureDevice in notification.
                 let id = unsafe { dev.uniqueID() }.to_string();
-                if let Ok(mut known) = self.ivars().lock() {
-                    known.insert(id.clone());
-                }
                 record_hotplug_connected(id);
             }
         }
@@ -494,13 +544,11 @@ define_class!(
         #[unsafe(method(hotplugDisconnected:))]
         fn hotplug_disconnected(&self, note: &NSNotification) {
             if let Some(obj) = note.object()
-                && let Ok(dev) = obj.downcast::<AVCaptureDevice>()
+                && let Some(dev) = as_av_capture_device(&obj)
+                && (is_video_or_muxed(dev) || is_audio_device(dev))
             {
                 // SAFETY: reading uniqueID from a live AVCaptureDevice in notification.
                 let id = unsafe { dev.uniqueID() }.to_string();
-                if let Ok(mut known) = self.ivars().lock() {
-                    known.remove(&id);
-                }
                 record_hotplug_disconnected(&id);
             }
         }
@@ -508,14 +556,22 @@ define_class!(
         #[unsafe(method(observeValueForKeyPath:ofObject:change:context:))]
         fn observe_value(
             &self,
-            _key_path: Option<&NSString>,
-            _object: Option<&AnyObject>,
+            key_path: Option<&NSString>,
+            object: Option<&AnyObject>,
             _change: Option<&AnyObject>,
             _context: *mut c_void,
         ) {
-            let next: HashSet<String> = discover_cameras().into_iter().map(|d| d.id).collect();
+            if !is_devices_key_path(key_path) {
+                return;
+            }
+            let sessions = &self.ivars().sessions;
+            let Some(obj) = object else { return };
+            if !sessions.iter().any(|s| std::ptr::eq(Retained::as_ptr(s).cast::<AnyObject>(), obj)) {
+                return;
+            }
+            let next = discovery_device_ids(sessions);
             let (added, removed) = {
-                let Ok(mut known) = self.ivars().lock() else { return };
+                let Ok(mut known) = self.ivars().known.lock() else { return };
                 let diff = diff_device_sets(&known, &next);
                 *known = next;
                 diff
@@ -530,12 +586,20 @@ define_class!(
     }
 );
 
-struct HotplugGuard {
-    _observer: Retained<HotplugObserver>,
-    _discovery: Vec<Retained<AVCaptureDeviceDiscoverySession>>,
+impl HotplugObserver {
+    fn new(sessions: Vec<Retained<AVCaptureDeviceDiscoverySession>>, initial: HashSet<String>) -> Retained<Self> {
+        let this: Allocated<Self> = Self::alloc();
+        let this = this.set_ivars(HotplugIvars { known: Mutex::new(initial), sessions });
+        // SAFETY: NSObject init on freshly allocated HotplugObserver with initialized ivars.
+        unsafe { msg_send![super(this), init] }
+    }
 }
 
-// SAFETY: `HotplugGuard` lives forever in a `OnceLock` and only touches atomics/mutexes.
+struct HotplugGuard {
+    _observer: Retained<HotplugObserver>,
+}
+
+// SAFETY: `HotplugGuard` lives forever in a `OnceLock` and only touches atomics/mutexes/retained sessions.
 unsafe impl Send for HotplugGuard {}
 // SAFETY: `HotplugGuard` is immutable after initialization in `OnceLock`.
 unsafe impl Sync for HotplugGuard {}
@@ -544,23 +608,12 @@ fn ensure_hotplug_listener() {
     static ONCE: OnceLock<HotplugGuard> = OnceLock::new();
     ONCE.get_or_init(|| {
         let discovery = camera_discovery_sessions();
-        let mut initial = HashSet::new();
-        // SAFETY: reading `.devices()` from newly created discovery sessions before installing KVO.
-        unsafe {
-            for s in &discovery {
-                for d in s.devices().iter() {
-                    initial.insert(d.uniqueID().to_string());
-                }
-            }
-        }
-        let this: Allocated<HotplugObserver> = HotplugObserver::alloc();
-        let this = this.set_ivars(Mutex::new(initial));
-        // SAFETY: NSObject's init on freshly allocated observer, registered for process lifetime.
-        let obs: Retained<HotplugObserver> = unsafe { msg_send![super(this), init] };
+        let initial = discovery_device_ids(&discovery);
+        let obs = HotplugObserver::new(discovery, initial);
         let key_path = NSString::from_str("devices");
         let null_ctx: *mut c_void = std::ptr::null_mut();
-        // SAFETY: observer and discovery sessions both stay alive for the process lifetime via
-        // `OnceLock`, so notifications and KVO registrations never outlive either object.
+        // SAFETY: observer and retained discovery sessions both stay alive for the process lifetime
+        // via `OnceLock`, so notifications and KVO registrations never outlive either object.
         unsafe {
             let center = NSNotificationCenter::defaultCenter();
             center.addObserver_selector_name_object(
@@ -575,12 +628,12 @@ fn ensure_hotplug_listener() {
                 Some(AVCaptureDeviceWasDisconnectedNotification),
                 None,
             );
-            for s in &discovery {
+            for s in &obs.ivars().sessions {
                 let _: () =
                     msg_send![&**s, addObserver: &*obs, forKeyPath: &*key_path, options: 0usize, context: null_ctx];
             }
         }
-        HotplugGuard { _observer: obs, _discovery: discovery }
+        HotplugGuard { _observer: obs }
     });
 }
 
@@ -1704,5 +1757,157 @@ mod tests {
         let (added, removed) = diff_device_sets(&prev, &next);
         assert_eq!(added, vec!["deskview"]);
         assert_eq!(removed, vec!["iphone"]);
+    }
+
+    #[test]
+    fn hotplug_kvo_ignores_wrong_key_path_and_foreign_object() {
+        use super::{HOTPLUG_EPOCH, HotplugObserver, camera_discovery_sessions, discovery_device_ids};
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2::{AnyThread, DefinedClass, msg_send};
+        use objc2_foundation::{NSNotification, NSString};
+        use std::collections::HashSet;
+        use std::ffi::c_void;
+        use std::sync::atomic::Ordering;
+
+        let _guard = hotplug_test_lock();
+        let sessions = camera_discovery_sessions();
+        assert!(!sessions.is_empty(), "macOS must provide at least one camera discovery session");
+
+        let mut initial: HashSet<String> = discovery_device_ids(&sessions);
+        initial.insert("synthetic-orphan-cam".into());
+        let obs = HotplugObserver::new(sessions.clone(), initial);
+
+        let wrong_kp = NSString::from_str("running");
+        let devices_kp = NSString::from_str("devices");
+        let foreign = NSString::from_str("not-a-discovery-session");
+        // SAFETY: live session / foreign NSString cast as &AnyObject for synthetic KVO dispatch.
+        let session_obj: &AnyObject = unsafe { &*(Retained::as_ptr(&sessions[0]).cast::<AnyObject>()) };
+        let foreign_obj: &AnyObject = foreign.as_ref();
+        let null_ctx: *mut c_void = std::ptr::null_mut();
+
+        let epoch0 = HOTPLUG_EPOCH.load(Ordering::Acquire);
+        // SAFETY: direct selector dispatch with wrong keyPath must be ignored.
+        let _: () = unsafe {
+            msg_send![
+                &*obs,
+                observeValueForKeyPath: &*wrong_kp,
+                ofObject: Some(session_obj),
+                change: None::<&AnyObject>,
+                context: null_ctx
+            ]
+        };
+        assert_eq!(HOTPLUG_EPOCH.load(Ordering::Acquire), epoch0, "wrong keyPath must be ignored");
+        assert!(obs.ivars().known.lock().unwrap().contains("synthetic-orphan-cam"));
+
+        // SAFETY: direct selector dispatch with foreign object must be ignored.
+        let _: () = unsafe {
+            msg_send![
+                &*obs,
+                observeValueForKeyPath: &*devices_kp,
+                ofObject: Some(foreign_obj),
+                change: None::<&AnyObject>,
+                context: null_ctx
+            ]
+        };
+        assert_eq!(HOTPLUG_EPOCH.load(Ordering::Acquire), epoch0, "foreign object must be ignored");
+        assert!(obs.ivars().known.lock().unwrap().contains("synthetic-orphan-cam"));
+
+        // SAFETY: non-AVCaptureDevice notification object must be ignored safely without mutating known.
+        let note_name = NSString::from_str("AVCaptureDeviceWasConnectedNotification");
+        // SAFETY: creating synthetic NSNotification with non-device object for handler guard test.
+        let non_device_note = unsafe {
+            NSNotification::initWithName_object_userInfo(NSNotification::alloc(), &note_name, Some(foreign_obj), None)
+        };
+        // SAFETY: direct selector dispatch on local HotplugObserver.
+        let _: () = unsafe { msg_send![&*obs, hotplugConnected: &*non_device_note] };
+        assert_eq!(HOTPLUG_EPOCH.load(Ordering::Acquire), epoch0);
+
+        // SAFETY: valid keyPath ("devices") on an owned discovery session diffs against sessions.
+        let _: () = unsafe {
+            msg_send![
+                &*obs,
+                observeValueForKeyPath: &*devices_kp,
+                ofObject: Some(session_obj),
+                change: None::<&AnyObject>,
+                context: null_ctx
+            ]
+        };
+        let epoch1 = HOTPLUG_EPOCH.load(Ordering::Acquire);
+        assert!(epoch1 > epoch0, "valid KVO change removing orphan id must bump hotplug epoch");
+        assert!(!obs.ivars().known.lock().unwrap().contains("synthetic-orphan-cam"));
+
+        // SAFETY: duplicate KVO callback with identical devices must be a no-op.
+        let _: () = unsafe {
+            msg_send![
+                &*obs,
+                observeValueForKeyPath: &*devices_kp,
+                ofObject: Some(session_obj),
+                change: None::<&AnyObject>,
+                context: null_ctx
+            ]
+        };
+        assert_eq!(HOTPLUG_EPOCH.load(Ordering::Acquire), epoch1, "identical discovery set must not bump epoch");
+    }
+
+    #[test]
+    fn hotplug_notifications_do_not_pollute_discovery_known_set() {
+        use super::{HOTPLUG_EPOCH, HotplugObserver, camera_discovery_sessions, discovery_device_ids};
+        use objc2::AnyThread;
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2::{DefinedClass, msg_send};
+        use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio};
+        use objc2_foundation::{NSNotification, NSString};
+        use std::ffi::c_void;
+        use std::sync::atomic::Ordering;
+
+        let _guard = hotplug_test_lock();
+        let sessions = camera_discovery_sessions();
+        let initial = discovery_device_ids(&sessions);
+        let obs = HotplugObserver::new(sessions.clone(), initial.clone());
+
+        // Prove notifications (for audio mics or cameras) never alter `known`, so KVO never emits
+        // a phantom disconnect for an audio device.
+        let audio_dev =
+            // SAFETY: querying static AVMediaTypeAudio default device if present on host.
+            unsafe { AVMediaTypeAudio.and_then(|k| AVCaptureDevice::defaultDeviceWithMediaType(k)) };
+        if let Some(audio_dev) = audio_dev {
+            // SAFETY: reading uniqueID from live AVCaptureDevice.
+            let dev_id = unsafe { audio_dev.uniqueID() }.to_string();
+            let note_name = NSString::from_str("AVCaptureDeviceWasConnectedNotification");
+            // SAFETY: Retained<AVCaptureDevice> points to a live ObjC object.
+            let dev_obj: &AnyObject = unsafe { &*(Retained::as_ptr(&audio_dev).cast::<AnyObject>()) };
+            // SAFETY: creating synthetic NSNotification with real AVCaptureDevice object.
+            let note = unsafe {
+                NSNotification::initWithName_object_userInfo(NSNotification::alloc(), &note_name, Some(dev_obj), None)
+            };
+            // SAFETY: direct selector dispatch on local HotplugObserver.
+            let _: () = unsafe { msg_send![&*obs, hotplugConnected: &*note] };
+            assert_eq!(*obs.ivars().known.lock().unwrap(), initial, "notification must not insert into known");
+
+            // SAFETY: direct selector dispatch on local HotplugObserver for disconnect notification.
+            let _: () = unsafe { msg_send![&*obs, hotplugDisconnected: &*note] };
+            assert_eq!(*obs.ivars().known.lock().unwrap(), initial, "disconnect notification must not mutate known");
+
+            if !initial.contains(&dev_id) && !sessions.is_empty() {
+                let devices_kp = NSString::from_str("devices");
+                // SAFETY: Retained<AVCaptureDeviceDiscoverySession> points to a live ObjC object.
+                let session_obj: &AnyObject = unsafe { &*(Retained::as_ptr(&sessions[0]).cast::<AnyObject>()) };
+                let null_ctx: *mut c_void = std::ptr::null_mut();
+                let epoch_before = HOTPLUG_EPOCH.load(Ordering::Acquire);
+                // SAFETY: invoking KVO callback must not see audio device as removed from known.
+                let _: () = unsafe {
+                    msg_send![
+                        &*obs,
+                        observeValueForKeyPath: &*devices_kp,
+                        ofObject: Some(session_obj),
+                        change: None::<&AnyObject>,
+                        context: null_ctx
+                    ]
+                };
+                assert_eq!(HOTPLUG_EPOCH.load(Ordering::Acquire), epoch_before);
+            }
+        }
     }
 }
