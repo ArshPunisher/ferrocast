@@ -1438,10 +1438,7 @@ impl Stage {
                 .rev()
                 .map(|c| {
                     let mut ci = self.info_with(c, false);
-                    let f = ci.frame;
-                    let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
-                    let on = unit.then(&a);
-                    ci.frame = [on.a, on.b, on.c, on.d, on.e, on.f];
+                    ci.frame = Self::compose_frame(ci.frame, &a);
                     ci
                 })
                 .collect()
@@ -1843,10 +1840,7 @@ impl Stage {
             let it = self.item(scene, id)?;
             let mut info = self.info_of(&it);
             if let Some(gi) = gid.and_then(|g| self.item(scene, g).ok()) {
-                let f = info.frame;
-                let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
-                let on = unit.then(&self.group_map(&gi));
-                info.frame = [on.a, on.b, on.c, on.d, on.e, on.f];
+                info.frame = Self::compose_frame(info.frame, &self.group_map(&gi));
             }
             return Ok(info);
         }
@@ -1999,8 +1993,23 @@ impl Stage {
             (t.bounds_width, t.bounds_height, t.alignment, t.bounds_alignment) = (nw, nh, 5, 5);
         }
         self.set_transform_placing(scene, id, t, (0.0, 0.0), target)?;
+        self.canvas_info(scene, id)
+    }
+
+    fn compose_frame(f: [f32; 6], map: &ferrocore::Affine) -> [f32; 6] {
+        let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
+        let on = unit.then(map);
+        [on.a, on.b, on.c, on.d, on.e, on.f]
+    }
+
+    /// An item's info with `frame` in canvas coordinates (composed with any enclosing group).
+    fn canvas_info(&self, scene: &str, id: i64) -> Result<ItemInfo, StudioError> {
         let it = self.item(scene, id)?;
-        Ok(self.info_of(&it))
+        let mut info = self.info_of(&it);
+        if let Some(gi) = self.group_of(scene, id) {
+            info.frame = Self::compose_frame(info.frame, &self.group_map(&gi));
+        }
+        Ok(info)
     }
 
     /// Where an item is in its scene (0 is the top) and the scene's name.
@@ -2026,13 +2035,7 @@ impl Stage {
     /// before any flip: the picture's top-left is (0, 0)) is on the canvas, through its group
     /// inside one.
     fn item_point(&self, scene: &str, id: i64, at: (f32, f32)) -> Result<(f32, f32), StudioError> {
-        let it = self.item(scene, id)?;
-        let mut f = self.info_of(&it).frame;
-        if let Some(gi) = self.group_of(scene, id) {
-            let unit = ferrocore::Affine { a: f[0], b: f[1], c: f[2], d: f[3], e: f[4], f: f[5] };
-            let on = unit.then(&self.group_map(&gi));
-            f = [on.a, on.b, on.c, on.d, on.e, on.f];
-        }
+        let f = self.canvas_info(scene, id)?.frame;
         Ok((f[4] + f[0] * at.0 + f[2] * at.1, f[5] + f[1] * at.0 + f[3] * at.1))
     }
 
@@ -9142,6 +9145,35 @@ mod tests {
         let t = ok(s.transform("Main", it.id));
         assert!(t.crop_left + t.crop_right <= 199 && t.crop_top + t.crop_bottom <= 99, "{t:?}");
         assert!(ok(s.item_point("Main", it.id, (0.5, 0.5))).0.is_finite());
+    }
+
+    /// `set_item_crop` on a grouped source must return the same canvas-space frame that `items()`
+    /// reports, including the enclosing group's offset and scale.
+    #[test]
+    fn set_item_crop_returns_canvas_frame_for_grouped_item() {
+        let s = stage();
+        let a = ok(s.add_source("Main", "color_source_v3", "GA", &json!({ "width": 200, "height": 100 }), false));
+        let b = ok(s.add_source("Main", "color_source_v3", "GB", &json!({ "width": 60, "height": 60 }), false));
+        ok(s.set_item_boxes("Main", &[(a.id, 100.0, 100.0, 200.0, 100.0), (b.id, 400.0, 200.0, 60.0, 60.0)]));
+        let g = ok(s.group_together("Main", &[a.id, b.id], "Pair"));
+        let gb = ok(s.items("Main")).into_iter().find(|i| i.id == g.id).unwrap_or_else(|| panic!("group missing"));
+        let (gw, gh) = (gb.frame[0].hypot(gb.frame[1]), gb.frame[2].hypot(gb.frame[3]));
+        ok(s.set_item_box("Main", g.id, 300.0, 150.0, gw * 2.0, gh * 0.5));
+
+        let returned = ok(s.set_item_crop("Main", a.id, [40, 10, 20, 5]));
+        let actual = ok(s.items("Main"))
+            .into_iter()
+            .find(|i| i.id == g.id)
+            .and_then(|grp| grp.children.into_iter().find(|c| c.id == a.id))
+            .unwrap_or_else(|| panic!("grouped child missing"));
+        for k in 0..6 {
+            assert!(
+                (returned.frame[k] - actual.frame[k]).abs() < 1e-3,
+                "frame[{k}] mismatch: returned={:?}, actual={:?}",
+                returned.frame,
+                actual.frame
+            );
+        }
     }
 
     /// An engine that cannot start (no graphics adapter) must not be tried thirty times a second
