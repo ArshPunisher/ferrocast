@@ -336,7 +336,13 @@ impl History {
         }
         let now = c.snapshot();
         if b.join {
-            if let Some(top) = self.undo.last_mut() {
+            let pop_noop = self.undo.last_mut().is_some_and(|top| {
+                // Dragging or sliding back to the exact origin before the step settles is a no-op
+                // and must not remain on the undo stack (keep mid-drag open steps until release).
+                let will_be_open = !b.closes && (b.open || top.open);
+                if !will_be_open && top.before == now {
+                    return true;
+                }
                 top.at = Instant::now();
                 top.after = now;
                 // The step's size follows its collection (a drag that added to it grows it).
@@ -346,6 +352,10 @@ impl History {
                 } else if b.open {
                     top.open = true;
                 }
+                false
+            });
+            if pop_noop {
+                self.undo.pop();
             }
             self.redo.clear();
             self.trim();
@@ -561,6 +571,82 @@ mod tests {
         go(&mut h, 80.0, true);
         assert_eq!(h.list().0.len(), 1, "one step: {:?}", h.list().0);
         assert!(h.undo.last().is_some_and(|s| !s.open), "the save closes it");
+    }
+
+    /// Dragging a source (or sources / crop) away and back to its exact origin before releasing
+    /// must drop the joined step instead of leaving a no-op undo entry.
+    #[test]
+    fn dragging_away_and_back_to_origin_leaves_no_noop_undo_step() {
+        use ferrocast_engine::studio_host::ItemBoxIn;
+        let c = stage();
+        let mut h = History::default();
+        let a = c
+            .add_source("Main", "color_source_v3", "A", &serde_json::json!({ "width": 100, "height": 100 }), false)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .id;
+
+        let move_a = |h: &mut History, x: f32, save: bool| {
+            let act = StudioAct::SetItemBox { scene: "Main".into(), id: a, x, y: 0.0, w: 100.0, h: 100.0, save };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> =
+                c.set_item_box("Main", a, x, 0.0, 100.0, 100.0).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+
+        // 1. Single-item drag away and back to exact (0, 0) on release: no undo step left.
+        move_a(&mut h, 40.0, false);
+        move_a(&mut h, 80.0, false);
+        assert_eq!(h.list().0, ["Move A"]);
+        move_a(&mut h, 0.0, true);
+        assert!(h.list().0.is_empty(), "single-item round-trip left no-op undo step: {:?}", h.list().0);
+
+        // 2. Passing through origin mid-drag (`save: false`) still records the step if released away.
+        move_a(&mut h, 50.0, false);
+        move_a(&mut h, 0.0, false);
+        move_a(&mut h, 25.0, true);
+        assert_eq!(h.list().0, ["Move A"]);
+        assert_eq!(h.undo(&c), Ok(Some("Move A".into())));
+
+        // 3. Multi-item batch drag away and back to origin: no undo step left either.
+        let b = c
+            .add_source("Main", "color_source_v3", "B", &serde_json::json!({ "width": 50, "height": 50 }), false)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .id;
+        let move_ab = |h: &mut History, x: f32, save: bool| {
+            let items = vec![
+                ItemBoxIn { id: a, x, y: 0.0, w: 100.0, h: 100.0 },
+                ItemBoxIn { id: b, x, y: 0.0, w: 50.0, h: 50.0 },
+            ];
+            let act = StudioAct::SetItemBoxes { scene: "Main".into(), items, save, reason: Default::default() };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> = c
+                .set_item_boxes("Main", &[(a, x, 0.0, 100.0, 100.0), (b, x, 0.0, 50.0, 50.0)])
+                .map(|_| Value::Null)
+                .map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        move_ab(&mut h, 30.0, false);
+        move_ab(&mut h, 0.0, true);
+        assert!(h.list().0.is_empty(), "multi-item round-trip left no-op undo step: {:?}", h.list().0);
+
+        // 4. Crop drag away and back to uncropped: passing through [0;4] mid-drag keeps the open
+        //    step alive, while releasing at [0;4] drops it.
+        let crop_a = |h: &mut History, crop: [i32; 4], save: bool| {
+            let act = StudioAct::SetItemCrop { scene: "Main".into(), id: a, crop, save };
+            let before = h.before(&c, &act).unwrap_or_else(|| panic!("a step"));
+            let out: Result<Value, String> =
+                c.set_item_crop("Main", a, crop).map(|_| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, before, &out);
+        };
+        crop_a(&mut h, [20, 0, 0, 0], false);
+        crop_a(&mut h, [0, 0, 0, 0], false);
+        crop_a(&mut h, [10, 0, 0, 0], true);
+        assert_eq!(h.list().0, ["Crop A"]);
+        assert_eq!(h.undo(&c), Ok(Some("Crop A".into())));
+
+        crop_a(&mut h, [20, 0, 0, 0], false);
+        crop_a(&mut h, [0, 0, 0, 0], true);
+        assert!(h.list().0.is_empty(), "crop round-trip left no-op undo step: {:?}", h.list().0);
     }
 
     /// Align and Space out are steps of their own, named for what they do, even right after a
