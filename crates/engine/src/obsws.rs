@@ -4089,7 +4089,13 @@ mod tests {
         // 3. Off-scene input volume/mute & Studio Mode preview item visibility changes emit events.
         c.req("SetStudioModeEnabled", json!({ "studioModeEnabled": true })).await;
         c.req("SetCurrentPreviewScene", json!({ "sceneName": "BRB" })).await;
-        assert_eq!(c.event("CurrentPreviewSceneChanged").await["sceneName"], "BRB");
+        // Turning Studio Mode on shows the program scene as the preview first; a look taken
+        // between the two requests tells that too, so skip it to reach the one asked for.
+        let mut told = c.event("CurrentPreviewSceneChanged").await;
+        if told["sceneName"] != "BRB" {
+            told = c.event("CurrentPreviewSceneChanged").await;
+        }
+        assert_eq!(told["sceneName"], "BRB");
         fake.with(|s| {
             s.aux.0 = true;
             s.preview_cam_visible = false;
