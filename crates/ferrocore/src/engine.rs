@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -1000,6 +1000,8 @@ struct Src {
     opening: Option<u64>,
     /// Clock time (`now_ns`) when the current reopen worker started, for [`REOPEN_TIMEOUT_NS`].
     opening_since: u64,
+    /// Active or wedged `open` / `reopen` worker threads currently executing for this source.
+    reopen_workers: Arc<AtomicUsize>,
     /// Pictures sent to the card so far (how busy it keeps the engine; Stats shows the rate).
     sent: u64,
     /// Per-source SPSC audio ring producer attached lazily on the first forwarded audio chunk.
@@ -1120,6 +1122,7 @@ impl Src {
             pending_since: 0,
             opening: None,
             opening_since: 0,
+            reopen_workers: Arc::new(AtomicUsize::new(0)),
             sent: 0,
             audio_tx: None,
             video_delay: None,
@@ -1283,6 +1286,31 @@ const CARD_RETRY_MAX_NS: u64 = 3_000_000_000;
 const REOPEN_TIMEOUT_NS: u64 = 60_000_000_000;
 /// Caps simultaneous reopen worker threads so a USB hub reset doesn't contend on every device at once.
 const MAX_PARALLEL_REOPENS: usize = 2;
+/// Maximum open/reopen worker threads allowed in flight or wedged for any single source.
+const MAX_SOURCE_REOPEN_WORKERS: usize = 2;
+/// Global cap on live or wedged open/reopen worker threads across the whole engine.
+const MAX_TOTAL_REOPEN_WORKERS: usize = 8;
+
+/// RAII worker-slot counter decremented on normal return, early exit, panic, or spawn failure.
+struct ReopenWorkerGuard {
+    source_workers: Arc<AtomicUsize>,
+    total_workers: Arc<AtomicUsize>,
+}
+
+impl ReopenWorkerGuard {
+    fn new(source_workers: Arc<AtomicUsize>, total_workers: Arc<AtomicUsize>) -> Self {
+        source_workers.fetch_add(1, Ordering::AcqRel);
+        total_workers.fetch_add(1, Ordering::AcqRel);
+        Self { source_workers, total_workers }
+    }
+}
+
+impl Drop for ReopenWorkerGuard {
+    fn drop(&mut self) {
+        self.source_workers.fetch_sub(1, Ordering::AcqRel);
+        self.total_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 fn next_open_token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1357,6 +1385,8 @@ struct State {
     sleep_want: bool,
     /// Monotonic counter so concurrent start/stop callers never apply a stale sleep state.
     sleep_epoch: u64,
+    /// Live or wedged open/reopen worker threads currently active across all sources.
+    reopen_workers: Arc<AtomicUsize>,
 }
 
 fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
@@ -1655,6 +1685,7 @@ impl Engine {
             parked: Vec::new(),
             sleep_want: false,
             sleep_epoch: 0,
+            reopen_workers: Arc::new(AtomicUsize::new(0)),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let seen: Arc<Seen> = Arc::default();
@@ -1971,34 +2002,50 @@ impl Engine {
     fn open_soon(&self, id: u64, restart: Option<SourceKind>, open: Opener) -> Result<(), AvError> {
         let token = next_open_token();
         let now = now_ns();
-        {
+        let worker_guard = {
             let mut st = self.lock();
+            if st.reopen_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
+                return Err(AvError::Source("too many stalled device opens in progress".into()));
+            }
+            if st
+                .sources
+                .get(&id)
+                .is_some_and(|s| s.reopen_workers.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS)
+            {
+                return Err(AvError::Source("too many stalled opens for this device".into()));
+            }
             self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
-            match st.sources.get_mut(&id) {
+            let total_workers = st.reopen_workers.clone();
+            let src_workers = match st.sources.get_mut(&id) {
                 // Already here with a picture (a screen capture handed over): it keeps running
                 // and showing until the new one is open.
                 Some(src) if src.size.is_some() => {
                     src.kind = restart;
                     src.opening = Some(token);
                     src.opening_since = now;
+                    src.reopen_workers.clone()
                 }
                 _ => {
                     let mut src = Src::new(Live::Still, None, restart);
                     src.opening = Some(token);
                     src.opening_since = now;
+                    let src_workers = src.reopen_workers.clone();
                     // Whatever was there before goes after the lock (stopping it can wait).
                     let gone = st.sources.insert(id, src);
                     drop(st);
                     drop(gone);
+                    src_workers
                 }
-            }
-        }
+            };
+            ReopenWorkerGuard::new(src_workers, total_workers)
+        };
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), AvError>>();
         let state = self.state.clone();
         let audio_cmd = self.audio.cmd_sender();
         let levels = self.levels.clone();
         let stop = self.stop.clone();
         let spawned = std::thread::Builder::new().name("ferrocore-open".into()).spawn(move || {
+            let _worker_guard = worker_guard;
             // A panic opening it is an error like any other: the token is cleared below and the
             // watchdog tries again (CodeRabbit), instead of a source stuck "opening".
             let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
@@ -2047,7 +2094,7 @@ impl Engine {
                         // A capture: the watchdog tries again later (cameras on 1..5 s backoff).
                         let now = now_ns();
                         if let Some(retry) = src.camera_retry.as_mut() {
-                            retry.on_reopen_finished(0, false, now, Some(&e.to_string()));
+                            retry.on_initial_open_failed(now, Some(&e.to_string()));
                         }
                         src.watch.next_try = now + src.watch.backoff(0);
                         src.watch.tries = 1;
@@ -5480,9 +5527,37 @@ fn watchdog_step(
             st.notices.push(n);
         }
         ready.sort_by_key(|(tries, id, _)| (*tries, *id));
-        let budget = MAX_PARALLEL_REOPENS.saturating_sub(in_flight);
-        for (_, id, why) in ready.into_iter().take(budget) {
+        let total_workers = st.reopen_workers.clone();
+        let mut launched = 0usize;
+        for (_, id, why) in ready {
+            if in_flight + launched >= MAX_PARALLEL_REOPENS {
+                break;
+            }
+            if total_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
+                tracing::warn!(
+                    active = total_workers.load(Ordering::Acquire),
+                    "global reopen worker cap reached; waiting for stalled workers to exit"
+                );
+                break;
+            }
             let Some(src) = st.sources.get_mut(&id) else { continue };
+            if src.reopen_workers.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS {
+                tracing::warn!(
+                    source = id,
+                    workers = src.reopen_workers.load(Ordering::Acquire),
+                    "source reopen worker cap reached; waiting for stalled workers to exit"
+                );
+                if let Some(retry) = src.camera_retry.as_mut() {
+                    retry.defer_backoff(now);
+                    src.watch.next_try = retry.next_try_ns();
+                    src.watch.tries = retry.tries();
+                } else {
+                    let prev = src.watch.tries;
+                    src.watch.next_try = now + src.watch.backoff(prev);
+                    src.watch.tries = prev.saturating_add(1);
+                }
+                continue;
+            }
             let Some(kind) = src.kind.clone() else { continue };
             let token = next_open_token();
             let prev_tries = if let Some(retry) = src.camera_retry.as_mut() {
@@ -5500,20 +5575,24 @@ fn watchdog_step(
             src.watch.since = now;
             src.opening = Some(token);
             src.opening_since = now;
+            let worker_guard = ReopenWorkerGuard::new(src.reopen_workers.clone(), total_workers.clone());
             // Taken out now (a camera is let go before it's opened again), dropped on its
             // own reopen worker outside the lock.
             let old = std::mem::replace(&mut src.live, Live::Still);
-            todo.push((id, kind, why, old, token, prev_tries));
+            todo.push((id, kind, why, old, token, prev_tries, worker_guard));
+            launched += 1;
         }
     }
-    for (id, kind, why, old, token, prev_tries) in todo {
+    for (id, kind, why, old, token, prev_tries, worker_guard) in todo {
         if stop.load(Ordering::Acquire) {
+            drop(worker_guard);
             drop(old);
             return;
         }
         let (state_w, state_panic, audio_w, stop_w, reopen_w) =
             (state.clone(), state.clone(), audio_cmd.clone(), stop.clone(), reopen.clone());
         let spawned = std::thread::Builder::new().name("ferrocore-reopen".into()).spawn(move || {
+            let _worker_guard = worker_guard;
             let worker_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 drop(old);
                 if stop_w.load(Ordering::Acquire) {
@@ -10801,5 +10880,181 @@ mod tests {
             expected_nested.extend_from_slice(&full_scene[start..start + 28 * 4]);
         }
         assert_eq!(nested_px, expected_nested, "nested group screenshot matches scene render pixel-for-pixel");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn open_soon_slow_failure_records_retry_tries() {
+        let Some(e) = engine() else { return };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate_c = gate.clone();
+
+        e.open_soon(
+            1,
+            Some(SourceKind::Camera(CameraSpec::from("slow-cam"))),
+            Box::new(move || {
+                let _ = entered_tx.send(());
+                let (lk, cv) = &*gate_c;
+                let mut released = lk.lock().unwrap_or_else(|x| x.into_inner());
+                while !*released {
+                    released = cv.wait(released).unwrap_or_else(|x| x.into_inner());
+                }
+                Err(AvError::Source("that camera isn't connected".into()))
+            }),
+        )
+        .unwrap_or_else(|x| panic!("{x}"));
+
+        entered_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        while e.opening() > 0 {
+            std::thread::yield_now();
+        }
+
+        let st = e.lock();
+        let src = st.sources.get(&1).expect("failed capture must remain in sources for watchdog retry");
+        let status = camera_status_of_src(src).expect("camera source must report CameraStatus");
+        assert_eq!(status.state, "waiting");
+        assert_eq!(src.watch.tries, 1);
+        assert_eq!(status.tries, 1, "slow initial open failure must increment retry.tries");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn watchdog_caps_stalled_reopen_workers_and_resumes_after_drain() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(Live::Still, None, Some(SourceKind::Camera(CameraSpec::from("wedged-cam")))));
+        }
+
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_c = attempts.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate_c = gate.clone();
+
+        let reopen: Reopener = Arc::new(move |_| {
+            let n = attempts_c.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = entered_tx.send(n);
+            if n <= 2 {
+                let (lk, cv) = &*gate_c;
+                let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                while !*open {
+                    open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                }
+            }
+            let _ = exited_tx.send(n);
+            Some(Err(AvError::Source("driver wedged".into())))
+        });
+
+        let mut now = now_ns();
+        let cmd = e.audio.cmd_sender();
+        // Worker 1 launches and blocks.
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert_eq!(entered_rx.recv().unwrap_or_else(|x| panic!("{x}")), 1);
+
+        // Past 60 s deadline, worker 2 replaces the slot and blocks too.
+        now += REOPEN_TIMEOUT_NS;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert_eq!(entered_rx.recv().unwrap_or_else(|x| panic!("{x}")), 2);
+
+        // Past another 60 s deadline + max backoff, worker 3 must NOT spawn while 2 are stuck.
+        now += REOPEN_TIMEOUT_NS + 120_000_000_000;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert!(e.lock().sources[&1].opening.is_none(), "capped source must not open a 3rd stalled worker");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "must not launch a 3rd thread while 2 are wedged");
+
+        // Unblock both wedged workers and wait for both to finish exiting their closures.
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        let _ = exited_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+        let _ = exited_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+        while e
+            .lock()
+            .sources
+            .get(&1)
+            .is_some_and(|s| s.opening.is_some() || s.reopen_workers.load(Ordering::Acquire) > 0)
+        {
+            std::thread::yield_now();
+        }
+
+        // Once workers drain, advancing past backoff allows worker 3 to launch normally.
+        now += 120_000_000_000;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert_eq!(entered_rx.recv().unwrap_or_else(|x| panic!("{x}")), 3);
+        let _ = exited_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn watchdog_caps_total_stalled_reopen_workers_across_sources() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            for id in 1..=5u64 {
+                st.sources.insert(
+                    id,
+                    Src::new(Live::Still, None, Some(SourceKind::Camera(CameraSpec::from(&*format!("cam-{id}"))))),
+                );
+            }
+        }
+
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_c = attempts.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate_c = gate.clone();
+
+        let reopen: Reopener = Arc::new(move |_| {
+            let n = attempts_c.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = entered_tx.send(n);
+            let (lk, cv) = &*gate_c;
+            let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+            while !*open {
+                open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+            }
+            let _ = exited_tx.send(n);
+            Some(Err(AvError::Source("driver wedged".into())))
+        });
+
+        let mut now = now_ns();
+        let cmd = e.audio.cmd_sender();
+        // Wedge MAX_TOTAL_REOPEN_WORKERS (8) across sources 1..=4 (2 workers per step x 4).
+        for _ in 0..(MAX_TOTAL_REOPEN_WORKERS / MAX_PARALLEL_REOPENS) {
+            now += REOPEN_TIMEOUT_NS;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+            for _ in 0..MAX_PARALLEL_REOPENS {
+                let _ = entered_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+            }
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_TOTAL_REOPEN_WORKERS as u64);
+
+        // Source 5 is due and has 0 per-source workers, yet global cap stops spawning a 9th thread.
+        now += REOPEN_TIMEOUT_NS + 120_000_000_000;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert!(e.lock().sources[&5].opening.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_TOTAL_REOPEN_WORKERS as u64);
+
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        for _ in 0..MAX_TOTAL_REOPEN_WORKERS {
+            let _ = exited_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+        }
+        while e.lock().reopen_workers.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
     }
 }

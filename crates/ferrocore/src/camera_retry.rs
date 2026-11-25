@@ -192,6 +192,20 @@ impl CameraRetry {
         prev
     }
 
+    /// Records failure of the asynchronous initial open so try count and backoff advance cleanly.
+    pub fn on_initial_open_failed(&mut self, now_ns: u64, err: Option<&str>) {
+        let prev = self.on_reopen_started(now_ns);
+        self.on_reopen_finished(prev, false, now_ns, err);
+    }
+
+    /// Advances exponential backoff without resetting status when a source's worker cap is saturated.
+    pub fn defer_backoff(&mut self, now_ns: u64) {
+        let prev = self.tries;
+        self.next_try_ns = now_ns.saturating_add(backoff_ns(prev));
+        self.tries = prev.saturating_add(1);
+        self.since_ns = now_ns;
+    }
+
     /// Updates state after an asynchronous reopen finishes.
     ///
     /// A successful open while waiting keeps `"waiting for the camera"` until frames actually resume
