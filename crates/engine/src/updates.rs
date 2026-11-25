@@ -260,8 +260,10 @@ impl Engine {
 
     /// The desktop shell has an updater: the dashboard may offer checks and installs.
     pub fn attach_updater(&self) {
-        self.studio().update_committing.store(false, Ordering::Release);
-        self.with_update(|s| s.updater = true);
+        self.with_update(|s| {
+            self.studio().update_committing.store(false, Ordering::Release);
+            s.updater = true;
+        });
     }
 
     /// The Microsoft Store installed this copy: it updates it, so Ferrocast offers no checks
@@ -338,8 +340,8 @@ impl Engine {
 
     /// Installed: it runs after a restart, which waits for the streamer (never automatic).
     pub fn update_ready(&self, version: &str) {
-        self.studio().update_committing.store(false, Ordering::Release);
         self.with_update(|s| {
+            self.studio().update_committing.store(false, Ordering::Release);
             s.install.phase = InstallPhase::Ready;
             s.install.version = Some(version.into());
             s.install.error = None;
@@ -353,9 +355,9 @@ impl Engine {
 
     /// The shell couldn't download or install: say why on the dashboard.
     pub fn update_install_failed(&self, problem: UpdateProblem) {
-        self.studio().update_committing.store(false, Ordering::Release);
         let detail = format!("{} {}", problem.message, problem.hint);
         self.with_update(|s| {
+            self.studio().update_committing.store(false, Ordering::Release);
             s.install.phase = InstallPhase::Failed;
             s.install.error = Some(problem);
         });
@@ -461,20 +463,19 @@ impl Engine {
 
     /// "Restart to finish": only after an install, and never while live, recording, or buffering replays (R-60).
     pub fn request_update_restart(&self) -> Result<String, EngineError> {
-        let (updater, store, install) = {
+        {
             let s = self.inner.update.lock().unwrap_or_else(|p| p.into_inner());
-            (s.updater, s.store, s.install.clone())
-        };
-        if !updater {
-            return Err(no_updater(store));
-        }
-        if install.phase != InstallPhase::Ready {
-            return Err(refused(
-                409,
-                "not_ready",
-                "There's no installed update waiting for a restart.",
-                "Install the update first (Update now), then restart.",
-            ));
+            if !s.updater {
+                return Err(no_updater(s.store));
+            }
+            if s.install.phase != InstallPhase::Ready {
+                return Err(refused(
+                    409,
+                    "not_ready",
+                    "There's no installed update waiting for a restart.",
+                    "Install the update first (Update now), then restart.",
+                ));
+            }
         }
         let _gate = self.studio().output_gate.try_lock().map_err(|_| {
             refused(
@@ -488,9 +489,26 @@ impl Engine {
             let (msg, hint) = reason.restart_message();
             return Err(refused(409, "live", msg, hint));
         }
-        self.studio().update_committing.store(true, Ordering::Release);
+        // Re-check Ready and publish `update_committing` inside one update-state transition so a
+        // racing `update_install_failed` cannot leave `update_committing` stuck `true`.
+        let version = {
+            let s = self.inner.update.lock().unwrap_or_else(|p| p.into_inner());
+            if !s.updater {
+                return Err(no_updater(s.store));
+            }
+            if s.install.phase != InstallPhase::Ready {
+                return Err(refused(
+                    409,
+                    "not_ready",
+                    "There's no installed update waiting for a restart.",
+                    "Install the update first (Update now), then restart.",
+                ));
+            }
+            self.studio().update_committing.store(true, Ordering::Release);
+            s.install.version.clone().unwrap_or_default()
+        };
         self.inner.restart_update.notify_one();
-        Ok(install.version.unwrap_or_default())
+        Ok(version)
     }
 }
 

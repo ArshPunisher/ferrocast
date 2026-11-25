@@ -1587,7 +1587,11 @@ async fn updates_refuse_install_and_restart_while_studio_recording_or_replay_act
         let eng = r.engine.clone();
         async move { eng.studio_replay(true).await }
     });
-    entered.await;
+    tokio::pin!(starting_rep);
+    tokio::select! {
+        () = entered => {},
+        res = &mut starting_rep => panic!("studio_replay returned before entering host: {res:?}"),
+    }
     let starting_restart = r.post("/api/v1/updates/restart", json!({})).await;
     assert_eq!(starting_restart.status(), StatusCode::CONFLICT);
     assert_eq!(starting_restart.json::<Value>().await.unwrap()["error"]["code"], "live");
@@ -1614,6 +1618,7 @@ async fn updates_refuse_install_and_restart_while_studio_recording_or_replay_act
     );
 
     r.engine.update_failed("restart aborted");
+    assert_eq!(r.post("/api/v1/updates/restart", json!({})).await.status(), StatusCode::CONFLICT);
     r.engine.studio_replay(true).await.expect("failure resets update_committing lock");
     r.engine.studio_replay(false).await.unwrap();
 }
