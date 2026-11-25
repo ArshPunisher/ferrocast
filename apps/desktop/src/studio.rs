@@ -2614,17 +2614,10 @@ impl StudioHost for DesktopStudio {
                 .await??;
             // Trimmed, as the engine keeps them (a Web text's reads are noted under these).
             let text = |k: &str| settings.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+            if let Some(camera_json) = camera_source_status_json(&kind, camera_status) {
+                return Ok(camera_json);
+            }
             return Ok(match kind.as_str() {
-                "av_capture_input" | "av_capture_input_v2" | "dshow_input" | "v4l2_input" => match camera_status {
-                    Some(st) => json!({
-                        "camera": {
-                            "state": st.state,
-                            "message": st.message,
-                            "tries": st.tries,
-                        }
-                    }),
-                    None => json!({}),
-                },
                 "ferrocast_web_text" => match ferrocore::source::webtext::status(&text("url"), &text("path")) {
                     Some(s) => json!({ "web_text": { "at_ms": s.at_ms, "value": s.value, "error": s.error } }),
                     None => json!({ "web_text": null }),
@@ -4507,6 +4500,27 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+fn camera_source_status_json(kind: &str, camera_status: Option<ferrocore::engine::CameraStatus>) -> Option<Value> {
+    match kind {
+        "av_capture_input"
+        | "av_capture_input_v2"
+        | "macos-avcapture"
+        | "macos-avcapture-fast"
+        | "dshow_input"
+        | "v4l2_input" => Some(match camera_status {
+            Some(st) => json!({
+                "camera": {
+                    "state": st.state,
+                    "message": st.message,
+                    "tries": st.tries,
+                }
+            }),
+            None => json!({}),
+        }),
+        _ => None,
+    }
+}
+
 fn stage_still_check(
     collection: Option<&ferrocast_studio::stage::Stage>,
     tk: &str,
@@ -6292,6 +6306,36 @@ mod import_tests {
             Poll::Pending => panic!("follower B lost wakeup or stalled on pre-await leader cancel"),
         }
         assert_eq!(probe_calls.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn source_status_treats_macos_avcapture_variants_as_camera_kinds() {
+        use ferrocore::engine::CameraStatus;
+        use serde_json::json;
+
+        let waiting = CameraStatus { state: "waiting", message: Some("looking for camera"), tries: 2 };
+        for kind in [
+            "av_capture_input",
+            "av_capture_input_v2",
+            "macos-avcapture",
+            "macos-avcapture-fast",
+            "dshow_input",
+            "v4l2_input",
+        ] {
+            assert_eq!(
+                super::camera_source_status_json(kind, Some(waiting.clone())),
+                Some(json!({
+                    "camera": {
+                        "state": "waiting",
+                        "message": "looking for camera",
+                        "tries": 2,
+                    }
+                })),
+                "{kind} must expose camera status"
+            );
+            assert_eq!(super::camera_source_status_json(kind, None), Some(json!({})));
+        }
+        assert_eq!(super::camera_source_status_json("color_source", Some(waiting)), None);
     }
 
     #[test]
