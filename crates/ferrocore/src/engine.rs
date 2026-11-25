@@ -1387,6 +1387,8 @@ struct State {
     sleep_epoch: u64,
     /// Live or wedged open/reopen worker threads currently active across all sources.
     reopen_workers: Arc<AtomicUsize>,
+    /// Per-source open/reopen worker counters preserved across `Src` replacement or removal.
+    source_reopen_workers: HashMap<u64, Arc<AtomicUsize>>,
 }
 
 fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
@@ -1406,6 +1408,14 @@ impl State {
         self.sleep_want = want;
         self.sleep_epoch += 1;
         Some((self.sleep_epoch, want))
+    }
+
+    fn source_workers_for(&mut self, id: u64) -> Arc<AtomicUsize> {
+        if let Some(w) = self.sources.get(&id).map(|s| s.reopen_workers.clone()) {
+            self.source_reopen_workers.insert(id, w.clone());
+            return w;
+        }
+        self.source_reopen_workers.entry(id).or_insert_with(|| Arc::new(AtomicUsize::new(0))).clone()
     }
 }
 
@@ -1686,6 +1696,7 @@ impl Engine {
             sleep_want: false,
             sleep_epoch: 0,
             reopen_workers: Arc::new(AtomicUsize::new(0)),
+            source_reopen_workers: HashMap::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let seen: Arc<Seen> = Arc::default();
@@ -2002,43 +2013,44 @@ impl Engine {
     fn open_soon(&self, id: u64, restart: Option<SourceKind>, open: Opener) -> Result<(), AvError> {
         let token = next_open_token();
         let now = now_ns();
+        let mut gone = None;
         let worker_guard = {
             let mut st = self.lock();
-            if st.reopen_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
-                return Err(AvError::Source("too many stalled device opens in progress".into()));
-            }
-            if st
-                .sources
-                .get(&id)
-                .is_some_and(|s| s.reopen_workers.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS)
-            {
-                return Err(AvError::Source("too many stalled opens for this device".into()));
-            }
+            let src_workers = st.source_workers_for(id);
+            let worker_guard = if restart.is_some() {
+                if st.reopen_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
+                    return Err(AvError::Source("too many stalled device opens in progress".into()));
+                }
+                if src_workers.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS {
+                    return Err(AvError::Source("too many stalled opens for this device".into()));
+                }
+                Some(ReopenWorkerGuard::new(src_workers.clone(), st.reopen_workers.clone()))
+            } else {
+                None
+            };
             self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
-            let total_workers = st.reopen_workers.clone();
-            let src_workers = match st.sources.get_mut(&id) {
+            match st.sources.get_mut(&id) {
                 // Already here with a picture (a screen capture handed over): it keeps running
                 // and showing until the new one is open.
                 Some(src) if src.size.is_some() => {
                     src.kind = restart;
                     src.opening = Some(token);
                     src.opening_since = now;
-                    src.reopen_workers.clone()
+                    src.reopen_workers = src_workers;
                 }
                 _ => {
                     let mut src = Src::new(Live::Still, None, restart);
                     src.opening = Some(token);
                     src.opening_since = now;
-                    let src_workers = src.reopen_workers.clone();
-                    // Whatever was there before goes after the lock (stopping it can wait).
-                    let gone = st.sources.insert(id, src);
-                    drop(st);
-                    drop(gone);
-                    src_workers
+                    src.reopen_workers = src_workers;
+                    // Stopping the replaced source happens outside the lock below, while slot
+                    // reservation already completed atomically under `st`.
+                    gone = st.sources.insert(id, src);
                 }
-            };
-            ReopenWorkerGuard::new(src_workers, total_workers)
+            }
+            worker_guard
         };
+        drop(gone);
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), AvError>>();
         let state = self.state.clone();
         let audio_cmd = self.audio.cmd_sender();
@@ -2756,6 +2768,19 @@ impl Engine {
     /// non-blockingly from `Shown` when the render loop holds `State`.
     pub fn camera_status(&self, name: &str) -> Option<CameraStatus> {
         self.now_or_last(|st| camera_status_of(st, name), |s| s.camera_statuses.get(name).cloned())
+    }
+
+    /// True when named camera source `name` still owns an open capture session while reporting
+    /// waiting state (e.g. interruption grace or healthy 0-frame card), so picker probes avoid
+    /// opening a competing session against it.
+    pub fn is_camera_holding_session(&self, name: &str) -> bool {
+        let st = self.lock();
+        let Some((id, _)) = st.opened.get(name) else {
+            return false;
+        };
+        st.sources
+            .get(id)
+            .is_some_and(|s| !matches!(s.live, Live::Still) && s.camera_retry.as_ref().is_some_and(|r| r.is_waiting()))
     }
 
     /// Captures shown somewhere (on air, a preview, an output) that have had no picture for at
@@ -3917,6 +3942,78 @@ fn active_item_effects_and_base(
     Ok((effects, base))
 }
 
+fn clip_poly_edge(
+    poly: &[(f32, f32)],
+    inside: impl Fn((f32, f32)) -> bool,
+    intersect: impl Fn((f32, f32), (f32, f32)) -> (f32, f32),
+) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(poly.len() + 2);
+    let Some(&last) = poly.last() else {
+        return out;
+    };
+    let mut prev = last;
+    let mut prev_in = inside(prev);
+    for &cur in poly {
+        let cur_in = inside(cur);
+        if cur_in != prev_in {
+            out.push(intersect(prev, cur));
+        }
+        if cur_in {
+            out.push(cur);
+        }
+        prev = cur;
+        prev_in = cur_in;
+    }
+    out
+}
+
+fn clip_pts_to_rect(pts: &[(f32, f32); 4], w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+    let mut poly: Vec<(f32, f32)> = pts.to_vec();
+    poly = clip_poly_edge(
+        &poly,
+        |(x, _)| x >= 0.0,
+        |(ax, ay), (bx, by)| {
+            let t = (0.0 - ax) / (bx - ax);
+            (0.0, ay + t * (by - ay))
+        },
+    );
+    poly = clip_poly_edge(
+        &poly,
+        |(x, _)| x <= w,
+        |(ax, ay), (bx, by)| {
+            let t = (w - ax) / (bx - ax);
+            (w, ay + t * (by - ay))
+        },
+    );
+    poly = clip_poly_edge(
+        &poly,
+        |(_, y)| y >= 0.0,
+        |(ax, ay), (bx, by)| {
+            let t = (0.0 - ay) / (by - ay);
+            (ax + t * (bx - ax), 0.0)
+        },
+    );
+    poly = clip_poly_edge(
+        &poly,
+        |(_, y)| y <= h,
+        |(ax, ay), (bx, by)| {
+            let t = (h - ay) / (by - ay);
+            (ax + t * (bx - ax), h)
+        },
+    );
+    if poly.len() < 3 {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (x, y) in poly {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
+}
+
 fn project_pts_through_group(
     pts: [(f32, f32); 4],
     g: &SceneItem,
@@ -3934,15 +4031,10 @@ fn project_pts_through_group(
     if !group_renders_to_texture {
         return Ok(pts.map(|(x, y)| m_group.apply(x, y)));
     }
-    let (mut tx0, mut ty0, mut tx1, mut ty1) = pts_aabb(&pts);
-    // Clip to the base group texture before any effects run, so off-group items don't smear into pads.
-    tx0 = tx0.max(0.0);
-    ty0 = ty0.max(0.0);
-    tx1 = tx1.min(g_base.0 as f32);
-    ty1 = ty1.min(g_base.1 as f32);
-    if tx1 <= tx0 || ty1 <= ty0 {
-        return Err(AvError::Source("the item is cropped out by its group".into()));
-    }
+    // Clip actual polygon corners to `[0..g_base.0, 0..g_base.1]` before computing its AABB so
+    // rotated items outside a corner (whose unclipped AABB straddles `(0,0)`) are rejected too.
+    let (mut tx0, mut ty0, mut tx1, mut ty1) = clip_pts_to_rect(&pts, g_base.0 as f32, g_base.1 as f32)
+        .ok_or_else(|| AvError::Source("the item is cropped out by its group".into()))?;
     let (mut cur_w, mut cur_h) = g_base;
     for e in g_effects {
         let (nw, nh) = e.out_size(cur_w, cur_h);
@@ -10637,9 +10729,14 @@ mod tests {
         });
         let skipped = e.load_obs(&doc);
         assert!(skipped.is_empty(), "native camera kind {cam_kind}/{cam_key} must load: {skipped:?}");
-        while e.opening() > 0 {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let wait_open = |label: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while e.opening() > 0 {
+                assert!(Instant::now() < deadline, "timed out waiting for {label} open to settle");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_open("initial");
         let (id, _) = e.source_named("iPhone").expect("selected camera kept in engine sources while waiting");
         assert!(e.lock().sources.contains_key(&id), "camera source stays registered for watchdog retries");
 
@@ -10649,12 +10746,10 @@ mod tests {
             "unseen camera backoff must cap at 5 s, got {} ns",
             w.backoff(9)
         );
-        // Second load once camera cache/probe is warm fails within OPEN_WAIT; camera still stays
-        // tracked in `sources` and marked waiting for the camera.
+        // Remove and reload cleanly so warm failure is driven through a fresh initial open attempt.
+        e.remove_source(id);
         let _ = e.load_obs(&doc);
-        while e.opening() > 0 {
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        wait_open("warm");
         let (id2, _) = e.source_named("iPhone").expect("warm offline camera stays in opened");
         assert!(e.lock().sources.contains_key(&id2));
         assert_eq!(e.waiting_cameras(), vec!["iPhone".to_string()]);
@@ -11251,5 +11346,124 @@ mod tests {
             Some(true),
             "pending frame waiting for GPU upload on an unshown source must report ready immediately"
         );
+    }
+
+    #[test]
+    fn snapshot_item_transformed_rejects_rotated_diamond_outside_group_corner() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 14, height: 14, rgba: [200, 100, 50, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        // Rotated 45 deg near top-left outside (-18..-8,-8..-18) -> unclipped AABB crosses (0,0)
+        // while the polygon itself stays strictly in x+y < 0 outside [0..60, 0..40].
+        let mut child = SceneItem::new(1, Placement { x: -8.0, y: -18.0, rotation: 45.0, ..Default::default() });
+        child.item_id = 51;
+        e.set_scene("CornerGroup", vec![child]);
+
+        let mut grp = SceneItem::new(0, Placement { x: 100.0, y: 100.0, ..Default::default() });
+        grp.scene = Some("CornerGroup".into());
+        grp.group = Some((60, 40));
+        grp.item_id = 52;
+        grp.effects = vec![Effect::ColorCorrection {
+            gamma: 0.0,
+            contrast: 0.0,
+            brightness: 0.0,
+            saturation: 0.0,
+            hue_shift: 0.0,
+            opacity: 1.0,
+            multiply: 0xFFFF_FFFF,
+            add: 0,
+        }];
+        e.set_scene("Main", vec![grp]);
+
+        assert!(
+            e.snapshot_item_transformed("Main", 51, (640, 360)).is_err(),
+            "rotated item entirely outside group corner must be cropped out"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn open_soon_preserves_worker_cap_across_source_replacement_and_allows_media_files() {
+        let Some(e) = engine() else { return };
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+
+        // Fill per-source cap (2) for picture-less source 1 via two sequential open_soon replacements.
+        for _ in 0..MAX_SOURCE_REOPEN_WORKERS {
+            let g = gate.clone();
+            let etx = entered_tx.clone();
+            let xtx = exited_tx.clone();
+            e.open_soon(
+                1,
+                Some(SourceKind::Camera(CameraSpec::from("cam-replace"))),
+                Box::new(move || {
+                    let _ = etx.send(());
+                    let (lk, cv) = &*g;
+                    let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                    while !*open {
+                        open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                    }
+                    let _ = xtx.send(());
+                    Err(AvError::Source("wedged".into()))
+                }),
+            )
+            .unwrap();
+            entered_rx.recv().unwrap();
+        }
+        // Third replacement on source 1 must be rejected even though earlier Src was replaced.
+        let third = e.open_soon(
+            1,
+            Some(SourceKind::Camera(CameraSpec::from("cam-replace"))),
+            Box::new(|| Err(AvError::Source("must not run".into()))),
+        );
+        assert!(third.is_err(), "source replacement must preserve worker count toward MAX_SOURCE_REOPEN_WORKERS");
+
+        // Local file open (`restart: None`) must still succeed even when global capture worker cap is reached.
+        for id in 2..=4u64 {
+            for _ in 0..MAX_SOURCE_REOPEN_WORKERS {
+                let g = gate.clone();
+                let etx = entered_tx.clone();
+                let xtx = exited_tx.clone();
+                e.open_soon(
+                    id,
+                    Some(SourceKind::Camera(CameraSpec::from("cam-cap"))),
+                    Box::new(move || {
+                        let _ = etx.send(());
+                        let (lk, cv) = &*g;
+                        let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                        while !*open {
+                            open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                        }
+                        let _ = xtx.send(());
+                        Err(AvError::Source("wedged".into()))
+                    }),
+                )
+                .unwrap();
+                entered_rx.recv().unwrap();
+            }
+        }
+        assert!(
+            e.open_soon(
+                99,
+                Some(SourceKind::Camera(CameraSpec::from("blocked"))),
+                Box::new(|| Err(AvError::Source("no".into())))
+            )
+            .is_err()
+        );
+        e.open_soon(100, None, Box::new(|| Ok((Live::Still, false))))
+            .expect("local media open must not be blocked when capture workers are at cap");
+
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        for _ in 0..8 {
+            exited_rx.recv().unwrap();
+        }
+        while e.lock().reopen_workers.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
     }
 }
