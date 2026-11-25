@@ -10488,13 +10488,14 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     #[test]
     fn waiting_camera_reports_waiting_status_instead_of_no_picture() {
+        let (cam_kind, cam_key) = ferrocore::obs::native_camera_kind_and_key();
         let doc = json!({
             "sources": [
                 {
-                    "id": "av_capture_input_v2",
-                    "versioned_id": "av_capture_input_v2",
+                    "id": cam_kind,
+                    "versioned_id": cam_kind,
                     "name": "iPhone Cam",
-                    "settings": { "device": "/no/such/continuity-cam" },
+                    "settings": { cam_key: "/no/such/continuity-cam" },
                     "filters": []
                 },
                 {
@@ -10509,17 +10510,23 @@ mod tests {
             "scene_order": [{ "name": "Main" }]
         });
         let s = ok(Stage::load(Canvas { width: 320, height: 180, fps: 30 }, &doc, "Main"));
-        // Trigger engine load even if cache is cold first.
-        let Ok(_) = s.engine() else { return };
+        // Trigger engine load and let any initial async probe finish before reopening.
+        let Ok(e) = s.engine() else { return };
+        while e.engine.opening() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         // Warm second reopen guarantees synchronous open failure reaches waiting camera path.
         s.edit(|_| ());
+        while e.engine.opening() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(
             s.camera_status("iPhone Cam").map(|st| (st.state, st.message)),
             Some(("waiting", Some("Waiting for the camera")))
         );
         let problems = s.capture_problems();
         assert!(
-            problems.iter().any(|p| p.source == "iPhone Cam" && p.problem == "waiting"),
+            problems.iter().any(|p| p.source == "iPhone Cam" && p.kind == cam_kind && p.problem == "waiting"),
             "expected waiting problem, got {problems:?}"
         );
         assert!(

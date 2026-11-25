@@ -889,11 +889,11 @@ enum Live {
     Visualizer(Box<crate::source::visualizer::VisualizerLive>),
     #[cfg(test)]
     PanicOnDrop(#[allow(dead_code)] PanicDrop),
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     FakeCamera(FakeCapture),
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 struct FakeCameraBackend {
     online: AtomicBool,
     interrupted: AtomicBool,
@@ -905,7 +905,7 @@ struct FakeCameraBackend {
     max_active_sessions: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl FakeCameraBackend {
     fn new(color: [u8; 4]) -> Arc<Self> {
         Arc::new(Self {
@@ -931,12 +931,12 @@ impl FakeCameraBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 struct FakeCapture {
     state: Arc<FakeCameraBackend>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl FakeCapture {
     fn received(&self) -> u64 {
         self.state.frames_sent.load(Ordering::Acquire)
@@ -965,7 +965,7 @@ impl FakeCapture {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl Drop for FakeCapture {
     fn drop(&mut self) {
         self.state.active_sessions.fetch_sub(1, Ordering::SeqCst);
@@ -5173,7 +5173,7 @@ fn signs(live: &Live) -> Option<(u64, bool, Option<String>)> {
         Live::Camera(c) | Live::Microphone(c) => Some((c.received(), c.steady(), c.ended())),
         #[cfg(test)]
         Live::PanicOnDrop(_) => Some((0, false, Some("dead".into()))),
-        #[cfg(test)]
+        #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         Live::FakeCamera(c) => Some((c.received(), true, c.ended())),
         _ => None,
     }
@@ -5954,7 +5954,7 @@ fn frame(
             Live::Still | Live::Visualizer(_) => {}
             #[cfg(test)]
             Live::PanicOnDrop(_) => {}
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
             Live::FakeCamera(cap) => {
                 if let Some((p, _)) = cap.take_frame() {
                     uploads.push((*id, Fresh::Pic(p)));
@@ -10460,13 +10460,14 @@ mod tests {
     #[test]
     fn offline_camera_stays_in_sources_and_keeps_retrying_within_5s() {
         let Some(e) = engine() else { return };
+        let (cam_kind, cam_key) = crate::obs::native_camera_kind_and_key();
         let doc = serde_json::json!({
             "current_program_scene": "Main",
             "sources": [
                 {
-                    "id": "av_capture_input_v2",
+                    "id": cam_kind,
                     "name": "iPhone",
-                    "settings": { "device": "/no/such/iphone" }
+                    "settings": { cam_key: "/no/such/iphone" }
                 },
                 {
                     "id": "scene",
@@ -10475,7 +10476,11 @@ mod tests {
                 }
             ]
         });
-        let _ = e.load_obs(&doc);
+        let skipped = e.load_obs(&doc);
+        assert!(skipped.is_empty(), "native camera kind {cam_kind}/{cam_key} must load: {skipped:?}");
+        while e.opening() > 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let (id, _) = e.source_named("iPhone").expect("selected camera kept in engine sources while waiting");
         assert!(e.lock().sources.contains_key(&id), "camera source stays registered for watchdog retries");
 
@@ -10485,9 +10490,12 @@ mod tests {
             "unseen camera backoff must cap at 5 s, got {} ns",
             w.backoff(9)
         );
-        // Second load once AVFoundation cache is warm fails within OPEN_WAIT; camera still stays
+        // Second load once camera cache/probe is warm fails within OPEN_WAIT; camera still stays
         // tracked in `sources` and marked waiting for the camera.
         let _ = e.load_obs(&doc);
+        while e.opening() > 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let (id2, _) = e.source_named("iPhone").expect("warm offline camera stays in opened");
         assert!(e.lock().sources.contains_key(&id2));
         assert_eq!(e.waiting_cameras(), vec!["iPhone".to_string()]);
