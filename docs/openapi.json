@@ -2204,6 +2204,113 @@
         ],
         "type": "object"
       },
+      "StudioScreenshotResponse": {
+        "description": "Saved screenshot file result.",
+        "properties": {
+          "file": {
+            "description": "Full local path of the saved PNG screenshot.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "file"
+        ],
+        "type": "object"
+      },
+      "StudioSourceScreenshotRequest": {
+        "description": "Optional scene-item target. Provide both `scene` and `item` (here or as query parameters; omit both to capture the raw source).",
+        "properties": {
+          "item": {
+            "description": "Scene item id in `scene`.",
+            "type": "integer"
+          },
+          "scene": {
+            "description": "Scene name holding `item`.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "StudioSourceStatus": {
+        "description": "Live health/status details for a source (`{}` when the source kind reports no live status).",
+        "properties": {
+          "app_on": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "camera": {
+            "description": "Present for open camera/capture sources.",
+            "properties": {
+              "message": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "live",
+                  "waiting"
+                ],
+                "type": "string"
+              },
+              "tries": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "state",
+              "tries"
+            ],
+            "type": "object"
+          },
+          "page": {
+            "properties": {
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ok": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "ok"
+            ],
+            "type": "object"
+          },
+          "web_text": {
+            "properties": {
+              "at_ms": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "error": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "value": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "StudioSourceStill": {
         "description": "Picker thumbnail response for a display, window, or camera.",
         "properties": {
@@ -31126,6 +31233,41 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "`true` treats `{id}` as a window id instead of a display id.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Requested thumbnail width in pixels (default 240, max 320).",
+            "in": "query",
+            "name": "w",
+            "required": false,
+            "schema": {
+              "default": 240,
+              "maximum": 320,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Pass `1` (or `true`) to bypass the 15 s still cache and probe a fresh frame.",
+            "in": "query",
+            "name": "fresh",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "integer",
+                "boolean"
+              ]
+            }
           }
         ],
         "responses": {
@@ -31133,10 +31275,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/StudioSourceStill"
                 }
               }
             },
@@ -32798,26 +32937,42 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Scene name holding `item` when capturing a scene item with transforms and filters (must be paired with `item`).",
+            "in": "query",
+            "name": "scene",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Scene item id in `scene` to capture with transforms and filters (must be paired with `scene`).",
+            "in": "query",
+            "name": "item",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
           }
         ],
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "type": "object"
+                "$ref": "#/components/schemas/StudioSourceScreenshotRequest"
               }
             }
-          }
+          },
+          "required": false
         },
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/StudioScreenshotResponse"
                 }
               }
             },
@@ -32859,7 +33014,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Save a PNG screenshot of a source.",
+        "summary": "Save a PNG screenshot of a source, or a scene item when `scene` and `item` are given.",
         "tags": [
           "Studio Engine"
         ],
@@ -33034,10 +33189,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/StudioSourceStatus"
                 }
               }
             },
@@ -33302,6 +33454,60 @@
     "/api/v1/studio/engine/still": {
       "get": {
         "operationId": "get_studio_engine_still",
+        "parameters": [
+          {
+            "description": "Source input kind id (for example `av_capture_input_v2`).",
+            "in": "query",
+            "name": "kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Device setting key (for example `device`).",
+            "in": "query",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Selected device setting value.",
+            "in": "query",
+            "name": "value",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Requested thumbnail width in pixels (default 240, max 320).",
+            "in": "query",
+            "name": "w",
+            "required": false,
+            "schema": {
+              "default": 240,
+              "maximum": 320,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Pass `1` (or `true`) to bypass the 15 s still cache and probe a fresh frame.",
+            "in": "query",
+            "name": "fresh",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "integer",
+                "boolean"
+              ]
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
