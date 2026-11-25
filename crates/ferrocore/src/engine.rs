@@ -11767,10 +11767,13 @@ mod tests {
         // Remove source 1 while both wedged workers remain alive, then reload a collection
         // assigning id 1 to a camera whose open_soon rejects at MAX_SOURCE_REOPEN_WORKERS.
         e.remove_source(1);
+        // The camera source id and device key are this OS's own (av_capture_input_v2 is only
+        // known on a Mac, so on Windows it was a source Ferrocast has no kind for).
+        let (cam_id, cam_key) = crate::obs::native_camera_kind_and_key();
         let doc = serde_json::json!({
             "current_program_scene": "Main",
             "sources": [
-                { "id": "av_capture_input_v2", "name": "WedgedCam", "settings": { "device": "wedged-cam" } },
+                { "id": cam_id, "name": "WedgedCam", "settings": { cam_key: "wedged-cam" } },
                 { "id": "scene", "name": "Main", "settings": { "items": [{ "name": "WedgedCam" }] } }
             ]
         });

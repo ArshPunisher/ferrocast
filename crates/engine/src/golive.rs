@@ -642,6 +642,11 @@ struct BackupState {
     since: HashMap<String, (bool, std::time::Instant)>,
     /// Destinations whose backup is sending for them.
     failing: std::collections::HashSet<String>,
+    /// A test that set `failing` itself holds it: the one-second tick would otherwise put a
+    /// destination that never reaches a real server back on the list as soon as a slow machine
+    /// (a Windows CI runner) takes a second between two steps of the test.
+    #[cfg(test)]
+    pinned: bool,
 }
 
 #[derive(Debug)]
@@ -1066,6 +1071,7 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn seed_backup_failing_for_test(&self, id: &str, failing: bool) {
         let mut b = lock(&self.golive().backup);
+        b.pinned = true;
         if failing {
             b.failing.insert(id.to_string());
         } else {
@@ -3197,6 +3203,10 @@ impl Engine {
             let primaries: Vec<&String> =
                 cfg.advanced.per.iter().filter(|(_, a)| a.backup.is_some()).map(|(id, _)| id).collect();
             b.since.retain(|id, _| primaries.contains(&id));
+            #[cfg(test)]
+            if b.pinned {
+                return;
+            }
             for id in primaries {
                 let Some(d) = cfg.destinations.iter().find(|d| &d.id == id).filter(|d| d.enabled) else {
                     if b.failing.remove(id) {
