@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -889,11 +889,11 @@ enum Live {
     Visualizer(Box<crate::source::visualizer::VisualizerLive>),
     #[cfg(test)]
     PanicOnDrop(#[allow(dead_code)] PanicDrop),
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     FakeCamera(FakeCapture),
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 struct FakeCameraBackend {
     online: AtomicBool,
     interrupted: AtomicBool,
@@ -905,7 +905,7 @@ struct FakeCameraBackend {
     max_active_sessions: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl FakeCameraBackend {
     fn new(color: [u8; 4]) -> Arc<Self> {
         Arc::new(Self {
@@ -931,12 +931,12 @@ impl FakeCameraBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 struct FakeCapture {
     state: Arc<FakeCameraBackend>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl FakeCapture {
     fn received(&self) -> u64 {
         self.state.frames_sent.load(Ordering::Acquire)
@@ -946,10 +946,11 @@ impl FakeCapture {
         if !self.state.online.load(Ordering::Acquire) {
             return Some("the camera was disconnected".into());
         }
-        if self.state.interrupted.load(Ordering::Acquire) {
-            return Some("the camera was interrupted".into());
-        }
         None
+    }
+
+    fn interrupted(&self) -> bool {
+        self.state.online.load(Ordering::Acquire) && self.state.interrupted.load(Ordering::Acquire)
     }
 
     fn take_frame(&self) -> Option<(Picture, u64)> {
@@ -965,7 +966,7 @@ impl FakeCapture {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 impl Drop for FakeCapture {
     fn drop(&mut self) {
         self.state.active_sessions.fetch_sub(1, Ordering::SeqCst);
@@ -999,6 +1000,8 @@ struct Src {
     opening: Option<u64>,
     /// Clock time (`now_ns`) when the current reopen worker started, for [`REOPEN_TIMEOUT_NS`].
     opening_since: u64,
+    /// Active or wedged `open` / `reopen` worker threads currently executing for this source.
+    reopen_workers: Arc<AtomicUsize>,
     /// Pictures sent to the card so far (how busy it keeps the engine; Stats shows the rate).
     sent: u64,
     /// Per-source SPSC audio ring producer attached lazily on the first forwarded audio chunk.
@@ -1119,6 +1122,7 @@ impl Src {
             pending_since: 0,
             opening: None,
             opening_since: 0,
+            reopen_workers: Arc::new(AtomicUsize::new(0)),
             sent: 0,
             audio_tx: None,
             video_delay: None,
@@ -1223,11 +1227,16 @@ struct Watch {
     next_try: u64,
     /// True once this source has delivered at least one frame since creation or last edit.
     ever_sent: bool,
+    /// True for camera/capture-card sources that pause auto-retries after [`NO_SIGNAL_MAX_TRIES`]
+    /// healthy zero-frame attempts until signal arrives, disconnect, or USB hotplug.
+    cap_no_signal: bool,
     /// True for cameras (always `1, 2, 4, 5 s` backoff via `camera_retry`).
     camera_backoff: bool,
     /// A camera or microphone: one that has worked is looked for again within seconds when it
     /// goes (a USB mic bumped out and back in, where Windows has no hotplug wake).
     quick_retry: bool,
+    /// Set once `cap_no_signal && !ever_sent` reaches [`NO_SIGNAL_MAX_TRIES`] with an open session.
+    no_signal: bool,
     /// It panicked in the loop (and was stopped there).
     faulted: bool,
     /// Ended because the system turned its permission off (Screen Recording): not tried again
@@ -1253,12 +1262,13 @@ impl Watch {
     }
 
     fn for_kind(kind: Option<&SourceKind>, now: u64) -> Self {
-        let camera_backoff = is_camera_kind(kind);
+        let cap_no_signal = is_camera_kind(kind);
+        let camera_backoff = cap_no_signal;
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         let quick_retry = matches!(kind, Some(SourceKind::Camera(_) | SourceKind::Microphone(_)));
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         let quick_retry = false;
-        Self { since: now, camera_backoff, quick_retry, ..Self::default() }
+        Self { since: now, cap_no_signal, camera_backoff, quick_retry, ..Self::default() }
     }
 }
 
@@ -1266,6 +1276,8 @@ impl Watch {
 const STALL_NS: u64 = 5_000_000_000;
 /// Grace period for a freshly opened steady capture to deliver its first frame before restarting.
 const FIRST_FRAME_NS: u64 = 10_000_000_000;
+/// Maximum fruitless zero-frame tries for a capture card/camera before waiting in "no signal".
+const NO_SIGNAL_MAX_TRIES: u32 = crate::camera_retry::NO_SIGNAL_MAX_TRIES;
 /// How long a capture must keep sending before its failed tries are forgotten.
 const STABLE_NS: u64 = 10_000_000_000;
 /// The longest wait between tries at a capture card that has worked before.
@@ -1274,6 +1286,31 @@ const CARD_RETRY_MAX_NS: u64 = 3_000_000_000;
 const REOPEN_TIMEOUT_NS: u64 = 60_000_000_000;
 /// Caps simultaneous reopen worker threads so a USB hub reset doesn't contend on every device at once.
 const MAX_PARALLEL_REOPENS: usize = 2;
+/// Maximum open/reopen worker threads allowed in flight or wedged for any single source.
+const MAX_SOURCE_REOPEN_WORKERS: usize = 2;
+/// Global cap on live or wedged open/reopen worker threads across the whole engine.
+const MAX_TOTAL_REOPEN_WORKERS: usize = 8;
+
+/// RAII worker-slot counter decremented on normal return, early exit, panic, or spawn failure.
+struct ReopenWorkerGuard {
+    source_workers: Arc<AtomicUsize>,
+    total_workers: Arc<AtomicUsize>,
+}
+
+impl ReopenWorkerGuard {
+    fn new(source_workers: Arc<AtomicUsize>, total_workers: Arc<AtomicUsize>) -> Self {
+        source_workers.fetch_add(1, Ordering::AcqRel);
+        total_workers.fetch_add(1, Ordering::AcqRel);
+        Self { source_workers, total_workers }
+    }
+}
+
+impl Drop for ReopenWorkerGuard {
+    fn drop(&mut self) {
+        self.source_workers.fetch_sub(1, Ordering::AcqRel);
+        self.total_workers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 fn next_open_token() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -1348,6 +1385,10 @@ struct State {
     sleep_want: bool,
     /// Monotonic counter so concurrent start/stop callers never apply a stale sleep state.
     sleep_epoch: u64,
+    /// Live or wedged open/reopen worker threads currently active across all sources.
+    reopen_workers: Arc<AtomicUsize>,
+    /// Per-source open/reopen worker counters preserved across `Src` replacement or removal.
+    source_reopen_workers: HashMap<u64, Arc<AtomicUsize>>,
 }
 
 fn output_needs_awake(pipe: &Pipeline, kind: &OutputKind) -> bool {
@@ -1367,6 +1408,14 @@ impl State {
         self.sleep_want = want;
         self.sleep_epoch += 1;
         Some((self.sleep_epoch, want))
+    }
+
+    fn source_workers_for(&mut self, id: u64) -> Arc<AtomicUsize> {
+        if let Some(w) = self.sources.get(&id).map(|s| s.reopen_workers.clone()) {
+            self.source_reopen_workers.insert(id, w.clone());
+            return w;
+        }
+        self.source_reopen_workers.entry(id).or_insert_with(|| Arc::new(AtomicUsize::new(0))).clone()
     }
 }
 
@@ -1646,6 +1695,8 @@ impl Engine {
             parked: Vec::new(),
             sleep_want: false,
             sleep_epoch: 0,
+            reopen_workers: Arc::new(AtomicUsize::new(0)),
+            source_reopen_workers: HashMap::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let seen: Arc<Seen> = Arc::default();
@@ -1962,8 +2013,21 @@ impl Engine {
     fn open_soon(&self, id: u64, restart: Option<SourceKind>, open: Opener) -> Result<(), AvError> {
         let token = next_open_token();
         let now = now_ns();
-        {
+        let mut gone = None;
+        let worker_guard = {
             let mut st = self.lock();
+            let src_workers = st.source_workers_for(id);
+            let worker_guard = if restart.is_some() {
+                if st.reopen_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
+                    return Err(AvError::Source("too many stalled device opens in progress".into()));
+                }
+                if src_workers.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS {
+                    return Err(AvError::Source("too many stalled opens for this device".into()));
+                }
+                Some(ReopenWorkerGuard::new(src_workers.clone(), st.reopen_workers.clone()))
+            } else {
+                None
+            };
             self.audio.send(AudioCmd::SetTone { id, tone: None, levels: None });
             match st.sources.get_mut(&id) {
                 // Already here with a picture (a screen capture handed over): it keeps running
@@ -1972,24 +2036,28 @@ impl Engine {
                     src.kind = restart;
                     src.opening = Some(token);
                     src.opening_since = now;
+                    src.reopen_workers = src_workers;
                 }
                 _ => {
                     let mut src = Src::new(Live::Still, None, restart);
                     src.opening = Some(token);
                     src.opening_since = now;
-                    // Whatever was there before goes after the lock (stopping it can wait).
-                    let gone = st.sources.insert(id, src);
-                    drop(st);
-                    drop(gone);
+                    src.reopen_workers = src_workers;
+                    // Stopping the replaced source happens outside the lock below, while slot
+                    // reservation already completed atomically under `st`.
+                    gone = st.sources.insert(id, src);
                 }
             }
-        }
+            worker_guard
+        };
+        drop(gone);
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), AvError>>();
         let state = self.state.clone();
         let audio_cmd = self.audio.cmd_sender();
         let levels = self.levels.clone();
         let stop = self.stop.clone();
         let spawned = std::thread::Builder::new().name("ferrocore-open".into()).spawn(move || {
+            let _worker_guard = worker_guard;
             // A panic opening it is an error like any other: the token is cleared below and the
             // watchdog tries again (CodeRabbit), instead of a source stuck "opening".
             let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
@@ -2038,7 +2106,7 @@ impl Engine {
                         // A capture: the watchdog tries again later (cameras on 1..5 s backoff).
                         let now = now_ns();
                         if let Some(retry) = src.camera_retry.as_mut() {
-                            retry.on_reopen_finished(0, false, now, Some(&e.to_string()));
+                            retry.on_initial_open_failed(now, Some(&e.to_string()));
                         }
                         src.watch.next_try = now + src.watch.backoff(0);
                         src.watch.tries = 1;
@@ -2700,6 +2768,19 @@ impl Engine {
     /// non-blockingly from `Shown` when the render loop holds `State`.
     pub fn camera_status(&self, name: &str) -> Option<CameraStatus> {
         self.now_or_last(|st| camera_status_of(st, name), |s| s.camera_statuses.get(name).cloned())
+    }
+
+    /// True when named camera source `name` still owns an open capture session while reporting
+    /// waiting state (e.g. interruption grace or healthy 0-frame card), so picker probes avoid
+    /// opening a competing session against it.
+    pub fn is_camera_holding_session(&self, name: &str) -> bool {
+        let st = self.lock();
+        let Some((id, _)) = st.opened.get(name) else {
+            return false;
+        };
+        st.sources
+            .get(id)
+            .is_some_and(|s| !matches!(s.live, Live::Still) && s.camera_retry.as_ref().is_some_and(|r| r.is_waiting()))
     }
 
     /// Captures shown somewhere (on air, a preview, an output) that have had no picture for at
@@ -3605,7 +3686,11 @@ impl Engine {
     pub fn item_picture_ready(&self, scene: &str, item_id: i64) -> Option<bool> {
         let st = self.lock();
         let (it, _) = find_scene_item(&st, scene, item_id)?;
-        Some(if it.scene.is_some() { true } else { st.sources.get(&it.source).is_some_and(|s| s.size.is_some()) })
+        Some(if it.scene.is_some() {
+            true
+        } else {
+            st.sources.get(&it.source).is_some_and(|s| s.size.is_some() || s.pending.is_some())
+        })
     }
 
     /// One scene item rendered on its own exactly as the scene render draws it: its active
@@ -3623,7 +3708,7 @@ impl Engine {
     ) -> Result<(Vec<u8>, (u32, u32)), AvError> {
         const MAX_OFFSCREEN_SHOT: u32 = 4096;
         let canvas = (canvas.0.max(1), canvas.1.max(1));
-        let (built, scale_to) = {
+        let scene = {
             let mut st = self.lock();
             send_pending(&mut st, &self.gpu);
             let ts = now_ns();
@@ -3644,40 +3729,7 @@ impl Engine {
             for g in ancestors {
                 let (g_effects, g_base) = active_item_effects_and_base(&st, g, ms, canvas)?;
                 let (gp, g_opacity) = animated(g, ms);
-                let (m_group, (gcw, gch)) = item_draw_affine_and_crop(&gp, &g_effects, g_base)?;
-                let (gow, goh) = g_effects.iter().fold(g_base, |(w, h), e| e.out_size(w, h));
-                let [gl, gt, gr, gb] = Effect::outside_sides(&g_effects, g_base.0, g_base.1);
-                let has_crop = gp.crop.iter().any(|c| *c > 0);
-                let has_outside = gl + gt + gr + gb > 0;
-                if has_outside || has_crop {
-                    let (mut tx0, mut ty0, mut tx1, mut ty1) = pts_aabb(&pts);
-                    if has_outside {
-                        // In post-effect texture coords [0..gow, 0..goh], input (0..gw) sits at
-                        // (+gl, +gt) and outside effects spread [-gl, -gt, +gr, +gb], yielding
-                        // [lx0 .. lx1 + gl + gr] clamped to the rendered group target.
-                        tx0 = tx0.max(0.0);
-                        ty0 = ty0.max(0.0);
-                        tx1 = (tx1 + (gl + gr) as f32).min(gow as f32);
-                        ty1 = (ty1 + (gt + gb) as f32).min(goh as f32);
-                    }
-                    if has_crop {
-                        tx0 = (tx0 - gp.crop[0] as f32).max(0.0);
-                        ty0 = (ty0 - gp.crop[1] as f32).max(0.0);
-                        tx1 = (tx1 - gp.crop[0] as f32).min(gcw as f32);
-                        ty1 = (ty1 - gp.crop[1] as f32).min(gch as f32);
-                    }
-                    if tx1 <= tx0 || ty1 <= ty0 {
-                        return Err(AvError::Source("the item is cropped out by its group".into()));
-                    }
-                    pts = [
-                        m_group.apply(tx0, ty0),
-                        m_group.apply(tx1, ty0),
-                        m_group.apply(tx1, ty1),
-                        m_group.apply(tx0, ty1),
-                    ];
-                } else {
-                    pts = pts.map(|(x, y)| m_group.apply(x, y));
-                }
+                pts = project_pts_through_group(pts, g, &g_effects, g_base, &gp, g_opacity)?;
                 group_chain.push((g.clone(), g_effects, g_base, gp, g_opacity));
             }
 
@@ -3687,17 +3739,23 @@ impl Engine {
             }
             let (cx0, cy0, cx1, cy1) =
                 (bx0.max(0), by0.max(0), bx1.min(i64::from(canvas.0)), by1.min(i64::from(canvas.1)));
-            let ((off_x, off_y), (render_w, render_h), scale_to) = if cx1 > cx0 && cy1 > cy0 {
-                ((cx0 as f32, cy0 as f32), ((cx1 - cx0) as u32, (cy1 - cy0) as u32), None)
+            let (off_x, off_y, raw_w, raw_h, target_size) = if cx1 > cx0 && cy1 > cy0 {
+                let rw = u64::try_from(cx1 - cx0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
+                let rh = u64::try_from(cy1 - cy0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
+                let target = (
+                    u32::try_from(rw).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?,
+                    u32::try_from(rh).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?,
+                );
+                (cx0 as f32, cy0 as f32, rw, rh, target)
             } else {
-                let raw_w = u32::try_from(bx1 - bx0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
-                let raw_h = u32::try_from(by1 - by0).map_err(|_| AvError::BadSize(u32::MAX, u32::MAX))?.max(1);
-                let scale_to = if raw_w > MAX_OFFSCREEN_SHOT || raw_h > MAX_OFFSCREEN_SHOT {
-                    Some(fit_within(raw_w, raw_h, MAX_OFFSCREEN_SHOT))
+                let rw = u64::try_from(i128::from(bx1) - i128::from(bx0)).unwrap_or(u64::MAX).max(1);
+                let rh = u64::try_from(i128::from(by1) - i128::from(by0)).unwrap_or(u64::MAX).max(1);
+                let target = if rw > u64::from(MAX_OFFSCREEN_SHOT) || rh > u64::from(MAX_OFFSCREEN_SHOT) {
+                    fit_within_u64(rw, rh, MAX_OFFSCREEN_SHOT)
                 } else {
-                    None
+                    (rw as u32, rh as u32)
                 };
-                ((bx0 as f32, by0 as f32), (raw_w, raw_h), scale_to)
+                (bx0 as f32, by0 as f32, rw, rh, target)
             };
 
             let mut solo = it.clone();
@@ -3730,11 +3788,28 @@ impl Engine {
                     opacity: g_opacity,
                 };
             }
-            (Scene { width: render_w, height: render_h, items: vec![comp_item] }, scale_to)
-        };
-        let scene = match scale_to {
-            Some((tw, th)) => scaled(built, tw, th, Filter::Bicubic),
-            None => built,
+            // Scale oversized offscreen items via an unfiltered Group transform directly into the
+            // bounded target instead of wrapping in `Content::Scene(raw_w, raw_h)`, which would
+            // allocate a full `raw_w * raw_h` intermediate GPU texture before downscaling.
+            let items = if u64::from(target_size.0) != raw_w || u64::from(target_size.1) != raw_h {
+                vec![Item {
+                    content: Content::Group { width: target_size.0, height: target_size.1, items: vec![comp_item] },
+                    effects: Vec::new(),
+                    placement: Placement {
+                        scale_x: (target_size.0 as f64 / raw_w as f64) as f32,
+                        scale_y: (target_size.1 as f64 / raw_h as f64) as f32,
+                        ..Default::default()
+                    },
+                    filter: Filter::Disable,
+                    blend: crate::Blend::Normal,
+                    srgb_off: false,
+                    linear: true,
+                    opacity: 1.0,
+                }]
+            } else {
+                vec![comp_item]
+            };
+            Scene { width: target_size.0, height: target_size.1, items }
         };
         let out_size = (scene.width, scene.height);
         let px = self.gpu.render(&scene)?;
@@ -3867,6 +3942,144 @@ fn active_item_effects_and_base(
     Ok((effects, base))
 }
 
+fn clip_poly_edge(
+    poly: &[(f32, f32)],
+    inside: impl Fn((f32, f32)) -> bool,
+    intersect: impl Fn((f32, f32), (f32, f32)) -> (f32, f32),
+) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(poly.len() + 2);
+    let Some(&last) = poly.last() else {
+        return out;
+    };
+    let mut prev = last;
+    let mut prev_in = inside(prev);
+    for &cur in poly {
+        let cur_in = inside(cur);
+        if cur_in != prev_in {
+            out.push(intersect(prev, cur));
+        }
+        if cur_in {
+            out.push(cur);
+        }
+        prev = cur;
+        prev_in = cur_in;
+    }
+    out
+}
+
+fn clip_pts_to_rect(pts: &[(f32, f32); 4], w: f32, h: f32) -> Option<(f32, f32, f32, f32)> {
+    let mut poly: Vec<(f32, f32)> = pts.to_vec();
+    poly = clip_poly_edge(
+        &poly,
+        |(x, _)| x >= 0.0,
+        |(ax, ay), (bx, by)| {
+            let t = (0.0 - ax) / (bx - ax);
+            (0.0, ay + t * (by - ay))
+        },
+    );
+    poly = clip_poly_edge(
+        &poly,
+        |(x, _)| x <= w,
+        |(ax, ay), (bx, by)| {
+            let t = (w - ax) / (bx - ax);
+            (w, ay + t * (by - ay))
+        },
+    );
+    poly = clip_poly_edge(
+        &poly,
+        |(_, y)| y >= 0.0,
+        |(ax, ay), (bx, by)| {
+            let t = (0.0 - ay) / (by - ay);
+            (ax + t * (bx - ax), 0.0)
+        },
+    );
+    poly = clip_poly_edge(
+        &poly,
+        |(_, y)| y <= h,
+        |(ax, ay), (bx, by)| {
+            let t = (h - ay) / (by - ay);
+            (ax + t * (bx - ax), h)
+        },
+    );
+    if poly.len() < 3 {
+        return None;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (x, y) in poly {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
+}
+
+fn project_pts_through_group(
+    pts: [(f32, f32); 4],
+    g: &SceneItem,
+    g_effects: &[Effect],
+    g_base: (u32, u32),
+    gp: &Placement,
+    g_opacity: f32,
+) -> Result<[(f32, f32); 4], AvError> {
+    let (m_group, (gcw, gch)) = item_draw_affine_and_crop(gp, g_effects, g_base)?;
+    let has_crop = gp.crop.iter().any(|c| *c > 0);
+    // Compositor allocates an offscreen `g_base` texture (clipping children to `0..g_base`)
+    // whenever effects, placement crop, scale filter, blend mode, or group opacity apply.
+    let group_renders_to_texture =
+        !g_effects.is_empty() || has_crop || g.filter != Filter::Disable || g.blend != Blend::Normal || g_opacity < 1.0;
+    if !group_renders_to_texture {
+        return Ok(pts.map(|(x, y)| m_group.apply(x, y)));
+    }
+    // Clip actual polygon corners to `[0..g_base.0, 0..g_base.1]` before computing its AABB so
+    // rotated items outside a corner (whose unclipped AABB straddles `(0,0)`) are rejected too.
+    let (mut tx0, mut ty0, mut tx1, mut ty1) = clip_pts_to_rect(&pts, g_base.0 as f32, g_base.1 as f32)
+        .ok_or_else(|| AvError::Source("the item is cropped out by its group".into()))?;
+    let (mut cur_w, mut cur_h) = g_base;
+    for e in g_effects {
+        let (nw, nh) = e.out_size(cur_w, cur_h);
+        match e {
+            Effect::Crop { left, top, .. } => {
+                tx0 = (tx0 - *left as f32).max(0.0);
+                ty0 = (ty0 - *top as f32).max(0.0);
+                tx1 = (tx1 - *left as f32).min(nw as f32);
+                ty1 = (ty1 - *top as f32).min(nh as f32);
+                if tx1 <= tx0 || ty1 <= ty0 {
+                    return Err(AvError::Source("the item is cropped out by its group".into()));
+                }
+            }
+            Effect::Scroll { speed_x, speed_y, width, height, .. }
+                if *speed_x != 0.0 || *speed_y != 0.0 || width.is_some() || height.is_some() =>
+            {
+                tx0 = 0.0;
+                ty0 = 0.0;
+                tx1 = nw as f32;
+                ty1 = nh as f32;
+            }
+            _ => {
+                let pad = e.pad();
+                if pad > 0 {
+                    tx0 = tx0.max(0.0);
+                    ty0 = ty0.max(0.0);
+                    tx1 = (tx1 + (2 * pad) as f32).min(nw as f32);
+                    ty1 = (ty1 + (2 * pad) as f32).min(nh as f32);
+                }
+            }
+        }
+        (cur_w, cur_h) = (nw, nh);
+    }
+    if has_crop {
+        tx0 = (tx0 - gp.crop[0] as f32).max(0.0);
+        ty0 = (ty0 - gp.crop[1] as f32).max(0.0);
+        tx1 = (tx1 - gp.crop[0] as f32).min(gcw as f32);
+        ty1 = (ty1 - gp.crop[1] as f32).min(gch as f32);
+        if tx1 <= tx0 || ty1 <= ty0 {
+            return Err(AvError::Source("the item is cropped out by its group".into()));
+        }
+    }
+    Ok([m_group.apply(tx0, ty0), m_group.apply(tx1, ty0), m_group.apply(tx1, ty1), m_group.apply(tx0, ty1)])
+}
+
 fn item_draw_affine_and_crop(
     placement: &Placement,
     effects: &[Effect],
@@ -3908,13 +4121,14 @@ fn snap_pts_bbox(pts: &[(f32, f32); 4]) -> (i64, i64, i64, i64) {
     ((x0 + EPS).floor() as i64, (y0 + EPS).floor() as i64, (x1 - EPS).ceil() as i64, (y1 - EPS).ceil() as i64)
 }
 
-fn fit_within(w: u32, h: u32, max_side: u32) -> (u32, u32) {
+fn fit_within_u64(w: u64, h: u64, max_side: u32) -> (u32, u32) {
+    let cap = u128::from(max_side.max(1));
     if w >= h {
-        let th = ((u64::from(h) * u64::from(max_side)) / u64::from(w.max(1))).max(1) as u32;
-        (max_side, th)
+        let th = ((u128::from(h) * cap) / u128::from(w.max(1))).clamp(1, cap) as u32;
+        (max_side.max(1), th)
     } else {
-        let tw = ((u64::from(w) * u64::from(max_side)) / u64::from(h.max(1))).max(1) as u32;
-        (tw, max_side)
+        let tw = ((u128::from(w) * cap) / u128::from(h.max(1))).clamp(1, cap) as u32;
+        (tw, max_side.max(1))
     }
 }
 
@@ -5165,7 +5379,7 @@ fn signs(live: &Live) -> Option<(u64, bool, Option<String>)> {
         Live::Camera(c) | Live::Microphone(c) => Some((c.received(), c.steady(), c.ended())),
         #[cfg(test)]
         Live::PanicOnDrop(_) => Some((0, false, Some("dead".into()))),
-        #[cfg(test)]
+        #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         Live::FakeCamera(c) => Some((c.received(), true, c.ended())),
         _ => None,
     }
@@ -5192,12 +5406,36 @@ fn look(w: &mut Watch, running: bool, signs: Option<(u64, bool, Option<String>)>
         w.denied = true;
         return None;
     }
+    if w.cap_no_signal && !w.ever_sent && w.tries >= NO_SIGNAL_MAX_TRIES {
+        // Waiting for a signal, with the session left open: a picture that comes now (a console
+        // switched on) lets go of the wait, as USB hotplug does. Nothing else is tried.
+        let gone = signs.as_ref().is_some_and(|(_, _, ended)| ended.is_some());
+        match signs {
+            Some((count, ..)) if running && count > 0 => {
+                w.ever_sent = true;
+                w.no_signal = false;
+                w.count = count;
+                w.since = now;
+                w.tries = 0;
+                w.next_try = 0;
+            }
+            // No session to see the signal come with (the last try failed to open, or it ended
+            // with an error): retry on backoff until a healthy open session is listening.
+            _ if !running || gone => {
+                w.no_signal = true;
+                return Some("its session is gone while it waits for a signal".into());
+            }
+            _ => w.no_signal = true,
+        }
+        return None;
+    }
     if !running {
         return Some("it didn't start again last time".into());
     }
     let (count, steady, ended) = signs?;
     if count > 0 {
         w.ever_sent = true;
+        w.no_signal = false;
     }
     if count != w.count {
         w.count = count;
@@ -5282,6 +5520,16 @@ fn is_live_ended(live: &Live) -> bool {
     signs(live).is_some_and(|(_, _, e)| e.is_some())
 }
 
+fn is_live_interrupted(live: &Live) -> bool {
+    match live {
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        Live::Camera(c) => c.interrupted(),
+        #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        Live::FakeCamera(c) => c.interrupted(),
+        _ => false,
+    }
+}
+
 fn poll_hotplug(seq: &mut u64) -> Option<Vec<String>> {
     #[cfg(target_os = "macos")]
     {
@@ -5326,6 +5574,7 @@ fn apply_hotplug_reconnects(sources: &mut BTreeMap<u64, Src>, connected: &[Strin
             }
             src.watch.next_try = now;
             src.watch.tries = 0;
+            src.watch.no_signal = false;
             woke += 1;
         }
     }
@@ -5397,15 +5646,26 @@ fn watchdog_step(
                     None => (0, false),
                 };
                 let ended = ended || src.watch.faulted;
+                let was_no_signal = retry.is_no_signal();
                 src.watch.count = frames;
                 let action = retry.step(CameraObservation {
                     running,
                     frames,
                     ended,
+                    interrupted: is_live_interrupted(&src.live),
                     opening: false,
                     visible_or_on_air,
                     now_ns: now,
                 });
+                src.watch.no_signal = retry.is_no_signal();
+                src.watch.ever_sent = retry.ever_sent();
+                if !was_no_signal && retry.is_no_signal() {
+                    tracing::warn!(
+                        source = *id,
+                        tries = NO_SIGNAL_MAX_TRIES,
+                        "capture didn't deliver a picture (no signal); leaving session open until signal or disconnect"
+                    );
+                }
                 if let CameraAction::Reopen(why) = action {
                     ready.push((retry.tries(), *id, why.to_string()));
                 }
@@ -5425,9 +5685,37 @@ fn watchdog_step(
             st.notices.push(n);
         }
         ready.sort_by_key(|(tries, id, _)| (*tries, *id));
-        let budget = MAX_PARALLEL_REOPENS.saturating_sub(in_flight);
-        for (_, id, why) in ready.into_iter().take(budget) {
+        let total_workers = st.reopen_workers.clone();
+        let mut launched = 0usize;
+        for (_, id, why) in ready {
+            if in_flight + launched >= MAX_PARALLEL_REOPENS {
+                break;
+            }
+            if total_workers.load(Ordering::Acquire) >= MAX_TOTAL_REOPEN_WORKERS {
+                tracing::warn!(
+                    active = total_workers.load(Ordering::Acquire),
+                    "global reopen worker cap reached; waiting for stalled workers to exit"
+                );
+                break;
+            }
             let Some(src) = st.sources.get_mut(&id) else { continue };
+            if src.reopen_workers.load(Ordering::Acquire) >= MAX_SOURCE_REOPEN_WORKERS {
+                tracing::warn!(
+                    source = id,
+                    workers = src.reopen_workers.load(Ordering::Acquire),
+                    "source reopen worker cap reached; waiting for stalled workers to exit"
+                );
+                if let Some(retry) = src.camera_retry.as_mut() {
+                    retry.defer_backoff(now);
+                    src.watch.next_try = retry.next_try_ns();
+                    src.watch.tries = retry.tries();
+                } else {
+                    let prev = src.watch.tries;
+                    src.watch.next_try = now + src.watch.backoff(prev);
+                    src.watch.tries = prev.saturating_add(1);
+                }
+                continue;
+            }
             let Some(kind) = src.kind.clone() else { continue };
             let token = next_open_token();
             let prev_tries = if let Some(retry) = src.camera_retry.as_mut() {
@@ -5445,20 +5733,24 @@ fn watchdog_step(
             src.watch.since = now;
             src.opening = Some(token);
             src.opening_since = now;
+            let worker_guard = ReopenWorkerGuard::new(src.reopen_workers.clone(), total_workers.clone());
             // Taken out now (a camera is let go before it's opened again), dropped on its
             // own reopen worker outside the lock.
             let old = std::mem::replace(&mut src.live, Live::Still);
-            todo.push((id, kind, why, old, token, prev_tries));
+            todo.push((id, kind, why, old, token, prev_tries, worker_guard));
+            launched += 1;
         }
     }
-    for (id, kind, why, old, token, prev_tries) in todo {
+    for (id, kind, why, old, token, prev_tries, worker_guard) in todo {
         if stop.load(Ordering::Acquire) {
+            drop(worker_guard);
             drop(old);
             return;
         }
         let (state_w, state_panic, audio_w, stop_w, reopen_w) =
             (state.clone(), state.clone(), audio_cmd.clone(), stop.clone(), reopen.clone());
         let spawned = std::thread::Builder::new().name("ferrocore-reopen".into()).spawn(move || {
+            let _worker_guard = worker_guard;
             let worker_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 drop(old);
                 if stop_w.load(Ordering::Acquire) {
@@ -5911,7 +6203,7 @@ fn frame(
             Live::Still | Live::Visualizer(_) => {}
             #[cfg(test)]
             Live::PanicOnDrop(_) => {}
-            #[cfg(test)]
+            #[cfg(all(test, any(target_os = "macos", target_os = "windows", target_os = "linux")))]
             Live::FakeCamera(cap) => {
                 if let Some((p, _)) = cap.take_frame() {
                     uploads.push((*id, Fresh::Pic(p)));
@@ -6785,6 +7077,7 @@ mod tests {
                 running: false,
                 frames: 0,
                 ended: false,
+                interrupted: false,
                 opening: false,
                 visible_or_on_air: true,
                 now_ns: t,
@@ -6807,6 +7100,7 @@ mod tests {
             running: false,
             frames: 0,
             ended: false,
+            interrupted: false,
             opening: false,
             visible_or_on_air: true,
             now_ns: t + sec,
@@ -6838,6 +7132,57 @@ mod tests {
         // An ordinary crash is still restarted as before.
         let mut crashed = Watch::for_kind(None, 0);
         assert!(look(&mut crashed, true, Some((0, false, Some("it crashed".into()))), s).is_some());
+    }
+
+    /// The wait for a signal needs a session open to see it come: without one (the last try failed
+    /// to open, or it ended with an error) the watchdog still tries.
+    #[test]
+    fn a_no_signal_wait_without_a_session_is_retried_slowly() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert!(look(&mut w, false, None, 40 * s).is_some(), "not running: try again");
+        let err = Some((0, true, Some("runtime error".to_string())));
+        assert!(look(&mut w, true, err, 41 * s).is_some(), "ended with an error: try again");
+        // With a healthy session it still just waits.
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 42 * s), None);
+        assert!(w.no_signal);
+    }
+
+    /// A capture card nobody has plugged anything into yet (a console turned on later): once it
+    /// sends, the "no signal" wait ends by itself, with no unplugging or editing.
+    #[test]
+    fn a_no_signal_card_wakes_when_its_picture_comes() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.tries = NO_SIGNAL_MAX_TRIES;
+        assert_eq!(look(&mut w, true, Some((0, true, None)), 40 * s), None);
+        assert!(w.no_signal, "waiting for a signal");
+        // The console is switched on: frames flow on the session that was open all along.
+        assert_eq!(look(&mut w, true, Some((30, true, None)), 90 * s), None);
+        assert!(!w.no_signal && w.ever_sent, "the latch let go");
+        assert_eq!(w.tries, 0);
+        // And it's watched as a working card again: if it stops, it's restarted.
+        assert!(look(&mut w, true, Some((30, true, None)), 97 * s).is_some());
+    }
+
+    /// An HDMI link that flaps (one frame, then nothing, again and again) keeps its tries, so the
+    /// backoff grows instead of restarting on every drop.
+    #[test]
+    fn a_flapping_link_does_not_reset_its_backoff() {
+        let s = 1_000_000_000;
+        let mut w = Watch::for_kind(Some(&SourceKind::Camera("capture-card".into())), 0);
+        w.ever_sent = true;
+        let mut count = 0;
+        let mut now = 100 * s;
+        for _ in 0..5 {
+            count += 1;
+            assert_eq!(look(&mut w, true, Some((count, true, None)), now), None, "one frame");
+            now += 6 * s;
+            assert!(look(&mut w, true, Some((count, true, None)), now).is_some(), "stalled again");
+            w.tries += 1; // the watchdog's reopen
+        }
+        assert_eq!(w.tries, 5, "the failed tries were kept");
     }
 
     /// A camera/card that has worked and one that has not yet sent both retry quickly within 5 s;
@@ -10366,13 +10711,14 @@ mod tests {
     #[test]
     fn offline_camera_stays_in_sources_and_keeps_retrying_within_5s() {
         let Some(e) = engine() else { return };
+        let (cam_kind, cam_key) = crate::obs::native_camera_kind_and_key();
         let doc = serde_json::json!({
             "current_program_scene": "Main",
             "sources": [
                 {
-                    "id": "av_capture_input_v2",
+                    "id": cam_kind,
                     "name": "iPhone",
-                    "settings": { "device": "/no/such/iphone" }
+                    "settings": { cam_key: "/no/such/iphone" }
                 },
                 {
                     "id": "scene",
@@ -10381,7 +10727,16 @@ mod tests {
                 }
             ]
         });
-        let _ = e.load_obs(&doc);
+        let skipped = e.load_obs(&doc);
+        assert!(skipped.is_empty(), "native camera kind {cam_kind}/{cam_key} must load: {skipped:?}");
+        let wait_open = |label: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while e.opening() > 0 {
+                assert!(Instant::now() < deadline, "timed out waiting for {label} open to settle");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait_open("initial");
         let (id, _) = e.source_named("iPhone").expect("selected camera kept in engine sources while waiting");
         assert!(e.lock().sources.contains_key(&id), "camera source stays registered for watchdog retries");
 
@@ -10391,9 +10746,10 @@ mod tests {
             "unseen camera backoff must cap at 5 s, got {} ns",
             w.backoff(9)
         );
-        // Second load once AVFoundation cache is warm fails within OPEN_WAIT; camera still stays
-        // tracked in `sources` and marked waiting for the camera.
+        // Remove and reload cleanly so warm failure is driven through a fresh initial open attempt.
+        e.remove_source(id);
         let _ = e.load_obs(&doc);
+        wait_open("warm");
         let (id2, _) = e.source_named("iPhone").expect("warm offline camera stays in opened");
         assert!(e.lock().sources.contains_key(&id2));
         assert_eq!(e.waiting_cameras(), vec!["iPhone".to_string()]);
@@ -10505,6 +10861,139 @@ mod tests {
         assert_eq!(backend.open_attempts.load(Ordering::Acquire), final_attempts);
     }
 
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn no_signal_capture_card_keeps_healthy_session_open_and_wakes_on_signal() {
+        let Some(e) = engine() else { return };
+        let backend = FakeCameraBackend::new([0, 200, 100, 255]);
+        backend.streaming.store(false, Ordering::Release);
+        {
+            let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(live, None, Some(SourceKind::Camera("capture-card".into()))));
+            st.opened.insert("Card".into(), (1, SourceKind::Camera("capture-card".into())));
+            st.scenes.insert("Main".into(), vec![SceneItem::new(1, Placement::default())]);
+            st.on_air = Some("Main".into());
+        }
+        let reopen_b = Arc::clone(&backend);
+        let reopen: Reopener = Arc::new(move |kind| match kind {
+            SourceKind::Camera(spec) if spec.id == "capture-card" => Some(reopen_b.open()),
+            _ => None,
+        });
+        let cmd = e.audio.cmd_sender();
+        let wait_idle = || {
+            let dl = Instant::now() + Duration::from_secs(2);
+            while e.lock().sources.get(&1).is_some_and(|s| s.opening.is_some()) && Instant::now() < dl {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        let mut t = now_ns();
+        for _ in 0..3 {
+            t += 10_500_000_000;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+            wait_idle();
+        }
+        let settled_attempts = backend.open_attempts.load(Ordering::Acquire);
+        assert_eq!(backend.active_sessions.load(Ordering::Acquire), 1);
+
+        // Past 3 zero-frame tries, a healthy open session stays open without 10 s teardown churn.
+        for _ in 0..5 {
+            t += 11_000_000_000;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+            wait_idle();
+            assert_eq!(
+                backend.open_attempts.load(Ordering::Acquire),
+                settled_attempts,
+                "healthy 0-frame capture session must not be torn down every 10 s"
+            );
+            assert_eq!(backend.active_sessions.load(Ordering::Acquire), 1);
+        }
+
+        // Turning the console on delivers frames on the existing open session with no extra reopen.
+        backend.streaming.store(true, Ordering::Release);
+        let dl = Instant::now() + Duration::from_secs(2);
+        let mut px = vec![0; 4];
+        while Instant::now() < dl {
+            px = e.snapshot_scene_at("Main", (16, 16), (16, 16)).unwrap_or_default();
+            if px.get(0..4) == Some(&[0, 200, 100, 255]) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(&px[0..4], &[0, 200, 100, 255]);
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), settled_attempts);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn interrupted_camera_keeps_session_open_during_grace_and_resumes_without_reopen() {
+        let Some(e) = engine() else { return };
+        let backend = FakeCameraBackend::new([255, 0, 0, 255]);
+        {
+            let live = backend.open().unwrap_or_else(|x| panic!("{x}"));
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(live, None, Some(SourceKind::Camera("fake-iphone".into()))));
+            st.opened.insert("iPhone".into(), (1, SourceKind::Camera("fake-iphone".into())));
+            st.scenes.insert("Main".into(), vec![SceneItem::new(1, Placement::default())]);
+            st.on_air = Some("Main".into());
+        }
+        let dl = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < dl && e.lock().sources.get(&1).and_then(|s| s.size).is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(e.lock().sources.get(&1).and_then(|s| s.size).is_some());
+
+        let reopen_b = Arc::clone(&backend);
+        let reopen: Reopener = Arc::new(move |kind| match kind {
+            SourceKind::Camera(spec) if spec.id == "fake-iphone" => Some(reopen_b.open()),
+            _ => None,
+        });
+        let cmd = e.audio.cmd_sender();
+        let wait_idle = || {
+            let dl = Instant::now() + Duration::from_secs(5);
+            while e.lock().sources.get(&1).is_some_and(|s| s.opening.is_some()) && Instant::now() < dl {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // Session interrupted while device stays connected: surfaces Waiting without destroying session.
+        backend.interrupted.store(true, Ordering::Release);
+        *backend.color.lock().unwrap_or_else(|x| x.into_inner()) = [0, 255, 0, 255];
+        let attempts0 = backend.open_attempts.load(Ordering::Acquire);
+        let t = now_ns();
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 6_000_000_000);
+        wait_idle();
+        assert_eq!(backend.active_sessions.load(Ordering::Acquire), 1, "must keep interrupted session alive");
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), attempts0, "must not reopen during grace");
+        assert_eq!(e.waiting_cameras(), vec!["iPhone".to_string()]);
+
+        // Interruption ends: same session resumes delivering green frames with zero reopen churn.
+        backend.interrupted.store(false, Ordering::Release);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t + 7_000_000_000);
+        let dl2 = Instant::now() + Duration::from_secs(5);
+        let mut px = vec![0; 4];
+        while Instant::now() < dl2 {
+            px = e.snapshot_scene_at("Main", (16, 16), (16, 16)).unwrap_or_default();
+            if px.get(0..4) == Some(&[0, 255, 0, 255]) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(&px[0..4], &[0, 255, 0, 255]);
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), attempts0);
+        assert!(e.waiting_cameras().is_empty());
+
+        // An interruption that never ends past the grace window falls back to reopening cleanly.
+        backend.interrupted.store(true, Ordering::Release);
+        let t2 = t + 8_000_000_000;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t2);
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, t2 + crate::camera_retry::CAMERA_INTERRUPTION_GRACE_NS);
+        wait_idle();
+        assert_eq!(backend.open_attempts.load(Ordering::Acquire), attempts0 + 1);
+    }
+
     #[test]
     fn snapshot_item_transformed_handles_offscreen_and_missing_items() {
         let Some(e) = engine() else { return };
@@ -10552,5 +11041,429 @@ mod tests {
             expected_nested.extend_from_slice(&full_scene[start..start + 28 * 4]);
         }
         assert_eq!(nested_px, expected_nested, "nested group screenshot matches scene render pixel-for-pixel");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn open_soon_slow_failure_records_retry_tries() {
+        let Some(e) = engine() else { return };
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate_c = gate.clone();
+
+        e.open_soon(
+            1,
+            Some(SourceKind::Camera(CameraSpec::from("slow-cam"))),
+            Box::new(move || {
+                let _ = entered_tx.send(());
+                let (lk, cv) = &*gate_c;
+                let mut released = lk.lock().unwrap_or_else(|x| x.into_inner());
+                while !*released {
+                    released = cv.wait(released).unwrap_or_else(|x| x.into_inner());
+                }
+                Err(AvError::Source("that camera isn't connected".into()))
+            }),
+        )
+        .unwrap_or_else(|x| panic!("{x}"));
+
+        entered_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        while e.opening() > 0 {
+            std::thread::yield_now();
+        }
+
+        let st = e.lock();
+        let src = st.sources.get(&1).expect("failed capture must remain in sources for watchdog retry");
+        let status = camera_status_of_src(src).expect("camera source must report CameraStatus");
+        assert_eq!(status.state, "waiting");
+        assert_eq!(src.watch.tries, 1);
+        assert_eq!(status.tries, 1, "slow initial open failure must increment retry.tries");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn watchdog_caps_stalled_reopen_workers_and_resumes_after_drain() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            st.sources.insert(1, Src::new(Live::Still, None, Some(SourceKind::Camera(CameraSpec::from("wedged-cam")))));
+        }
+
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_c = attempts.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate_c = gate.clone();
+
+        let reopen: Reopener = Arc::new(move |_| {
+            let n = attempts_c.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = entered_tx.send(n);
+            if n <= 2 {
+                let (lk, cv) = &*gate_c;
+                let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                while !*open {
+                    open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                }
+            }
+            let _ = exited_tx.send(n);
+            Some(Err(AvError::Source("driver wedged".into())))
+        });
+
+        let mut now = now_ns();
+        let cmd = e.audio.cmd_sender();
+        // Worker 1 launches and blocks.
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert_eq!(entered_rx.recv().unwrap_or_else(|x| panic!("{x}")), 1);
+
+        // Past 60 s deadline, worker 2 replaces the slot and blocks too.
+        now += REOPEN_TIMEOUT_NS;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert_eq!(entered_rx.recv().unwrap_or_else(|x| panic!("{x}")), 2);
+
+        // Past another 60 s deadline + max backoff, worker 3 must NOT spawn while 2 are stuck.
+        now += REOPEN_TIMEOUT_NS + 120_000_000_000;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert!(e.lock().sources[&1].opening.is_none(), "capped source must not open a 3rd stalled worker");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "must not launch a 3rd thread while 2 are wedged");
+
+        // Unblock both wedged workers and wait for both to finish exiting their closures.
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        let _ = exited_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+        let _ = exited_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+        while e
+            .lock()
+            .sources
+            .get(&1)
+            .is_some_and(|s| s.opening.is_some() || s.reopen_workers.load(Ordering::Acquire) > 0)
+        {
+            std::thread::yield_now();
+        }
+
+        // Once workers drain, advancing past backoff allows worker 3 to launch normally.
+        now += 120_000_000_000;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert_eq!(entered_rx.recv().unwrap_or_else(|x| panic!("{x}")), 3);
+        let _ = exited_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn watchdog_caps_total_stalled_reopen_workers_across_sources() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            for id in 1..=5u64 {
+                st.sources.insert(
+                    id,
+                    Src::new(Live::Still, None, Some(SourceKind::Camera(CameraSpec::from(&*format!("cam-{id}"))))),
+                );
+            }
+        }
+
+        let attempts = Arc::new(AtomicU64::new(0));
+        let attempts_c = attempts.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let gate_c = gate.clone();
+
+        let reopen: Reopener = Arc::new(move |_| {
+            let n = attempts_c.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = entered_tx.send(n);
+            let (lk, cv) = &*gate_c;
+            let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+            while !*open {
+                open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+            }
+            let _ = exited_tx.send(n);
+            Some(Err(AvError::Source("driver wedged".into())))
+        });
+
+        let mut now = now_ns();
+        let cmd = e.audio.cmd_sender();
+        // Wedge MAX_TOTAL_REOPEN_WORKERS (8) across sources 1..=4 (2 workers per step x 4).
+        for _ in 0..(MAX_TOTAL_REOPEN_WORKERS / MAX_PARALLEL_REOPENS) {
+            now += REOPEN_TIMEOUT_NS;
+            watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+            for _ in 0..MAX_PARALLEL_REOPENS {
+                let _ = entered_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+            }
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_TOTAL_REOPEN_WORKERS as u64);
+
+        // Source 5 is due and has 0 per-source workers, yet global cap stops spawning a 9th thread.
+        now += REOPEN_TIMEOUT_NS + 120_000_000_000;
+        watchdog_step(&e.state, &cmd, &e.stop, &reopen, None, now);
+        assert!(e.lock().sources[&5].opening.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), MAX_TOTAL_REOPEN_WORKERS as u64);
+
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        for _ in 0..MAX_TOTAL_REOPEN_WORKERS {
+            let _ = exited_rx.recv().unwrap_or_else(|x| panic!("{x}"));
+        }
+        while e.lock().reopen_workers.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn snapshot_item_transformed_clips_outside_group_and_tracks_crop_filter() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 40, height: 20, rgba: [20, 180, 240, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+
+        // 1. Children sitting completely left (-50..-10) or right (65..105) of a 60x40 group with an
+        // outside shadow must be rejected as cropped out instead of clamping into a bogus sliver.
+        for bad_x in [-50.0f32, 65.0f32] {
+            let mut off = SceneItem::new(1, Placement { x: bad_x, y: 10.0, ..Default::default() });
+            off.item_id = 21;
+            e.set_scene("ShadowGroup", vec![off]);
+
+            let mut grp = SceneItem::new(0, Placement { x: 100.0, y: 100.0, ..Default::default() });
+            grp.scene = Some("ShadowGroup".into());
+            grp.group = Some((60, 40));
+            grp.item_id = 22;
+            grp.effects = vec![Effect::Shadow { rgba: [0.0, 0.0, 0.0, 1.0], blur: 8.0, x: 0.0, y: 0.0, outside: true }];
+            e.set_scene("Main", vec![grp]);
+
+            assert!(
+                e.snapshot_item_transformed("Main", 21, (640, 360)).is_err(),
+                "item at x={bad_x} outside 60x40 group must be cropped out before shadow padding"
+            );
+        }
+
+        // 2. Effect::Crop on the enclosing group must shift & clip the child's transformed box to match the scene.
+        let mut inside = SceneItem::new(1, Placement { x: 20.0, y: 20.0, ..Default::default() });
+        inside.item_id = 31;
+        e.set_scene("CropGroup", vec![inside]);
+
+        let mut cropped_grp = SceneItem::new(0, Placement { x: 50.0, y: 40.0, ..Default::default() });
+        cropped_grp.scene = Some("CropGroup".into());
+        cropped_grp.group = Some((100, 80));
+        cropped_grp.item_id = 32;
+        cropped_grp.effects = vec![Effect::Crop { left: 10, top: 8, right: 0, bottom: 0, size: Some((70, 50)) }];
+        e.set_scene("Main", vec![cropped_grp]);
+
+        let (px, size) = e.snapshot_item_transformed("Main", 31, (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(size, (40, 20), "child [20..60, 20..40] cropped by (10,8) remains 40x20");
+        let full_scene = e.snapshot_scene_at("Main", (640, 360), (640, 360)).unwrap_or_else(|x| panic!("{x}"));
+        let mut expected = Vec::with_capacity((40 * 20 * 4) as usize);
+        // Group placed at (50, 40); child starts at (20-10, 20-8) = (10, 12) inside cropped group -> (60, 52).
+        for y in 52..72usize {
+            let start = (y * 640 + 60) * 4;
+            expected.extend_from_slice(&full_scene[start..start + 40 * 4]);
+        }
+        assert_eq!(px, expected, "group with Effect::Crop screenshot must match scene render pixel-for-pixel");
+
+        // 3. Item completely cut away by Effect::Crop on its enclosing group must return an error.
+        let mut wiped_grp = SceneItem::new(0, Placement { x: 50.0, y: 40.0, ..Default::default() });
+        wiped_grp.scene = Some("CropGroup".into());
+        wiped_grp.group = Some((100, 80));
+        wiped_grp.item_id = 33;
+        wiped_grp.effects = vec![Effect::Crop { left: 70, top: 0, right: 0, bottom: 0, size: None }];
+        e.set_scene("Main", vec![wiped_grp]);
+        assert!(
+            e.snapshot_item_transformed("Main", 31, (640, 360)).is_err(),
+            "child completely removed by Effect::Crop must error cleanly"
+        );
+    }
+
+    #[test]
+    fn snapshot_item_transformed_downscales_oversized_offscreen_item_without_raw_target() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 1000, height: 500, rgba: [40, 190, 90, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+
+        let mut big = SceneItem::new(
+            1,
+            Placement { x: -30_000.0, y: -20_000.0, scale_x: 20.0, scale_y: 20.0, ..Default::default() },
+        );
+        big.item_id = 41;
+        e.set_scene("Main", vec![big]);
+
+        let (px, size) = e
+            .snapshot_item_transformed("Main", 41, (1920, 1080))
+            .expect("oversized 20000x10000 offscreen item must downscale without allocating raw target");
+        assert_eq!(size, (4096, 2048));
+        assert_eq!(px.len(), 4096 * 2048 * 4);
+        let center = (1024 * 4096 + 2048) * 4;
+        assert_eq!(&px[center..center + 4], &[40, 190, 90, 255]);
+
+        // Rotated 90 deg and scaled past u32::MAX also downscales without raw texture allocation.
+        let mut rot = SceneItem::new(
+            1,
+            Placement {
+                x: -20_000_000_000.0,
+                y: -20_000_000_000.0,
+                scale_x: 10_000_000.0,
+                scale_y: 10_000_000.0,
+                rotation: 90.0,
+                ..Default::default()
+            },
+        );
+        rot.item_id = 42;
+        e.set_scene("Main", vec![rot]);
+        let (rpx, rsize) = e.snapshot_item_transformed("Main", 42, (1920, 1080)).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(rsize, (2048, 4096));
+        assert_eq!(rpx.len(), 2048 * 4096 * 4);
+    }
+
+    #[test]
+    fn item_picture_ready_counts_pending_frame_for_unshown_source() {
+        let Some(e) = engine() else { return };
+        {
+            let mut st = e.lock();
+            let mut no_pic = Src::new(Live::Still, None, None);
+            no_pic.pending = None;
+            st.sources.insert(1, no_pic);
+
+            let mut with_pending = Src::new(Live::Still, None, None);
+            with_pending.pending = Some(Fresh::Pic(Picture::solid(16, 16, [10, 20, 30, 255])));
+            st.sources.insert(2, with_pending);
+        }
+        let mut a = SceneItem::new(1, Placement::default());
+        a.item_id = 10;
+        let mut b = SceneItem::new(2, Placement::default());
+        b.item_id = 11;
+        e.set_scene("Unshown", vec![a, b]);
+
+        assert_eq!(e.item_picture_ready("Unshown", 10), Some(false));
+        assert_eq!(
+            e.item_picture_ready("Unshown", 11),
+            Some(true),
+            "pending frame waiting for GPU upload on an unshown source must report ready immediately"
+        );
+    }
+
+    #[test]
+    fn snapshot_item_transformed_rejects_rotated_diamond_outside_group_corner() {
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 14, height: 14, rgba: [200, 100, 50, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        // Rotated 45 deg near top-left outside (-18..-8,-8..-18) -> unclipped AABB crosses (0,0)
+        // while the polygon itself stays strictly in x+y < 0 outside [0..60, 0..40].
+        let mut child = SceneItem::new(1, Placement { x: -8.0, y: -18.0, rotation: 45.0, ..Default::default() });
+        child.item_id = 51;
+        e.set_scene("CornerGroup", vec![child]);
+
+        let mut grp = SceneItem::new(0, Placement { x: 100.0, y: 100.0, ..Default::default() });
+        grp.scene = Some("CornerGroup".into());
+        grp.group = Some((60, 40));
+        grp.item_id = 52;
+        grp.effects = vec![Effect::ColorCorrection {
+            gamma: 0.0,
+            contrast: 0.0,
+            brightness: 0.0,
+            saturation: 0.0,
+            hue_shift: 0.0,
+            opacity: 1.0,
+            multiply: 0xFFFF_FFFF,
+            add: 0,
+        }];
+        e.set_scene("Main", vec![grp]);
+
+        assert!(
+            e.snapshot_item_transformed("Main", 51, (640, 360)).is_err(),
+            "rotated item entirely outside group corner must be cropped out"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn open_soon_preserves_worker_cap_across_source_replacement_and_allows_media_files() {
+        let Some(e) = engine() else { return };
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+
+        // Fill per-source cap (2) for picture-less source 1 via two sequential open_soon replacements.
+        for _ in 0..MAX_SOURCE_REOPEN_WORKERS {
+            let g = gate.clone();
+            let etx = entered_tx.clone();
+            let xtx = exited_tx.clone();
+            e.open_soon(
+                1,
+                Some(SourceKind::Camera(CameraSpec::from("cam-replace"))),
+                Box::new(move || {
+                    let _ = etx.send(());
+                    let (lk, cv) = &*g;
+                    let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                    while !*open {
+                        open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                    }
+                    let _ = xtx.send(());
+                    Err(AvError::Source("wedged".into()))
+                }),
+            )
+            .unwrap();
+            entered_rx.recv().unwrap();
+        }
+        // Third replacement on source 1 must be rejected even though earlier Src was replaced.
+        let third = e.open_soon(
+            1,
+            Some(SourceKind::Camera(CameraSpec::from("cam-replace"))),
+            Box::new(|| Err(AvError::Source("must not run".into()))),
+        );
+        assert!(third.is_err(), "source replacement must preserve worker count toward MAX_SOURCE_REOPEN_WORKERS");
+
+        // Local file open (`restart: None`) must still succeed even when global capture worker cap is reached.
+        for id in 2..=4u64 {
+            for _ in 0..MAX_SOURCE_REOPEN_WORKERS {
+                let g = gate.clone();
+                let etx = entered_tx.clone();
+                let xtx = exited_tx.clone();
+                e.open_soon(
+                    id,
+                    Some(SourceKind::Camera(CameraSpec::from("cam-cap"))),
+                    Box::new(move || {
+                        let _ = etx.send(());
+                        let (lk, cv) = &*g;
+                        let mut open = lk.lock().unwrap_or_else(|x| x.into_inner());
+                        while !*open {
+                            open = cv.wait(open).unwrap_or_else(|x| x.into_inner());
+                        }
+                        let _ = xtx.send(());
+                        Err(AvError::Source("wedged".into()))
+                    }),
+                )
+                .unwrap();
+                entered_rx.recv().unwrap();
+            }
+        }
+        assert!(
+            e.open_soon(
+                99,
+                Some(SourceKind::Camera(CameraSpec::from("blocked"))),
+                Box::new(|| Err(AvError::Source("no".into())))
+            )
+            .is_err()
+        );
+        e.open_soon(100, None, Box::new(|| Ok((Live::Still, false))))
+            .expect("local media open must not be blocked when capture workers are at cap");
+
+        {
+            let (lk, cv) = &*gate;
+            *lk.lock().unwrap_or_else(|x| x.into_inner()) = true;
+            cv.notify_all();
+        }
+        for _ in 0..8 {
+            exited_rx.recv().unwrap();
+        }
+        while e.lock().reopen_workers.load(Ordering::Acquire) > 0 {
+            std::thread::yield_now();
+        }
     }
 }

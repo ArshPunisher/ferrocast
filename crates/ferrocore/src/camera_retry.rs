@@ -14,6 +14,10 @@ pub const CAMERA_FIRST_FRAME_NS: u64 = 10_000_000_000;
 pub const CAMERA_STALL_NS: u64 = 5_000_000_000;
 /// Sustained delivery window before consecutive failure count resets: 10 s.
 pub const CAMERA_STABLE_NS: u64 = 10_000_000_000;
+/// Grace window keeping an interrupted-but-connected session alive for `interruptionEnded:`: 15 s.
+pub const CAMERA_INTERRUPTION_GRACE_NS: u64 = 15_000_000_000;
+/// Fruitless zero-frame startup opens before an idle capture session stays open in no-signal mode.
+pub const NO_SIGNAL_MAX_TRIES: u32 = 3;
 /// Human-facing status message shown while waiting for a camera to return.
 pub const WAITING_MESSAGE: &str = "Waiting for the camera";
 
@@ -40,8 +44,10 @@ pub struct CameraObservation {
     pub running: bool,
     /// Total frames/samples received by the current capture session.
     pub frames: u64,
-    /// True when the capture backend reported stop, disconnect, interruption, or error.
+    /// True when the capture backend reported stop, disconnect, or error.
     pub ended: bool,
+    /// True when the capture session is temporarily interrupted while the device remains connected.
+    pub interrupted: bool,
     /// True when an asynchronous open/reopen worker is currently running.
     pub opening: bool,
     /// True while the camera source is visible in a shown/preview/output scene or on air.
@@ -69,7 +75,11 @@ pub struct CameraRetry {
     count: u64,
     since_ns: u64,
     flowing_since_ns: u64,
+    interrupted_since_ns: u64,
     was_visible: bool,
+    ever_sent: bool,
+    no_signal: bool,
+    no_signal_tries: u32,
 }
 
 impl CameraRetry {
@@ -83,7 +93,11 @@ impl CameraRetry {
             count: 0,
             since_ns: now_ns,
             flowing_since_ns: 0,
+            interrupted_since_ns: 0,
             was_visible: true,
+            ever_sent: false,
+            no_signal: false,
+            no_signal_tries: 0,
         }
     }
 
@@ -97,7 +111,11 @@ impl CameraRetry {
             count: 0,
             since_ns: now_ns,
             flowing_since_ns: 0,
+            interrupted_since_ns: 0,
             was_visible: true,
+            ever_sent: false,
+            no_signal: false,
+            no_signal_tries: 0,
         }
     }
 
@@ -109,6 +127,16 @@ impl CameraRetry {
     /// True while the camera is waiting to reconnect instead of treating it as dead.
     pub fn is_waiting(&self) -> bool {
         self.state == CameraState::Waiting
+    }
+
+    /// True when a healthy 0-frame capture session stays open quietly waiting for a signal.
+    pub fn is_no_signal(&self) -> bool {
+        self.no_signal
+    }
+
+    /// True once this source has delivered at least one frame.
+    pub fn ever_sent(&self) -> bool {
+        self.ever_sent
     }
 
     /// Status string exposed while waiting.
@@ -135,13 +163,24 @@ impl CameraRetry {
     pub fn on_hotplug(&mut self, now_ns: u64) {
         self.next_try_ns = now_ns;
         self.tries = 0;
+        self.no_signal = false;
+        self.no_signal_tries = 0;
+        self.interrupted_since_ns = 0;
         self.since_ns = now_ns;
     }
 
     /// Clears waiting state once a fresh video frame renders on the source.
     pub fn on_frame_uploaded(&mut self, now_ns: u64) {
+        if self.no_signal {
+            self.tries = 0;
+            self.next_try_ns = now_ns;
+        }
         self.state = CameraState::Live;
         self.reason = None;
+        self.ever_sent = true;
+        self.no_signal = false;
+        self.no_signal_tries = 0;
+        self.interrupted_since_ns = 0;
         self.since_ns = now_ns;
     }
 
@@ -149,6 +188,8 @@ impl CameraRetry {
     pub fn on_reopen_started(&mut self, now_ns: u64) -> u32 {
         let prev = self.tries;
         self.state = CameraState::Waiting;
+        self.no_signal = false;
+        self.interrupted_since_ns = 0;
         if self.reason.is_none() {
             self.reason = Some(WAITING_MESSAGE.into());
         }
@@ -160,6 +201,20 @@ impl CameraRetry {
         prev
     }
 
+    /// Records failure of the asynchronous initial open so try count and backoff advance cleanly.
+    pub fn on_initial_open_failed(&mut self, now_ns: u64, err: Option<&str>) {
+        let prev = self.on_reopen_started(now_ns);
+        self.on_reopen_finished(prev, false, now_ns, err);
+    }
+
+    /// Advances exponential backoff without resetting status when a source's worker cap is saturated.
+    pub fn defer_backoff(&mut self, now_ns: u64) {
+        let prev = self.tries;
+        self.next_try_ns = now_ns.saturating_add(backoff_ns(prev));
+        self.tries = prev.saturating_add(1);
+        self.since_ns = now_ns;
+    }
+
     /// Updates state after an asynchronous reopen finishes.
     ///
     /// A successful open while waiting keeps `"waiting for the camera"` until frames actually resume
@@ -167,6 +222,7 @@ impl CameraRetry {
     pub fn on_reopen_finished(&mut self, prev_tries: u32, opened: bool, now_ns: u64, err: Option<&str>) {
         self.next_try_ns = now_ns.saturating_add(backoff_ns(prev_tries));
         self.count = 0;
+        self.interrupted_since_ns = 0;
         self.since_ns = now_ns;
         if !opened {
             self.state = CameraState::Waiting;
@@ -178,18 +234,32 @@ impl CameraRetry {
     pub fn step(&mut self, obs: CameraObservation) -> CameraAction {
         if !obs.visible_or_on_air {
             self.was_visible = false;
-            if !obs.running || obs.ended {
+            if !obs.running || obs.ended || obs.interrupted {
+                self.no_signal = false;
                 self.state = CameraState::Waiting;
                 self.flowing_since_ns = 0;
                 if self.reason.is_none() {
                     self.reason = Some(WAITING_MESSAGE.into());
                 }
-            } else if obs.frames != self.count {
-                self.count = obs.frames;
-                self.since_ns = obs.now_ns;
-                if obs.frames > 0 {
-                    self.state = CameraState::Live;
-                    self.reason = None;
+                if obs.interrupted && obs.running && !obs.ended {
+                    if self.interrupted_since_ns == 0 {
+                        self.interrupted_since_ns = obs.now_ns.max(1);
+                    }
+                    self.since_ns = obs.now_ns;
+                } else {
+                    self.interrupted_since_ns = 0;
+                }
+            } else {
+                self.interrupted_since_ns = 0;
+                if obs.frames != self.count {
+                    self.count = obs.frames;
+                    self.since_ns = obs.now_ns;
+                    if obs.frames > 0 {
+                        self.ever_sent = true;
+                        self.no_signal = false;
+                        self.state = CameraState::Live;
+                        self.reason = None;
+                    }
                 }
             }
             return CameraAction::Keep;
@@ -200,6 +270,7 @@ impl CameraRetry {
             if self.state == CameraState::Waiting || !obs.running || obs.ended {
                 self.next_try_ns = obs.now_ns;
                 self.tries = 0;
+                self.no_signal_tries = 0;
                 self.since_ns = obs.now_ns;
             }
         }
@@ -209,6 +280,8 @@ impl CameraRetry {
         }
 
         if !obs.running {
+            self.no_signal = false;
+            self.interrupted_since_ns = 0;
             self.state = CameraState::Waiting;
             self.flowing_since_ns = 0;
             if self.reason.is_none() {
@@ -225,12 +298,17 @@ impl CameraRetry {
             self.count = obs.frames;
             self.since_ns = obs.now_ns;
             if obs.frames > 0 {
+                let woke_from_no_signal = self.no_signal;
+                self.ever_sent = true;
+                self.no_signal = false;
+                self.no_signal_tries = 0;
+                self.interrupted_since_ns = 0;
                 self.state = CameraState::Live;
                 self.reason = None;
                 if self.flowing_since_ns == 0 {
                     self.flowing_since_ns = obs.now_ns.max(1);
                 }
-                if obs.now_ns.saturating_sub(self.flowing_since_ns) >= CAMERA_STABLE_NS {
+                if woke_from_no_signal || obs.now_ns.saturating_sub(self.flowing_since_ns) >= CAMERA_STABLE_NS {
                     self.tries = 0;
                     self.next_try_ns = 0;
                 }
@@ -238,6 +316,8 @@ impl CameraRetry {
         }
 
         if obs.ended {
+            self.no_signal = false;
+            self.interrupted_since_ns = 0;
             self.flowing_since_ns = 0;
             self.state = CameraState::Waiting;
             if self.reason.is_none() {
@@ -250,15 +330,54 @@ impl CameraRetry {
             };
         }
 
-        let limit = if obs.frames > 0 { CAMERA_STALL_NS } else { CAMERA_FIRST_FRAME_NS };
-        if obs.now_ns.saturating_sub(self.since_ns) > limit {
+        if obs.interrupted {
+            self.no_signal = false;
             self.flowing_since_ns = 0;
             self.state = CameraState::Waiting;
             if self.reason.is_none() {
                 self.reason = Some(WAITING_MESSAGE.into());
             }
+            if self.interrupted_since_ns == 0 {
+                self.interrupted_since_ns = obs.now_ns.max(1);
+            }
+            self.since_ns = obs.now_ns;
+            if obs.now_ns.saturating_sub(self.interrupted_since_ns) < CAMERA_INTERRUPTION_GRACE_NS {
+                return CameraAction::Keep;
+            }
+            return if obs.now_ns >= self.next_try_ns {
+                CameraAction::Reopen("the camera interruption didn't end")
+            } else {
+                CameraAction::Keep
+            };
+        } else if self.interrupted_since_ns != 0 {
+            self.interrupted_since_ns = 0;
+            self.since_ns = obs.now_ns;
+        }
+
+        let limit = if obs.frames > 0 { CAMERA_STALL_NS } else { CAMERA_FIRST_FRAME_NS };
+        if obs.now_ns.saturating_sub(self.since_ns) > limit {
+            self.flowing_since_ns = 0;
+            if !self.ever_sent && self.no_signal_tries >= NO_SIGNAL_MAX_TRIES {
+                // Keep a healthy 0-frame capture session open quietly (e.g. powered-off console
+                // on an HDMI capture card) until a signal arrives or the device disconnects.
+                self.no_signal = true;
+                self.state = CameraState::Live;
+                self.reason = None;
+                return CameraAction::Keep;
+            }
+            self.state = CameraState::Waiting;
+            if self.reason.is_none() {
+                self.reason = Some(WAITING_MESSAGE.into());
+            }
             let why = if obs.frames > 0 { "the camera stopped sending" } else { "the camera hasn't sent a frame yet" };
-            return if obs.now_ns >= self.next_try_ns { CameraAction::Reopen(why) } else { CameraAction::Keep };
+            return if obs.now_ns >= self.next_try_ns {
+                if !self.ever_sent && obs.frames == 0 {
+                    self.no_signal_tries = self.no_signal_tries.saturating_add(1);
+                }
+                CameraAction::Reopen(why)
+            } else {
+                CameraAction::Keep
+            };
         }
 
         CameraAction::Keep
@@ -272,7 +391,15 @@ mod tests {
     const SEC: u64 = 1_000_000_000;
 
     fn obs(running: bool, frames: u64, ended: bool, now_ns: u64) -> CameraObservation {
-        CameraObservation { running, frames, ended, opening: false, visible_or_on_air: true, now_ns }
+        CameraObservation {
+            running,
+            frames,
+            ended,
+            interrupted: false,
+            opening: false,
+            visible_or_on_air: true,
+            now_ns,
+        }
     }
 
     #[test]
@@ -360,5 +487,106 @@ mod tests {
         assert_eq!(policy.step(obs(true, 1, false, 12 * SEC)), CameraAction::Keep);
         assert_eq!(policy.step(obs(true, 300, false, 22 * SEC)), CameraAction::Keep);
         assert_eq!(policy.tries(), 0);
+    }
+
+    #[test]
+    fn healthy_zero_frame_capture_card_stops_reopening_after_three_tries_and_wakes_on_frame() {
+        let mut policy = CameraRetry::new(0);
+        // Three 10 s zero-frame startup windows reopen; once tries reaches 3 on a healthy open
+        // session (PS5/Switch powered off), the session stays open quietly without 10 s churn.
+        let mut t = 0;
+        for _ in 0..3 {
+            t += CAMERA_FIRST_FRAME_NS + 1;
+            assert!(matches!(policy.step(obs(true, 0, false, t)), CameraAction::Reopen(_)));
+            let p = policy.on_reopen_started(t);
+            policy.on_reopen_finished(p, true, t, None);
+        }
+        assert_eq!(policy.tries(), 3);
+
+        t += CAMERA_FIRST_FRAME_NS + 1;
+        assert_eq!(
+            policy.step(obs(true, 0, false, t)),
+            CameraAction::Keep,
+            "healthy 0-frame session must stay open without reopening"
+        );
+        for extra in [20 * SEC, 60 * SEC, 600 * SEC] {
+            assert_eq!(policy.step(obs(true, 0, false, t + extra)), CameraAction::Keep);
+        }
+
+        // Console switches on later: frames flow on the existing open session and reset tries.
+        t += 600 * SEC;
+        assert_eq!(policy.step(obs(true, 12, false, t)), CameraAction::Keep);
+        assert_eq!(policy.state(), CameraState::Live);
+        assert_eq!(policy.tries(), 0);
+
+        // Once frames have flowed, a later stall resumes reopening instead of latching no-signal.
+        assert!(matches!(policy.step(obs(true, 12, false, t + CAMERA_STALL_NS + 1)), CameraAction::Reopen(_)));
+    }
+
+    #[test]
+    fn interrupted_session_waits_for_grace_window_before_reopening() {
+        let mut policy = CameraRetry::new(0);
+        assert_eq!(policy.step(obs(true, 10, false, SEC)), CameraAction::Keep);
+
+        // Session interrupted on connected device: marks Waiting immediately without tearing down.
+        let int_obs = |frames: u64, now_ns: u64| CameraObservation {
+            running: true,
+            frames,
+            ended: false,
+            interrupted: true,
+            opening: false,
+            visible_or_on_air: true,
+            now_ns,
+        };
+        assert_eq!(policy.step(int_obs(10, 2 * SEC)), CameraAction::Keep);
+        assert!(policy.is_waiting());
+        assert_eq!(policy.step(int_obs(10, 2 * SEC + CAMERA_STALL_NS + SEC)), CameraAction::Keep);
+        assert_eq!(policy.step(int_obs(10, 2 * SEC + CAMERA_INTERRUPTION_GRACE_NS - 1)), CameraAction::Keep);
+
+        // Interruption ends before grace expires: keeps session open and resumes cleanly on frame.
+        assert_eq!(policy.step(obs(true, 10, false, 10 * SEC)), CameraAction::Keep);
+        assert_eq!(policy.step(obs(true, 11, false, 10 * SEC + 100_000_000)), CameraAction::Keep);
+        assert!(!policy.is_waiting());
+
+        // Stuck interrupted past grace window triggers a single reopen.
+        assert_eq!(policy.step(int_obs(11, 20 * SEC)), CameraAction::Keep);
+        assert!(matches!(policy.step(int_obs(11, 20 * SEC + CAMERA_INTERRUPTION_GRACE_NS)), CameraAction::Reopen(_)));
+    }
+
+    #[test]
+    fn failed_opens_do_not_exhaust_no_signal_startup_tries_and_render_wake_resets_backoff() {
+        let mut policy = CameraRetry::new(0);
+        let mut t = 0;
+        // Three failed offline opens (`running = false`) advance `tries` to 3 without counting as
+        // zero-frame startup windows on an actually open session.
+        for _ in 0..3 {
+            t += CAMERA_BACKOFF_MAX_NS + SEC;
+            assert!(matches!(policy.step(obs(false, 0, false, t)), CameraAction::Reopen(_)));
+            let p = policy.on_reopen_started(t);
+            policy.on_reopen_finished(p, false, t, Some("disconnected"));
+        }
+        assert_eq!(policy.tries(), 3);
+
+        // Once the card finally opens, it still gets all 3 zero-frame startup windows before latching no_signal.
+        let p = policy.on_reopen_started(t);
+        policy.on_reopen_finished(p, true, t, None);
+        for _ in 0..NO_SIGNAL_MAX_TRIES {
+            t += CAMERA_BACKOFF_MAX_NS + CAMERA_FIRST_FRAME_NS + SEC;
+            assert!(matches!(policy.step(obs(true, 0, false, t)), CameraAction::Reopen(_)));
+            let p = policy.on_reopen_started(t);
+            policy.on_reopen_finished(p, true, t, None);
+        }
+        assert!(!policy.is_no_signal());
+
+        t += CAMERA_BACKOFF_MAX_NS + CAMERA_FIRST_FRAME_NS + SEC;
+        assert_eq!(policy.step(obs(true, 0, false, t)), CameraAction::Keep);
+        assert!(policy.is_no_signal());
+
+        // When the render loop calls on_frame_uploaded before the next watchdog tick, tries and
+        // next_try_ns reset immediately so subsequent recovery doesn't carry stale no-signal backoff.
+        policy.on_frame_uploaded(t + SEC);
+        assert!(!policy.is_no_signal());
+        assert_eq!(policy.tries(), 0);
+        assert_eq!(policy.next_try_ns(), t + SEC);
     }
 }

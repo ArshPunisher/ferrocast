@@ -1,10 +1,13 @@
 //! Cameras (DirectShow, read by FFmpeg) and microphones (WASAPI, through cpal) on Windows.
 
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::ffsrc::{Live, Nv12Picture, OpenFail, ProbeFail, ffmpeg, stderr_within};
 use crate::sound_in::{SoundIn, Which};
-use crate::win_logic::{DshowListStatus, DshowOption, dshow_attempts, parse_dshow_options, resolve_dshow_list};
+use crate::win_logic::{
+    DshowListStatus, DshowOption, dshow_attempts, dshow_matches_id, parse_dshow_options, resolve_dshow_list,
+};
 use crate::{AvError, Picture};
 
 /// A camera or microphone.
@@ -35,16 +38,62 @@ pub fn parse_dshow(text: &str) -> Vec<Device> {
     out
 }
 
-/// Cameras connected now (FFmpeg asks DirectShow; none without FFmpeg yet).
+/// Cameras connected now (FFmpeg asks DirectShow; bounded by a timeout and shared across
+/// overlapping callers so concurrent checks do not spawn redundant FFmpeg processes).
 pub fn cameras() -> Vec<Device> {
-    let Ok(ff) = ffmpeg() else { return Vec::new() };
-    let mut cmd = std::process::Command::new(ff);
-    cmd.args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]);
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+    struct ProbeFlight {
+        in_flight: bool,
+        last: Vec<Device>,
     }
-    cmd.output().map(|o| parse_dshow(&String::from_utf8_lossy(&o.stderr))).unwrap_or_default()
+    static FLIGHT: OnceLock<(Mutex<ProbeFlight>, Condvar)> = OnceLock::new();
+    let (lock, cv) =
+        FLIGHT.get_or_init(|| (Mutex::new(ProbeFlight { in_flight: false, last: Vec::new() }), Condvar::new()));
+    let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.in_flight {
+        while guard.in_flight {
+            guard = cv.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        return guard.last.clone();
+    }
+    guard.in_flight = true;
+    drop(guard);
+
+    struct ResetFlight<'a>(&'a Mutex<ProbeFlight>, &'a Condvar);
+    impl Drop for ResetFlight<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut g) = self.0.lock() {
+                g.in_flight = false;
+                self.1.notify_all();
+            }
+        }
+    }
+    let _reset = ResetFlight(lock, cv);
+
+    let list = ffmpeg()
+        .ok()
+        .and_then(|ff| {
+            let args: Vec<String> = ["-hide_banner", "-nostdin", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            stderr_within(&ff, &args, Duration::from_secs(4)).ok()
+        })
+        .map(|text| parse_dshow(&text))
+        .unwrap_or_default();
+
+    let mut guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.last = list.clone();
+    guard.in_flight = false;
+    cv.notify_all();
+    list
+}
+
+/// Returns `true` when the camera matching `id` (alternative id, friendly name, or OBS combined
+/// form) is currently enumerated by DirectShow.
+pub fn is_connected(id: &str) -> bool {
+    let devs = cameras();
+    let pairs: Vec<(&str, &str)> = devs.iter().map(|d| (d.id.as_str(), d.name.as_str())).collect();
+    dshow_matches_id(&pairs, id)
 }
 
 /// Microphones and other inputs connected now.
@@ -162,6 +211,11 @@ impl Capture {
     /// Why FFmpeg's camera or the microphone ended, if it did.
     pub fn ended(&self) -> Option<String> {
         self.live.as_ref().and_then(Live::ended).or_else(|| self.sound.as_ref()?.ended())
+    }
+
+    /// DirectShow/WASAPI has no separate suspended-interruption state.
+    pub fn interrupted(&self) -> bool {
+        false
     }
 }
 

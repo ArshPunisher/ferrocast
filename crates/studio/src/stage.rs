@@ -3640,6 +3640,34 @@ impl Stage {
         }))
     }
 
+    /// Classifies whether any stage camera source matching `(kind, key, value)` is currently in
+    /// `"waiting"` state and whether one of those waiting sources still holds an open session.
+    pub fn matching_camera_wait(&self, kind: &str, key: &str, value: &Value) -> MatchingCameraWait {
+        if !PICTURE_ONLY_DEVICES.contains(&kind) {
+            return MatchingCameraWait::LiveOrAbsent;
+        }
+        let mut waiting = false;
+        let engine = self.engine.borrow();
+        for s in self.sources_list() {
+            if device_source_matches(&s, kind, key, value, true) {
+                let name = name_of(&s);
+                if self.camera_status(name).is_some_and(|st| st.state == "waiting") {
+                    waiting = true;
+                    if engine.as_ref().is_some_and(|e| e.engine.is_camera_holding_session(name)) {
+                        return MatchingCameraWait::WaitingWithSession;
+                    }
+                }
+            }
+        }
+        if waiting { MatchingCameraWait::WaitingWithoutSession } else { MatchingCameraWait::LiveOrAbsent }
+    }
+
+    /// Returns true when any stage camera source matching `(kind, key, value)` is currently in
+    /// `"waiting"` state so picker stills never serve a frozen texture or stale cache entry.
+    pub fn is_matching_camera_waiting(&self, kind: &str, key: &str, value: &Value) -> bool {
+        !matches!(self.matching_camera_wait(kind, key, value), MatchingCameraWait::LiveOrAbsent)
+    }
+
     /// Reuses an already-open capture source matching `(kind, key, value)` for a picker
     /// thumbnail so the picker never opens a second camera session or grabs hardware unnecessarily.
     #[allow(clippy::type_complexity)]
@@ -3650,37 +3678,11 @@ impl Stage {
         value: &Value,
         width: u32,
     ) -> Option<impl FnOnce() -> Option<(Vec<u8>, u32, u32)> + Send + 'static + use<>> {
-        let want_camera = PICTURE_ONLY_DEVICES.contains(&kind);
-        let want_screen = matches!(
-            kind,
-            "screen_capture" | "display_capture" | "window_capture" | "monitor_capture" | "xshm_input" | "game_capture"
-        );
-        if !want_camera && !want_screen {
-            return None;
-        }
-        let matched = self.sources_list().into_iter().find(|s| {
-            let sk = kind_of(s);
-            let kind_matches = if want_camera {
-                PICTURE_ONLY_DEVICES.contains(&sk)
-            } else {
-                sk == kind
-                    || (matches!(sk, "screen_capture" | "display_capture" | "monitor_capture")
-                        && matches!(kind, "screen_capture" | "display_capture" | "monitor_capture"))
-            };
-            if !kind_matches {
-                return false;
-            }
-            let set = s.get("settings").and_then(Value::as_object);
-            let Some(set) = set else { return false };
-            if let Some(v) = set.get(key) {
-                return v == value;
-            }
-            if want_camera {
-                return ["device", "uid", "video_device_id"].iter().any(|k| set.get(*k).is_some_and(|v| v == value));
-            }
-            false
-        })?;
-        let name = name_of(&matched).to_string();
+        let sources = self.sources_list();
+        let name = select_matching_device_source(&sources, kind, key, value, |n| {
+            self.camera_status(n).is_some_and(|st| st.state == "waiting")
+        })?
+        .to_string();
         let job = self.source_picture_job(&name, width.clamp(64, 320), false).ok().flatten()?;
         Some(move || {
             let (px, pw, ph, _) = job()?;
@@ -4615,8 +4617,20 @@ impl Stage {
         scene: &str,
         id: i64,
     ) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
+        self.screenshot_item_job_for(expected_source, scene, id)?()
+    }
+
+    /// Reads the item metadata and engine handle on the Stage thread so the caller can run the
+    /// readiness wait, GPU render, and readback off the main thread.
+    #[allow(clippy::type_complexity)]
+    pub fn screenshot_item_job_for(
+        &self,
+        expected_source: Option<&str>,
+        scene: &str,
+        id: i64,
+    ) -> Result<impl FnOnce() -> Result<(Vec<u8>, (u32, u32)), StudioError> + Send + 'static + use<>, StudioError> {
         let it = self.item(scene, id)?;
-        let src = name_of(&it);
+        let src = name_of(&it).to_string();
         if let Some(want) = expected_source
             && want != src
         {
@@ -4628,34 +4642,63 @@ impl Stage {
             (self.canvas.width, self.canvas.height)
         };
         let e = self.engine()?;
-        let started = std::time::Instant::now();
-        while e.engine.item_picture_ready(scene, id) == Some(false)
-            && started.elapsed() < std::time::Duration::from_secs(2)
-        {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        e.engine.snapshot_item_transformed(scene, id, canvas).map_err(|x| fail(x.to_string()))
+        let scene = scene.to_string();
+        Ok(move || {
+            let started = std::time::Instant::now();
+            while e.engine.item_picture_ready(&scene, id) == Some(false)
+                && should_wait_for_item_picture(&e.engine, &src)
+                && started.elapsed() < std::time::Duration::from_secs(2)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            e.engine.snapshot_item_transformed(&scene, id, canvas).map_err(|x| fail(x.to_string()))
+        })
     }
 
     /// A scene (or vertical scene) at its picture's full size, as RGBA pixels: saving them as a
     /// PNG ([`write_png`]) can happen off this thread.
     pub fn screenshot_pixels(&self, name: &str) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
-        let size = if self.vertical_order().iter().any(|n| n == name) {
-            crate::collection::VERTICAL_SIZE
-        } else if self.scene_index(name).is_ok() {
-            (self.canvas.width, self.canvas.height)
-        } else {
-            // A source (OBS's Screenshot (Source)): drawn on its own, at its own size.
-            self.source(name)?;
+        self.screenshot_job(name)?()
+    }
+
+    /// Splits [`Self::screenshot_pixels`] so only scene/source resolution touches the Stage thread
+    /// while GPU snapshot runs on a worker thread.
+    #[allow(clippy::type_complexity)]
+    pub fn screenshot_job(
+        &self,
+        name: &str,
+    ) -> Result<impl FnOnce() -> Result<(Vec<u8>, (u32, u32)), StudioError> + Send + 'static + use<>, StudioError> {
+        if self.vertical_order().iter().any(|n| n == name) {
+            let size = crate::collection::VERTICAL_SIZE;
             let e = self.engine()?;
-            let (scene, w, h) = crate::own::show_alone(&e.engine, name, (self.canvas.width, self.canvas.height))?;
-            e.keep_alone(name);
-            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()));
-            e.release_alone(name);
-            return px.map(|px| (px, (w, h)));
-        };
-        let px = self.engine()?.engine.snapshot_scene_at(name, size, size).map_err(|e| fail(e.to_string()))?;
-        Ok((px, size))
+            let name = name.to_string();
+            return Ok(Box::new(move || {
+                let px = e.engine.snapshot_scene_at(&name, size, size).map_err(|x| fail(x.to_string()))?;
+                Ok((px, size))
+            }) as Box<dyn FnOnce() -> Result<(Vec<u8>, (u32, u32)), StudioError> + Send>);
+        }
+        if self.scene_index(name).is_ok() {
+            let size = (self.canvas.width, self.canvas.height);
+            let e = self.engine()?;
+            let name = name.to_string();
+            return Ok(Box::new(move || {
+                let px = e.engine.snapshot_scene_at(&name, size, size).map_err(|x| fail(x.to_string()))?;
+                Ok((px, size))
+            }));
+        }
+        // A source (OBS's Screenshot (Source)): drawn on its own, at its own size.
+        self.source(name)?;
+        let e = self.engine()?;
+        let (scene, w, h) = crate::own::show_alone(&e.engine, name, (self.canvas.width, self.canvas.height))?;
+        e.keep_alone(name);
+        let src_name = name.to_string();
+        // Capture `AloneGuard` when creating the job so dropping an uncalled job still releases it.
+        let alone = AloneGuard { engine: e.clone(), name: src_name };
+        Ok(Box::new(move || {
+            let _release = alone;
+            let px = e.engine.snapshot_scene_at(&scene, (w, h), (w, h)).map_err(|x| fail(x.to_string()))?;
+            Ok((px, (w, h)))
+        }))
     }
 
     /// A picture of what's on air exactly, as a PNG at `path`.
@@ -4666,10 +4709,100 @@ impl Stage {
 
     /// What's on air as RGBA pixels and their size.
     pub fn screenshot_program_pixels(&self) -> Result<(Vec<u8>, (u32, u32)), StudioError> {
-        let px = self.engine()?.engine.snapshot().map_err(|e| fail(e.to_string()))?;
-        Ok((px, (self.canvas.width, self.canvas.height)))
+        self.screenshot_program_job()?()
     }
 
+    /// Captures the program canvas size and engine handle on the Stage thread so GPU snapshot and
+    /// readback can run on a background worker thread.
+    #[allow(clippy::type_complexity)]
+    pub fn screenshot_program_job(
+        &self,
+    ) -> Result<impl FnOnce() -> Result<(Vec<u8>, (u32, u32)), StudioError> + Send + 'static + use<>, StudioError> {
+        let size = (self.canvas.width, self.canvas.height);
+        let e = self.engine()?;
+        Ok(move || {
+            let px = e.engine.snapshot().map_err(|x| fail(x.to_string()))?;
+            Ok((px, size))
+        })
+    }
+}
+
+struct AloneGuard {
+    engine: Arc<own::Shared>,
+    name: String,
+}
+
+impl Drop for AloneGuard {
+    fn drop(&mut self) {
+        self.engine.release_alone(&self.name);
+    }
+}
+
+/// How an already-staged camera matching a picker still request behaves right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchingCameraWait {
+    /// No matching staged camera is waiting (either absent or streaming live).
+    LiveOrAbsent,
+    /// A matching staged camera is waiting while still owning a live capture session
+    /// (e.g. interrupted Continuity Camera or healthy 0-frame card), so probes must not open a
+    /// competing capture stream.
+    WaitingWithSession,
+    /// A matching staged camera is waiting without an open capture session (disconnected/offline).
+    WaitingWithoutSession,
+}
+
+fn should_wait_for_item_picture(engine: &ferrocore::engine::Engine, source: &str) -> bool {
+    !(engine.opening() == 0 && engine.camera_status(source).is_some_and(|s| s.state == "waiting"))
+}
+
+fn device_source_matches(source: &Value, kind: &str, key: &str, value: &Value, want_camera: bool) -> bool {
+    let sk = kind_of(source);
+    let kind_matches = if want_camera {
+        PICTURE_ONLY_DEVICES.contains(&sk)
+    } else {
+        sk == kind
+            || (matches!(sk, "screen_capture" | "display_capture" | "monitor_capture")
+                && matches!(kind, "screen_capture" | "display_capture" | "monitor_capture"))
+    };
+    if !kind_matches {
+        return false;
+    }
+    let Some(set) = source.get("settings").and_then(Value::as_object) else {
+        return false;
+    };
+    if let Some(v) = set.get(key) {
+        return v == value;
+    }
+    if want_camera {
+        return ["device", "uid", "video_device_id"].iter().any(|k| set.get(*k).is_some_and(|v| v == value));
+    }
+    false
+}
+
+fn select_matching_device_source<'a>(
+    sources: &'a [Value],
+    kind: &str,
+    key: &str,
+    value: &Value,
+    is_camera_waiting: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    let want_camera = PICTURE_ONLY_DEVICES.contains(&kind);
+    let want_screen = matches!(
+        kind,
+        "screen_capture" | "display_capture" | "window_capture" | "monitor_capture" | "xshm_input" | "game_capture"
+    );
+    if !want_camera && !want_screen {
+        return None;
+    }
+    sources
+        .iter()
+        .find(|s| {
+            device_source_matches(s, kind, key, value, want_camera) && !(want_camera && is_camera_waiting(name_of(s)))
+        })
+        .map(name_of)
+}
+
+impl Stage {
     // ------------------------------------------------------------------ the vertical picture
 
     fn vertical_doc(&self) -> Option<Value> {
@@ -10642,13 +10775,14 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     #[test]
     fn waiting_camera_reports_waiting_status_instead_of_no_picture() {
+        let (cam_kind, cam_key) = ferrocore::obs::native_camera_kind_and_key();
         let doc = json!({
             "sources": [
                 {
-                    "id": "av_capture_input_v2",
-                    "versioned_id": "av_capture_input_v2",
+                    "id": cam_kind,
+                    "versioned_id": cam_kind,
                     "name": "iPhone Cam",
-                    "settings": { "device": "/no/such/continuity-cam" },
+                    "settings": { cam_key: "/no/such/continuity-cam" },
                     "filters": []
                 },
                 {
@@ -10663,17 +10797,23 @@ mod tests {
             "scene_order": [{ "name": "Main" }]
         });
         let s = ok(Stage::load(Canvas { width: 320, height: 180, fps: 30 }, &doc, "Main"));
-        // Trigger engine load even if cache is cold first.
-        let Ok(_) = s.engine() else { return };
+        // Trigger engine load and let any initial async probe finish before reopening.
+        let Ok(e) = s.engine() else { return };
+        while e.engine.opening() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         // Warm second reopen guarantees synchronous open failure reaches waiting camera path.
         s.edit(|_| ());
+        while e.engine.opening() > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(
             s.camera_status("iPhone Cam").map(|st| (st.state, st.message)),
             Some(("waiting", Some("Waiting for the camera")))
         );
         let problems = s.capture_problems();
         assert!(
-            problems.iter().any(|p| p.source == "iPhone Cam" && p.problem == "waiting"),
+            problems.iter().any(|p| p.source == "iPhone Cam" && p.kind == cam_kind && p.problem == "waiting"),
             "expected waiting problem, got {problems:?}"
         );
         assert!(
@@ -10824,5 +10964,87 @@ mod tests {
         ok(s.set_transform("Main", big.id, &tbig));
         let (_, sbig) = ok(s.screenshot_item_pixels("Main", big.id));
         assert_eq!(sbig, (640, 360), "overflowing item clips to visible canvas bounds");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn screenshot_jobs_run_off_stage_thread_and_skip_wait_for_waiting_camera() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        let sw = ok(s.add_source(
+            "Main",
+            "color_source_v3",
+            "Color",
+            &json!({ "width": 64, "height": 32, "color": 0xFF00_FF00u32 }),
+            false,
+        ));
+        let item_job = ok(s.screenshot_item_job_for(Some("Color"), "Main", sw.id));
+        let scene_job = ok(s.screenshot_job("Main"));
+        let source_job = ok(s.screenshot_job("Color"));
+        let prog_job = ok(s.screenshot_program_job());
+
+        let (_, isize) = std::thread::spawn(item_job).join().unwrap().unwrap();
+        let (_, ssize) = std::thread::spawn(scene_job).join().unwrap().unwrap();
+        let (_, rsize) = std::thread::spawn(source_job).join().unwrap().unwrap();
+        let (_, psize) = std::thread::spawn(prog_job).join().unwrap().unwrap();
+        assert_eq!(isize, (64, 32));
+        assert_eq!(ssize, (320, 180));
+        assert_eq!(rsize, (64, 32));
+        assert_eq!(psize, (320, 180));
+
+        // Dropping an uncalled source screenshot_job still releases its temporary solo scene.
+        let uncalled = ok(s.screenshot_job("Color"));
+        drop(uncalled);
+        assert_eq!(e.alone_count(), 0, "dropping an uncalled screenshot_job must still release keep_alone ownership");
+
+        // Waiting camera (disconnected, opening() == 0) skips the 2 s sleep loop.
+        let (cam_kind, cam_key) = ferrocore::obs::native_camera_kind_and_key();
+        let mut cam_settings = serde_json::Map::new();
+        cam_settings.insert(cam_key.to_string(), serde_json::Value::String("fc-missing-cam-h5".into()));
+        let cam = ok(s.add_source("Main", cam_kind, "MissingCam", &serde_json::Value::Object(cam_settings), false));
+        while e.engine.opening() > 0 {
+            std::thread::yield_now();
+        }
+        assert!(!super::should_wait_for_item_picture(&e.engine, "MissingCam"));
+        let cam_job = ok(s.screenshot_item_job_for(Some("MissingCam"), "Main", cam.id));
+        assert!(std::thread::spawn(cam_job).join().unwrap().is_err());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn matching_device_picture_job_skips_waiting_camera() {
+        let (cam_kind, cam_key) = ferrocore::obs::native_camera_kind_and_key();
+        let val = Value::String("fc-c6-wait-cam".into());
+        let mut settings = serde_json::Map::new();
+        settings.insert(cam_key.to_string(), val.clone());
+        let sources = vec![json!({
+            "name": "iPhone Cam",
+            "id": cam_kind,
+            "settings": Value::Object(settings.clone()),
+        })];
+
+        assert_eq!(
+            super::select_matching_device_source(&sources, cam_kind, cam_key, &val, |_| false),
+            Some("iPhone Cam")
+        );
+        assert_eq!(
+            super::select_matching_device_source(&sources, cam_kind, cam_key, &val, |_| true),
+            None,
+            "matching camera in waiting state must skip the fast-path reuse"
+        );
+
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        ok(s.add_source("Main", cam_kind, "WaitingCam", &Value::Object(settings), false));
+        while e.engine.opening() > 0 {
+            std::thread::yield_now();
+        }
+        assert_eq!(s.matching_camera_wait(cam_kind, cam_key, &val), super::MatchingCameraWait::WaitingWithoutSession);
+        assert_eq!(
+            s.matching_camera_wait(cam_kind, cam_key, &Value::String("other-cam".into())),
+            super::MatchingCameraWait::LiveOrAbsent
+        );
+        assert!(s.is_matching_camera_waiting(cam_kind, cam_key, &val));
+        assert!(s.matching_device_picture_job(cam_kind, cam_key, &val, 160).is_none());
     }
 }

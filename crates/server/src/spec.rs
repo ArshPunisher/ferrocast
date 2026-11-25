@@ -1264,7 +1264,14 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         None,
         None,
     ),
-    doc("GET", "/studio/engine/still", "Studio Engine", "Fetch a static frame thumbnail.", None, None),
+    doc(
+        "GET",
+        "/studio/engine/still",
+        "Studio Engine",
+        "Fetch a static frame thumbnail.",
+        None,
+        Some("StudioSourceStill"),
+    ),
     doc("GET", "/studio/engine/vst/plugins", "Studio Engine", "Discover installed VST audio plugins.", None, None),
     doc(
         "GET",
@@ -1405,7 +1412,7 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         "Studio Engine",
         "Compositor CPU, GPU, frame-time, and dropped-frame stats.",
         None,
-        None,
+        Some("StudioEngineStats"),
     ),
     doc("POST", "/studio/engine/record", "Studio Engine", "Start or stop local recording.", None, None),
     doc("POST", "/studio/engine/record/pause", "Studio Engine", "Pause or resume local recording.", None, None),
@@ -2924,14 +2931,119 @@ fn schemas() -> Value {
         "SettingsPatch": {
             "type": "object",
             "description": "Partial update of non-sensitive local application preferences."
+        },
+        "StudioSourceStill": {
+            "type": "object",
+            "description": "Picker thumbnail response for a display, window, or camera.",
+            "required": ["image"],
+            "properties": {
+                "image": { "type": ["string", "null"] },
+                "waiting": {
+                    "type": "boolean",
+                    "description": "Present and true only when a camera is temporarily disconnected or waiting for its first frame."
+                },
+                "error": { "type": ["string", "null"] }
+            }
         }
     });
     if let Some(map) = doc.as_object_mut() {
+        map.extend(studio_stats_schemas());
         map.extend(auto_config_schemas());
         map.extend(store_schemas());
         map.extend(schedule_schemas());
     }
     doc
+}
+
+fn studio_stats_schemas() -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "CaptureProblem".into(),
+        json!({
+            "type": "object",
+            "description": "Active capture source on air showing no usable picture.",
+            "required": ["source", "kind", "problem"],
+            "properties": {
+                "source": { "type": "string" },
+                "kind": { "type": "string" },
+                "problem": {
+                    "type": "string",
+                    "enum": ["permission", "waiting", "no_picture", "black"]
+                }
+            }
+        }),
+    );
+    m.insert(
+        "StudioEngineStats".into(),
+        json!({
+            "type": "object",
+            "description": "Compositor metrics, active capture issues, output status, and per-source frame load.",
+            "required": ["engine", "scene", "history", "canvas", "disk_free_mb", "captures", "sources"],
+            "properties": {
+                "engine": {
+                    "type": "object",
+                    "properties": {
+                        "cpu": { "type": "number" },
+                        "fps": { "type": "number" },
+                        "frame_ms": { "type": "number" },
+                        "lagged": { "type": "integer" },
+                        "frames": { "type": "integer" },
+                        "memory_mb": { "type": "integer" },
+                        "skipped": { "type": "integer" },
+                        "encoded": { "type": "integer" },
+                        "recovered": { "type": "integer" },
+                        "restarts": { "type": "integer" },
+                        "encode_ms": { "type": "number" },
+                        "encoding_ms": { "type": "integer" }
+                    }
+                },
+                "scene": { "type": ["string", "null"] },
+                "history": {
+                    "type": "object",
+                    "properties": {
+                        "undo": { "type": ["string", "null"] },
+                        "redo": { "type": ["string", "null"] }
+                    }
+                },
+                "canvas": {
+                    "type": "object",
+                    "properties": {
+                        "width": { "type": "integer" },
+                        "height": { "type": "integer" },
+                        "fps": { "type": "integer" }
+                    }
+                },
+                "stream": { "type": ["object", "null"] },
+                "record": { "type": ["object", "null"] },
+                "source_records": { "type": "array", "items": { "type": "object" } },
+                "disk_free_mb": { "type": "integer" },
+                "replay": { "type": ["object", "null"] },
+                "virtualcam": { "type": ["object", "null"] },
+                "ndi": { "type": ["object", "null"] },
+                "captures": {
+                    "type": "array",
+                    "items": { "$ref": "#/components/schemas/CaptureProblem" }
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["name", "sent", "waiting"],
+                        "properties": {
+                            "name": { "type": "string" },
+                            "sent": { "type": "integer" },
+                            "width": { "type": ["integer", "null"] },
+                            "height": { "type": ["integer", "null"] },
+                            "waiting": { "type": "boolean" }
+                        }
+                    }
+                },
+                "remux": { "type": ["object", "null"] },
+                "sidechain_cycles": { "type": "array", "items": { "type": "object" } }
+            }
+        }),
+    );
+    m
 }
 
 /// A frame of the live socket. The `type` constant is the wire discriminator: with it a frame

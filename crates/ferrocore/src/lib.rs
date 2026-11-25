@@ -412,6 +412,39 @@ pub fn camera_still_cancel(id: &str, width: u32, cancel: &std::sync::atomic::Ato
     Err(AvError::Source("the camera gave no picture in time".into()))
 }
 
+/// Outcome of probing a camera or capture card for a single picker still frame.
+#[derive(Debug)]
+pub enum CameraStill {
+    /// Captured frame ready to encode.
+    Picture(Picture),
+    /// Disconnected, locked/warming up, or timed out waiting for the first frame.
+    Waiting,
+    /// Permission denied, device busy/in use, or hard capture failure.
+    Error(String),
+}
+
+/// Classifies a camera capture error into transient [`CameraStill::Waiting`] vs hard [`CameraStill::Error`].
+pub fn classify_camera_still_error(msg: &str) -> CameraStill {
+    if msg.contains("isn't connected")
+        || msg.contains("isn't a camera")
+        || msg.contains("gave no picture in time")
+        || msg.contains("timed out opening")
+    {
+        CameraStill::Waiting
+    } else {
+        CameraStill::Error(msg.to_string())
+    }
+}
+
+/// One-shot still of a camera or capture card that classifies disconnects and timeouts as
+/// [`CameraStill::Waiting`] while preserving permission/in-use errors as [`CameraStill::Error`].
+pub fn camera_still_status_cancel(id: &str, width: u32, cancel: &std::sync::atomic::AtomicBool) -> CameraStill {
+    match camera_still_cancel(id, width, cancel) {
+        Ok(pic) => CameraStill::Picture(pic),
+        Err(e) => classify_camera_still_error(&e.to_string()),
+    }
+}
+
 /// Ferrocast's own picture filters, applied to an item's picture in order before it's placed
 /// (as libobs runs a source's filters). Colours are red, green, blue, alpha, 0 to 1.
 #[derive(Debug, Clone, PartialEq)]
@@ -978,5 +1011,34 @@ mod pixel_pool {
             let _ = pixel_buffer(LEN_SMALL_BIG);
         }
         assert_eq!(pool_count(), 0, "stale unrequested 4K buffer must be dropped after N mismatching frames");
+    }
+
+    #[test]
+    fn camera_still_status_classifies_transient_wait_vs_hard_errors() {
+        use crate::{CameraStill, classify_camera_still_error};
+        for transient in [
+            "the camera isn't connected",
+            "that camera isn't connected",
+            "\"/dev/video9\" isn't a camera",
+            "the camera gave no picture in time",
+            "FFmpeg timed out opening the camera",
+        ] {
+            assert!(
+                matches!(classify_camera_still_error(transient), CameraStill::Waiting),
+                "expected Waiting for `{transient}`"
+            );
+        }
+        for hard in [
+            "the camera couldn't open (Not authorized); allow it for Ferrocast in System Settings → Privacy & Security, or close the app using it",
+            "FFmpeg couldn't open it",
+            "the camera can't be used this way",
+        ] {
+            assert!(
+                matches!(classify_camera_still_error(hard), CameraStill::Error(ref m) if m == hard),
+                "expected Error for `{hard}`"
+            );
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        assert!(!crate::camera::is_connected("fc-nonexistent-camera-c6"));
     }
 }

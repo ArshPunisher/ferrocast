@@ -151,6 +151,32 @@ pub fn strip_exe_suffix(name: &str) -> &str {
     }
 }
 
+/// Resolves a DirectShow identifier (`@alt_id`, `"Friendly Name"`, or OBS `"Friendly:\\\\?\\path"`)
+/// against enumerated `(alt_id, friendly_name)` pairs while preserving exact alt-ID matching when
+/// multiple devices share a friendly name.
+pub fn dshow_matches_id(devices: &[(&str, &str)], query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    if query.starts_with('@') {
+        return devices.iter().any(|(id, _)| *id == query);
+    }
+    if devices.iter().any(|(id, _)| *id == query) {
+        return true;
+    }
+    if let Some((friendly, path)) = query.split_once(":\\\\") {
+        // OBS stores `Name:\\?\usb#...`; prefer matching the unique path suffix inside `alt_id`
+        // when present, falling back to friendly name only if unambiguous.
+        let path_with_prefix = format!(r"\\{path}");
+        if devices.iter().any(|(id, _)| id.ends_with(&path_with_prefix) || id.contains(path)) {
+            return true;
+        }
+        return devices.iter().filter(|(_, name)| *name == friendly).count() == 1
+            && devices.iter().all(|(id, _)| !id.is_empty());
+    }
+    devices.iter().any(|(_, name)| *name == query)
+}
+
 /// DirectShow format/codec family parsed from `ffmpeg -list_options true`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DshowFormat {
@@ -624,5 +650,21 @@ mod tests {
         assert_eq!(strip_exe_suffix("notepad"), "notepad");
         assert_eq!(strip_exe_suffix(".exe"), "");
         assert_eq!(strip_exe_suffix("ゲーム.EXE"), "ゲーム");
+    }
+
+    #[test]
+    fn dshow_matches_id_resolves_alt_friendly_and_obs_paths_without_clobbering_duplicates() {
+        let devs = [
+            (r"@device_pnp_\\?\usb#vid_1#mi_00", "USB Camera"),
+            (r"@device_pnp_\\?\usb#vid_2#mi_00", "USB Camera"),
+            (r"@device_pnp_\\?\usb#vid_3#mi_00", "Sony Cam"),
+        ];
+        assert!(dshow_matches_id(&devs, r"@device_pnp_\\?\usb#vid_1#mi_00"));
+        assert!(!dshow_matches_id(&devs, r"@device_pnp_\\?\usb#vid_9#mi_00"));
+        assert!(dshow_matches_id(&devs, "USB Camera"));
+        assert!(dshow_matches_id(&devs, r"USB Camera:\\?\usb#vid_2#mi_00"));
+        assert!(!dshow_matches_id(&devs, r"USB Camera:\\?\usb#vid_999#mi_00"));
+        assert!(dshow_matches_id(&devs, r"Sony Cam:\\?\usb#other_path"));
+        assert!(!dshow_matches_id(&devs, "Missing Cam"));
     }
 }

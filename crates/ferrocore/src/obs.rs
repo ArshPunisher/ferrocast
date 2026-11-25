@@ -1069,6 +1069,24 @@ pub fn camera_device(kind: &str, settings: &Value) -> Option<String> {
     })
 }
 
+/// Native OBS camera source `id` and device-setting key accepted by [`import`] on this OS.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[must_use]
+pub fn native_camera_kind_and_key() -> (&'static str, &'static str) {
+    #[cfg(target_os = "macos")]
+    {
+        ("av_capture_input_v2", "device")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        ("dshow_input", "video_device_id")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        ("v4l2_input", "device_id")
+    }
+}
+
 /// Whether `kind` is an OBS/Ferrocast audio filter id (lives on the source, never overridden
 /// per scene item).
 #[must_use]
@@ -3057,5 +3075,40 @@ mod tests {
         let n2 = im.sources.iter().find(|s| s.id == m2).map(|s| s.name.as_str());
         assert_eq!(n1, Some("Main#1: Cut"));
         assert_eq!(n2, Some("Vertical#2: Cut"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn native_camera_kind_and_key_imports_on_host_and_rejects_foreign_kinds() {
+        let (kind, key) = native_camera_kind_and_key();
+        let make_doc = |k: &str, setting_key: &str| {
+            serde_json::json!({
+                "sources": [{
+                    "id": k,
+                    "name": "Cam",
+                    "settings": { setting_key: "/no/such/cam" }
+                }]
+            })
+        };
+        let native = import(&make_doc(kind, key), (1920, 1080));
+        assert!(native.skipped.is_empty(), "native camera kind {kind}/{key} skipped: {:?}", native.skipped);
+        assert!(
+            native
+                .sources
+                .iter()
+                .any(|s| s.name == "Cam" && matches!(&s.kind, SourceKind::Camera(spec) if spec.id == "/no/such/cam")),
+            "native camera kind {kind}/{key} did not preserve device id"
+        );
+        for (other_kind, other_key) in
+            [("av_capture_input_v2", "device"), ("dshow_input", "video_device_id"), ("v4l2_input", "device_id")]
+        {
+            if other_kind != kind {
+                let foreign = import(&make_doc(other_kind, other_key), (1920, 1080));
+                assert!(
+                    foreign.sources.is_empty(),
+                    "foreign camera kind {other_kind} unexpectedly imported on host OS"
+                );
+            }
+        }
     }
 }
