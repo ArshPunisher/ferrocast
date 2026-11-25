@@ -2373,7 +2373,7 @@
     "description": "Authenticate using a dashboard pairing token or a scoped local API key (`Authorization: Bearer fc_key_...`). Keys are hashed with SHA-256, rate-limited (120 req/min default), audited without storing the secret, and never permitted on PC-only secret, account, plugin, diagnostics, or key-management endpoints.",
     "summary": "Loopback HTTP API exposed by the local Ferrocast engine and desktop daemon.",
     "title": "Ferrocast Local REST API",
-    "version": "3.6.0"
+    "version": "3.6.1"
   },
   "jsonSchemaDialect": "https://spec.openapis.org/oas/3.1/dialect/base",
   "openapi": "3.1.0",

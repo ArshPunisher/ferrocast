@@ -5,6 +5,35 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.6.1
+
+Fixes for the problems found with 3.6.0: the setup mic meter, iPhone cameras, flip and crop in
+Studio, and the bitrate numbers.
+
+- **Setup mic meter**: the level meter in first setup moves again, even before anything is on air.
+- **iPhone and other cameras**: a camera that drops out for a moment keeps being retried and comes
+  back on its own, also when it is unplugged and plugged in again. A capture card with no signal
+  still stops after a few tries so it is not hammered. Two identical USB cameras on Windows now
+  open the right one each.
+- **"No buffer space available (os error 55)"**: Ferrocast waits and tries again to open its local
+  server, and a start that fails no longer makes the next launch offer Safe Mode.
+- **Planned streams**: a tab of its own in Studio.
+- **Flip and turn**: a flipped or turned source stays where it was on the canvas, also inside a
+  group.
+- **Source screenshot**: includes the source's filters, crop, flip and turn.
+- **Alt+drag crop**: shows a crop cursor, dragging an edge crops instead of moving the source, and
+  the visible picture stays put while you crop. A quick crop followed by a nudge no longer loses
+  the crop, and undo steps match what you did.
+- **Bitrate**: the Go live screen now explains why a stream can send 6.2 Mbps per place: one
+  shared encode, Twitch's 6,000 kbps limit, and the total upload for all places. A Twitch that is
+  not connected no longer caps your YouTube stream.
+- **Updates**: Ferrocast waits for a recording or replay buffer to stop before it installs an
+  update, and shuts down cleanly on Windows when it does.
+- **A tidier Studio**: a 100% zoom button that works on every click, bordered tiles for Start show
+  and Your platforms, a clearer alert editor (buttons, Rule switch, narrow dock), themed Accounts
+  tiles, a tidier Advanced settings page and one tile for Clean up my mic.
+- **API**: the screenshot route can take a single source, and the API documents describe it.
+
 ## 3.6.0
 
 A Community Store, clips, more places to go live, a fuller Studio and a redesigned dashboard.
