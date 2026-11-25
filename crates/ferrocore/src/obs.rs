@@ -3093,8 +3093,11 @@ mod tests {
         let native = import(&make_doc(kind, key), (1920, 1080));
         assert!(native.skipped.is_empty(), "native camera kind {kind}/{key} skipped: {:?}", native.skipped);
         assert!(
-            native.sources.iter().any(|s| s.name == "Cam" && matches!(&s.kind, SourceKind::Camera(_))),
-            "native camera kind {kind}/{key} did not parse as SourceKind::Camera"
+            native
+                .sources
+                .iter()
+                .any(|s| s.name == "Cam" && matches!(&s.kind, SourceKind::Camera(spec) if spec.id == "/no/such/cam")),
+            "native camera kind {kind}/{key} did not preserve device id"
         );
         for (other_kind, other_key) in
             [("av_capture_input_v2", "device"), ("dshow_input", "video_device_id"), ("v4l2_input", "device_id")]
