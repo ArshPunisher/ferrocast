@@ -1806,25 +1806,172 @@ fn push_main(e: &crate::Engine, frame_bytes: usize) {
 /// nothing.
 #[tokio::test]
 async fn a_destination_that_cannot_start_sets_no_limit() {
+    use ferrocast_core::event::Platform;
     let (e, _dir) = engine().await;
     let studio = Arc::new(DirectStudio::default());
     *studio.settings.lock().unwrap() = twitch_studio_settings();
     e.set_studio_host(studio.clone());
+    e.register_connector(Arc::new(SignedIn(Platform::Twitch)));
+    e.register_connector(Arc::new(SignedIn(Platform::Youtube)));
     let both: Vec<(String, bool)> = GoLiveConfig::default()
         .destinations
         .into_iter()
         .map(|d| (d.id.clone(), d.id == "twitch" || d.id == "youtube"))
         .collect();
     e.set_golive_destinations(both).await.unwrap();
-    assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000), "Twitch on, as far as anyone knows");
-    // It couldn't start (no account): the stream is YouTube's alone.
-    e.golive().blocked.lock().unwrap().insert("twitch".into(), "Connect Twitch first.".into());
+    assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000), "Twitch connected and ticked");
+    // Runtime block (e.g. token revoked at Go Live): the stream is YouTube's alone.
+    e.golive().blocked.lock().unwrap().insert("twitch".into(), "Twitch needs sign-in.".into());
     assert_eq!(e.studio_limit(), None);
     e.sync_stream_cap().await;
     assert_eq!(studio.caps.lock().unwrap().last().copied().flatten(), None, "lifted for the stream on air");
-    // It can: the limit is back.
+    // Unblocked: the limit is back.
     e.golive().blocked.lock().unwrap().clear();
     assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000));
+}
+
+#[tokio::test]
+async fn disconnected_twitch_beside_youtube_does_not_cap_live_youtube_stream() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::platform;
+
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        video_kbps: 12_000,
+        vbr: true,
+        keyframe_s: 4,
+        bframes: true,
+        ..Default::default()
+    };
+    e.set_studio_host(studio.clone());
+    // YouTube is connected; Twitch is NOT connected. Both are ticked.
+    let (yt_port, _yt_got) = platform("k").await;
+    #[derive(Debug)]
+    struct LocalYt(String);
+    #[async_trait::async_trait]
+    impl ferrocast_connector::Connector for LocalYt {
+        fn platform(&self) -> Platform {
+            Platform::Youtube
+        }
+        fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+            Default::default()
+        }
+        async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "k".into(), backup: None, note: None })
+        }
+    }
+    e.register_connector(Arc::new(LocalYt(format!("rtmp://127.0.0.1:{yt_port}/app"))));
+
+    let both: Vec<(String, bool)> = GoLiveConfig::default()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "twitch" || d.id == "youtube"))
+        .collect();
+    e.set_golive_destinations(both).await.unwrap();
+
+    // Before streaming starts, disconnected Twitch must NOT impose a 6,000 kbps cap.
+    assert_eq!(e.studio_limit(), None, "disconnected Twitch must not set studio_limit");
+    assert!(
+        studio.caps.lock().unwrap().iter().all(|c| c.is_none()),
+        "no cap must be pushed before stream start: {:?}",
+        *studio.caps.lock().unwrap()
+    );
+
+    // Start Studio stream and bring up the real hub/ingest running state.
+    e.studio_stream(true).await.unwrap();
+    assert!(
+        studio.caps.lock().unwrap().iter().all(|c| c.is_none()),
+        "studio_stream(true) must not apply a 6,000 kbps cap: {:?}",
+        *studio.caps.lock().unwrap()
+    );
+    let _feed = stream_in(&e).await;
+    eventually_async(|| async {
+        let v = e.golive_view().await;
+        v.live
+            && v.destinations.iter().any(|d| d.id == "twitch" && d.blocked.is_some())
+            && e.golive_running().contains("youtube")
+    })
+    .await;
+
+    // Both before and after reconcile(), no 6,000 kbps cap was ever applied,
+    // YouTube has no capped badge, and Twitch reports blocked.
+    assert_eq!(e.studio_limit(), None);
+    assert_eq!(e.applied_cap(), None);
+    assert!(
+        studio.caps.lock().unwrap().iter().all(|c| c.is_none()),
+        "live YouTube stream must never be capped at 6,000 kbps: {:?}",
+        *studio.caps.lock().unwrap()
+    );
+    let v = e.golive_view().await;
+    let yt = v.destinations.iter().find(|d| d.id == "youtube").unwrap();
+    let tw = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert_eq!(yt.capped, None);
+    assert!(tw.blocked.is_some());
+    assert_eq!(tw.capped, None);
+
+    _feed.abort();
+    e.studio_stream(false).await.unwrap();
+    eventually_async(|| async {
+        let v = e.golive_view().await;
+        !v.live && v.destinations.iter().all(|d| d.blocked.is_none())
+    })
+    .await;
+
+    // Custom RTMP missing its stream key in secrets cannot start, and custom WHIP without a
+    // valid host must not disable B-frames, whereas a valid WHIP does.
+    let no_key = e
+        .add_golive_destination("NoKey", "rtmp://127.0.0.1:9/app", "tmp-k", crate::golive::Canvas::Main)
+        .await
+        .unwrap();
+    let _ = e.inner.secrets.delete(&format!("{}{}", crate::golive::CUSTOM_KEY_PREFIX, no_key.id));
+    let mut cfg = e.golive_config();
+    cfg.destinations.push(crate::golive::DestinationConfig {
+        id: "c_bad_whip".into(),
+        kind: ferrocast_golive::probe::Service::Custom,
+        name: Some("Bad WHIP".into()),
+        url: Some("https://".into()),
+        enabled: true,
+        canvas: crate::golive::Canvas::Main,
+        light: false,
+        enhanced: false,
+        brand: None,
+    });
+    e.save_golive(cfg).await.unwrap();
+    let empty_blocked = std::collections::HashMap::new();
+    assert!(!e.can_start_destination(&no_key, &empty_blocked), "custom RTMP without key cannot start");
+    assert!(!e.studio_no_bframes(), "WHIP without a valid host must not disable B-frames");
+    let _good_whip = e
+        .add_golive_destination("Good WHIP", "https://whip.example.com/whip", "", crate::golive::Canvas::Main)
+        .await
+        .unwrap();
+    assert!(e.studio_no_bframes(), "valid WHIP disables B-frames");
+
+    // Once Twitch connects, studio_limit returns 6,000 kbps unless ignore_service_limits is set.
+    e.register_connector(Arc::new(SignedIn(Platform::Twitch)));
+    assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000));
+    let mut adv = e.golive_config().advanced;
+    adv.ignore_service_limits = true;
+    e.set_golive_advanced(adv).await.unwrap();
+    assert_eq!(e.studio_limit(), None, "ignore_service_limits keeps studio_limit disabled");
 }
 
 /// A cap the Studio couldn't put on the stream on air (its encoder is shared with a recording)

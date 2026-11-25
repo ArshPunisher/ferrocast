@@ -699,6 +699,10 @@ pub(crate) fn lock_enhanced(e: &Engine) -> std::sync::MutexGuard<'_, Option<ferr
     lock(&e.golive().enhanced)
 }
 
+pub(crate) fn clear_applied_cap(e: &Engine) {
+    *lock(&e.golive().applied_cap) = None;
+}
+
 /// The destination `id` backs up, if any.
 fn backs_up<'a>(cfg: &'a GoLiveConfig, id: &str) -> Option<&'a DestinationConfig> {
     let (primary, _) = cfg.advanced.per.iter().find(|(_, a)| a.backup.as_deref() == Some(id))?;
@@ -1049,6 +1053,37 @@ impl Engine {
         self.golive().studio_live.store(on, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn applied_cap(&self) -> Option<crate::studio_host::StreamCap> {
+        *lock(&self.golive().applied_cap)
+    }
+
+    /// Whether `d` has what it needs to start (account connector for platforms; valid URL and
+    /// non-empty stream key for custom RTMP; valid host URL for direct SRT/RIST/WHIP) and was not
+    /// blocked when starting.
+    pub(crate) fn can_start_destination(&self, d: &DestinationConfig, blocked: &HashMap<String, String>) -> bool {
+        if blocked.contains_key(&d.id) {
+            return false;
+        }
+        match platform_of(d.kind) {
+            Some(p) => self.connector(p).is_some(),
+            None => match d.url.as_deref() {
+                Some(url) if direct_kind(url).is_some() => direct_host(url).is_some(),
+                Some(url) => {
+                    Target::parse(url).is_ok()
+                        && self
+                            .inner
+                            .secrets
+                            .get(&format!("{CUSTOM_KEY_PREFIX}{}", d.id))
+                            .ok()
+                            .flatten()
+                            .is_some_and(|k| !k.is_empty())
+                }
+                None => false,
+            },
+        }
+    }
+
     /// Active platform ceiling for Studio's shared main stream (Twitch 6,000 kbps / Kick
     /// 8,000 kbps H.264 2 s), or `None` when disabled by `ignore_service_limits`, Enhanced
     /// Broadcasting, manual light routing, or when only uncapped destinations are enabled.
@@ -1057,8 +1092,9 @@ impl Engine {
         if cfg.advanced.ignore_service_limits {
             return None;
         }
-        // One that can't start (no account, no key) isn't on this stream, so it sets no limit: a
-        // YouTube stream was held to 6,000 kbps by a Twitch switch with nobody signed in.
+        // One that can't start (no account, no key/URL, or blocked) isn't on this stream, so it
+        // sets no limit: a YouTube stream was held to 6,000 kbps by a Twitch switch with nobody
+        // signed in.
         let blocked = lock(&self.golive().blocked).clone();
         probe::effective_limit(
             cfg.destinations
@@ -1068,7 +1104,7 @@ impl Engine {
                         && d.canvas == Canvas::Main
                         && d.url.as_deref().and_then(direct_kind).is_none()
                         && !self.wants_light_now(d)
-                        && !blocked.contains_key(&d.id)
+                        && self.can_start_destination(d, &blocked)
                 })
                 .map(|d| (d.kind, d.enhanced)),
         )
@@ -1082,7 +1118,7 @@ impl Engine {
         cfg.destinations.iter().any(|d| {
             d.canvas == Canvas::Main
                 && d.url.as_deref().and_then(direct_kind) == Some("whip")
-                && !blocked.contains_key(&d.id)
+                && self.can_start_destination(d, &blocked)
                 && (d.enabled || backs_up(&cfg, &d.id).is_some_and(|p| p.enabled))
         })
     }
@@ -1188,9 +1224,11 @@ impl Engine {
                 let mut issues =
                     if d.enabled { probe::rules_structured(&dest_stats, d.kind, d.enhanced) } else { Vec::new() };
                 let is_whip = d.url.as_deref().and_then(direct_kind) == Some("whip");
+                let can_start = self.can_start_destination(d, &blocked);
                 let capped = if is_whip
                     && d.enabled
                     && d.canvas == Canvas::Main
+                    && can_start
                     && cap_held
                     && (!live || studio_streaming)
                     && let Some(sv) = studio_cfg
@@ -1208,6 +1246,7 @@ impl Engine {
                 } else if d.enabled
                     && d.canvas == Canvas::Main
                     && d.url.as_deref().and_then(direct_kind).is_none()
+                    && can_start
                     && !d.enhanced
                     && !d.wants_light()
                     && cap_held
@@ -3291,6 +3330,7 @@ pub(crate) async fn run(engine: Engine) {
                     engine.clear_golive_failures(Canvas::Main);
                 } else {
                     g.studio_live.store(false, std::sync::atomic::Ordering::Release);
+                    *lock(&g.applied_cap) = None;
                 }
             }
             if now.1 != was.1 {
