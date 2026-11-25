@@ -1707,7 +1707,13 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
     );
     let v = e.golive_view().await;
     let kick = v.destinations.iter().find(|d| d.id == "kick").unwrap();
-    assert_eq!(kick.capped.as_ref().map(|c| c.summary.as_str()), Some("Capped at 8,000 kbps for Kick"));
+    let kick_cap = kick.capped.as_ref().expect("running encode stays capped at 6,000 kbps");
+    assert_eq!(kick_cap.kbps, 6_000, "{kick_cap:?}");
+    assert!(
+        kick_cap.summary.contains("6,000 kbps") && !kick_cap.summary.contains("Kick"),
+        "must describe the applied 6,000 kbps cap rather than Kick's 8,000: {:?}",
+        kick_cap
+    );
 
     // Power-user override (C-6) disables automatic cap and removes the chip.
     let mut adv = e.golive_config().advanced;
@@ -1972,6 +1978,83 @@ async fn disconnected_twitch_beside_youtube_does_not_cap_live_youtube_stream() {
     adv.ignore_service_limits = true;
     e.set_golive_advanced(adv).await.unwrap();
     assert_eq!(e.studio_limit(), None, "ignore_service_limits keeps studio_limit disabled");
+}
+
+#[tokio::test]
+async fn live_view_reflects_applied_cap_after_midstream_destination_switch_and_standby() {
+    use crate::golive::DestAdvanced;
+    use ferrocast_core::event::Platform;
+
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() =
+        crate::studio_host::StudioSettings { video_kbps: 12_000, vbr: true, keyframe_s: 4, ..Default::default() };
+    e.set_studio_host(studio.clone());
+    e.register_connector(Arc::new(SignedIn(Platform::Twitch)));
+    e.register_connector(Arc::new(SignedIn(Platform::Youtube)));
+    e.register_connector(Arc::new(SignedIn(Platform::Kick)));
+
+    let enable = |ids: &[&str]| -> Vec<(String, bool)> {
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), ids.contains(&d.id.as_str()))).collect()
+    };
+
+    // 1. standby_for: Twitch configured as backup for enabled YouTube must NOT set studio_limit,
+    //    even if Twitch itself is enabled, until Twitch actually carries the stream.
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert("youtube".into(), DestAdvanced { backup: Some("twitch".into()), ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+    e.set_golive_destinations(enable(&["youtube", "twitch"])).await.unwrap();
+    let v = e.golive_view().await;
+    let tw = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert_eq!(tw.standby_for.as_deref(), Some("YouTube"));
+    assert_eq!(e.studio_limit(), None, "standby Twitch must not cap YouTube");
+    assert_eq!(tw.capped, None, "standby Twitch must not display a cap badge");
+
+    // Once primary YouTube fails over so Twitch carries the stream, Twitch counts in studio_limit.
+    e.seed_backup_failing_for_test("youtube", true);
+    assert_eq!(e.studio_limit().map(|l| l.max_kbps), Some(6_000));
+    e.seed_backup_failing_for_test("youtube", false);
+
+    // Clear backup for the mid-stream badge checks below.
+    let mut adv = e.golive_config().advanced;
+    adv.per.clear();
+    e.set_golive_advanced(adv).await.unwrap();
+
+    // 2. Start live Studio stream at 12,000 kbps with Twitch + YouTube -> applied_cap = 6,000 kbps.
+    e.set_golive_destinations(enable(&["twitch", "youtube"])).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    e.golive().hub.start();
+    assert_eq!(e.applied_cap().and_then(|c| c.max_kbps), Some(6_000));
+
+    // (a) Twitch + YouTube -> YouTube only mid-stream: applied_cap stays 6,000 kbps and
+    // golive_view() still informs the user that the running stream stays held at 6,000 kbps.
+    e.set_golive_destinations(enable(&["youtube"])).await.unwrap();
+    assert_eq!(e.applied_cap().and_then(|c| c.max_kbps), Some(6_000));
+    let v = e.golive_view().await;
+    let yt = v.destinations.iter().find(|d| d.id == "youtube").unwrap();
+    let yt_cap = yt.capped.as_ref().expect("YouTube must explain that running stream stays at 6,000 kbps");
+    assert_eq!(yt_cap.kbps, 6_000);
+    assert!(yt_cap.summary.contains("6,000 kbps"), "{yt_cap:?}");
+    assert!(yt_cap.summary.contains("next stream") || yt_cap.detail.contains("next stream"), "{yt_cap:?}");
+
+    // (b) Switch to Kick mid-stream: applied_cap stays 6,000 kbps and Kick must NOT claim 8,000 kbps.
+    e.set_golive_destinations(enable(&["kick"])).await.unwrap();
+    assert_eq!(e.applied_cap().and_then(|c| c.max_kbps), Some(6_000));
+    let v = e.golive_view().await;
+    let kick = v.destinations.iter().find(|d| d.id == "kick").unwrap();
+    let kick_cap = kick.capped.as_ref().expect("Kick must show the actual 6,000 kbps running cap");
+    assert_eq!(kick_cap.kbps, 6_000);
+    assert!(!kick_cap.summary.contains("8,000") && !kick_cap.summary.contains("Kick"), "{kick_cap:?}");
+
+    // (c) Auto-light (lighter_for_route: true) suppresses the main-stream cap badge.
+    e.seed_light_route_for_test("kick");
+    e.golive().lhub.start();
+    let v = e.golive_view().await;
+    let kick = v.destinations.iter().find(|d| d.id == "kick").unwrap();
+    assert!(kick.lighter_for_route, "Kick should report lighter_for_route");
+    assert_eq!(kick.capped, None, "auto-light destination must not display a main-stream cap badge");
+
+    e.studio_stream(false).await.unwrap();
 }
 
 /// A cap the Studio couldn't put on the stream on air (its encoder is shared with a recording)
