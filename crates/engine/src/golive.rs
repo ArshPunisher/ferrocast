@@ -2671,6 +2671,13 @@ impl Engine {
             if lock(&g.running).contains_key(&d.id) || lock(&g.paused).contains_key(&d.id) {
                 continue;
             }
+            if backs_up(&cfg, &d.id).is_some_and(|p| p.enabled)
+                && let Some(why) = self.midstream_misfit(&cfg.destinations, &d)
+            {
+                tracing::info!(dest = %d.id, %why, "Go live: standby backup cannot join live encode");
+                lock(&g.blocked).insert(d.id.clone(), why);
+                continue;
+            }
             self.start_destination(&d).await;
         }
         self.reconcile_cut().await;

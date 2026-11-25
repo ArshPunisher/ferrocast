@@ -2057,6 +2057,60 @@ async fn live_view_reflects_applied_cap_after_midstream_destination_switch_and_s
     e.studio_stream(false).await.unwrap();
 }
 
+#[tokio::test]
+async fn uncapped_primary_failover_to_incompatible_standby_twitch_is_blocked_without_pushing() {
+    use crate::golive::DestAdvanced;
+    use ferrocast_core::event::Platform;
+
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() =
+        crate::studio_host::StudioSettings { video_kbps: 12_000, vbr: true, keyframe_s: 4, ..Default::default() };
+    e.set_studio_host(studio);
+    e.register_connector(Arc::new(SignedIn(Platform::Youtube)));
+    e.register_connector(Arc::new(SignedIn(Platform::Twitch)));
+
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert("youtube".into(), DestAdvanced { backup: Some("twitch".into()), ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+    let both: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "twitch"))
+        .collect();
+    e.set_golive_destinations(both).await.unwrap();
+
+    // Start uncapped YouTube at 12,000 kbps while Twitch waits on standby.
+    e.studio_stream(true).await.unwrap();
+    e.golive().hub.start();
+    e.reconcile().await;
+    assert_eq!(e.applied_cap(), None);
+    assert!(e.golive_running().contains("youtube"));
+    assert!(!e.golive_running().contains("twitch"));
+
+    // Live failover to Twitch must NOT start Twitch on the incompatible 12,000 kbps encode.
+    e.seed_backup_failing_for_test("youtube", true);
+    e.reconcile().await;
+    assert!(
+        !e.golive_running().contains("twitch"),
+        "standby Twitch must not start on an incompatible 12,000 kbps encode"
+    );
+    let v = e.golive_view().await;
+    let tw = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    let blocked = tw.blocked.as_deref().unwrap_or("");
+    assert!(blocked.contains("6000") && blocked.contains("12000"), "unexpected block reason: {tw:?}");
+
+    // When primary YouTube recovers, Twitch leaves want and its block clears.
+    e.seed_backup_failing_for_test("youtube", false);
+    e.reconcile().await;
+    let v = e.golive_view().await;
+    let tw = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert_eq!(tw.blocked, None);
+
+    e.studio_stream(false).await.unwrap();
+}
+
 /// A cap the Studio couldn't put on the stream on air (its encoder is shared with a recording)
 /// isn't claimed: no badge says the stream is held, and the bitrate warning isn't held back, so
 /// the 7,011 kbps one comes back instead of silence. The codec rule still speaks when capped.
