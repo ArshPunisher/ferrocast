@@ -4406,7 +4406,9 @@ impl Stage {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "the engine could not start for the level meters; trying again in a while");
-                self.levels_retry_at.set(Some(now + LEVELS_RETRY));
+                // From when it failed, not from when it began: a slow start must still leave
+                // the whole wait before the next try.
+                self.levels_retry_at.set(Some(std::time::Instant::now() + LEVELS_RETRY));
                 None
             }
         }
