@@ -182,6 +182,13 @@ impl PreviewRect {
     }
 }
 
+/// Local Studio capture state inspected synchronously by update guards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalCaptureBlock {
+    pub recording: bool,
+    pub replay: bool,
+}
+
 /// The desktop app's side of the Studio (it owns libobs and the window).
 #[async_trait::async_trait]
 pub trait StudioHost: Send + Sync + std::fmt::Debug {
@@ -242,6 +249,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// and no action runs from it. Asked again within seconds, it keeps them off; it puts them
     /// back by itself if the page goes away without saying so. Not queued behind other work.
     fn capture_keys(&self, _on: bool) {}
+    /// Active local Studio capture state checked synchronously before installing/restarting updates.
+    fn local_capture_block(&self) -> LocalCaptureBlock {
+        LocalCaptureBlock::default()
+    }
     /// The Studio's settings (saved by the host; defaults the first time).
     async fn settings(&self) -> StudioSettings;
     /// Saves and applies them (checked before they get here) → what applies only after
@@ -2656,7 +2667,9 @@ impl Engine {
             *crate::golive::lock_enhanced(self) = None;
             self.set_studio_live(false);
         }
-        host.stop().await.map_err(failed)
+        let status = host.stop().await.map_err(failed)?;
+        self.send_update_frame();
+        Ok(status)
     }
 
     pub async fn studio_kinds(&self) -> Result<Value, EngineError> {
@@ -2771,7 +2784,9 @@ impl Engine {
         } else {
             None
         };
-        host.record(on).await.map_err(failed)
+        let out = host.record(on).await.map_err(failed)?;
+        self.send_update_frame();
+        Ok(out)
     }
 
     /// Refuses (and starts fetching FFmpeg) when x264 is `needed` and FFmpeg isn't here yet.
@@ -2798,7 +2813,9 @@ impl Engine {
         } else {
             None
         };
-        self.studio_host()?.record_source(name.to_string(), on).await.map_err(failed)
+        let out = self.studio_host()?.record_source(name.to_string(), on).await.map_err(failed)?;
+        self.send_update_frame();
+        Ok(out)
     }
 
     pub async fn studio_record_pause(&self, on: bool) -> Result<(), EngineError> {
@@ -2813,7 +2830,9 @@ impl Engine {
         } else {
             None
         };
-        self.studio_host()?.replay(on).await.map_err(failed)
+        let out = self.studio_host()?.replay(on).await.map_err(failed)?;
+        self.send_update_frame();
+        Ok(out)
     }
 
     pub async fn studio_replay_save(&self) -> Result<Value, EngineError> {

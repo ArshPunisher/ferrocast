@@ -324,6 +324,30 @@ thread_local! {
     static HELD: RefCell<Held> = RefCell::default();
 }
 
+const CAPTURE_RECORDING: u8 = 1 << 0;
+const CAPTURE_REPLAY: u8 = 1 << 1;
+
+static LOCAL_CAPTURE_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn capture_flags_of(h: &Held) -> u8 {
+    let rec = h.record.as_ref().is_some_and(|r| r.0.stats().active)
+        || h.source_records.iter().any(|(_, r, _)| r.stats().active);
+    let rep = h.replay.as_ref().is_some_and(|r| r.active());
+    (if rec { CAPTURE_RECORDING } else { 0 }) | (if rep { CAPTURE_REPLAY } else { 0 })
+}
+
+fn sync_local_capture_flags(h: &Held) {
+    LOCAL_CAPTURE_FLAGS.store(capture_flags_of(h), std::sync::atomic::Ordering::Release);
+}
+
+fn current_local_capture_block() -> ferrocast_engine::studio_host::LocalCaptureBlock {
+    let flags = LOCAL_CAPTURE_FLAGS.load(std::sync::atomic::Ordering::Acquire);
+    ferrocast_engine::studio_host::LocalCaptureBlock {
+        recording: (flags & CAPTURE_RECORDING) != 0,
+        replay: (flags & CAPTURE_REPLAY) != 0,
+    }
+}
+
 /// Passes mouse actions over a picture on to the page (Windows: the picture's own window takes
 /// them, where on a Mac they go through to the page by themselves).
 fn pass_input(window: &tauri::WebviewWindow, p: &Preview) {
@@ -956,6 +980,7 @@ fn take_outputs_from_held(h: &mut Held) -> Vec<Box<dyn FnOnce() + Send>> {
     push_opt_drain(&mut jobs, &mut h.virtualcam);
     push_opt_drain(&mut jobs, &mut h.ndi);
     push_vec_drain(&mut jobs, &mut h.guests);
+    sync_local_capture_flags(h);
     jobs
 }
 
@@ -1971,7 +1996,12 @@ impl DesktopStudio {
                     );
                 }
                 let _ = started_tx.send(());
-                let out = HELD.with(|h| f(&mut h.borrow_mut()));
+                let out = HELD.with(|h| {
+                    let mut h = h.borrow_mut();
+                    let out = f(&mut h);
+                    sync_local_capture_flags(&h);
+                    out
+                });
                 let _ = tx.send(out);
             })
             .map_err(|e| format!("The window isn't ready: {e}"))?;
@@ -2492,6 +2522,10 @@ impl StudioHost for DesktopStudio {
 
     fn capture_keys(&self, on: bool) {
         crate::studio_keys::capture(&self.app, on);
+    }
+
+    fn local_capture_block(&self) -> ferrocast_engine::studio_host::LocalCaptureBlock {
+        current_local_capture_block()
     }
 
     fn levels_now(&self, names: &[String], fast: bool) -> Option<Value> {
@@ -6530,6 +6564,36 @@ mod import_tests {
             ))
             .unwrap();
         assert_eq!(disp_res, json!({ "image": "data:image/jpeg;base64,FRESH_DISP" }));
+    }
+
+    #[test]
+    fn local_capture_block_syncs_and_resets_cleanly() {
+        use std::sync::Mutex;
+        use std::sync::atomic::Ordering;
+
+        use super::{
+            CAPTURE_RECORDING, CAPTURE_REPLAY, Held, LOCAL_CAPTURE_FLAGS, current_local_capture_block,
+            sync_local_capture_flags,
+        };
+
+        static FLAG_LOCK: Mutex<()> = Mutex::new(());
+        let _g = FLAG_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = LOCAL_CAPTURE_FLAGS.load(Ordering::Acquire);
+
+        LOCAL_CAPTURE_FLAGS.store(CAPTURE_RECORDING, Ordering::Release);
+        let block_rec = current_local_capture_block();
+        assert!(block_rec.recording && !block_rec.replay);
+
+        LOCAL_CAPTURE_FLAGS.store(CAPTURE_REPLAY, Ordering::Release);
+        let block_rep = current_local_capture_block();
+        assert!(!block_rep.recording && block_rep.replay);
+
+        LOCAL_CAPTURE_FLAGS.store(CAPTURE_RECORDING | CAPTURE_REPLAY, Ordering::Release);
+        sync_local_capture_flags(&Held::default());
+        let cleared = current_local_capture_block();
+        assert!(!cleared.recording && !cleared.replay);
+
+        LOCAL_CAPTURE_FLAGS.store(prev, Ordering::Release);
     }
 
     #[test]

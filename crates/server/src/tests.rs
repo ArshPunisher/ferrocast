@@ -1423,6 +1423,152 @@ async fn a_failed_install_says_why_and_can_be_tried_again() {
 }
 
 #[tokio::test]
+async fn updates_refuse_install_and_restart_while_studio_recording_or_replay_active() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use ferrocast_engine::studio_host::{
+        LocalCaptureBlock, PreviewRect, StudioAct, StudioHost, StudioSettings, StudioStatus,
+    };
+
+    #[derive(Debug, Default)]
+    struct CaptureStateHost {
+        recording: AtomicBool,
+        replay: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl StudioHost for CaptureStateHost {
+        async fn status(&self) -> StudioStatus {
+            StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn options(&self, _kind: String) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn act(&self, _act: StudioAct) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn settings(&self) -> StudioSettings {
+            StudioSettings::default()
+        }
+        async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record(&self, _on: bool) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(json!({ "devices": [] }))
+        }
+        async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn import_obs(&self, _id: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        fn local_capture_block(&self) -> LocalCaptureBlock {
+            LocalCaptureBlock {
+                recording: self.recording.load(Ordering::Acquire),
+                replay: self.replay.load(Ordering::Acquire),
+            }
+        }
+    }
+
+    let r = start().await;
+    let host = Arc::new(CaptureStateHost::default());
+    r.engine.set_studio_host(host.clone());
+    r.engine.attach_updater();
+    r.engine.set_available_update(Some(found("9.9.9")));
+
+    // Active local recording blocks both install and update_view without conflating Engine::is_live().
+    host.recording.store(true, Ordering::Release);
+    assert!(!r.engine.is_live(), "local recording must not report stream live status");
+    assert!(r.engine.update_blocked(), "local recording must block updates");
+    let v: Value = r.get("/api/v1/updates").await.json().await.unwrap();
+    assert_eq!(v["blocked_while_live"], json!(true));
+    let rec_install = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(rec_install.status(), StatusCode::CONFLICT);
+    let rec_body: Value = rec_install.json().await.unwrap();
+    assert_eq!(rec_body["error"]["code"], "live");
+    assert!(
+        rec_body["error"]["message"].as_str().unwrap_or_default().to_ascii_lowercase().contains("record"),
+        "expected recording message, got {rec_body}"
+    );
+
+    // Active replay buffer also blocks both install and update_view.
+    host.recording.store(false, Ordering::Release);
+    host.replay.store(true, Ordering::Release);
+    assert!(r.engine.update_blocked(), "active replay buffer must block updates");
+    let rep_install = r.post("/api/v1/updates/install", json!({})).await;
+    assert_eq!(rep_install.status(), StatusCode::CONFLICT);
+    let rep_body: Value = rep_install.json().await.unwrap();
+    assert_eq!(rep_body["error"]["code"], "live");
+    assert!(
+        rep_body["error"]["message"].as_str().unwrap_or_default().to_ascii_lowercase().contains("replay"),
+        "expected replay message, got {rep_body}"
+    );
+
+    // Stop replay so download succeeds and becomes Ready, then confirm restart refuses for recording and replay.
+    host.replay.store(false, Ordering::Release);
+    assert_eq!(r.post("/api/v1/updates/install", json!({})).await.status(), StatusCode::ACCEPTED);
+    r.engine.update_ready("9.9.9");
+
+    host.recording.store(true, Ordering::Release);
+    let rec_restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(rec_restart.status(), StatusCode::CONFLICT);
+    let rec_restart_body: Value = rec_restart.json().await.unwrap();
+    assert_eq!(rec_restart_body["error"]["code"], "live");
+    assert!(
+        rec_restart_body["error"]["message"].as_str().unwrap_or_default().to_ascii_lowercase().contains("record"),
+        "expected recording restart refusal, got {rec_restart_body}"
+    );
+
+    host.recording.store(false, Ordering::Release);
+    host.replay.store(true, Ordering::Release);
+    let rep_restart = r.post("/api/v1/updates/restart", json!({})).await;
+    assert_eq!(rep_restart.status(), StatusCode::CONFLICT);
+    let rep_restart_body: Value = rep_restart.json().await.unwrap();
+    assert_eq!(rep_restart_body["error"]["code"], "live");
+    assert!(
+        rep_restart_body["error"]["message"].as_str().unwrap_or_default().to_ascii_lowercase().contains("replay"),
+        "expected replay restart refusal, got {rep_restart_body}"
+    );
+
+    host.replay.store(false, Ordering::Release);
+    assert_eq!(r.post("/api/v1/updates/restart", json!({})).await.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn a_daily_backup_is_taken_at_start_and_listed_with_its_reason() {
     let r = start().await;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
