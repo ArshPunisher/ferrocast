@@ -11219,6 +11219,14 @@ mod tests {
         while e.engine.opening() > 0 {
             std::thread::yield_now();
         }
+        // The engine shows its camera states to other threads once its frame loop has noted them;
+        // a busy runner (Windows CI) can take a while, so wait for it instead of reading once.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while s.matching_camera_wait(cam_kind, cam_key, &val) != super::MatchingCameraWait::WaitingWithoutSession
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(s.matching_camera_wait(cam_kind, cam_key, &val), super::MatchingCameraWait::WaitingWithoutSession);
         assert_eq!(
             s.matching_camera_wait(cam_kind, cam_key, &Value::String("other-cam".into())),

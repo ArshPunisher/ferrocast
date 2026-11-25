@@ -10132,6 +10132,15 @@ mod tests {
         }
     }
 
+    /// Waits (up to 10 s) until nothing but the test holds `buf`.
+    #[cfg(target_os = "macos")]
+    fn wait_retain_count_one(buf: &objc2_core_video::CVImageBuffer) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::apple::screen::tests::buffer_retain_count(buf) != 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn hidden_or_frozen_source_releases_pinned_cv_image_buffer() {
@@ -10156,7 +10165,9 @@ mod tests {
         frozen_item.effects = vec![Effect::Freeze];
         e.set_scene("Main", vec![frozen_item]);
         drop(surface);
-        std::thread::sleep(Duration::from_millis(200));
+        // The frame loop lets go of it on its next frame: wait for that, not a fixed time (a
+        // loaded CI runner took longer than 200 ms).
+        wait_retain_count_one(&buf);
         assert_eq!(
             crate::apple::screen::tests::buffer_retain_count(&buf),
             1,
@@ -10171,7 +10182,7 @@ mod tests {
         drop(surface2);
         std::thread::sleep(Duration::from_millis(120));
         e.go("Other").unwrap_or_else(|x| panic!("{x}"));
-        std::thread::sleep(Duration::from_millis(200));
+        wait_retain_count_one(&buf);
         assert_eq!(
             crate::apple::screen::tests::buffer_retain_count(&buf),
             1,
