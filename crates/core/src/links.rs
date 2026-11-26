@@ -375,6 +375,26 @@ pub fn format_utc_schedule(start_ms: i64) -> String {
     }
 }
 
+fn social_dedup_key(url: &str) -> String {
+    let (scheme, rest) = if let Some(pos) = url.find("://") {
+        let s = &url[..pos];
+        let mut chars = s.chars();
+        if chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        {
+            (url[..pos + 3].to_lowercase(), &url[pos + 3..])
+        } else {
+            (String::new(), url)
+        }
+    } else {
+        (String::new(), url)
+    };
+    match rest.find(['/', '?', '#']) {
+        Some(idx) => format!("{scheme}{}{}", rest[..idx].to_lowercase(), &rest[idx..]),
+        None => format!("{scheme}{}", rest.to_lowercase()),
+    }
+}
+
 /// Resolves effective overlay links from saved overrides, connected accounts, and upcoming schedule.
 pub fn resolve_links(
     links: &CreatorLinks,
@@ -413,13 +433,14 @@ pub fn resolve_links(
     let mut seen_socials = HashSet::new();
     let mut socials = Vec::new();
     for v in [&twitch, &youtube, &kick, &facebook, &discord, &instagram, &x, &tiktok, &website].into_iter().flatten() {
-        if seen_socials.insert(v.to_lowercase()) {
+        if seen_socials.insert(social_dedup_key(v)) {
             socials.push(v.clone());
         }
     }
     for c in &custom {
         let entry = format!("{}: {}", c.label, c.value);
-        if seen_socials.insert(entry.to_lowercase()) {
+        let key = format!("{}: {}", c.label.to_lowercase(), social_dedup_key(&c.value));
+        if seen_socials.insert(key) {
             socials.push(entry);
         }
     }
@@ -592,5 +613,25 @@ mod tests {
 
         // Multi-byte UTF-8 characters within the first 4 bytes must never panic during normalization.
         assert_eq!(normalize_display_link("website", "https://café.example/").as_deref(), Some("café.example"));
+    }
+
+    #[test]
+    fn preserves_url_path_casing_when_deduplicating_socials() {
+        let links = CreatorLinks {
+            discord: Some("discord.gg/AbCd".into()),
+            website: Some("discord.gg/abcd".into()),
+            instagram: Some("https://Discord.GG/AbCd".into()),
+            custom: vec![
+                CustomLink { label: "Merch".into(), value: "shop.gg/AbCd".into() },
+                CustomLink { label: "Merch".into(), value: "shop.gg/abcd".into() },
+                CustomLink { label: "Merch".into(), value: "SHOP.GG/AbCd".into() },
+            ],
+            ..Default::default()
+        };
+        let res = resolve_links(&links, &[], None);
+        assert_eq!(
+            res.socials,
+            vec!["discord.gg/AbCd", "discord.gg/abcd", "Merch: shop.gg/AbCd", "Merch: shop.gg/abcd"]
+        );
     }
 }
