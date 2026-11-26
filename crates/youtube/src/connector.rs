@@ -146,6 +146,7 @@ impl Connector for YoutubeConnector {
             return Err(ConnectorError::RateLimited { platform: Platform::Youtube, retry_after });
         }
         let mut ids = self.api.active_broadcast_ids();
+        let used_cache = !ids.is_empty();
         if ids.is_empty() {
             let active = self.api.active_broadcasts().await.map_err(|e| self.map_err(e))?;
             ids = active.into_iter().map(|b| b.id).collect();
@@ -153,6 +154,17 @@ impl Connector for YoutubeConnector {
         if ids.is_empty() {
             return Ok(None);
         }
-        self.api.concurrent_viewers(&ids).await.map_err(|e| self.map_err(e))
+        let count = self.api.concurrent_viewers(&ids).await.map_err(|e| self.map_err(e))?;
+        if count.is_none() && used_cache {
+            let active = self.api.active_broadcasts().await.map_err(|e| self.map_err(e))?;
+            let fresh_ids: Vec<String> = active.into_iter().map(|b| b.id).collect();
+            if fresh_ids.is_empty() {
+                return Ok(None);
+            }
+            if fresh_ids != ids {
+                return self.api.concurrent_viewers(&fresh_ids).await.map_err(|e| self.map_err(e));
+            }
+        }
+        Ok(count)
     }
 }

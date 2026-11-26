@@ -2775,3 +2775,71 @@ async fn viewer_count_uses_active_broadcasts_batches_videos_and_respects_quota()
     assert_eq!(c.viewer_count().await.unwrap(), Some(17));
     assert_eq!(st.calls.lock().unwrap().len(), calls_at_quota + 1);
 }
+
+#[tokio::test]
+async fn viewer_count_rediscovers_broadcasts_after_cached_broadcast_ends() {
+    use axum::extract::{Query, State};
+    use ferrocast_connector::Connector;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Default)]
+    struct MockSt {
+        calls: Arc<Mutex<Vec<String>>>,
+        rotated: Arc<AtomicBool>,
+    }
+
+    let st = MockSt::default();
+    let app = axum::Router::new()
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|State(st): State<MockSt>, Query(_q): Query<HashMap<String, String>>| async move {
+                st.calls.lock().unwrap().push("GET /liveBroadcasts".into());
+                let id = if st.rotated.load(Ordering::SeqCst) { "b-new" } else { "b-old" };
+                axum::Json(json!({ "items": [{ "id": id, "snippet": { "liveChatId": "lc" } }] }))
+            }),
+        )
+        .route(
+            "/api/videos",
+            axum::routing::get(|State(st): State<MockSt>, Query(q): Query<HashMap<String, String>>| async move {
+                let ids = q.get("id").cloned().unwrap_or_default();
+                st.calls.lock().unwrap().push(format!("GET /videos id={ids}"));
+                let items = if ids == "b-new" {
+                    vec![json!({ "id": "b-new", "liveStreamingDetails": { "concurrentViewers": "25" } })]
+                } else {
+                    vec![json!({ "id": "b-old", "liveStreamingDetails": {} })]
+                };
+                axum::Json(json!({ "items": items }))
+            }),
+        )
+        .with_state(st.clone());
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let ep =
+        Endpoints { authorize: String::new(), token: String::new(), api: format!("{base}/api"), grpc: String::new() };
+    let api = Arc::new(video_api(ep));
+    api.set_active_broadcasts(vec!["b-old".into()]);
+    st.rotated.store(true, Ordering::SeqCst);
+
+    let c = crate::YoutubeConnector { api: api.clone(), live: Arc::default() };
+    assert_eq!(c.viewer_count().await.unwrap(), Some(25));
+    assert_eq!(*st.calls.lock().unwrap(), vec!["GET /videos id=b-old", "GET /liveBroadcasts", "GET /videos id=b-new"]);
+
+    // Cached broadcast ids expire after TTL so mid-stream broadcasts (e.g. Shorts) are discovered.
+    assert_eq!(api.active_broadcast_ids(), vec!["b-new".to_string()]);
+    api.expire_active_broadcasts_for_test();
+    assert!(api.active_broadcast_ids().is_empty(), "expired active broadcast cache must empty out");
+    assert_eq!(c.viewer_count().await.unwrap(), Some(25));
+    assert_eq!(
+        *st.calls.lock().unwrap(),
+        vec![
+            "GET /videos id=b-old",
+            "GET /liveBroadcasts",
+            "GET /videos id=b-new",
+            "GET /liveBroadcasts",
+            "GET /videos id=b-new",
+        ]
+    );
+}

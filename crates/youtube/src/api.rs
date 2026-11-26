@@ -118,9 +118,27 @@ pub struct Api {
     /// How long a read is kept (ms; 0: never, as before).
     read_ttl_ms: i64,
     /// Broadcast ids reported active by the latest `active_broadcasts` check.
-    active_broadcasts: StdMutex<Vec<String>>,
+    active_broadcasts: StdMutex<ActiveBroadcastCache>,
     /// When daily quota ran out, stop polling viewer counts until this monotonic instant.
     quota_paused_until: StdMutex<Option<std::time::Instant>>,
+}
+
+struct ActiveBroadcastCache {
+    ids: Vec<String>,
+    cached_at: Option<std::time::Instant>,
+    ttl: std::time::Duration,
+}
+
+impl Default for ActiveBroadcastCache {
+    fn default() -> Self {
+        Self { ids: Vec::new(), cached_at: None, ttl: ACTIVE_BROADCAST_TTL }
+    }
+}
+
+impl ActiveBroadcastCache {
+    fn is_fresh(&self, now: std::time::Instant) -> bool {
+        !self.ids.is_empty() && self.cached_at.is_some_and(|t| now.saturating_duration_since(t) < self.ttl)
+    }
 }
 
 /// An active YouTube broadcast returned by `liveBroadcasts.list(broadcastStatus=active)`.
@@ -148,6 +166,9 @@ const UPCOMING_PAST_MS: i64 = 12 * 3_600_000;
 
 /// Upper bound on pages followed when paginating `liveStreams` / `liveBroadcasts` (50/page).
 const MAX_LIST_PAGES: usize = 20;
+
+/// How long cached active broadcast ids remain trusted before re-querying `liveBroadcasts`.
+const ACTIVE_BROADCAST_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Standard YouTube RTMPS ingest server, used as read-only reachability fallback when the channel
 /// doesn't yet have a usable RTMP stream (e.g. vertical stream not created yet, or HLS-only key).
@@ -185,7 +206,7 @@ impl Api {
             reads: StdMutex::new(HashMap::new()),
             writes: AtomicU64::new(0),
             read_ttl_ms: READ_TTL_MS,
-            active_broadcasts: StdMutex::new(Vec::new()),
+            active_broadcasts: StdMutex::new(ActiveBroadcastCache::default()),
             quota_paused_until: StdMutex::new(None),
         }
     }
@@ -413,9 +434,16 @@ impl Api {
         Ok(self.active_broadcasts().await?.into_iter().find_map(|b| b.live_chat_id))
     }
 
-    /// Cached active broadcast ids from the most recent `active_broadcasts` check.
+    /// Cached active broadcast ids from the most recent `active_broadcasts` check (empty once expired).
     pub fn active_broadcast_ids(&self) -> Vec<String> {
-        self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_fresh(std::time::Instant::now()) {
+            guard.ids.clone()
+        } else {
+            guard.ids.clear();
+            guard.cached_at = None;
+            Vec::new()
+        }
     }
 
     /// Stores the active broadcast ids (deduplicated, preserving order).
@@ -426,12 +454,22 @@ impl Api {
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty() && seen.insert(id.clone()))
             .collect();
-        *self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner()) = deduped;
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        guard.cached_at = (!deduped.is_empty()).then(std::time::Instant::now);
+        guard.ids = deduped;
     }
 
     /// Clears cached active broadcast ids when a stream goes offline.
     pub fn clear_active_broadcasts(&self) {
-        self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        guard.ids.clear();
+        guard.cached_at = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_active_broadcasts_for_test(&self) {
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        guard.ttl = std::time::Duration::ZERO;
     }
 
     /// Records a daily-quota pause window so non-essential polling skips requests until reset.
