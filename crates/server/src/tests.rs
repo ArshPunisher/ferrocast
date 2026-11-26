@@ -2907,3 +2907,44 @@ async fn overlay_test_preview_socket_receives_live_links_state_updates() {
     .unwrap();
     assert_eq!(updated["discord"], "discord.gg/liveview");
 }
+
+#[tokio::test]
+async fn put_links_refuses_to_overwrite_corrupt_creator_links_row() {
+    let r = start().await;
+    let corrupt_json = r#"{"discord":"discord.gg/keepme","x":123}"#;
+    r.engine
+        .db(move |s| {
+            s.write(|tx| {
+                tx.execute(
+                    "INSERT INTO settings(key, value, updated_at) VALUES ('creator_links', ?1, 1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [corrupt_json],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let res = r.put("/api/v1/links", json!({ "twitch": "twitch.tv/nova" })).await;
+    assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let err: Value = res.json().await.unwrap();
+    assert_eq!(err["error"]["code"], "storage");
+    let msg = err["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.to_lowercase().contains("my links") && msg.to_lowercase().contains("read"),
+        "expected clear message on failed PUT /links read: {err}"
+    );
+
+    let stored_after: String = r
+        .engine
+        .db(|s| {
+            s.read(|c| Ok(c.query_row("SELECT value FROM settings WHERE key = 'creator_links'", [], |r| r.get(0))?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored_after, corrupt_json);
+
+    // Best-effort GET /api/v1/links display path still returns 200 with empty fallback.
+    assert_eq!(r.get("/api/v1/links").await.status(), StatusCode::OK);
+}

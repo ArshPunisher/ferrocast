@@ -2660,3 +2660,102 @@ async fn reload_pushes_restored_links_to_open_overlays_and_dashboards() {
     .unwrap();
     assert_eq!(live_frame["data"]["resolved"]["discord"], "discord.gg/restored");
 }
+
+#[tokio::test]
+async fn patch_links_refuses_to_overwrite_stored_links_after_failed_read() {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::instrument::WithSubscriber;
+    use tracing::{Event, Level, Metadata, Subscriber, span};
+
+    #[derive(Default)]
+    struct LogCapture {
+        errors: Mutex<Vec<String>>,
+    }
+
+    impl LogCapture {
+        fn record_event(&self, event: &Event<'_>) {
+            struct MsgVisitor(String);
+            impl Visit for MsgVisitor {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, "{}={:?} ", field.name(), value);
+                }
+            }
+            if *event.metadata().level() <= Level::ERROR {
+                let mut v = MsgVisitor(String::new());
+                event.record(&mut v);
+                self.errors.lock().unwrap().push(v.0);
+            }
+        }
+    }
+
+    struct CaptureSub(Arc<LogCapture>);
+    impl Subscriber for CaptureSub {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= Level::ERROR
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            self.0.record_event(event);
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    let (eng, _d) = engine().await;
+    let corrupt_json = r#"{"twitch":"twitch.tv/keepme","discord":123}"#;
+    eng.db(move |s| {
+        s.write(|tx| {
+            tx.execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES ('creator_links', ?1, 1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [corrupt_json],
+            )?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+
+    let logs = Arc::new(LogCapture::default());
+    let dispatch = tracing::Dispatch::new(CaptureSub(logs.clone()));
+    let patch = serde_json::json!({ "x": "novaplays" }).as_object().unwrap().clone();
+    let err = eng.patch_links(&patch).with_subscriber(dispatch).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("my links") && msg.to_lowercase().contains("read"),
+        "expected clear error explaining failed read prevented overwrite, got: {msg}"
+    );
+
+    // Stored JSON row must remain completely intact (never overwritten with partial patch).
+    let stored_after: String = eng
+        .db(|s| {
+            s.read(|c| Ok(c.query_row("SELECT value FROM settings WHERE key = 'creator_links'", [], |r| r.get(0))?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(stored_after, corrupt_json);
+
+    // Error was logged with context (`creator_links` and patched field key, without leaking values).
+    let recorded = logs.errors.lock().unwrap().join("\n");
+    assert!(recorded.contains("creator_links"), "expected creator_links context in error log: {recorded}");
+    assert!(recorded.contains("patch_keys"), "expected patch_keys context in error log: {recorded}");
+
+    // Best-effort display paths still fall back to empty links instead of failing.
+    assert_eq!(eng.links().await.unwrap().links, ferrocast_core::links::CreatorLinks::default());
+    assert!(eng.resolved_links().await.unwrap().socials.is_empty());
+
+    // SQL read errors also fail instead of falling back to empty links.
+    let (sql_eng, _d2) = engine().await;
+    sql_eng.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TABLE settings;")?))).await.unwrap();
+    let sql_err = sql_eng.patch_links(&patch).await.unwrap_err();
+    assert!(
+        sql_err.to_string().to_lowercase().contains("my links"),
+        "expected clear error on SQL read failure, got: {sql_err}"
+    );
+}

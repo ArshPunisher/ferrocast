@@ -19,12 +19,16 @@ pub struct LinksView {
 }
 
 impl Engine {
-    async fn load_creator_links_or_empty(&self) -> Result<CreatorLinks, EngineError> {
-        match self.db(|s| repo::settings::get_or_default::<CreatorLinks>(s, KEY)).await {
-            Ok(links) => Ok(links),
+    async fn load_creator_links(&self) -> Result<CreatorLinks, EngineError> {
+        self.db(|s| repo::settings::get_or_default::<CreatorLinks>(s, KEY)).await
+    }
+
+    async fn load_creator_links_or_empty(&self) -> CreatorLinks {
+        match self.load_creator_links().await {
+            Ok(links) => links,
             Err(e) => {
                 tracing::warn!(error = %e, key = KEY, "corrupt or unreadable creator_links setting; falling back to empty links");
-                Ok(CreatorLinks::default())
+                CreatorLinks::default()
             }
         }
     }
@@ -35,14 +39,14 @@ impl Engine {
     }
 
     pub(crate) async fn links_at(&self, at_ms: i64) -> Result<LinksView, EngineError> {
-        let links = self.load_creator_links_or_empty().await?;
+        let links = self.load_creator_links_or_empty().await;
         let resolved = self.resolve_creator_links_at(&links, at_ms).await?;
         Ok(LinksView { links, resolved })
     }
 
     /// Resolves effective overlay links from saved overrides, connected accounts, and schedule.
     pub async fn resolved_links(&self) -> Result<ResolvedLinks, EngineError> {
-        let links = self.load_creator_links_or_empty().await?;
+        let links = self.load_creator_links_or_empty().await;
         self.resolve_creator_links_at(&links, now().0).await
     }
 
@@ -85,7 +89,31 @@ impl Engine {
     /// Applies a partial JSON update to saved "My links", preserving omitted and unknown future keys.
     pub async fn patch_links(&self, patch: &Map<String, Value>) -> Result<LinksView, EngineError> {
         let _w = self.config_lock().await;
-        let existing = self.load_creator_links_or_empty().await?;
+        let existing = match self.load_creator_links().await {
+            Ok(links) => links,
+            Err(err) => {
+                let patch_keys: Vec<&str> = patch.keys().map(String::as_str).collect();
+                tracing::error!(
+                    error = %err,
+                    key = KEY,
+                    ?patch_keys,
+                    "couldn't read stored creator_links before applying patch; refusing to overwrite"
+                );
+                let (message, hint) = match &err {
+                    EngineError::Store(ferrocast_store::StoreError::Json(_)) => (
+                        "Saved \"My links\" data couldn't be read, so this change wasn't saved over it.".to_string(),
+                        "Restore a backup in Settings or fix the stored links before saving partial updates."
+                            .to_string(),
+                    ),
+                    _ => (
+                        "Ferrocast couldn't read your saved \"My links\", so this change wasn't saved over them."
+                            .to_string(),
+                        "Check there's free disk space and the database isn't busy, then try again.".to_string(),
+                    ),
+                };
+                return Err(EngineError::Refused { status: 500, code: "storage", message, hint, retry_after: None });
+            }
+        };
         let links = patch_creator_links(&existing, patch).map_err(EngineError::Invalid)?;
         let to_save = links.clone();
         self.db(move |s| repo::settings::set(s, KEY, &to_save)).await?;
