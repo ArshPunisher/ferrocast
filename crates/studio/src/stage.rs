@@ -1035,6 +1035,26 @@ impl Stage {
         Ok(s.get("settings").and_then(|v| v.get("items")).and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
+    fn reorder_scene(order: &mut Vec<String>, name: &str, to: usize) -> Option<bool> {
+        let at = order.iter().position(|n| n == name)?;
+        let target = to.min(order.len() - 1);
+        if at == target {
+            return Some(false);
+        }
+        let s = order.remove(at);
+        order.insert(target, s);
+        Some(true)
+    }
+
+    fn set_vertical_order(&self, order: &[String]) {
+        let list: Vec<Value> = order.iter().map(|n| json!({ "name": n })).collect();
+        self.edit(|d| {
+            if let Some(v) = d.pointer_mut("/ferrocast/vertical") {
+                v["scene_order"] = Value::Array(list);
+            }
+        });
+    }
+
     fn set_order(&self, order: &[String]) {
         let list: Vec<Value> = order.iter().map(|n| json!({ "name": n })).collect();
         self.edit(|d| d["scene_order"] = Value::Array(list));
@@ -1184,14 +1204,26 @@ impl Stage {
         Ok(())
     }
 
+    /// Moves a scene to slot `to` (`0` = first) on either main or active vertical canvas.
+    /// Moving to the current slot is a no-op so no reload or undo step is triggered.
     pub fn move_scene(&self, name: &str, to: usize) -> Result<(), StudioError> {
         let mut order = self.order();
-        let at =
-            order.iter().position(|n| n == name).ok_or_else(|| fail(format!("There's no scene called \"{name}\".")))?;
-        let s = order.remove(at);
-        order.insert(to.min(order.len()), s);
-        self.set_order(&order);
-        Ok(())
+        if let Some(changed) = Self::reorder_scene(&mut order, name, to) {
+            if changed {
+                self.set_order(&order);
+            }
+            return Ok(());
+        }
+        if self.vertical().is_some() {
+            let mut vorder = self.vertical_order();
+            if let Some(changed) = Self::reorder_scene(&mut vorder, name, to) {
+                if changed {
+                    self.set_vertical_order(&vorder);
+                }
+                return Ok(());
+            }
+        }
+        Err(fail(format!("There's no scene called \"{name}\".")))
     }
 
     /// Puts a scene on air, through the resolved transition (the engine plays it).
@@ -7956,6 +7988,42 @@ mod tests {
         assert_eq!(s.current(), "Three", "the first scene goes on air instead");
         ok(s.remove_scene("Main"));
         assert!(s.remove_scene("Three").is_err(), "one scene is always kept");
+    }
+
+    #[test]
+    fn move_scene_reorders_vertical_scenes_and_skips_noop_reloads() {
+        let s = stage();
+        ok(s.add_scene("Two"));
+        ok(s.add_scene("Three"));
+        ok(s.start_vertical("Tall"));
+        ok(s.add_vertical_scene("Tall 2"));
+        ok(s.add_vertical_scene("Tall 3"));
+
+        let reloads_before = s.graph_reloads();
+        let snap_before = s.snapshot();
+        // Moving to the same index (exact or clamped past end) is a no-op.
+        ok(s.move_scene("Main", 0));
+        ok(s.move_scene("Three", 99));
+        assert_eq!(s.graph_reloads(), reloads_before, "same-index main move must not reload");
+        assert_eq!(s.snapshot(), snap_before, "same-index main move must not mutate doc");
+
+        // Reordering a vertical scene works through the same move_scene path.
+        ok(s.move_scene("Tall 3", 0));
+        assert_eq!(
+            s.vertical().unwrap().scenes.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["Tall 3", "Tall", "Tall 2"]
+        );
+        let v_reloads = s.graph_reloads();
+        let v_snap = s.snapshot();
+        ok(s.move_scene("Tall 3", 0));
+        ok(s.move_scene("Tall 2", 99));
+        assert_eq!(s.graph_reloads(), v_reloads, "same-index vertical move must not reload");
+        assert_eq!(s.snapshot(), v_snap, "same-index vertical move must not mutate doc");
+        assert!(s.move_scene("Missing", 0).is_err());
+
+        // When vertical is turned off, vertical scenes are not active for move_scene.
+        s.stop_vertical();
+        assert!(s.move_scene("Tall 3", 1).is_err());
     }
 
     #[test]

@@ -977,4 +977,53 @@ mod tests {
         assert_eq!(h.redo(&c), Ok(Some("Change transition matrix".into())));
         assert_eq!(c.resolve_transition("Main", "BRB").name, "Fast Cut");
     }
+
+    #[test]
+    fn moving_scenes_including_vertical_undoes_and_noop_move_leaves_no_step() {
+        let c = stage();
+        c.add_scene("Two").unwrap();
+        c.start_vertical("Tall").unwrap();
+        c.add_vertical_scene("Tall 2").unwrap();
+        let mut h = History::default();
+        let run_move = |h: &mut History, scene: &str, to: usize| -> Result<(), String> {
+            let act = StudioAct::MoveScene { scene: scene.into(), to };
+            let b = h.before(&c, &act).unwrap();
+            let out = c.move_scene(scene, to).map(|()| Value::Null).map_err(|e| e.to_string());
+            h.after(&c, b, &out);
+            out.map(|_| ())
+        };
+
+        // Real move then undo, so both undo and redo stacks are tested against a no-op move.
+        run_move(&mut h, "Two", 0).unwrap();
+        assert_eq!(h.labels().0, Some("Reorder Two"));
+        assert_eq!(h.undo(&c), Ok(Some("Reorder Two".into())));
+        assert_eq!(h.labels(), (None, Some("Reorder Two")));
+
+        // No-op move (exact and clamped) adds no undo step and keeps redo intact.
+        run_move(&mut h, "Main", 0).unwrap();
+        run_move(&mut h, "Two", 99).unwrap();
+        assert_eq!(h.labels(), (None, Some("Reorder Two")));
+
+        // Moving a vertical scene records an undo step and restores vertical order on undo/redo.
+        run_move(&mut h, "Tall 2", 0).unwrap();
+        assert_eq!(h.labels().0, Some("Reorder Tall 2"));
+        assert_eq!(
+            c.vertical().unwrap().scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Tall 2", "Tall"]
+        );
+        // No-op vertical move leaves no extra undo step.
+        run_move(&mut h, "Tall 2", 0).unwrap();
+        assert_eq!(h.labels().0, Some("Reorder Tall 2"));
+
+        assert_eq!(h.undo(&c), Ok(Some("Reorder Tall 2".into())));
+        assert_eq!(
+            c.vertical().unwrap().scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Tall", "Tall 2"]
+        );
+        assert_eq!(h.redo(&c), Ok(Some("Reorder Tall 2".into())));
+        assert_eq!(
+            c.vertical().unwrap().scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["Tall 2", "Tall"]
+        );
+    }
 }
