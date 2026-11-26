@@ -17,7 +17,7 @@ pub use ferrocast_golive::cut::{CutBox, CutConfig, Layout};
 pub use ferrocast_golive::cutter::CutState as CutStateView;
 use ferrocast_golive::cutter::CutState;
 use ferrocast_golive::probe::{self, Need, Service, TWITCH_BANDWIDTH_TEST};
-pub use ferrocast_golive::probe::{CappedInfo, PlatformLimit, RuleCode, RuleNotice};
+pub use ferrocast_golive::probe::{Canvas, CappedInfo, PlatformLimit, RuleCode, RuleNotice};
 use ferrocast_golive::{Destination, Health, Hub, Ingest, PushState, StreamStats, Target, Verdict};
 use ferrocast_obs::control::{self as obs, StreamService};
 use serde::{Deserialize, Serialize};
@@ -43,15 +43,6 @@ const HEALTH_EVERY: Duration = Duration::from_secs(1);
 const DEFAULT_NEED_KBPS: u32 = 6_160;
 /// The same for an upright 1080×1920 stream from OBS's vertical canvas.
 const DEFAULT_VERTICAL_NEED_KBPS: u32 = 4_660;
-
-/// Which picture a destination gets: OBS's normal stream, or its vertical canvas (A2.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Canvas {
-    #[default]
-    Main,
-    Vertical,
-}
 
 fn is_main(c: &Canvas) -> bool {
     *c == Canvas::Main
@@ -724,26 +715,16 @@ fn destination_sends(cfg: &GoLiveConfig, failing: &std::collections::HashSet<Str
 fn limit_from_cap(c: crate::studio_host::StreamCap) -> Option<PlatformLimit> {
     match c.max_kbps? {
         6_000 => Some(PlatformLimit {
-            service: Service::Twitch,
-            name: "Twitch",
-            max_kbps: 6_000,
             keyframe_secs: c.keyframe_secs,
-            h264_only: c.h264_only,
+            max_keyframe_secs: c.keyframe_secs,
+            ..probe::TWITCH_LIMIT
         }),
         8_000 => Some(PlatformLimit {
-            service: Service::Kick,
-            name: "Kick",
-            max_kbps: 8_000,
             keyframe_secs: c.keyframe_secs,
-            h264_only: c.h264_only,
+            max_keyframe_secs: c.keyframe_secs,
+            ..probe::KICK_LIMIT
         }),
-        other => Some(PlatformLimit {
-            service: Service::Custom,
-            name: "Stream",
-            max_kbps: other,
-            keyframe_secs: c.keyframe_secs,
-            h264_only: c.h264_only,
-        }),
+        other => Some(PlatformLimit::custom_cap(other, c.keyframe_secs, c.h264_only)),
     }
 }
 
@@ -1212,7 +1193,7 @@ impl Engine {
         let no_bframes = self.studio_no_bframes();
         let cap = (limit.is_some() || no_bframes).then(|| crate::studio_host::StreamCap {
             max_kbps: limit.map(|l| l.max_kbps),
-            h264_only: limit.is_some_and(|l| l.h264_only),
+            h264_only: limit.is_some_and(|l| l.is_h264_only()),
             keyframe_secs: limit.map_or(0, |l| l.keyframe_secs),
             no_bframes,
         });
@@ -1329,6 +1310,7 @@ impl Engine {
                     Some(probe::CappedInfo {
                         kbps,
                         resolution: None,
+                        fps: None,
                         separate_encode: false,
                         summary: "B-frames off for WebRTC".into(),
                         detail: "B-frames are turned off for this stream because WebRTC (WHIP) can't carry them."
@@ -1839,7 +1821,7 @@ impl Engine {
                 limit.max_kbps, on_air_kbps
             ));
         }
-        if limit.h264_only && stats.video_codec.is_some_and(|c| c != VideoCodec::H264) {
+        if limit.is_h264_only() && stats.video_codec.is_some_and(|c| c != VideoCodec::H264) {
             return Some(format!(
                 "{name} takes H.264 only and this stream is not. Changing the live encode would change every other output."
             ));

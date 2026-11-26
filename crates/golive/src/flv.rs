@@ -4,10 +4,10 @@
 //! and starts at the next keyframe. Covers classic AVC and AAC, and Enhanced RTMP (HEVC, AV1,
 //! VP9 video and its audio, as OBS 30+ sends them).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The video codec, as its header names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
     H264,
