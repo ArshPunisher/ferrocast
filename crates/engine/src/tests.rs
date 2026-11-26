@@ -2322,3 +2322,306 @@ async fn account_urls_capture_youtube_custom_url_and_lazy_refresh_updates_overla
     assert_eq!(f2.pointer("/data/links/youtube"), Some(&Value::Null));
     drop(e);
 }
+
+#[tokio::test]
+async fn disconnect_removes_account_row_before_emitting_status_frame() {
+    #[derive(Debug)]
+    struct InspectOnDeleteSecrets {
+        inner: ferrocast_secrets::MemorySecrets,
+        live_rx: Mutex<Option<tokio::sync::broadcast::Receiver<LiveFrame>>>,
+        saw_status_before_delete: Mutex<bool>,
+    }
+    impl ferrocast_secrets::Secrets for InspectOnDeleteSecrets {
+        fn get(&self, key: &str) -> Result<Option<String>, ferrocast_secrets::SecretError> {
+            self.inner.get(key)
+        }
+        fn set(&self, key: &str, value: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            self.inner.set(key, value)
+        }
+        fn delete(&self, key: &str) -> Result<(), ferrocast_secrets::SecretError> {
+            if let Some(rx) = self.live_rx.lock().unwrap().as_mut() {
+                while let Ok(frame) = rx.try_recv() {
+                    let v: Value = serde_json::from_str(&frame.text).unwrap_or(Value::Null);
+                    if v["type"] == "status" {
+                        *self.saw_status_before_delete.lock().unwrap() = true;
+                    }
+                }
+            }
+            self.inner.delete(key)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(InspectOnDeleteSecrets {
+        inner: ferrocast_secrets::MemorySecrets::default(),
+        live_rx: Mutex::new(None),
+        saw_status_before_delete: Mutex::new(false),
+    });
+    let eng = Engine::start_with_secrets(dir.path(), secrets.clone()).await.unwrap();
+    eng.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "twitch".into(),
+                user_id: "tw1".into(),
+                login: "novaplays".into(),
+                display_name: "NovaPlays".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 1,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    let mut post_rx = eng.subscribe_live();
+    *secrets.live_rx.lock().unwrap() = Some(eng.subscribe_live());
+
+    eng.disconnect_account(Platform::Twitch).await.unwrap();
+
+    assert!(
+        !*secrets.saw_status_before_delete.lock().unwrap(),
+        "status live frame must not fire before secrets + DB account deletion"
+    );
+    let mut saw_status = false;
+    while let Ok(frame) = post_rx.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "status" {
+            assert!(v.pointer("/data/connectors/twitch/account").is_some_and(Value::is_null));
+            saw_status = true;
+        }
+    }
+    assert!(saw_status);
+}
+
+#[tokio::test]
+async fn youtube_handle_refresh_does_not_resurrect_disconnected_or_switched_account() {
+    use ferrocast_youtube::{Endpoints as YtEndpoints, Tokens as YtTokens};
+    let req_started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let req_started_srv = req_started.clone();
+    let release_srv = release.clone();
+
+    let app = axum::Router::new()
+        .route(
+            "/token",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "access_token": "yt-fresh",
+                    "refresh_token": "yt-r",
+                    "expires_in": 3600
+                }))
+            }),
+        )
+        .route(
+            "/api/channels",
+            axum::routing::get(move || {
+                let req_started = req_started_srv.clone();
+                let release = release_srv.clone();
+                async move {
+                    req_started.notify_one();
+                    release.notified().await;
+                    axum::Json(serde_json::json!({
+                        "items": [{
+                            "id": "UC_OLD_1",
+                            "snippet": {
+                                "title": "Old Channel",
+                                "customUrl": "@OldHandle"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let apps = PlatformApps {
+        youtube: Some(ferrocast_youtube::AppCredentials { client_id: "cid".into(), client_secret: "sec".into() }),
+        youtube_endpoints: YtEndpoints {
+            authorize: format!("{base}/auth"),
+            token: format!("{base}/token"),
+            api: format!("{base}/api"),
+            grpc: String::new(),
+        },
+        ..Default::default()
+    };
+
+    // Case A: disconnect happens while `api.me()` is in flight -> no zombie resurrection.
+    let dir = tempfile::tempdir().unwrap();
+    let eng = Engine::start_with(dir.path(), mem(), apps.clone()).await.unwrap();
+    eng.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "youtube".into(),
+                user_id: "UC_OLD_1".into(),
+                login: "Old Title".into(),
+                display_name: "Old Title".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 100,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    let api = eng
+        .youtube_api(YtTokens {
+            access_token: "yt-valid".into(),
+            refresh_token: "yt-r".into(),
+            expires_at: crate::now().0 + 3_600_000,
+        })
+        .unwrap();
+    let task = {
+        let eng = eng.clone();
+        let api = api.clone();
+        tokio::spawn(async move {
+            eng.refresh_youtube_handle_if_missing(&api).await;
+        })
+    };
+    req_started.notified().await;
+    eng.disconnect_account(Platform::Youtube).await.unwrap();
+    release.notify_one();
+    task.await.unwrap();
+    assert!(
+        !eng.db(ferrocast_store::repo::settings::accounts).await.unwrap().into_iter().any(|a| a.platform == "youtube")
+    );
+    assert!(eng.state().connectors.get("youtube").and_then(|c| c.account.as_ref()).is_none());
+    assert!(eng.resolved_links().await.unwrap().youtube.is_none());
+
+    // Case B: switching to UC_NEW_2 while `api.me()` for UC_OLD_1 is in flight -> new account wins.
+    let dir2 = tempfile::tempdir().unwrap();
+    let eng2 = Engine::start_with(dir2.path(), mem(), apps).await.unwrap();
+    eng2.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "youtube".into(),
+                user_id: "UC_OLD_1".into(),
+                login: "Old Title".into(),
+                display_name: "Old Title".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 100,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    let api2 = eng2
+        .youtube_api(YtTokens {
+            access_token: "yt-valid".into(),
+            refresh_token: "yt-r".into(),
+            expires_at: crate::now().0 + 3_600_000,
+        })
+        .unwrap();
+    let task2 = {
+        let eng2 = eng2.clone();
+        let api2 = api2.clone();
+        tokio::spawn(async move {
+            eng2.refresh_youtube_handle_if_missing(&api2).await;
+        })
+    };
+    req_started.notified().await;
+    eng2.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "youtube".into(),
+                user_id: "UC_NEW_2".into(),
+                login: "@NewChannel".into(),
+                display_name: "New Channel".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 200,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    release.notify_one();
+    task2.await.unwrap();
+    let yt_after = eng2
+        .db(ferrocast_store::repo::settings::accounts)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| a.platform == "youtube")
+        .unwrap();
+    assert_eq!(yt_after.user_id, "UC_NEW_2");
+    assert_eq!(yt_after.login, "@NewChannel");
+}
+
+#[tokio::test]
+async fn resume_account_backfills_youtube_handle_on_startup_without_waiting_for_token_expiry() {
+    use ferrocast_secrets::Secrets;
+    use ferrocast_youtube::{Endpoints as YtEndpoints, Tokens as YtTokens};
+    let app = axum::Router::new().route(
+        "/api/channels",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "items": [{
+                    "id": "UC_EXIST_1",
+                    "snippet": {
+                        "title": "Nova Legacy Title",
+                        "customUrl": "@NovaActualHandle"
+                    }
+                }]
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(ferrocast_secrets::MemorySecrets::default());
+    {
+        let seed = Engine::start_with_secrets(dir.path(), secrets.clone()).await.unwrap();
+        seed.db(|s| {
+            ferrocast_store::repo::settings::save_account(
+                s,
+                &ferrocast_store::repo::settings::Account {
+                    platform: "youtube".into(),
+                    user_id: "UC_EXIST_1".into(),
+                    login: "Nova Legacy Title".into(),
+                    display_name: "Nova Legacy Title".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 100,
+                },
+            )
+        })
+        .await
+        .unwrap();
+        let tok_json = serde_json::to_string(&YtTokens {
+            access_token: "yt-still-valid".into(),
+            refresh_token: "yt-r".into(),
+            expires_at: crate::now().0 + 3_600_000,
+        })
+        .unwrap();
+        secrets.set(crate::accounts::YOUTUBE_TOKENS, &tok_json).unwrap();
+    }
+
+    let apps = PlatformApps {
+        youtube: Some(ferrocast_youtube::AppCredentials { client_id: "cid".into(), client_secret: "sec".into() }),
+        youtube_endpoints: YtEndpoints {
+            authorize: format!("{base}/auth"),
+            token: format!("{base}/token"),
+            api: format!("{base}/api"),
+            grpc: String::new(),
+        },
+        ..Default::default()
+    };
+    let eng = Engine::start_with(dir.path(), secrets, apps).await.unwrap();
+    eventually(|| {
+        eng.state()
+            .connectors
+            .get("youtube")
+            .and_then(|c| c.account.as_ref())
+            .is_some_and(|a| a.url.as_deref() == Some("youtube.com/@NovaActualHandle"))
+    })
+    .await;
+}

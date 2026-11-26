@@ -328,7 +328,16 @@ impl Engine {
             match saved_tokens::<ferrocast_youtube::Tokens>(&*self.inner.secrets, YOUTUBE_TOKENS) {
                 Saved::Unreadable => return true,
                 Saved::Found(t) => match self.youtube_api(t) {
-                    Ok(api) => self.start_youtube(api, a.clone()),
+                    Ok(api) => {
+                        let needs_handle = !a.login.trim().starts_with('@');
+                        self.start_youtube(api.clone(), a.clone());
+                        if needs_handle && let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            let eng = self.clone();
+                            handle.spawn(async move {
+                                eng.refresh_youtube_handle_if_missing(&api).await;
+                            });
+                        }
+                    }
                     Err(e) => tracing::warn!(%e, "YouTube is saved but can't start"),
                 },
                 Saved::Missing => {
@@ -368,10 +377,10 @@ impl Engine {
 
     /// Signs a platform out: stops its adapter, forgets its tokens and account.
     pub async fn disconnect_account(&self, platform: Platform) -> Result<(), EngineError> {
+        let _w = self.config_lock().await;
         if let Some(h) = self.inner.adapters.lock().unwrap_or_else(|p| p.into_inner()).remove(&platform) {
             h.abort();
         }
-        self.unregister_connector(platform);
         let key = match platform {
             Platform::Twitch => {
                 self.cloud_bot_set_twitch(None);
@@ -397,7 +406,9 @@ impl Engine {
         }
         let key = crate::platform_key(platform).to_string();
         self.db(move |s| repo::settings::remove_account(s, &key)).await?;
-        self.push_overlay_links().await;
+        // Emit `status` only after DB + secrets removal so `GET /links` listeners never see a stale account.
+        self.unregister_connector(platform);
+        self.push_overlay_links_locked().await;
         Ok(())
     }
 
@@ -529,11 +540,12 @@ impl Engine {
             scopes: ferrocast_youtube::oauth::SCOPES.iter().map(|s| s.to_string()).collect(),
             connected_at: now().0,
         };
+        let _w = self.config_lock().await;
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
         self.inner.youtube_handle_checked.store(true, std::sync::atomic::Ordering::Release);
         self.start_youtube(api, account);
-        self.push_overlay_links().await;
+        self.push_overlay_links_locked().await;
         self.notice_detail(
             "account:youtube",
             NoticeLevel::Info,
@@ -598,7 +610,7 @@ impl Engine {
         Ok(api)
     }
 
-    /// Backfills `snippet.customUrl` (`@handle`) for pre-existing YouTube installs on token refresh.
+    /// Backfills `snippet.customUrl` (`@handle`) for pre-existing YouTube installs on startup or token refresh.
     pub(crate) async fn refresh_youtube_handle_if_missing(&self, api: &ferrocast_youtube::Api) {
         if self.inner.youtube_handle_checked.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return;
@@ -607,32 +619,59 @@ impl Engine {
             self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
             return;
         };
-        let Some(mut acct) = accounts.into_iter().find(|a| a.platform == "youtube") else {
+        let Some(acct) = accounts.into_iter().find(|a| a.platform == "youtube") else {
+            self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
             return;
         };
         if acct.login.trim().starts_with('@') {
             return;
         }
+        let expected_user_id = acct.user_id.clone();
+        let expected_connected_at = acct.connected_at;
         let Ok(me) = api.me().await else {
             self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
             return;
         };
-        acct.login = me.custom_url.unwrap_or_default();
-        acct.display_name = me.title;
-        acct.avatar_url = me.avatar_url;
-        let saved = acct.clone();
-        if self.db(move |s| repo::settings::save_account(s, &saved)).await.is_err() {
-            self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
+        if me.id != expected_user_id {
             return;
         }
+        let new_login = me.custom_url.unwrap_or_default();
+        let new_title = me.title;
+        let new_avatar = me.avatar_url;
+        let _w = self.config_lock().await;
+        // Re-verify under `config_lock` that YouTube wasn't disconnected or switched while `api.me()` ran.
+        let updated = match self
+            .db(move |s| {
+                let current = repo::settings::accounts(s)?.into_iter().find(|a| a.platform == "youtube");
+                let Some(mut cur) = current else {
+                    return Ok(None);
+                };
+                if cur.user_id != expected_user_id || cur.connected_at != expected_connected_at {
+                    return Ok(None);
+                }
+                cur.login = new_login;
+                cur.display_name = new_title;
+                cur.avatar_url = new_avatar;
+                repo::settings::save_account(s, &cur)?;
+                Ok(Some(cur))
+            })
+            .await
+        {
+            Ok(Some(cur)) => cur,
+            Ok(None) => return,
+            Err(_) => {
+                self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
+                return;
+            }
+        };
         let connectors = {
             let mut st = self.state_mut();
             let v = st.connectors.entry("youtube".into()).or_insert_with(crate::state::ConnectorView::off);
-            v.account = Some(account_view(&acct));
+            v.account = Some(account_view(&updated));
             st.connectors.clone()
         };
         self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": connectors })));
-        self.push_overlay_links().await;
+        self.push_overlay_links_locked().await;
     }
 
     fn start_youtube(&self, api: Arc<ferrocast_youtube::Api>, account: repo::settings::Account) {
