@@ -152,6 +152,7 @@ impl fmt::Debug for Api {
 pub struct Channel {
     pub id: String,
     pub title: String,
+    pub custom_url: Option<String>,
     pub avatar_url: Option<String>,
 }
 
@@ -279,6 +280,12 @@ impl Api {
         Ok(Channel {
             id: item["id"].as_str().unwrap_or("").to_string(),
             title: item.pointer("/snippet/title").and_then(Value::as_str).unwrap_or("YouTube").to_string(),
+            custom_url: item
+                .pointer("/snippet/customUrl")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
             avatar_url: item.pointer("/snippet/thumbnails/default/url").and_then(Value::as_str).map(String::from),
         })
     }

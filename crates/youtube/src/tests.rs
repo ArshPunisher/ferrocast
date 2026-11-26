@@ -2588,3 +2588,48 @@ async fn a_scheduled_broadcast_has_its_time_and_never_auto_starts() {
     assert_eq!(b["contentDetails"]["enableAutoStart"], false);
     assert_eq!(b["contentDetails"]["enableAutoStop"], false);
 }
+
+#[tokio::test]
+async fn me_captures_custom_url_handle_and_handles_missing() {
+    let app = axum::Router::new().route(
+        "/api/channels",
+        axum::routing::get(|axum::extract::Query(q): axum::extract::Query<Vec<(String, String)>>| async move {
+            assert!(q.iter().any(|(k, v)| k == "part" && v == "snippet"));
+            axum::Json(serde_json::json!({
+                "items": [{
+                    "id": "UC_NOVA_123",
+                    "snippet": {
+                        "title": "Nova Plays",
+                        "customUrl": " @NovaPlays ",
+                        "thumbnails": { "default": { "url": "https://img.example/a.png" } }
+                    }
+                }]
+            }))
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let ep =
+        Endpoints { authorize: String::new(), token: String::new(), api: format!("{base}/api"), grpc: String::new() };
+    let ch = video_api(ep).me().await.unwrap();
+    assert_eq!(ch.id, "UC_NOVA_123");
+    assert_eq!(ch.title, "Nova Plays");
+    assert_eq!(ch.custom_url.as_deref(), Some("@NovaPlays"));
+
+    let app2 = axum::Router::new().route(
+        "/api/channels",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!({
+                "items": [{ "id": "UC_NOHANDLE", "snippet": { "title": "Legacy Channel" } }]
+            }))
+        }),
+    );
+    let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base2 = format!("http://{}", l2.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l2, app2).await });
+    let ep2 =
+        Endpoints { authorize: String::new(), token: String::new(), api: format!("{base2}/api"), grpc: String::new() };
+    let ch2 = video_api(ep2).me().await.unwrap();
+    assert_eq!(ch2.custom_url, None);
+}
