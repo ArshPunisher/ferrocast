@@ -84,6 +84,12 @@ pub trait SoundPlugin: Send + std::fmt::Debug {
     fn hand_over(&mut self) -> Option<[Vec<f32>; 2]> {
         None
     }
+
+    /// Voice-activity probability (`0.0..=1.0`) from the plugin's latest processed audio frame,
+    /// when the plugin computes one (e.g. RNNoise).
+    fn vad_prob(&self) -> Option<f32> {
+        None
+    }
 }
 
 /// Makes the strong noise removal at a strength (1 to 100), when the app has one.
@@ -522,6 +528,39 @@ impl AudioFilter {
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether this filter is an active noise gate or downward expander currently attenuating
+    /// audio (at least 6 dB reduction for an expander, or attenuation below 0.5 for a gate).
+    #[must_use]
+    pub fn gate_closed(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match self.effect {
+            AudioEffect::NoiseGate { .. } => self.attenuation < 0.5,
+            AudioEffect::Expander { .. } => self.gain_db[0] < -6.0,
+            _ => false,
+        }
+    }
+
+    /// Voice-activity probability (`0.0..=1.0`) when this filter is an enabled speech-aware
+    /// noise suppressor (`Rnnoise` VAD or fallback `light_denoise` voice detector).
+    #[must_use]
+    pub fn voice_prob(&self) -> Option<f32> {
+        if !self.enabled {
+            return None;
+        }
+        if let Some(p) = &self.plugin {
+            return p.vad_prob();
+        }
+        match self.effect {
+            AudioEffect::Rnnoise { .. } if self.pending_build.is_some() => None,
+            AudioEffect::Rnnoise { .. } | AudioEffect::Denoise { .. } => {
+                Some(if self.nr_voice_s > 0.0 { 1.0 } else { 0.0 })
+            }
+            _ => None,
+        }
     }
 
     /// Whether `effect` at `rate` expects an external [`SoundPlugin`] to be built.
@@ -2941,5 +2980,48 @@ mod tests {
         // Dry and wet are 480 frames apart, so the crossfade moves between two points of the
         // same tone: the step per sample stays near the tone's own slope, never a click.
         assert!(worst < 0.1, "worst step {worst}");
+    }
+
+    #[test]
+    fn gate_closed_and_voice_prob_reflect_filter_state() {
+        let mut gate = AudioFilter::new(
+            AudioEffect::NoiseGate { open_db: -26.0, close_db: -32.0, attack_ms: 5.0, hold_ms: 50.0, release_ms: 50.0 },
+            RATE,
+        );
+        assert!(gate.gate_closed(), "new closed gate starts closed");
+        let mut l = vec![0.4f32; 1024];
+        let mut r = vec![0.4f32; 1024];
+        for _ in 0..4 {
+            l.fill(0.4);
+            r.fill(0.4);
+            gate.process([&mut l, &mut r]);
+        }
+        assert!(!gate.gate_closed(), "loud audio opens NoiseGate");
+        gate.set_enabled(false);
+        assert!(!gate.gate_closed(), "bypassed NoiseGate never reports closed");
+
+        let mut exp = AudioFilter::new(
+            AudioEffect::Expander {
+                ratio: 3.5,
+                threshold_db: -40.0,
+                attack_ms: 6.0,
+                release_ms: 180.0,
+                output_db: 0.0,
+                rms: true,
+            },
+            RATE,
+        );
+        let amp = db_to_mul(-50.0);
+        for _ in 0..25 {
+            l.fill(amp);
+            r.fill(amp);
+            exp.process([&mut l, &mut r]);
+        }
+        assert!(exp.gate_closed(), "attenuating Expander (-50 dB < -40 dB) reports closed");
+
+        let mut denoise = AudioFilter::new_without_plugin(AudioEffect::Denoise { strength: 50 }, RATE);
+        assert_eq!(denoise.voice_prob(), Some(0.0));
+        denoise.set_enabled(false);
+        assert_eq!(denoise.voice_prob(), None);
     }
 }

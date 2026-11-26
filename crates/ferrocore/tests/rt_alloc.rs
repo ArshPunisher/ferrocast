@@ -48,7 +48,7 @@ fn pushing_popping_and_metering_allocate_nothing() {
     let levels = AtomicLevels::shared();
     let pcm = vec![0.5f32; 2048];
     let mut out = vec![0.0f32; 2048];
-    let l = Levels { peak: [-3.0, -4.0], rms: [-20.0, -21.0], input_peak: [-1.0, -2.0], gated: false };
+    let l = Levels { peak: [-3.0, -4.0], rms: [-20.0, -21.0], input_peak: [-1.0, -2.0], gated: false, speech: true };
 
     let before = ALLOCATIONS.load(Ordering::SeqCst);
     for n in 0..20_000u64 {
