@@ -1,9 +1,9 @@
 //! Creator profile links ("My links") and resolved overlay state.
 
-use ferrocast_core::links::{ConnectedAccountInfo, CreatorLinks, ResolvedLinks, resolve_links};
+use ferrocast_core::links::{ConnectedAccountInfo, CreatorLinks, ResolvedLinks, patch_creator_links, resolve_links};
 use ferrocast_store::repo;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use crate::error::EngineError;
 use crate::frames::{Audience, LiveFrame, OverlayFrame};
@@ -11,7 +11,7 @@ use crate::{Engine, now};
 
 const KEY: &str = "creator_links";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LinksView {
     #[serde(flatten)]
     pub links: CreatorLinks,
@@ -19,16 +19,26 @@ pub struct LinksView {
 }
 
 impl Engine {
+    async fn load_creator_links_or_empty(&self) -> Result<CreatorLinks, EngineError> {
+        match self.db(|s| repo::settings::get_or_default::<CreatorLinks>(s, KEY)).await {
+            Ok(links) => Ok(links),
+            Err(e) => {
+                tracing::warn!(error = %e, key = KEY, "corrupt or unreadable creator_links setting; falling back to empty links");
+                Ok(CreatorLinks::default())
+            }
+        }
+    }
+
     /// Returns saved "My links" overrides along with the currently resolved overlay values.
     pub async fn links(&self) -> Result<LinksView, EngineError> {
-        let links = self.db(|s| repo::settings::get_or_default::<CreatorLinks>(s, KEY)).await?;
+        let links = self.load_creator_links_or_empty().await?;
         let resolved = self.resolve_creator_links(&links).await?;
         Ok(LinksView { links, resolved })
     }
 
     /// Resolves effective overlay links from saved overrides, connected accounts, and schedule.
     pub async fn resolved_links(&self) -> Result<ResolvedLinks, EngineError> {
-        let links = self.db(|s| repo::settings::get_or_default::<CreatorLinks>(s, KEY)).await?;
+        let links = self.load_creator_links_or_empty().await?;
         self.resolve_creator_links(&links).await
     }
 
@@ -53,6 +63,21 @@ impl Engine {
     pub async fn save_links(&self, incoming: CreatorLinks) -> Result<LinksView, EngineError> {
         let links = incoming.validated().map_err(EngineError::Invalid)?;
         let _w = self.config_lock().await;
+        let to_save = links.clone();
+        self.db(move |s| repo::settings::set(s, KEY, &to_save)).await?;
+        let resolved = self.resolve_creator_links(&links).await?;
+        let view = LinksView { links, resolved };
+        let seq = self.next_seq();
+        self.send_overlay(OverlayFrame::new(Audience::All, seq, "state", &json!({ "links": view.resolved })));
+        self.send_live(LiveFrame::new("links", &view));
+        Ok(view)
+    }
+
+    /// Applies a partial JSON update to saved "My links", preserving omitted and unknown future keys.
+    pub async fn patch_links(&self, patch: &Map<String, Value>) -> Result<LinksView, EngineError> {
+        let _w = self.config_lock().await;
+        let existing = self.load_creator_links_or_empty().await?;
+        let links = patch_creator_links(&existing, patch).map_err(EngineError::Invalid)?;
         let to_save = links.clone();
         self.db(move |s| repo::settings::set(s, KEY, &to_save)).await?;
         let resolved = self.resolve_creator_links(&links).await?;

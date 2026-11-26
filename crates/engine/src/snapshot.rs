@@ -195,7 +195,10 @@ impl Engine {
         let credits = if has(WidgetKind::EndCredits) { Some(self.credits().await?) } else { None };
         let chat_highlight = if has(WidgetKind::ChatHighlight) { self.chat_highlight() } else { None };
         let view = self.overlay_view(o);
-        let links = self.resolved_links().await?;
+        let links = self.resolved_links().await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, overlay_id = %o.id, "failed to load resolved links for snapshot; falling back to empty links");
+            ferrocast_core::links::ResolvedLinks::default()
+        });
         Ok(json!({
             "overlay": view_public(&view),
             "state": { "goals": goals, "labels": labels, "label_trains": label_trains, "viewers": viewers, "events": events, "chat": chat,

@@ -2,7 +2,10 @@
 //!
 //! Keep pure logic here so the engine, server validation, and tests share identical rules.
 
+use std::collections::{BTreeMap, HashSet};
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const MAX_LINK_CHARS: usize = 120;
 pub const MAX_LABEL_CHARS: usize = 40;
@@ -17,7 +20,7 @@ pub struct CustomLink {
 }
 
 /// Editable "My links" configuration persisted under `settings["creator_links"]`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CreatorLinks {
     pub twitch: Option<String>,
@@ -31,6 +34,9 @@ pub struct CreatorLinks {
     pub website: Option<String>,
     pub schedule_text: Option<String>,
     pub custom: Vec<CustomLink>,
+    /// Forward-compatible store for unknown link fields added by newer versions.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 /// Effective links pushed into overlay `snapshot.state.links` and live `state` frames.
@@ -63,26 +69,44 @@ pub struct ConnectedAccountInfo<'a> {
     pub user_id: &'a str,
 }
 
+fn is_zero_width(c: char) -> bool {
+    matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}')
+}
+
+fn starts_with_scheme(s: &str) -> Option<&str> {
+    let (scheme, _) = s.split_once("://")?;
+    let mut chars = scheme.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    if chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) { Some(scheme) } else { None }
+}
+
 fn has_unsafe_scheme(raw: &str) -> bool {
-    let compact: String = raw.chars().filter(|c| !c.is_ascii_whitespace()).collect::<String>().to_ascii_lowercase();
-    let stripped =
-        compact.strip_prefix("https://").or_else(|| compact.strip_prefix("http://")).unwrap_or(compact.as_str());
+    let compact: String =
+        raw.chars().filter(|c| !c.is_whitespace() && !is_zero_width(*c)).collect::<String>().to_lowercase();
+    let mut stripped = compact.as_str();
+    while let Some(rest) = stripped.strip_prefix("https://").or_else(|| stripped.strip_prefix("http://")) {
+        stripped = rest;
+    }
     for candidate in [compact.as_str(), stripped] {
-        if candidate.starts_with("javascript:") || candidate.starts_with("vbscript:") || candidate.starts_with("data:")
-        {
+        if ["javascript:", "vbscript:", "data:", "file:", "blob:", "about:"].iter().any(|p| candidate.starts_with(p)) {
             return true;
         }
     }
-    if let Some((scheme, _)) = compact.split_once("://") {
-        let ok = matches!(scheme, "http" | "https");
-        if !ok {
-            return true;
-        }
+    if let Some(scheme) = starts_with_scheme(&compact)
+        && !matches!(scheme, "http" | "https")
+    {
+        return true;
+    }
+    if starts_with_scheme(stripped).is_some() {
+        return true;
     }
     false
 }
 
-fn check_field(field: &str, raw: &str, max_chars: usize) -> Result<Option<String>, String> {
+fn check_field(field: &str, raw: &str, max_chars: usize, link_kind: Option<&str>) -> Result<Option<String>, String> {
     if raw.chars().any(char::is_control) {
         return Err(format!("{field}: control characters are not allowed."));
     }
@@ -93,17 +117,121 @@ fn check_field(field: &str, raw: &str, max_chars: usize) -> Result<Option<String
     if trimmed.chars().count() > max_chars {
         return Err(format!("{field}: must be at most {max_chars} characters."));
     }
-    if has_unsafe_scheme(trimmed) {
-        return Err(format!("{field}: javascript: and unsafe link schemes are not allowed."));
+    if let Some(kind) = link_kind {
+        if has_unsafe_scheme(trimmed) {
+            return Err(format!("{field}: javascript: and unsafe link schemes are not allowed."));
+        }
+        if normalize_display_link(kind, trimmed).is_none() {
+            return Err(format!("{field}: enter a valid handle or link."));
+        }
     }
     Ok(Some(trimmed.to_string()))
 }
 
-fn check_opt(field: &str, raw: Option<String>, max_chars: usize) -> Result<Option<String>, String> {
+fn check_opt(
+    field: &str,
+    raw: Option<String>,
+    max_chars: usize,
+    link_kind: Option<&str>,
+) -> Result<Option<String>, String> {
     match raw {
-        Some(s) => check_field(field, &s, max_chars),
+        Some(s) => check_field(field, &s, max_chars, link_kind),
         None => Ok(None),
     }
+}
+
+const KNOWN_LINK_KEYS: [&str; 11] = [
+    "twitch",
+    "youtube",
+    "kick",
+    "facebook",
+    "discord",
+    "instagram",
+    "x",
+    "tiktok",
+    "website",
+    "schedule_text",
+    "custom",
+];
+
+fn patch_opt_string(
+    slot: &mut Option<String>,
+    field: &str,
+    patch: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let Some(val) = patch.get(field) else {
+        return Ok(());
+    };
+    match val {
+        Value::Null => {
+            *slot = None;
+            Ok(())
+        }
+        Value::String(s) => {
+            *slot = Some(s.clone());
+            Ok(())
+        }
+        _ => Err(format!("{field}: must be a string.")),
+    }
+}
+
+/// Applies a partial JSON patch to existing `CreatorLinks`: omitted known and unknown keys are kept,
+/// explicit `""` or `null` clears a field, and updated fields are validated.
+pub fn patch_creator_links(
+    existing: &CreatorLinks,
+    patch: &serde_json::Map<String, Value>,
+) -> Result<CreatorLinks, String> {
+    let mut next = existing.clone();
+    patch_opt_string(&mut next.twitch, "twitch", patch)?;
+    patch_opt_string(&mut next.youtube, "youtube", patch)?;
+    patch_opt_string(&mut next.kick, "kick", patch)?;
+    patch_opt_string(&mut next.facebook, "facebook", patch)?;
+    patch_opt_string(&mut next.discord, "discord", patch)?;
+    patch_opt_string(&mut next.instagram, "instagram", patch)?;
+    patch_opt_string(&mut next.x, "x", patch)?;
+    patch_opt_string(&mut next.tiktok, "tiktok", patch)?;
+    patch_opt_string(&mut next.website, "website", patch)?;
+    patch_opt_string(&mut next.schedule_text, "schedule_text", patch)?;
+
+    if let Some(custom_val) = patch.get("custom") {
+        match custom_val {
+            Value::Null => next.custom.clear(),
+            Value::Array(items) => {
+                let mut rows = Vec::with_capacity(items.len());
+                for (idx, item) in items.iter().enumerate() {
+                    let Some(obj) = item.as_object() else {
+                        return Err(format!("custom.{idx}: must be an object."));
+                    };
+                    let label = match obj.get("label") {
+                        None | Some(Value::Null) => String::new(),
+                        Some(Value::String(s)) => s.clone(),
+                        Some(_) => return Err(format!("custom.{idx}.label: must be a string.")),
+                    };
+                    let value = match obj.get("value") {
+                        None | Some(Value::Null) => String::new(),
+                        Some(Value::String(s)) => s.clone(),
+                        Some(_) => return Err(format!("custom.{idx}.value: must be a string.")),
+                    };
+                    rows.push(CustomLink { label, value });
+                }
+                next.custom = rows;
+            }
+            _ => return Err("custom: must be a list of custom links.".into()),
+        }
+    }
+
+    for (k, v) in patch {
+        if KNOWN_LINK_KEYS.contains(&k.as_str()) || k == "resolved" {
+            continue;
+        }
+        if v.is_null() {
+            next.extra.remove(k);
+        } else {
+            next.extra.insert(k.clone(), v.clone());
+        }
+    }
+
+    next.validated()
 }
 
 impl CreatorLinks {
@@ -114,8 +242,8 @@ impl CreatorLinks {
         }
         let mut custom = Vec::with_capacity(self.custom.len());
         for (idx, row) in self.custom.into_iter().enumerate() {
-            let label = check_field(&format!("custom.{idx}.label"), &row.label, MAX_LABEL_CHARS)?;
-            let value = check_field(&format!("custom.{idx}.value"), &row.value, MAX_LINK_CHARS)?;
+            let label = check_field(&format!("custom.{idx}.label"), &row.label, MAX_LABEL_CHARS, None)?;
+            let value = check_field(&format!("custom.{idx}.value"), &row.value, MAX_LINK_CHARS, Some("custom"))?;
             match (label, value) {
                 (None, None) => continue,
                 (None, Some(_)) => return Err(format!("custom.{idx}.label: enter a label.")),
@@ -124,17 +252,18 @@ impl CreatorLinks {
             }
         }
         Ok(CreatorLinks {
-            twitch: check_opt("twitch", self.twitch, MAX_LINK_CHARS)?,
-            youtube: check_opt("youtube", self.youtube, MAX_LINK_CHARS)?,
-            kick: check_opt("kick", self.kick, MAX_LINK_CHARS)?,
-            facebook: check_opt("facebook", self.facebook, MAX_LINK_CHARS)?,
-            discord: check_opt("discord", self.discord, MAX_LINK_CHARS)?,
-            instagram: check_opt("instagram", self.instagram, MAX_LINK_CHARS)?,
-            x: check_opt("x", self.x, MAX_LINK_CHARS)?,
-            tiktok: check_opt("tiktok", self.tiktok, MAX_LINK_CHARS)?,
-            website: check_opt("website", self.website, MAX_LINK_CHARS)?,
-            schedule_text: check_opt("schedule_text", self.schedule_text, MAX_LINK_CHARS)?,
+            twitch: check_opt("twitch", self.twitch, MAX_LINK_CHARS, Some("twitch"))?,
+            youtube: check_opt("youtube", self.youtube, MAX_LINK_CHARS, Some("youtube"))?,
+            kick: check_opt("kick", self.kick, MAX_LINK_CHARS, Some("kick"))?,
+            facebook: check_opt("facebook", self.facebook, MAX_LINK_CHARS, Some("facebook"))?,
+            discord: check_opt("discord", self.discord, MAX_LINK_CHARS, Some("discord"))?,
+            instagram: check_opt("instagram", self.instagram, MAX_LINK_CHARS, Some("instagram"))?,
+            x: check_opt("x", self.x, MAX_LINK_CHARS, Some("x"))?,
+            tiktok: check_opt("tiktok", self.tiktok, MAX_LINK_CHARS, Some("tiktok"))?,
+            website: check_opt("website", self.website, MAX_LINK_CHARS, Some("website"))?,
+            schedule_text: check_opt("schedule_text", self.schedule_text, MAX_LINK_CHARS, None)?,
             custom,
+            extra: self.extra,
         })
     }
 }
@@ -179,11 +308,14 @@ pub fn account_url(platform: &str, login: &str, user_id: &str) -> Option<String>
 
 fn strip_url_noise(raw: &str) -> &str {
     let mut s = raw.trim();
-    let lower = s.to_ascii_lowercase();
-    if lower.starts_with("https://") {
-        s = &s["https://".len()..];
-    } else if lower.starts_with("http://") {
-        s = &s["http://".len()..];
+    loop {
+        if s.as_bytes().get(..8).is_some_and(|b| b.eq_ignore_ascii_case(b"https://")) {
+            s = &s["https://".len()..];
+        } else if s.as_bytes().get(..7).is_some_and(|b| b.eq_ignore_ascii_case(b"http://")) {
+            s = &s["http://".len()..];
+        } else {
+            break;
+        }
     }
     if s.as_bytes().get(..4).is_some_and(|b| b.eq_ignore_ascii_case(b"www.")) {
         s = &s[4..];
@@ -203,24 +335,19 @@ pub fn normalize_display_link(kind: &str, raw: &str) -> Option<String> {
     if clean.contains('/') {
         return Some(clean.to_string());
     }
+    let bare = clean.trim_start_matches('@');
+    if !matches!(kind, "website" | "custom") && bare.is_empty() {
+        return None;
+    }
     let formatted = match kind {
-        "twitch" => format!("twitch.tv/{}", clean.trim_start_matches('@').to_ascii_lowercase()),
-        "youtube" => {
-            if clean.starts_with('@') {
-                format!("youtube.com/{clean}")
-            } else {
-                format!("youtube.com/@{clean}")
-            }
-        }
-        "kick" => format!("kick.com/{}", clean.trim_start_matches('@')),
-        "facebook" => format!("facebook.com/{}", clean.trim_start_matches('@')),
-        "discord" => format!("discord.gg/{}", clean.trim_start_matches('@')),
-        "instagram" => format!("instagram.com/{}", clean.trim_start_matches('@')),
-        "x" => format!("x.com/{}", clean.trim_start_matches('@')),
-        "tiktok" => {
-            let handle = clean.trim_start_matches('@');
-            format!("tiktok.com/@{handle}")
-        }
+        "twitch" => format!("twitch.tv/{}", bare.to_ascii_lowercase()),
+        "youtube" => format!("youtube.com/@{bare}"),
+        "kick" => format!("kick.com/{bare}"),
+        "facebook" => format!("facebook.com/{bare}"),
+        "discord" => format!("discord.gg/{bare}"),
+        "instagram" => format!("instagram.com/{bare}"),
+        "x" => format!("x.com/{bare}"),
+        "tiktok" => format!("tiktok.com/@{bare}"),
         _ => clean.to_string(),
     };
     Some(formatted)
@@ -283,12 +410,18 @@ pub fn resolve_links(
         }
     }
 
+    let mut seen_socials = HashSet::new();
     let mut socials = Vec::new();
     for v in [&twitch, &youtube, &kick, &facebook, &discord, &instagram, &x, &tiktok, &website].into_iter().flatten() {
-        socials.push(v.clone());
+        if seen_socials.insert(v.to_lowercase()) {
+            socials.push(v.clone());
+        }
     }
     for c in &custom {
-        socials.push(format!("{}: {}", c.label, c.value));
+        let entry = format!("{}: {}", c.label, c.value);
+        if seen_socials.insert(entry.to_lowercase()) {
+            socials.push(entry);
+        }
     }
 
     let channel_name = ["twitch", "youtube", "kick", "facebook"].into_iter().find_map(|p| {
@@ -368,6 +501,28 @@ mod tests {
             .is_err()
         );
 
+        for bad in [
+            "https://https://javascript:alert(1)",
+            "blob:https://evil.example/1",
+            "file:/etc/passwd",
+            "about:blank",
+            "javascript\u{00A0}:alert(1)",
+            "@",
+            "https://",
+        ] {
+            assert!(CreatorLinks { discord: Some(bad.into()), ..Default::default() }.validated().is_err(), "{bad}");
+        }
+        assert_eq!(normalize_display_link("youtube", "@"), None);
+
+        let free_text = CreatorLinks {
+            schedule_text: Some("Data: Friday 8 PM — https://twitch.tv/arsh".into()),
+            custom: vec![CustomLink { label: "Data: Schedule".into(), value: "arsh.gg".into() }],
+            ..Default::default()
+        }
+        .validated()
+        .unwrap();
+        assert_eq!(free_text.schedule_text.as_deref(), Some("Data: Friday 8 PM — https://twitch.tv/arsh"));
+
         let clean = CreatorLinks {
             discord: Some("  ".into()),
             schedule_text: Some(" Fridays, 8 PM ".into()),
@@ -428,6 +583,12 @@ mod tests {
         let scheduled = resolve_links(&links, &accounts, Some(1_800_043_200_000));
         assert_eq!(scheduled.next_stream.as_deref(), Some("Friday, 8 PM UTC"));
         assert_eq!(scheduled.next_stream_at, Some(1_800_043_200_000));
+
+        // Duplicate normalized URLs across fields (e.g. website duplicating twitch) deduplicate cleanly.
+        let mut with_dup = links.clone();
+        with_dup.website = Some("https://twitch.tv/nova_alt/".into());
+        let deduped = resolve_links(&with_dup, &accounts, None);
+        assert_eq!(deduped.socials.iter().filter(|s| s.as_str() == "twitch.tv/nova_alt").count(), 1);
 
         // Multi-byte UTF-8 characters within the first 4 bytes must never panic during normalization.
         assert_eq!(normalize_display_link("website", "https://café.example/").as_deref(), Some("café.example"));

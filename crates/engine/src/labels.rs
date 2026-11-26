@@ -383,9 +383,16 @@ impl Engine {
         ));
     }
 
-    /// Evaluates every stream label source for dashboard previews (`GET /api/v1/labels`).
+    /// Evaluates every stream label source for dashboard previews (`GET /api/v1/labels`) in UTC.
     /// Returns an empty map when no activity has been recorded yet so previews can show samples.
     pub async fn all_labels(&self) -> std::collections::BTreeMap<String, String> {
+        self.all_labels_for_offset(0).await
+    }
+
+    /// Evaluates every stream label source for dashboard previews using `tz_offset_min` (`-720..=840`)
+    /// for calendar-month rollovers.
+    pub async fn all_labels_for_offset(&self, tz_offset_min: i32) -> std::collections::BTreeMap<String, String> {
+        let tz_offset_min = tz_offset_min.clamp(-720, 840);
         let now_ms = crate::now();
         let hydrated = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner()).hydrated;
         if !hydrated {
@@ -396,7 +403,7 @@ impl Engine {
             template: "{value}".into(),
             theme: "molten".into(),
             timezone: None,
-            timezone_offset_min: 0,
+            timezone_offset_min: tz_offset_min,
             train_window_s: 120,
             train_step_s: 15,
             train_max_s: 300,

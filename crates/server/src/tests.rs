@@ -2729,9 +2729,97 @@ async fn links_endpoints_validate_persist_and_push_overlay_state() {
     assert!(pushed_back["next_stream_at"].is_null());
     assert_eq!(pushed_back["next_stream"], "Fridays, 8 PM");
 
-    // Verify persistence in a fresh Engine on the same store dir.
-    let reread: Value = r.get("/api/v1/links").await.json().await.unwrap();
-    assert_eq!(reread["discord"], "https://discord.gg/nova/");
+    // Partial PUT preserves omitted known fields AND unknown future keys, while "" clears and non-strings 400.
+    let with_future = r.put("/api/v1/links", json!({ "bluesky": "bsky.app/profile/nova" })).await;
+    assert_eq!(with_future.status(), StatusCode::OK);
+    let old_client_patch = r.put("/api/v1/links", json!({ "x": "novaplays" })).await;
+    assert_eq!(old_client_patch.status(), StatusCode::OK);
+    let patch_v: Value = old_client_patch.json().await.unwrap();
+    assert_eq!(patch_v["x"], "novaplays");
+    assert_eq!(patch_v["discord"], "https://discord.gg/nova/");
+    assert_eq!(patch_v["schedule_text"], "Fridays, 8 PM");
+    assert_eq!(patch_v["custom"], json!([{ "label": "Merch", "value": "https://shop.nova.gg/" }]));
+    assert_eq!(patch_v["bluesky"], "bsky.app/profile/nova");
+
+    let cleared_x = r.put("/api/v1/links", json!({ "x": "" })).await;
+    assert_eq!(cleared_x.status(), StatusCode::OK);
+    let cleared_v: Value = cleared_x.json().await.unwrap();
+    assert!(cleared_v["x"].is_null());
+    assert_eq!(cleared_v["discord"], "https://discord.gg/nova/");
+    assert_eq!(r.put("/api/v1/links", json!({ "discord": 123 })).await.status(), StatusCode::BAD_REQUEST);
+
+    // Verify persistence in a fresh Engine started on the same store dir.
+    drop(ws);
+    let dir = r._dir;
+    drop(r.engine);
+    let fresh =
+        Engine::start_with_secrets(dir.path(), std::sync::Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+    let from_disk = fresh.links().await.unwrap();
+    assert_eq!(from_disk.links.discord.as_deref(), Some("https://discord.gg/nova/"));
+    assert_eq!(json!(from_disk)["bluesky"], "bsky.app/profile/nova");
+}
+
+#[tokio::test]
+async fn links_and_labels_enforce_auth_and_scopes() {
+    let r = start().await;
+    assert_eq!(r.anonymous(reqwest::Method::GET, "/api/v1/links").await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(r.anonymous(reqwest::Method::PUT, "/api/v1/links").await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(r.anonymous(reqwest::Method::GET, "/api/v1/labels").await.status(), StatusCode::UNAUTHORIZED);
+
+    let key_v: Value = r
+        .post("/api/v1/api-keys", json!({ "name": "Chat", "scopes": ["chat"], "expires_at": null }))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let tok = key_v["token"].as_str().unwrap();
+    assert_eq!(
+        r.client
+            .put(format!("{}/api/v1/links", r.base))
+            .bearer_auth(tok)
+            .json(&json!({ "discord": "x" }))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        r.client.get(format!("{}/api/v1/links", r.base)).bearer_auth(tok).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        r.client.get(format!("{}/api/v1/labels", r.base)).bearer_auth(tok).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn corrupt_creator_links_row_does_not_black_out_overlay_snapshots() {
+    let r = start().await;
+    r.engine
+        .db(|s| {
+            s.write(|tx| {
+                tx.execute(
+                    "INSERT INTO settings(key, value, updated_at) VALUES ('creator_links', '{corrupt-json', 1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [],
+                )?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let ov: Value = r.post("/api/v1/overlays", json!({ "name": "Main" })).await.json().await.unwrap();
+    let ws_url = ov["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let snap: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(snap["type"], "snapshot");
+    assert!(snap["data"]["overlay"].is_object(), "overlay must not null out: {snap}");
+    assert!(snap["data"]["state"]["links"]["socials"].is_array());
 }
 
 #[tokio::test]
@@ -2772,4 +2860,22 @@ async fn labels_endpoint_returns_real_labels_and_empty_when_unseen() {
     assert_eq!(labels["latest_tip"], "Asha $10");
     assert_eq!(labels["session_follows"], "1");
     assert_eq!(labels["alltime_follows"], "1");
+
+    // Monthly totals respect ?tz_offset_min=... across UTC month boundary.
+    let now_utc =
+        Millis(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64);
+    let (s_0, _) = ferrocast_core::labels::month_bounds(now_utc, 0);
+    let (s_840, _) = ferrocast_core::labels::month_bounds(now_utc, 840);
+    let edge_ts = if s_840 < s_0 { s_0.0 - 60_000 } else { s_0.0 + 60_000 };
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("f-boundary".into()),
+            Millis(edge_ts),
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "BoundaryFan") },
+        ))
+        .await;
+    let utc_labels: Value = r.get("/api/v1/labels?tz_offset_min=0").await.json().await.unwrap();
+    let shifted_labels: Value = r.get("/api/v1/labels?tz_offset_min=840").await.json().await.unwrap();
+    assert_ne!(utc_labels["monthly_follows"], shifted_labels["monthly_follows"]);
 }

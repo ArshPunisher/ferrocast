@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use ferrocast_core::alert::AlertRule;
 use ferrocast_core::goal::{Goal, GoalView};
-use ferrocast_core::links::{CreatorLinks, account_url};
+use ferrocast_core::links::account_url;
 use ferrocast_core::overlay::{Overlay, Preset, Widget};
 use ferrocast_store::{backup, repo};
 use serde::Deserialize;
@@ -93,12 +93,21 @@ pub async fn links(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.links().await?)))
 }
 
-pub async fn save_links(State(app): State<AppState>, Body(b): Body<CreatorLinks>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(app.engine.save_links(b).await?)))
+pub async fn save_links(State(app): State<AppState>, Body(b): Body<Value>) -> ApiResult<Json<Value>> {
+    let Some(patch) = b.as_object() else {
+        return Err(ApiError::invalid("Links must be a JSON object."));
+    };
+    Ok(Json(json!(app.engine.patch_links(patch).await?)))
 }
 
-pub async fn labels(State(app): State<AppState>) -> Json<Value> {
-    Json(json!(app.engine.all_labels().await))
+#[derive(Deserialize, Default)]
+pub struct LabelsQuery {
+    #[serde(default)]
+    pub tz_offset_min: Option<i32>,
+}
+
+pub async fn labels(State(app): State<AppState>, Query(q): Query<LabelsQuery>) -> Json<Value> {
+    Json(json!(app.engine.all_labels_for_offset(q.tz_offset_min.unwrap_or(0)).await))
 }
 
 pub async fn connect(State(app): State<AppState>, Path(p): Path<String>) -> ApiResult<Json<Value>> {
