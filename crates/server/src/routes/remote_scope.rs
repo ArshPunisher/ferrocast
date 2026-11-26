@@ -390,6 +390,8 @@ pub const READ_ONLY_ALLOWED: &[Rule] = &[
     ("GET", "/moments/markers"),
     ("GET", "/moments/markers/export"),
     ("GET", "/automations"),
+    ("GET", "/links"),
+    ("GET", "/labels"),
 ];
 
 /// Chat and moderation: posting, the viewers' lists and the rules that answer them. Never the
@@ -508,6 +510,8 @@ pub const ALERTS_ALLOWED: &[Rule] = &[
     ("POST", "/goals/*/adjust"),
     ("GET", "/media"),
     ("GET", "/media/*"),
+    ("GET", "/links"),
+    ("GET", "/labels"),
 ];
 
 /// Running the show: scenes, the mixer, recording, replay, markers. Not the stream (that is
@@ -617,6 +621,8 @@ pub const GO_LIVE_ALLOWED: &[Rule] = &[
 pub const SETTINGS_ALLOWED: &[Rule] = &[
     ("GET", "/settings"),
     ("PUT", "/settings"),
+    ("GET", "/links"),
+    ("PUT", "/links"),
     ("GET", "/themes"),
     ("GET", "/updates"),
     ("POST", "/setup/complete"),
@@ -682,7 +688,7 @@ pub fn api_key_live_frame_allowed(scopes: &[ferrocast_core::api_keys::ApiKeyScop
             has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Chat)
         }
         "tts_pending" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Chat) || has(ApiKeyScope::Alerts),
-        "queue" | "goals" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Alerts),
+        "queue" | "goals" | "links" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Alerts),
         "golive" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::GoLive) || has(ApiKeyScope::StudioControl),
         "brb" | "obs_health" | "live_alert" | "lane" | "marker" | "show" => {
             has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::StudioControl) || has(ApiKeyScope::GoLive)

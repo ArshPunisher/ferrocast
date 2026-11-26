@@ -199,6 +199,8 @@ pub struct ConnectorView {
 pub struct AccountView {
     pub name: String,
     pub avatar_url: Option<String>,
+    pub login: String,
+    pub url: Option<String>,
 }
 
 impl ConnectorView {

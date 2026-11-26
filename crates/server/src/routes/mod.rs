@@ -57,6 +57,8 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/accounts", get(core::accounts))
         .route("/accounts/{platform}/connect", post(core::connect))
         .route("/accounts/{platform}", delete(core::disconnect))
+        .route("/links", get(core::links).put(core::save_links))
+        .route("/labels", get(core::labels))
         // overlays
         .route("/overlays", get(core::overlays).post(core::create_overlay))
         .route("/overlays/{id}", get(core::overlay).put(core::update_overlay).delete(core::delete_overlay))

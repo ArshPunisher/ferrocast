@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::accounts::ConnectFlow;
 use crate::frames::{LiveFrame, NoticeLevel};
-use crate::state::{AccountView, ConnectorView};
+use crate::state::ConnectorView;
 use crate::{Engine, EngineError, now};
 
 pub(crate) const INSTALL: &str = "relay-install";
@@ -338,6 +338,7 @@ impl Engine {
             );
         }
         self.start_kick(api, account);
+        self.push_overlay_links().await;
         self.notice("account:kick", NoticeLevel::Info, "Kick is connected.");
         Ok(())
     }
@@ -413,7 +414,7 @@ impl Engine {
         self.register_connector(Arc::new(KickConnector { api, broadcaster_id: account.user_id.clone() }));
         let mut st = self.state_mut();
         let v = st.connectors.entry("kick".into()).or_insert_with(ConnectorView::off);
-        v.account = Some(AccountView { name: account.display_name.clone(), avatar_url: account.avatar_url.clone() });
+        v.account = Some(crate::accounts::account_view(&account));
         v.state = "connected".into();
         // No standing caveat: the dashboard warns only while the relay link is down.
         v.detail = None;

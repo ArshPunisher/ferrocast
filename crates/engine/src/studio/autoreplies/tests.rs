@@ -168,7 +168,12 @@ async fn loop_guard_ignores_the_streamer_bots_and_echoes() {
     e.ingest(chat_as(&person("Nightbot", Roles::empty()), "discord")).await;
     // The connected account (a separate bot account) speaking.
     if let Some(c) = e.state_mut().connectors.get_mut("twitch") {
-        c.account = Some(crate::state::AccountView { name: "MyBotAccount".into(), avatar_url: None });
+        c.account = Some(crate::state::AccountView {
+            name: "MyBotAccount".into(),
+            avatar_url: None,
+            login: "mybotaccount".into(),
+            url: Some("twitch.tv/mybotaccount".into()),
+        });
     }
     e.ingest(chat_as(&person("mybotaccount", Roles::empty()), "discord")).await;
     assert!(settle(&tw).await.is_empty(), "never answers itself or bots: {:?}", tw.said());

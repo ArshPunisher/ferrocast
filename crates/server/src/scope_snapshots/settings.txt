@@ -1,5 +1,6 @@
 GET /asyncapi.json
 GET /backups
+GET /links
 GET /obs/switcher
 GET /openapi.json
 GET /settings
@@ -8,5 +9,6 @@ GET /themes
 GET /updates
 POST /backups
 POST /setup/complete
+PUT /links
 PUT /obs/switcher
 PUT /settings

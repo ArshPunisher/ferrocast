@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use ferrocast_core::alert::AlertRule;
 use ferrocast_core::goal::{Goal, GoalView};
+use ferrocast_core::links::{CreatorLinks, account_url};
 use ferrocast_core::overlay::{Overlay, Preset, Widget};
 use ferrocast_store::{backup, repo};
 use serde::Deserialize;
@@ -80,11 +81,24 @@ pub async fn accounts(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     let out: Vec<Value> = list
         .into_iter()
         .map(|a| {
-            json!({ "platform": a.platform, "name": a.display_name, "avatar_url": a.avatar_url,
-                         "connected_at": a.connected_at, "scopes_ok": true })
+            let url = account_url(&a.platform, &a.login, &a.user_id);
+            json!({ "platform": a.platform, "name": a.display_name, "login": a.login, "url": url,
+                         "avatar_url": a.avatar_url, "connected_at": a.connected_at, "scopes_ok": true })
         })
         .collect();
     Ok(Json(json!(out)))
+}
+
+pub async fn links(State(app): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.links().await?)))
+}
+
+pub async fn save_links(State(app): State<AppState>, Body(b): Body<CreatorLinks>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!(app.engine.save_links(b).await?)))
+}
+
+pub async fn labels(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.all_labels().await))
 }
 
 pub async fn connect(State(app): State<AppState>, Path(p): Path<String>) -> ApiResult<Json<Value>> {

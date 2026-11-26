@@ -2223,3 +2223,102 @@ async fn a_rule_without_interrupt_queues_behind_the_playing_alert() {
     }
     panic!("the second follow never queued");
 }
+
+#[tokio::test]
+async fn account_urls_capture_youtube_custom_url_and_lazy_refresh_updates_overlays() {
+    use ferrocast_youtube::{Endpoints as YtEndpoints, Tokens as YtTokens};
+    let (e, _d) = engine().await;
+
+    // Seed an existing YouTube install whose login still holds a display title (no @handle)
+    // and expired OAuth tokens, backed by a fake YouTube OAuth + API server.
+    let app = axum::Router::new()
+        .route(
+            "/token",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "access_token": "yt-fresh",
+                    "refresh_token": "yt-r",
+                    "expires_in": 3600
+                }))
+            }),
+        )
+        .route(
+            "/api/channels",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "items": [{
+                        "id": "UC_EXIST_1",
+                        "snippet": {
+                            "title": "Nova Legacy Title",
+                            "customUrl": "@NovaActualHandle"
+                        }
+                    }]
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let apps = PlatformApps {
+        youtube: Some(ferrocast_youtube::AppCredentials { client_id: "cid".into(), client_secret: "sec".into() }),
+        youtube_endpoints: YtEndpoints {
+            authorize: format!("{base}/auth"),
+            token: format!("{base}/token"),
+            api: format!("{base}/api"),
+            grpc: String::new(),
+        },
+        ..Default::default()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(ferrocast_secrets::MemorySecrets::default());
+    let eng = Engine::start_with(dir.path(), secrets.clone(), apps).await.unwrap();
+
+    // Save legacy YouTube account row + expired tokens before creating an overlay listener.
+    eng.db(|s| {
+        ferrocast_store::repo::settings::save_account(
+            s,
+            &ferrocast_store::repo::settings::Account {
+                platform: "youtube".into(),
+                user_id: "UC_EXIST_1".into(),
+                login: "Nova Legacy Title".into(),
+                display_name: "Nova Legacy Title".into(),
+                avatar_url: None,
+                scopes: vec![],
+                connected_at: 100,
+            },
+        )
+    })
+    .await
+    .unwrap();
+    let mut rx = eng.subscribe_overlays();
+    let api = eng
+        .youtube_api(YtTokens { access_token: "yt-old".into(), refresh_token: "yt-r".into(), expires_at: 1 })
+        .unwrap();
+
+    // Trigger a token refresh via api.access(); lazy handle discovery runs in background.
+    assert_eq!(api.access().await.unwrap(), "yt-fresh");
+    eventually(|| {
+        eng.state()
+            .connectors
+            .get("youtube")
+            .and_then(|c| c.account.as_ref())
+            .is_some_and(|a| a.login == "@NovaActualHandle")
+    })
+    .await;
+
+    let yt = eng.state().connectors["youtube"].account.as_ref().unwrap().clone();
+    assert_eq!(yt.login, "@NovaActualHandle");
+    assert_eq!(yt.url.as_deref(), Some("youtube.com/@NovaActualHandle"));
+
+    // Overlay stream received live `state` frame with updated YouTube link.
+    let f = next_overlay_frame(&mut rx, "state").await;
+    assert_eq!(f["data"]["links"]["youtube"], "youtube.com/@NovaActualHandle");
+
+    // Disconnecting clears the link explicitly (not merely omitting the key) and notifies live overlays.
+    eng.disconnect_account(Platform::Youtube).await.unwrap();
+    let f2 = next_overlay_frame(&mut rx, "state").await;
+    assert_eq!(f2.pointer("/data/links/youtube"), Some(&Value::Null));
+    drop(e);
+}

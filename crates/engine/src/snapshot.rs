@@ -195,12 +195,14 @@ impl Engine {
         let credits = if has(WidgetKind::EndCredits) { Some(self.credits().await?) } else { None };
         let chat_highlight = if has(WidgetKind::ChatHighlight) { self.chat_highlight() } else { None };
         let view = self.overlay_view(o);
+        let links = self.resolved_links().await?;
         Ok(json!({
             "overlay": view_public(&view),
             "state": { "goals": goals, "labels": labels, "label_trains": label_trains, "viewers": viewers, "events": events, "chat": chat,
                        "poll": self.poll(), "giveaway": self.giveaway_card().await,
                        "credits": credits, "chat_highlight": chat_highlight,
-                       "show": self.show_overlay_state(), "music": self.music_now() },
+                       "show": self.show_overlay_state(), "music": self.music_now(),
+                       "links": links },
         }))
     }
 }

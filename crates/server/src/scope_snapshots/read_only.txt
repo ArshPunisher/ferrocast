@@ -18,6 +18,8 @@ GET /goals
 GET /golive
 GET /golive/picture
 GET /insights/supporters
+GET /labels
+GET /links
 GET /loyalty
 GET /loyalty/leaderboard
 GET /loyalty/viewers/{platform}/{user_id}

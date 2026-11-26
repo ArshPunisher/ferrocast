@@ -2524,3 +2524,252 @@ async fn the_schedule_routes_plan_list_and_delete_with_plain_errors() {
         .await;
     assert!(odd.status().is_client_error());
 }
+
+#[tokio::test]
+async fn accounts_include_login_and_platform_urls() {
+    use ferrocast_store::repo::settings::{Account, save_account};
+    let r = start().await;
+    r.engine
+        .db(|s| {
+            save_account(
+                s,
+                &Account {
+                    platform: "twitch".into(),
+                    user_id: "t1".into(),
+                    login: "NovaGG".into(),
+                    display_name: "Nova GG".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 1,
+                },
+            )?;
+            save_account(
+                s,
+                &Account {
+                    platform: "youtube".into(),
+                    user_id: "UC_HANDLE".into(),
+                    login: "@NovaPlays".into(),
+                    display_name: "Nova Plays".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 2,
+                },
+            )?;
+            save_account(
+                s,
+                &Account {
+                    platform: "kick".into(),
+                    user_id: "k1".into(),
+                    login: "nova_kick".into(),
+                    display_name: "NovaKick".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 3,
+                },
+            )?;
+            save_account(
+                s,
+                &Account {
+                    platform: "facebook".into(),
+                    user_id: "fb1".into(),
+                    login: "Nova Page".into(),
+                    display_name: "Nova Page".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 4,
+                },
+            )
+        })
+        .await
+        .unwrap();
+
+    let list: Vec<Value> = r.get("/api/v1/accounts").await.json().await.unwrap();
+    let by = |p: &str| list.iter().find(|a| a["platform"] == p).unwrap().clone();
+    assert_eq!(by("twitch")["login"], "NovaGG");
+    assert_eq!(by("twitch")["url"], "twitch.tv/novagg");
+    assert_eq!(by("youtube")["login"], "@NovaPlays");
+    assert_eq!(by("youtube")["url"], "youtube.com/@NovaPlays");
+    assert_eq!(by("kick")["login"], "nova_kick");
+    assert_eq!(by("kick")["url"], "kick.com/nova_kick");
+    assert_eq!(by("facebook")["login"], "Nova Page");
+    assert!(by("facebook")["url"].is_null());
+
+    // Legacy YouTube row without an @handle falls back to /channel/<id> instead of display title.
+    r.engine
+        .db(|s| {
+            save_account(
+                s,
+                &Account {
+                    platform: "youtube".into(),
+                    user_id: "UC_LEGACY_1234567890".into(),
+                    login: "Nova Plays Live".into(),
+                    display_name: "Nova Plays Live".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 5,
+                },
+            )
+        })
+        .await
+        .unwrap();
+    let list2: Vec<Value> = r.get("/api/v1/accounts").await.json().await.unwrap();
+    let yt2 = list2.iter().find(|a| a["platform"] == "youtube").unwrap();
+    assert_eq!(yt2["url"], "youtube.com/channel/UC_LEGACY_1234567890");
+}
+
+#[tokio::test]
+async fn links_endpoints_validate_persist_and_push_overlay_state() {
+    use ferrocast_store::repo::settings::{Account, save_account};
+    let r = start().await;
+    let init = r.get("/api/v1/links").await;
+    assert_eq!(init.status(), StatusCode::OK);
+    let init_v: Value = init.json().await.unwrap();
+    assert!(init_v["resolved"]["socials"].as_array().unwrap().is_empty());
+
+    for (payload, field) in [
+        (json!({ "discord": "javascript:alert(1)" }), "discord"),
+        (json!({ "website": "  JaVaScRiPt:void(0)" }), "website"),
+        (json!({ "instagram": "bad\nline" }), "instagram"),
+        (json!({ "x": "bad\0nul" }), "x"),
+        (json!({ "tiktok": "a".repeat(121) }), "tiktok"),
+        (
+            json!({ "custom": (0..7).map(|i| json!({ "label": format!("L{i}"), "value": "x.com/a" })).collect::<Vec<_>>() }),
+            "custom",
+        ),
+        (json!({ "custom": [{ "label": "", "value": "x.com/a" }] }), "custom"),
+    ] {
+        let bad = r.put("/api/v1/links", payload).await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST, "expected 400 for {field}");
+        let err: Value = bad.json().await.unwrap();
+        let msg = err["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains(field), "expected error naming {field}: {err}");
+    }
+
+    r.engine
+        .db(|s| {
+            save_account(
+                s,
+                &Account {
+                    platform: "twitch".into(),
+                    user_id: "t1".into(),
+                    login: "novaplays".into(),
+                    display_name: "NovaPlays".into(),
+                    avatar_url: None,
+                    scopes: vec![],
+                    connected_at: 1,
+                },
+            )
+        })
+        .await
+        .unwrap();
+
+    let ov: Value = r.post("/api/v1/overlays", json!({ "name": "Main" })).await.json().await.unwrap();
+    let ws_url = ov["url"].as_str().unwrap().replace("http://", "ws://") + "ws";
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let snap: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(snap["type"], "snapshot");
+    assert_eq!(snap["data"]["state"]["links"]["twitch"], "twitch.tv/novaplays");
+    assert_eq!(snap["data"]["state"]["links"]["channel_name"], "NovaPlays");
+
+    let saved = r
+        .put(
+            "/api/v1/links",
+            json!({
+                "discord": "https://discord.gg/nova/",
+                "instagram": "@novagram",
+                "schedule_text": "Fridays, 8 PM",
+                "custom": [{ "label": "Merch", "value": "https://shop.nova.gg/" }]
+            }),
+        )
+        .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved_v: Value = saved.json().await.unwrap();
+    assert_eq!(saved_v["discord"], "https://discord.gg/nova/");
+    assert_eq!(saved_v["resolved"]["discord"], "discord.gg/nova");
+    assert_eq!(saved_v["resolved"]["instagram"], "instagram.com/novagram");
+    assert_eq!(saved_v["resolved"]["next_stream"], "Fridays, 8 PM");
+
+    let next_state = async |ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >| loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await.unwrap().unwrap().unwrap();
+        let f: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        if f["type"] == "state" && f["data"].get("links").is_some() {
+            break f["data"]["links"].clone();
+        }
+    };
+    let pushed = next_state(&mut ws).await;
+    assert_eq!(pushed["discord"], "discord.gg/nova");
+    assert_eq!(pushed["next_stream"], "Fridays, 8 PM");
+
+    // Creating a scheduled stream pushes an updated resolved next_stream to open overlays.
+    let soon =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + 2 * 86_400_000;
+    let created = r
+        .post("/api/v1/schedule", json!({ "info": { "title": "Cozy Fri" }, "platforms": ["twitch"], "start_ms": soon }))
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let sched_item: Value = created.json().await.unwrap();
+    let pushed_sched = next_state(&mut ws).await;
+    assert_eq!(pushed_sched["next_stream_at"], soon);
+
+    // Deleting the scheduled stream restores the schedule_text fallback and pushes again.
+    let sid = sched_item["id"].as_str().unwrap();
+    assert_eq!(
+        r.client
+            .delete(format!("{}/api/v1/schedule/{sid}", r.base))
+            .bearer_auth(&r.token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let pushed_back = next_state(&mut ws).await;
+    assert!(pushed_back["next_stream_at"].is_null());
+    assert_eq!(pushed_back["next_stream"], "Fridays, 8 PM");
+
+    // Verify persistence in a fresh Engine on the same store dir.
+    let reread: Value = r.get("/api/v1/links").await.json().await.unwrap();
+    assert_eq!(reread["discord"], "https://discord.gg/nova/");
+}
+
+#[tokio::test]
+async fn labels_endpoint_returns_real_labels_and_empty_when_unseen() {
+    use ferrocast_core::event::{Actor, Event, EventKind, Millis, PaymentStatus, Platform, TipProvider};
+    use ferrocast_core::money::Money;
+    let r = start().await;
+    let empty = r.get("/api/v1/labels").await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(empty.json::<Value>().await.unwrap(), json!({}));
+
+    r.engine
+        .ingest(Event::live(
+            Platform::Twitch,
+            Some("f1".into()),
+            Millis(1),
+            EventKind::Follow { actor: Actor::named(Platform::Twitch, "LunaLagoon") },
+        ))
+        .await;
+    r.engine
+        .ingest(Event::live(
+            Platform::Tips,
+            Some("t1".into()),
+            Millis(2),
+            EventKind::Tip {
+                actor: Actor::named(Platform::Tips, "Asha"),
+                money: Money::new(1000, "USD"),
+                message: None,
+                provider: TipProvider::Stripe,
+                payment_ref: "p1".into(),
+                status: PaymentStatus::Captured,
+            },
+        ))
+        .await;
+
+    let labels: Value = r.get("/api/v1/labels").await.json().await.unwrap();
+    assert_eq!(labels["latest_follower"], "LunaLagoon");
+    assert_eq!(labels["latest_tip"], "Asha $10");
+    assert_eq!(labels["session_follows"], "1");
+    assert_eq!(labels["alltime_follows"], "1");
+}

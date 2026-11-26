@@ -148,6 +148,7 @@ impl Engine {
         }
         all.push(item.clone());
         self.schedule_save(all).await?;
+        self.push_overlay_links_locked().await;
         Ok(item)
     }
 
@@ -183,7 +184,9 @@ impl Engine {
         if all.len() == before {
             return Err(EngineError::NotFound("scheduled stream"));
         }
-        self.schedule_save(all).await
+        self.schedule_save(all).await?;
+        self.push_overlay_links_locked().await;
+        Ok(())
     }
 
     /// One pass: the reminders now due (each once), and long-past plans dropped. Returns the
@@ -198,7 +201,8 @@ impl Engine {
         // Said only once the plans are saved as reminded: a failed save sends nothing, so the next
         // tick says it (once), instead of saying it now and again on every tick after.
         let mut notices: Vec<(String, String)> = Vec::new();
-        let mut changed = all.len() != n;
+        let dropped = all.len() != n;
+        let mut changed = dropped;
         for p in &mut all {
             let due = p.start_ms.saturating_sub(i64::from(p.remind_minutes) * 60_000);
             if !p.reminded && at_ms >= due {
@@ -221,6 +225,9 @@ impl Engine {
         }
         if changed {
             self.schedule_save(all).await?;
+            if dropped {
+                self.push_overlay_links_locked().await;
+            }
         }
         for (key, msg) in notices {
             self.send_live(LiveFrame::new("notice", &Notice::new(NoticeLevel::Info, &msg).key(key)));

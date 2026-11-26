@@ -302,6 +302,14 @@ const ALERTS_DESIGNS_MEDIA: &[RouteDoc] = &[
     doc("DELETE", "/goals/{id}", "Alerts & Overlays", "Delete a goal.", None, None),
     doc("POST", "/goals/{id}/adjust", "Alerts & Overlays", "Manually adjust a goal's current value.", None, None),
     doc("GET", "/media", "Designs & Media", "List uploaded local alert images, video, and sounds.", None, None),
+    doc(
+        "GET",
+        "/labels",
+        "Alerts & Overlays",
+        "Current evaluated stream label values by source key.",
+        None,
+        Some("LabelsMap"),
+    ),
     doc("POST", "/media", "Designs & Media", "Upload local alert media asset (PC only).", None, None),
     doc("GET", "/media/{id}", "Designs & Media", "Serve a stored media asset by id.", None, None),
     doc("DELETE", "/media/{id}", "Designs & Media", "Delete an uploaded media asset.", None, None),
@@ -1643,7 +1651,30 @@ const SETTINGS_AND_IMPORTS: &[RouteDoc] = &[
 ];
 
 const ACCOUNTS_AND_PRO: &[RouteDoc] = &[
-    doc("GET", "/accounts", "Accounts & Pro", "Connected platform account statuses (PC only).", None, None),
+    doc(
+        "GET",
+        "/accounts",
+        "Accounts & Pro",
+        "Connected platform account statuses, logins, and public channel URLs (PC only).",
+        None,
+        None,
+    ),
+    doc(
+        "GET",
+        "/links",
+        "Accounts & Pro",
+        "Creator \"My links\" configuration and resolved overlay links/schedule values.",
+        None,
+        Some("LinksResponse"),
+    ),
+    doc(
+        "PUT",
+        "/links",
+        "Accounts & Pro",
+        "Validate and save \"My links\" overrides, non-streaming socials, and custom links; updates live overlays.",
+        Some("CreatorLinks"),
+        Some("LinksResponse"),
+    ),
     doc(
         "POST",
         "/accounts/{platform}/connect",
@@ -3035,8 +3066,98 @@ fn schemas() -> Value {
         map.extend(auto_config_schemas());
         map.extend(store_schemas());
         map.extend(schedule_schemas());
+        map.extend(links_and_labels_schemas());
     }
     doc
+}
+
+fn links_and_labels_schemas() -> Map<String, Value> {
+    let mut m = Map::new();
+    let opt_str = json!({ "type": ["string", "null"], "maxLength": 120 });
+    m.insert(
+        "CustomLink".into(),
+        json!({
+            "type": "object",
+            "required": ["label", "value"],
+            "properties": {
+                "label": { "type": "string", "maxLength": 40 },
+                "value": { "type": "string", "maxLength": 120 }
+            }
+        }),
+    );
+    m.insert(
+        "CreatorLinks".into(),
+        json!({
+            "type": "object",
+            "description": "Creator \"My links\" configuration.",
+            "properties": {
+                "twitch": opt_str,
+                "youtube": opt_str,
+                "kick": opt_str,
+                "facebook": opt_str,
+                "discord": opt_str,
+                "instagram": opt_str,
+                "x": opt_str,
+                "tiktok": opt_str,
+                "website": opt_str,
+                "schedule_text": opt_str,
+                "custom": { "type": "array", "maxItems": 6, "items": { "$ref": "#/components/schemas/CustomLink" } }
+            }
+        }),
+    );
+    m.insert(
+        "ResolvedLinks".into(),
+        json!({
+            "type": "object",
+            "required": ["custom", "socials"],
+            "properties": {
+                "twitch": opt_str,
+                "youtube": opt_str,
+                "kick": opt_str,
+                "facebook": opt_str,
+                "discord": opt_str,
+                "instagram": opt_str,
+                "x": opt_str,
+                "tiktok": opt_str,
+                "website": opt_str,
+                "custom": { "type": "array", "items": { "$ref": "#/components/schemas/CustomLink" } },
+                "socials": { "type": "array", "items": { "type": "string" } },
+                "channel_name": { "type": ["string", "null"] },
+                "next_stream": { "type": ["string", "null"] },
+                "next_stream_at": { "type": ["integer", "null"] }
+            }
+        }),
+    );
+    m.insert(
+        "LinksResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["custom", "resolved"],
+            "properties": {
+                "twitch": opt_str,
+                "youtube": opt_str,
+                "kick": opt_str,
+                "facebook": opt_str,
+                "discord": opt_str,
+                "instagram": opt_str,
+                "x": opt_str,
+                "tiktok": opt_str,
+                "website": opt_str,
+                "schedule_text": opt_str,
+                "custom": { "type": "array", "maxItems": 6, "items": { "$ref": "#/components/schemas/CustomLink" } },
+                "resolved": { "$ref": "#/components/schemas/ResolvedLinks" }
+            }
+        }),
+    );
+    m.insert(
+        "LabelsMap".into(),
+        json!({
+            "type": "object",
+            "description": "Evaluated stream label display strings keyed by LabelSource snake_case name.",
+            "additionalProperties": { "type": "string" }
+        }),
+    );
+    m
 }
 
 fn studio_source_schemas() -> Map<String, Value> {
@@ -3312,6 +3433,7 @@ fn build_asyncapi() -> Value {
                     "event": live_message("event", "Normalized stream event (follow, sub, gift_sub, tip, bits, raid, chat_message, etc.).", "read_only; chat (chat/mod kinds); alerts (stream events)", json!({ "type": "object", "properties": { "id": { "type": "string" }, "platform": { "type": "string" }, "kind": { "type": "object" } } })),
                     "notice": live_message("notice", "Engine status notice or panic warning (`account:*` notices suppressed for API keys).", "read_only, alerts, studio_control, go_live (chat sees panic only)", json!({ "type": "object", "properties": { "level": { "type": "string" }, "message": { "type": "string" }, "key": { "type": ["string", "null"] } } })),
                     "goals": live_message("goals", "Updated stream goals array.", "read_only, alerts", json!({ "type": "array" })),
+                    "links": live_message("links", "Updated \"My links\" and resolved overlay link state.", "read_only, alerts", json!({ "type": "object" })),
                     "held": live_message("held", "Message/event held by safety filters (`{ event_id, reason }`).", "read_only, chat", json!({ "type": "object" })),
                     "held_resolved": live_message("held_resolved", "Held event released or dropped (`{ event_id, outcome }`).", "read_only, chat", json!({ "type": "object" })),
                     "panic": live_message("panic", "Panic lockdown toggled (`{ on, plan }`).", "read_only, chat", json!({ "type": "object" })),

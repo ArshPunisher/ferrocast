@@ -382,6 +382,52 @@ impl Engine {
             &json!({ "labels": labels, "label_trains": label_trains }),
         ));
     }
+
+    /// Evaluates every stream label source for dashboard previews (`GET /api/v1/labels`).
+    /// Returns an empty map when no activity has been recorded yet so previews can show samples.
+    pub async fn all_labels(&self) -> std::collections::BTreeMap<String, String> {
+        let now_ms = crate::now();
+        let hydrated = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner()).hydrated;
+        if !hydrated {
+            self.hydrate_labels().await;
+        }
+        let default_opts = |source: LabelSource| LabelOptions {
+            source,
+            template: "{value}".into(),
+            theme: "molten".into(),
+            timezone: None,
+            timezone_offset_min: 0,
+            train_window_s: 120,
+            train_step_s: 15,
+            train_max_s: 300,
+            train_threshold: 3,
+        };
+        let tz = MonthZoneKey::from_opts(&default_opts(LabelSource::MonthlyFollows));
+        self.ensure_month_cached(tz, now_ms).await;
+
+        let rt = self.inner.labels.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out = std::collections::BTreeMap::new();
+        let mut has_activity = false;
+        for &source in LabelSource::ALL {
+            let val = if source == LabelSource::HypeTrain {
+                rt.trains
+                    .values()
+                    .find(|t| t.view(now_ms).active)
+                    .map(|t| t.render("Lv.{level} · {events} events · {timer}", now_ms))
+                    .unwrap_or_default()
+            } else {
+                eval_non_train(&default_opts(source), &rt, now_ms)
+            };
+            if val.is_empty() {
+                continue;
+            }
+            if val != "0" {
+                has_activity = true;
+            }
+            out.insert(source.as_str().to_string(), val);
+        }
+        if has_activity { out } else { std::collections::BTreeMap::new() }
+    }
 }
 
 fn eval_non_train(opts: &LabelOptions, rt: &LabelRuntime, now_ms: Millis) -> String {

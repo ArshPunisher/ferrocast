@@ -208,6 +208,7 @@ impl Engine {
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
         self.start_twitch(auth, account);
+        self.push_overlay_links().await;
         self.notice("account:twitch", NoticeLevel::Info, "Twitch is connected.");
         Ok(())
     }
@@ -243,10 +244,7 @@ impl Engine {
         {
             let mut st = self.state_mut();
             let v = st.connectors.entry("twitch".into()).or_insert_with(crate::state::ConnectorView::off);
-            v.account = Some(crate::state::AccountView {
-                name: account.display_name.clone(),
-                avatar_url: account.avatar_url.clone(),
-            });
+            v.account = Some(account_view(&account));
             v.state = "reconnecting".into();
         }
         let url = self.apps().twitch_endpoints.eventsub.clone();
@@ -394,8 +392,12 @@ impl Engine {
         if let Some(k) = key {
             self.inner.secrets.delete(k).map_err(|e| EngineError::Unavailable(e.to_string()))?;
         }
+        if platform == Platform::Youtube {
+            self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
+        }
         let key = crate::platform_key(platform).to_string();
         self.db(move |s| repo::settings::remove_account(s, &key)).await?;
+        self.push_overlay_links().await;
         Ok(())
     }
 
@@ -445,6 +447,7 @@ impl Engine {
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
         self.start_facebook(page, account);
+        self.push_overlay_links().await;
         self.notice_detail(
             "account:facebook",
             NoticeLevel::Info,
@@ -465,10 +468,7 @@ impl Engine {
         {
             let mut st = self.state_mut();
             let v = st.connectors.entry("facebook".into()).or_insert_with(crate::state::ConnectorView::off);
-            v.account = Some(crate::state::AccountView {
-                name: account.display_name.clone(),
-                avatar_url: account.avatar_url.clone(),
-            });
+            v.account = Some(account_view(&account));
             // Comments are asked for, not pushed: connected means the Page is signed in.
             v.state = "connected".into();
             v.detail = None;
@@ -523,7 +523,7 @@ impl Engine {
         let account = repo::settings::Account {
             platform: "youtube".into(),
             user_id: me.id.clone(),
-            login: me.title.clone(),
+            login: me.custom_url.clone().unwrap_or_default(),
             display_name: me.title.clone(),
             avatar_url: me.avatar_url.clone(),
             scopes: ferrocast_youtube::oauth::SCOPES.iter().map(|s| s.to_string()).collect(),
@@ -531,7 +531,9 @@ impl Engine {
         };
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
+        self.inner.youtube_handle_checked.store(true, std::sync::atomic::Ordering::Release);
         self.start_youtube(api, account);
+        self.push_overlay_links().await;
         self.notice_detail(
             "account:youtube",
             NoticeLevel::Info,
@@ -552,13 +554,27 @@ impl Engine {
     ) -> Result<Arc<ferrocast_youtube::Api>, EngineError> {
         let app = self.apps().youtube.clone().ok_or_else(|| EngineError::Unavailable("no YouTube app".into()))?;
         let secrets = self.inner.secrets.clone();
+        let engine = Arc::downgrade(&self.inner);
+        let api_slot: Arc<std::sync::OnceLock<std::sync::Weak<ferrocast_youtube::Api>>> = Default::default();
+        let api_for_cb = Arc::clone(&api_slot);
+        let engine_for_cb = engine.clone();
         let persist = Arc::new(move |t: &ferrocast_youtube::Tokens| {
             let json = serde_json::to_string(t).map_err(|e| e.to_string())?;
-            secrets.set(YOUTUBE_TOKENS, &json).map_err(|e| e.to_string())
+            secrets.set(YOUTUBE_TOKENS, &json).map_err(|e| e.to_string())?;
+            if let (Some(inner), Some(weak_api)) =
+                (engine_for_cb.upgrade(), api_for_cb.get().and_then(std::sync::Weak::upgrade))
+            {
+                let eng = Engine { inner };
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        eng.refresh_youtube_handle_if_missing(&weak_api).await;
+                    });
+                }
+            }
+            Ok(())
         });
         // The privacy of the broadcasts it makes is read from the settings each time, so a change
         // applies to the next one. A weak link: the Api lives inside the engine's connectors.
-        let engine = Arc::downgrade(&self.inner);
         let privacy: ferrocast_youtube::PrivacySource = Arc::new(move || {
             // A value that isn't one of the three (a hand-edited file) must not publish: unlisted.
             engine
@@ -568,7 +584,7 @@ impl Engine {
                     ferrocast_youtube::Privacy::parse(&v).unwrap_or(ferrocast_youtube::Privacy::Unlisted)
                 })
         });
-        Ok(Arc::new(
+        let api = Arc::new(
             ferrocast_youtube::Api::new(
                 ferrocast_youtube::http_client(),
                 self.apps().youtube_endpoints.clone(),
@@ -577,7 +593,46 @@ impl Engine {
                 persist,
             )
             .with_privacy(privacy),
-        ))
+        );
+        let _ = api_slot.set(Arc::downgrade(&api));
+        Ok(api)
+    }
+
+    /// Backfills `snippet.customUrl` (`@handle`) for pre-existing YouTube installs on token refresh.
+    pub(crate) async fn refresh_youtube_handle_if_missing(&self, api: &ferrocast_youtube::Api) {
+        if self.inner.youtube_handle_checked.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let Ok(accounts) = self.db(repo::settings::accounts).await else {
+            self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        let Some(mut acct) = accounts.into_iter().find(|a| a.platform == "youtube") else {
+            return;
+        };
+        if acct.login.trim().starts_with('@') {
+            return;
+        }
+        let Ok(me) = api.me().await else {
+            self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
+            return;
+        };
+        acct.login = me.custom_url.unwrap_or_default();
+        acct.display_name = me.title;
+        acct.avatar_url = me.avatar_url;
+        let saved = acct.clone();
+        if self.db(move |s| repo::settings::save_account(s, &saved)).await.is_err() {
+            self.inner.youtube_handle_checked.store(false, std::sync::atomic::Ordering::Release);
+            return;
+        }
+        let connectors = {
+            let mut st = self.state_mut();
+            let v = st.connectors.entry("youtube".into()).or_insert_with(crate::state::ConnectorView::off);
+            v.account = Some(account_view(&acct));
+            st.connectors.clone()
+        };
+        self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": connectors })));
+        self.push_overlay_links().await;
     }
 
     fn start_youtube(&self, api: Arc<ferrocast_youtube::Api>, account: repo::settings::Account) {
@@ -588,10 +643,7 @@ impl Engine {
         {
             let mut st = self.state_mut();
             let v = st.connectors.entry("youtube".into()).or_insert_with(crate::state::ConnectorView::off);
-            v.account = Some(crate::state::AccountView {
-                name: account.display_name.clone(),
-                avatar_url: account.avatar_url.clone(),
-            });
+            v.account = Some(account_view(&account));
         }
         let wake = Arc::new(tokio::sync::Notify::new());
         *self.inner.youtube_wake.lock().unwrap_or_else(|p| p.into_inner()) = Some(wake.clone());
@@ -695,6 +747,15 @@ fn save_failure_message(what: &str, kind: std::io::ErrorKind, raw: Option<i32>) 
         K::PermissionDenied => format!("Couldn't save {what}: Ferrocast isn't allowed to write there."),
         K::NotFound => format!("Couldn't save {what}: its folder is missing."),
         _ => format!("Couldn't save {what}."),
+    }
+}
+
+pub(crate) fn account_view(account: &repo::settings::Account) -> crate::state::AccountView {
+    crate::state::AccountView {
+        name: account.display_name.clone(),
+        avatar_url: account.avatar_url.clone(),
+        login: account.login.clone(),
+        url: ferrocast_core::links::account_url(&account.platform, &account.login, &account.user_id),
     }
 }
 

@@ -866,6 +866,106 @@
         ],
         "type": "object"
       },
+      "CreatorLinks": {
+        "description": "Creator \"My links\" configuration.",
+        "properties": {
+          "custom": {
+            "items": {
+              "$ref": "#/components/schemas/CustomLink"
+            },
+            "maxItems": 6,
+            "type": "array"
+          },
+          "discord": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "facebook": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instagram": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kick": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "schedule_text": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tiktok": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "twitch": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "website": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "x": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "youtube": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "CustomLink": {
+        "properties": {
+          "label": {
+            "maxLength": 40,
+            "type": "string"
+          },
+          "value": {
+            "maxLength": 120,
+            "type": "string"
+          }
+        },
+        "required": [
+          "label",
+          "value"
+        ],
+        "type": "object"
+      },
       "GoLiveDestinationCreate": {
         "properties": {
           "brand": {
@@ -902,6 +1002,102 @@
         "required": [
           "name",
           "url"
+        ],
+        "type": "object"
+      },
+      "LabelsMap": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "Evaluated stream label display strings keyed by LabelSource snake_case name.",
+        "type": "object"
+      },
+      "LinksResponse": {
+        "properties": {
+          "custom": {
+            "items": {
+              "$ref": "#/components/schemas/CustomLink"
+            },
+            "maxItems": 6,
+            "type": "array"
+          },
+          "discord": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "facebook": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instagram": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kick": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved": {
+            "$ref": "#/components/schemas/ResolvedLinks"
+          },
+          "schedule_text": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tiktok": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "twitch": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "website": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "x": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "youtube": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "custom",
+          "resolved"
         ],
         "type": "object"
       },
@@ -1068,6 +1264,108 @@
         },
         "required": [
           "token"
+        ],
+        "type": "object"
+      },
+      "ResolvedLinks": {
+        "properties": {
+          "channel_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "custom": {
+            "items": {
+              "$ref": "#/components/schemas/CustomLink"
+            },
+            "type": "array"
+          },
+          "discord": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "facebook": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instagram": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kick": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_stream": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_stream_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "socials": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tiktok": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "twitch": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "website": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "x": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "youtube": {
+            "maxLength": 120,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "custom",
+          "socials"
         ],
         "type": "object"
       },
@@ -2431,7 +2729,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Connected platform account statuses (PC only).",
+        "summary": "Connected platform account statuses, logins, and public channel URLs (PC only).",
         "tags": [
           "Accounts & Pro"
         ],
@@ -10972,6 +11270,194 @@
         ],
         "x-ferrocast-scopes": [
           "read_only"
+        ]
+      }
+    },
+    "/api/v1/labels": {
+      "get": {
+        "operationId": "get_labels",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LabelsMap"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Current evaluated stream label values by source key.",
+        "tags": [
+          "Alerts & Overlays"
+        ],
+        "x-ferrocast-scopes": [
+          "read_only",
+          "alerts"
+        ]
+      }
+    },
+    "/api/v1/links": {
+      "get": {
+        "operationId": "get_links",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinksResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Creator \"My links\" configuration and resolved overlay links/schedule values.",
+        "tags": [
+          "Accounts & Pro"
+        ],
+        "x-ferrocast-scopes": [
+          "read_only",
+          "alerts",
+          "settings"
+        ]
+      },
+      "put": {
+        "operationId": "put_links",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatorLinks"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinksResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Validate and save \"My links\" overrides, non-streaming socials, and custom links; updates live overlays.",
+        "tags": [
+          "Accounts & Pro"
+        ],
+        "x-ferrocast-scopes": [
+          "settings"
         ]
       }
     },

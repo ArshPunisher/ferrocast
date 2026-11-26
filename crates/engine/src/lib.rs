@@ -35,6 +35,8 @@ mod guests;
 mod history;
 pub mod import;
 mod labels;
+pub mod links;
+pub use links::LinksView;
 mod loyalty;
 pub mod music;
 mod obs;
@@ -82,7 +84,7 @@ pub mod state;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ferrocast_connector::{Connector, EventSink, SINK_CAPACITY};
@@ -228,6 +230,8 @@ struct Inner {
     diagnostics_busy: tokio::sync::Mutex<()>,
     /// Short-lived cache of slow OS/GPU/audio hardware enumeration for repeated diagnostics calls.
     hardware_probe_cache: diagnostics::HardwareProbeCache,
+    /// Avoids repeating `/channels` handle discovery when a legacy YouTube account has no `@handle`.
+    youtube_handle_checked: AtomicBool,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -388,6 +392,7 @@ impl Engine {
                 stream_health: Mutex::new(Default::default()),
                 diagnostics_busy: tokio::sync::Mutex::new(()),
                 hardware_probe_cache: Default::default(),
+                youtube_handle_checked: AtomicBool::new(false),
             }),
         };
         tokio::spawn(prune(engine.clone()));

@@ -489,6 +489,37 @@
           "summary": "Live Moments lane items.",
           "x-ferrocast-scopes": "read_only, studio_control, go_live"
         },
+        "links": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "links",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Updated \"My links\" and resolved overlay link state.",
+          "x-ferrocast-scopes": "read_only, alerts"
+        },
         "live_alert": {
           "payload": {
             "properties": {
