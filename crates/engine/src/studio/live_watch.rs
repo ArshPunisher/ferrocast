@@ -26,6 +26,22 @@ const OUTPUT_LAG_LOG_EVERY_MS: i64 = 5_000;
 /// Upload check comparison threshold: warn when total stream bitrate exceeds 85% of measured upload.
 const TIGHT_UPLOAD_PCT: u64 = 85;
 
+fn lag_cause_rank(cause: &str) -> u8 {
+    match cause {
+        "output stalled (0 bytes sent)" => 4,
+        "sender dropping packets" => 3,
+        "destination falling behind" => 2,
+        _ => 1,
+    }
+}
+
+fn pick_lag_cause(existing: Option<&'static str>, next: &'static str) -> &'static str {
+    match existing {
+        Some(prev) if lag_cause_rank(prev) >= lag_cause_rank(next) => prev,
+        _ => next,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OutputLagReport {
     pub cause: &'static str,
@@ -49,6 +65,7 @@ pub(crate) struct OutputLagWatch {
     prev_dest_dropped: std::collections::HashMap<String, u64>,
     prev_dest_live: std::collections::HashMap<String, bool>,
     pending_dropped: u64,
+    pending_cause: Option<&'static str>,
     last_warn_ms: Option<i64>,
 }
 
@@ -110,7 +127,7 @@ impl OutputLagWatch {
         let step_drops = d_sender_dropped.saturating_add(d_dest_dropped);
         self.pending_dropped = self.pending_dropped.saturating_add(step_drops);
 
-        let cause = if stalled {
+        let step_cause = if stalled {
             Some("output stalled (0 bytes sent)")
         } else if d_sender_dropped > 0 {
             Some("sender dropping packets")
@@ -121,11 +138,15 @@ impl OutputLagWatch {
         } else {
             None
         };
-        let cause = cause?;
+        if let Some(c) = step_cause {
+            self.pending_cause = Some(pick_lag_cause(self.pending_cause, c));
+        }
+        let cause = step_cause.or(self.pending_cause)?;
         if !self.last_warn_ms.is_none_or(|t| tick.at_ms - t >= OUTPUT_LAG_LOG_EVERY_MS) {
             return None;
         }
         let burst = std::mem::take(&mut self.pending_dropped);
+        self.pending_cause = None;
         self.last_warn_ms = Some(tick.at_ms);
         Some((cause, sender_kbps, burst))
     }
@@ -1144,5 +1165,70 @@ mod tests {
             dest_details: vec![],
         });
         assert_eq!(missing.upload_status, "no_upload_check");
+    }
+
+    #[test]
+    fn output_lag_watch_flushes_cooldown_masked_drops_on_calm_tick_after_cooldown() {
+        let dest = |dropped: u64| {
+            vec![ferrocast_core::auto_quality::Dest { id: "twitch".into(), dropped, live_ms: 30_000, live: true }]
+        };
+        let mut watch = OutputLagWatch::default();
+
+        assert_eq!(
+            watch.detect_trouble(&OutputLagTick {
+                at_ms: 0,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 500_000,
+                sender_dropped: 0,
+                dests: &dest(0),
+                paused: false,
+            }),
+            None
+        );
+
+        // Stall at 1s warns and starts the 5s cooldown.
+        let (first_cause, _, _) = watch
+            .detect_trouble(&OutputLagTick {
+                at_ms: 1_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 500_000,
+                sender_dropped: 0,
+                dests: &dest(0),
+                paused: false,
+            })
+            .unwrap_or_else(|| panic!("expected initial stall warning"));
+        assert_eq!(first_cause, "output stalled (0 bytes sent)");
+
+        // Drops occur at 3s inside cooldown (suppressed).
+        assert_eq!(
+            watch.detect_trouble(&OutputLagTick {
+                at_ms: 3_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 1_000_000,
+                sender_dropped: 6,
+                dests: &dest(4),
+                paused: false,
+            }),
+            None
+        );
+
+        // At 6s (cooldown expired), even if no new drop/stall happens on this calm tick,
+        // the pending burst from during cooldown must flush with its retained cause.
+        let (cause, _, burst) = watch
+            .detect_trouble(&OutputLagTick {
+                at_ms: 6_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 1_600_000,
+                sender_dropped: 6,
+                dests: &dest(4),
+                paused: false,
+            })
+            .unwrap_or_else(|| panic!("expected retained drop burst to flush once cooldown elapsed"));
+        assert_eq!(cause, "sender dropping packets");
+        assert_eq!(burst, 10);
     }
 }
