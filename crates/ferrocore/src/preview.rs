@@ -196,11 +196,12 @@ impl Compositor {
             .find(|f| !f.is_srgb())
             .or_else(|| caps.formats.first().copied())
             .ok_or_else(|| AvError::NoGpu("the preview's surface takes no format this card draws".into()))?;
+        let (w, h) = self.clamped_surface_size(width, height);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: width.max(1),
-            height: height.max(1),
+            width: w,
+            height: h,
             // Never waits for the screen: the engine's frame loop draws it and mustn't stall.
             present_mode: wgpu::PresentMode::AutoNoVsync,
             desired_maximum_frame_latency: 2,
@@ -212,9 +213,14 @@ impl Compositor {
         Ok(PreviewSurface { surface, config })
     }
 
+    fn clamped_surface_size(&self, width: u32, height: u32) -> (u32, u32) {
+        let max_dim = self.device.limits().max_texture_dimension_2d.max(1);
+        (width.clamp(1, max_dim), height.clamp(1, max_dim))
+    }
+
     /// The view changed size (device pixels).
     pub fn resize_preview(&self, s: &mut PreviewSurface, width: u32, height: u32) {
-        let (w, h) = (width.max(1), height.max(1));
+        let (w, h) = self.clamped_surface_size(width, height);
         if (s.config.width, s.config.height) != (w, h) {
             (s.config.width, s.config.height) = (w, h);
             self.configure(&s.surface, &s.config);
@@ -224,27 +230,41 @@ impl Compositor {
     /// Draws `shown` and presents it in the surface. A frame the window can't take now (hidden,
     /// being resized) is skipped.
     pub fn present(&self, s: &mut PreviewSurface, shown: Shown<'_>, look: &PreviewLook) -> Result<(), AvError> {
-        let frame = match s.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f) => f,
-            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
-                self.configure(&s.surface, &s.config);
-                f
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.configure(&s.surface, &s.config);
-                return Ok(());
-            }
-            _ => return Ok(()),
+        let got = s.surface.get_current_texture();
+        let Some(frame) = self.finish_surface_acquire(s, got) else {
+            return Ok(());
         };
         let view = frame.texture.create_view(&Default::default());
         let mut enc = self.device.create_command_encoder(&Default::default());
         let canvas = self.canvas_of(&mut enc, shown)?;
         self.paint(&mut enc, &view, s.config.format, (s.config.width, s.config.height), &canvas, look);
         self.submit([enc.finish()]);
-        self.queue.present(frame);
+        self.present_surface(frame);
         // What finished drawing is let go now (Direct3D and Vulkan hold it until asked).
         let _ = self.device.poll(wgpu::PollType::Poll);
         Ok(())
+    }
+
+    fn finish_surface_acquire(
+        &self,
+        s: &mut PreviewSurface,
+        got: wgpu::CurrentSurfaceTexture,
+    ) -> Option<wgpu::SurfaceTexture> {
+        match got {
+            wgpu::CurrentSurfaceTexture::Success(f) => Some(f),
+            wgpu::CurrentSurfaceTexture::Suboptimal(f) => {
+                // Drop the acquired swapchain texture before reconfiguring; configuring while it is
+                // still alive raises `PreviousOutputExists` and leaves the surface unconfigured.
+                drop(f);
+                self.configure(&s.surface, &s.config);
+                None
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.configure(&s.surface, &s.config);
+                None
+            }
+            _ => None,
+        }
     }
 
     /// The same, read back: RGBA rows of a `width`×`height` view.
@@ -820,5 +840,116 @@ mod tests {
         look.outlines[0].handles = false;
         let plain = layout((200, 100), (160, 90), &PreviewLook { guides: None, ..look.clone() }).len();
         assert_eq!(layout((200, 100), (160, 90), &look).len(), plain);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    fn test_metal_surface(
+        gpu: &Compositor,
+        width: u32,
+        height: u32,
+    ) -> (objc2::rc::Retained<objc2::runtime::AnyObject>, PreviewSurface) {
+        use objc2::msg_send;
+        use objc2::rc::Retained;
+        use objc2::runtime::{AnyClass, AnyObject};
+        use std::ffi::c_void;
+        let Some(cls) = AnyClass::get(c"CAMetalLayer") else {
+            panic!("CAMetalLayer class missing");
+        };
+        // SAFETY: `CAMetalLayer` is an Objective-C `CALayer` subclass; `+new` returns a retained instance.
+        let layer: Retained<AnyObject> = unsafe { msg_send![cls, new] };
+        let ptr: *mut c_void = Retained::as_ptr(&layer).cast_mut().cast();
+        // SAFETY: `layer` is kept alive by the returned `Retained<AnyObject>`, which callers drop after the surface.
+        let raw = unsafe { gpu.instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(ptr)) }
+            .unwrap_or_else(|e| panic!("metal surface: {e}"));
+        let surf = gpu.surface_from(raw, width, height).unwrap_or_else(|e| panic!("surface_from: {e}"));
+        (layer, surf)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oversized_preview_surface_clamps_without_validation_error() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (layer, mut surf) = test_metal_surface(&gpu, 100_000, 100_000);
+        assert_eq!(
+            gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "initial oversized configure must clamp instead of triggering TooLarge validation error"
+        );
+        gpu.resize_preview(&mut surf, 100_000, 100_000);
+        assert_eq!(
+            gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "resize_preview with oversized bounds must clamp instead of triggering validation error"
+        );
+        let scene = Scene { width: 320, height: 180, items: Vec::new() };
+        gpu.resize_preview(&mut surf, 320, 180);
+        let _ = gpu.present(&mut surf, Shown::Scene(&scene), &PreviewLook::default());
+        assert_eq!(gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(surf);
+        drop(layer);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn suboptimal_surface_reconfigures_cleanly_without_previous_output_exists() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (layer, mut surf) = test_metal_surface(&gpu, 320, 180);
+        let wgpu::CurrentSurfaceTexture::Success(frame) = surf.surface.get_current_texture() else {
+            return;
+        };
+        if let Some(left) = gpu.finish_surface_acquire(&mut surf, wgpu::CurrentSurfaceTexture::Suboptimal(frame)) {
+            gpu.present_surface(left);
+        }
+        let scene = Scene { width: 320, height: 180, items: Vec::new() };
+        let _ = gpu.present(&mut surf, Shown::Scene(&scene), &PreviewLook::default());
+        assert_eq!(
+            gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "Suboptimal surface must drop the acquired texture before reconfiguring so NotConfigured never follows"
+        );
+        drop(surf);
+        drop(layer);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn concurrent_present_and_resize_surfaces_emit_zero_validation_errors() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (layer_a, mut surf_a) = test_metal_surface(&gpu, 320, 180);
+        let (layer_b, mut surf_b) = test_metal_surface(&gpu, 320, 180);
+        std::thread::scope(|s| {
+            let gpu_b = &gpu;
+            s.spawn(move || {
+                for i in 0..30u32 {
+                    let w = 300 + (i % 10) * 8;
+                    gpu_b.resize_preview(&mut surf_b, w, 180);
+                }
+                drop(surf_b);
+            });
+            let scene = Scene { width: 320, height: 180, items: Vec::new() };
+            for _ in 0..30 {
+                let _ = gpu.present(&mut surf_a, Shown::Scene(&scene), &PreviewLook::default());
+            }
+            drop(surf_a);
+        });
+        assert_eq!(
+            gpu.uncaptured_errors.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "concurrent present_surface and configure must not trigger GpuWaitTimeout"
+        );
+        drop(layer_b);
+        drop(layer_a);
+    }
+
+    #[test]
+    fn wgpu_validation_error_collapses_to_single_diagnostic_line() {
+        let err = wgpu::Error::Validation {
+            source: Box::new(std::io::Error::other("surface not configured")),
+            description: "Validation Error\n\nCaused by:\n  Surface is not configured for presentation\n".into(),
+        };
+        let line = crate::compose::format_wgpu_error(&err);
+        assert!(!line.contains('\n'), "{line:?}");
+        assert!(line.contains("Caused by: Surface is not configured"), "{line:?}");
     }
 }
