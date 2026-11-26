@@ -42,6 +42,8 @@ pub struct Pipeline {
     carry: Vec<Tag>,
     /// The first frame's time: 0 for everything after.
     start_ns: Option<u64>,
+    /// Shared stream epoch across simultaneous/mid-stream outputs on one engine.
+    epoch_ns: Option<u64>,
     /// Where the sound's first sample sits on the output's clock.
     audio_offset_us: Option<i64>,
     sent_video_header: bool,
@@ -431,6 +433,7 @@ impl Pipeline {
             audio: AudioEncoder::new(audio)?,
             carry: Vec::new(),
             start_ns: None,
+            epoch_ns: None,
             audio_offset_us: None,
             sent_video_header: false,
             sent_audio_header: false,
@@ -466,6 +469,28 @@ impl Pipeline {
             rec_held: VecDeque::new(),
             last_in_us: 0,
         })
+    }
+
+    /// Anchors this output to an existing shared stream epoch (nanoseconds on the engine clock).
+    pub fn set_epoch_ns(&mut self, epoch_ns: u64) {
+        self.epoch_ns = Some(epoch_ns);
+    }
+
+    /// Returns the shared engine epoch this output is anchored to, if any.
+    pub fn epoch_ns(&self) -> Option<u64> {
+        self.epoch_ns
+    }
+
+    /// Returns the timestamp (ns) of the first video frame encoded by this output, if started.
+    pub fn start_ns(&self) -> Option<u64> {
+        self.start_ns
+    }
+
+    /// Maps a local presentation timestamp (`pts_us` since `start_ns`) onto `epoch_ns`.
+    pub fn anchored_pts_us(&self, local_pts_us: i64) -> Option<i64> {
+        let (start, epoch) = (self.start_ns?, self.epoch_ns?);
+        let delta_us = (i128::from(start) - i128::from(epoch)) / 1000;
+        i64::try_from(delta_us + i128::from(local_pts_us)).ok()
     }
 
     /// Starts recording into `path` on this running output, at its next frame (a keyframe),
@@ -854,6 +879,9 @@ impl Pipeline {
             return Err(AvError::Source("an injected encoder fault".into()));
         }
         let start = *self.start_ns.get_or_insert(ts_ns);
+        if self.epoch_ns.is_none() {
+            self.epoch_ns = Some(start);
+        }
         let first = !self.sent_video_header && self.video.header().is_none();
         let key = first || std::mem::take(&mut self.key_next);
         let pts = (ts_ns.saturating_sub(start).saturating_sub(self.paused_ns) / 1000) as i64;
@@ -2665,5 +2693,48 @@ mod bframe_tests {
         for (got, want) in pts_ms.iter().zip(&input_pts_ms) {
             assert!((got - want).abs() <= 1, "display time altered: got={got} ms want={want} ms");
         }
+    }
+
+    #[test]
+    fn midstream_pipeline_anchors_to_shared_epoch_with_tight_av_sync() {
+        let vcfg = VideoConfig { software: true, ..video(false) };
+        let acfg = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
+        let Ok(mut pipe) = Pipeline::new(vcfg, acfg, None) else { return };
+        let epoch_ns: u64 = 10_000_000_000;
+        let start_ns: u64 = epoch_ns + 300_000_000_000;
+        pipe.set_epoch_ns(epoch_ns);
+
+        let y = vec![128u8; 320 * 180];
+        let uv = vec![128u8; 320 * 90];
+        let frame = Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 };
+
+        // Audio from before first frame must be trimmed so mid-stream A/V starts together.
+        let mut tags = Vec::new();
+        tags.extend(pipe.video(frame, start_ns).unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!(pipe.epoch_ns(), Some(epoch_ns));
+        assert_eq!(pipe.start_ns(), Some(start_ns));
+
+        let step_ns = 1_000_000_000 / 30;
+        let block_ns = (1024u64 * 1_000_000_000) / 48_000;
+        let pre_audio = vec![0.0f32; 1024 * 2];
+        tags.extend(pipe.audio(&pre_audio, start_ns - block_ns / 2).unwrap_or_else(|e| panic!("{e}")));
+        for i in 1..=15u64 {
+            tags.extend(pipe.video(frame, start_ns + i * step_ns).unwrap_or_else(|e| panic!("{e}")));
+            tags.extend(pipe.audio(&pre_audio, start_ns - block_ns / 2 + i * block_ns).unwrap_or_else(|e| panic!("{e}")));
+        }
+        let anchored_0 = pipe.anchored_pts_us(0);
+        tags.extend(pipe.finish().unwrap_or_else(|e| panic!("{e}")));
+
+        let first_video_ms = tags.iter().find_map(|t| match t {
+            Tag::Video { ms, body } if body.len() > 5 && body[1] == 1 => Some(i64::from(*ms)),
+            _ => None,
+        });
+        let first_audio_ms = tags.iter().find_map(|t| match t {
+            Tag::Audio { ms, body } if body.len() > 2 && body[1] == 1 => Some(i64::from(*ms)),
+            _ => None,
+        });
+        let (fv, fa) = (first_video_ms.expect("video frame"), first_audio_ms.expect("audio frame"));
+        assert!((fv - fa).abs() < 40, "mid-stream A/V start skewed: video={fv}ms audio={fa}ms");
+        assert_eq!(anchored_0, Some(300_000_000));
     }
 }
