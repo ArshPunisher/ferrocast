@@ -355,3 +355,42 @@ async fn a_reload_keeps_the_active_design() {
     e.reload().await.unwrap();
     assert_eq!(e.state().active_design.as_ref().map(|d| d.id.as_str()), Some("builtin.molten"));
 }
+
+#[tokio::test]
+async fn reimporting_a_theme_screen_gives_unique_numbered_overlay_names() {
+    let (e, _d) = with_catalogue().await;
+    let first = e
+        .use_design("builtin.forge", UseRequest { scenes: vec!["in_game".into()], ..Default::default() })
+        .await
+        .unwrap();
+    let second = e
+        .use_design("builtin.forge", UseRequest { scenes: vec!["in_game".into()], ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(first.overlays[0].name, "Be right back (Forge)");
+    assert_eq!(second.overlays[0].name, "Be right back (Forge) 2");
+
+    // Case-insensitive collision with " 3" is skipped, picking " 4" once " 2" is freed.
+    let mut renamed = e.overlay(&second.overlays[0].id).await.unwrap();
+    renamed.name = "be right back (forge) 3".into();
+    e.update_overlay(renamed).await.unwrap();
+    let third = e
+        .use_design("builtin.forge", UseRequest { scenes: vec!["in_game".into()], ..Default::default() })
+        .await
+        .unwrap();
+    let fourth = e
+        .use_design("builtin.forge", UseRequest { scenes: vec!["in_game".into()], ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(third.overlays[0].name, "Be right back (Forge) 2");
+    assert_eq!(fourth.overlays[0].name, "Be right back (Forge) 4");
+
+    // Names near the 60-character limit still leave room for the numbered suffix.
+    let long_base = "X".repeat(60);
+    e.create_overlay(&long_base, Preset::Blank).await.unwrap();
+    let d = e.design("builtin.forge").await.unwrap();
+    let DesignContent::Theme(t) = &d.content else { unreachable!() };
+    let numbered = e.place_scene(&d, &t.scenes[0], &long_base, None).await.unwrap();
+    assert_eq!(numbered.name.chars().count(), 60);
+    assert!(numbered.name.ends_with(" 2"), "got {}", numbered.name);
+}

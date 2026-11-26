@@ -88,6 +88,28 @@ fn short(name: &str, max: usize) -> String {
     name.trim().chars().take(max).collect::<String>().trim_end().to_string()
 }
 
+fn unique_overlay_name(existing: &[Overlay], raw: &str) -> String {
+    let base = short(raw, 60);
+    let base = if base.is_empty() { "Overlay".to_string() } else { base };
+    let taken = |cand: &str| {
+        let lower = cand.to_lowercase();
+        existing.iter().any(|o| o.name.to_lowercase() == lower)
+    };
+    if !taken(&base) {
+        return base;
+    }
+    let mut n = 2usize;
+    loop {
+        let suffix = format!(" {n}");
+        let prefix = short(&base, 60usize.saturating_sub(suffix.chars().count()));
+        let cand = format!("{prefix}{suffix}");
+        if !taken(&cand) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
 impl Engine {
     /// Loads the catalogue that ships with the app (`designs/catalog.json` in the overlay
     /// bundle). Anything that isn't a valid built-in is left out with a warning.
@@ -405,9 +427,15 @@ impl Engine {
                 Ok(view)
             }
             None => {
-                let o = Overlay { widgets: layers, ..scene.as_overlay("new", Some(link)) };
-                let o = Overlay { name: name.to_string(), ..o };
-                let made = self.db(move |s| repo::overlays::create_from(s, o)).await?;
+                let mut o = Overlay { widgets: layers, ..scene.as_overlay("new", Some(link)) };
+                let raw = name.to_string();
+                let made = self
+                    .db(move |s| {
+                        let existing = repo::overlays::list(s)?;
+                        o.name = unique_overlay_name(&existing, &raw);
+                        repo::overlays::create_from(s, o)
+                    })
+                    .await?;
                 Ok(self.overlay_view(&made))
             }
         }
