@@ -1180,7 +1180,9 @@ async fn engine_capture_keys(State(app): State<AppState>, Body(b): Body<CaptureK
 /// cleared now and not raised again for this stream. 400 for any other id.
 async fn engine_silence_alert(State(app): State<AppState>, Body(b): Body<SilenceAlert>) -> ApiResult<StatusCode> {
     if !app.engine.live_alert_silence(&b.id) {
-        return Err(ferrocast_engine::EngineError::Invalid("id: a mic alert (mic:muted:…).".into()).into());
+        return Err(
+            ferrocast_engine::EngineError::Invalid("id: a mic alert (mic:muted:… or mic:quiet:…).".into()).into()
+        );
     }
     Ok(StatusCode::NO_CONTENT)
 }

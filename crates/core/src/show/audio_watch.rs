@@ -44,14 +44,16 @@ pub const GATED_CLEAR_TICKS: u32 = 15;
 /// The window the voice's level is judged over, and the least of it that must be seen.
 pub const QUIET_WINDOW_S: i64 = 60;
 pub const QUIET_SPAN_S: i64 = 45;
-/// A tick counts as speech above the room's floor plus 6 dB, and never below this.
+/// A tick counts as speech when `speech` is true, its peak is above this, and RMS exceeds
+/// `SPEECH_MIN_RMS_DB`.
 pub const SPEECH_MIN_DB: f32 = -54.0;
+pub const SPEECH_MIN_RMS_DB: f32 = -55.0;
 /// A voice reaching this on the stream is fine (aim is -18 to -6).
 pub const GOOD_PEAK_DB: f32 = -24.0;
 /// The speech's 75th percentile under this, with nothing ever reaching `GOOD_PEAK_DB`: too quiet.
 pub const QUIET_P75_DB: f32 = -28.0;
-/// At least this many speech ticks (12 s of talk) in the window before judging.
-pub const SPEECH_TICKS_MIN: usize = 6;
+/// At least this many speech ticks (~16 s of genuine talk) in the window before judging.
+pub const SPEECH_TICKS_MIN: usize = 8;
 /// Ticks reaching `GOOD_PEAK_DB` that clear the notice (one thump isn't enough).
 pub const GOOD_TICKS_CLEAR: usize = 3;
 /// An on-air scene with no picture this long (seconds) is said.
@@ -63,11 +65,15 @@ pub struct MicLevel {
     pub name: String,
     /// After its filters and fader: what the stream gets.
     pub peak_db: f32,
+    /// Post-filter/fader RMS magnitude (`magnitude` in `LevelInfo`).
+    pub rms_db: f32,
     /// Before them, and before the mute: what the device hears.
     pub input_db: f32,
     pub muted: bool,
     /// Held shut by a push-to-talk or push-to-mute key: on purpose.
     pub gated: bool,
+    /// Real speech detected on this tick (RNNoise VAD / gate state / sustained energy).
+    pub speech: bool,
     /// Its fader, dB.
     pub volume_db: f32,
     /// A mic the Show's own list already watches for silence (no second "no sound" notice).
@@ -84,6 +90,14 @@ pub struct SceneLook {
     pub faded: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QuietSample {
+    at: i64,
+    peak_db: f32,
+    rms_db: f32,
+    speech: bool,
+}
+
 /// What's been seen of one mic.
 #[derive(Debug, Default)]
 pub(super) struct MicTrack {
@@ -98,8 +112,8 @@ pub(super) struct MicTrack {
     dead_since: Option<i64>,
     /// Ticks in a row above `HEARS_DB`.
     heard_run: u32,
-    /// `(at, post-fader peak)` while it was on, last `QUIET_WINDOW_S`.
-    window: VecDeque<(i64, f32)>,
+    /// Samples while it was open, last `QUIET_WINDOW_S`.
+    window: VecDeque<QuietSample>,
 }
 
 fn percentile(sorted: &[f32], p: f32) -> f32 {
@@ -109,20 +123,21 @@ fn percentile(sorted: &[f32], p: f32) -> f32 {
 
 /// Whether the voice is too quiet over the window; `raised` keeps it so until it's clearly
 /// fixed (hysteresis, so it never flaps).
-fn judge_quiet(window: &VecDeque<(i64, f32)>, raised: bool) -> bool {
+fn judge_quiet(window: &VecDeque<QuietSample>, raised: bool) -> bool {
     let (Some(first), Some(last)) = (window.front(), window.back()) else { return false };
-    if (last.0 - first.0) / 1000 < QUIET_SPAN_S {
+    if (last.at - first.at) / 1000 < QUIET_SPAN_S {
         return raised;
     }
-    let mut all: Vec<f32> = window.iter().map(|w| w.1).collect();
-    all.sort_by(f32::total_cmp);
-    let floor = percentile(&all, 0.2).clamp(-70.0, -45.0);
-    let threshold = (floor + 6.0).max(SPEECH_MIN_DB);
-    let speech: Vec<f32> = all.iter().copied().filter(|v| *v > threshold).collect();
-    let good = all.iter().filter(|v| **v >= GOOD_PEAK_DB).count();
     if !raised && window.len() < QUIET_TICKS_MIN {
         return false;
     }
+    let mut speech: Vec<f32> = window
+        .iter()
+        .filter(|w| w.speech && w.peak_db > SPEECH_MIN_DB && w.rms_db > SPEECH_MIN_RMS_DB)
+        .map(|w| w.peak_db)
+        .collect();
+    speech.sort_by(f32::total_cmp);
+    let good = window.iter().filter(|w| w.peak_db >= GOOD_PEAK_DB).count();
     if raised {
         return good < GOOD_TICKS_CLEAR && !speech.is_empty() && percentile(&speech, 0.75) < QUIET_P75_DB;
     }
@@ -231,9 +246,9 @@ impl LiveWatch {
             self.flip(out, &id_s, dead_wrong, &format!("{name} hears you again."));
             // A voice that stays too quiet.
             if live {
-                t.window.push_back((s.at, m.peak_db));
+                t.window.push_back(QuietSample { at: s.at, peak_db: m.peak_db, rms_db: m.rms_db, speech: m.speech });
             }
-            while t.window.front().is_some_and(|w| s.at - w.0 > QUIET_WINDOW_S * 1000) {
+            while t.window.front().is_some_and(|w| s.at - w.at > QUIET_WINDOW_S * 1000) {
                 t.window.pop_front();
             }
             t.gated_run = if m.gated { t.gated_run + 1 } else { 0 };
@@ -255,12 +270,10 @@ impl LiveWatch {
             } else {
                 let quiet = judge_quiet(&t.window, self.raised.contains(&id_q));
                 let wrong = quiet.then(|| {
-                    LiveAlert::raised(&id_q, "warn", format!("{name} is very quiet."))
-                        .detail(format!(
-                            "{name} is far below the level viewers need (aim for peaks of -18 to -6 dB). \
-                             Raise the mic's gain or volume; +6 dB is a safe first step."
-                        ))
+                    LiveAlert::raised(&id_q, "warn", format!("{name} sounds quiet."))
+                        .detail("No gain was changed. Tap +6 dB to boost it, or move closer to the mic.")
                         .action(name, "gain_up")
+                        .dismissable("quiet_ok")
                 });
                 self.flip(out, &id_q, wrong, "Your voice is loud enough now.");
             }
@@ -292,12 +305,18 @@ mod tests {
         MicLevel {
             name: "KREO".into(),
             peak_db: peak,
+            rms_db: (peak - 6.0).max(-100.0),
             input_db: input,
             muted,
             gated: false,
+            speech: false,
             volume_db: 0.0,
             listed: false,
         }
+    }
+
+    fn mic_speech(peak: f32, rms: f32, input: f32) -> MicLevel {
+        MicLevel { speech: true, rms_db: rms, ..mic(peak, input, false) }
     }
 
     /// Feeds one level every 2 s for `secs`; returns every alert in order.
@@ -329,8 +348,13 @@ mod tests {
         assert!(a.is_empty(), "{a:?}");
         // Five minutes of normal speech (peaks -20 to -8) with pauses: nothing.
         let a = feed(&mut w, &mut t, 300, |i| {
-            let p = if i % 4 == 3 { room(i) } else { -20.0 + (i % 3) as f32 * 6.0 };
-            vec![mic(p, p, false)]
+            let m = if i % 4 == 3 {
+                mic(room(i), room(i), false)
+            } else {
+                let p = -20.0 + (i % 3) as f32 * 6.0;
+                mic_speech(p, p - 6.0, p)
+            };
+            vec![m]
         });
         assert!(a.is_empty(), "{a:?}");
         // A muted mic in a quiet room, and one keyboard thump on it: nothing.
@@ -378,22 +402,30 @@ mod tests {
     #[test]
     fn a_quiet_voice_is_said_after_a_minute_of_talk_and_clears_when_raised() {
         let (mut w, mut t) = (LiveWatch::default(), 0);
-        // 19 Nov: speech peaking at -50 over a -65 room, every other tick.
+        // Quiet speech peaking at -50..-48 dB (RMS -54..-52 dB) over a -65 room, every other tick.
         let quiet = |i: i64| {
-            let p = if i % 2 == 0 { -50.0 + (i % 3) as f32 } else { -65.0 };
-            vec![mic(p, p, false)]
+            let m = if i % 2 == 0 {
+                let p = -50.0 + (i % 3) as f32;
+                mic_speech(p, p - 4.0, p)
+            } else {
+                mic(-65.0, -65.0, false)
+            };
+            vec![m]
         };
         let a = feed(&mut w, &mut t, 40, quiet);
         assert!(a.is_empty(), "not before a minute of data: {a:?}");
         let a = feed(&mut w, &mut t, 30, |i| quiet(i + 20));
         assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), false)], "{a:?}");
+        assert_eq!(a[0].message, "KREO sounds quiet.");
         assert_eq!(a[0].action, Some("gain_up"));
+        assert_eq!(a[0].dismiss, Some("quiet_ok"));
+        assert!(a[0].detail.as_deref().unwrap_or("").contains("No gain was changed"));
         // Said once.
         assert!(feed(&mut w, &mut t, 60, quiet).is_empty());
         // Gain raised: peaks at -12 for a while → cleared.
         let a = feed(&mut w, &mut t, 30, |i| {
-            let p = if i % 2 == 0 { -12.0 } else { -60.0 };
-            vec![mic(p, p, false)]
+            let m = if i % 2 == 0 { mic_speech(-12.0, -18.0, -12.0) } else { mic(-60.0, -60.0, false) };
+            vec![m]
         });
         assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), true)], "{a:?}");
     }
@@ -616,7 +648,10 @@ mod tests {
         assert!(a.is_empty(), "{a:?}");
         // A raised notice, then the key is let go for good: it is let go too.
         let (mut w, mut t) = (LiveWatch::default(), 0);
-        let quiet = |i: i64| vec![mic(if i % 2 == 0 { -50.0 } else { -65.0 }, -50.0, false)];
+        let quiet = |i: i64| {
+            let m = if i % 2 == 0 { mic_speech(-42.0, -48.0, -42.0) } else { mic(-65.0, -65.0, false) };
+            vec![m]
+        };
         let a = feed(&mut w, &mut t, 70, quiet);
         assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), false)], "{a:?}");
         let a = feed(&mut w, &mut t, 40, |_| {
@@ -632,9 +667,53 @@ mod tests {
     fn a_reset_tells_the_page_everything_it_had_raised() {
         let (mut w, mut t) = (LiveWatch::default(), 0);
         assert_eq!(talk_muted(&mut w, &mut t, 4).len(), 1);
+        // A new stream or a wake starts fresh, and tells the page what it forgot.
         let told = w.reset_telling();
         assert_eq!(ids(&told), [("mic:muted:KREO".to_string(), true)]);
         assert!(w.raised().is_empty());
         assert!(w.reset_telling().is_empty());
+    }
+
+    #[test]
+    fn silent_room_with_boosted_noise_and_clicks_never_fires_quiet_warning() {
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        // Five minutes of boosted room noise (-46..-38 dB) plus periodic desk clicks (-33 dB).
+        let a = feed(&mut w, &mut t, 300, |i| {
+            let p = if i % 6 == 0 { -33.0 } else { -46.0 + (i % 8) as f32 };
+            vec![mic(p, p, false)]
+        });
+        assert!(a.is_empty(), "silent room must never trigger quiet-mic warning: {a:?}");
+    }
+
+    #[test]
+    fn quiet_speech_fires_and_silence_suppresses_until_new_stream() {
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        // Sparse speech ticks (< SPEECH_TICKS_MIN = 8) over 60 s never fire.
+        let a = feed(&mut w, &mut t, 64, |i| {
+            let m = if i % 7 == 0 { mic_speech(-36.0, -44.0, -36.0) } else { mic(-64.0, -64.0, false) };
+            vec![m]
+        });
+        assert!(a.is_empty(), "too few speech ticks should not fire: {a:?}");
+
+        // 60 s of quiet speech (-36 dB peak, -44 dB RMS, speech: true) fires with quiet_ok.
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let quiet_talk = |i: i64| {
+            let m = if i % 2 == 0 { mic_speech(-36.0, -44.0, -36.0) } else { mic(-64.0, -64.0, false) };
+            vec![m]
+        };
+        let a = feed(&mut w, &mut t, 64, quiet_talk);
+        assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), false)], "{a:?}");
+        assert_eq!(a[0].dismiss, Some("quiet_ok"));
+        assert_eq!(a[0].action, Some("gain_up"));
+
+        // Dismissing silences it for the rest of the stream.
+        let cleared = w.silence("mic:quiet:KREO").expect("alert was active");
+        assert!(cleared.cleared);
+        assert!(feed(&mut w, &mut t, 120, quiet_talk).is_empty(), "must stay silenced for rest of stream");
+
+        // A new stream starts fresh.
+        w.reset();
+        let a = feed(&mut w, &mut t, 64, quiet_talk);
+        assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), false)], "new stream raises again: {a:?}");
     }
 }

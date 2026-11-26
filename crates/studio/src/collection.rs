@@ -310,6 +310,8 @@ pub struct LevelInfo {
     pub input_peak: [f32; 2],
     /// Muted by a push-to-talk or push-to-mute key right now (the meter shows it dim).
     pub gated: bool,
+    /// Real speech detected on this source (RNNoise VAD / gate / sustained voice energy).
+    pub speech: bool,
 }
 
 /// How the picture goes from one scene to the next.

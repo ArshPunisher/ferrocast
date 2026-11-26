@@ -238,8 +238,8 @@ pub struct LiveAlert {
     /// The one-tap fix the page may offer: `unmute`, `gain_up` (+6 dB) or `pick_scene`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<&'static str>,
-    /// A second button that says "this is on purpose": `muted_on_purpose` silences this alert
-    /// for the rest of the stream (`LiveWatch::silence`).
+    /// A second button that says "this is on purpose" or "dismiss": `muted_on_purpose` or
+    /// `quiet_ok` silences this alert for the rest of the stream (`LiveWatch::silence`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dismiss: Option<&'static str>,
 }

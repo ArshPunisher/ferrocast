@@ -65,6 +65,7 @@ fn read_levels(
                     magnitude: floor(l.rms),
                     input_peak: floor(l.input_peak),
                     gated: l.gated,
+                    speech: l.speech,
                 },
             ))
         })

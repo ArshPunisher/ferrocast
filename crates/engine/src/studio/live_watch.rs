@@ -353,13 +353,15 @@ pub(crate) struct WatchSnap {
 const HOLD_READS: usize = 6;
 const HOLD_GAP: Duration = if cfg!(test) { Duration::from_millis(1) } else { Duration::from_millis(300) };
 
-/// Several reads of the same sounds' levels as one: each peak the highest seen (the sound since
-/// the last tick, not the one 300 ms before it), `gated` if it was at any read, the rest as last read.
+/// Several reads of the same sounds' levels as one: each peak/magnitude the highest seen (the
+/// sound since the last tick, not the one 300 ms before it), `gated` if it was at any read,
+/// `speech` when at least 2 reads reported speech (rejects single-read transient spikes), the rest
+/// as last read.
 pub(crate) fn peak_hold(reads: &[Value]) -> Value {
     let mut out = reads.last().cloned().unwrap_or(Value::Null);
     let Some(obj) = out.as_object_mut() else { return out };
     for (name, level) in obj.iter_mut() {
-        for key in ["peak", "input_peak"] {
+        for key in ["peak", "magnitude", "input_peak"] {
             let best = reads
                 .iter()
                 .filter_map(|r| r[name.as_str()][key].as_array())
@@ -377,6 +379,8 @@ pub(crate) fn peak_hold(reads: &[Value]) -> Value {
         }
         let gated = reads.iter().any(|r| r[name.as_str()]["gated"].as_bool() == Some(true));
         level["gated"] = Value::Bool(gated);
+        let speech_reads = reads.iter().filter(|r| r[name.as_str()]["speech"].as_bool() == Some(true)).count();
+        level["speech"] = Value::Bool(speech_reads >= 2);
     }
     out
 }
@@ -395,13 +399,16 @@ pub(crate) fn mic_levels(mixer: &Value, levels: &Value, listed: &[String]) -> Ve
         let Some(name) = row["name"].as_str() else { continue };
         // A mic nobody has measured yet (just added) says nothing.
         let Some(peak) = loudest(&levels[name]["peak"]) else { continue };
+        let rms = loudest(&levels[name]["magnitude"]).unwrap_or(peak);
         let input = loudest(&levels[name]["input_peak"]).unwrap_or(peak);
         out.push(MicLevel {
             name: name.to_string(),
             peak_db: peak,
+            rms_db: rms,
             input_db: input,
             muted: row["muted"].as_bool() == Some(true),
             gated: levels[name]["gated"].as_bool() == Some(true),
+            speech: levels[name]["speech"].as_bool().unwrap_or(false),
             volume_db: row["volume_db"].as_f64().unwrap_or(0.0) as f32,
             listed: listed.iter().any(|l| l == name),
         });
@@ -978,6 +985,46 @@ mod tests {
         assert_eq!(one["KREO"]["peak"], json!([-30.0, -31.0]));
         assert_eq!(one["KREO"]["gated"], json!(false));
         assert_eq!(peak_hold(&[]), Value::Null);
+    }
+
+    #[test]
+    fn peak_hold_aggregates_magnitude_and_requires_two_speech_reads() {
+        let read = |peak: f64, mag: f64, speech: bool| json!({ "KREO": { "peak": [peak, peak], "magnitude": [mag, mag], "input_peak": [peak, peak], "gated": false, "speech": speech } });
+        // Only 1 speech read out of 6 -> speech stays false (single-spike veto).
+        let one_spike = peak_hold(&[
+            read(-55.0, -60.0, false),
+            read(-30.0, -40.0, true),
+            read(-55.0, -60.0, false),
+            read(-55.0, -60.0, false),
+            read(-55.0, -60.0, false),
+            read(-55.0, -60.0, false),
+        ]);
+        assert_eq!(one_spike["KREO"]["speech"], json!(false));
+        assert_eq!(one_spike["KREO"]["magnitude"], json!([-40.0, -40.0]));
+
+        // 2 speech reads out of 6 -> speech is true even if the trailing read was a pause.
+        let two_reads = peak_hold(&[
+            read(-38.0, -45.0, true),
+            read(-36.0, -43.0, true),
+            read(-62.0, -66.0, false),
+            read(-62.0, -66.0, false),
+            read(-62.0, -66.0, false),
+            read(-62.0, -66.0, false),
+        ]);
+        assert_eq!(two_reads["KREO"]["speech"], json!(true));
+        assert_eq!(two_reads["KREO"]["peak"], json!([-36.0, -36.0]));
+        assert_eq!(two_reads["KREO"]["magnitude"], json!([-43.0, -43.0]));
+
+        let mixer = json!([row("KREO", json!({}))]);
+        let mics = mic_levels(&mixer, &two_reads, &[]);
+        assert_eq!(mics.len(), 1);
+        assert!(mics[0].speech);
+        assert_eq!(mics[0].rms_db, -43.0);
+
+        // Missing speech field (older engine) safely defaults to false.
+        let legacy = json!({ "KREO": { "peak": [-40.0, -40.0], "input_peak": [-40.0, -40.0] } });
+        let legacy_mics = mic_levels(&mixer, &legacy, &[]);
+        assert!(!legacy_mics[0].speech);
     }
 
     #[test]
