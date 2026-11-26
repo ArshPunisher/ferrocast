@@ -325,14 +325,11 @@ pub fn parse_channel_viewers(v: &Value) -> KickChannelViewers {
 pub fn parse_livestream_viewers(v: &Value, broadcaster_id: Option<&str>) -> Option<u64> {
     let items = v.get("data").and_then(Value::as_array)?;
     let entry = if let Some(bid) = broadcaster_id {
-        items
-            .iter()
-            .find(|item| match item.get("broadcaster_user_id") {
-                Some(Value::Number(n)) => n.to_string() == bid,
-                Some(Value::String(s)) => s == bid,
-                _ => false,
-            })
-            .or_else(|| items.first())
+        items.iter().find(|item| match item.get("broadcaster_user_id") {
+            Some(Value::Number(n)) => n.to_string() == bid,
+            Some(Value::String(s)) => s == bid,
+            _ => false,
+        })
     } else {
         items.first()
     }?;

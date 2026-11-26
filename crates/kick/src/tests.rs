@@ -373,8 +373,21 @@ fn parse_kick_viewer_counts_handles_channels_and_livestreams_fixtures() {
     );
     assert_eq!(
         parse_livestream_viewers(&json!({ "data": [{ "broadcaster_user_id": 99, "viewer_count": "12" }] }), Some("42")),
-        Some(12)
+        None
     );
+    assert_eq!(
+        parse_livestream_viewers(
+            &json!({
+                "data": [
+                    { "broadcaster_user_id": 11, "viewer_count": 5 },
+                    { "broadcaster_user_id": 99, "viewer_count": 12 }
+                ]
+            }),
+            Some("42")
+        ),
+        None
+    );
+    assert_eq!(parse_livestream_viewers(&json!({ "data": [{ "viewer_count": 19 }] }), Some("42")), None);
 }
 
 #[tokio::test]
