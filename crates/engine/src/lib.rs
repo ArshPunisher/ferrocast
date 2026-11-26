@@ -31,6 +31,7 @@ pub mod ffmpeg_get;
 pub mod fonts;
 mod giveaways;
 pub mod golive;
+pub mod golive_plan;
 mod guests;
 mod history;
 pub mod import;
