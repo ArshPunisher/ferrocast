@@ -526,6 +526,9 @@ pub struct DestinationView {
     /// variable"), for its details; never the key itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_note: Option<String>,
+    /// Advisory note when a destination exceeds a platform's recommendation without hitting a hard cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1677,6 +1680,21 @@ impl Engine {
                     backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
                     standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
                     key_note: key_notes.get(&d.id).cloned(),
+                    quality_note: plan
+                        .destinations
+                        .get(&d.id)
+                        .and_then(|p| p.note.clone())
+                        .or_else(|| {
+                            (!cfg.advanced.ignore_service_limits)
+                                .then(|| probe::ceiling(d.kind, d.enhanced))
+                                .flatten()
+                                .and_then(|lim| match &d.quality {
+                                    DestinationQuality::Custom(q) => lim.recommendation_note(q.width, q.height, q.fps),
+                                    DestinationQuality::SameAsMain => studio_cfg.and_then(|sv| {
+                                        lim.recommendation_note(sv.width, sv.height, sv.fps)
+                                    }),
+                                })
+                        }),
                 }
             })
             .collect();

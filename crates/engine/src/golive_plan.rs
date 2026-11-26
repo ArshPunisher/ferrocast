@@ -250,6 +250,8 @@ pub struct PlannedDestination {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shared_with: Vec<String>,
     pub on_light: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// Measured PC budget check returned alongside an [`EncodePlan`].
@@ -441,7 +443,7 @@ fn resolve_normal_fit(
     ignore_service_limits: bool,
 ) -> (FittedEncode, Option<PlatformLimit>) {
     if d.canvas == Canvas::Vertical && vertical_cut {
-        return (FittedEncode { key: base.as_key(), separate_encode: false, auto_fitted: false, capped: None }, None);
+        return (FittedEncode { key: base.as_key(), separate_encode: false, auto_fitted: false, capped: None, note: None }, None);
     }
     let limit = destination_limit(d);
     let ignore = effective_ignore_limits(d, ignore_service_limits);
@@ -461,10 +463,11 @@ fn resolve_normal_fit(
                     separate_encode: false,
                     auto_fitted: false,
                     capped: None,
+                    note: None,
                 })
             }
             DestinationQuality::SameAsMain => {
-                FittedEncode { key: base.as_key(), separate_encode: false, auto_fitted: false, capped: None }
+                FittedEncode { key: base.as_key(), separate_encode: false, auto_fitted: false, capped: None, note: None }
             }
         },
     };
@@ -481,6 +484,7 @@ struct WorkingDest {
     coalesced: bool,
     shared_cap_fallback: bool,
     capped: Option<CappedInfo>,
+    note: Option<String>,
     is_same_as_main: bool,
     is_auto_fitted_same_as_main: bool,
     is_eb: bool,
@@ -583,16 +587,20 @@ fn group_is_auto_fitted_only(g: &WorkingGroup, dests: &[WorkingDest]) -> bool {
 }
 
 fn merged_compatible_key(a: &EncodeKey, b: &EncodeKey) -> Option<EncodeKey> {
-    if (a.canvas, a.width, a.height, a.fps, a.fps_ntsc, a.codec)
-        != (b.canvas, b.width, b.height, b.fps, b.fps_ntsc, b.codec)
-    {
+    if (a.canvas, a.fps_ntsc, a.codec) != (b.canvas, b.fps_ntsc, b.codec) {
+        return None;
+    }
+    let a_px = u64::from(a.width) * u64::from(a.height);
+    let b_px = u64::from(b.width) * u64::from(b.height);
+    let (width, height) = if a_px <= b_px { (a.width, a.height) } else { (b.width, b.height) };
+    if width > a.width || height > a.height || width > b.width || height > b.height {
         return None;
     }
     Some(EncodeKey {
         canvas: a.canvas,
-        width: a.width,
-        height: a.height,
-        fps: a.fps,
+        width,
+        height,
+        fps: a.fps.min(b.fps),
         fps_ntsc: a.fps_ntsc,
         kbps: a.kbps.min(b.kbps),
         codec: a.codec,
@@ -641,7 +649,7 @@ fn coalesce_pass(
     budget: &PcBudget,
 ) {
     while evaluate_budget(groups, main, budget).status == BudgetStatus::Over {
-        let mut best: Option<(u32, usize, usize, EncodeKey)> = None;
+        let mut best: Option<(bool, u32, usize, usize, EncodeKey)> = None;
         for (di, donor) in groups.iter().enumerate() {
             if !group_is_auto_fitted_only(donor, dests) {
                 continue;
@@ -666,20 +674,22 @@ fn coalesce_pass(
                 if !ok_all {
                     continue;
                 }
+                let res_changed = (merged.width, merged.height, merged.fps)
+                    != (donor.key.width.max(target.key.width), donor.key.height.max(target.key.height), donor.key.fps.max(target.key.fps));
                 let kbps_loss = donor.key.kbps.max(target.key.kbps).saturating_sub(merged.kbps);
                 let replace = match &best {
                     None => true,
-                    Some((best_loss, best_di, best_ti, _)) => {
-                        (kbps_loss, donor.id.as_str(), target.id.as_str())
-                            < (*best_loss, groups[*best_di].id.as_str(), groups[*best_ti].id.as_str())
+                    Some((best_res_changed, best_loss, best_di, best_ti, _)) => {
+                        (res_changed, kbps_loss, donor.id.as_str(), target.id.as_str())
+                            < (*best_res_changed, *best_loss, groups[*best_di].id.as_str(), groups[*best_ti].id.as_str())
                     }
                 };
                 if replace {
-                    best = Some((kbps_loss, di, ti, merged));
+                    best = Some((res_changed, kbps_loss, di, ti, merged));
                 }
             }
         }
-        let Some((_, di, ti, merged)) = best else {
+        let Some((_, _, di, ti, merged)) = best else {
             break;
         };
         let target_id = if groups[ti].id == GROUP_MAIN || groups[ti].id == GROUP_VERTICAL {
@@ -988,6 +998,7 @@ pub fn resolve_preview(
             capped: None,
             shared_with: Vec::new(),
             on_light: false,
+            note: None,
         };
     }
     let (fitted, _) = resolve_normal_fit(d, base, vertical_cut, ignore_service_limits);
@@ -1009,6 +1020,7 @@ pub fn resolve_preview(
         capped: fitted.capped,
         shared_with: Vec::new(),
         on_light: false,
+        note: fitted.note,
     }
 }
 
@@ -1060,6 +1072,7 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
                 coalesced: false,
                 shared_cap_fallback: false,
                 capped: None,
+                note: None,
                 is_same_as_main: false,
                 is_auto_fitted_same_as_main: false,
                 is_eb: true,
@@ -1091,6 +1104,7 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
             coalesced: false,
             shared_cap_fallback: false,
             capped: fitted.capped,
+            note: fitted.note,
             is_same_as_main,
             is_auto_fitted_same_as_main,
             is_eb: false,
@@ -1140,6 +1154,10 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
             .get(&d.group_id)
             .map(|list| list.iter().filter(|(id, _)| id != &d.input.id).map(|(_, name)| name.clone()).collect())
             .unwrap_or_default();
+        let note = (!d.is_eb && !effective_ignore_limits(&d.input, input.ignore_service_limits))
+            .then(|| d.limit.as_ref().and_then(|lim| lim.recommendation_note(d.key.width, d.key.height, d.key.fps)))
+            .flatten()
+            .or_else(|| d.note.clone().filter(|_| d.limit.is_none()));
         dest_map.insert(
             d.input.id.clone(),
             PlannedDestination {
@@ -1153,6 +1171,7 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
                 capped: d.capped.clone(),
                 shared_with,
                 on_light: d.on_light,
+                note,
             },
         );
     }
@@ -1234,7 +1253,7 @@ mod tests {
         };
         let plan = plan_encodes(&input);
         assert_eq!(plan.budget.status, BudgetStatus::Ok);
-        assert_eq!(plan.groups.len(), 3, "main (YouTube) + 1080p60@8M (Kick) + 1080p60@6M (Twitch)");
+        assert_eq!(plan.groups.len(), 3, "main (YouTube) + 1080p60@8M (Kick) + 1440p60@6M (Twitch)");
         assert!(!plan.groups.iter().any(|g| g.is_light), "light encoder must not run idle");
 
         let yt = &plan.destinations["youtube"];
@@ -1255,17 +1274,18 @@ mod tests {
         assert_ne!(twitch.group_id, kick.group_id);
         assert_eq!(
             (twitch.key.width, twitch.key.height, twitch.key.kbps, twitch.key.codec),
-            (1920, 1080, 6_000, VideoCodec::H264)
+            (2560, 1440, 6_000, VideoCodec::H264)
         );
         assert!(twitch.separate_encode);
+        assert_eq!(twitch.note.as_deref(), Some("Above Twitch's recommended 1080p"));
     }
 
     #[test]
     fn planner_dedups_identical_custom_encodes_and_preserves_vod_track_union() {
         let mut c1 = dest("c_1", "Relay 1", Service::Custom, Canvas::Main);
         c1.quality = DestinationQuality::Custom(CustomQuality {
-            width: 1920,
-            height: 1080,
+            width: 2560,
+            height: 1440,
             fps: 60,
             kbps: 6_000,
             codec: Some(VideoCodec::H264),
@@ -1288,7 +1308,7 @@ mod tests {
             budget: PcBudget::apple_silicon(2),
         };
         let plan = plan_encodes(&input);
-        // YouTube gets main; c_1, c_2, and auto-fitted Twitch all have identical 1080p60@6000 H.264 keys -> 1 shared group!
+        // YouTube gets main; c_1, c_2, and auto-fitted Twitch all have identical 1440p60@6000 H.264 keys -> 1 shared group!
         assert_eq!(plan.groups.len(), 2, "{:?}", plan.groups);
         let shared_group = plan.group_for_destination("c_1").unwrap();
         assert_eq!(shared_group.members, vec!["c_1", "c_2", "twitch"]);

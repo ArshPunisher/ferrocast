@@ -170,17 +170,24 @@ pub struct BitrateCap {
     pub max_kbps: u32,
 }
 
-/// Hard encoding limits for platforms whose ingest rejects or stutters above a ceiling.
+/// Encoding limits for platforms whose ingest rejects, disconnects, or warns above a ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlatformLimit {
     pub id: &'static str,
     pub service: Service,
     pub name: &'static str,
-    /// Maximum long edge (landscape width or portrait height) so portrait and landscape share one check.
+    /// Hard maximum long edge (`u32::MAX` = no hard edge limit). Portrait and landscape share one check.
     pub max_long_edge: u32,
-    /// Maximum short edge (landscape height or portrait width).
+    /// Hard maximum short edge (`u32::MAX` = no hard edge limit).
     pub max_short_edge: u32,
+    /// Hard maximum frame rate (`u32::MAX` = no hard fps limit).
     pub max_fps: u32,
+    /// Soft recommended long edge (`None` = no advisory resolution note).
+    pub rec_long_edge: Option<u32>,
+    /// Soft recommended short edge (`None` = no advisory resolution note).
+    pub rec_short_edge: Option<u32>,
+    /// Soft recommended frame rate (`None` = no advisory fps note).
+    pub rec_fps: Option<u32>,
     pub max_kbps: u32,
     /// Optional `(short_edge, fps)` ceiling matrix sorted ascending by `(max_short_edge, max_fps)`.
     pub bitrate_matrix: &'static [BitrateCap],
@@ -211,16 +218,18 @@ const FACEBOOK_BITRATE_MATRIX: &[BitrateCap] = &[
     BitrateCap { max_short_edge: 1080, max_fps: 60, max_kbps: 9_000 },
 ];
 
-/// Twitch non-Enhanced standard limit.
-/// Sources: bitrate 6,000, keyint 2 s, codec H.264, audio 320 kbps verified in OBS `services.json` ("Twitch");
-/// 1920x1080 and 60 fps cap unverified in `services.json` (Twitch Broadcasting Guidelines).
+/// Twitch non-Enhanced limit: 6,000 kbps H.264 / 2 s keyint / strict CBR are hard;
+/// 1080p @ 60 fps is recommended only (1440p+ stays selectable with an advisory note).
 pub const TWITCH_LIMIT: PlatformLimit = PlatformLimit {
     id: "twitch",
     service: Service::Twitch,
     name: "Twitch",
-    max_long_edge: 1920,
-    max_short_edge: 1080,
-    max_fps: 60,
+    max_long_edge: u32::MAX,
+    max_short_edge: u32::MAX,
+    max_fps: u32::MAX,
+    rec_long_edge: Some(1920),
+    rec_short_edge: Some(1080),
+    rec_fps: Some(60),
     max_kbps: 6_000,
     bitrate_matrix: &[],
     keyframe_secs: 2,
@@ -242,6 +251,9 @@ pub const KICK_LIMIT: PlatformLimit = PlatformLimit {
     max_long_edge: 1920,
     max_short_edge: 1080,
     max_fps: 60,
+    rec_long_edge: None,
+    rec_short_edge: None,
+    rec_fps: None,
     max_kbps: 8_000,
     bitrate_matrix: &[],
     keyframe_secs: 2,
@@ -262,6 +274,9 @@ pub const YOUTUBE_LIMIT: PlatformLimit = PlatformLimit {
     max_long_edge: 3840,
     max_short_edge: 2160,
     max_fps: 60,
+    rec_long_edge: None,
+    rec_short_edge: None,
+    rec_fps: None,
     max_kbps: 51_000,
     bitrate_matrix: &[],
     keyframe_secs: 2,
@@ -282,6 +297,9 @@ pub const YOUTUBE_VERTICAL_LIMIT: PlatformLimit = PlatformLimit {
     max_long_edge: 1920,
     max_short_edge: 1080,
     max_fps: 60,
+    rec_long_edge: None,
+    rec_short_edge: None,
+    rec_fps: None,
     max_kbps: 15_000,
     bitrate_matrix: &[],
     keyframe_secs: 2,
@@ -302,6 +320,9 @@ pub const FACEBOOK_LIMIT: PlatformLimit = PlatformLimit {
     max_long_edge: 1920,
     max_short_edge: 1080,
     max_fps: 60,
+    rec_long_edge: None,
+    rec_short_edge: None,
+    rec_fps: None,
     max_kbps: 9_000,
     bitrate_matrix: FACEBOOK_BITRATE_MATRIX,
     keyframe_secs: 2,
@@ -322,6 +343,9 @@ pub const X_LIMIT: PlatformLimit = PlatformLimit {
     max_long_edge: 1920,
     max_short_edge: 1080,
     max_fps: 60,
+    rec_long_edge: None,
+    rec_short_edge: None,
+    rec_fps: None,
     max_kbps: 12_000,
     bitrate_matrix: &[],
     keyframe_secs: 3,
@@ -342,6 +366,9 @@ pub const INSTAGRAM_LIMIT: PlatformLimit = PlatformLimit {
     max_long_edge: 1280,
     max_short_edge: 720,
     max_fps: 30,
+    rec_long_edge: None,
+    rec_short_edge: None,
+    rec_fps: None,
     max_kbps: 4_000,
     bitrate_matrix: &[],
     keyframe_secs: 2,
@@ -361,6 +388,9 @@ pub const WHIP_LIMIT: PlatformLimit = PlatformLimit {
     max_long_edge: u32::MAX,
     max_short_edge: u32::MAX,
     max_fps: u32::MAX,
+    rec_long_edge: None,
+    rec_short_edge: None,
+    rec_fps: None,
     max_kbps: u32::MAX,
     bitrate_matrix: &[],
     keyframe_secs: 2,
@@ -381,6 +411,9 @@ impl PlatformLimit {
             max_long_edge: u32::MAX,
             max_short_edge: u32::MAX,
             max_fps: u32::MAX,
+            rec_long_edge: None,
+            rec_short_edge: None,
+            rec_fps: None,
             max_kbps,
             bitrate_matrix: &[],
             keyframe_secs,
@@ -390,6 +423,21 @@ impl PlatformLimit {
             strict_cbr: false,
             force_no_bframes: false,
         }
+    }
+
+    /// Returns an advisory note when `width`×`height` @ `fps` exceeds soft recommendations.
+    pub fn recommendation_note(&self, width: u32, height: u32, fps: u32) -> Option<String> {
+        if let (Some(rl), Some(rs)) = (self.rec_long_edge, self.rec_short_edge)
+            && (width.max(height) > rl || width.min(height) > rs)
+        {
+            return Some(format!("Above {}'s recommended {rs}p", self.name));
+        }
+        if let Some(rf) = self.rec_fps
+            && fps > rf
+        {
+            return Some(format!("Above {}'s recommended {rf} fps", self.name));
+        }
+        None
     }
 
     pub fn is_h264_only(&self) -> bool {
@@ -647,6 +695,8 @@ pub struct FittedEncode {
     pub separate_encode: bool,
     pub auto_fitted: bool,
     pub capped: Option<CappedInfo>,
+    /// Advisory note when chosen/inherited resolution or fps exceeds a soft platform recommendation.
+    pub note: Option<String>,
 }
 
 /// Resolves a destination's effective encode from `main`, optional `limit`, and its chosen `quality`.
@@ -701,7 +751,10 @@ pub fn fit(
                 audio_kbps,
             };
             let separate_encode = key != main.as_key();
-            Ok(FittedEncode { key, separate_encode, auto_fitted: false, capped: None })
+            let note = limit
+                .filter(|_| !ignore_service_limits)
+                .and_then(|lim| lim.recommendation_note(key.width, key.height, key.fps));
+            Ok(FittedEncode { key, separate_encode, auto_fitted: false, capped: None, note })
         }
         DestinationQuality::SameAsMain => {
             let main_key = main.as_key();
@@ -711,7 +764,7 @@ pub fn fit(
                 key.width = w;
                 key.height = h;
                 let separate_encode = key != main_key;
-                return Ok(FittedEncode { key, separate_encode, auto_fitted: false, capped: None });
+                return Ok(FittedEncode { key, separate_encode, auto_fitted: false, capped: None, note: None });
             };
             let (w, h) = fit_dimensions(main.width, main.height, lim.max_long_edge, lim.max_short_edge);
             let fps = largest_fps_divisor(main.fps, lim.max_fps);
@@ -721,6 +774,7 @@ pub fn fit(
             let audio_kbps = main.audio_kbps.min(lim.max_audio_kbps);
             let no_bframes = main.no_bframes || lim.force_no_bframes;
             let cbr_enforced = lim.strict_cbr && main.vbr;
+            let note = lim.recommendation_note(w, h, fps);
             let auto_fitted = (w, h) != (main.width, main.height)
                 || fps != main.fps
                 || kbps != main.kbps
@@ -730,7 +784,7 @@ pub fn fit(
                 || cbr_enforced
                 || (no_bframes != main.no_bframes);
             if !auto_fitted {
-                return Ok(FittedEncode { key: main_key, separate_encode: false, auto_fitted: false, capped: None });
+                return Ok(FittedEncode { key: main_key, separate_encode: false, auto_fitted: false, capped: None, note });
             }
             let key = EncodeKey {
                 canvas: main.canvas,
@@ -747,7 +801,7 @@ pub fn fit(
             };
             let separate_encode = key != main_key;
             let capped = Some(build_fit_capped_info(main, lim, &key, separate_encode));
-            Ok(FittedEncode { key, separate_encode, auto_fitted: true, capped })
+            Ok(FittedEncode { key, separate_encode, auto_fitted: true, capped, note })
         }
     }
 }
@@ -1198,9 +1252,9 @@ mod tests {
                 brand: None,
                 canvas: Canvas::Main,
                 expected_id: Some("twitch"),
-                long_edge: 1920,
-                short_edge: 1080,
-                max_fps: 60,
+                long_edge: u32::MAX,
+                short_edge: u32::MAX,
+                max_fps: u32::MAX,
                 max_kbps: 6_000,
                 keyint: 2,
                 max_keyint: 2,
@@ -1381,10 +1435,11 @@ mod tests {
         let twitch = fit(&main, Some(&twitch_lim), &DestinationQuality::SameAsMain, false).unwrap();
         assert!(twitch.separate_encode);
         assert!(twitch.auto_fitted);
-        assert_eq!((twitch.key.width, twitch.key.height, twitch.key.fps, twitch.key.kbps), (1920, 1080, 60, 6_000));
+        assert_eq!((twitch.key.width, twitch.key.height, twitch.key.fps, twitch.key.kbps), (2560, 1440, 60, 6_000));
         assert_eq!(twitch.key.codec, VideoCodec::H264);
+        assert_eq!(twitch.note.as_deref(), Some("Above Twitch's recommended 1080p"));
         let twitch_cap = twitch.capped.expect("twitch capped chip");
-        assert_eq!(twitch_cap.resolution, Some((1920, 1080)));
+        assert_eq!(twitch_cap.resolution, Some((2560, 1440)));
         assert_eq!(twitch_cap.fps, Some(60));
         assert_eq!(twitch_cap.kbps, 6_000);
         assert!(twitch_cap.separate_encode);
@@ -1569,22 +1624,54 @@ mod tests {
         let same: DestinationQuality = serde_json::from_str(r#"{"mode":"same_as_main"}"#).unwrap();
         assert_eq!(same, DestinationQuality::SameAsMain);
 
-        // EncodeKey deduplicates identical outputs across destinations (e.g. Twitch & Custom 1080p60@6000).
+        // EncodeKey deduplicates identical outputs across destinations (e.g. Kick & Custom 1080p60@8000).
         let main_1440 = MainEncode::from_canvas(Canvas::Main, 2560, 1440, 60, 18_000, VideoCodec::H264);
-        let twitch_lim = platform_limit(Service::Twitch, None, Canvas::Main).unwrap();
-        let twitch_fit = fit(&main_1440, Some(&twitch_lim), &DestinationQuality::SameAsMain, false).unwrap();
+        let kick_lim2 = platform_limit(Service::Kick, None, Canvas::Main).unwrap();
+        let kick_fit = fit(&main_1440, Some(&kick_lim2), &DestinationQuality::SameAsMain, false).unwrap();
         let mut custom_shared = main_1440;
         custom_shared.strict_cbr = true;
         let custom_q = DestinationQuality::Custom(CustomQuality {
             width: 1920,
             height: 1080,
             fps: 60,
-            kbps: 6_000,
+            kbps: 8_000,
             codec: Some(VideoCodec::H264),
         });
         let custom_fit = fit(&custom_shared, None, &custom_q, false).unwrap();
         let mut keys = std::collections::HashSet::new();
-        keys.insert(twitch_fit.key);
+        keys.insert(kick_fit.key);
         assert!(!keys.insert(custom_fit.key), "matching EncodeKeys must deduplicate");
+    }
+
+    #[test]
+    fn twitch_1080p_is_recommended_while_kick_1080p_is_hard() {
+        let main_1440_h264 = MainEncode::from_canvas(Canvas::Main, 2560, 1440, 60, 6_000, VideoCodec::H264);
+        let twitch_lim = platform_limit(Service::Twitch, None, Canvas::Main).unwrap();
+        let kick_lim = platform_limit(Service::Kick, None, Canvas::Main).unwrap();
+
+        // Twitch 1440p60 stays selectable in Custom with advisory note; >6000 kbps stays rejected.
+        let q_1440 = CustomQuality { width: 2560, height: 1440, fps: 60, kbps: 6_000, codec: Some(VideoCodec::H264) };
+        let fitted_custom = fit(&main_1440_h264, Some(&twitch_lim), &DestinationQuality::Custom(q_1440.clone()), false)
+            .expect("Twitch 1440p custom must be selectable");
+        assert_eq!((fitted_custom.key.width, fitted_custom.key.height), (2560, 1440));
+        assert_eq!(fitted_custom.note.as_deref(), Some("Above Twitch's recommended 1080p"));
+
+        let q_over_kbps =
+            CustomQuality { width: 2560, height: 1440, fps: 60, kbps: 7_000, codec: Some(VideoCodec::H264) };
+        assert!(fit(&main_1440_h264, Some(&twitch_lim), &DestinationQuality::Custom(q_over_kbps), false).is_err());
+
+        // Twitch SameAsMain keeps 1440p60 untouched while enforcing hard 6000 kbps / H264 / 2s / CBR.
+        let main_1440_hevc = MainEncode::from_canvas(Canvas::Main, 2560, 1440, 60, 18_000, VideoCodec::Hevc);
+        let twitch_same = fit(&main_1440_hevc, Some(&twitch_lim), &DestinationQuality::SameAsMain, false).unwrap();
+        assert_eq!((twitch_same.key.width, twitch_same.key.height, twitch_same.key.fps, twitch_same.key.kbps), (2560, 1440, 60, 6_000));
+        assert_eq!(twitch_same.key.codec, VideoCodec::H264);
+        assert!(twitch_same.key.strict_cbr);
+        assert_eq!(twitch_same.note.as_deref(), Some("Above Twitch's recommended 1080p"));
+
+        // Kick 1080p remains HARD for both Custom and SameAsMain.
+        assert!(fit(&main_1440_h264, Some(&kick_lim), &DestinationQuality::Custom(q_1440), false).is_err());
+        let kick_same = fit(&main_1440_hevc, Some(&kick_lim), &DestinationQuality::SameAsMain, false).unwrap();
+        assert_eq!((kick_same.key.width, kick_same.key.height, kick_same.key.kbps), (1920, 1080, 8_000));
+        assert_eq!(kick_same.note, None);
     }
 }
