@@ -2931,3 +2931,19 @@ async fn dynamic_hub_registry_routes_custom_group_checks_budget_and_promotes_bac
 
     feeds.iter().for_each(tokio::task::JoinHandle::abort);
 }
+
+#[tokio::test]
+async fn save_golive_and_view_with_backup_do_not_deadlock() {
+    use crate::golive::{Canvas, DestAdvanced};
+    let (e, _dir) = engine().await;
+    let main = e.add_golive_destination("Primary", "rtmp://127.0.0.1:1935/app", "k1", Canvas::Main).await.unwrap();
+    let backup = e.add_golive_destination("Fallback", "rtmp://127.0.0.1:1935/app", "k2", Canvas::Main).await.unwrap();
+    let mut cfg = e.golive_config();
+    cfg.advanced.per.insert(main.id.clone(), DestAdvanced { backup: Some(backup.id.clone()), ..Default::default() });
+    e.save_golive(cfg).await.unwrap();
+    let view = e.golive_view().await;
+    assert_eq!(
+        view.destinations.iter().find(|d| d.id == backup.id).and_then(|d| d.standby_for.as_deref()),
+        Some("Primary")
+    );
+}

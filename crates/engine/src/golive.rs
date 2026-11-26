@@ -1539,8 +1539,9 @@ impl Engine {
         } else {
             lock(&g.upload).clone()
         };
-        let running = lock(&g.running);
-        let paused = lock(&g.paused);
+        let running_health: std::collections::HashMap<String, Health> =
+            lock(&g.running).iter().map(|(id, r)| (id.clone(), r.health.borrow().clone())).collect();
+        let paused = lock(&g.paused).clone();
         let studio_streaming = live && g.studio_live.load(std::sync::atomic::Ordering::Acquire);
         let cap_held = !g.cap_failed.load(std::sync::atomic::Ordering::Acquire);
         let applied_cap = *lock(&g.applied_cap);
@@ -1550,11 +1551,13 @@ impl Engine {
         } else {
             self.studio_limit()
         };
-        let failed = lock(&g.failed);
-        let blocked = lock(&g.blocked);
+        let failed = lock(&g.failed).clone();
+        let blocked = lock(&g.blocked).clone();
         let st = self.state();
         let failing = lock(&g.backup).failing.clone();
         let studio_cfg = *lock(&g.studio_video);
+        let key_notes = lock(&g.key_notes).clone();
+        let cut_state = lock(&g.cut).as_ref().map(|c| c.state.borrow().clone());
         let limiter_still_active = !studio_streaming
             || eff_limit.is_some_and(|limit| {
                 cfg.destinations.iter().any(|x| {
@@ -1657,9 +1660,9 @@ impl Engine {
                     account,
                     enabled: d.enabled,
                     connected,
-                    health: running
+                    health: running_health
                         .get(&d.id)
-                        .map(|r| r.health.borrow().clone())
+                        .cloned()
                         .or_else(|| paused.get(&d.id).cloned())
                         .or_else(|| failed.get(&d.id).cloned()),
                     blocked: blocked.get(&d.id).cloned(),
@@ -1673,7 +1676,7 @@ impl Engine {
                     lighter_for_route: !d.wants_light() && self.on_light(d),
                     backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
                     standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
-                    key_note: lock(&self.golive().key_notes).get(&d.id).cloned(),
+                    key_note: key_notes.get(&d.id).cloned(),
                 }
             })
             .collect();
@@ -1693,7 +1696,7 @@ impl Engine {
             cut: CutView {
                 source: cfg.vertical_source,
                 config: cfg.cut.clone(),
-                state: lock(&g.cut).as_ref().map(|c| c.state.borrow().clone()),
+                state: cut_state,
                 ffmpeg: self.ffmpeg_state(),
             },
         }
