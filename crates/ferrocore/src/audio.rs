@@ -39,7 +39,7 @@ pub fn aac_config(sample_rate: u32, channels: u32) -> Option<[u8; 2]> {
 enum Inner {
     #[cfg(target_os = "macos")]
     Native(crate::apple::aac::Encoder),
-    Ffmpeg(crate::ffenc::Audio),
+    Ffmpeg(Box<crate::ffenc::Audio>),
 }
 
 impl std::fmt::Debug for Inner {
@@ -372,7 +372,7 @@ impl AudioEncoder {
     /// Through FFmpeg, whatever the system.
     pub fn ffmpeg(config: AudioConfig) -> Result<Self, AvError> {
         Self::check(&config)?;
-        let inner = Inner::Ffmpeg(crate::ffenc::Audio::new(&config)?);
+        let inner = Inner::Ffmpeg(Box::new(crate::ffenc::Audio::new(&config)?));
         Ok(Self { mode: Mode::Here(Core { inner, config, pending: Vec::new(), frames: 0 }), config })
     }
 
@@ -659,5 +659,10 @@ mod tests {
         assert_eq!(aac_config(48000, 2), Some([0x11, 0x90]));
         assert_eq!(aac_config(44100, 2), Some([0x12, 0x10]));
         assert_eq!(aac_config(44101, 2), None);
+    }
+
+    #[test]
+    fn inner_enum_stays_compact_for_off_thread_stack_parity() {
+        assert!(std::mem::size_of::<Inner>() <= 64, "Inner grew to {}", std::mem::size_of::<Inner>());
     }
 }
