@@ -781,6 +781,10 @@ struct FrameMissMonitor {
 }
 
 impl FrameMissMonitor {
+    fn with_enc_skipped(prev_enc_skipped: u64) -> Self {
+        Self { prev_enc_skipped, ..Self::default() }
+    }
+
     fn record(
         &mut self,
         now_ns: u64,
@@ -1929,7 +1933,7 @@ impl Engine {
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio_cfg },
             last_heard: Vec::new(),
             stats: Stats::default(),
-            miss_monitor: FrameMissMonitor::default(),
+            miss_monitor: FrameMissMonitor::with_enc_skipped(crate::video::dropped_frames()),
             errors: HashMap::new(),
             heal: HashMap::new(),
             notices: Default::default(),
@@ -12104,5 +12108,36 @@ mod tests {
         assert_eq!(second.why, "encoder fell behind");
         assert_eq!((second.render_missed, second.encode_held, second.encode_skipped), (0, 2, 5));
         assert_eq!((second.total_missed, second.total_encode_skipped), (5, 5));
+    }
+
+    #[test]
+    fn engine_miss_monitor_baselines_preexisting_encoder_drops() {
+        let _guard = crate::video::DROPPED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::video::note_dropped(40);
+        let baseline = crate::video::dropped_frames();
+
+        // Deterministic state-machine check with non-zero startup baseline.
+        let frame_ns = 33_333_333u64;
+        let mut mon = FrameMissMonitor::with_enc_skipped(baseline);
+        let mut st = Stats::default();
+        assert_eq!(mon.record(1_000_000_000, 0, frame_ns, &mut st, baseline), None);
+        let log = mon
+            .record(2_000_000_000, 0, frame_ns, &mut st, baseline + 3)
+            .unwrap_or_else(|| panic!("expected encode drop log after new drops"));
+        assert_eq!(log.encode_skipped, 3);
+
+        // Live Engine::new must adopt the current dropped_frames() baseline without logging prior drops.
+        let Some(engine) = engine() else {
+            return;
+        };
+        let mut state = engine.state.lock().unwrap_or_else(|e| e.into_inner());
+        let s = &mut *state;
+        assert!(s.miss_monitor.prev_enc_skipped >= baseline);
+        assert!(
+            s.stats.skipped > 0 || s.miss_monitor.last_log_ns.is_none(),
+            "new Engine logged pre-existing encoder drops without any missed frames"
+        );
+        let check_ns = now_ns().saturating_add(MISS_LOG_EVERY_NS + 1);
+        assert_eq!(s.miss_monitor.record(check_ns, 0, frame_ns, &mut s.stats, crate::video::dropped_frames()), None);
     }
 }
