@@ -232,6 +232,8 @@ struct Inner {
     hardware_probe_cache: diagnostics::HardwareProbeCache,
     /// Avoids repeating `/channels` handle discovery when a legacy YouTube account has no `@handle`.
     youtube_handle_checked: AtomicBool,
+    /// Last `next_stream_at` timestamp broadcast to overlays, so schedule ticks detect pass-through.
+    last_pushed_next_stream_at: Mutex<Option<Option<i64>>>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -393,6 +395,7 @@ impl Engine {
                 diagnostics_busy: tokio::sync::Mutex::new(()),
                 hardware_probe_cache: Default::default(),
                 youtube_handle_checked: AtomicBool::new(false),
+                last_pushed_next_stream_at: Mutex::new(None),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -654,6 +657,7 @@ impl Engine {
         self.refresh_active_design().await;
         // Auto-replies live outside `State`; an import or restore brings new ones.
         self.load_autoreplies().await;
+        self.push_overlay_links_locked().await;
         Ok(())
     }
 

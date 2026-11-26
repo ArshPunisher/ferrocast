@@ -253,8 +253,12 @@ async fn test_loop(app: AppState, mut overlay: Overlay, socket: WebSocket) {
             },
             frame = frames.recv() => match frame {
                 Ok(f) => {
-                    let Audience::Overlay(id) = &f.audience else { continue };
-                    if *id != overlay.id {
+                    let matched = match &f.audience {
+                        Audience::Overlay(id) => *id == overlay.id,
+                        Audience::All => is_links_state_frame(&f.text),
+                        _ => false,
+                    };
+                    if !matched {
                         continue;
                     }
                     if !forward_overlay_frame(&app, &mut overlay, &f, &mut tx).await {
@@ -272,6 +276,10 @@ async fn test_loop(app: AppState, mut overlay: Overlay, socket: WebSocket) {
 }
 
 const TEST_EVERY: std::time::Duration = std::time::Duration::from_secs(6);
+
+fn is_links_state_frame(text: &str) -> bool {
+    serde_json::from_str::<Value>(text).ok().is_some_and(|v| v["type"] == "state" && v["data"].get("links").is_some())
+}
 
 /// Sends a frame meant for this overlay (layout change or revoke). `false` when the socket
 /// is done: it failed, or the URL was revoked and the socket is now closed.

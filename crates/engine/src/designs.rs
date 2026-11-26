@@ -88,7 +88,7 @@ fn short(name: &str, max: usize) -> String {
     name.trim().chars().take(max).collect::<String>().trim_end().to_string()
 }
 
-fn unique_overlay_name(existing: &[Overlay], raw: &str) -> String {
+pub(crate) fn unique_overlay_name(existing: &[Overlay], raw: &str) -> String {
     let base = short(raw, 60);
     let base = if base.is_empty() { "Overlay".to_string() } else { base };
     let taken = |cand: &str| {

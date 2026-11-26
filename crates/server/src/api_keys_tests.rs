@@ -474,10 +474,40 @@ async fn live_websocket_filters_frames_by_api_key_scope() {
     let (_, settings_tok) = rig.create_key("Settings Only", &[ApiKeyScope::Settings]).await;
     let (_, chat_tok) = rig.create_key("Chat Only", &[ApiKeyScope::Chat]).await;
 
-    // Settings-only key must be denied on /api/v1/live.
+    // Settings-only key must still be denied on /api/v1/live.
     let mut bad_req = format!("{ws_base}/api/v1/live").into_client_request().unwrap();
     bad_req.headers_mut().insert("authorization", format!("Bearer {settings_tok}").parse().unwrap());
     assert!(tokio_tungstenite::connect_async(bad_req).await.is_err());
+
+    // Key combining Settings with Chat connects to /live and receives `links` frames.
+    let (_, chat_settings_tok) = rig.create_key("Chat + Settings", &[ApiKeyScope::Chat, ApiKeyScope::Settings]).await;
+    let mut cs_req = format!("{ws_base}/api/v1/live").into_client_request().unwrap();
+    cs_req.headers_mut().insert("authorization", format!("Bearer {chat_settings_tok}").parse().unwrap());
+    let (mut cs_ws, _) = tokio_tungstenite::connect_async(cs_req).await.unwrap();
+    assert_eq!(
+        rig.call(
+            HttpMethod::PUT,
+            "/links",
+            &chat_settings_tok,
+            Some(json!({ "discord": "https://discord.gg/keyframe" }))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let link_frame = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let Some(Ok(WsMessage::Text(txt))) = cs_ws.next().await else {
+                panic!("expected links frame for Chat+Settings key");
+            };
+            let v: Value = serde_json::from_str(&txt).unwrap();
+            if v["type"] == "links" {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(link_frame["data"]["resolved"]["discord"], "discord.gg/keyframe");
 
     // Chat key connects with Bearer header; receives hello + status, skips queue.
     let mut ok_req = format!("{ws_base}/api/v1/live").into_client_request().unwrap();

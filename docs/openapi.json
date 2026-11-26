@@ -867,7 +867,7 @@
         "type": "object"
       },
       "CreatorLinks": {
-        "description": "Creator \"My links\" configuration.",
+        "description": "Creator \"My links\" configuration. On PUT /api/v1/links, omitted fields and unknown future keys are preserved; an explicit empty string or null clears that field.",
         "properties": {
           "custom": {
             "items": {
@@ -11276,6 +11276,20 @@
     "/api/v1/labels": {
       "get": {
         "operationId": "get_labels",
+        "parameters": [
+          {
+            "description": "Viewer timezone offset in minutes (`-720` to `840`, default `0` UTC) for monthly label calendar bounds.",
+            "in": "query",
+            "name": "tz_offset_min",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "maximum": 840,
+              "minimum": -720,
+              "type": "integer"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -11452,7 +11466,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Validate and save \"My links\" overrides, non-streaming socials, and custom links; updates live overlays.",
+        "summary": "Partially update \"My links\" overrides, non-streaming socials, and custom links; omitted fields and unknown keys are preserved, `\"\"` or `null` clears a field, and live overlays update.",
         "tags": [
           "Accounts & Pro"
         ],

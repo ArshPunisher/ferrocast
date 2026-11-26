@@ -688,7 +688,8 @@ pub fn api_key_live_frame_allowed(scopes: &[ferrocast_core::api_keys::ApiKeyScop
             has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Chat)
         }
         "tts_pending" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Chat) || has(ApiKeyScope::Alerts),
-        "queue" | "goals" | "links" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Alerts),
+        "queue" | "goals" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Alerts),
+        "links" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::Alerts) || has(ApiKeyScope::Settings),
         "golive" => has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::GoLive) || has(ApiKeyScope::StudioControl),
         "brb" | "obs_health" | "live_alert" | "lane" | "marker" | "show" => {
             has(ApiKeyScope::ReadOnly) || has(ApiKeyScope::StudioControl) || has(ApiKeyScope::GoLive)

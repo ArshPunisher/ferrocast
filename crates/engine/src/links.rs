@@ -31,22 +31,25 @@ impl Engine {
 
     /// Returns saved "My links" overrides along with the currently resolved overlay values.
     pub async fn links(&self) -> Result<LinksView, EngineError> {
+        self.links_at(now().0).await
+    }
+
+    pub(crate) async fn links_at(&self, at_ms: i64) -> Result<LinksView, EngineError> {
         let links = self.load_creator_links_or_empty().await?;
-        let resolved = self.resolve_creator_links(&links).await?;
+        let resolved = self.resolve_creator_links_at(&links, at_ms).await?;
         Ok(LinksView { links, resolved })
     }
 
     /// Resolves effective overlay links from saved overrides, connected accounts, and schedule.
     pub async fn resolved_links(&self) -> Result<ResolvedLinks, EngineError> {
         let links = self.load_creator_links_or_empty().await?;
-        self.resolve_creator_links(&links).await
+        self.resolve_creator_links_at(&links, now().0).await
     }
 
-    async fn resolve_creator_links(&self, links: &CreatorLinks) -> Result<ResolvedLinks, EngineError> {
+    async fn resolve_creator_links_at(&self, links: &CreatorLinks, at_ms: i64) -> Result<ResolvedLinks, EngineError> {
         let accounts = self.db(repo::settings::accounts).await?;
         let scheduled = self.schedule_list().await?;
-        let now_ms = now().0;
-        let next_stream_at = scheduled.into_iter().find(|s| s.start_ms >= now_ms).map(|s| s.start_ms);
+        let next_stream_at = scheduled.into_iter().find(|s| s.start_ms >= at_ms).map(|s| s.start_ms);
         let infos: Vec<ConnectedAccountInfo<'_>> = accounts
             .iter()
             .map(|a| ConnectedAccountInfo {
@@ -59,17 +62,23 @@ impl Engine {
         Ok(resolve_links(links, &infos, next_stream_at))
     }
 
+    fn broadcast_links(&self, view: &LinksView) {
+        *self.inner.last_pushed_next_stream_at.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(view.resolved.next_stream_at);
+        let seq = self.next_seq();
+        self.send_overlay(OverlayFrame::new(Audience::All, seq, "state", &json!({ "links": view.resolved })));
+        self.send_live(LiveFrame::new("links", view));
+    }
+
     /// Validates, saves, and broadcasts updated links to connected overlays and dashboards.
     pub async fn save_links(&self, incoming: CreatorLinks) -> Result<LinksView, EngineError> {
         let links = incoming.validated().map_err(EngineError::Invalid)?;
         let _w = self.config_lock().await;
         let to_save = links.clone();
         self.db(move |s| repo::settings::set(s, KEY, &to_save)).await?;
-        let resolved = self.resolve_creator_links(&links).await?;
+        let resolved = self.resolve_creator_links_at(&links, now().0).await?;
         let view = LinksView { links, resolved };
-        let seq = self.next_seq();
-        self.send_overlay(OverlayFrame::new(Audience::All, seq, "state", &json!({ "links": view.resolved })));
-        self.send_live(LiveFrame::new("links", &view));
+        self.broadcast_links(&view);
         Ok(view)
     }
 
@@ -80,22 +89,20 @@ impl Engine {
         let links = patch_creator_links(&existing, patch).map_err(EngineError::Invalid)?;
         let to_save = links.clone();
         self.db(move |s| repo::settings::set(s, KEY, &to_save)).await?;
-        let resolved = self.resolve_creator_links(&links).await?;
+        let resolved = self.resolve_creator_links_at(&links, now().0).await?;
         let view = LinksView { links, resolved };
-        let seq = self.next_seq();
-        self.send_overlay(OverlayFrame::new(Audience::All, seq, "state", &json!({ "links": view.resolved })));
-        self.send_live(LiveFrame::new("links", &view));
+        self.broadcast_links(&view);
         Ok(view)
     }
 
     /// Broadcasts current resolved links when `config_lock` is already held by the caller.
     pub(crate) async fn push_overlay_links_locked(&self) {
-        match self.links().await {
-            Ok(view) => {
-                let seq = self.next_seq();
-                self.send_overlay(OverlayFrame::new(Audience::All, seq, "state", &json!({ "links": view.resolved })));
-                self.send_live(LiveFrame::new("links", &view));
-            }
+        self.push_overlay_links_at_locked(now().0).await;
+    }
+
+    pub(crate) async fn push_overlay_links_at_locked(&self, at_ms: i64) {
+        match self.links_at(at_ms).await {
+            Ok(view) => self.broadcast_links(&view),
             Err(e) => tracing::warn!(%e, "couldn't push updated overlay links"),
         }
     }

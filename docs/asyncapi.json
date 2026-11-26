@@ -518,7 +518,7 @@
             "type": "object"
           },
           "summary": "Updated \"My links\" and resolved overlay link state.",
-          "x-ferrocast-scopes": "read_only, alerts"
+          "x-ferrocast-scopes": "read_only, alerts, settings"
         },
         "live_alert": {
           "payload": {

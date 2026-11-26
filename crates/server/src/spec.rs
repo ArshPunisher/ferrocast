@@ -1671,7 +1671,7 @@ const ACCOUNTS_AND_PRO: &[RouteDoc] = &[
         "PUT",
         "/links",
         "Accounts & Pro",
-        "Validate and save \"My links\" overrides, non-streaming socials, and custom links; updates live overlays.",
+        "Partially update \"My links\" overrides, non-streaming socials, and custom links; omitted fields and unknown keys are preserved, `\"\"` or `null` clears a field, and live overlays update.",
         Some("CreatorLinks"),
         Some("LinksResponse"),
     ),
@@ -2129,6 +2129,13 @@ fn still_width_param(default: u32) -> Value {
 
 fn query_params(method: &str, rel_path: &str) -> Vec<Value> {
     match (method, rel_path) {
+        ("GET", "/labels") => vec![json!({
+            "name": "tz_offset_min",
+            "in": "query",
+            "required": false,
+            "description": "Viewer timezone offset in minutes (`-720` to `840`, default `0` UTC) for monthly label calendar bounds.",
+            "schema": { "type": "integer", "minimum": -720, "maximum": 840, "default": 0 }
+        })],
         ("GET", "/store/catalog") => vec![json!({
             "name": "fresh",
             "in": "query",
@@ -3089,7 +3096,7 @@ fn links_and_labels_schemas() -> Map<String, Value> {
         "CreatorLinks".into(),
         json!({
             "type": "object",
-            "description": "Creator \"My links\" configuration.",
+            "description": "Creator \"My links\" configuration. On PUT /api/v1/links, omitted fields and unknown future keys are preserved; an explicit empty string or null clears that field.",
             "properties": {
                 "twitch": opt_str,
                 "youtube": opt_str,
@@ -3433,7 +3440,7 @@ fn build_asyncapi() -> Value {
                     "event": live_message("event", "Normalized stream event (follow, sub, gift_sub, tip, bits, raid, chat_message, etc.).", "read_only; chat (chat/mod kinds); alerts (stream events)", json!({ "type": "object", "properties": { "id": { "type": "string" }, "platform": { "type": "string" }, "kind": { "type": "object" } } })),
                     "notice": live_message("notice", "Engine status notice or panic warning (`account:*` notices suppressed for API keys).", "read_only, alerts, studio_control, go_live (chat sees panic only)", json!({ "type": "object", "properties": { "level": { "type": "string" }, "message": { "type": "string" }, "key": { "type": ["string", "null"] } } })),
                     "goals": live_message("goals", "Updated stream goals array.", "read_only, alerts", json!({ "type": "array" })),
-                    "links": live_message("links", "Updated \"My links\" and resolved overlay link state.", "read_only, alerts", json!({ "type": "object" })),
+                    "links": live_message("links", "Updated \"My links\" and resolved overlay link state.", "read_only, alerts, settings", json!({ "type": "object" })),
                     "held": live_message("held", "Message/event held by safety filters (`{ event_id, reason }`).", "read_only, chat", json!({ "type": "object" })),
                     "held_resolved": live_message("held_resolved", "Held event released or dropped (`{ event_id, outcome }`).", "read_only, chat", json!({ "type": "object" })),
                     "panic": live_message("panic", "Panic lockdown toggled (`{ on, plan }`).", "read_only, chat", json!({ "type": "object" })),

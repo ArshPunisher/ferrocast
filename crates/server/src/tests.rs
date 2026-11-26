@@ -2879,3 +2879,31 @@ async fn labels_endpoint_returns_real_labels_and_empty_when_unseen() {
     let shifted_labels: Value = r.get("/api/v1/labels?tz_offset_min=840").await.json().await.unwrap();
     assert_ne!(utc_labels["monthly_follows"], shifted_labels["monthly_follows"]);
 }
+
+#[tokio::test]
+async fn overlay_test_preview_socket_receives_live_links_state_updates() {
+    let r = start().await;
+    let ov: Value = r.post("/api/v1/overlays", json!({ "name": "LivePreview" })).await.json().await.unwrap();
+    let url = ov["url"].as_str().unwrap().replace("http://", "ws://") + "ws?test";
+    let (mut test_ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let snap: Value = serde_json::from_str(test_ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(snap["type"], "snapshot");
+
+    assert_eq!(
+        r.put("/api/v1/links", json!({ "discord": "https://discord.gg/liveview/" })).await.status(),
+        StatusCode::OK
+    );
+
+    let updated = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let msg = test_ws.next().await.unwrap().unwrap();
+            let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+            if v["type"] == "state" && v["data"].get("links").is_some() {
+                break v["data"]["links"].clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(updated["discord"], "discord.gg/liveview");
+}

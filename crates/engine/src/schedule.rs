@@ -223,11 +223,14 @@ impl Engine {
                 said.push(msg);
             }
         }
+        let next_upcoming = all.iter().find(|p| p.start_ms >= at_ms).map(|p| p.start_ms);
+        let rolled =
+            *self.inner.last_pushed_next_stream_at.lock().unwrap_or_else(|p| p.into_inner()) != Some(next_upcoming);
         if changed {
             self.schedule_save(all).await?;
-            if dropped {
-                self.push_overlay_links_locked().await;
-            }
+        }
+        if dropped || rolled {
+            self.push_overlay_links_at_locked(at_ms).await;
         }
         for (key, msg) in notices {
             self.send_live(LiveFrame::new("notice", &Notice::new(NoticeLevel::Info, &msg).key(key)));

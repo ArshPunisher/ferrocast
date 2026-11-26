@@ -2625,3 +2625,38 @@ async fn resume_account_backfills_youtube_handle_on_startup_without_waiting_for_
     })
     .await;
 }
+
+#[tokio::test]
+async fn reload_pushes_restored_links_to_open_overlays_and_dashboards() {
+    let (eng, _d) = engine().await;
+    let mut ov_rx = eng.subscribe_overlays();
+    let mut live_rx = eng.subscribe_live();
+
+    eng.db(|s| {
+        ferrocast_store::repo::settings::set(
+            s,
+            "creator_links",
+            &serde_json::json!({ "discord": "https://discord.gg/restored/" }),
+        )
+    })
+    .await
+    .unwrap();
+
+    eng.reload().await.unwrap();
+
+    let ov_frame = next_overlay_frame(&mut ov_rx, "state").await;
+    assert_eq!(ov_frame["data"]["links"]["discord"], "discord.gg/restored");
+    let live_frame = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(f) = live_rx.recv().await {
+                let v: Value = serde_json::from_str(&f.text).unwrap();
+                if v["type"] == "links" {
+                    return v;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(live_frame["data"]["resolved"]["discord"], "discord.gg/restored");
+}

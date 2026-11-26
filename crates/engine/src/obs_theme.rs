@@ -782,19 +782,24 @@ impl Engine {
             let _one_at_a_time = self.config_lock().await;
             self.place_scene(design, screen, &name, existing.as_deref()).await?
         };
-        // Switching theme: the overlay and its OBS source take the new name (the URL stays).
-        if overlay.name != name {
-            let old_source = ferrocast_obs::source_name(&overlay.name);
-            let new_source = ferrocast_obs::source_name(&name);
-            // OBS first: if it refuses, the overlay keeps its old name and the next apply retries.
-            if ferrocast_obs::theme::rename_input(client, &old_source, &new_source).await.map_err(obs_error)? {
-                for n in rec.made_inputs.iter_mut().chain(rec.added_items.iter_mut().map(|(_, s)| s)) {
-                    if *n == old_source {
-                        n.clone_from(&new_source);
+        // Switching theme (`existing.is_some()`): the overlay and its OBS source take the unique target name.
+        if existing.is_some() && overlay.name != name {
+            let others: Vec<_> =
+                self.db(repo::overlays::list).await?.into_iter().filter(|o| o.id != overlay.id).collect();
+            let unique_name = crate::designs::unique_overlay_name(&others, &name);
+            if overlay.name != unique_name {
+                let old_source = ferrocast_obs::source_name(&overlay.name);
+                let new_source = ferrocast_obs::source_name(&unique_name);
+                // OBS first: if it refuses, the overlay keeps its old name and the next apply retries.
+                if ferrocast_obs::theme::rename_input(client, &old_source, &new_source).await.map_err(obs_error)? {
+                    for n in rec.made_inputs.iter_mut().chain(rec.added_items.iter_mut().map(|(_, s)| s)) {
+                        if *n == old_source {
+                            n.clone_from(&new_source);
+                        }
                     }
                 }
+                overlay = self.rename_overlay(&overlay.id, &unique_name).await?;
             }
-            overlay = self.rename_overlay(&overlay.id, &name).await?;
         }
         // And a scene Ferrocast made for this screen takes the new name.
         if matches!(p.place, Place::New)

@@ -253,3 +253,50 @@ async fn a_reminder_is_said_only_once_the_plans_are_saved() {
     assert_eq!(e.schedule_tick(at).await.unwrap().len(), 1);
     assert!(e.schedule_tick(at).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn schedule_tick_pushes_updated_links_when_stream_start_time_passes_without_waiting_24h() {
+    let (e, _d) = engine().await;
+    e.save_links(ferrocast_core::links::CreatorLinks {
+        schedule_text: Some("Fridays, 8 PM".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let s1 = e.schedule_create(input("First", &[Platform::Twitch], HOUR)).await.unwrap();
+    let s2 = e.schedule_create(input("Second", &[Platform::Twitch], 3 * HOUR)).await.unwrap();
+    let mut ov_rx = e.subscribe_overlays();
+    let mut live_rx = e.subscribe_live();
+
+    let next_links = async |rx: &mut tokio::sync::broadcast::Receiver<crate::frames::OverlayFrame>| {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(f) = rx.recv().await {
+                    let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+                    if v["type"] == "state" && v["data"].get("links").is_some() {
+                        return v["data"]["links"].clone();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap()
+    };
+
+    // 1 minute past s1's start: s1 is kept for 24h (`dropped == false`), yet overlays must roll over to s2.
+    e.schedule_tick(s1.start_ms + 60_000).await.unwrap();
+    let rolled = next_links(&mut ov_rx).await;
+    assert_eq!(rolled["next_stream_at"], s2.start_ms);
+
+    // Clear queued live frames, then advance 1 minute past s2's start -> falls back to schedule_text.
+    while live_rx.try_recv().is_ok() {}
+    e.schedule_tick(s2.start_ms + 60_000).await.unwrap();
+    let fallback = next_links(&mut ov_rx).await;
+    assert!(fallback["next_stream_at"].is_null());
+    assert_eq!(fallback["next_stream"], "Fridays, 8 PM");
+
+    // Repeated tick at the same schedule boundary emits no redundant broadcast.
+    while ov_rx.try_recv().is_ok() {}
+    e.schedule_tick(s2.start_ms + 90_000).await.unwrap();
+    assert!(ov_rx.try_recv().is_err());
+}
