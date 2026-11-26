@@ -15,7 +15,7 @@
 // window's thread).
 #![recursion_limit = "256"]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,6 +54,11 @@ const SHOW_SHORTCUT: &str = "CmdOrCtrl+Alt+Shift+F";
 const MINIMIZED_ARG: &str = "--minimized";
 /// Launch directly in Safe Mode (no third-party plugins, VSTs, auto-start, or auto-loaded collection).
 const SAFE_MODE_ARG: &str = "--safe-mode";
+/// Bundle identifier in `tauri.conf.json`, used for LaunchServices relaunch when bundle path is unavailable.
+const BUNDLE_ID: &str = "com.clearcraftlabs.ferrocast";
+/// Set before `app.exit(0)` on macOS so `RunEvent::Exit` schedules LaunchServices relaunch after exit.
+#[cfg(target_os = "macos")]
+static RELAUNCH_AFTER_EXIT: AtomicBool = AtomicBool::new(false);
 /// How often the shell picks up settings changed in the dashboard.
 const SETTINGS_EVERY: Duration = Duration::from_secs(2);
 
@@ -510,14 +515,15 @@ fn main() {
             if let Some(l) = LOG_FILE.get() {
                 l.flush(std::time::Duration::from_secs(2));
             }
-            // Help > Restart in Safe Mode: now that the quit is clean, start again with the flag.
+            // After updating or restarting in Safe Mode, relaunch via LaunchServices once this
+            // process has exited so macOS reuses the pinned Dock icon instead of opening a second one.
             #[cfg(target_os = "macos")]
-            if quit::RELAUNCH_SAFE.load(Ordering::SeqCst) {
-                let mut env = app.env();
-                if !env.args_os.iter().any(|a| a == SAFE_MODE_ARG) {
-                    env.args_os.push(SAFE_MODE_ARG.into());
+            {
+                let safe = quit::RELAUNCH_SAFE.load(Ordering::SeqCst);
+                let update_restart = RELAUNCH_AFTER_EXIT.load(Ordering::SeqCst);
+                if safe || update_restart {
+                    schedule_mac_relaunch(&app.env(), safe);
                 }
-                tauri::process::restart(&env);
             }
         }
         _ => {}
@@ -1007,7 +1013,82 @@ async fn restart_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
             }
         }
         tracing::info!("restarting to finish the update");
+        #[cfg(target_os = "macos")]
+        {
+            RELAUNCH_AFTER_EXIT.store(true, Ordering::SeqCst);
+            app.exit(0);
+            break;
+        }
+        #[cfg(not(target_os = "macos"))]
         app.restart();
+    }
+}
+
+/// Command specification to wait for `pid` to exit and reopen the app via LaunchServices.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct MacRelaunchSpec {
+    program: &'static str,
+    args: Vec<std::ffi::OsString>,
+}
+
+/// Filters raw `env.args_os` (skipping argv[0] and LaunchServices `-psn_*` serial tokens) and
+/// appends `--safe-mode` once when restarting into Safe Mode.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn relaunch_forward_args(env_args: &[std::ffi::OsString], safe_mode: bool) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> =
+        env_args.iter().skip(1).filter(|a| !a.to_str().is_some_and(|s| s.starts_with("-psn_"))).cloned().collect();
+    if safe_mode && !out.iter().any(|a| a == SAFE_MODE_ARG) {
+        out.push(SAFE_MODE_ARG.into());
+    }
+    out
+}
+
+/// Builds a detached `/bin/sh` + `/usr/bin/open` invocation that waits for `pid` to finish exiting
+/// (bounded) before asking LaunchServices to launch the `.app` bundle (or bundle ID fallback).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn mac_relaunch_spec(
+    pid: u32,
+    bundle: Option<&Path>,
+    bundle_id: &str,
+    env_args: &[std::ffi::OsString],
+    safe_mode: bool,
+) -> MacRelaunchSpec {
+    let script = "pid=\"$1\"; shift; n=0; while /bin/kill -0 \"$pid\" 2>/dev/null && [ \"$n\" -lt 200 ]; do /bin/sleep 0.05; n=$((n + 1)); done; exec /usr/bin/open \"$@\"";
+    let mut args: Vec<std::ffi::OsString> =
+        vec!["-c".into(), script.into(), "ferrocast-relaunch".into(), pid.to_string().into(), "-n".into()];
+    match bundle {
+        Some(path) => args.push(path.as_os_str().to_os_string()),
+        None => {
+            args.push("-b".into());
+            args.push(bundle_id.into());
+        }
+    }
+    let forward = relaunch_forward_args(env_args, safe_mode);
+    if !forward.is_empty() {
+        args.push("--args".into());
+        args.extend(forward);
+    }
+    MacRelaunchSpec { program: "/bin/sh", args }
+}
+
+/// Spawns a detached watcher that relaunches via LaunchServices only after this process exits.
+#[cfg(target_os = "macos")]
+fn schedule_mac_relaunch(env: &tauri::Env, safe_mode: bool) {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let bundle = std::env::current_exe().ok().and_then(|exe| mac_update::bundle_of(&exe));
+    let spec = mac_relaunch_spec(std::process::id(), bundle.as_deref(), BUNDLE_ID, &env.args_os, safe_mode);
+    if let Err(e) = Command::new(spec.program)
+        .args(&spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        tracing::error!(error = %e, "couldn't schedule LaunchServices relaunch");
     }
 }
 
@@ -2095,6 +2176,46 @@ mod update_tests {
         assert_eq!(
             store_deeplink_route("ferrocast://store/install/aurora-pulse"),
             "#/store?link=ferrocast%3A%2F%2Fstore%2Finstall%2Faurora-pulse"
+        );
+    }
+
+    #[test]
+    fn bundle_id_matches_tauri_config() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(conf["identifier"].as_str(), Some(BUNDLE_ID));
+    }
+
+    #[test]
+    fn mac_relaunch_spec_uses_launchservices_after_exit_and_filters_psn_args() {
+        let env_args: Vec<std::ffi::OsString> = vec![
+            "/Applications/Ferrocast.app/Contents/MacOS/ferrocast".into(),
+            "-psn_0_123456".into(),
+            "--minimized".into(),
+        ];
+        let spec = mac_relaunch_spec(4242, Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &env_args, true);
+        assert_eq!(spec.program, "/bin/sh");
+        assert_eq!(
+            spec.args[2..],
+            [
+                std::ffi::OsString::from("ferrocast-relaunch"),
+                "4242".into(),
+                "-n".into(),
+                "/Applications/Ferrocast.app".into(),
+                "--args".into(),
+                "--minimized".into(),
+                "--safe-mode".into(),
+            ]
+        );
+        let script = spec.args[1].to_string_lossy();
+        assert!(script.contains("kill -0") && script.contains("exec /usr/bin/open"), "{script}");
+
+        // Without extra flags and without a bundle path, falls back to `-b <bundle_id>` with no `--args`.
+        let fallback =
+            mac_relaunch_spec(99, None, BUNDLE_ID, &["/usr/local/bin/ferrocast".into(), "-psn_0_777".into()], false);
+        assert_eq!(
+            fallback.args[2..],
+            [std::ffi::OsString::from("ferrocast-relaunch"), "99".into(), "-n".into(), "-b".into(), BUNDLE_ID.into(),]
         );
     }
 }
