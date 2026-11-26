@@ -1931,7 +1931,7 @@
     "description": "Clients authenticate on `/api/v1/live` using `Authorization: Bearer fc_key_...` (recommended), `?key=...`, or `?session=...`. Reconnecting with `?since=<seq>` replays buffered frames in order. Overlay browser sources connect to `/o/{token}/ws`.",
     "summary": "Real-time event, queue, status, studio telemetry, and browser-source overlay streams.",
     "title": "Ferrocast Live & Overlay WebSocket API",
-    "version": "3.6.1"
+    "version": "3.7.0"
   },
   "operations": {
     "receiveLiveFrames": {

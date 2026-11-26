@@ -5,6 +5,33 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.7.0
+
+Your own names and links in every overlay, a calmer layout editor, picking only the parts of a theme
+you want, and scenes you can drag into order.
+
+- **My links**: one place in Settings > Accounts for your channel links (filled in from your
+  connected Twitch, YouTube and Kick accounts, including your YouTube @handle) plus Discord,
+  Instagram, X, TikTok, your website and a "next stream" line. Every theme and overlay reads from
+  it and updates live, also in OBS. Text you typed yourself is never changed, and a platform you
+  have not connected is left out instead of showing "yourname".
+- **Real names in previews**: overlay and theme previews show your latest follower, sub and tip
+  instead of made-up names (samples only until you have real ones).
+- **Layout editor**: one scroll area, the canvas fills the window, the save bar sits right under
+  the editor, and the canvas no longer jumps or flickers when you change an option. Backspace or
+  Delete removes the selected layer (undo brings it back) instead of leaving the page. Saving
+  keeps your undo history.
+- **Use part of a theme**: tick the screens you want (all ticked by default, Select all/none),
+  see which ones you already added, use just one screen, or add one part of a theme (chat, goal,
+  event list) to an overlay you already have. Studio setup only covers what you ticked.
+- **Scenes in order**: drag scenes in the Studio's Scenes list, or move them with Alt+Up/Down.
+  Dragging never puts a scene on air. In Studio Mode the buttons under the list act on the scene
+  you picked, as in OBS. Scenes on the Vertical canvas can be reordered too.
+- **Fixes**: adding a theme screen twice gives the copy its own name ("2"), a scene dropped back
+  in place no longer adds an empty undo step, and a few more small fixes in these screens.
+- **API**: accounts include their login and channel link; new `GET/PUT /api/v1/links` (fields you
+  leave out are kept) and `GET /api/v1/labels`; overlays receive your links in their live state.
+
 ## 3.6.1
 
 Fixes for the problems found with 3.6.0: the setup mic meter, iPhone cameras, flip and crop in
