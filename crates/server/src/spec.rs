@@ -1671,7 +1671,7 @@ const ACCOUNTS_AND_PRO: &[RouteDoc] = &[
         "PUT",
         "/links",
         "Accounts & Pro",
-        "Partially update \"My links\" overrides, non-streaming socials, and custom links; omitted fields and unknown keys are preserved, `\"\"` or `null` clears a field, and live overlays update.",
+        "Partially update \"My links\" overrides, non-streaming socials, and custom links; omitted fields and unknown keys are preserved, `\"\"` or `null` clears string fields (`[]` or `null` clears `custom`), and live overlays update.",
         Some("CreatorLinks"),
         Some("LinksResponse"),
     ),
@@ -3096,7 +3096,7 @@ fn links_and_labels_schemas() -> Map<String, Value> {
         "CreatorLinks".into(),
         json!({
             "type": "object",
-            "description": "Creator \"My links\" configuration. On PUT /api/v1/links, omitted fields and unknown future keys are preserved; an explicit empty string or null clears that field.",
+            "description": "Creator \"My links\" configuration. On PUT /api/v1/links, omitted fields and unknown future keys are preserved; an explicit empty string or null clears a string field, and [] or null clears custom.",
             "properties": {
                 "twitch": opt_str,
                 "youtube": opt_str,
@@ -3108,7 +3108,7 @@ fn links_and_labels_schemas() -> Map<String, Value> {
                 "tiktok": opt_str,
                 "website": opt_str,
                 "schedule_text": opt_str,
-                "custom": { "type": "array", "maxItems": 6, "items": { "$ref": "#/components/schemas/CustomLink" } }
+                "custom": { "type": ["array", "null"], "maxItems": 6, "items": { "$ref": "#/components/schemas/CustomLink" } }
             }
         }),
     );

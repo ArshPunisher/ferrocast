@@ -867,14 +867,17 @@
         "type": "object"
       },
       "CreatorLinks": {
-        "description": "Creator \"My links\" configuration. On PUT /api/v1/links, omitted fields and unknown future keys are preserved; an explicit empty string or null clears that field.",
+        "description": "Creator \"My links\" configuration. On PUT /api/v1/links, omitted fields and unknown future keys are preserved; an explicit empty string or null clears a string field, and [] or null clears custom.",
         "properties": {
           "custom": {
             "items": {
               "$ref": "#/components/schemas/CustomLink"
             },
             "maxItems": 6,
-            "type": "array"
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "discord": {
             "maxLength": 120,
@@ -11466,7 +11469,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Partially update \"My links\" overrides, non-streaming socials, and custom links; omitted fields and unknown keys are preserved, `\"\"` or `null` clears a field, and live overlays update.",
+        "summary": "Partially update \"My links\" overrides, non-streaming socials, and custom links; omitted fields and unknown keys are preserved, `\"\"` or `null` clears string fields (`[]` or `null` clears `custom`), and live overlays update.",
         "tags": [
           "Accounts & Pro"
         ],

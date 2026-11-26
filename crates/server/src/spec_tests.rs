@@ -525,3 +525,20 @@ fn screenshot_screen_still_and_source_status_contracts_match_runtime() {
     assert_eq!(cam["properties"]["message"]["type"], json!(["string", "null"]));
     assert_eq!(cam["properties"]["tries"]["type"], "integer");
 }
+
+#[test]
+fn creator_links_schema_allows_null_custom_and_documents_string_vs_array_clearing() {
+    let o = spec::openapi();
+    let schemas = &o["components"]["schemas"];
+    assert_eq!(schemas["CreatorLinks"]["properties"]["custom"]["type"], json!(["array", "null"]));
+    assert_eq!(schemas["LinksResponse"]["properties"]["custom"]["type"], "array");
+    assert_eq!(schemas["ResolvedLinks"]["properties"]["custom"]["type"], "array");
+
+    let put_summary = op(o, "/links", "put")["summary"].as_str().expect("PUT /links summary");
+    assert!(put_summary.contains("string"), "summary must scope \"\" clearing to strings: {put_summary}");
+    assert!(put_summary.contains("[]"), "summary must mention [] for clearing custom: {put_summary}");
+
+    let desc = schemas["CreatorLinks"]["description"].as_str().expect("CreatorLinks description");
+    assert!(desc.contains("string"), "description must scope \"\" clearing to strings: {desc}");
+    assert!(desc.contains("[]"), "description must mention [] for clearing custom: {desc}");
+}
