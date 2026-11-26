@@ -1660,6 +1660,78 @@ async fn kick_gives_up_after_repeated_rapid_drops_and_says_why() {
     );
 }
 
+async fn platform_that_drops_on_video(listener: TcpListener, key: &'static str) -> mpsc::UnboundedReceiver<Got> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let (itx, mut irx) = mpsc::unbounded_channel();
+                let serve = serve_platform(&mut sock, key, &itx);
+                let drop_on_video = async {
+                    while let Some(g) = irx.recv().await {
+                        let is_video = matches!(g, Got::Video(_, _));
+                        let _ = tx.send(g);
+                        if is_video {
+                            break;
+                        }
+                    }
+                };
+                tokio::select! {
+                    _ = serve => {}
+                    _ = drop_on_video => {}
+                }
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    rx
+}
+
+#[tokio::test]
+async fn kick_over_1080p_rapid_close_does_not_blame_multistreaming() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops_on_video(l, "k").await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: push::Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(2560);
+    m.video_height = Some(1440);
+    m.video_frame_rate = Some(60.0);
+    m.video_bitrate_kbps = Some(18_000);
+    let r = obs.c.publish_metadata(&m).unwrap();
+    obs.send(vec![r]).await.unwrap();
+    obs.video(0, AVC_HEADER).await;
+    obs.video(0, KEY).await;
+
+    match state_is(&mut health, |s| matches!(s, PushState::Reconnecting { .. })).await {
+        PushState::Reconnecting { reason, .. } => {
+            assert!(!reason.contains("Allow multistreaming"), "misdiagnosed 1440p close: {reason}");
+            assert!(reason.contains("1080p"), "should explain Kick 1080p cap: {reason}");
+        }
+        s => panic!("expected Reconnecting, got {s:?}"),
+    }
+
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { reason, detail, refused, .. } => {
+            assert!(refused);
+            assert!(!reason.contains("Allow multistreaming"), "{reason}");
+            assert!(reason.contains("1080p"), "reason should mention 1080p: {reason}");
+            let detail = detail.expect("Kick limit failure explains why");
+            assert!(!detail.contains("Allow multistreaming"), "misdiagnosed detail: {detail}");
+            assert!(detail.contains("1080p") && detail.contains("2560"), "{detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_refused_stream_key_gives_up_after_bounded_attempts() {
     let w = world().await;

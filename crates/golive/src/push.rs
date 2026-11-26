@@ -333,9 +333,12 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                 set_state(&health, PushState::Connecting);
             }
             let mut live_at: Option<Instant> = None;
+            let mut sent_info = SentStreamInfo::default();
             // `stop` is watched inside the session: while connecting it gives up at once, and once
             // live it closes the connection properly (not dropped mid-write).
-            let outcome = session(&dest, target, &hub, &health, stream, via.as_ref(), &mut live_at, stop.clone()).await;
+            let outcome =
+                session(&dest, target, &hub, &health, stream, via.as_ref(), &mut live_at, &mut sent_info, stop.clone())
+                    .await;
             match outcome {
                 Ok(Ended::Stopped) => break 'streams,
                 Ok(Ended::StreamEnded) => break,
@@ -343,6 +346,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                     if !still_on(&live.borrow()) {
                         break;
                     }
+                    sent_info.merge_hub_stats(hub.stats());
                     // A session that stayed live a while and then failed starts the count over: a
                     // platform that keeps dropping a long stream is retried at once, not after
                     // the longest wait. One that took the stream and closed it at once doesn't
@@ -447,7 +451,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         limit > 0 && attempt >= limit
                     };
                     if give_up {
-                        let (short_reason, detail) = failure_text(&dest, &err, kick_refused);
+                        let (short_reason, detail) = failure_text(&dest, &err, kick_refused, &sent_info, None);
                         tracing::warn!(
                             dest = %dest.id,
                             attempts = attempt.max(net_tries),
@@ -487,6 +491,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                                 _ = tokio::time::sleep(wait) => {}
                             }
                             let mut probe_live: Option<Instant> = None;
+                            let mut probe_info = SentStreamInfo::default();
                             let probed = session(
                                 &dest,
                                 target,
@@ -495,6 +500,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                                 stream,
                                 via.as_ref(),
                                 &mut probe_live,
+                                &mut probe_info,
                                 stop.clone(),
                             )
                             .await;
@@ -529,7 +535,7 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                             if on_backup { "its backup server" } else { "its main server again" }
                         )
                     } else if kick_refused {
-                        kick_multistream_detail(&err)
+                        kick_reconnecting_detail(&err, &sent_info, None)
                     } else {
                         err.to_string()
                     };
@@ -579,6 +585,142 @@ fn is_kick(dest: &Destination) -> bool {
     id.starts_with("kick") || host.contains("kick") || host.starts_with("fa723fc1b171.")
 }
 
+/// Stream parameters sent to a destination, captured from metadata/headers and Hub stats to
+/// distinguish Kick limit rejects (over 1080p, 60 fps, 8,000 kbps, or non-H.264) from
+/// multistreaming disconnects.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SentStreamInfo {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fps: Option<f32>,
+    pub video_kbps: Option<u32>,
+    pub measured_kbps: u32,
+    pub codec: Option<flv::VideoCodec>,
+    pub keyframe_interval_ms: Option<u32>,
+}
+
+impl SentStreamInfo {
+    fn update_from_metadata(&mut self, m: &rml_rtmp::sessions::StreamMetadata) {
+        if let Some(w) = m.video_width {
+            self.width = Some(w);
+        }
+        if let Some(h) = m.video_height {
+            self.height = Some(h);
+        }
+        if let Some(fps) = m.video_frame_rate {
+            self.fps = Some(fps);
+        }
+        if let Some(kbps) = m.video_bitrate_kbps {
+            self.video_kbps = Some(kbps);
+        }
+        if self.codec.is_none() {
+            self.codec = match m.video_codec_id {
+                Some(7) => Some(flv::VideoCodec::H264),
+                Some(12) => Some(flv::VideoCodec::Hevc),
+                _ => None,
+            };
+        }
+    }
+
+    fn update_from_video_header(&mut self, data: &[u8]) {
+        if let Some(codec) = flv::video_codec(data) {
+            self.codec = Some(codec);
+        }
+    }
+
+    fn merge_hub_stats(&mut self, stats: crate::hub::StreamStats) {
+        if self.width.is_none() {
+            self.width = stats.width;
+        }
+        if self.height.is_none() {
+            self.height = stats.height;
+        }
+        if self.fps.is_none() {
+            self.fps = stats.fps;
+        }
+        if self.codec.is_none() {
+            self.codec = stats.video_codec;
+        }
+        if stats.kbps > 0 {
+            self.measured_kbps = stats.kbps;
+        }
+        if stats.keyframe_interval_ms.is_some() {
+            self.keyframe_interval_ms = stats.keyframe_interval_ms;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KickCloseKind {
+    OverLimit { reason: String, detail: String },
+    Multistreaming,
+    Closed,
+}
+
+fn codec_label(c: flv::VideoCodec) -> &'static str {
+    match c {
+        flv::VideoCodec::H264 => "H.264",
+        flv::VideoCodec::Hevc => "HEVC",
+        flv::VideoCodec::Av1 => "AV1",
+        flv::VideoCodec::Vp9 => "VP9",
+    }
+}
+
+/// Classifies why Kick closed a stream shortly after publish: checks Kick's ingest limits
+/// (`probe::KICK_LIMIT`) first so >1080p / >60fps / >8,000 kbps / non-H.264 streams are never
+/// misdiagnosed as `"Allow multistreaming"`.
+pub(crate) fn classify_kick_close(info: &SentStreamInfo, other_destinations_live: Option<bool>) -> KickCloseKind {
+    let lim = crate::probe::KICK_LIMIT;
+    let mut tags: Vec<&'static str> = Vec::new();
+    let mut got_parts: Vec<String> = Vec::new();
+
+    if let (Some(w), Some(h)) = (info.width, info.height)
+        && !lim.allows_resolution(w, h)
+    {
+        tags.push("over 1080p");
+        got_parts.push(format!("{w}×{h}"));
+    }
+    if let Some(fps) = info.fps
+        && fps > lim.max_fps as f32 + 0.5
+    {
+        tags.push("over 60 fps");
+        got_parts.push(format!("{fps:.0} fps"));
+    }
+    if let Some(codec) = info.codec
+        && !lim.allows_codec(codec)
+    {
+        tags.push("H.264 required");
+        got_parts.push(codec_label(codec).to_string());
+    }
+    let over_kbps = info.video_kbps.is_some_and(|k| k > lim.max_kbps) || info.measured_kbps > lim.max_kbps + 400;
+    if over_kbps {
+        tags.push("over 8,000 kbps");
+        let sent_kbps = info.video_kbps.filter(|&k| k > lim.max_kbps).unwrap_or(info.measured_kbps);
+        got_parts.push(crate::probe::kbps_text(sent_kbps));
+    }
+    if let Some(k_ms) = info.keyframe_interval_ms
+        && k_ms > lim.max_keyframe_secs * 1000 + 250
+    {
+        tags.push("keyframes over 2 s");
+        got_parts.push(format!("{:.1} s keyframes", f64::from(k_ms) / 1000.0));
+    }
+
+    if let Some(first_tag) = tags.first() {
+        let reason = format!("Kick closed the stream ({first_tag}).");
+        let detail = format!(
+            "Kick takes up to 1080p60 / {} H.264 ({} s keyframes); this stream sent {}. \
+             Lower resolution or bitrate to 1080p60 / {} H.264, or turn off Ignore service limits.",
+            crate::probe::kbps_text(lim.max_kbps),
+            lim.keyframe_secs,
+            got_parts.join(", "),
+            crate::probe::kbps_text(lim.max_kbps),
+        );
+        return KickCloseKind::OverLimit { reason, detail };
+    }
+
+    if other_destinations_live == Some(false) { KickCloseKind::Closed } else { KickCloseKind::Multistreaming }
+}
+
 fn kick_multistream_detail(err: &PushError) -> String {
     format!(
         "{err} Kick took the stream and closed it at once: streaming to other platforms too \
@@ -586,10 +728,36 @@ fn kick_multistream_detail(err: &PushError) -> String {
     )
 }
 
+fn kick_reconnecting_detail(err: &PushError, info: &SentStreamInfo, other_destinations_live: Option<bool>) -> String {
+    match classify_kick_close(info, other_destinations_live) {
+        KickCloseKind::OverLimit { detail, .. } => format!("{err} {detail}"),
+        KickCloseKind::Multistreaming => kick_multistream_detail(err),
+        KickCloseKind::Closed => format!(
+            "{err} Kick took the stream and closed it right away. Check your stream key and account status on Kick."
+        ),
+    }
+}
+
 /// One short line and an optional `(i)` detail for terminal `PushState::Failed`.
-fn failure_text(dest: &Destination, err: &PushError, kick_refused: bool) -> (String, Option<String>) {
+fn failure_text(
+    dest: &Destination,
+    err: &PushError,
+    kick_refused: bool,
+    info: &SentStreamInfo,
+    other_destinations_live: Option<bool>,
+) -> (String, Option<String>) {
     if kick_refused {
-        return ("Kick refused the stream.".into(), Some(kick_multistream_detail(err)));
+        return match classify_kick_close(info, other_destinations_live) {
+            KickCloseKind::OverLimit { reason, detail } => (reason, Some(detail)),
+            KickCloseKind::Multistreaming => ("Kick refused the stream.".into(), Some(kick_multistream_detail(err))),
+            KickCloseKind::Closed => (
+                "Kick closed the stream.".into(),
+                Some(
+                    "Kick took the stream and closed it right away. Check your stream key and account status on Kick."
+                        .into(),
+                ),
+            ),
+        };
     }
     match err {
         PushError::NetworkDown(host) => (
@@ -823,6 +991,7 @@ async fn session(
     stream: u64,
     via: Option<&links::Network>,
     live_at: &mut Option<Instant>,
+    sent_info: &mut SentStreamInfo,
     mut stop: watch::Receiver<bool>,
 ) -> Result<Ended, PushError> {
     let mut p = tokio::select! {
@@ -841,6 +1010,13 @@ async fn session(
 
     // Headers first, then packets from the next keyframe, timestamps from zero.
     let Subscription { live, headers, mut rx } = hub.subscribe();
+    if let Some(m) = &headers.metadata {
+        sent_info.update_from_metadata(m);
+    }
+    if let Some(v) = &headers.video {
+        sent_info.update_from_video_header(v);
+    }
+    sent_info.merge_hub_stats(hub.stats());
     // The stream may have ended (or a new one begun) while this connection was being set up.
     if !live.on || live.stream != stream {
         return Ok(Ended::StreamEnded);
@@ -905,12 +1081,18 @@ async fn session(
                         p.finish().await;
                         return Ok(Ended::StreamEnded);
                     }
-                    Frame::Metadata(m) => Some(p.client.publish_metadata(&m)),
+                    Frame::Metadata(m) => {
+                        sent_info.update_from_metadata(&m);
+                        Some(p.client.publish_metadata(&m))
+                    }
                     // Codec headers always go through; initial frames wait for a main keyframe,
                     // and once live, stale non-keyframe video drops until its track's next keyframe.
                     Frame::Video { ts, data, key } => {
                         let extra = flv::video_extra_track(&data);
                         let header = flv::video_is_header(&data) || extra.is_some_and(|(_, h)| h);
+                        if extra.is_none() && flv::video_is_header(&data) {
+                            sent_info.update_from_video_header(&data);
+                        }
                         let send = if extra.is_some() && !dest.extra_video {
                             false
                         } else if header {
@@ -1463,9 +1645,113 @@ mod give_up_text_tests {
                 extra_video: false,
                 backup: None,
             };
-            let (reason, detail) = failure_text(&d, &PushError::NetworkDown(host.into()), false);
+            let (reason, detail) =
+                failure_text(&d, &PushError::NetworkDown(host.into()), false, &SentStreamInfo::default(), None);
             assert!(!reason.contains("waiting") && !reason.contains("stopped taking"), "{reason}");
             assert!(detail.is_some_and(|x| x.contains(host)));
         }
+    }
+
+    #[test]
+    fn kick_rapid_close_classification_distinguishes_limits_from_multistreaming() {
+        let kick_dest = Destination {
+            id: "kick".into(),
+            target: Target::parse("rtmp://fa723fc1b171.global-contribute.live-video.net/app").unwrap(),
+            key: "k".into(),
+            retry: Retry::default(),
+            extra_audio: false,
+            extra_video: false,
+            backup: None,
+        };
+        let err = PushError::Closed("fa723fc1b171.global-contribute.live-video.net".into());
+
+        // Over 1080p (26 Nov bug): must report resolution limit, never "Allow multistreaming".
+        let over_res = SentStreamInfo {
+            width: Some(2560),
+            height: Some(1440),
+            fps: Some(60.0),
+            video_kbps: Some(18_000),
+            codec: Some(flv::VideoCodec::H264),
+            keyframe_interval_ms: Some(2_000),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_res, Some(true));
+        assert!(r.contains("1080p"), "{r}");
+        assert!(!r.contains("Allow multistreaming"), "{r}");
+        let d = d.unwrap();
+        assert!(d.contains("2560×1440") && d.contains("1080p60"), "{d}");
+        assert!(!d.contains("Allow multistreaming"), "{d}");
+
+        // Over bitrate alone (measured or configured): must report 8,000 kbps limit.
+        let over_kbps = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            video_kbps: Some(12_000),
+            codec: Some(flv::VideoCodec::H264),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_kbps, None);
+        assert!(r.contains("8,000 kbps"), "{r}");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
+
+        // Non-H.264 codec: must report H.264 required.
+        let over_codec = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            video_kbps: Some(6_000),
+            codec: Some(flv::VideoCodec::Hevc),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_codec, None);
+        assert!(r.contains("H.264"), "{r}");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
+
+        // Over 60 fps: must report fps limit.
+        let over_fps = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(120.0),
+            video_kbps: Some(6_000),
+            codec: Some(flv::VideoCodec::H264),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_fps, None);
+        assert!(r.contains("60 fps"), "{r}");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
+
+        // Over 2 s keyframe interval: must report keyframe limit.
+        let over_keyint = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            video_kbps: Some(6_000),
+            codec: Some(flv::VideoCodec::H264),
+            keyframe_interval_ms: Some(4_000),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &over_keyint, None);
+        assert!(r.contains("keyframes"), "{r}");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
+
+        // Fits Kick's limits + other platforms live -> "Allow multistreaming".
+        let fits = SentStreamInfo {
+            width: Some(1920),
+            height: Some(1080),
+            fps: Some(60.0),
+            video_kbps: Some(6_000),
+            codec: Some(flv::VideoCodec::H264),
+            keyframe_interval_ms: Some(2_000),
+            ..Default::default()
+        };
+        let (r, d) = failure_text(&kick_dest, &err, true, &fits, Some(true));
+        assert!(r.contains("refused"), "{r}");
+        assert!(d.unwrap().contains("Allow multistreaming"));
+
+        // Fits Kick's limits + NO other platform live -> accurate generic close, not "Allow multistreaming".
+        let (r, d) = failure_text(&kick_dest, &err, true, &fits, Some(false));
+        assert_eq!(r, "Kick closed the stream.");
+        assert!(!d.unwrap().contains("Allow multistreaming"));
     }
 }
