@@ -1054,9 +1054,9 @@ fn mac_relaunch_spec(
     env_args: &[std::ffi::OsString],
     safe_mode: bool,
 ) -> MacRelaunchSpec {
-    let script = "pid=\"$1\"; shift; n=0; while /bin/kill -0 \"$pid\" 2>/dev/null && [ \"$n\" -lt 200 ]; do /bin/sleep 0.05; n=$((n + 1)); done; exec /usr/bin/open \"$@\"";
+    let script = "pid=\"$1\"; shift; n=0; while /bin/kill -0 \"$pid\" 2>/dev/null && [ \"$n\" -lt 400 ]; do /bin/sleep 0.05; n=$((n + 1)); done; exec /usr/bin/open \"$@\"";
     let mut args: Vec<std::ffi::OsString> =
-        vec!["-c".into(), script.into(), "ferrocast-relaunch".into(), pid.to_string().into(), "-n".into()];
+        vec!["-c".into(), script.into(), "ferrocast-relaunch".into(), pid.to_string().into()];
     match bundle {
         Some(path) => args.push(path.as_os_str().to_os_string()),
         None => {
@@ -2195,12 +2195,12 @@ mod update_tests {
         ];
         let spec = mac_relaunch_spec(4242, Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &env_args, true);
         assert_eq!(spec.program, "/bin/sh");
+        assert!(!spec.args.iter().any(|a| a == "-n"), "open -n must not be passed: {:?}", spec.args);
         assert_eq!(
             spec.args[2..],
             [
                 std::ffi::OsString::from("ferrocast-relaunch"),
                 "4242".into(),
-                "-n".into(),
                 "/Applications/Ferrocast.app".into(),
                 "--args".into(),
                 "--minimized".into(),
@@ -2208,14 +2208,17 @@ mod update_tests {
             ]
         );
         let script = spec.args[1].to_string_lossy();
-        assert!(script.contains("kill -0") && script.contains("exec /usr/bin/open"), "{script}");
+        assert!(
+            script.contains("kill -0") && script.contains("exec /usr/bin/open") && script.contains("-lt 400"),
+            "{script}"
+        );
 
         // Without extra flags and without a bundle path, falls back to `-b <bundle_id>` with no `--args`.
         let fallback =
             mac_relaunch_spec(99, None, BUNDLE_ID, &["/usr/local/bin/ferrocast".into(), "-psn_0_777".into()], false);
         assert_eq!(
             fallback.args[2..],
-            [std::ffi::OsString::from("ferrocast-relaunch"), "99".into(), "-n".into(), "-b".into(), BUNDLE_ID.into(),]
+            [std::ffi::OsString::from("ferrocast-relaunch"), "99".into(), "-b".into(), BUNDLE_ID.into(),]
         );
     }
 }
