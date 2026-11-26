@@ -291,7 +291,7 @@ async fn adding_or_removing_a_destination_while_live_never_reshapes_the_encoder(
     };
     e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
     push_main(&e, 20_000);
-    let _keep = keep_streaming(e.golive().hub.clone(), 20_000, 4_000);
+    let _keep = keep_streaming(e.golive().main_hub(), 20_000, 4_000);
     e.set_studio_live(true);
     e.sync_stream_cap().await;
     let before = studio.caps.lock().unwrap().len();
@@ -316,7 +316,7 @@ async fn a_destination_the_running_encode_cannot_serve_is_refused() {
     // A 14,000 kbps stream is on air to YouTube: Twitch takes 6,000 at most.
     e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
     push_main(&e, 175_000);
-    let _keep = keep_streaming(e.golive().hub.clone(), 175_000, 4_000);
+    let _keep = keep_streaming(e.golive().main_hub(), 175_000, 4_000);
     let err =
         e.set_golive_destinations_checked(order(&e, &["youtube", "twitch"]), Default::default()).await.unwrap_err();
     match err {
@@ -347,8 +347,8 @@ async fn a_compliant_stream_can_take_twitch_and_the_others_are_not_judged() {
     };
     e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
     push_main(&e, 77_000);
-    let _keep = keep_streaming(e.golive().hub.clone(), 77_000, 4_000);
-    eventually_async(|| async { e.golive().hub.stats().kbps > 5_000 }).await;
+    let _keep = keep_streaming(e.golive().main_hub(), 77_000, 4_000);
+    eventually_async(|| async { e.golive().main_hub().stats().kbps > 5_000 }).await;
     e.set_golive_destinations_checked(order(&e, &["youtube", "twitch"]), Default::default()).await.unwrap();
     // Kick as well: it only has to fit itself (8,000), not be judged against Twitch's 6,000.
     e.set_golive_destinations_checked(order(&e, &["youtube", "twitch", "kick"]), Default::default()).await.unwrap();
@@ -744,6 +744,11 @@ struct DirectStudio {
     caps: std::sync::Mutex<Vec<Option<crate::studio_host::StreamCap>>>,
     /// Set: `set_stream_cap` refuses with this (the encoder is shared with a recording).
     cap_refused: std::sync::Mutex<Option<String>>,
+    streaming: std::sync::atomic::AtomicBool,
+    budget_level: std::sync::Mutex<Option<String>>,
+    budget_light_checks: std::sync::atomic::AtomicUsize,
+    light_starts: std::sync::atomic::AtomicUsize,
+    light_stops: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -795,6 +800,28 @@ impl crate::studio_host::StudioHost for DirectStudio {
     async fn monitoring(&self) -> Result<serde_json::Value, String> {
         Err("n/a".into())
     }
+    async fn encode_budget(
+        &self,
+        _draft: Option<serde_json::Value>,
+        _enhanced: bool,
+        light: bool,
+    ) -> Result<serde_json::Value, String> {
+        if light {
+            self.budget_light_checks.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(match self.budget_level.lock().unwrap().as_deref() {
+            Some(lvl) => json!({ "level": lvl }),
+            None => json!({ "budget_mpx": null, "level": "unknown" }),
+        })
+    }
+    async fn light_stream_start(&self, _server: String, _key: String) -> Result<(), String> {
+        self.light_starts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+    async fn light_stream_stop(&self) -> Result<(), String> {
+        self.light_stops.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
     async fn stream_start(
         &self,
         _server: String,
@@ -807,7 +834,11 @@ impl crate::studio_host::StudioHost for DirectStudio {
         Ok(())
     }
     async fn stream_stats(&self) -> Result<serde_json::Value, String> {
-        Ok(serde_json::Value::Null)
+        if self.streaming.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(json!({ "active": true }))
+        } else {
+            Ok(serde_json::Value::Null)
+        }
     }
     async fn obs_collections(&self) -> Result<serde_json::Value, String> {
         Ok(json!([]))
@@ -1602,9 +1633,11 @@ async fn light_hub_destination_checks_light_hub_rules_and_eb_is_exempt() {
             hub.video(ts, d.into());
         }
     };
-    push_stream(&g.hub, 150_000); // ~12,000 kbps
-    push_stream(&g.lhub, 37_500); // ~3,000 kbps
-    let feeds = [keep_streaming(g.hub.clone(), 150_000, 4_000), keep_streaming(g.lhub.clone(), 37_500, 4_000)];
+    let main_hub = g.main_hub();
+    let light_hub = g.light_hub();
+    push_stream(&main_hub, 150_000); // ~12,000 kbps
+    push_stream(&light_hub, 37_500); // ~3,000 kbps
+    let feeds = [keep_streaming(main_hub, 150_000, 4_000), keep_streaming(light_hub, 37_500, 4_000)];
 
     let v = e.golive_view().await;
     let twitch = v.destinations.iter().find(|d| d.id == "twitch").unwrap();
@@ -1617,7 +1650,9 @@ async fn light_hub_destination_checks_light_hub_rules_and_eb_is_exempt() {
     assert!(matches!(err, EngineError::Refused { status: 422, code: "golive_needs_new_encode", .. }), "{err:?}");
     // (The rest is about what the view says, so the move is made in the saved settings directly.)
     let mut cfg = e.golive_config();
-    cfg.destinations.iter_mut().find(|d| d.id == "twitch").unwrap().light = false;
+    let twitch_cfg = cfg.destinations.iter_mut().find(|d| d.id == "twitch").unwrap();
+    twitch_cfg.light = false;
+    twitch_cfg.quality = crate::golive::DestinationQuality::SameAsMain;
     e.save_golive(cfg).await.unwrap();
     e.set_golive_enhanced("twitch", true).await.unwrap();
     let v = e.golive_view().await;
@@ -1678,7 +1713,7 @@ async fn studio_stream_caps_twitch_and_kick_exposes_c2_and_honors_ignore_limits(
     );
 
     // While Studio holds the live stream, small VT accounting above 6,000 produces zero nagging warnings.
-    let hub = &e.golive().hub;
+    let hub = e.golive().main_hub();
     hub.start();
     hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
     for i in 0..=40u32 {
@@ -1797,7 +1832,7 @@ fn keep_streaming(hub: Arc<ferrocast_golive::Hub>, frame_bytes: usize, mut ts: u
 
 /// A stream of `kbps` on the main hub, as the Studio's would arrive.
 fn push_main(e: &crate::Engine, frame_bytes: usize) {
-    let hub = &e.golive().hub;
+    let hub = e.golive().main_hub();
     hub.start();
     hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
     for i in 0..=40u32 {
@@ -1960,6 +1995,7 @@ async fn disconnected_twitch_beside_youtube_does_not_cap_live_youtube_stream() {
         light: false,
         enhanced: false,
         brand: None,
+        quality: crate::golive::DestinationQuality::SameAsMain,
     });
     e.save_golive(cfg).await.unwrap();
     let empty_blocked = std::collections::HashMap::new();
@@ -2023,7 +2059,7 @@ async fn live_view_reflects_applied_cap_after_midstream_destination_switch_and_s
     // 2. Start live Studio stream at 12,000 kbps with Twitch + YouTube -> applied_cap = 6,000 kbps.
     e.set_golive_destinations(enable(&["twitch", "youtube"])).await.unwrap();
     e.studio_stream(true).await.unwrap();
-    e.golive().hub.start();
+    e.golive().main_hub().start();
     assert_eq!(e.applied_cap().and_then(|c| c.max_kbps), Some(6_000));
 
     // (a) Twitch + YouTube -> YouTube only mid-stream: applied_cap stays 6,000 kbps and
@@ -2048,7 +2084,7 @@ async fn live_view_reflects_applied_cap_after_midstream_destination_switch_and_s
 
     // (c) Auto-light (lighter_for_route: true) suppresses the main-stream cap badge.
     e.seed_light_route_for_test("kick");
-    e.golive().lhub.start();
+    e.golive().light_hub().start();
     let v = e.golive_view().await;
     let kick = v.destinations.iter().find(|d| d.id == "kick").unwrap();
     assert!(kick.lighter_for_route, "Kick should report lighter_for_route");
@@ -2083,7 +2119,7 @@ async fn uncapped_primary_failover_to_incompatible_standby_twitch_is_blocked_wit
 
     // Start uncapped YouTube at 12,000 kbps while Twitch waits on standby.
     e.studio_stream(true).await.unwrap();
-    e.golive().hub.start();
+    e.golive().main_hub().start();
     e.reconcile().await;
     assert_eq!(e.applied_cap(), None);
     assert!(e.golive_running().contains("youtube"));
@@ -2130,7 +2166,7 @@ async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
     e.studio_stream(true).await.unwrap();
     // 7,011 kbps arrives, and goes on arriving.
     push_main(&e, 90_000);
-    let feed = keep_streaming(e.golive().hub.clone(), 90_000, 4_000);
+    let feed = keep_streaming(e.golive().main_hub(), 90_000, 4_000);
     let twitch = |v: &crate::golive::GoLiveView| v.destinations.iter().find(|d| d.id == "twitch").cloned().unwrap();
     let v = e.golive_view().await;
     assert_eq!(twitch(&v).capped, None, "not claimed");
@@ -2400,7 +2436,7 @@ async fn the_running_encode_keeps_the_cap_it_started_with() {
     let started = studio.caps.lock().unwrap().last().copied().flatten();
     assert_eq!(started.and_then(|c| c.max_kbps), Some(6_000));
     push_main(&e, 20_000);
-    let _keep = keep_streaming(e.golive().hub.clone(), 20_000, 4_000);
+    let _keep = keep_streaming(e.golive().main_hub(), 20_000, 4_000);
     // Twitch leaves: the encoder keeps its cap, through this and an ordinary reconcile.
     e.set_golive_destinations(order(&e, &["youtube"])).await.unwrap();
     e.reconcile().await;
@@ -2487,4 +2523,411 @@ async fn a_pasted_key_for_x_instagram_or_facebook_is_a_branded_custom_server() {
     assert_eq!(brand_of(&plain.id), Some(None), "no brand, no field");
     assert!(rows.iter().any(|r| r["brand"] == "facebook"), "{rows:?}");
     assert!(rows.iter().any(|r| r["brand"] == "instagram"));
+}
+
+#[tokio::test]
+async fn v37_golive_config_fixture_loads_preserves_single_main_encode_and_ignores_unknown_quality_on_rollback() {
+    use ferrocast_golive::probe::Service;
+
+    use crate::golive::{Canvas, DestinationQuality, GROUP_LIGHT, GROUP_MAIN, PcBudget};
+
+    // Exact Ferrocast 3.7 GoLiveConfig JSON shape (no `quality` field on any destination).
+    let v37_json = json!({
+        "destinations": [
+            { "id": "twitch", "kind": "twitch", "enabled": true, "light": true },
+            { "id": "youtube", "kind": "youtube", "enabled": true },
+            { "id": "kick", "kind": "kick", "enabled": true },
+            { "id": "youtube_vertical", "kind": "youtube", "enabled": false, "canvas": "vertical" },
+            { "id": "c_legacy", "kind": "custom", "name": "BackupRTMP", "url": "rtmp://127.0.0.1:9/app", "enabled": false }
+        ],
+        "protect": true,
+        "auto_quality": true,
+        "aitum_ok": false
+    });
+    let mut cfg: GoLiveConfig = serde_json::from_value(v37_json).unwrap();
+    assert!(
+        cfg.destinations.iter().all(|d| d.quality == DestinationQuality::SameAsMain),
+        "v3.7 destinations missing `quality` must default to SameAsMain"
+    );
+
+    // Default `SameAsMain` is omitted on serialization (zero wire change unless custom quality is chosen).
+    let serialized = serde_json::to_value(&cfg).unwrap();
+    let arr = serialized["destinations"].as_array().unwrap();
+    assert!(arr.iter().all(|d| d.get("quality").is_none()), "default SameAsMain must omit `quality` field: {arr:?}");
+
+    // Legacy `light: true` in v3.7 config resolves through planner bridge to `GROUP_LIGHT`.
+    let (e, _dir) = engine().await;
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Twitch)));
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Youtube)));
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 12_000,
+        ..Default::default()
+    };
+    e.set_studio_host(studio);
+    e.note_studio_settings(&crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 12_000,
+        ..Default::default()
+    });
+    e.save_golive(cfg.clone()).await.unwrap();
+    let plan_with_light = e.plan_golive_encodes(PcBudget::unknown());
+    assert_eq!(plan_with_light.destinations["twitch"].group_id, GROUP_LIGHT);
+
+    // Without `light: true`, a 3.7 1080p60 config preserves today's single `main` encode (6,000 kbps Studio cap),
+    // collapses to one `main` group under a 1-session budget, and separates cleanly when budget permits.
+    cfg.destinations.iter_mut().find(|d| d.id == "twitch").unwrap().light = false;
+    e.save_golive(cfg).await.unwrap();
+    let studio_cap = e.studio_limit();
+    assert_eq!(studio_cap.map(|l| l.max_kbps), Some(6_000));
+    e.studio_stream(true).await.unwrap();
+    assert_eq!(e.applied_cap().and_then(|c| c.max_kbps), Some(6_000));
+    e.studio_stream(false).await.unwrap();
+
+    let tight =
+        e.plan_golive_encodes(PcBudget::with_limits(crate::golive::BudgetSource::CpuDefault, Some(200.0), Some(1)));
+    assert_eq!(tight.groups.len(), 1, "tight 1-session budget keeps 3.7 single main encode: {:?}", tight.groups);
+    assert_eq!(tight.groups[0].id, GROUP_MAIN);
+    assert_eq!(tight.groups[0].key.kbps, 6_000);
+    assert!(tight.destinations.values().all(|d| d.group_id == GROUP_MAIN));
+
+    let unconstrained = e.plan_golive_encodes(PcBudget::apple_silicon(2));
+    assert_eq!(unconstrained.groups.len(), 2, "unconstrained 3.8 splits YouTube 12M and Twitch 6M");
+
+    // Rollback test: a simulated v3.7 reader (without `quality` field) cleanly ignores `quality` in JSON.
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct V37DestinationConfig {
+        id: String,
+        kind: Service,
+        enabled: bool,
+        #[serde(default)]
+        canvas: Canvas,
+        #[serde(default)]
+        light: bool,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct V37GoLiveConfig {
+        destinations: Vec<V37DestinationConfig>,
+    }
+    e.set_golive_quality(
+        "kick",
+        DestinationQuality::Custom(crate::golive::CustomQuality {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            kbps: 4_500,
+            codec: Some(crate::golive::VideoCodec::H264),
+        }),
+    )
+    .await
+    .unwrap();
+    let saved_json = serde_json::to_value(e.golive_config()).unwrap();
+    assert!(
+        saved_json["destinations"].as_array().unwrap().iter().any(|d| d["id"] == "kick" && d.get("quality").is_some()),
+        "custom quality must serialize into golive config"
+    );
+    let rollback: V37GoLiveConfig = serde_json::from_value(saved_json).unwrap();
+    assert_eq!(rollback.destinations.len(), e.golive_config().destinations.len());
+}
+
+#[tokio::test]
+async fn legacy_light_bridge_and_per_destination_quality_persist_and_validate() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, PcBudget, VideoCodec};
+
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 12_000,
+        ..Default::default()
+    };
+    e.set_studio_host(studio);
+    e.register_connector(Arc::new(SignedIn(ferrocast_core::event::Platform::Kick)));
+
+    // Turning legacy `light` on populates `light: true` + `Custom(720p, <=3000 kbps, H264)`.
+    let cfg = e.set_golive_light("twitch", true).await.unwrap();
+    let twitch = cfg.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert!(twitch.light);
+    assert_eq!(
+        twitch.quality,
+        DestinationQuality::Custom(CustomQuality {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            kbps: 3_000,
+            codec: Some(VideoCodec::H264),
+        })
+    );
+
+    // Re-deserializing preserves the exact quality.
+    let raw = serde_json::to_string(&cfg).unwrap();
+    let reloaded: GoLiveConfig = serde_json::from_str(&raw).unwrap();
+    assert_eq!(reloaded.destinations.iter().find(|d| d.id == "twitch").unwrap().quality, twitch.quality);
+
+    // Turning `light` off clears both `light` and resets `quality` back to `SameAsMain`.
+    let cfg = e.set_golive_light("twitch", false).await.unwrap();
+    let twitch = cfg.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert!(!twitch.light);
+    assert_eq!(twitch.quality, DestinationQuality::SameAsMain);
+
+    // Explicit `set_golive_quality` writes Custom, clears `light`, and produces a dedicated encode group.
+    e.set_golive_light("kick", true).await.unwrap();
+    let cfg = e
+        .set_golive_quality(
+            "kick",
+            DestinationQuality::Custom(CustomQuality {
+                width: 1280,
+                height: 720,
+                fps: 30,
+                kbps: 4_500,
+                codec: Some(VideoCodec::H264),
+            }),
+        )
+        .await
+        .unwrap();
+    let kick = cfg.destinations.iter().find(|d| d.id == "kick").unwrap();
+    assert!(!kick.light);
+    assert!(matches!(kick.quality, DestinationQuality::Custom(_)));
+    let order: Vec<(String, bool)> = cfg.destinations.iter().map(|d| (d.id.clone(), d.id == "kick")).collect();
+    e.set_golive_destinations(order).await.unwrap();
+    let plan = e.plan_golive_encodes(PcBudget::unknown());
+    assert_ne!(plan.destinations["kick"].group_id, crate::golive::GROUP_MAIN);
+
+    // Validation rejections: resolution > canvas, odd dimensions, disallowed codec, direct/EB.
+    let err = e
+        .set_golive_quality(
+            "youtube",
+            DestinationQuality::Custom(CustomQuality { width: 2560, height: 1440, fps: 60, kbps: 9_000, codec: None }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+
+    let err = e
+        .set_golive_quality(
+            "twitch",
+            DestinationQuality::Custom(CustomQuality {
+                width: 1280,
+                height: 720,
+                fps: 60,
+                kbps: 9_000,
+                codec: Some(VideoCodec::Hevc),
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+
+    let whip = e.add_golive_destination("WHIP", "https://whip.example.com/whip", "", Canvas::Main).await.unwrap();
+    let err = e
+        .set_golive_quality(
+            &whip.id,
+            DestinationQuality::Custom(CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_000, codec: None }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+
+    e.set_golive_enhanced("twitch", true).await.unwrap();
+    let err = e
+        .set_golive_quality(
+            "twitch",
+            DestinationQuality::Custom(CustomQuality { width: 1280, height: 720, fps: 60, kbps: 5_000, codec: None }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn dynamic_hub_registry_routes_custom_group_checks_budget_and_promotes_back_to_assigned_group() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::timeout;
+
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_LIGHT, GROUP_MAIN, PcBudget, VideoCodec};
+
+    let (e, _dir) = engine().await;
+    let studio = Arc::new(DirectStudio::default());
+    *studio.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 12_000,
+        ..Default::default()
+    };
+    studio.streaming.store(true, Ordering::Release);
+    e.set_studio_host(studio.clone());
+
+    let (port_main, mut got_main) = platform("main-k").await;
+    let (port_cust, mut got_cust) = platform("cust-k").await;
+    let (port_low, _got_low) = platform("low-k").await;
+
+    let d_main = e
+        .add_golive_destination("MainOut", &format!("rtmp://127.0.0.1:{port_main}/app"), "main-k", Canvas::Main)
+        .await
+        .unwrap();
+    let d_cust = e
+        .add_golive_destination("CustOut", &format!("rtmp://127.0.0.1:{port_cust}/app"), "cust-k", Canvas::Main)
+        .await
+        .unwrap();
+    let d_low = e
+        .add_golive_destination("LowOut", &format!("rtmp://127.0.0.1:{port_low}/app"), "low-k", Canvas::Main)
+        .await
+        .unwrap();
+
+    e.set_golive_quality(
+        &d_cust.id,
+        DestinationQuality::Custom(CustomQuality {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            kbps: 4_500,
+            codec: Some(VideoCodec::H264),
+        }),
+    )
+    .await
+    .unwrap();
+    // Already lighter than the 3,000 kbps fallback: never downgraded onto `light`.
+    e.set_golive_quality(
+        &d_low.id,
+        DestinationQuality::Custom(CustomQuality {
+            width: 852,
+            height: 480,
+            fps: 30,
+            kbps: 1_500,
+            codec: Some(VideoCodec::H264),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| {
+            let on = d.id == d_main.id || d.id == d_cust.id || d.id == d_low.id;
+            (d.id, on)
+        })
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    let plan = e.plan_golive_encodes(PcBudget::unknown());
+    let cust_group = plan.destinations[&d_cust.id].group_id.clone();
+    let low_group = plan.destinations[&d_low.id].group_id.clone();
+    assert_ne!(cust_group, GROUP_MAIN);
+    assert_ne!(cust_group, low_group);
+
+    let g = e.golive();
+    let main_hub = g.main_hub();
+    let cust_hub = g.ensure_hub(&cust_group, Canvas::Main);
+    let low_hub = g.ensure_hub(&low_group, Canvas::Main);
+
+    let start_hub = |hub: &ferrocast_golive::Hub, frame_bytes: usize| {
+        hub.start();
+        hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
+        for i in 0..=40u32 {
+            let mut d = vec![if i % 20 == 0 { 0x17 } else { 0x27 }, 0x01];
+            d.resize(frame_bytes, 0);
+            hub.video(i * 100, d.into());
+        }
+    };
+    start_hub(&main_hub, 150_000); // ~12,000 kbps
+    start_hub(&cust_hub, 56_250); // ~4,500 kbps
+    start_hub(&low_hub, 18_750); // ~1,500 kbps
+    let feeds = [
+        keep_streaming(main_hub, 150_000, 4_000),
+        keep_streaming(cust_hub, 56_250, 4_000),
+        keep_streaming(low_hub, 18_750, 4_000),
+    ];
+
+    e.reconcile().await;
+    assert_eq!(e.golive_running_group(&d_main.id).as_deref(), Some(GROUP_MAIN));
+    assert_eq!(e.golive_running_group(&d_cust.id).as_deref(), Some(cust_group.as_str()));
+    assert_eq!(e.golive_running_group(&d_low.id).as_deref(), Some(low_group.as_str()));
+
+    let mut saw_cust_publish = false;
+    for _ in 0..10 {
+        if let Ok(Some(msg)) = timeout(Duration::from_secs(2), got_cust.recv()).await
+            && matches!(msg, Got::Publish(ref k) if k == "cust-k")
+        {
+            saw_cust_publish = true;
+            break;
+        }
+    }
+    assert!(saw_cust_publish, "dynamic hub must feed its assigned custom destination");
+    let mut saw_main_publish = false;
+    for _ in 0..10 {
+        if let Ok(Some(msg)) = timeout(Duration::from_secs(2), got_main.recv()).await
+            && matches!(msg, Got::Publish(ref k) if k == "main-k")
+        {
+            saw_main_publish = true;
+            break;
+        }
+    }
+    assert!(saw_main_publish, "main hub must keep serving its destination");
+
+    // 1. Healthy throughput on `d_cust` matching its own group's ~4,500 kbps (NOT main's 12,000 kbps)
+    // must NOT trigger a downgrade to `light`.
+    let _main_tx = e.replace_running_health_for_test(&d_main.id, GROUP_MAIN, 12_000, 60_000);
+    let cust_tx = e.replace_running_health_for_test(&d_cust.id, &cust_group, 4_500, 60_000);
+    let _low_tx = e.replace_running_health_for_test(&d_low.id, &low_group, 200, 60_000);
+    let t0 = Instant::now();
+    for s in 0..10u64 {
+        e.quality_tick_at(t0 + Duration::from_secs(s)).await;
+    }
+    let updated_cfg = e.golive_config();
+    assert!(!e.wants_light_now(updated_cfg.destinations.iter().find(|d| d.id == d_cust.id).unwrap()));
+    assert!(
+        !e.wants_light_now(updated_cfg.destinations.iter().find(|d| d.id == d_low.id).unwrap()),
+        "already-1500 kbps destination must never be moved to 3000 kbps light fallback"
+    );
+    assert_eq!(studio.light_starts.load(Ordering::Acquire), 0);
+
+    // 2. Slow route on `d_cust` while encode budget is `over` keeps `light` off cleanly.
+    *studio.budget_level.lock().unwrap() = Some("over".into());
+    cust_tx.send_modify(|h| h.kbps = 500);
+    for s in 10..20u64 {
+        e.quality_tick_at(t0 + Duration::from_secs(s)).await;
+    }
+    assert!(studio.budget_light_checks.load(Ordering::Acquire) >= 1);
+    assert_eq!(studio.light_starts.load(Ordering::Acquire), 0, "over budget must block on-demand light start");
+    assert!(!e.wants_light_now(e.golive_config().destinations.iter().find(|d| d.id == d_cust.id).unwrap()));
+
+    // 3. With budget `ok`, slow `d_cust` moves to `light` and starts light stream.
+    *studio.budget_level.lock().unwrap() = Some("ok".into());
+    for s in 20..30u64 {
+        e.quality_tick_at(t0 + Duration::from_secs(s)).await;
+    }
+    assert!(studio.light_starts.load(Ordering::Acquire) >= 1, "ok budget should allow light stream start");
+    assert!(e.wants_light_now(e.golive_config().destinations.iter().find(|d| d.id == d_cust.id).unwrap()));
+    let light_hub = g.light_hub();
+    start_hub(&light_hub, 37_500);
+    e.reconcile().await;
+    assert_eq!(e.golive_running_group(&d_cust.id).as_deref(), Some(GROUP_LIGHT));
+
+    // 4. After LIGHT_FIRST cooldown expires, `quality_tick` promotes `d_cust` back to its own `cust_group`, not `main`.
+    e.quality_tick_at(t0 + Duration::from_secs(200)).await;
+    light_hub.end();
+    e.reconcile().await;
+    assert!(!e.wants_light_now(e.golive_config().destinations.iter().find(|d| d.id == d_cust.id).unwrap()));
+    assert_eq!(
+        e.golive_running_group(&d_cust.id).as_deref(),
+        Some(cust_group.as_str()),
+        "recovered destination must return to its assigned encode group, not blindly main"
+    );
+
+    feeds.iter().for_each(tokio::task::JoinHandle::abort);
 }

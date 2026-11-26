@@ -3179,11 +3179,17 @@ impl Engine {
         let host = self.studio_host().ok()?;
         let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
         // For a platform that takes it, or as a WebRTC server's simulcast layer.
-        let wanted = self
-            .golive_config()
-            .destinations
-            .iter()
-            .any(|d| d.enabled && (self.wants_light_now(d) || self.simulcast(d)));
+        let cfg = self.golive_config();
+        let manual_or_simulcast = cfg.destinations.iter().any(|d| d.enabled && (d.wants_light() || self.simulcast(d)));
+        let route_light = cfg.destinations.iter().any(|d| d.enabled && !d.wants_light() && self.wants_light_now(d));
+        let mut wanted = manual_or_simulcast || route_light;
+        if streaming && route_light && !manual_or_simulcast && !self.golive().light_hub().live().borrow().on {
+            let enhanced = cfg.destinations.iter().any(|d| d.enabled && d.enhanced);
+            if host.encode_budget(None, enhanced, true).await.ok().is_some_and(|v| v["level"].as_str() == Some("over"))
+            {
+                wanted = false;
+            }
+        }
         if !streaming || !wanted {
             if let Err(e) = host.light_stream_stop().await {
                 tracing::warn!(error = %e, "the Studio's lighter stream didn't stop");
@@ -3347,7 +3353,7 @@ impl Engine {
             ));
         }
         let gl = self.golive();
-        if gl.hub.live().borrow().on || gl.vhub.live().borrow().on || gl.lhub.live().borrow().on {
+        if gl.any_hub_live() {
             return Err(busy_err(busy_message, busy_hint));
         }
         let Ok(host) = self.studio_host() else { return Ok(()) };
