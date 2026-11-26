@@ -21,6 +21,171 @@ const EVERY: Duration = Duration::from_secs(2);
 const WAKE_JUMP_MS: i64 = 10_000;
 /// Rate limit for live missed-frame breakdown logs (ms).
 const MISS_LOG_EVERY_MS: i64 = 10_000;
+/// Rate limit for output falling-behind warnings (ms).
+const OUTPUT_LAG_LOG_EVERY_MS: i64 = 5_000;
+/// Upload check comparison threshold: warn when total stream bitrate exceeds 85% of measured upload.
+const TIGHT_UPLOAD_PCT: u64 = 85;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputLagReport {
+    pub cause: &'static str,
+    pub queue_mb: f64,
+    pub dropped_delta: u64,
+    pub dropped_total: u64,
+    pub sender_kbps: u32,
+    pub bitrate_kbps: u32,
+    pub measured_upload_kbps: Option<u32>,
+    pub measured_by: Option<String>,
+    pub upload_status: &'static str,
+    pub auto_quality_pct: u8,
+    pub slow_dests: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OutputLagWatch {
+    prev_at_ms: Option<i64>,
+    prev_sender_bytes: u64,
+    prev_sender_dropped: u64,
+    prev_dest_dropped: std::collections::HashMap<String, u64>,
+    prev_dest_live: std::collections::HashMap<String, bool>,
+    pending_dropped: u64,
+    last_warn_ms: Option<i64>,
+}
+
+pub(crate) struct OutputLagTick<'a> {
+    pub at_ms: i64,
+    pub sender_active: bool,
+    pub sender_reconnecting: bool,
+    pub sender_bytes: u64,
+    pub sender_dropped: u64,
+    pub dests: &'a [ferrocast_core::auto_quality::Dest],
+    pub paused: bool,
+}
+
+impl OutputLagWatch {
+    /// Checks sender and lightweight Go live destination counters every tick without calling `golive_view`
+    /// unless a stall, drop, or disconnect requires upload-check & bitrate comparison details.
+    pub(crate) fn detect_trouble(&mut self, tick: &OutputLagTick<'_>) -> Option<(&'static str, u32, u64)> {
+        let Some(prev_ms) = self.prev_at_ms else {
+            self.prev_at_ms = Some(tick.at_ms);
+            self.prev_sender_bytes = tick.sender_bytes;
+            self.prev_sender_dropped = tick.sender_dropped;
+            for d in tick.dests {
+                self.prev_dest_dropped.insert(d.id.clone(), d.dropped);
+                self.prev_dest_live.insert(d.id.clone(), d.live);
+            }
+            return None;
+        };
+        if tick.at_ms < prev_ms
+            || tick.sender_bytes < self.prev_sender_bytes
+            || tick.sender_dropped < self.prev_sender_dropped
+        {
+            *self = Self::default();
+            return self.detect_trouble(tick);
+        }
+        let dt_ms = (tick.at_ms - prev_ms).max(1) as u64;
+        let d_bytes = tick.sender_bytes - self.prev_sender_bytes;
+        let d_sender_dropped = tick.sender_dropped - self.prev_sender_dropped;
+        let sender_kbps = u32::try_from(d_bytes.saturating_mul(8) / dt_ms).unwrap_or(u32::MAX);
+
+        let mut d_dest_dropped = 0u64;
+        let mut hung_up = false;
+        for d in tick.dests {
+            let prev_d = self.prev_dest_dropped.get(&d.id).copied().unwrap_or(0);
+            if d.dropped >= prev_d {
+                d_dest_dropped += d.dropped - prev_d;
+            }
+            let was_live = self.prev_dest_live.get(&d.id).copied().unwrap_or(false);
+            if was_live && !d.live {
+                hung_up = true;
+            }
+            self.prev_dest_dropped.insert(d.id.clone(), d.dropped);
+            self.prev_dest_live.insert(d.id.clone(), d.live);
+        }
+        let stalled = tick.sender_active && !tick.sender_reconnecting && self.prev_sender_bytes > 0 && d_bytes == 0;
+        self.prev_at_ms = Some(tick.at_ms);
+        self.prev_sender_bytes = tick.sender_bytes;
+        self.prev_sender_dropped = tick.sender_dropped;
+
+        let step_drops = d_sender_dropped.saturating_add(d_dest_dropped);
+        self.pending_dropped = self.pending_dropped.saturating_add(step_drops);
+
+        let cause = if stalled {
+            Some("output stalled (0 bytes sent)")
+        } else if d_sender_dropped > 0 {
+            Some("sender dropping packets")
+        } else if d_dest_dropped > 0 {
+            Some("destination falling behind")
+        } else if hung_up || tick.paused {
+            Some("destination disconnected or paused")
+        } else {
+            None
+        };
+        let cause = cause?;
+        if !self.last_warn_ms.is_none_or(|t| tick.at_ms - t >= OUTPUT_LAG_LOG_EVERY_MS) {
+            return None;
+        }
+        let burst = std::mem::take(&mut self.pending_dropped);
+        self.last_warn_ms = Some(tick.at_ms);
+        Some((cause, sender_kbps, burst))
+    }
+
+    pub(crate) fn build_report(input: OutputLagInput) -> OutputLagReport {
+        let dest_kbps_sum: u32 = input.dest_details.iter().map(|(_, _, k)| *k).fold(0u32, u32::saturating_add);
+        let dropped_total =
+            input.sender_dropped.saturating_add(input.dest_details.iter().map(|(_, d, _)| *d).sum::<u64>());
+        let bitrate_kbps = input.hub_kbps.max(dest_kbps_sum).max(input.sender_kbps);
+        let (measured_upload_kbps, measured_by, upload_status) = match input.upload {
+            Some((up, by)) if up > 0 => {
+                let status = if bitrate_kbps > up {
+                    "exceeds_upload"
+                } else if u64::from(bitrate_kbps).saturating_mul(100) >= u64::from(up).saturating_mul(TIGHT_UPLOAD_PCT)
+                {
+                    "tight_upload"
+                } else {
+                    "within_upload"
+                };
+                (Some(up), Some(by), status)
+            }
+            _ => (None, None, "no_upload_check"),
+        };
+        let slow_dests = if input.dest_details.is_empty() {
+            "none".into()
+        } else {
+            input
+                .dest_details
+                .into_iter()
+                .map(|(name, dropped, kbps)| format!("{name}:{kbps}kbps/drop={dropped}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        OutputLagReport {
+            cause: input.cause,
+            queue_mb: input.queue_mb,
+            dropped_delta: input.dropped_delta,
+            dropped_total,
+            sender_kbps: input.sender_kbps,
+            bitrate_kbps,
+            measured_upload_kbps,
+            measured_by,
+            upload_status,
+            auto_quality_pct: input.auto_quality_pct,
+            slow_dests,
+        }
+    }
+}
+
+pub(crate) struct OutputLagInput {
+    pub cause: &'static str,
+    pub queue_mb: f64,
+    pub dropped_delta: u64,
+    pub sender_dropped: u64,
+    pub sender_kbps: u32,
+    pub hub_kbps: u32,
+    pub upload: Option<(u32, String)>,
+    pub auto_quality_pct: u8,
+    pub dest_details: Vec<(String, u64, u32)>,
+}
 
 /// Cumulative counters observed at one live tick to split misses into render vs encode vs network.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -303,6 +468,7 @@ impl Engine {
                     *engine.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     *engine.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     *engine.studio().miss_watch.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+                    *engine.studio().output_lag_watch.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     if live {
                         engine.wake_youtube();
                     }
@@ -318,6 +484,7 @@ impl Engine {
                     let dropped = sender.as_ref().and_then(|v| v["dropped"].as_u64()).unwrap_or(0);
                     engine.auto_quality_tick_with(dropped).await;
                     engine.health_tick().await;
+                    engine.output_lag_tick(sender.as_ref()).await;
                     engine.live_watch_tick_with(&snap).await;
                 }
             }
@@ -450,6 +617,66 @@ impl Engine {
                 m.why
             );
         }
+    }
+
+    /// Diagnoses output freezes and falling-behind destinations with queue depth, dropped counts,
+    /// and bitrate vs measured upload capacity (rate-limited at warn).
+    pub(crate) async fn output_lag_tick(&self, sender: Option<&Value>) {
+        let Some(s) = sender else { return };
+        let active = s["active"].as_bool() == Some(true);
+        let reconnecting = s["reconnecting"].as_bool() == Some(true);
+        let sender_bytes = s["bytes"].as_u64().unwrap_or(0);
+        let sender_dropped = s["dropped"].as_u64().unwrap_or(0);
+        let queue_mb = s["delay_mb"].as_f64().unwrap_or(0.0);
+        let (_, paused) = self.golive_trouble();
+        let dests = self.golive_senders();
+
+        let hit =
+            self.studio().output_lag_watch.lock().unwrap_or_else(|p| p.into_inner()).detect_trouble(&OutputLagTick {
+                at_ms: now().0,
+                sender_active: active,
+                sender_reconnecting: reconnecting,
+                sender_bytes,
+                sender_dropped,
+                dests: &dests,
+                paused,
+            });
+        let Some((cause, sender_kbps, dropped_delta)) = hit else { return };
+
+        let gl = self.golive_view().await;
+        let upload = gl.upload.as_ref().map(|u| (u.verdict.upload_kbps, u.measured_by.clone()));
+        let dest_details = gl
+            .destinations
+            .iter()
+            .filter_map(|d| d.health.as_ref().map(|h| (d.name.clone(), h.dropped, h.kbps)))
+            .collect();
+        let aq_pct = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct();
+        let r = OutputLagWatch::build_report(OutputLagInput {
+            cause,
+            queue_mb,
+            dropped_delta,
+            sender_dropped,
+            sender_kbps,
+            hub_kbps: gl.stats.kbps,
+            upload,
+            auto_quality_pct: aq_pct,
+            dest_details,
+        });
+        tracing::warn!(
+            cause = r.cause,
+            queue_mb = r.queue_mb,
+            dropped_delta = r.dropped_delta,
+            dropped_total = r.dropped_total,
+            sender_kbps = r.sender_kbps,
+            bitrate_kbps = r.bitrate_kbps,
+            measured_upload_kbps = r.measured_upload_kbps,
+            measured_by = r.measured_by.as_deref(),
+            upload_status = r.upload_status,
+            auto_quality_pct = r.auto_quality_pct,
+            destinations = %r.slow_dests,
+            "output falling behind: {}",
+            r.cause
+        );
     }
 
     /// Auto quality turned off: a lowered stream goes back to full quality.
@@ -765,7 +992,7 @@ mod tests {
             platform_dropped: pd,
         };
         assert_eq!(w.observe(sample(1_000, 0, 0, 0, 0, 0)), None);
-        let first = w.observe(sample(3_000, 4, 2, 1, 5, 3)).expect("first miss summary");
+        let first = w.observe(sample(3_000, 4, 2, 1, 5, 3)).unwrap_or_else(|| panic!("first miss summary"));
         assert_eq!(first.why, "render + encode + network");
         assert_eq!((first.render_missed, first.encode_missed, first.network_dropped), (4, 3, 8));
         assert_eq!((first.stream_dropped, first.platform_dropped), (5, 3));
@@ -773,8 +1000,102 @@ mod tests {
         // Within rate-limit window (< 10 s): accumulates without logging.
         assert_eq!(w.observe(sample(5_000, 4, 2, 1, 5, 7)), None);
         // Past 10 s: flushes accumulated network drops cleanly.
-        let second = w.observe(sample(13_000, 4, 2, 1, 5, 9)).expect("rate-limited flush");
+        let second = w.observe(sample(13_000, 4, 2, 1, 5, 9)).unwrap_or_else(|| panic!("rate-limited flush"));
         assert_eq!(second.why, "network");
         assert_eq!((second.render_missed, second.encode_missed, second.network_dropped), (0, 0, 6));
+    }
+
+    #[test]
+    fn output_lag_watch_detects_stalls_drops_rate_limits_and_compares_upload() {
+        let mut w = OutputLagWatch::default();
+        let dest = |dropped, live| {
+            vec![ferrocast_core::auto_quality::Dest { id: "twitch".into(), dropped, live_ms: 30_000, live }]
+        };
+
+        // Warm baseline emits nothing.
+        assert_eq!(
+            w.detect_trouble(&OutputLagTick {
+                at_ms: 1_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 100_000,
+                sender_dropped: 0,
+                dests: &dest(0, true),
+                paused: false,
+            }),
+            None
+        );
+
+        // 2 s later with 0 additional bytes sent: 1-2 s output freeze triggers at once.
+        let (cause, kbps, _) = w
+            .detect_trouble(&OutputLagTick {
+                at_ms: 3_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 100_000,
+                sender_dropped: 0,
+                dests: &dest(0, true),
+                paused: false,
+            })
+            .unwrap_or_else(|| panic!("freeze detected"));
+        assert_eq!(cause, "output stalled (0 bytes sent)");
+        assert_eq!(kbps, 0);
+
+        // Drops within the 5 s cooldown accumulate silently without re-warning yet.
+        assert_eq!(
+            w.detect_trouble(&OutputLagTick {
+                at_ms: 5_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 200_000,
+                sender_dropped: 3,
+                dests: &dest(4, true),
+                paused: false,
+            }),
+            None
+        );
+
+        // Past the 5 s cooldown, accumulated drops flush together with measured bitrate vs upload.
+        let (cause2, _, burst) = w
+            .detect_trouble(&OutputLagTick {
+                at_ms: 9_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 1_200_000,
+                sender_dropped: 5,
+                dests: &dest(7, true),
+                paused: false,
+            })
+            .unwrap_or_else(|| panic!("drop summary after cooldown"));
+        assert_eq!(cause2, "sender dropping packets");
+        assert_eq!(burst, 12);
+
+        let over = OutputLagWatch::build_report(OutputLagInput {
+            cause: cause2,
+            queue_mb: 2.5,
+            dropped_delta: burst,
+            sender_dropped: 5,
+            sender_kbps: 2000,
+            hub_kbps: 7500,
+            upload: Some((6000, "twitch".into())),
+            auto_quality_pct: 85,
+            dest_details: vec![("Twitch".into(), 7, 7500)],
+        });
+        assert_eq!(over.upload_status, "exceeds_upload");
+        assert_eq!(over.measured_upload_kbps, Some(6000));
+        assert_eq!(over.queue_mb, 2.5);
+
+        let missing = OutputLagWatch::build_report(OutputLagInput {
+            cause,
+            queue_mb: 0.0,
+            dropped_delta: 0,
+            sender_dropped: 0,
+            sender_kbps: 0,
+            hub_kbps: 6000,
+            upload: None,
+            auto_quality_pct: 100,
+            dest_details: vec![],
+        });
+        assert_eq!(missing.upload_status, "no_upload_check");
     }
 }

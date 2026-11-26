@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -220,6 +220,9 @@ struct Proc {
     child: Child,
     stdin: Option<SyncSender<Vec<u8>>>,
     writer: Option<std::thread::JoinHandle<()>>,
+    /// Frames currently queued for FFmpeg's input thread, and queue capacity.
+    queued: Arc<AtomicUsize>,
+    queue_cap: usize,
     /// The pipe broke (FFmpeg stopped).
     broken: Arc<AtomicBool>,
     tags: Receiver<Tag>,
@@ -257,14 +260,17 @@ impl Proc {
             .map_err(|e| AvError::Encoder(format!("FFmpeg didn't start ({e})")))?;
         tracing::info!(pid = child.id(), "FFmpeg started");
         let mut pipe = child.stdin.take().ok_or_else(|| AvError::Encoder("FFmpeg took no input".into()))?;
-        let (stdin, queued) = sync_channel::<Vec<u8>>(queue_cap);
+        let (stdin, queued_rx) = sync_channel::<Vec<u8>>(queue_cap);
+        let queued = Arc::new(AtomicUsize::new(0));
         let broken = Arc::new(AtomicBool::new(false));
         let writer = {
             let broken = broken.clone();
+            let queued = queued.clone();
             std::thread::Builder::new()
                 .name("ferrocast-ffmpeg-in".into())
                 .spawn(move || {
-                    for bytes in queued {
+                    for bytes in queued_rx {
+                        queued.fetch_sub(1, Ordering::AcqRel);
                         if pipe.write_all(&bytes).is_err() {
                             broken.store(true, Ordering::Release);
                             return;
@@ -308,12 +314,22 @@ impl Proc {
                 }
             });
         }
-        Ok(Self { child, stdin: Some(stdin), writer: Some(writer), broken, tags, stderr })
+        Ok(Self { child, stdin: Some(stdin), writer: Some(writer), queued, queue_cap, broken, tags, stderr })
+    }
+
+    fn queue_status(&self) -> (usize, usize) {
+        (self.queued.load(Ordering::Acquire), self.queue_cap)
     }
 
     fn write(&mut self, bytes: Vec<u8>) -> Result<(), AvError> {
         let w = self.stdin.as_ref().ok_or_else(|| AvError::Encoder("the encoder was already finished".into()))?;
-        if self.broken.load(Ordering::Acquire) || w.send(bytes).is_err() {
+        if self.broken.load(Ordering::Acquire) {
+            return Err(self.died());
+        }
+        // Increment before sending so the writer cannot decrement before this store; roll back on error.
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        if w.send(bytes).is_err() {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
             return Err(self.died());
         }
         Ok(())
@@ -335,13 +351,18 @@ impl Proc {
             if self.broken.load(Ordering::Acquire) {
                 return Err(self.died());
             }
+            self.queued.fetch_add(1, Ordering::AcqRel);
             match w.try_send(bytes) {
                 Ok(()) => return Ok(()),
                 Err(TrySendError::Full(b)) => {
+                    self.queued.fetch_sub(1, Ordering::AcqRel);
                     bytes = b;
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                Err(TrySendError::Disconnected(_)) => return Err(self.died()),
+                Err(TrySendError::Disconnected(_)) => {
+                    self.queued.fetch_sub(1, Ordering::AcqRel);
+                    return Err(self.died());
+                }
             }
         }
     }
@@ -355,10 +376,17 @@ impl Proc {
         if self.broken.load(Ordering::Acquire) {
             return Err(self.died());
         }
+        self.queued.fetch_add(1, Ordering::AcqRel);
         match w.try_send(bytes) {
             Ok(()) => Ok(true),
-            Err(TrySendError::Full(_)) => Ok(false),
-            Err(TrySendError::Disconnected(_)) => Err(self.died()),
+            Err(TrySendError::Full(_)) => {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+                Ok(false)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+                Err(self.died())
+            }
         }
     }
 
@@ -565,6 +593,9 @@ pub(crate) struct Video {
     pub(crate) record_global_drops: bool,
     /// Optional cancellation signal for blocking benchmark writes (C3).
     cancel: Option<Arc<AtomicBool>>,
+    /// Timestamp (ms from `Video` creation) of the last rate-limited encoder lag warning.
+    started: std::time::Instant,
+    last_lag_warn_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for Video {
@@ -637,6 +668,8 @@ impl Video {
             blocking,
             record_global_drops: true,
             cancel: None,
+            started: std::time::Instant::now(),
+            last_lag_warn_ms: None,
         }
     }
 
@@ -988,19 +1021,31 @@ impl Video {
         }
         // Each packet gets its time from `times` in order, so a frame left out is just missing:
         // nothing after it moves.
+        let mut dropped = false;
         if self.blocking {
             self.proc.write_cancellable(raw, self.cancel.as_deref())?;
             self.times.push_back(pts_us);
         } else if self.proc.try_write(raw)? {
             self.times.push_back(pts_us);
         } else {
+            dropped = true;
             self.skipped += 1;
             if self.record_global_drops {
                 crate::video::note_dropped(1);
             }
-            if self.skipped.is_power_of_two() {
-                tracing::warn!(encoder = %self.name, skipped = self.skipped, "the encoder is behind: frames left out");
-            }
+        }
+        let (depth, cap) = self.proc.queue_status();
+        let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if should_log_lag(now_ms, self.last_lag_warn_ms, dropped, depth, cap) {
+            self.last_lag_warn_ms = Some(now_ms);
+            tracing::warn!(
+                encoder = %self.name,
+                queue_depth = depth,
+                queue_cap = cap,
+                skipped = self.skipped,
+                bitrate_kbps = self.cfg.bitrate_kbps,
+                "output encoder falling behind: frames queued or left out"
+            );
         }
         let made = packets(&mut self.times, &mut self.header, self.proc.tags.try_iter().collect());
         if self.next.is_none() {
@@ -1177,6 +1222,13 @@ impl Audio {
             .filter_map(|(k, _, b)| (k == 8 && b.len() > 2 && b[1] == 1).then(|| b[2..].to_vec()))
             .collect())
     }
+}
+
+const LAG_WARN_EVERY_MS: u64 = 5_000;
+
+fn should_log_lag(now_ms: u64, prev_ms: Option<u64>, dropped: bool, depth: usize, cap: usize) -> bool {
+    let behind = dropped || (cap > 0 && depth >= cap);
+    behind && prev_ms.is_none_or(|p| now_ms.saturating_sub(p) >= LAG_WARN_EVERY_MS)
 }
 
 #[cfg(test)]
@@ -1618,5 +1670,16 @@ sleep $slow"#;
         let after = crate::video::dropped_frames();
         assert!(v.skipped >= 100, "{} left out locally", v.skipped);
         assert_eq!(after.saturating_sub(before), 0, "benchmark skips must not pollute global live dropped_frames()");
+        let (depth, cap) = v.proc.queue_status();
+        assert!(cap >= 2 && depth <= cap, "queue status bounded: depth={depth} cap={cap}");
+    }
+
+    #[test]
+    fn ffenc_lag_logger_rate_limits_and_flags_full_queue_or_drops() {
+        assert!(!should_log_lag(1_000, None, false, 1, 8));
+        assert!(should_log_lag(1_000, None, false, 8, 8), "full queue triggers first warn");
+        assert!(should_log_lag(1_000, None, true, 0, 8), "dropped frame triggers first warn");
+        assert!(!should_log_lag(4_000, Some(1_000), true, 8, 8), "suppressed within 5s rate limit");
+        assert!(should_log_lag(6_000, Some(1_000), true, 8, 8), "emits again after 5s");
     }
 }
