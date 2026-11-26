@@ -752,7 +752,7 @@ pub fn fit(
     }
 }
 
-fn fitted_keyframe(main_keyframe_s: u32, lim: &PlatformLimit) -> u32 {
+pub fn fitted_keyframe(main_keyframe_s: u32, lim: &PlatformLimit) -> u32 {
     if main_keyframe_s >= 1 && main_keyframe_s <= lim.max_keyframe_secs {
         main_keyframe_s
     } else if lim.keyframe_secs > 0 {
@@ -810,7 +810,7 @@ fn build_fit_capped_info(main: &MainEncode, lim: &PlatformLimit, key: &EncodeKey
     }
 }
 
-fn fit_dimensions(src_w: u32, src_h: u32, max_long: u32, max_short: u32) -> (u32, u32) {
+pub fn fit_dimensions(src_w: u32, src_h: u32, max_long: u32, max_short: u32) -> (u32, u32) {
     let portrait = src_h > src_w;
     let src_long = src_w.max(src_h);
     let src_short = src_w.min(src_h);
@@ -848,7 +848,7 @@ fn round_even_capped(num: u64, den: u64, cap: u32) -> u32 {
     u32::try_from(even).unwrap_or(max_even).clamp(2, max_even)
 }
 
-fn largest_fps_divisor(src_fps: u32, max_fps: u32) -> u32 {
+pub fn largest_fps_divisor(src_fps: u32, max_fps: u32) -> u32 {
     if src_fps == 0 {
         return if max_fps == 0 { 30 } else { max_fps.min(30) };
     }
@@ -864,7 +864,7 @@ fn largest_fps_divisor(src_fps: u32, max_fps: u32) -> u32 {
     max_fps
 }
 
-fn format_res_fps(w: u32, h: u32, fps: u32) -> String {
+pub fn format_res_fps(w: u32, h: u32, fps: u32) -> String {
     let is_standard_16_9 = matches!(
         (w, h),
         (3840, 2160) | (2560, 1440) | (1920, 1080) | (1280, 720) | (852, 480) | (854, 480) | (640, 360)
@@ -872,7 +872,7 @@ fn format_res_fps(w: u32, h: u32, fps: u32) -> String {
     if is_standard_16_9 { format!("{h}p{fps}") } else { format!("{w}×{h}@{fps}") }
 }
 
-fn bitrate_chip(kbps: u32) -> String {
+pub fn bitrate_chip(kbps: u32) -> String {
     if kbps.is_multiple_of(1_000) { format!("{} Mbps", kbps / 1_000) } else { mbps(kbps) }
 }
 
@@ -1040,7 +1040,7 @@ pub fn mbps(kbps: u32) -> String {
 }
 
 /// `6,000 kbps`.
-pub(crate) fn kbps_text(kbps: u32) -> String {
+pub fn kbps_text(kbps: u32) -> String {
     let s = kbps.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

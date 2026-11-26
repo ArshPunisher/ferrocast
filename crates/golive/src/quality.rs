@@ -43,6 +43,12 @@ impl Quality {
         self.light.contains_key(id)
     }
 
+    /// Reverts a pending move to the lighter stream when the PC encode budget cannot accommodate it.
+    pub fn cancel_light(&mut self, id: &str) {
+        self.light.remove(id);
+        self.trouble.remove(id);
+    }
+
     /// A new stream: everyone gets the full one again.
     pub fn reset(&mut self) {
         *self = Self::default();
@@ -161,5 +167,17 @@ mod tests {
                 assert!(moves.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn cancel_light_reverts_on_demand_fallback_when_budget_is_full() {
+        let mut q = Quality::default();
+        let t0 = Instant::now();
+        for n in 0..6 {
+            q.tick(t0 + Duration::from_secs(n), &[s("twitch", 6000), s("kick", 2500)], 70);
+        }
+        assert!(q.is_light("kick"));
+        q.cancel_light("kick");
+        assert!(!q.is_light("kick"));
     }
 }
