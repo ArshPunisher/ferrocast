@@ -292,6 +292,7 @@ impl Engine {
         // then, so ask it to look now rather than up to ten minutes later.
         if sample.streaming && !prev.as_ref().is_some_and(|p| p.streaming) {
             self.wake_youtube();
+            self.wake_viewer_poller();
         }
         let h = ferrocast_core::show::health(prev.as_ref(), &sample);
         *self.studio().health.lock().unwrap_or_else(|p| p.into_inner()) = Some((sample, h.clone()));

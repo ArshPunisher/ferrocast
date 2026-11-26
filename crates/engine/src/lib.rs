@@ -153,6 +153,7 @@ struct Inner {
     youtube_wake: Mutex<Option<Arc<Notify>>>,
     viewer_wake: tokio::sync::watch::Sender<u64>,
     viewer_task: Mutex<Option<tokio::task::AbortHandle>>,
+    live_epoch: [AtomicU64; 3],
     /// The Ferrocast account sign-in in progress (or its last problem).
     account_flow: Mutex<ferro_account::Flow>,
     relay_link: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -351,6 +352,7 @@ impl Engine {
                 youtube_wake: Mutex::new(None),
                 viewer_wake: tokio::sync::watch::Sender::new(0),
                 viewer_task: Mutex::new(None),
+                live_epoch: std::array::from_fn(|_| AtomicU64::new(0)),
                 account_flow: Mutex::new(Default::default()),
                 relay_link: Mutex::new(None),
                 activity: Mutex::new(Default::default()),
@@ -479,11 +481,13 @@ impl Engine {
     pub fn register_connector(&self, c: Arc<dyn Connector>) {
         let platform = c.platform();
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).insert(platform, c);
+        self.bump_live_epoch(platform);
         self.wake_viewer_poller();
     }
 
     pub fn unregister_connector(&self, platform: Platform) {
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).remove(&platform);
+        self.bump_live_epoch(platform);
         let (view, cleared) = {
             let mut st = self.state_mut();
             st.connectors.insert(platform_key(platform).into(), ConnectorView::off());
@@ -506,6 +510,24 @@ impl Engine {
 
     pub(crate) fn wake_viewer_poller(&self) {
         self.inner.viewer_wake.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    pub(crate) fn bump_live_epoch(&self, platform: Platform) {
+        let idx = match platform {
+            Platform::Twitch => 0,
+            Platform::Youtube => 1,
+            Platform::Kick => 2,
+            _ => return,
+        };
+        self.inner.live_epoch[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn live_epochs(&self) -> [u64; 3] {
+        [
+            self.inner.live_epoch[0].load(Ordering::Relaxed),
+            self.inner.live_epoch[1].load(Ordering::Relaxed),
+            self.inner.live_epoch[2].load(Ordering::Relaxed),
+        ]
     }
 
     #[cfg(test)]

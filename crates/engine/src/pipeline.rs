@@ -107,7 +107,7 @@ impl Engine {
                         .collect::<std::collections::HashMap<_, _>>()
                 };
                 self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
-                self.send_live_event(e.seq, LiveFrame::new("event", &e));
+                self.send_live(LiveFrame::new("event", &e));
                 self.history_saw(&e, None);
                 self.discord_saw(&e);
                 return;
@@ -226,6 +226,7 @@ impl Engine {
                     }
                     was_live
                 };
+                self.bump_live_epoch(e.platform);
                 self.wake_viewer_poller();
                 if !anyone_live {
                     self.clear_chat_highlight();
@@ -259,8 +260,14 @@ impl Engine {
                     let viewers = removed.then(|| crate::viewers::overlay_clear_payload(&st.viewers, e.platform));
                     (st.live.values().any(|l| *l), viewers)
                 };
+                self.bump_live_epoch(e.platform);
                 if let Some(viewers) = viewers {
-                    self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
+                    self.send_overlay(OverlayFrame::new(
+                        Audience::All,
+                        self.next_seq(),
+                        "state",
+                        &json!({ "viewers": viewers }),
+                    ));
                 }
                 self.wake_viewer_poller();
                 if !any_live && e.origin == Origin::Live {

@@ -2817,3 +2817,75 @@ async fn studio_stream_start_wakes_youtube() {
     e.on_stream_started();
     tokio::time::timeout(Duration::from_secs(1), woken).await.expect("Studio on_stream_started must wake YouTube");
 }
+
+#[tokio::test]
+async fn stream_offline_viewer_clear_uses_fresh_seq_and_viewer_counts_skip_recent_events() {
+    let (e, _d) = engine().await;
+    let before = e.current_seq();
+    e.ingest(Event::live(Platform::Twitch, None, Millis(1_000_000), EventKind::StreamOnline { title: None })).await;
+    e.ingest(first_time(chat(Platform::Twitch, "msg-1", "alice", "hello"))).await;
+    let (after_chat, gap_initial) = e.events_since(before);
+    assert!(!gap_initial);
+    let chat_seq = after_chat
+        .iter()
+        .filter_map(|f| serde_json::from_str::<Value>(&f.text).ok())
+        .filter_map(|v| v["data"]["seq"].as_u64())
+        .max()
+        .unwrap();
+
+    // ViewerCount must still reach live subscribers, without polluting or evicting recent_events.
+    let mut live_rx = e.subscribe_live();
+    for count in 1..=510u64 {
+        e.ingest(Event::live(
+            Platform::Twitch,
+            None,
+            Millis(1_000_000 + count as i64),
+            EventKind::ViewerCount { count },
+        ))
+        .await;
+    }
+    let mut saw_510 = false;
+    while let Ok(frame) = live_rx.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "event" && v["data"]["kind"]["count"] == 510 {
+            saw_510 = true;
+        }
+    }
+    assert!(saw_510, "live websocket subscribers must still receive ViewerCount updates");
+    let (since_chat, gap_after) = e.events_since(chat_seq);
+    assert!(!gap_after, "ViewerCount updates must not evict chat events from recent_events");
+    assert!(
+        !since_chat.iter().any(|f| {
+            serde_json::from_str::<Value>(&f.text).ok().is_some_and(|v| v["data"]["kind"]["type"] == "viewer_count")
+        }),
+        "ViewerCount must not be pushed into recent_events replay buffer"
+    );
+
+    // StreamOffline's overlay clear frame must get a fresh seq strictly above the offline event's seq.
+    let mut overlays = e.subscribe_overlays();
+    while overlays.try_recv().is_ok() {}
+    while live_rx.try_recv().is_ok() {}
+    e.ingest(Event::live(Platform::Twitch, None, Millis(2_000_000), EventKind::StreamOffline)).await;
+
+    let offline_event_seq = {
+        let mut found = None;
+        while let Ok(f) = live_rx.try_recv() {
+            let v: Value = serde_json::from_str(&f.text).unwrap();
+            if v["type"] == "event" && v["data"]["kind"]["type"] == "stream_offline" {
+                found = v["data"]["seq"].as_u64();
+            }
+        }
+        found.expect("expected StreamOffline live frame")
+    };
+    let mut clear_seq = None;
+    while let Ok(frame) = overlays.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "state" && v["data"].get("viewers").is_some() {
+            clear_seq = v.get("seq").and_then(|s| s.as_u64());
+        }
+    }
+    assert!(
+        clear_seq.expect("expected viewer-clear overlay frame") > offline_event_seq,
+        "viewer-clear overlay frame must mint a fresh seq above the offline event seq"
+    );
+}
