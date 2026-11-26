@@ -25,6 +25,7 @@ pub mod goal;
 pub mod health;
 pub mod labels;
 pub mod layer;
+pub mod links;
 pub mod loyalty;
 pub mod moderation;
 pub mod moments;

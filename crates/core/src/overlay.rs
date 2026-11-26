@@ -174,6 +174,37 @@ pub enum LabelSource {
 }
 
 impl LabelSource {
+    pub const ALL: &[Self] = &[
+        Self::LatestFollower,
+        Self::LatestSub,
+        Self::LatestGifter,
+        Self::LatestTip,
+        Self::LatestBits,
+        Self::LatestRaid,
+        Self::SessionFollows,
+        Self::SessionSubs,
+        Self::SessionBits,
+        Self::SessionTips,
+        Self::SessionRaids,
+        Self::TopTipSession,
+        Self::TopSupporterSession,
+        Self::MonthlyFollows,
+        Self::MonthlySubs,
+        Self::MonthlyBits,
+        Self::MonthlyTips,
+        Self::MonthlyRaids,
+        Self::TopTipMonthly,
+        Self::TopSupporterMonthly,
+        Self::AlltimeFollows,
+        Self::AlltimeSubs,
+        Self::AlltimeBits,
+        Self::AlltimeTips,
+        Self::AlltimeRaids,
+        Self::TopTipAlltime,
+        Self::TopSupporterAlltime,
+        Self::HypeTrain,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             LabelSource::LatestFollower => "latest_follower",
