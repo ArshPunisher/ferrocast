@@ -538,7 +538,7 @@ pub struct StreamSettings {
 }
 
 /// The engine's own load.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EngineStats {
     /// Ferrocast's CPU use, % of one machine.
     pub cpu: f64,
@@ -560,6 +560,57 @@ pub struct EngineStats {
     pub encode_ms: f64,
     /// All the time the encoders took since the engine started, in ms.
     pub encoding_ms: u64,
+    /// Missed frames attributed to rendering vs encoding, when any occurred.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub missed_render: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub missed_encode: u32,
+    /// Few-word explanation of why frames were missed or skipped, shown on Stats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missed_reason: Option<String>,
+    /// Counts and recovery hint shown behind Stats' `(i)` tooltip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missed_detail: Option<String>,
+}
+
+/// Builds a short Stats explanation and `(i)` detail for missed/skipped frames.
+pub fn describe_missed_frames(
+    missed_render: u32,
+    missed_encode: u32,
+    skipped_encode: u32,
+) -> (Option<String>, Option<String>) {
+    let encode_total = missed_encode.saturating_add(skipped_encode);
+    match (missed_render > 0, encode_total > 0) {
+        (false, false) => (None, None),
+        (true, false) => (
+            Some("render fell behind".into()),
+            Some(format!(
+                "{missed_render} missed in render (scene took too long to draw). Use fewer sources or a lower frame rate."
+            )),
+        ),
+        (false, true) => {
+            let mut parts = Vec::new();
+            if missed_encode > 0 {
+                parts.push(format!("{missed_encode} held the frame loop back"));
+            }
+            if skipped_encode > 0 {
+                parts.push(format!("{skipped_encode} skipped by the encoder"));
+            }
+            (
+                Some("encoder fell behind".into()),
+                Some(format!(
+                    "Encoder backlog ({}). Lower the quality or resolution, or use the hardware encoder.",
+                    parts.join(", ")
+                )),
+            )
+        }
+        (true, true) => (
+            Some("render and encoder fell behind".into()),
+            Some(format!(
+                "{missed_render} missed in render, {encode_total} missed or skipped in encoding. Lower the quality, resolution, or source load."
+            )),
+        ),
+    }
 }
 
 /// How a source's picture looks now (`Stage::look`): for catching a black or frozen camera.
@@ -723,6 +774,25 @@ mod tests {
         for bad in ["", " lead", "a\nb", &"x".repeat(101)] {
             assert!(check_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn missed_frame_reasons_explain_render_vs_encode_with_counts() {
+        assert_eq!(describe_missed_frames(0, 0, 0), (None, None));
+        let (r, d) = describe_missed_frames(42, 0, 0);
+        assert_eq!(r.as_deref(), Some("render fell behind"));
+        assert!(d.as_deref().is_some_and(|s| s.contains("42 missed in render")), "{d:?}");
+
+        let (r, d) = describe_missed_frames(0, 7, 12);
+        assert_eq!(r.as_deref(), Some("encoder fell behind"));
+        assert!(d.as_deref().is_some_and(|s| s.contains("7 held") && s.contains("12 skipped")), "{d:?}");
+
+        let (r, d) = describe_missed_frames(5, 3, 2);
+        assert_eq!(r.as_deref(), Some("render and encoder fell behind"));
+        assert!(
+            d.as_deref().is_some_and(|s| s.contains("5 missed in render") && s.contains("5 missed or skipped")),
+            "{d:?}"
+        );
     }
 }
 

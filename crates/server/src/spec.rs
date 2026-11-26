@@ -3288,7 +3288,11 @@ fn studio_stats_schemas() -> Map<String, Value> {
                         "recovered": { "type": "integer" },
                         "restarts": { "type": "integer" },
                         "encode_ms": { "type": "number" },
-                        "encoding_ms": { "type": "integer" }
+                        "encoding_ms": { "type": "integer" },
+                        "missed_render": { "type": "integer" },
+                        "missed_encode": { "type": "integer" },
+                        "missed_reason": { "type": ["string", "null"] },
+                        "missed_detail": { "type": ["string", "null"] }
                     }
                 },
                 "scene": { "type": ["string", "null"] },

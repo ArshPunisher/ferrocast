@@ -2342,6 +2342,24 @@
               "memory_mb": {
                 "type": "integer"
               },
+              "missed_detail": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "missed_encode": {
+                "type": "integer"
+              },
+              "missed_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "missed_render": {
+                "type": "integer"
+              },
               "recovered": {
                 "type": "integer"
               },

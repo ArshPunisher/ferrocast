@@ -130,6 +130,8 @@ pub(crate) struct Studio {
     pub auto_brb: Mutex<std::collections::BTreeSet<String>>,
     /// The stream's health now (None while it isn't live) and its memory.
     pub live_health: Mutex<(ferrocast_core::health::HealthMeter, Option<ferrocast_core::health::Health>)>,
+    /// Rate-limited logger for render vs encode vs network frame misses while live.
+    pub miss_watch: Mutex<live_watch::MissWatch>,
     /// Auto quality's state for the stream now.
     pub auto_quality: Mutex<ferrocast_core::auto_quality::AutoQuality>,
     /// The scene on air while the Studio streams (a change is a chapter marker).
@@ -184,6 +186,7 @@ impl Default for Studio {
             live_watching: std::sync::atomic::AtomicBool::default(),
             auto_brb: Mutex::default(),
             live_health: Mutex::default(),
+            miss_watch: Mutex::default(),
             auto_quality: Mutex::default(),
             scene_now: Mutex::default(),
             autoreplies: autoreplies::AutoReplies::default(),

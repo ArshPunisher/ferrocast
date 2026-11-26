@@ -19,6 +19,121 @@ const EVERY: Duration = Duration::from_secs(2);
 /// A gap longer than this between 2-second ticks means the system slept or froze: reset
 /// pending silence/black/frozen durations so wake never fires false live alerts.
 const WAKE_JUMP_MS: i64 = 10_000;
+/// Rate limit for live missed-frame breakdown logs (ms).
+const MISS_LOG_EVERY_MS: i64 = 10_000;
+
+/// Cumulative counters observed at one live tick to split misses into render vs encode vs network.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MissSample {
+    pub at_ms: i64,
+    pub render_missed: u64,
+    pub encode_held: u64,
+    pub encode_skipped: u64,
+    pub stream_dropped: u64,
+    pub platform_dropped: u64,
+}
+
+impl MissSample {
+    pub(crate) fn from_stats(at_ms: i64, v: &Value, platform_dropped: u64) -> Self {
+        let (e, s) = (&v["engine"], &v["stream"]);
+        let n = |x: &Value| x.as_u64().unwrap_or(0);
+        let lagged = n(&e["lagged"]);
+        let encode_held = n(&e["missed_encode"]);
+        let render_missed = if e.get("missed_render").is_some() || e.get("missed_encode").is_some() {
+            n(&e["missed_render"])
+        } else {
+            lagged.saturating_sub(encode_held)
+        };
+        Self {
+            at_ms,
+            render_missed,
+            encode_held,
+            encode_skipped: n(&e["skipped"]),
+            stream_dropped: n(&s["dropped"]),
+            platform_dropped,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissSummary {
+    pub why: String,
+    pub render_missed: u64,
+    pub encode_missed: u64,
+    pub network_dropped: u64,
+    pub stream_dropped: u64,
+    pub platform_dropped: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MissWatch {
+    prev: Option<MissSample>,
+    pending_render: u64,
+    pending_encode: u64,
+    pending_stream: u64,
+    pending_platform: u64,
+    last_log_ms: Option<i64>,
+}
+
+impl MissWatch {
+    pub(crate) fn observe(&mut self, s: MissSample) -> Option<MissSummary> {
+        let Some(prev) = self.prev else {
+            self.prev = Some(s);
+            return None;
+        };
+        // Counters going backwards mean a new engine/stream session started.
+        if s.render_missed < prev.render_missed
+            || s.encode_held < prev.encode_held
+            || s.encode_skipped < prev.encode_skipped
+            || s.stream_dropped < prev.stream_dropped
+            || s.platform_dropped < prev.platform_dropped
+        {
+            *self = Self { prev: Some(s), ..Self::default() };
+            return None;
+        }
+        let d_render = s.render_missed - prev.render_missed;
+        let d_encode = (s.encode_held - prev.encode_held).saturating_add(s.encode_skipped - prev.encode_skipped);
+        let d_stream = s.stream_dropped - prev.stream_dropped;
+        let d_platform = s.platform_dropped - prev.platform_dropped;
+        self.prev = Some(s);
+
+        self.pending_render += d_render;
+        self.pending_encode += d_encode;
+        self.pending_stream += d_stream;
+        self.pending_platform += d_platform;
+
+        let network_dropped = self.pending_stream.saturating_add(self.pending_platform);
+        let has_misses = self.pending_render > 0 || self.pending_encode > 0 || network_dropped > 0;
+        if !has_misses || !self.last_log_ms.is_none_or(|t| s.at_ms - t >= MISS_LOG_EVERY_MS) {
+            return None;
+        }
+
+        let mut causes = Vec::new();
+        if self.pending_render > 0 {
+            causes.push("render");
+        }
+        if self.pending_encode > 0 {
+            causes.push("encode");
+        }
+        if network_dropped > 0 {
+            causes.push("network");
+        }
+        let out = MissSummary {
+            why: causes.join(" + "),
+            render_missed: self.pending_render,
+            encode_missed: self.pending_encode,
+            network_dropped,
+            stream_dropped: self.pending_stream,
+            platform_dropped: self.pending_platform,
+        };
+        self.pending_render = 0;
+        self.pending_encode = 0;
+        self.pending_stream = 0;
+        self.pending_platform = 0;
+        self.last_log_ms = Some(s.at_ms);
+        Some(out)
+    }
+}
 
 /// Whether a mixer row is judged as a microphone: the one the owner said ("This is a mic"), else
 /// by its kind (a mic input or a Mic/Aux channel that isn't a capture card; never the desktop's
@@ -187,6 +302,7 @@ impl Engine {
                     *engine.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     *engine.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     *engine.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+                    *engine.studio().miss_watch.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     if live {
                         engine.wake_youtube();
                     }
@@ -317,8 +433,23 @@ impl Engine {
             at_ms: u64::try_from(now().0).unwrap_or(0),
         };
         let mut h = self.studio().live_health.lock().unwrap_or_else(|p| p.into_inner());
-        let now = h.0.push(sample);
-        h.1 = Some(now);
+        let health_now = h.0.push(sample);
+        h.1 = Some(health_now);
+        drop(h);
+        let miss_sample = MissSample::from_stats(now().0, &v, net_dropped);
+        let miss_summary = self.studio().miss_watch.lock().unwrap_or_else(|p| p.into_inner()).observe(miss_sample);
+        if let Some(m) = miss_summary {
+            tracing::warn!(
+                why = %m.why,
+                render_missed = m.render_missed,
+                encode_missed = m.encode_missed,
+                network_dropped = m.network_dropped,
+                stream_dropped = m.stream_dropped,
+                platform_dropped = m.platform_dropped,
+                "missed or dropped frames during stream ({})",
+                m.why
+            );
+        }
     }
 
     /// Auto quality turned off: a lowered stream goes back to full quality.
@@ -620,5 +751,30 @@ mod tests {
         assert_eq!(one["KREO"]["peak"], json!([-30.0, -31.0]));
         assert_eq!(one["KREO"]["gated"], json!(false));
         assert_eq!(peak_hold(&[]), Value::Null);
+    }
+
+    #[test]
+    fn miss_watch_separates_render_encode_network_and_rate_limits() {
+        let mut w = MissWatch::default();
+        let sample = |at_ms, r, eh, es, sd, pd| MissSample {
+            at_ms,
+            render_missed: r,
+            encode_held: eh,
+            encode_skipped: es,
+            stream_dropped: sd,
+            platform_dropped: pd,
+        };
+        assert_eq!(w.observe(sample(1_000, 0, 0, 0, 0, 0)), None);
+        let first = w.observe(sample(3_000, 4, 2, 1, 5, 3)).expect("first miss summary");
+        assert_eq!(first.why, "render + encode + network");
+        assert_eq!((first.render_missed, first.encode_missed, first.network_dropped), (4, 3, 8));
+        assert_eq!((first.stream_dropped, first.platform_dropped), (5, 3));
+
+        // Within rate-limit window (< 10 s): accumulates without logging.
+        assert_eq!(w.observe(sample(5_000, 4, 2, 1, 5, 7)), None);
+        // Past 10 s: flushes accumulated network drops cleanly.
+        let second = w.observe(sample(13_000, 4, 2, 1, 5, 9)).expect("rate-limited flush");
+        assert_eq!(second.why, "network");
+        assert_eq!((second.render_missed, second.encode_missed, second.network_dropped), (0, 0, 6));
     }
 }

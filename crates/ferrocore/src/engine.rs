@@ -735,6 +735,10 @@ pub struct Stats {
     pub frames: u64,
     /// Frames not made on time (the loop fell behind and skipped them).
     pub skipped: u64,
+    /// Frames missed when scene rendering / frame work fell behind.
+    pub missed_render: u64,
+    /// Frames missed while encoders held the frame loop back.
+    pub missed_encode: u64,
     /// How long the last frame took to make, and the longest so far, in ms.
     pub frame_ms: f32,
     pub worst_ms: f32,
@@ -749,6 +753,99 @@ pub struct Stats {
     /// All the time the encoders took since the start, in µs: against the clock, the share of
     /// the frame loop's time spent encoding (an output encoding every other frame counts half).
     pub encoding_us: u64,
+}
+
+const MISS_LOG_EVERY_NS: u64 = 5_000_000_000;
+
+#[derive(Debug, Clone, PartialEq)]
+struct MissLog {
+    why: &'static str,
+    render_missed: u64,
+    encode_held: u64,
+    encode_skipped: u64,
+    total_missed: u64,
+    total_encode_skipped: u64,
+    frame_ms: f32,
+    encode_ms: f32,
+}
+
+#[derive(Debug, Default)]
+struct FrameMissMonitor {
+    prev_enc_us: u64,
+    last_frame_enc_us: u64,
+    prev_enc_skipped: u64,
+    pending_render: u64,
+    pending_encode_held: u64,
+    pending_encode_skipped: u64,
+    last_log_ns: Option<u64>,
+}
+
+impl FrameMissMonitor {
+    fn record(
+        &mut self,
+        now_ns: u64,
+        behind: u64,
+        frame_ns: u64,
+        stats: &mut Stats,
+        enc_skipped_total: u64,
+    ) -> Option<MissLog> {
+        let enc_delta_us = stats.encoding_us.saturating_sub(self.prev_enc_us);
+        self.prev_enc_us = stats.encoding_us;
+
+        let mut render_delta = 0u64;
+        let mut encode_held_delta = 0u64;
+        if behind > 0 {
+            let frame_us = (frame_ns / 1000).max(1);
+            let miss_budget_us = behind.saturating_mul(frame_us);
+            // The overrun happened before this frame began: check whether the preceding frame spent
+            // at least 60% of the missed deadline encoding, or smoothed encode_ms exceeds 60% of a frame.
+            let enc_dominated = self.last_frame_enc_us.saturating_mul(10) >= miss_budget_us.saturating_mul(6)
+                || (self.last_frame_enc_us > 0 && stats.encode_ms * 1000.0 >= frame_us as f32 * 0.6);
+            if enc_dominated {
+                stats.missed_encode += behind;
+                encode_held_delta = behind;
+            } else {
+                stats.missed_render += behind;
+                render_delta = behind;
+            }
+        }
+        self.last_frame_enc_us = enc_delta_us;
+
+        let encode_skipped_delta = enc_skipped_total.saturating_sub(self.prev_enc_skipped);
+        self.prev_enc_skipped = enc_skipped_total;
+
+        self.pending_render += render_delta;
+        self.pending_encode_held += encode_held_delta;
+        self.pending_encode_skipped += encode_skipped_delta;
+
+        let has_pending = self.pending_render > 0 || self.pending_encode_held > 0 || self.pending_encode_skipped > 0;
+        if !has_pending || !self.last_log_ns.is_none_or(|t| now_ns.saturating_sub(t) >= MISS_LOG_EVERY_NS) {
+            return None;
+        }
+
+        let encode_any = self.pending_encode_held > 0 || self.pending_encode_skipped > 0;
+        let why = match (self.pending_render > 0, encode_any) {
+            (true, true) => "render and encoder fell behind",
+            (true, false) => "render fell behind",
+            (false, true) => "encoder fell behind",
+            (false, false) => unreachable!(),
+        };
+        let out = MissLog {
+            why,
+            render_missed: self.pending_render,
+            encode_held: self.pending_encode_held,
+            encode_skipped: self.pending_encode_skipped,
+            total_missed: stats.skipped,
+            total_encode_skipped: enc_skipped_total,
+            frame_ms: stats.frame_ms,
+            encode_ms: stats.encode_ms,
+        };
+        self.pending_render = 0;
+        self.pending_encode_held = 0;
+        self.pending_encode_skipped = 0;
+        self.last_log_ns = Some(now_ns);
+        Some(out)
+    }
 }
 
 /// Settings fixed for the engine's life.
@@ -1387,6 +1484,7 @@ struct State {
     /// Sorted list of source IDs currently active/heard on `ferrocast-audio` (`SetHeard` dedup).
     last_heard: Vec<u64>,
     stats: Stats,
+    miss_monitor: FrameMissMonitor,
     /// Why an output failed, by id, until it stops (`deliver`).
     errors: HashMap<u64, String>,
     /// Outputs whose encoder failed and are being made again (see `heal_outputs`).
@@ -1831,6 +1929,7 @@ impl Engine {
             audio: AudioConfig { sample_rate: config.sample_rate, ..audio_cfg },
             last_heard: Vec::new(),
             stats: Stats::default(),
+            miss_monitor: FrameMissMonitor::default(),
             errors: HashMap::new(),
             heal: HashMap::new(),
             notices: Default::default(),
@@ -6748,11 +6847,29 @@ fn frame(
     st.stats.frames += 1;
     st.stats.frame_ms = ms;
     st.stats.worst_ms = st.stats.worst_ms.max(ms);
+    let miss_log = {
+        let s = &mut *st;
+        s.miss_monitor.record(now_ns(), behind, config.frame_ns(), &mut s.stats, crate::video::dropped_frames())
+    };
     // Shown before the state's lock goes: a change made right after (a split, a pause) shows
     // itself, never overwritten by this older picture (projects-60).
     *shown.lock().unwrap_or_else(|e| e.into_inner()) = Shown::of(&st);
     let ticket = st.sleep_ticket();
     drop(st);
+    if let Some(m) = miss_log {
+        tracing::warn!(
+            why = m.why,
+            render_missed = m.render_missed,
+            encode_held = m.encode_held,
+            encode_skipped = m.encode_skipped,
+            total_missed = m.total_missed,
+            total_encode_skipped = m.total_encode_skipped,
+            frame_ms = m.frame_ms,
+            encode_ms = m.encode_ms,
+            "frames missed: {}",
+            m.why
+        );
+    }
     // Open/close `close_when_inactive` media completely off the State lock and frame pacing path.
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     {
@@ -11949,5 +12066,43 @@ mod tests {
             !e.lock().source_reopen_workers.contains_key(&88) && e.lock().draining_workers.is_empty(),
             "watchdog_step must prune drained worker entries for removed sources"
         );
+    }
+
+    #[test]
+    fn frame_miss_monitor_attributes_render_vs_encode_and_rate_limits() {
+        let frame_ns = 33_333_333u64;
+        let mut mon = FrameMissMonitor::default();
+        let mut st = Stats::default();
+
+        // Calm start emits nothing.
+        assert_eq!(mon.record(1_000_000_000, 0, frame_ns, &mut st, 0), None);
+
+        // Render slowdown (`behind = 3`, minimal encoding time) attributes to `missed_render` and logs at once.
+        st.skipped += 3;
+        st.frame_ms = 95.0;
+        st.encode_ms = 1.0;
+        st.encoding_us += 1_000;
+        let first =
+            mon.record(2_000_000_000, 3, frame_ns, &mut st, 0).unwrap_or_else(|| panic!("expected immediate miss log"));
+        assert_eq!(first.why, "render fell behind");
+        assert_eq!((first.render_missed, first.encode_held, first.encode_skipped), (3, 0, 0));
+        assert_eq!((st.missed_render, st.missed_encode), (3, 0));
+
+        // Encoder stalls on the next frame (80 ms encoding out of 33 ms budget), then subsequent
+        // frame misses 2 ticks while rate-limited (< 5 s): accumulates without logging yet.
+        st.encoding_us += 80_000;
+        st.encode_ms = 30.0;
+        assert_eq!(mon.record(3_000_000_000, 0, frame_ns, &mut st, 0), None);
+        st.skipped += 2;
+        assert_eq!(mon.record(4_000_000_000, 2, frame_ns, &mut st, 4), None);
+        assert_eq!((st.missed_render, st.missed_encode), (3, 2));
+
+        // At 5 s past first log, both encoder-held and encoder-skipped counts flush cleanly.
+        let second = mon
+            .record(7_000_000_000, 0, frame_ns, &mut st, 5)
+            .unwrap_or_else(|| panic!("expected rate-limited miss log after 5s"));
+        assert_eq!(second.why, "encoder fell behind");
+        assert_eq!((second.render_missed, second.encode_held, second.encode_skipped), (0, 2, 5));
+        assert_eq!((second.total_missed, second.total_encode_skipped), (5, 5));
     }
 }

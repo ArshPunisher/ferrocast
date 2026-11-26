@@ -305,10 +305,10 @@ impl TimingWindow {
         }
     }
 
-    /// Whether a window's p99 mixing time is over half the real-time budget, or its p99 wake error over
-    /// a millisecond.
+    /// Whether a window's p99 mixing time is over half the real-time budget, or its p99 wake error is
+    /// over 5 ms (half the 10 ms real-time constraint: normal 1-3 ms OS jitter stays at debug).
     fn anomaly(mix_p99_us: u32, late_p99_us: u32) -> bool {
-        u64::from(mix_p99_us) * 1000 > crate::engine::AUDIO_COMPUTATION_NS / 2 || late_p99_us > 1000
+        u64::from(mix_p99_us) * 1000 > crate::engine::AUDIO_COMPUTATION_NS / 2 || late_p99_us > 5000
     }
 
     /// (average, p99, max, median) of the window; sorts it.
@@ -979,15 +979,17 @@ mod tests {
     const RATE: u32 = 48_000;
     const STEP_NS: u64 = BLOCK as u64 * 1_000_000_000 / RATE as u64;
 
-    /// A normal stream's windows (mixing 0.2 ms, a late wake of 0.7 ms at worst in the soak) stay at
-    /// debug; mixing over half the 4 ms budget, or a wake over 1 ms at p99, is said at warn.
+    /// A normal stream's windows (mixing 0.2 ms, normal 1-3 ms scheduler wake jitter inside the
+    /// 21.3 ms block / 10 ms constraint) stay at debug; mixing over half the 4 ms budget, or a
+    /// wake over 5 ms at p99, is said at warn.
     #[test]
     fn the_timing_line_is_a_warning_only_for_an_anomaly() {
         assert!(!TimingWindow::anomaly(350, 700), "the soak's normal windows");
-        assert!(!TimingWindow::anomaly(2000, 1000), "the bounds are not over");
+        assert!(!TimingWindow::anomaly(350, 1500), "normal OS wake jitter must not spam warnings");
+        assert!(!TimingWindow::anomaly(1481, 3110), "sub-5ms wake jitter inside 10ms deadline stays debug");
+        assert!(!TimingWindow::anomaly(2000, 5000), "the bounds are not over");
         assert!(TimingWindow::anomaly(2100, 10), "mixing over half the budget");
-        assert!(TimingWindow::anomaly(200, 1001), "a wake over a millisecond late");
-        assert!(TimingWindow::anomaly(1481, 3110), "the soak's one bad window");
+        assert!(TimingWindow::anomaly(200, 5001), "a wake over 5 ms late");
     }
 
     /// Gate: a 250 ms video stall leaves `AudioRunner<SimClock>` cadence steady (exact 21.33 ms
