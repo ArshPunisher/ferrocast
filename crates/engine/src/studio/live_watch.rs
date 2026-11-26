@@ -187,6 +187,10 @@ impl Engine {
                     *engine.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     *engine.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     *engine.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+                    if live {
+                        engine.wake_youtube();
+                    }
+                    engine.wake_viewer_poller();
                     was_live = live;
                 }
                 // A recording stopping or running out of room matters live or not.

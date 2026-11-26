@@ -54,7 +54,7 @@ impl Engine {
             e.source_id = Some(format!("{id}#{}", tip_status_key(*status)));
         }
 
-        if e.origin != Origin::Test {
+        if e.origin != Origin::Test && !matches!(e.kind, EventKind::ViewerCount { .. }) {
             let first = self.inner.dedupe.lock().unwrap_or_else(|p| p.into_inner()).first_time(&e, at);
             if !first {
                 tracing::debug!(platform = %e.platform, source = ?e.source_id, "duplicate dropped");
@@ -95,6 +95,7 @@ impl Engine {
                 return;
             }
             EventKind::ViewerCount { count } => {
+                tracing::debug!(platform = %e.platform, count = *count, "viewer count");
                 let viewers = {
                     let mut st = self.state_mut();
                     st.viewers.insert(e.platform, *count);
@@ -106,6 +107,7 @@ impl Engine {
                         .collect::<std::collections::HashMap<_, _>>()
                 };
                 self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
+                self.send_live_event(e.seq, LiveFrame::new("event", &e));
                 self.history_saw(&e, None);
                 self.discord_saw(&e);
                 return;
@@ -215,6 +217,7 @@ impl Engine {
                     let was_live = st.live.values().any(|l| *l);
                     st.live.insert(e.platform, true);
                     if !was_live {
+                        st.viewers.clear();
                         st.session = crate::state::Session {
                             started_at: Some(at),
                             credits: ferrocast_core::credits::Credits::new(Some(at)),
@@ -223,6 +226,7 @@ impl Engine {
                     }
                     was_live
                 };
+                self.wake_viewer_poller();
                 if !anyone_live {
                     self.clear_chat_highlight();
                     self.push_credits();
@@ -247,13 +251,18 @@ impl Engine {
                     let since = self.state().session.started_at.map_or(at.0 - 43_200_000, |m| m.0);
                     self.youtube_chapters_later(since);
                 }
-                let any_live = {
+                let (any_live, viewers) = {
                     let mut st = self.state_mut();
                     st.live.insert(e.platform, false);
                     // An ended stream's last count must not keep adding to the peak.
-                    st.viewers.remove(&e.platform);
-                    st.live.values().any(|l| *l)
+                    let removed = st.viewers.remove(&e.platform).is_some();
+                    let viewers = removed.then(|| crate::viewers::overlay_clear_payload(&st.viewers, e.platform));
+                    (st.live.values().any(|l| *l), viewers)
                 };
+                if let Some(viewers) = viewers {
+                    self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
+                }
+                self.wake_viewer_poller();
                 if !any_live && e.origin == Origin::Live {
                     if self.golive_stream_running() {
                         // The stream is still on air (no platform gets it any more): the session

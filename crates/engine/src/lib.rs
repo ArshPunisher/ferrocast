@@ -76,6 +76,7 @@ pub use updates::{
 };
 mod tip_pro;
 pub use tip_pro::TIP_IMAGES;
+mod viewers;
 mod weekly_email;
 mod welcome;
 
@@ -150,6 +151,8 @@ struct Inner {
     apps: accounts::PlatformApps,
     adapters: Mutex<HashMap<Platform, tokio::task::JoinHandle<()>>>,
     youtube_wake: Mutex<Option<Arc<Notify>>>,
+    viewer_wake: tokio::sync::watch::Sender<u64>,
+    viewer_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// The Ferrocast account sign-in in progress (or its last problem).
     account_flow: Mutex<ferro_account::Flow>,
     relay_link: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -346,6 +349,8 @@ impl Engine {
                 apps,
                 adapters: Mutex::new(HashMap::new()),
                 youtube_wake: Mutex::new(None),
+                viewer_wake: tokio::sync::watch::Sender::new(0),
+                viewer_task: Mutex::new(None),
                 account_flow: Mutex::new(Default::default()),
                 relay_link: Mutex::new(None),
                 activity: Mutex::new(Default::default()),
@@ -401,6 +406,8 @@ impl Engine {
         tokio::spawn(prune(engine.clone()));
         tokio::spawn(backups::run(engine.clone()));
         tokio::spawn(pipeline::run(engine.clone(), rx));
+        let vh = tokio::spawn(viewers::run(engine.clone()));
+        *engine.inner.viewer_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(vh.abort_handle());
         tokio::spawn(dispatcher::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
         tokio::spawn(schedule::run(engine.clone()));
@@ -472,19 +479,40 @@ impl Engine {
     pub fn register_connector(&self, c: Arc<dyn Connector>) {
         let platform = c.platform();
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).insert(platform, c);
+        self.wake_viewer_poller();
     }
 
     pub fn unregister_connector(&self, platform: Platform) {
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).remove(&platform);
-        let view = {
+        let (view, cleared) = {
             let mut st = self.state_mut();
             st.connectors.insert(platform_key(platform).into(), ConnectorView::off());
             st.live.remove(&platform);
-            st.viewers.remove(&platform);
-            st.connectors.clone()
+            let cleared = st.viewers.remove(&platform).map(|_| viewers::overlay_clear_payload(&st.viewers, platform));
+            (st.connectors.clone(), cleared)
         };
+        if let Some(viewers) = cleared {
+            self.send_overlay(OverlayFrame::new(
+                frames::Audience::All,
+                self.next_seq(),
+                "state",
+                &serde_json::json!({ "viewers": viewers }),
+            ));
+        }
         // Open dashboards drop the account at once instead of after a reload.
         self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": view })));
+        self.wake_viewer_poller();
+    }
+
+    pub(crate) fn wake_viewer_poller(&self) {
+        self.inner.viewer_wake.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_viewer_poller(&self) {
+        if let Some(h) = self.inner.viewer_task.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            h.abort();
+        }
     }
 
     /// Held while saving any setting (see `Inner::config`).

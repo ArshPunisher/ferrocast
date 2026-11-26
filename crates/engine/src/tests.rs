@@ -2759,3 +2759,61 @@ async fn patch_links_refuses_to_overwrite_stored_links_after_failed_read() {
         "expected clear error on SQL read failure, got: {sql_err}"
     );
 }
+
+#[tokio::test]
+async fn viewer_count_forwards_to_live_socket_bypasses_dedupe_and_offline_clears_overlays() {
+    let (e, _d) = engine().await;
+    let mut live = e.subscribe_live();
+    let mut overlays = e.subscribe_overlays();
+
+    e.ingest(Event::live(Platform::Twitch, None, Millis(1_000_000), EventKind::StreamOnline { title: None })).await;
+    e.ingest(Event::live(Platform::Youtube, None, Millis(1_000_000), EventKind::StreamOnline { title: None })).await;
+
+    // Two live ViewerCount updates for the same platform at the same millisecond must both
+    // forward to the dashboard live socket instead of being swallowed by dedupe or early-returned.
+    e.ingest(Event::live(Platform::Twitch, None, Millis(1_000_000), EventKind::ViewerCount { count: 100 })).await;
+    e.ingest(Event::live(Platform::Twitch, None, Millis(1_000_000), EventKind::ViewerCount { count: 120 })).await;
+    e.ingest(Event::live(Platform::Youtube, None, Millis(1_000_000), EventKind::ViewerCount { count: 50 })).await;
+
+    let mut viewer_events = Vec::new();
+    while let Ok(frame) = live.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "event" && v["data"]["kind"]["type"] == "viewer_count" {
+            viewer_events.push((
+                v["data"]["platform"].as_str().unwrap_or("").to_string(),
+                v["data"]["kind"]["count"].as_u64().unwrap_or(0),
+            ));
+        }
+    }
+    assert_eq!(
+        viewer_events,
+        vec![("twitch".into(), 100), ("twitch".into(), 120), ("youtube".into(), 50)],
+        "every live viewer_count update must reach the dashboard live socket"
+    );
+
+    // Drain earlier overlay frames before StreamOffline.
+    while overlays.try_recv().is_ok() {}
+
+    e.ingest(Event::live(Platform::Youtube, None, Millis(1_001_000), EventKind::StreamOffline)).await;
+
+    let mut offline_viewers: Option<Value> = None;
+    while let Ok(frame) = overlays.try_recv() {
+        let v: Value = serde_json::from_str(&frame.text).unwrap();
+        if v["type"] == "state" && v["data"].get("viewers").is_some() {
+            offline_viewers = Some(v["data"]["viewers"].clone());
+        }
+    }
+    let viewers = offline_viewers.expect("StreamOffline must emit updated viewers state to overlays");
+    assert_eq!(viewers["twitch"], 120);
+    assert!(viewers["youtube"].is_null(), "offline platform must clear in overlays: {viewers:?}");
+}
+
+#[tokio::test]
+async fn studio_stream_start_wakes_youtube() {
+    let (e, _d) = engine().await;
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let woken = wake.notified();
+    *e.inner.youtube_wake.lock().unwrap() = Some(wake.clone());
+    e.on_stream_started();
+    tokio::time::timeout(Duration::from_secs(1), woken).await.expect("Studio on_stream_started must wake YouTube");
+}

@@ -309,6 +309,8 @@ impl Engine {
         if let Some(run) = emit {
             self.emit_show(Some(run));
         }
+        self.wake_youtube();
+        self.wake_viewer_poller();
     }
 
     /// Cancels any active Show, countdown, or pending delayed stop when the Studio stops.
