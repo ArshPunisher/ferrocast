@@ -71,58 +71,60 @@ pub async fn run_with(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: L
     // never between failed attempts (it flashed green, then red, every time it woke up).
     let mut connected = true;
     loop {
-        match api.active_live_chat().await {
-            Ok(Some(chat)) => {
-                attempt = 0;
-                if !connected {
-                    emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
-                    connected = true;
-                }
-                *live.write().unwrap_or_else(|p| p.into_inner()) = Some(chat.clone());
-                emit(&sink, EventKind::StreamOnline { title: None }).await;
-                let end = follow(&api, &chat, &sink).await;
-                *live.write().unwrap_or_else(|p| p.into_inner()) = None;
-                match end {
-                    End::ChatEnded => {
-                        emit(&sink, EventKind::StreamOffline).await;
+        match api.active_broadcasts().await {
+            Ok(broadcasts) => {
+                if let Some(chat) = broadcasts.iter().find_map(|b| b.live_chat_id.clone()) {
+                    attempt = 0;
+                    if !connected {
+                        emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
+                        connected = true;
                     }
-                    End::SignInNeeded => {
-                        emit(&sink, EventKind::Connector(ConnectorStatus::SignInNeeded)).await;
-                        return;
+                    *live.write().unwrap_or_else(|p| p.into_inner()) = Some(chat.clone());
+                    emit(&sink, EventKind::StreamOnline { title: None }).await;
+                    let end = follow(&api, &chat, &sink).await;
+                    *live.write().unwrap_or_else(|p| p.into_inner()) = None;
+                    match end {
+                        End::ChatEnded => {
+                            api.clear_active_broadcasts();
+                            emit(&sink, EventKind::StreamOffline).await;
+                        }
+                        End::SignInNeeded => {
+                            emit(&sink, EventKind::Connector(ConnectorStatus::SignInNeeded)).await;
+                            return;
+                        }
+                        End::Quota => {
+                            connected = false;
+                            quota_pause(&api, &sink, waits).await;
+                        }
+                        End::RateLimited(asked) => {
+                            connected = false;
+                            attempt += 1;
+                            emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
+                            tokio::time::sleep(waits.rate.unwrap_or_else(|| rate_backoff(attempt, asked))).await;
+                        }
+                        End::Lost(reason) => {
+                            connected = false;
+                            attempt += 1;
+                            tracing::warn!(%reason, attempt, "YouTube chat stream lost");
+                            emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
+                            tokio::time::sleep(backoff(attempt)).await;
+                        }
                     }
-                    End::Quota => {
-                        connected = false;
-                        quota_pause(&sink, waits).await;
-                    }
-                    End::RateLimited(asked) => {
-                        connected = false;
-                        attempt += 1;
-                        emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
-                        tokio::time::sleep(waits.rate.unwrap_or_else(|| rate_backoff(attempt, asked))).await;
-                    }
-                    End::Lost(reason) => {
-                        connected = false;
-                        attempt += 1;
-                        tracing::warn!(%reason, attempt, "YouTube chat stream lost");
-                        emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
-                        tokio::time::sleep(backoff(attempt)).await;
-                    }
-                }
-            }
-            Ok(None) => {
-                if !connected {
-                    emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
-                    connected = true;
-                }
-                let wait = if eager > 0 {
-                    eager -= 1;
-                    EAGER_EVERY
                 } else {
-                    LOOK_EVERY
-                };
-                tokio::select! {
-                    _ = wake.notified() => eager = EAGER_LOOKS,
-                    _ = tokio::time::sleep(wait) => {}
+                    if !connected {
+                        emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
+                        connected = true;
+                    }
+                    let wait = if eager > 0 {
+                        eager -= 1;
+                        EAGER_EVERY
+                    } else {
+                        LOOK_EVERY
+                    };
+                    tokio::select! {
+                        _ = wake.notified() => eager = EAGER_LOOKS,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
                 }
             }
             Err(YoutubeError::SignInNeeded) => {
@@ -131,7 +133,7 @@ pub async fn run_with(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: L
             }
             Err(YoutubeError::QuotaExceeded) => {
                 connected = false;
-                quota_pause(&sink, waits).await;
+                quota_pause(&api, &sink, waits).await;
             }
             Err(YoutubeError::RateLimited(asked)) => {
                 connected = false;
@@ -161,11 +163,13 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The day's units are used up: said, then nothing is asked until they are back (midnight in
 /// Pacific time, and a few minutes of spread), not every hour for nothing.
-async fn quota_pause(sink: &EventSink, waits: Waits) {
+async fn quota_pause(api: &Api, sink: &EventSink, waits: Waits) {
     emit(sink, EventKind::Connector(ConnectorStatus::Disconnected { reason: YoutubeError::QuotaExceeded.to_string() }))
         .await;
     let wait = waits.quota.unwrap_or_else(|| crate::quota_resets_in(now_ms(), crate::quota_jitter_s()));
+    api.note_quota_exceeded(wait);
     tokio::time::sleep(wait).await;
+    api.clear_quota_pause();
 }
 
 /// A gRPC "resource exhausted" is the day's quota when it says so, else a burst.

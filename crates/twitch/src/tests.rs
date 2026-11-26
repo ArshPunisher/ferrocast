@@ -628,3 +628,43 @@ async fn a_fresh_token_helix_refuses_names_the_scope_then_ends_in_a_sign_in() {
     }
     assert_eq!(helix.me().await.unwrap_err(), TwitchError::SignInNeeded);
 }
+
+#[test]
+fn parse_stream_viewers_handles_live_zero_non_live_and_offline() {
+    use crate::helix::parse_stream_viewers;
+    assert_eq!(parse_stream_viewers(&json!({ "data": [{ "type": "live", "viewer_count": 42 }] })), Some(42));
+    assert_eq!(parse_stream_viewers(&json!({ "data": [{ "type": "live", "viewer_count": 0 }] })), Some(0));
+    assert_eq!(parse_stream_viewers(&json!({ "data": [{ "type": "", "viewer_count": 99 }] })), None);
+    assert_eq!(parse_stream_viewers(&json!({ "data": [] })), None);
+}
+
+#[tokio::test]
+async fn connector_viewer_count_reads_helix_streams_handles_offline_401_and_429() {
+    use ferrocast_connector::{Connector, ConnectorError};
+    use ferrocast_core::event::Platform;
+
+    let (st, ep) = fake().await;
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let c = TwitchConnector { helix: Helix::new(auth_for(&ep, saved)), user_id: "111".into() };
+
+    assert_eq!(c.viewer_count().await.unwrap(), None, "empty data means offline");
+
+    st.lock().unwrap().streams_data =
+        Some(json!([{ "id": "s1", "user_id": "111", "type": "live", "viewer_count": 318 }]));
+    assert_eq!(c.viewer_count().await.unwrap(), Some(318));
+
+    st.lock().unwrap().streams_data =
+        Some(json!([{ "id": "s1", "user_id": "111", "type": "live", "viewer_count": 0 }]));
+    assert_eq!(c.viewer_count().await.unwrap(), Some(0), "0 viewers while live is still Some(0)");
+
+    st.lock().unwrap().fail_next_with_401 = true;
+    assert_eq!(c.viewer_count().await.unwrap(), Some(0), "401 refreshes token and retries");
+    assert_eq!(st.lock().unwrap().refreshes, 1);
+
+    st.lock().unwrap().fail_next_streams_429 = true;
+    let err = c.viewer_count().await.unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::RateLimited { platform: Platform::Twitch, .. }),
+        "expected Twitch RateLimited, got {err:?}"
+    );
+}

@@ -289,6 +289,56 @@ impl KickApi {
     }
 }
 
+/// Unverified against a live Kick API call: Kick Public API v1 `/public/v1/channels` is
+/// documented to expose `data[0].stream.{is_live, viewer_count}` and `/public/v1/livestreams`
+/// to expose `data[0].viewer_count`; confirm against an active Kick broadcast in QA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KickChannelViewers {
+    Offline,
+    Live(u64),
+    LiveMissingCount,
+}
+
+fn parse_u64_lenient(v: Option<&Value>) -> Option<u64> {
+    match v? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Parses `GET /public/v1/channels` for live status and `stream.viewer_count`.
+pub fn parse_channel_viewers(v: &Value) -> KickChannelViewers {
+    let Some(stream) = v.pointer("/data/0/stream") else {
+        return KickChannelViewers::Offline;
+    };
+    if stream.get("is_live").and_then(Value::as_bool) != Some(true) {
+        return KickChannelViewers::Offline;
+    }
+    match parse_u64_lenient(stream.get("viewer_count")) {
+        Some(count) => KickChannelViewers::Live(count),
+        None => KickChannelViewers::LiveMissingCount,
+    }
+}
+
+/// Parses `GET /public/v1/livestreams` for `viewer_count`.
+pub fn parse_livestream_viewers(v: &Value, broadcaster_id: Option<&str>) -> Option<u64> {
+    let items = v.get("data").and_then(Value::as_array)?;
+    let entry = if let Some(bid) = broadcaster_id {
+        items
+            .iter()
+            .find(|item| match item.get("broadcaster_user_id") {
+                Some(Value::Number(n)) => n.to_string() == bid,
+                Some(Value::String(s)) => s == bid,
+                _ => false,
+            })
+            .or_else(|| items.first())
+    } else {
+        items.first()
+    }?;
+    parse_u64_lenient(entry.get("viewer_count"))
+}
+
 impl KickApi {
     /// Go live everywhere: `GET /public/v1/channels` for the signed-in channel's stream URL and
     /// key. Kick leaves the key out without `streamkey:read`, so an older sign-in is told to
@@ -312,6 +362,31 @@ impl KickApi {
             .filter(|u| u.starts_with("rtmps://") || u.starts_with("rtmp://"))
             .ok_or_else(|| KickError::Refused("Kick didn't give out the stream address".into()))?;
         Ok(ferrocast_connector::Ingest { url: with_app(&url), key, backup: None, note: None })
+    }
+
+    /// Concurrent viewer count for the signed-in Kick channel when live.
+    /// Reads `/public/v1/channels` first and falls back to `/public/v1/livestreams` if
+    /// `is_live` is true without a `viewer_count` field on the channel stream object.
+    pub async fn stream_viewers(&self, broadcaster_id: &str) -> Result<Option<u64>, KickError> {
+        let v = match self.call(Method::GET, "/public/v1/channels", &[], None).await {
+            Err(KickError::Forbidden(_)) => return Err(KickError::MissingScope("channel:read".into())),
+            other => other?,
+        };
+        match parse_channel_viewers(&v) {
+            KickChannelViewers::Offline => Ok(None),
+            KickChannelViewers::Live(count) => Ok(Some(count)),
+            KickChannelViewers::LiveMissingCount => {
+                let id = numeric(broadcaster_id)?.to_string();
+                let lv = match self
+                    .call(Method::GET, "/public/v1/livestreams", &[("broadcaster_user_id", id.as_str())], None)
+                    .await
+                {
+                    Err(KickError::Forbidden(_)) => return Err(KickError::MissingScope("channel:read".into())),
+                    other => other?,
+                };
+                Ok(parse_livestream_viewers(&lv, Some(id.as_str())))
+            }
+        }
     }
 }
 

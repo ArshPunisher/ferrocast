@@ -180,6 +180,12 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     async fn vertical_ingest(&self) -> Result<Ingest> {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "take a second, vertical stream" })
     }
+
+    /// Current concurrent live viewers for this channel, when live and available.
+    /// Returns `Ok(None)` when offline or when the platform hides the count.
+    async fn viewer_count(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
 }
 
 /// A channel's ingest: the server address and the stream key. The key is a secret: it never

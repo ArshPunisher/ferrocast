@@ -117,6 +117,17 @@ pub struct Api {
     writes: AtomicU64,
     /// How long a read is kept (ms; 0: never, as before).
     read_ttl_ms: i64,
+    /// Broadcast ids reported active by the latest `active_broadcasts` check.
+    active_broadcasts: StdMutex<Vec<String>>,
+    /// When daily quota ran out, stop polling viewer counts until this monotonic instant.
+    quota_paused_until: StdMutex<Option<std::time::Instant>>,
+}
+
+/// An active YouTube broadcast returned by `liveBroadcasts.list(broadcastStatus=active)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveBroadcast {
+    pub id: String,
+    pub live_chat_id: Option<String>,
 }
 
 /// How long to wait before asking the Keychain again to save a refreshed sign-in it refused.
@@ -174,6 +185,8 @@ impl Api {
             reads: StdMutex::new(HashMap::new()),
             writes: AtomicU64::new(0),
             read_ttl_ms: READ_TTL_MS,
+            active_broadcasts: StdMutex::new(Vec::new()),
+            quota_paused_until: StdMutex::new(None),
         }
     }
 
@@ -366,14 +379,106 @@ impl Api {
         .await
     }
 
+    /// Active broadcasts on the channel (`liveBroadcasts.list?broadcastStatus=active`, 1 unit/page),
+    /// updating the cached active broadcast ids for viewer-count polling.
+    pub async fn active_broadcasts(&self) -> Result<Vec<ActiveBroadcast>, YoutubeError> {
+        let v = self.list_broadcasts("snippet", "active", MAX_LIST_PAGES, true).await?;
+        let mut out = Vec::new();
+        for item in v.get("items").and_then(Value::as_array).into_iter().flatten() {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_string();
+            let live_chat_id = item
+                .pointer("/snippet/liveChatId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            if id.is_empty() && live_chat_id.is_none() {
+                continue;
+            }
+            out.push(ActiveBroadcast { id, live_chat_id });
+        }
+        let ids: Vec<String> = out.iter().filter(|b| !b.id.is_empty()).map(|b| b.id.clone()).collect();
+        self.set_active_broadcasts(ids);
+        Ok(out)
+    }
+
     /// The live chat of the channel's active broadcast, if it's live now (1 unit/page).
     pub async fn active_live_chat(&self) -> Result<Option<String>, YoutubeError> {
-        let v = self.list_broadcasts("snippet", "active", MAX_LIST_PAGES, true).await?;
-        Ok(v.get("items")
-            .and_then(Value::as_array)
+        Ok(self.active_broadcasts().await?.into_iter().find_map(|b| b.live_chat_id))
+    }
+
+    /// Cached active broadcast ids from the most recent `active_broadcasts` check.
+    pub fn active_broadcast_ids(&self) -> Vec<String> {
+        self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Stores the active broadcast ids (deduplicated, preserving order).
+    pub fn set_active_broadcasts(&self, ids: Vec<String>) {
+        let mut seen = HashSet::new();
+        let deduped: Vec<String> = ids
             .into_iter()
-            .flatten()
-            .find_map(|i| i.pointer("/snippet/liveChatId").and_then(Value::as_str).map(String::from)))
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+            .collect();
+        *self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner()) = deduped;
+    }
+
+    /// Clears cached active broadcast ids when a stream goes offline.
+    pub fn clear_active_broadcasts(&self) {
+        self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// Records a daily-quota pause window so non-essential polling skips requests until reset.
+    pub fn note_quota_exceeded(&self, wait: std::time::Duration) {
+        *self.quota_paused_until.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now() + wait);
+    }
+
+    /// Clears any recorded daily-quota pause after the pause finishes.
+    pub fn clear_quota_pause(&self) {
+        *self.quota_paused_until.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Remaining duration of the active daily-quota pause, if any.
+    pub fn quota_retry_after(&self) -> Option<std::time::Duration> {
+        let mut guard = self.quota_paused_until.lock().unwrap_or_else(|p| p.into_inner());
+        let until = (*guard)?;
+        let now = std::time::Instant::now();
+        if until > now {
+            Some(until.duration_since(now))
+        } else {
+            *guard = None;
+            None
+        }
+    }
+
+    /// Concurrent viewers summed across `broadcast_ids` via `videos.list(part=liveStreamingDetails)`
+    /// (1 quota unit per batch of up to 50 ids). Returns `None` when none of the videos report
+    /// an active `concurrentViewers`.
+    pub async fn concurrent_viewers(&self, broadcast_ids: &[String]) -> Result<Option<u64>, YoutubeError> {
+        let mut seen = HashSet::new();
+        let ids: Vec<&str> =
+            broadcast_ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && seen.insert(*s)).collect();
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let mut total: u64 = 0;
+        let mut any = false;
+        for chunk in ids.chunks(50) {
+            let joined = chunk.join(",");
+            let v =
+                self.call(Method::GET, "/videos", &[("part", "liveStreamingDetails"), ("id", &joined)], None).await?;
+            if let Some(count) = parse_concurrent_viewers(&v) {
+                total = total.saturating_add(count);
+                any = true;
+            }
+        }
+        Ok(any.then_some(total))
     }
 
     pub async fn send(&self, live_chat_id: &str, text: &str) -> Result<(), YoutubeError> {
@@ -1865,6 +1970,34 @@ fn usable(s: &Value) -> Option<ferrocast_connector::Ingest> {
         backup,
         note: None,
     })
+}
+
+/// Parses active `concurrentViewers` from a YouTube `videos.list(part=liveStreamingDetails)` response.
+/// Ignores items that already have a non-empty `actualEndTime` and sums active items so simultaneous
+/// horizontal + Shorts broadcasts count together.
+pub fn parse_concurrent_viewers(v: &Value) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut any = false;
+    for item in v.get("items").and_then(Value::as_array).into_iter().flatten() {
+        let ended = item
+            .pointer("/liveStreamingDetails/actualEndTime")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if ended {
+            continue;
+        }
+        let raw = item.pointer("/liveStreamingDetails/concurrentViewers");
+        let parsed = match raw {
+            Some(Value::Number(n)) => n.as_u64(),
+            Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        if let Some(n) = parsed {
+            total = total.saturating_add(n);
+            any = true;
+        }
+    }
+    any.then_some(total)
 }
 
 #[cfg(test)]

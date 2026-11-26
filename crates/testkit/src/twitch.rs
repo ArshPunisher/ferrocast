@@ -50,6 +50,10 @@ pub struct Fake {
     pub markers: Vec<Value>,
     /// Answer the next channel PATCH with 401 "Missing scope" (an old sign-in).
     pub refuse_channel_scope: bool,
+    /// Optional custom payload for `GET /helix/streams` (`data` array contents).
+    pub streams_data: Option<Value>,
+    /// Answer the next `GET /helix/streams` with 429 (`Ratelimit-Reset` far ahead so Helix returns RateLimited).
+    pub fail_next_streams_429: bool,
 }
 
 pub type St = Arc<Mutex<Fake>>;
@@ -64,6 +68,7 @@ pub async fn fake() -> (St, (String, String, String)) {
         .route("/helix/users", get(users))
         .route("/helix/channels", get(channels).patch(patch_channel))
         .route("/helix/search/categories", get(search_categories))
+        .route("/helix/streams", get(streams))
         .route("/helix/streams/markers", post(marker))
         .route("/helix/streams/key", get(stream_key))
         .route("/ingests", get(ingests))
@@ -84,6 +89,34 @@ pub async fn fake() -> (St, (String, String, String)) {
 
 async fn stream_key() -> Response {
     axum::Json(json!({ "data": [{ "stream_key": "live_123456_FakeKey" }] })).into_response()
+}
+
+async fn streams(
+    State(st): State<St>,
+    headers: axum::http::HeaderMap,
+    Query(_q): Query<HashMap<String, String>>,
+) -> Response {
+    if !check_auth(&st, &headers) {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "message": "Invalid OAuth token" }))).into_response();
+    }
+    let (fail_429, data) = {
+        let mut s = st.lock().unwrap();
+        let fail = std::mem::take(&mut s.fail_next_streams_429);
+        let data = s.streams_data.clone().unwrap_or_else(|| json!([]));
+        (fail, data)
+    };
+    if fail_429 {
+        let reset = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+            + 300)
+            .to_string();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Ratelimit-Reset", reset)],
+            axum::Json(json!({ "status": 429, "message": "Too Many Requests" })),
+        )
+            .into_response();
+    }
+    axum::Json(json!({ "data": data })).into_response()
 }
 
 /// Twitch's ingest list: nearest first; the first one is down, so the second is picked.

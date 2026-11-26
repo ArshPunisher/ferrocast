@@ -88,6 +88,10 @@ impl Connector for TwitchConnector {
         let key = self.helix.stream_key(&self.user_id).await?;
         Ok(Ingest { url: self.helix.nearest_ingest().await, key, backup: None, note: None })
     }
+
+    async fn viewer_count(&self) -> Result<Option<u64>> {
+        Ok(self.helix.stream_viewers(&self.user_id).await?)
+    }
 }
 
 const BROADCAST: &str = "channel:manage:broadcast";

@@ -232,4 +232,22 @@ impl Helix {
             Err(e) => Err(e),
         }
     }
+
+    /// Concurrent viewer count for `broadcaster` from `GET /streams?user_id=<id>`.
+    /// Returns `Ok(None)` when offline or not currently `"live"`.
+    pub async fn stream_viewers(&self, broadcaster: &str) -> Result<Option<u64>, TwitchError> {
+        let v = self.call(Method::GET, "/streams", &[("user_id", broadcaster)], None).await?;
+        Ok(parse_stream_viewers(&v))
+    }
+}
+
+/// Extracts `viewer_count` from a Helix `GET /streams` response when a stream is `"live"`.
+pub fn parse_stream_viewers(v: &Value) -> Option<u64> {
+    let items = v.get("data").and_then(Value::as_array)?;
+    items.iter().find_map(|s| {
+        if s.get("type").and_then(Value::as_str) != Some("live") {
+            return None;
+        }
+        s.get("viewer_count").and_then(Value::as_u64)
+    })
 }

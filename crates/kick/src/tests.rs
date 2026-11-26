@@ -334,3 +334,124 @@ async fn a_refresh_whose_save_fails_keeps_the_new_tokens_and_saves_them_later() 
     assert_eq!(*saved.lock().unwrap(), vec!["r2".to_string()], "the next use saved them");
     assert_eq!(seen.lock().unwrap().refreshed, 1, "no second refresh");
 }
+
+#[test]
+fn parse_kick_viewer_counts_handles_channels_and_livestreams_fixtures() {
+    use crate::api::{KickChannelViewers, parse_channel_viewers, parse_livestream_viewers};
+
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": true, "viewer_count": 42 } }] })),
+        KickChannelViewers::Live(42)
+    );
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": true, "viewer_count": 0 } }] })),
+        KickChannelViewers::Live(0)
+    );
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": true, "viewer_count": "19" } }] })),
+        KickChannelViewers::Live(19)
+    );
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": true } }] })),
+        KickChannelViewers::LiveMissingCount
+    );
+    assert_eq!(
+        parse_channel_viewers(&json!({ "data": [{ "stream": { "is_live": false, "viewer_count": 42 } }] })),
+        KickChannelViewers::Offline
+    );
+    assert_eq!(
+        parse_livestream_viewers(
+            &json!({
+                "data": [
+                    { "broadcaster_user_id": 11, "viewer_count": 5 },
+                    { "broadcaster_user_id": 42, "viewer_count": 88 }
+                ]
+            }),
+            Some("42")
+        ),
+        Some(88)
+    );
+    assert_eq!(
+        parse_livestream_viewers(&json!({ "data": [{ "broadcaster_user_id": 99, "viewer_count": "12" }] }), Some("42")),
+        Some(12)
+    );
+}
+
+#[tokio::test]
+async fn connector_viewer_count_reads_channels_falls_back_to_livestreams_and_maps_403() {
+    use axum::extract::State;
+    use ferrocast_connector::{Connector, ConnectorError};
+    use ferrocast_core::event::Platform;
+
+    #[derive(Clone, Default)]
+    struct MockSt {
+        calls: Arc<Mutex<Vec<String>>>,
+        channels_body: Arc<Mutex<(axum::http::StatusCode, Value)>>,
+        livestreams_body: Arc<Mutex<(axum::http::StatusCode, Value)>>,
+    }
+
+    let st = MockSt {
+        calls: Arc::new(Mutex::new(Vec::new())),
+        channels_body: Arc::new(Mutex::new((
+            axum::http::StatusCode::OK,
+            json!({ "data": [{ "stream": { "is_live": true, "viewer_count": 42 } }] }),
+        ))),
+        livestreams_body: Arc::new(Mutex::new((
+            axum::http::StatusCode::OK,
+            json!({ "data": [{ "broadcaster_user_id": 42, "viewer_count": 65 }] }),
+        ))),
+    };
+
+    let app = axum::Router::new()
+        .route(
+            "/public/v1/channels",
+            axum::routing::get(|State(st): State<MockSt>| async move {
+                st.calls.lock().unwrap().push("GET /public/v1/channels".into());
+                let (code, body) = st.channels_body.lock().unwrap().clone();
+                (code, axum::Json(body))
+            }),
+        )
+        .route(
+            "/public/v1/livestreams",
+            axum::routing::get(
+                |State(st): State<MockSt>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                    st.calls.lock().unwrap().push(format!(
+                        "GET /public/v1/livestreams broadcaster_user_id={}",
+                        q.get("broadcaster_user_id").map(String::as_str).unwrap_or("")
+                    ));
+                    let (code, body) = st.livestreams_body.lock().unwrap().clone();
+                    (code, axum::Json(body))
+                },
+            ),
+        )
+        .with_state(st.clone());
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let c = KickConnector { api: Arc::new(api(&base, seen)), broadcaster_id: "42".into() };
+
+    assert_eq!(c.viewer_count().await.unwrap(), Some(42));
+    assert_eq!(*st.calls.lock().unwrap(), vec!["GET /public/v1/channels"]);
+
+    *st.channels_body.lock().unwrap() =
+        (axum::http::StatusCode::OK, json!({ "data": [{ "stream": { "is_live": true } }] }));
+    assert_eq!(c.viewer_count().await.unwrap(), Some(65), "falls back to /livestreams when stream lacks viewer_count");
+    assert_eq!(
+        *st.calls.lock().unwrap(),
+        vec!["GET /public/v1/channels", "GET /public/v1/channels", "GET /public/v1/livestreams broadcaster_user_id=42",]
+    );
+
+    *st.channels_body.lock().unwrap() =
+        (axum::http::StatusCode::OK, json!({ "data": [{ "stream": { "is_live": false } }] }));
+    assert_eq!(c.viewer_count().await.unwrap(), None, "offline channel does not fall back to /livestreams");
+    assert_eq!(st.calls.lock().unwrap().len(), 4);
+
+    *st.channels_body.lock().unwrap() = (axum::http::StatusCode::FORBIDDEN, json!({ "message": "Forbidden" }));
+    let err = c.viewer_count().await.unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::MissingScope { platform: Platform::Kick, ref scope } if scope == "channel:read"),
+        "expected MissingScope(channel:read), got {err:?}"
+    );
+}

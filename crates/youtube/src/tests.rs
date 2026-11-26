@@ -2633,3 +2633,145 @@ async fn me_captures_custom_url_handle_and_handles_missing() {
     let ch2 = video_api(ep2).me().await.unwrap();
     assert_eq!(ch2.custom_url, None);
 }
+
+#[test]
+fn parse_concurrent_viewers_handles_strings_numbers_multi_broadcast_and_ended() {
+    use crate::api::parse_concurrent_viewers;
+
+    assert_eq!(
+        parse_concurrent_viewers(&json!({
+            "items": [{ "id": "b1", "liveStreamingDetails": { "concurrentViewers": "42" } }]
+        })),
+        Some(42)
+    );
+    assert_eq!(
+        parse_concurrent_viewers(&json!({
+            "items": [{ "id": "b1", "liveStreamingDetails": { "concurrentViewers": "0" } }]
+        })),
+        Some(0)
+    );
+    assert_eq!(
+        parse_concurrent_viewers(&json!({
+            "items": [{ "id": "b1", "liveStreamingDetails": { "concurrentViewers": 15 } }]
+        })),
+        Some(15)
+    );
+    assert_eq!(
+        parse_concurrent_viewers(&json!({
+            "items": [
+                { "id": "b1", "liveStreamingDetails": { "concurrentViewers": "10" } },
+                { "id": "b2", "liveStreamingDetails": { "concurrentViewers": "7" } }
+            ]
+        })),
+        Some(17)
+    );
+    assert_eq!(
+        parse_concurrent_viewers(&json!({
+            "items": [
+                { "id": "b1", "liveStreamingDetails": { "concurrentViewers": "5", "actualEndTime": "2026-11-26T10:00:00Z" } },
+                { "id": "b2", "liveStreamingDetails": { "concurrentViewers": "12" } }
+            ]
+        })),
+        Some(12)
+    );
+    assert_eq!(
+        parse_concurrent_viewers(&json!({
+            "items": [{ "id": "b1", "liveStreamingDetails": { "concurrentViewers": "5", "actualEndTime": "2026-11-26T10:00:00Z" } }]
+        })),
+        None
+    );
+    assert_eq!(
+        parse_concurrent_viewers(&json!({
+            "items": [{ "id": "b1", "liveStreamingDetails": { "actualStartTime": "2026-11-26T10:00:00Z" } }]
+        })),
+        None
+    );
+}
+
+#[tokio::test]
+async fn viewer_count_uses_active_broadcasts_batches_videos_and_respects_quota() {
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use ferrocast_connector::{Connector, ConnectorError};
+    use ferrocast_core::event::Platform;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Default)]
+    struct MockSt {
+        calls: Arc<Mutex<Vec<String>>>,
+        quota_gone: Arc<AtomicBool>,
+    }
+
+    let st = MockSt::default();
+    let app = axum::Router::new()
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|State(st): State<MockSt>, Query(q): Query<HashMap<String, String>>| async move {
+                let status = q.get("broadcastStatus").cloned().unwrap_or_default();
+                st.calls.lock().unwrap().push(format!("GET /liveBroadcasts status={status}"));
+                axum::Json(json!({
+                    "items": [
+                        { "id": "b-main", "snippet": { "liveChatId": "lc-1" } },
+                        { "id": "b-shorts", "snippet": { "liveChatId": "lc-2" } }
+                    ]
+                }))
+            }),
+        )
+        .route(
+            "/api/videos",
+            axum::routing::get(|State(st): State<MockSt>, Query(q): Query<HashMap<String, String>>| async move {
+                let ids = q.get("id").cloned().unwrap_or_default();
+                st.calls.lock().unwrap().push(format!("GET /videos id={ids}"));
+                if st.quota_gone.load(Ordering::SeqCst) {
+                    return (StatusCode::FORBIDDEN, axum::Json(google_error("quotaExceeded")));
+                }
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "items": [
+                            { "id": "b-main", "liveStreamingDetails": { "concurrentViewers": "10" } },
+                            { "id": "b-shorts", "liveStreamingDetails": { "concurrentViewers": "7" } }
+                        ]
+                    })),
+                )
+            }),
+        )
+        .with_state(st.clone());
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let ep =
+        Endpoints { authorize: String::new(), token: String::new(), api: format!("{base}/api"), grpc: String::new() };
+    let api = Arc::new(video_api(ep));
+    let c = crate::YoutubeConnector { api: api.clone(), live: Arc::default() };
+
+    // First call discovers active broadcasts once and batches both ids into one /videos call.
+    assert_eq!(c.viewer_count().await.unwrap(), Some(17));
+    assert_eq!(*st.calls.lock().unwrap(), vec!["GET /liveBroadcasts status=active", "GET /videos id=b-main,b-shorts"]);
+
+    // Subsequent poll reuses cached active broadcast ids (1 unit total).
+    assert_eq!(c.viewer_count().await.unwrap(), Some(17));
+    assert_eq!(
+        *st.calls.lock().unwrap(),
+        vec!["GET /liveBroadcasts status=active", "GET /videos id=b-main,b-shorts", "GET /videos id=b-main,b-shorts",]
+    );
+
+    // Daily quota exhausted: returns RateLimited and records quota pause so next poll makes 0 HTTP requests.
+    st.quota_gone.store(true, Ordering::SeqCst);
+    let err = c.viewer_count().await.unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::RateLimited { platform: Platform::Youtube, retry_after } if !retry_after.is_zero())
+    );
+    let calls_at_quota = st.calls.lock().unwrap().len();
+    let err2 = c.viewer_count().await.unwrap_err();
+    assert!(matches!(err2, ConnectorError::RateLimited { platform: Platform::Youtube, .. }));
+    assert_eq!(st.calls.lock().unwrap().len(), calls_at_quota, "must not hit YouTube HTTP again while quota paused");
+
+    // Once quota pause is lifted and server recovers, polling resumes cleanly.
+    api.clear_quota_pause();
+    st.quota_gone.store(false, Ordering::SeqCst);
+    assert_eq!(c.viewer_count().await.unwrap(), Some(17));
+    assert_eq!(st.calls.lock().unwrap().len(), calls_at_quota + 1);
+}

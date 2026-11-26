@@ -10,6 +10,7 @@ use ferrocast_core::moderation::{Capabilities, ModeChange};
 
 use crate::api::Api;
 use crate::stream::LiveChat;
+use crate::{YoutubeError, now_ms, quota_jitter_s, quota_resets_in};
 
 #[derive(Debug, Clone)]
 pub struct YoutubeConnector {
@@ -23,6 +24,15 @@ impl YoutubeConnector {
             platform: Platform::Youtube,
             message: "you aren't live on YouTube right now".into(),
         })
+    }
+
+    fn map_err(&self, err: YoutubeError) -> ConnectorError {
+        if matches!(err, YoutubeError::QuotaExceeded) {
+            let retry_after = quota_resets_in(now_ms(), quota_jitter_s());
+            self.api.note_quota_exceeded(retry_after);
+            return ConnectorError::RateLimited { platform: Platform::Youtube, retry_after };
+        }
+        ConnectorError::from(err)
     }
 }
 
@@ -129,5 +139,20 @@ impl Connector for YoutubeConnector {
 
     async fn vertical_ingest(&self) -> Result<ferrocast_connector::Ingest> {
         Ok(self.api.vertical_ingest().await?)
+    }
+
+    async fn viewer_count(&self) -> Result<Option<u64>> {
+        if let Some(retry_after) = self.api.quota_retry_after() {
+            return Err(ConnectorError::RateLimited { platform: Platform::Youtube, retry_after });
+        }
+        let mut ids = self.api.active_broadcast_ids();
+        if ids.is_empty() {
+            let active = self.api.active_broadcasts().await.map_err(|e| self.map_err(e))?;
+            ids = active.into_iter().map(|b| b.id).collect();
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        self.api.concurrent_viewers(&ids).await.map_err(|e| self.map_err(e))
     }
 }

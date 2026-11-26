@@ -61,4 +61,8 @@ impl Connector for KickConnector {
     async fn set_mode(&self, _change: ModeChange) -> Result<()> {
         Err(ConnectorError::NotSupported { platform: Platform::Kick, what: "change chat modes yet" })
     }
+
+    async fn viewer_count(&self) -> Result<Option<u64>> {
+        Ok(self.api.stream_viewers(&self.broadcaster_id).await?)
+    }
 }
