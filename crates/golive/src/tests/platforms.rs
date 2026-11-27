@@ -607,3 +607,294 @@ async fn a_backup_that_held_then_dropped_gives_way_to_the_main_server() {
     state_within(&mut health, LONG, |s| *s == PushState::Live).await;
     assert_eq!(next(&mut main_got).await, Got::Publish("k".into()));
 }
+
+/// Kick closes ~200 ms after receiving a >1080p H.264 `avcC` SPS header even when no AMF0
+/// `onMetaData` dimensions arrived yet; `classify_kick_close` must read the SPS resolution and
+/// NOT misdiagnose the close as `"Allow multistreaming"`.
+#[tokio::test]
+async fn kick_over_1080p_avcc_sps_without_metadata_does_not_blame_multistreaming() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops_on_video(l, "k").await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let avc_1440p = Bytes::from(crate::flv::minimal_avc_header(2560, 1440));
+    let r = obs.c.publish_video_data(avc_1440p, RtmpTimestamp::new(0), false).unwrap();
+    obs.send(vec![r]).await.unwrap();
+    obs.video(0, KEY).await;
+
+    let reconn = state_within(&mut health, WAIT, |s| matches!(s, PushState::Reconnecting { .. })).await.state;
+    match reconn {
+        PushState::Reconnecting { reason, .. } => {
+            assert!(!reason.contains("Allow multistreaming"), "misdiagnosed 1440p SPS close: {reason}");
+            assert!(reason.contains("1080p"), "should explain Kick 1080p cap: {reason}");
+        }
+        s => panic!("expected Reconnecting, got {s:?}"),
+    }
+
+    let failed = state_within(&mut health, WAIT, |s| matches!(s, PushState::Failed { .. })).await.state;
+    match failed {
+        PushState::Failed { reason, detail, refused, .. } => {
+            assert!(refused);
+            assert!(!reason.contains("Allow multistreaming"), "{reason}");
+            assert!(reason.contains("1080p"), "reason should mention 1080p: {reason}");
+            let detail = detail.expect("Kick limit failure explains why");
+            assert!(!detail.contains("Allow multistreaming"), "misdiagnosed detail: {detail}");
+            assert!(detail.contains("1080p") && detail.contains("2560"), "{detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+fn exceeds_dimensions(w: u32, h: u32, max_w: u32, max_h: u32) -> bool {
+    w.max(h) > max_w.max(max_h) || w.min(h) > max_w.min(max_h)
+}
+
+/// Fake IVS-like ingest: parses AMF0 `onMetaData` (`width`, `height`, `videodatarate`) and H.264
+/// `avcC` SPS coded dimensions, plus RTMP-timestamped video rate; closes TCP ~200 ms after
+/// receiving an offending header or metadata payload.
+async fn platform_that_rejects_above(
+    listener: TcpListener,
+    key: &'static str,
+    max_w: u32,
+    max_h: u32,
+    max_kbps: u32,
+) -> mpsc::UnboundedReceiver<Got> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut first_ts: Option<u32> = None;
+                let mut total_bytes: u64 = 0;
+                let _ = serve_platform_inspected(&mut sock, key, &tx, false, |ev| {
+                    let over = match ev {
+                        ServerSessionEvent::StreamMetadataChanged { metadata, .. } => {
+                            let over_dims = match (metadata.video_width, metadata.video_height) {
+                                (Some(w), Some(h)) => exceeds_dimensions(w, h, max_w, max_h),
+                                (Some(w), None) => w > max_w.max(max_h),
+                                (None, Some(h)) => h > max_w.min(max_h),
+                                (None, None) => false,
+                            };
+                            let over_kbps = metadata.video_bitrate_kbps.is_some_and(|k| k > max_kbps);
+                            over_dims || over_kbps
+                        }
+                        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+                            if crate::flv::video_is_header(data) {
+                                crate::flv::avcc_sps_dimensions(data)
+                                    .is_some_and(|(w, h)| exceeds_dimensions(w, h, max_w, max_h))
+                            } else {
+                                let start = *first_ts.get_or_insert(timestamp.value);
+                                total_bytes = total_bytes.saturating_add(data.len() as u64);
+                                let span = timestamp.value.wrapping_sub(start);
+                                if (1000..u32::MAX / 2).contains(&span) {
+                                    (total_bytes * 8 / u64::from(span)) > u64::from(max_kbps)
+                                } else {
+                                    false
+                                }
+                            }
+                        }
+                        _ => false,
+                    };
+                    if over { ServeAction::CloseAfter(Duration::from_millis(200)) } else { ServeAction::Continue }
+                })
+                .await;
+                let _ = tx.send(Got::Closed);
+            });
+        }
+    });
+    rx
+}
+
+#[tokio::test]
+async fn platform_that_rejects_above_drops_over_1080p_metadata() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = platform_that_rejects_above(l, "k", 1920, 1080, 8000).await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(2560);
+    m.video_height = Some(1440);
+    m.video_bitrate_kbps = Some(18_000);
+    let r = obs.c.publish_metadata(&m).unwrap();
+    obs.send(vec![r]).await.unwrap();
+    obs.video(0, AVC_HEADER).await;
+    obs.video(0, KEY).await;
+
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    loop {
+        if next(&mut got).await == Got::Closed {
+            break;
+        }
+    }
+    let failed = state_within(&mut health, WAIT, |s| matches!(s, PushState::Failed { .. })).await.state;
+    match failed {
+        PushState::Failed { reason, detail, refused, .. } => {
+            assert!(refused);
+            assert!(reason.contains("1080p"), "{reason}");
+            assert!(!reason.contains("Allow multistreaming"), "{reason}");
+            let detail = detail.unwrap_or_default();
+            assert!(detail.contains("2560"), "{detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn platform_that_rejects_above_drops_over_1080p_sps_without_metadata() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = platform_that_rejects_above(l, "k", 1920, 1080, 8000).await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let avc_1440p = Bytes::from(crate::flv::minimal_avc_header(2560, 1440));
+    let r = obs.c.publish_video_data(avc_1440p, RtmpTimestamp::new(0), false).unwrap();
+    obs.send(vec![r]).await.unwrap();
+    obs.video(0, KEY).await;
+
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    loop {
+        if next(&mut got).await == Got::Closed {
+            break;
+        }
+    }
+    let failed = state_within(&mut health, WAIT, |s| matches!(s, PushState::Failed { .. })).await.state;
+    match failed {
+        PushState::Failed { reason, detail, refused, .. } => {
+            assert!(refused);
+            assert!(reason.contains("1080p"), "{reason}");
+            assert!(!reason.contains("Allow multistreaming"), "{reason}");
+            let detail = detail.unwrap_or_default();
+            assert!(detail.contains("2560"), "{detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn platform_that_rejects_above_drops_over_bitrate() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = platform_that_rejects_above(l, "k", 1920, 1080, 8000).await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(1920);
+    m.video_height = Some(1080);
+    m.video_bitrate_kbps = Some(9_500);
+    let r = obs.c.publish_metadata(&m).unwrap();
+    obs.send(vec![r]).await.unwrap();
+    let avc_1080p = Bytes::from(crate::flv::minimal_avc_header(1920, 1080));
+    let rv = obs.c.publish_video_data(avc_1080p, RtmpTimestamp::new(0), false).unwrap();
+    obs.send(vec![rv]).await.unwrap();
+    obs.video(0, KEY).await;
+
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    loop {
+        if next(&mut got).await == Got::Closed {
+            break;
+        }
+    }
+    let failed = state_within(&mut health, WAIT, |s| matches!(s, PushState::Failed { .. })).await.state;
+    match failed {
+        PushState::Failed { reason, detail, refused, .. } => {
+            assert!(refused);
+            assert!(reason.contains("8,000 kbps"), "{reason}");
+            assert!(!reason.contains("Allow multistreaming"), "{reason}");
+            let detail = detail.unwrap_or_default();
+            assert!(detail.contains("9,500 kbps"), "{detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn platform_that_rejects_above_allows_within_limits_and_twitch_allows_1440p() {
+    let w_kick = world().await;
+    let lk = free_listener().await;
+    let kport = lk.local_addr().unwrap().port();
+    let mut kgot = platform_that_rejects_above(lk, "kick-k", 1920, 1080, 8000).await;
+    let mut khealth = start(&w_kick, Destination { id: "kick".into(), ..destination(kport, "kick-k") });
+
+    let w_tw = world().await;
+    let lt = free_listener().await;
+    let tport = lt.local_addr().unwrap().port();
+    let mut tgot = platform(lt, "tw-k").await;
+    let mut thealth = start(&w_tw, Destination { id: "twitch".into(), ..destination(tport, "tw-k") });
+
+    let mut obs_k = Obs::publish(w_kick.port, "live", OBS_KEY).await.unwrap();
+    let mut mk = StreamMetadata::new();
+    mk.video_width = Some(1920);
+    mk.video_height = Some(1080);
+    mk.video_frame_rate = Some(60.0);
+    mk.video_bitrate_kbps = Some(8000);
+    let r = obs_k.c.publish_metadata(&mk).unwrap();
+    obs_k.send(vec![r]).await.unwrap();
+    let avc_1080p = Bytes::from(crate::flv::minimal_avc_header(1920, 1080));
+    let rv = obs_k.c.publish_video_data(avc_1080p, RtmpTimestamp::new(0), false).unwrap();
+    obs_k.send(vec![rv]).await.unwrap();
+
+    let mut obs_t = Obs::publish(w_tw.port, "live", OBS_KEY).await.unwrap();
+    let mut mt = StreamMetadata::new();
+    mt.video_width = Some(2560);
+    mt.video_height = Some(1440);
+    mt.video_frame_rate = Some(60.0);
+    mt.video_bitrate_kbps = Some(6000);
+    let r = obs_t.c.publish_metadata(&mt).unwrap();
+    obs_t.send(vec![r]).await.unwrap();
+    let avc_1440p = Bytes::from(crate::flv::minimal_avc_header(2560, 1440));
+    let rv = obs_t.c.publish_video_data(avc_1440p, RtmpTimestamp::new(0), false).unwrap();
+    obs_t.send(vec![rv]).await.unwrap();
+
+    state_within(&mut khealth, WAIT, |s| *s == PushState::Live).await;
+    state_within(&mut thealth, WAIT, |s| *s == PushState::Live).await;
+
+    for ts in (0..=2100u32).step_by(500) {
+        obs_k.video(ts, KEY).await;
+        obs_t.video(ts, KEY).await;
+    }
+
+    let mut kick_last_ts = None;
+    while kick_last_ts != Some(2000) {
+        match next(&mut kgot).await {
+            Got::Closed => panic!("Kick unexpectedly closed valid 1080p60@8000 stream"),
+            Got::Video(ts, data) if !crate::flv::video_is_header(&data) => kick_last_ts = Some(ts),
+            _ => {}
+        }
+    }
+    let mut twitch_last_ts = None;
+    while twitch_last_ts != Some(2000) {
+        match next(&mut tgot).await {
+            Got::Closed => panic!("Twitch unexpectedly closed valid 1440p60@6000 stream"),
+            Got::Video(ts, data) if !crate::flv::video_is_header(&data) => twitch_last_ts = Some(ts),
+            _ => {}
+        }
+    }
+    assert_eq!(khealth.borrow().state, PushState::Live);
+    assert_eq!(thealth.borrow().state, PushState::Live);
+}

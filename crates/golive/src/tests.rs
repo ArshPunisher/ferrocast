@@ -51,6 +51,12 @@ async fn platform(listener: TcpListener, key: &'static str) -> mpsc::UnboundedRe
     rx
 }
 
+#[derive(Clone, Copy)]
+enum ServeAction {
+    Continue,
+    CloseAfter(Duration),
+}
+
 async fn serve_platform(sock: &mut TcpStream, key: &str, tx: &mpsc::UnboundedSender<Got>) -> Option<()> {
     serve_platform_with(sock, key, tx, false).await
 }
@@ -63,53 +69,80 @@ async fn serve_platform_with(
     tx: &mpsc::UnboundedSender<Got>,
     hang_up_on_publish: bool,
 ) -> Option<()> {
+    serve_platform_inspected(sock, key, tx, hang_up_on_publish, |_| ServeAction::Continue).await
+}
+
+async fn serve_platform_inspected(
+    sock: &mut TcpStream,
+    key: &str,
+    tx: &mpsc::UnboundedSender<Got>,
+    hang_up_on_publish: bool,
+    mut on_event: impl FnMut(&ServerSessionEvent) -> ServeAction,
+) -> Option<()> {
     let rest = conn::handshake(sock, PeerType::Server).await.ok()?;
     let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;
     let mut queue: Vec<ServerSessionResult> = first;
     queue.extend(s.handle_input(&rest).ok()?);
     let mut buf = vec![0u8; 65536];
+    let mut close_deadline: Option<tokio::time::Instant> = None;
     loop {
         while !queue.is_empty() {
             for r in std::mem::take(&mut queue) {
                 match r {
                     ServerSessionResult::OutboundResponse(p) => sock.write_all(&p.bytes).await.ok()?,
-                    ServerSessionResult::RaisedEvent(ev) => match ev {
-                        ServerSessionEvent::ConnectionRequested { request_id, .. } => {
-                            queue.extend(s.accept_request(request_id).ok()?)
+                    ServerSessionResult::RaisedEvent(ev) => {
+                        if close_deadline.is_none()
+                            && let ServeAction::CloseAfter(delay) = on_event(&ev)
+                        {
+                            close_deadline = Some(tokio::time::Instant::now() + delay);
                         }
-                        ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
-                            if hang_up_on_publish {
-                                return None;
+                        match ev {
+                            ServerSessionEvent::ConnectionRequested { request_id, .. } => {
+                                queue.extend(s.accept_request(request_id).ok()?)
                             }
-                            if stream_key == key {
-                                let _ = tx.send(Got::Publish(stream_key));
-                                queue.extend(s.accept_request(request_id).ok()?);
-                            } else {
-                                // Like Twitch: refuse, then hang up.
-                                for r in s.reject_request(request_id, "NetStream.Publish.BadName", "bad key").ok()? {
-                                    if let ServerSessionResult::OutboundResponse(p) = r {
-                                        sock.write_all(&p.bytes).await.ok()?;
-                                    }
+                            ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+                                if hang_up_on_publish {
+                                    return None;
                                 }
-                                return None;
+                                if stream_key == key {
+                                    let _ = tx.send(Got::Publish(stream_key));
+                                    queue.extend(s.accept_request(request_id).ok()?);
+                                } else {
+                                    // Like Twitch: refuse, then hang up.
+                                    for r in
+                                        s.reject_request(request_id, "NetStream.Publish.BadName", "bad key").ok()?
+                                    {
+                                        if let ServerSessionResult::OutboundResponse(p) = r {
+                                            sock.write_all(&p.bytes).await.ok()?;
+                                        }
+                                    }
+                                    return None;
+                                }
                             }
+                            ServerSessionEvent::StreamMetadataChanged { .. } => {
+                                let _ = tx.send(Got::Meta);
+                            }
+                            ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+                                let _ = tx.send(Got::Video(timestamp.value, data));
+                            }
+                            ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
+                                let _ = tx.send(Got::Audio(timestamp.value, data));
+                            }
+                            _ => {}
                         }
-                        ServerSessionEvent::StreamMetadataChanged { .. } => {
-                            let _ = tx.send(Got::Meta);
-                        }
-                        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
-                            let _ = tx.send(Got::Video(timestamp.value, data));
-                        }
-                        ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
-                            let _ = tx.send(Got::Audio(timestamp.value, data));
-                        }
-                        _ => {}
-                    },
+                    }
                     ServerSessionResult::UnhandleableMessageReceived(_) => {}
                 }
             }
         }
-        let n = sock.read(&mut buf).await.ok()?;
+        let n = if let Some(deadline) = close_deadline {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return None,
+                res = sock.read(&mut buf) => res.ok()?,
+            }
+        } else {
+            sock.read(&mut buf).await.ok()?
+        };
         if n == 0 {
             return None;
         }
