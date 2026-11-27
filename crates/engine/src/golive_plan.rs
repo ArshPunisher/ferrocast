@@ -757,23 +757,26 @@ fn evaluate_budget(groups: &[WorkingGroup], main: &MainEncode, budget: &PcBudget
     )
 }
 
-/// Evaluates steady-state `plan` combined with any still-running or reserved encode groups not yet in `plan`.
+/// Evaluates steady-state `plan` combined with any already-live encode groups (`extra_groups`),
+/// billing the live spec whenever a group ID collides with a mutated plan entry.
 pub(crate) fn evaluate_plan_with_extra_groups(
     plan: &EncodePlan,
     main: &MainEncode,
     budget: &PcBudget,
     extra_groups: &[crate::studio_host::EncodeGroupSpec],
 ) -> BudgetCheck {
-    let plan_rows = plan.groups.iter().map(|g| BudgetRow {
-        id: &g.id,
-        key: &g.key,
-        extra_tracks: &g.extra_tracks,
-        vod_track: g.vod_track,
+    let live_rows = extra_groups.iter().map(|spec| BudgetRow {
+        id: &spec.id,
+        key: &spec.key,
+        extra_tracks: &spec.extra_tracks,
+        vod_track: spec.vod_track,
     });
-    let extra_rows = extra_groups.iter().filter(|spec| !plan.groups.iter().any(|g| g.id == spec.id)).map(|spec| {
-        BudgetRow { id: &spec.id, key: &spec.key, extra_tracks: &spec.extra_tracks, vod_track: spec.vod_track }
-    });
-    evaluate_budget_rows(plan_rows.chain(extra_rows), main, budget)
+    let plan_rows = plan
+        .groups
+        .iter()
+        .filter(|g| !extra_groups.iter().any(|spec| spec.id == g.id))
+        .map(|g| BudgetRow { id: &g.id, key: &g.key, extra_tracks: &g.extra_tracks, vod_track: g.vod_track });
+    evaluate_budget_rows(live_rows.chain(plan_rows), main, budget)
 }
 
 fn rebuild_groups(dests: &[WorkingDest], eb_extra: &[(u32, u32, u32)]) -> Vec<WorkingGroup> {
@@ -2310,5 +2313,73 @@ mod tests {
         assert_eq!(p_av1.groups.len(), 1, "AV1 main + WHIP must share single H.264 main group: {:?}", p_av1.groups);
         assert_eq!(p_av1.groups[0].key.codec, VideoCodec::H264);
         assert_eq!(p_av1.destinations["whip"].group_id, GROUP_MAIN);
+    }
+
+    #[test]
+    fn evaluate_plan_with_extra_groups_bills_live_extra_spec_on_group_id_collision() {
+        let main = base_1440p60();
+        let budget = PcBudget::with_limits(BudgetSource::NvencDefault, Some(360.0), Some(3));
+        let yt = dest("youtube", "YouTube", Service::Youtube, Canvas::Main);
+        let kick = dest("kick", "Kick", Service::Kick, Canvas::Main);
+        let mut custom = dest("custom", "Custom", Service::Custom, Canvas::Main);
+        custom.quality = DestinationQuality::Custom(CustomQuality {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            kbps: 3_500,
+            codec: Some(VideoCodec::H264),
+        });
+        // Simulated Pass-2 plan where GROUP_MAIN was downscaled to 1080p60 alongside custom 720p30.
+        let mut mutated_main = main;
+        mutated_main.width = 1920;
+        mutated_main.height = 1080;
+        mutated_main.kbps = 8_000;
+        let sim_plan = plan_encodes(&PlannerInput {
+            main: mutated_main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![yt, custom],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: budget.clone(),
+        });
+        assert!(sim_plan.groups.iter().any(|g| g.id == GROUP_MAIN && g.key.height == 1080));
+
+        // Real live encoders on GPU: GROUP_MAIN at 1440p60 (221.2 Mpx/s) + g_kick at 1080p60 (124.4 Mpx/s).
+        // Combined with new custom 720p30 (27.6 Mpx/s) = 373.2 Mpx/s > 360 Mpx/s.
+        let extra_groups = vec![
+            crate::studio_host::EncodeGroupSpec {
+                id: GROUP_MAIN.into(),
+                key: main.as_key(),
+                extra_tracks: Vec::new(),
+                vod_track: false,
+                is_light: false,
+                is_twitch_eb: false,
+            },
+            crate::studio_host::EncodeGroupSpec {
+                id: "g_kick".into(),
+                key: EncodeKey {
+                    canvas: Canvas::Main,
+                    width: 1920,
+                    height: 1080,
+                    fps: 60,
+                    fps_ntsc: false,
+                    kbps: 8_000,
+                    audio_kbps: 160,
+                    codec: VideoCodec::H264,
+                    keyframe_s: 2,
+                    strict_cbr: true,
+                    no_bframes: false,
+                },
+                extra_tracks: Vec::new(),
+                vod_track: false,
+                is_light: false,
+                is_twitch_eb: false,
+            },
+        ];
+        let _ = kick;
+        let overlap = evaluate_plan_with_extra_groups(&sim_plan, &main, &budget, &extra_groups);
+        assert_eq!(overlap.status, BudgetStatus::Over, "must bill live 1440p60 main spec on ID collision: {overlap:?}");
     }
 }

@@ -3144,10 +3144,14 @@ impl Engine {
         if matches!(act, StudioAct::Undo | StudioAct::Redo) {
             self.studio_release_holds().await;
         }
-        let turns_vertical = matches!(act, StudioAct::StartVertical { .. } | StudioAct::StopVertical);
+        let starts_vertical = matches!(act, StudioAct::StartVertical { .. });
+        let stops_vertical = matches!(act, StudioAct::StopVertical);
         let out = self.studio_host()?.act(act).await.map_err(failed)?;
-        if turns_vertical {
-            // Turned on or off while live: the vertical stream follows.
+        if starts_vertical {
+            // Turned on while live: clear quarantined vertical destinations and recover vertical encode.
+            self.recover_vertical_after_start().await;
+        } else if stops_vertical {
+            // Turned off while live: the vertical stream follows.
             self.studio_sync_vertical().await;
         }
         Ok(out)

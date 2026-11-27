@@ -7922,3 +7922,507 @@ async fn switch_commit_serialized_with_studio_stop_and_remove_leaves_no_orphans(
     assert_eq!(e.golive_running_group(&b.id).as_deref(), Some(GROUP_MAIN));
     e.studio_stream(false).await.unwrap();
 }
+
+#[tokio::test]
+async fn f54_paused_peer_pass2_switch_and_check_midstream_reject_422_and_keep_kick_group() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform, platform_rejecting_above};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 2560,
+        height: 1440,
+        fps: 60,
+        video_kbps: 18_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        cpu_cores: 12,
+        nvidia_driver_major: Some(555),
+        nvidia_driver_minor: Some(0),
+        hw_backend: Some("nvenc".into()),
+        host_sig: "win|nv=555".into(),
+        ..Default::default()
+    });
+    *e.studio().studio_bench.write().unwrap() = Some(crate::golive_plan::PersistedStudioBench {
+        encoder_id: "ffmpeg_nvenc".into(),
+        is_software: false,
+        max_mpx_s: 360.0,
+        max_sessions_ok: Some(5),
+        measured_at: 1,
+        host_sig: "win|nv=555".into(),
+    });
+    e.set_studio_host(host.clone());
+
+    let (p_yt, mut got_yt) = platform("f54-yt").await;
+    let (p_kick, mut got_kick, _) =
+        platform_rejecting_above("f54-kick", 1920, 1080, 8000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+    let (p_a, mut got_a) = platform("f54-a").await;
+    let (p_c, _got_c) = platform("f54-c").await;
+
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "f54-yt".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Kick,
+        format!("rtmp://127.0.0.1:{p_kick}/app"),
+        "f54-kick".into(),
+    )));
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{p_a}/app"), "f54-a", Canvas::Main).await.unwrap();
+    let c = e.add_golive_destination("C", &format!("rtmp://127.0.0.1:{p_c}/app"), "f54-c", Canvas::Main).await.unwrap();
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "kick" || d.id == a.id))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_yt, "f54-yt"), (&mut got_kick, "f54-kick"), (&mut got_a, "f54-a")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+    let kick_gid = e.golive_running_group("kick").unwrap();
+    assert_ne!(kick_gid, GROUP_MAIN);
+
+    // Pause Kick via upload protection while YouTube and A stay on 1440p GROUP_MAIN.
+    e.pause("kick".into(), "YouTube".into());
+    assert!(!e.golive_running().contains("kick"));
+
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    // GET quality-options must mark 720p30 disallowed on A because Pass-2 would collapse paused Kick onto 1440p main.
+    let opts = e.golive_quality_options().await;
+    let a_opts = opts.destinations.get(&a.id).expect("A options");
+    if let Some(opt_720) = a_opts.options.iter().find(|o| o.quality == DestinationQuality::Custom(q720.clone())) {
+        assert!(!opt_720.allowed, "quality-options must disallow Pass-2 peer-collapsing 720p30 switch");
+    }
+
+    // PUT .../quality on A must refuse (422) rather than launching 720p30 + retiring g_kick.
+    let err = e.set_golive_quality(&a.id, DestinationQuality::Custom(q720.clone())).await.unwrap_err();
+    assert!(matches!(err, crate::EngineError::Refused { status: 422, .. }), "expected 422 refusal, got {err:?}");
+    assert!(host.started.lock().unwrap().contains_key(&kick_gid), "g_kick must remain started while Kick is paused");
+
+    // Pre-configured Custom C ticked mid-stream must also refuse (422) via check_midstream.
+    let c_order: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == c.id || d.enabled)).collect();
+    // Pre-configure C to 720p30 before testing midstream enable? First untick A cleanly doesn't change test, instead
+    // add pre-configured D offline? Wait: C was added while live (`enabled = false`), configure C offline? No, set C quality first?
+    // Wait: set_golive_quality on unticked C offline succeeds even while live!
+    e.set_golive_quality(&c.id, DestinationQuality::Custom(q720)).await.unwrap();
+    let mid_err = e.set_golive_destinations(c_order).await.unwrap_err();
+    assert!(
+        matches!(mid_err, crate::EngineError::Refused { status: 422, .. }),
+        "expected 422 check_midstream refusal, got {mid_err:?}"
+    );
+
+    // Unpause Kick via golive_resume: Kick must resume onto `kick_gid` (1080p), NEVER 1440p GROUP_MAIN.
+    while got_kick.try_recv().is_ok() {}
+    e.golive_resume("kick").await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_kick.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f54-kick")
+        {
+            break;
+        }
+    }
+    assert_eq!(e.golive_running_group("kick").as_deref(), Some(kick_gid.as_str()));
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f54_standby_failover_under_tight_budget_blocks_backup_without_disrupting_kick() {
+    use crate::golive::{Canvas, CustomQuality, DestAdvanced, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform, platform_rejecting_above};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 2560,
+        height: 1440,
+        fps: 60,
+        video_kbps: 18_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        cpu_cores: 8,
+        nvidia_driver_major: Some(530), // 2 sessions? Wait: <531 is 3, bench overrides max_sessions_ok = 2
+        hw_backend: Some("nvenc".into()),
+        host_sig: "win|nv=530".into(),
+        ..Default::default()
+    });
+    *e.studio().studio_bench.write().unwrap() = Some(crate::golive_plan::PersistedStudioBench {
+        encoder_id: "ffmpeg_nvenc".into(),
+        is_software: false,
+        max_mpx_s: 600.0,
+        max_sessions_ok: Some(3),
+        measured_at: 1,
+        host_sig: "win|nv=530".into(),
+    });
+    e.set_studio_host(host.clone());
+
+    let (p_yt, mut got_yt) = platform("fail-yt").await;
+    let (p_kick, mut got_kick, _) =
+        platform_rejecting_above("fail-kick", 1920, 1080, 8000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+    let (p_back, _got_back) = platform("fail-back").await;
+
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "fail-yt".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Kick,
+        format!("rtmp://127.0.0.1:{p_kick}/app"),
+        "fail-kick".into(),
+    )));
+    let srt = e.add_golive_destination("SRT", "srt://127.0.0.1:19999", "", Canvas::Main).await.unwrap();
+    let back = e
+        .add_golive_destination("Backup", &format!("rtmp://127.0.0.1:{p_back}/app"), "fail-back", Canvas::Main)
+        .await
+        .unwrap();
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "kick" || d.id == srt.id))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&back.id, DestinationQuality::Custom(q720)).await.unwrap();
+
+    let mut adv = e.golive_config().advanced;
+    adv.per.insert(srt.id.clone(), DestAdvanced { backup: Some(back.id.clone()), ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_yt, "fail-yt"), (&mut got_kick, "fail-kick")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+    while got_kick.try_recv().is_ok() {}
+    let kick_gid = e.golive_running_group("kick").unwrap();
+    assert_ne!(kick_gid, GROUP_MAIN);
+
+    // Trigger SRT failover to Backup (Custom 720p30) on tight 2-session host.
+    e.seed_backup_failing_for_test(&srt.id, true);
+    e.reconcile().await;
+
+    let mut kick_closed = 0usize;
+    while let Ok(msg) = got_kick.try_recv() {
+        if matches!(msg, Got::Closed) {
+            kick_closed += 1;
+        }
+    }
+    assert_eq!(kick_closed, 0, "backup failover must not disrupt live Kick sibling");
+    assert!(
+        host.started.lock().unwrap().len() <= 2,
+        "must not exceed 2 live encoder sessions: {:?}",
+        host.started.lock().unwrap().keys().collect::<Vec<_>>()
+    );
+    assert!(!e.golive_running().contains(&back.id), "over-budget backup must be blocked cleanly");
+    assert_eq!(e.golive_running_group("kick").as_deref(), Some(kick_gid.as_str()));
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f54_set_golive_advanced_editing_keep_free_pct_preserves_applied_cap() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 12_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.h264".into(),
+        engines: None, // Unknown engines => Intel/1-session? Set windows nv=555 with 1 session bench for Pass-2!
+        ..Default::default()
+    });
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        cpu_cores: 8,
+        nvidia_driver_major: Some(555),
+        hw_backend: Some("nvenc".into()),
+        host_sig: "win|nv=555".into(),
+        ..Default::default()
+    });
+    *e.studio().studio_bench.write().unwrap() = Some(crate::golive_plan::PersistedStudioBench {
+        encoder_id: "ffmpeg_nvenc".into(),
+        is_software: false,
+        max_mpx_s: 300.0,
+        max_sessions_ok: Some(1),
+        measured_at: 1,
+        host_sig: "win|nv=555".into(),
+    });
+    e.set_studio_host(host.clone());
+
+    let (p_yt, mut got_yt) = platform("adv-yt").await;
+    let (p_tw, mut got_tw) = platform("adv-tw").await;
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "adv-yt".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Twitch,
+        format!("rtmp://127.0.0.1:{p_tw}/app"),
+        "adv-tw".into(),
+    )));
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "twitch"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_yt, "adv-yt"), (&mut got_tw, "adv-tw")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+    assert_eq!(e.applied_cap().and_then(|c| c.max_kbps), Some(6_000), "Pass-2 startup must record Twitch cap");
+
+    let mut adv = e.golive_config().advanced;
+    adv.keep_free_pct = 25;
+    e.set_golive_advanced(adv).await.unwrap();
+
+    assert_eq!(
+        e.applied_cap().and_then(|c| c.max_kbps),
+        Some(6_000),
+        "unrelated keep_free_pct edit must never wipe applied_cap on a Pass-2 stream"
+    );
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f55_start_vertical_midstream_recovers_quarantined_vertical_without_restarting_main() {
+    use crate::golive::{Canvas, GROUP_MAIN, GROUP_VERTICAL};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    #[derive(Debug)]
+    struct StartVerticalHost {
+        inner: Arc<MultiGroupHost>,
+    }
+    #[async_trait::async_trait]
+    impl crate::studio_host::StudioHost for StartVerticalHost {
+        async fn status(&self) -> crate::studio_host::StudioStatus {
+            self.inner.status().await
+        }
+        async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            self.inner.start().await
+        }
+        async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            self.inner.stop().await
+        }
+        async fn kinds(&self) -> Result<serde_json::Value, String> {
+            self.inner.kinds().await
+        }
+        async fn options(&self, kind: String) -> Result<serde_json::Value, String> {
+            self.inner.options(kind).await
+        }
+        async fn preview(&self, rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+            self.inner.preview(rect).await
+        }
+        async fn defaults(&self, kind: String) -> Result<serde_json::Value, String> {
+            self.inner.defaults(kind).await
+        }
+        async fn act(&self, act: crate::studio_host::StudioAct) -> Result<serde_json::Value, String> {
+            match act {
+                crate::studio_host::StudioAct::StartVertical { .. } => {
+                    if let Some(b) = self.inner.budget_info.lock().unwrap().as_mut() {
+                        b.vertical_on = true;
+                        b.vertical_size = Some((1080, 1920));
+                    }
+                    Ok(serde_json::json!({ "vertical_on": true }))
+                }
+                crate::studio_host::StudioAct::StopVertical => {
+                    if let Some(b) = self.inner.budget_info.lock().unwrap().as_mut() {
+                        b.vertical_on = false;
+                    }
+                    Ok(serde_json::json!({ "vertical_on": false }))
+                }
+                other => self.inner.act(other).await,
+            }
+        }
+        async fn settings(&self) -> crate::studio_host::StudioSettings {
+            self.inner.settings().await
+        }
+        async fn set_settings(&self, s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+            self.inner.set_settings(s).await
+        }
+        async fn stats(&self) -> Result<serde_json::Value, String> {
+            self.inner.stats().await
+        }
+        async fn record(&self, on: bool) -> Result<serde_json::Value, String> {
+            self.inner.record(on).await
+        }
+        async fn record_pause(&self, on: bool) -> Result<(), String> {
+            self.inner.record_pause(on).await
+        }
+        async fn monitoring(&self) -> Result<serde_json::Value, String> {
+            self.inner.monitoring().await
+        }
+        async fn stream_start(
+            &self,
+            server: String,
+            key: String,
+            t: Vec<(u32, u32, u32)>,
+        ) -> Result<serde_json::Value, String> {
+            self.inner.stream_start(server, key, t).await
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            self.inner.stream_stop().await
+        }
+        async fn stream_stats(&self) -> Result<serde_json::Value, String> {
+            self.inner.stream_stats().await
+        }
+        async fn obs_collections(&self) -> Result<serde_json::Value, String> {
+            self.inner.obs_collections().await
+        }
+        async fn import_obs(&self, id: String) -> Result<serde_json::Value, String> {
+            self.inner.import_obs(id).await
+        }
+        fn supports_encode_groups(&self) -> bool {
+            true
+        }
+        async fn start_encode_group(
+            &self,
+            spec: crate::studio_host::EncodeGroupSpec,
+            hub: Arc<ferrocast_golive::Hub>,
+        ) -> Result<bool, String> {
+            self.inner.start_encode_group(spec, hub).await
+        }
+        async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
+            self.inner.stop_encode_group(id).await
+        }
+        async fn abort_encode_group(&self, id: &str) -> Result<(), String> {
+            self.inner.abort_encode_group(id).await
+        }
+        async fn live_group_key(&self, id: &str) -> Option<crate::studio_host::EncodeKey> {
+            self.inner.live_group_key(id).await
+        }
+        async fn group_stats(&self) -> Result<Option<serde_json::Value>, String> {
+            self.inner.group_stats().await
+        }
+        async fn host_budget_info(&self) -> Option<crate::studio_host::HostBudgetInfo> {
+            self.inner.host_budget_info().await
+        }
+    }
+
+    let (e, _dir) = engine().await;
+    let inner = Arc::new(MultiGroupHost::default());
+    *inner.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 6_000,
+        ..Default::default()
+    };
+    *inner.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        vertical_on: false,
+        vertical_size: Some((1080, 1920)),
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(Arc::new(StartVerticalHost { inner: inner.clone() }));
+
+    let (p_yt, mut got_yt) = platform("f55-yt").await;
+    let (p_v, mut got_v) = platform("f55-v").await;
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "f55-yt".into(),
+    )));
+    let vert = e
+        .add_golive_destination("VertRTMP", &format!("rtmp://127.0.0.1:{p_v}/app"), "f55-v", Canvas::Vertical)
+        .await
+        .unwrap();
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == vert.id))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    // Start live while vertical canvas is OFF -> GROUP_MAIN starts cleanly; vertical dest is quarantined.
+    e.studio_stream(true).await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-yt")
+        {
+            break;
+        }
+    }
+    assert!(!inner.started.lock().unwrap().contains_key(GROUP_VERTICAL));
+    assert!(!e.golive_running().contains(&vert.id));
+
+    // Turn Vertical canvas ON mid-stream via StartVertical -> GROUP_VERTICAL must start and publish without restarting GROUP_MAIN.
+    e.studio_act(crate::studio_host::StudioAct::StartVertical { scene: "Vertical".into() }).await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_v.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-v")
+        {
+            break;
+        }
+    }
+    assert!(inner.started.lock().unwrap().contains_key(GROUP_VERTICAL));
+    assert_eq!(e.golive_running_group(&vert.id).as_deref(), Some(GROUP_VERTICAL));
+    assert_eq!(inner.start_counts.lock().unwrap().get(GROUP_MAIN).copied(), Some(1), "GROUP_MAIN must not restart");
+
+    // Also untick + re-tick vertical dest while vertical canvas is ON -> GROUP_VERTICAL stops then recovers mid-stream!
+    let only_yt: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
+    e.set_golive_destinations(only_yt).await.unwrap();
+    assert!(!inner.started.lock().unwrap().contains_key(GROUP_VERTICAL));
+
+    let both_back: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == vert.id))
+        .collect();
+    e.set_golive_destinations(both_back).await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_v.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-v")
+        {
+            break;
+        }
+    }
+    assert_eq!(e.golive_running_group(&vert.id).as_deref(), Some(GROUP_VERTICAL));
+    assert_eq!(inner.start_counts.lock().unwrap().get(GROUP_MAIN).copied(), Some(1));
+    e.studio_stream(false).await.unwrap();
+}

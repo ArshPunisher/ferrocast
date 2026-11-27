@@ -2757,6 +2757,28 @@ impl Engine {
         }
     }
 
+    pub(crate) async fn recover_vertical_after_start(&self) {
+        let group_ops = self.golive().group_ops.lock().await;
+        let _ = self.refresh_pc_budget().await;
+        let vertical_ids: std::collections::HashSet<String> = self
+            .golive_config()
+            .destinations
+            .into_iter()
+            .filter(|d| d.canvas == Canvas::Vertical)
+            .map(|d| d.id)
+            .collect();
+        if !vertical_ids.is_empty() {
+            let g = self.golive();
+            lock(&g.group_start_failed).retain(|id| !vertical_ids.contains(id));
+            lock(&g.blocked).retain(|id, _| !vertical_ids.contains(id));
+        }
+        if self.golive_uses_encode_groups() {
+            self.reconcile_locked(&group_ops).await;
+        } else {
+            self.studio_sync_vertical_locked(&group_ops).await;
+        }
+    }
+
     pub(crate) async fn reconcile_studio_groups_now_locked(&self, group_ops: &tokio::sync::MutexGuard<'_, ()>) {
         self.drain_orphaned_groups_locked(group_ops).await;
         let budget = self.refresh_pc_budget().await;
@@ -2777,9 +2799,27 @@ impl Engine {
         let cfg = self.golive_config();
         let specs = self.encode_group_specs_for_plan(&cfg, plan);
         let desired_ids: std::collections::HashSet<GroupId> = specs.iter().map(|s| s.id.clone()).collect();
+        let studio = (*lock(&g.studio_video)).unwrap_or_default();
+        let planner_in = self.planner_input_for(&cfg, &studio, self.cached_pc_budget());
         for spec in &specs {
             // Never restart an already-live encode group mid-stream (main, vertical, or custom).
             if lock(&g.active_groups).contains_key(&spec.id) {
+                continue;
+            }
+            let active_specs: Vec<crate::studio_host::EncodeGroupSpec> =
+                lock(&g.active_groups).values().cloned().collect();
+            let overlap = crate::golive_plan::evaluate_plan_with_extra_groups(
+                plan,
+                &planner_in.main,
+                &planner_in.budget,
+                &active_specs,
+            );
+            if plan.budget.status == BudgetStatus::Over || overlap.status == BudgetStatus::Over {
+                let msg = overlap
+                    .note
+                    .or_else(|| plan.budget.note.clone())
+                    .unwrap_or_else(|| Self::format_group_start_failure(spec, None));
+                self.record_group_start_failure(&cfg, plan, spec, &msg);
                 continue;
             }
             let hub = g.ensure_hub(&spec.id, spec.key.canvas);
@@ -3017,6 +3057,8 @@ impl Engine {
         {
             let draft_cfg = GoLiveConfig { destinations: next.to_vec(), ..before.clone() };
             let studio = (*lock(&g.studio_video)).unwrap_or_default();
+            let base_in = self.planner_input_for(before, &studio, budget.clone());
+            let base_plan = crate::golive_plan::plan_encodes(&base_in);
             let planner_in = self.planner_input_for(&draft_cfg, &studio, budget.clone());
             let plan = crate::golive_plan::plan_encodes(&planner_in);
             let failing = lock(&g.backup).failing.clone();
@@ -3027,53 +3069,36 @@ impl Engine {
                 })
                 .map(|(oid, r)| (oid.clone(), r.group_id.clone()))
                 .collect();
-            if running_peers
-                .iter()
-                .any(|(oid, prev_gid)| plan.destinations.get(oid).is_some_and(|pd| pd.group_id != *prev_gid))
-            {
-                return Err(refused(
-                    "encode_budget_exceeded",
-                    "Enabling that destination now would move or restart another live destination.",
-                    "Lower main quality, share an active preset, or stop and restart the stream.",
-                ));
-            }
-            let active_groups = lock(&g.active_groups).clone();
-            for d in added {
-                if let Some(pd) = plan.destinations.get(&d.id)
-                    && (pd.shared_cap_fallback
-                        || active_groups.get(&pd.group_id).is_some_and(|active| active.key != pd.key))
-                {
-                    return Err(refused(
+            let active_specs: Vec<crate::studio_host::EncodeGroupSpec> =
+                lock(&g.active_groups).values().cloned().collect();
+            let added_ids: Vec<&str> = added.iter().map(|d| d.id.as_str()).collect();
+            if let Err(rej) = check_live_plan_transition(
+                None,
+                &added_ids,
+                &plan,
+                Some(&base_plan),
+                &active_specs,
+                &running_peers,
+                &planner_in.main,
+                &planner_in.budget,
+            ) {
+                return Err(match rej {
+                    LiveTransitionReject::PeerDisrupted => refused(
+                        "encode_budget_exceeded",
+                        "Enabling that destination now would move or restart another live destination.",
+                        "Lower main quality, share an active preset, or stop and restart the stream.",
+                    ),
+                    LiveTransitionReject::MutatesLiveGroup(_) | LiveTransitionReject::SharedCapFallback(_) => refused(
                         "golive_needs_new_encode",
                         "Enabling that destination now would change a live encode group.",
                         "Stop and start the stream again with it ticked.",
-                    ));
-                }
-            }
-            let overlap_specs: Vec<crate::studio_host::EncodeGroupSpec> = active_groups.values().cloned().collect();
-            let needs_new_group = added.iter().any(|d| {
-                plan.destinations.get(&d.id).is_some_and(|pd| !overlap_specs.iter().any(|s| s.id == pd.group_id))
-            });
-            if needs_new_group {
-                let overlap = crate::golive_plan::evaluate_plan_with_extra_groups(
-                    &plan,
-                    &planner_in.main,
-                    &planner_in.budget,
-                    &overlap_specs,
-                );
-                if plan.budget.status == crate::golive_plan::BudgetStatus::Over
-                    || overlap.status == crate::golive_plan::BudgetStatus::Over
-                {
-                    let note = overlap
-                        .note
-                        .or_else(|| plan.budget.note.clone())
-                        .unwrap_or_else(|| "Adding this destination would exceed your computer's encode limit.".into());
-                    return Err(refused(
+                    ),
+                    LiveTransitionReject::OverBudget(note) => refused(
                         "encode_budget_exceeded",
                         note,
                         "Lower main quality, pick a shared quality preset, or turn off another destination.",
-                    ));
-                }
+                    ),
+                });
             }
         }
         // Per live canvas: the last destination ticked on a picture that is on air.
@@ -3134,7 +3159,13 @@ impl Engine {
         let studio_on = g.studio_live.load(std::sync::atomic::Ordering::Acquire);
         let direct = d.url.as_deref().and_then(direct_kind);
         if d.canvas == Canvas::Vertical && !g.any_canvas_hub_live(Canvas::Vertical) {
-            return Some("The vertical stream isn't running, so this destination can't join it now.".to_string());
+            let studio_vertical_ready = studio_on
+                && self.golive_uses_encode_groups()
+                && self.golive_config().vertical_source == VerticalSource::Canvas
+                && self.cached_host_budget_info().is_some_and(|i| i.vertical_on);
+            if !studio_vertical_ready {
+                return Some("The vertical stream isn't running, so this destination can't join it now.".to_string());
+            }
         }
         if !studio_on
             && direct.is_none()
@@ -3696,6 +3727,8 @@ impl Engine {
                     "Enable the destination again before switching its quality.",
                 ));
             }
+            let base_plan =
+                crate::golive_plan::plan_encodes(&self.planner_input_for(&cfg_live, &studio, budget.clone()));
             let Some(moved_now) = cfg_live.destinations.iter_mut().find(|d| d.id == id) else {
                 return Err(refused(
                     "golive_switch_cancelled",
@@ -3729,15 +3762,52 @@ impl Engine {
                 .filter(|(oid, _)| oid.as_str() != id)
                 .map(|(oid, r)| (oid.clone(), r.group_id.clone()))
                 .collect();
-            if running_peers
-                .iter()
-                .any(|(oid, prev_gid)| plan.destinations.get(oid).is_some_and(|pd| pd.group_id != *prev_gid))
-            {
-                return Err(refused(
-                    "encode_budget_exceeded",
-                    "Changing to that quality now would move or restart another live destination.",
-                    "Lower main quality, share an active preset, or stop and restart the stream.",
-                ));
+            let overlap_specs: Vec<crate::studio_host::EncodeGroupSpec> =
+                lock(&g.active_groups).values().cloned().collect();
+            if let Err(rej) = check_live_plan_transition(
+                Some(id),
+                &[id],
+                &plan,
+                Some(&base_plan),
+                &overlap_specs,
+                &running_peers,
+                &planner_in.main,
+                &planner_in.budget,
+            ) {
+                return Err(match rej {
+                    LiveTransitionReject::PeerDisrupted => refused(
+                        "encode_budget_exceeded",
+                        "Changing to that quality now would move or restart another live destination.",
+                        "Lower main quality, pick a quality shared with another destination, or stop and restart the stream.",
+                    ),
+                    LiveTransitionReject::SharedCapFallback(canvas) => {
+                        let what = if canvas == Canvas::Vertical { "vertical stream" } else { "main stream" };
+                        refused(
+                            "golive_needs_new_encode",
+                            format!("Changing to that quality while the encoder is full would restart the {what}."),
+                            "Stop and start the stream again to apply it cleanly.",
+                        )
+                    }
+                    LiveTransitionReject::MutatesLiveGroup(group_id) => {
+                        let what = if group_id == GROUP_VERTICAL {
+                            "vertical stream"
+                        } else if group_id == GROUP_MAIN {
+                            "main stream"
+                        } else {
+                            "active encode group"
+                        };
+                        refused(
+                            "golive_needs_new_encode",
+                            format!("Changing to that quality while the encoder is full would restart the {what}."),
+                            "Stop and start the stream again to apply it cleanly.",
+                        )
+                    }
+                    LiveTransitionReject::OverBudget(note) => refused(
+                        "encode_budget_exceeded",
+                        note,
+                        "Lower main quality or keep more destinations on Same as main.",
+                    ),
+                });
             }
 
             let target_group_id = plan.destinations.get(id).map_or_else(
@@ -3764,14 +3834,6 @@ impl Engine {
                     },
                 );
 
-            if plan.destinations.get(id).is_some_and(|pd| pd.shared_cap_fallback) {
-                let what = if moved_snapshot.canvas == Canvas::Vertical { "vertical stream" } else { "main stream" };
-                return Err(refused(
-                    "golive_needs_new_encode",
-                    format!("Changing to that quality while the encoder is full would restart the {what}."),
-                    "Stop and start the stream again to apply it cleanly.",
-                ));
-            }
             if let Some(live_spec) = lock(&g.active_groups).get(&target_group_id)
                 && live_spec.key != target_spec.key
             {
@@ -3788,31 +3850,7 @@ impl Engine {
                     "Stop and start the stream again to apply it cleanly.",
                 ));
             }
-
-            let overlap_specs: Vec<crate::studio_host::EncodeGroupSpec> =
-                lock(&g.active_groups).values().cloned().collect();
             let target_active = lock(&g.active_groups).contains_key(&target_group_id);
-            if !target_active {
-                let overlap = crate::golive_plan::evaluate_plan_with_extra_groups(
-                    &plan,
-                    &planner_in.main,
-                    &planner_in.budget,
-                    &overlap_specs,
-                );
-                if plan.budget.status == crate::golive_plan::BudgetStatus::Over
-                    || overlap.status == crate::golive_plan::BudgetStatus::Over
-                {
-                    let note = overlap
-                        .note
-                        .or_else(|| plan.budget.note.clone())
-                        .unwrap_or_else(|| "This quality would exceed your computer's encode limit.".into());
-                    return Err(refused(
-                        "encode_budget_exceeded",
-                        note,
-                        "Lower main quality or keep more destinations on Same as main.",
-                    ));
-                }
-            }
 
             let target_hub = g.ensure_hub(&target_group_id, moved_snapshot.canvas);
             let baseline = target_hub.encoded_idr_count();
@@ -4821,8 +4859,60 @@ impl Engine {
             (g.main_hub().live().borrow().on, g.vertical_hub().live().borrow().on, g.light_hub().live().borrow().on);
         let cfg = self.golive_config();
         let budget = self.refresh_pc_budget().await;
-        let plan = self.plan_golive_encodes(budget.clone());
         let studio_on = g.studio_live.load(std::sync::atomic::Ordering::Acquire);
+        if studio_on && !lock(&g.active_groups).is_empty() {
+            let failing_now = lock(&g.backup).failing.clone();
+            let blocked_now = lock(&g.blocked).clone();
+            let new_backups: Vec<String> = cfg
+                .destinations
+                .iter()
+                .filter(|d| {
+                    backs_up(&cfg, &d.id).is_some_and(|p| p.enabled)
+                        && destination_sends(&cfg, &failing_now, d)
+                        && self.can_start_destination(d, &blocked_now)
+                        && !lock(&g.running).contains_key(&d.id)
+                })
+                .map(|d| d.id.clone())
+                .collect();
+            if !new_backups.is_empty() {
+                let studio = (*lock(&g.studio_video)).unwrap_or_default();
+                let planner_in = self.planner_input_for(&cfg, &studio, budget.clone());
+                let full_plan = crate::golive_plan::plan_encodes(&planner_in);
+                let mut base_in = planner_in.clone();
+                for pd in &mut base_in.destinations {
+                    if new_backups.contains(&pd.id) {
+                        pd.enabled = false;
+                        pd.standby = true;
+                    }
+                }
+                let base_plan = crate::golive_plan::plan_encodes(&base_in);
+                let active_specs: Vec<crate::studio_host::EncodeGroupSpec> =
+                    lock(&g.active_groups).values().cloned().collect();
+                let running_peers: Vec<(String, GroupId)> =
+                    lock(&g.running).iter().map(|(id, r)| (id.clone(), r.group_id.clone())).collect();
+                let new_backup_refs: Vec<&str> = new_backups.iter().map(String::as_str).collect();
+                if check_live_plan_transition(
+                    None,
+                    &new_backup_refs,
+                    &full_plan,
+                    Some(&base_plan),
+                    &active_specs,
+                    &running_peers,
+                    &planner_in.main,
+                    &planner_in.budget,
+                )
+                .is_err()
+                {
+                    let msg = "Standby backup can't start without exceeding your computer's encode limit or disrupting live destinations.".to_string();
+                    for bid in new_backups {
+                        tracing::info!(dest = %bid, "Go live: blocking standby failover backup to protect live destinations");
+                        lock(&g.blocked).insert(bid.clone(), msg.clone());
+                        lock(&g.group_start_failed).insert(bid);
+                    }
+                }
+            }
+        }
+        let plan = self.plan_golive_encodes(budget.clone());
         if studio_on && !lock(&g.active_groups).is_empty() {
             self.reconcile_studio_groups_locked(group_ops, &plan).await;
         }
@@ -5015,10 +5105,44 @@ impl Engine {
     /// the next start.
     pub async fn set_golive_advanced(&self, advanced: Advanced) -> Result<GoLiveConfig, EngineError> {
         let group_ops = self.golive().group_ops.lock().await;
-        let cfg = {
+        let live = self.golive_stream_running();
+        let uses_groups = live && self.golive_uses_encode_groups();
+        let (cfg, ignore_changed) = {
             let _one_at_a_time = self.config_lock().await;
             let mut cfg = self.golive_config();
             advanced.validate(&cfg.destinations).map_err(EngineError::Invalid)?;
+            let ignore_changed = cfg.advanced.ignore_service_limits != advanced.ignore_service_limits;
+            if uses_groups && ignore_changed {
+                let mut draft = cfg.clone();
+                draft.advanced = advanced.clone();
+                let budget = self.cached_pc_budget();
+                let studio = (*lock(&self.golive().studio_video)).unwrap_or_default();
+                let base_plan = self.plan_golive_encodes(budget.clone());
+                let next_in = self.planner_input_for(&draft, &studio, budget);
+                let next_plan = crate::golive_plan::plan_encodes(&next_in);
+                let active_specs: Vec<crate::studio_host::EncodeGroupSpec> =
+                    lock(&self.golive().active_groups).values().cloned().collect();
+                let running_groups: Vec<(String, GroupId)> =
+                    lock(&self.golive().running).iter().map(|(oid, r)| (oid.clone(), r.group_id.clone())).collect();
+                if check_live_plan_transition(
+                    None,
+                    &[],
+                    &next_plan,
+                    Some(&base_plan),
+                    &active_specs,
+                    &running_groups,
+                    &next_in.main,
+                    &next_in.budget,
+                )
+                .is_err()
+                {
+                    return Err(refused(
+                        "golive_needs_new_encode",
+                        "Changing service limit checks now would change a live encode group.",
+                        "Stop and start the stream again to change Ignore service limits.",
+                    ));
+                }
+            }
             let rules_changed = cfg.advanced.rules != advanced.rules;
             cfg.advanced = advanced;
             self.save_golive(cfg.clone()).await?;
@@ -5026,9 +5150,11 @@ impl Engine {
             if rules_changed {
                 lock(&self.golive().protector).set_rules(cfg.advanced.rules.clone());
             }
-            cfg
+            (cfg, ignore_changed)
         };
-        self.sync_stream_cap_now_locked(&group_ops).await;
+        if !live || (!uses_groups && ignore_changed) {
+            self.sync_stream_cap_now_locked(&group_ops).await;
+        }
         Ok(cfg)
     }
 
@@ -5825,7 +5951,6 @@ impl Engine {
         let failing = lock(&g.backup).failing.clone();
         let active_group_specs: Vec<crate::studio_host::EncodeGroupSpec> =
             lock(&g.active_groups).values().cloned().collect();
-        let active_group_ids: HashSet<GroupId> = active_group_specs.iter().map(|s| s.id.clone()).collect();
         let running_groups: Vec<(String, GroupId)> =
             lock(&g.running).iter().map(|(oid, r)| (oid.clone(), r.group_id.clone())).collect();
         let supports_hevc = host_info.as_ref().map_or(cfg!(target_os = "macos"), |i| i.os == "macos");
@@ -5918,7 +6043,6 @@ impl Engine {
                 base_input: &planner_in,
                 base_plan: &base_plan,
                 studio_live,
-                active_group_ids: &active_group_ids,
                 active_group_specs: &active_group_specs,
                 running_groups: &running_groups,
                 locked_reason: locked_reason.as_deref(),
@@ -6108,7 +6232,6 @@ struct QualitySimContext<'a> {
     base_input: &'a PlannerInput,
     base_plan: &'a EncodePlan,
     studio_live: bool,
-    active_group_ids: &'a std::collections::HashSet<GroupId>,
     active_group_specs: &'a [crate::studio_host::EncodeGroupSpec],
     running_groups: &'a [(String, GroupId)],
     locked_reason: Option<&'a str>,
@@ -6169,49 +6292,40 @@ fn simulate_quality_option(
         let shares_existing =
             ctx.base_plan.groups.iter().any(|g| g.id == group_id && g.members.iter().any(|m| m != &d.id))
                 || ctx.base_plan.destinations.get(&d.id).is_some_and(|old_pd| old_pd.group_id == group_id);
-        let group_already_running = is_live_dest && ctx.active_group_ids.contains(&group_id);
-        let peer_disrupted = is_live_dest
-            && ctx
-                .running_groups
-                .iter()
-                .filter(|(oid, _)| oid != &d.id)
-                .any(|(oid, prev_gid)| sim_plan.destinations.get(oid).is_some_and(|pd| pd.group_id != *prev_gid));
-        if peer_disrupted {
-            allowed = false;
-            disabled_reason =
-                Some("Changing to that quality now would move or restart another live destination.".into());
-        } else if is_live_dest && sim_pd.is_some_and(|p| p.shared_cap_fallback) {
-            let what = if d.canvas == Canvas::Vertical { "vertical" } else { "main" };
-            allowed = false;
-            disabled_reason = Some(format!("Changing to that quality now would restart the {what} stream."));
-        } else if is_live_dest && ctx.active_group_specs.iter().any(|s| s.id == group_id && s.key != key) {
-            let what = if group_id == GROUP_VERTICAL {
-                "the vertical stream"
-            } else if group_id == GROUP_MAIN {
-                "the main stream"
-            } else {
-                "an active encode group"
-            };
-            allowed = false;
-            disabled_reason = Some(format!("Changing to that quality now would restart {what}."));
-        } else if is_live_dest && !group_already_running {
-            let overlap = crate::golive_plan::evaluate_plan_with_extra_groups(
+        if is_live_dest {
+            if let Err(rej) = check_live_plan_transition(
+                Some(&d.id),
+                &[d.id.as_str()],
                 &sim_plan,
+                Some(ctx.base_plan),
+                ctx.active_group_specs,
+                ctx.running_groups,
                 &sim_in.main,
                 &sim_in.budget,
-                ctx.active_group_specs,
-            );
-            if sim_plan.budget.status == BudgetStatus::Over || overlap.status == BudgetStatus::Over {
+            ) {
                 allowed = false;
-                disabled_reason = Some(
-                    overlap
-                        .note
-                        .or_else(|| sim_plan.budget.note.clone())
-                        .unwrap_or_else(|| "Exceeds your computer's encode budget.".into()),
-                );
+                disabled_reason = Some(match rej {
+                    LiveTransitionReject::PeerDisrupted => {
+                        "Changing to that quality now would move or restart another live destination.".into()
+                    }
+                    LiveTransitionReject::SharedCapFallback(canvas) => {
+                        let what = if canvas == Canvas::Vertical { "vertical" } else { "main" };
+                        format!("Changing to that quality now would restart the {what} stream.")
+                    }
+                    LiveTransitionReject::MutatesLiveGroup(group_id) => {
+                        let what = if group_id == GROUP_VERTICAL {
+                            "the vertical stream"
+                        } else if group_id == GROUP_MAIN {
+                            "the main stream"
+                        } else {
+                            "an active encode group"
+                        };
+                        format!("Changing to that quality now would restart {what}.")
+                    }
+                    LiveTransitionReject::OverBudget(note) => note,
+                });
             }
-        } else if !is_live_dest
-            && matches!(candidate, DestinationQuality::Custom(_))
+        } else if matches!(candidate, DestinationQuality::Custom(_))
             && !shares_existing
             && sim_plan.budget.status == BudgetStatus::Over
         {
@@ -6514,6 +6628,72 @@ pub(crate) async fn run(engine: Engine) {
         engine.protect_tick().await;
         engine.send_golive();
     }
+}
+
+enum LiveTransitionReject {
+    PeerDisrupted,
+    MutatesLiveGroup(GroupId),
+    SharedCapFallback(Canvas),
+    OverBudget(String),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_live_plan_transition(
+    candidate_id: Option<&str>,
+    changed_ids: &[&str],
+    plan: &EncodePlan,
+    base_plan: Option<&EncodePlan>,
+    active_groups: &[crate::studio_host::EncodeGroupSpec],
+    running_groups: &[(String, GroupId)],
+    main: &MainEncode,
+    budget: &PcBudget,
+) -> Result<(), LiveTransitionReject> {
+    if running_groups
+        .iter()
+        .filter(|(oid, _)| Some(oid.as_str()) != candidate_id)
+        .any(|(oid, prev_gid)| plan.destinations.get(oid).is_some_and(|pd| pd.group_id != *prev_gid))
+    {
+        return Err(LiveTransitionReject::PeerDisrupted);
+    }
+    if let Some(bp) = base_plan
+        && bp.destinations.iter().any(|(oid, prev_pd)| {
+            !changed_ids.contains(&oid.as_str())
+                && plan.destinations.get(oid).is_some_and(|pd| pd.group_id != prev_pd.group_id)
+        })
+    {
+        return Err(LiveTransitionReject::PeerDisrupted);
+    }
+    for pg in &plan.groups {
+        if let Some(live) = active_groups.iter().find(|s| s.id == pg.id)
+            && live.key != pg.key
+        {
+            return Err(LiveTransitionReject::MutatesLiveGroup(pg.id.clone()));
+        }
+    }
+    for (oid, pd) in &plan.destinations {
+        if !pd.shared_cap_fallback {
+            continue;
+        }
+        let already_same_fallback = base_plan.is_some_and(|bp| {
+            bp.destinations
+                .get(oid)
+                .is_some_and(|old| old.shared_cap_fallback && old.group_id == pd.group_id && old.key == pd.key)
+        });
+        if !already_same_fallback {
+            return Err(LiveTransitionReject::SharedCapFallback(pd.key.canvas));
+        }
+    }
+    if plan.groups.iter().any(|pg| !active_groups.iter().any(|live| live.id == pg.id)) {
+        let overlap = crate::golive_plan::evaluate_plan_with_extra_groups(plan, main, budget, active_groups);
+        if plan.budget.status == BudgetStatus::Over || overlap.status == BudgetStatus::Over {
+            let note = overlap
+                .note
+                .or_else(|| plan.budget.note.clone())
+                .unwrap_or_else(|| "This quality would exceed your computer's encode limit.".into());
+            return Err(LiveTransitionReject::OverBudget(note));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
