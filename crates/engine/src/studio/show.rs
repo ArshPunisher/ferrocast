@@ -124,6 +124,9 @@ pub(crate) struct BroadcastMachine {
     /// Incremented whenever any stream starts (Show or plain Go live) or Studio stops.
     /// A delayed stop only fires if BOTH `epoch` and `stream_epoch` still match.
     pub stream_epoch: u64,
+    /// `golive.stream_cancel` session captured when a delayed stop is scheduled, so a stale
+    /// delayed stop task never cancels a newer stream's switch-cancellation token.
+    pub stop_cancel_session: u64,
     pub run: Option<ShowRun>,
     pub countdown: Option<CountdownTimer>,
     pub stop_task: Option<tokio::task::AbortHandle>,
@@ -277,6 +280,17 @@ impl Engine {
             m.run.clone()
         };
         self.emit_show(run);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn trigger_delayed_stop_later_for_test(&self) {
+        let args = {
+            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            m.run.as_ref().map(|r| (m.epoch, m.stream_epoch, r.id.clone(), m.stop_cancel_session))
+        };
+        if let Some((show_gen, stream_gen, show_id, cancel_session)) = args {
+            self.stop_stream_later(show_gen, stream_gen, &show_id, cancel_session).await;
+        }
     }
 
     /// Called whenever a stream starts (Show or plain Go live): advances `stream_gen` and
@@ -1433,11 +1447,13 @@ impl Engine {
                 m.run = Some(run.clone());
                 if let Some(delay) = scheduled_delay {
                     let stream_gen = m.stream_epoch;
+                    let cancel_session = self.golive_switch_cancel_session();
+                    m.stop_cancel_session = cancel_session;
                     let engine = self.clone();
                     let id = run.id.clone();
                     let handle = tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_secs(u64::from(delay))).await;
-                        engine.stop_stream_later(my_gen, stream_gen, &id).await;
+                        engine.stop_stream_later(my_gen, stream_gen, &id, cancel_session).await;
                     });
                     m.stop_task = Some(handle.abort_handle());
                     m.stop_waiting = true;
@@ -1484,33 +1500,40 @@ impl Engine {
     }
 
     /// The delayed Stop Streaming of an ended show. Serialized with `group_ops -> output_lock`
-    /// and guarded by BOTH `show_gen`, `stream_gen`, and a still-waiting `stop_stream` step, so
-    /// it never fires after "stop now", a new Show, or a plain stream started without a Show.
-    async fn stop_stream_later(&self, show_gen: u64, stream_gen: u64, show_id: &str) {
+    /// and guarded by `show_gen`, `stream_gen`, `stop_waiting`, and `cancel_session`, so it never
+    /// fires after "stop now", a new Show, or a plain stream started without a Show, and never
+    /// cancels a newer stream's switch-cancellation token.
+    async fn stop_stream_later(&self, show_gen: u64, stream_gen: u64, show_id: &str, cancel_session: u64) {
+        let waiting = |r: &ShowRun| {
+            r.id == show_id
+                && r.phase == Phase::Ended
+                && r.steps.iter().any(|s| s.id == "stop_stream" && s.status == "waiting")
+        };
         let maybe_ours = {
             let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
-            let waiting = |r: &ShowRun| {
-                r.id == show_id
-                    && r.phase == Phase::Ended
-                    && r.steps.iter().any(|s| s.id == "stop_stream" && s.status == "waiting")
-            };
             m.epoch == show_gen && m.stream_epoch == stream_gen && m.stop_waiting && m.run.as_ref().is_some_and(waiting)
         };
         if !maybe_ours {
             return;
         }
-        if matches!(self.rig().await, Ok(crate::studio::rig::Rig::Studio)) {
-            self.cancel_golive_switches();
+        let rig = self.rig().await;
+        {
+            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            let still_ours_now = m.epoch == show_gen
+                && m.stream_epoch == stream_gen
+                && m.stop_waiting
+                && m.run.as_ref().is_some_and(waiting);
+            if !still_ours_now {
+                return;
+            }
+            if matches!(rig, Ok(crate::studio::rig::Rig::Studio)) {
+                self.cancel_golive_switches_if_session(cancel_session);
+            }
         }
         let group_ops = self.golive().group_ops.lock().await;
         let _out = self.studio().output_lock.lock().await;
         let still_ours = {
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
-            let waiting = |r: &ShowRun| {
-                r.id == show_id
-                    && r.phase == Phase::Ended
-                    && r.steps.iter().any(|s| s.id == "stop_stream" && s.status == "waiting")
-            };
             let ok = m.epoch == show_gen
                 && m.stream_epoch == stream_gen
                 && m.stop_waiting

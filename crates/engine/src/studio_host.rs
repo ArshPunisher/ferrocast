@@ -3327,9 +3327,16 @@ impl Engine {
         group_ops: &tokio::sync::MutexGuard<'_, ()>,
     ) -> Option<String> {
         if self.golive_uses_encode_groups() {
-            self.reconcile_studio_groups_now_locked(group_ops).await;
+            self.reconcile_locked(group_ops).await;
             return None;
         }
+        self.studio_sync_vertical_legacy_locked(group_ops).await
+    }
+
+    pub(crate) async fn studio_sync_vertical_legacy_locked(
+        &self,
+        _group_ops: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Option<String> {
         let host = self.studio_host().ok()?;
         // The wide stream is on (connecting or live) unless it isn't there or failed.
         let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
@@ -3353,18 +3360,20 @@ impl Engine {
         }
     }
 
-    pub(crate) async fn studio_sync_light(&self) -> Option<String> {
-        let group_ops = self.golive().group_ops.lock().await;
-        self.studio_sync_light_locked(&group_ops).await
-    }
-
     /// Starts or stops the Studio's lighter stream to match: while the Studio streams, it goes
     /// to Go live's light key when a ticked platform takes it → a note when it can't.
     pub(crate) async fn studio_sync_light_locked(&self, group_ops: &tokio::sync::MutexGuard<'_, ()>) -> Option<String> {
         if self.golive_uses_encode_groups() {
-            self.reconcile_studio_groups_now_locked(group_ops).await;
+            self.reconcile_locked(group_ops).await;
             return None;
         }
+        self.studio_sync_light_legacy_locked(group_ops).await
+    }
+
+    pub(crate) async fn studio_sync_light_legacy_locked(
+        &self,
+        _group_ops: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Option<String> {
         let host = self.studio_host().ok()?;
         let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
         // For a platform that takes it, or as a WebRTC server's simulcast layer.
