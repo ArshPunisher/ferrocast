@@ -68,14 +68,16 @@ impl Engine {
         let view = poll.view();
         self.broadcast_poll(Some(view.clone()));
         self.announce(&poll.announcement(), "post the poll");
-        // Closes it on time, unless it was ended or replaced first.
-        let engine = self.clone();
-        let (id, ends_at) = (poll.id.clone(), poll.ends_at);
-        tokio::spawn(async move {
-            let wait = u64::try_from((ends_at.0 - now().0).max(0)).unwrap_or(0);
-            tokio::time::sleep(Duration::from_millis(wait)).await;
-            let _ = engine.finish_poll(Some(&id)).await;
-        });
+        // Closes it on time when timed, unless it was ended or replaced first.
+        if let Some(ends_at) = poll.ends_at {
+            let engine = self.clone();
+            let id = poll.id.clone();
+            tokio::spawn(async move {
+                let wait = u64::try_from((ends_at.0 - now().0).max(0)).unwrap_or(0);
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                let _ = engine.finish_poll(Some(&id)).await;
+            });
+        }
         Ok(view)
     }
 

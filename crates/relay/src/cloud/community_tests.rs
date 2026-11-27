@@ -92,7 +92,7 @@ async fn a_poll_past_its_end_takes_no_votes_and_the_dashboard_hears_it() {
     assert_eq!(s, 201);
     // Its time ran out (the timer that closes it is minutes away in real polls).
     let bus = w.state.cloud.buses.get(&u.account.id).unwrap();
-    bus.state().poll.as_mut().unwrap().ends_at = ferrocast_core::event::Millis(crate::now_ms());
+    bus.state().poll.as_mut().unwrap().ends_at = Some(ferrocast_core::event::Millis(crate::now_ms()));
     let (_, v) = w.web(&u, Method::GET, "/c/api/v1/polls/current", None).await;
     assert_eq!(v["question"], "Snack?");
     let mut frames = bus.subscribe();
@@ -126,6 +126,25 @@ async fn a_poll_past_its_end_takes_no_votes_and_the_dashboard_hears_it() {
     }
     assert!(kinds.contains(&(super::bus::Audience::Dashboard, "poll".into())), "{kinds:?}");
     assert!(kinds.contains(&(super::bus::Audience::Widget(ferrocast_core::overlay::WidgetKind::Poll), "state".into())));
+}
+
+#[tokio::test]
+async fn an_untimed_cloud_poll_has_null_ends_at_and_closes_only_on_end() {
+    let w = world().await;
+    let u = w.cloud_user("asha@example.com").await;
+    w.bind_channels(&u);
+    let spec = json!({ "question": "Next game?", "options": ["Hades", "Balatro"], "duration_s": null });
+    let (s, p) = w.web(&u, Method::POST, "/c/api/v1/polls", Some(spec)).await;
+    assert_eq!(s, 201);
+    assert_eq!(p["ends_at"], Value::Null);
+    assert_eq!(p["closed"], false);
+    w.say(1, "31", "!vote 2").await;
+    let cur = w.until(&u, "/c/api/v1/polls/current", |v| v["total"] == 1).await;
+    assert_eq!(cur["ends_at"], Value::Null);
+    assert_eq!(cur["options"][1]["votes"], 1);
+    let (s, ended) = w.web(&u, Method::POST, "/c/api/v1/polls/current/end", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(ended["closed"], true);
 }
 
 #[tokio::test]

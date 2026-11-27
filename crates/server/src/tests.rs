@@ -956,6 +956,26 @@ async fn poll_routes_validate_and_refuse_races() {
     assert_eq!(error_code(gone).await, (StatusCode::NOT_FOUND, "poll_not_found".into()));
     let fresh = r.post("/api/v1/polls", ok).await;
     assert_eq!(fresh.status(), StatusCode::CREATED, "a new poll after the last one ended");
+    assert!(r.post("/api/v1/polls/current/end", json!({})).await.status().is_success());
+
+    // Omitted `duration_s` defaults to 60s; explicit JSON `null` creates a No-timer poll.
+    let defaulted = r.post("/api/v1/polls", json!({ "question": "Default?", "options": ["A", "B"] })).await;
+    assert_eq!(defaulted.status(), StatusCode::CREATED);
+    let dv: Value = defaulted.json().await.unwrap();
+    assert!(dv["ends_at"].is_i64(), "omitted duration_s defaults to timed: {dv}");
+    assert!(r.post("/api/v1/polls/current/end", json!({})).await.status().is_success());
+
+    let bad_fb =
+        r.post("/api/v1/polls", json!({ "question": "Bad?", "options": ["A", "B"], "chat_fallback": "yes" })).await;
+    assert_eq!(bad_fb.status(), StatusCode::BAD_REQUEST);
+
+    let untimed = r
+        .post("/api/v1/polls", json!({ "question": "No timer?", "options": ["Stay", "Go"], "duration_s": null }))
+        .await;
+    assert_eq!(untimed.status(), StatusCode::CREATED);
+    let uv: Value = untimed.json().await.unwrap();
+    assert_eq!(uv["ends_at"], Value::Null, "explicit null creates an untimed poll");
+    assert_eq!(r.post("/api/v1/polls/current/end", json!({})).await.status(), StatusCode::OK);
 }
 
 #[tokio::test]

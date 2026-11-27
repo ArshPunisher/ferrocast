@@ -1218,7 +1218,8 @@ fn poll_spec(opts: &[&str]) -> ferrocast_core::poll::PollSpec {
     ferrocast_core::poll::PollSpec {
         question: "Which map next?".into(),
         options: opts.iter().map(|s| s.to_string()).collect(),
-        duration_s: 60,
+        duration_s: Some(60),
+        chat_fallback: true,
     }
 }
 

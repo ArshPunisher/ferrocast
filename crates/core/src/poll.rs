@@ -1,28 +1,114 @@
-//! Chat polls that work the same on every platform: viewers type `!vote 2`. No platform
-//! poll API is used, so no extra permissions are needed.
+//! Stream polls: native platform polls (Twitch Helix, YouTube live chat) when supported
+//! and `!vote` chat polls elsewhere (or as fallback).
 //!
-//! One vote per person (linked accounts count once); voting again changes the vote. A
-//! vote after the end, or after the poll was closed early, is refused.
+//! Chat polls allow one vote per person (linked accounts count once); voting again changes
+//! the vote. Votes after the end, or after the poll closes early, are refused.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::event::Millis;
+use crate::event::{Millis, Platform};
 
 pub const MIN_OPTIONS: usize = 2;
 pub const MAX_OPTIONS: usize = 5;
 pub const MIN_DURATION_S: u32 = 10;
 pub const MAX_DURATION_S: u32 = 30 * 60;
+pub const DEFAULT_DURATION_S: u32 = 60;
 /// More voters than any real chat, so a bot flood can't grow memory without bound.
 pub const MAX_VOTERS: usize = 200_000;
+
+pub const DEFAULT_LIMITS: PollLimits = PollLimits {
+    min_options: MIN_OPTIONS,
+    max_options: MAX_OPTIONS,
+    min_duration_s: MIN_DURATION_S,
+    max_duration_s: MAX_DURATION_S,
+    supports_no_timer: true,
+    question_chars: 120,
+    option_chars: 60,
+};
+
+fn default_duration_s() -> Option<u32> {
+    Some(DEFAULT_DURATION_S)
+}
+
+fn default_chat_fallback() -> bool {
+    true
+}
+
+/// Whether a connected platform can run native polls right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollCapabilityMode {
+    Native,
+    ChatFallback,
+    ReconnectNeeded,
+}
+
+/// Platform constraints reported to the UI so warnings are proactive and concise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollLimits {
+    pub min_options: usize,
+    pub max_options: usize,
+    pub min_duration_s: u32,
+    pub max_duration_s: u32,
+    pub supports_no_timer: bool,
+    pub question_chars: usize,
+    pub option_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformPollCapability {
+    pub platform: Platform,
+    pub mode: PollCapabilityMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub limits: PollLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollsCapabilities {
+    pub platforms: Vec<PlatformPollCapability>,
+}
+
+/// How an active poll runs on a given platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformPollMode {
+    Native,
+    Chat,
+}
+
+/// Lifecycle state of an active poll on a single platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformPollState {
+    Active,
+    Ended,
+    FailedFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformPollStatus {
+    pub platform: Platform,
+    pub mode: PlatformPollMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    pub state: PlatformPollState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
 
 /// What the dashboard asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollSpec {
     pub question: String,
     pub options: Vec<String>,
-    pub duration_s: u32,
+    /// `None` starts a "No timer" poll that runs until closed manually.
+    #[serde(default = "default_duration_s")]
+    pub duration_s: Option<u32>,
+    #[serde(default = "default_chat_fallback")]
+    pub chat_fallback: bool,
 }
 
 impl PollSpec {
@@ -44,10 +130,12 @@ impl PollSpec {
                 return Err(format!("options: \"{o}\" is in the list twice."));
             }
         }
-        if !(MIN_DURATION_S..=MAX_DURATION_S).contains(&self.duration_s) {
+        if let Some(secs) = self.duration_s
+            && !(MIN_DURATION_S..=MAX_DURATION_S).contains(&secs)
+        {
             return Err("duration_s: polls run for 10 seconds to 30 minutes.".into());
         }
-        Ok(PollSpec { question, options, duration_s: self.duration_s })
+        Ok(PollSpec { question, options, duration_s: self.duration_s, chat_fallback: self.chat_fallback })
     }
 }
 
@@ -62,11 +150,15 @@ pub struct Poll {
     pub question: String,
     pub options: Vec<String>,
     pub started_at: Millis,
-    pub ends_at: Millis,
+    pub ends_at: Option<Millis>,
     /// Closed early, or finished and announced.
     pub closed: bool,
+    /// Per-platform delivery state (`Native` vs `Chat`). Empty means legacy chat-everywhere mode.
+    pub platforms: Vec<PlatformPollStatus>,
     /// Voter key (one per person) → the option index, from 0.
     votes: HashMap<String, usize>,
+    /// Latest option vote counts reported by native platform polls, keyed by platform.
+    native_tallies: HashMap<Platform, Vec<u64>>,
 }
 
 /// Why a vote didn't count.
@@ -93,10 +185,12 @@ pub struct PollView {
     pub options: Vec<OptionView>,
     pub total: u64,
     pub started_at: Millis,
-    pub ends_at: Millis,
+    pub ends_at: Option<Millis>,
     pub closed: bool,
     /// Indexes (from 0) of the leading answers; several on a tie, none without votes.
     pub leaders: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<PlatformPollStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,19 +201,72 @@ pub struct OptionView {
 
 impl Poll {
     pub fn start(id: String, spec: PollSpec, now: Millis) -> Poll {
+        let ends_at = spec.duration_s.map(|secs| Millis(now.0.saturating_add(i64::from(secs) * 1000)));
         Poll {
             id,
             question: spec.question,
             options: spec.options,
             started_at: now,
-            ends_at: Millis(now.0.saturating_add(i64::from(spec.duration_s) * 1000)),
+            ends_at,
             closed: false,
+            platforms: Vec::new(),
             votes: HashMap::new(),
+            native_tallies: HashMap::new(),
         }
     }
 
     pub fn is_open(&self, now: Millis) -> bool {
-        !self.closed && now < self.ends_at
+        !self.closed && self.ends_at.is_none_or(|end| now < end)
+    }
+
+    pub fn set_platforms(&mut self, platforms: Vec<PlatformPollStatus>) {
+        self.platforms = platforms;
+    }
+
+    pub fn allows_chat_vote(&self, platform: Platform) -> bool {
+        self.platforms.is_empty()
+            || self.platforms.iter().any(|p| p.platform == platform && p.mode == PlatformPollMode::Chat)
+    }
+
+    pub fn has_chat_platforms(&self) -> bool {
+        self.platforms.is_empty() || self.platforms.iter().any(|p| p.mode == PlatformPollMode::Chat)
+    }
+
+    pub fn chat_platforms(&self) -> Option<HashSet<Platform>> {
+        if self.platforms.is_empty() {
+            return None;
+        }
+        Some(self.platforms.iter().filter(|p| p.mode == PlatformPollMode::Chat).map(|p| p.platform).collect())
+    }
+
+    /// Replaces the cached native counts for `platform`; returns `true` if values changed.
+    pub fn set_native_tally(&mut self, platform: Platform, counts: &[u64]) -> bool {
+        let mut next = vec![0u64; self.options.len()];
+        for (dst, &src) in next.iter_mut().zip(counts.iter()) {
+            *dst = src;
+        }
+        if self.native_tallies.get(&platform) == Some(&next) {
+            return false;
+        }
+        self.native_tallies.insert(platform, next);
+        true
+    }
+
+    pub fn set_platform_state(&mut self, platform: Platform, state: PlatformPollState, note: Option<String>) -> bool {
+        let Some(entry) = self.platforms.iter_mut().find(|p| p.platform == platform) else {
+            return false;
+        };
+        if entry.state == state && entry.note == note {
+            return false;
+        }
+        entry.state = state;
+        entry.note = note;
+        true
+    }
+
+    /// `true` once every platform tracking this poll has ended (used to auto-finish native-only polls).
+    pub fn all_platforms_ended(&self) -> bool {
+        !self.platforms.is_empty() && self.platforms.iter().all(|p| p.state == PlatformPollState::Ended)
     }
 
     /// `choice` is what the viewer typed: 1 for the first answer.
@@ -146,14 +293,27 @@ impl Poll {
 
     /// Closes the poll. `false` when it was already closed (a second "end" does nothing).
     pub fn close(&mut self) -> bool {
-        !std::mem::replace(&mut self.closed, true)
+        let changed = !std::mem::replace(&mut self.closed, true);
+        if changed {
+            for p in &mut self.platforms {
+                if p.state == PlatformPollState::Active {
+                    p.state = PlatformPollState::Ended;
+                }
+            }
+        }
+        changed
     }
 
     pub fn tally(&self) -> Vec<u64> {
         let mut t = vec![0u64; self.options.len()];
         for i in self.votes.values() {
             if let Some(slot) = t.get_mut(*i) {
-                *slot += 1;
+                *slot = slot.saturating_add(1);
+            }
+        }
+        for counts in self.native_tallies.values() {
+            for (slot, &n) in t.iter_mut().zip(counts.iter()) {
+                *slot = slot.saturating_add(n);
             }
         }
         t
@@ -161,7 +321,7 @@ impl Poll {
 
     pub fn view(&self) -> PollView {
         let tally = self.tally();
-        let total: u64 = tally.iter().sum();
+        let total: u64 = tally.iter().copied().fold(0u64, u64::saturating_add);
         let top = tally.iter().copied().max().unwrap_or(0);
         let leaders = if top == 0 { vec![] } else { (0..tally.len()).filter(|i| tally[*i] == top).collect() };
         PollView {
@@ -178,6 +338,7 @@ impl Poll {
             ends_at: self.ends_at,
             closed: self.closed,
             leaders,
+            platforms: self.platforms.clone(),
         }
     }
 
@@ -185,14 +346,19 @@ impl Poll {
     pub fn announcement(&self) -> String {
         let choices: Vec<String> =
             self.options.iter().enumerate().map(|(i, o)| format!("!vote {} for {o}", i + 1)).collect();
-        let secs = (self.ends_at.0 - self.started_at.0).max(0) / 1000;
-        let time = if secs >= 60 && secs % 60 == 0 {
-            let m = secs / 60;
-            format!("{m} minute{}", if m == 1 { "" } else { "s" })
-        } else {
-            format!("{secs} seconds")
-        };
-        format!("Poll: {} Type {}. You have {time}.", self.question, choices.join(", "))
+        match self.ends_at {
+            Some(ends_at) => {
+                let secs = (ends_at.0 - self.started_at.0).max(0) / 1000;
+                let time = if secs >= 60 && secs % 60 == 0 {
+                    let m = secs / 60;
+                    format!("{m} minute{}", if m == 1 { "" } else { "s" })
+                } else {
+                    format!("{secs} seconds")
+                };
+                format!("Poll: {} Type {}. You have {time}.", self.question, choices.join(", "))
+            }
+            None => format!("Poll: {} Type {}. Open until closed.", self.question, choices.join(", ")),
+        }
     }
 
     /// The chat message with the result.
@@ -249,7 +415,8 @@ mod tests {
         PollSpec {
             question: "Which map?".into(),
             options: opts.iter().map(|s| s.to_string()).collect(),
-            duration_s: 60,
+            duration_s: Some(60),
+            chat_fallback: true,
         }
     }
 
@@ -258,7 +425,8 @@ mod tests {
         let s = PollSpec {
             question: "  Which\n map? ".into(),
             options: vec![" Ascent ".into(), "Bind".into()],
-            duration_s: 60,
+            duration_s: Some(60),
+            chat_fallback: true,
         };
         let c = s.cleaned().unwrap();
         assert_eq!(c.question, "Which map?");
@@ -271,8 +439,9 @@ mod tests {
         assert!(err(spec(&["a", " "])).starts_with("options: answer 2"));
         assert!(err(spec(&["Bind", "bind"])).contains("twice"));
         assert!(err(spec(&["a", &"x".repeat(61)])).starts_with("options:"));
-        assert!(err(PollSpec { duration_s: 9, ..spec(&["a", "b"]) }).starts_with("duration_s:"));
-        assert!(err(PollSpec { duration_s: 1801, ..spec(&["a", "b"]) }).starts_with("duration_s:"));
+        assert!(err(PollSpec { duration_s: Some(9), ..spec(&["a", "b"]) }).starts_with("duration_s:"));
+        assert!(err(PollSpec { duration_s: Some(1801), ..spec(&["a", "b"]) }).starts_with("duration_s:"));
+        assert_eq!(PollSpec { duration_s: None, ..spec(&["a", "b"]) }.cleaned().unwrap().duration_s, None);
     }
 
     #[test]
@@ -295,6 +464,55 @@ mod tests {
     }
 
     #[test]
+    fn untimed_polls_stay_open_until_closed_and_combine_native_and_chat_tallies() {
+        let spec_none = PollSpec { duration_s: None, ..spec(&["Yes", "No"]) };
+        let mut p = Poll::start("u1".into(), spec_none, Millis(0));
+        assert_eq!(p.ends_at, None);
+        assert!(p.is_open(Millis(99_999_999)));
+        assert!(p.announcement().ends_with("Open until closed."));
+        p.set_platforms(vec![
+            PlatformPollStatus {
+                platform: Platform::Twitch,
+                mode: PlatformPollMode::Native,
+                external_id: Some("tw-1".into()),
+                state: PlatformPollState::Active,
+                note: None,
+            },
+            PlatformPollStatus {
+                platform: Platform::Kick,
+                mode: PlatformPollMode::Chat,
+                external_id: None,
+                state: PlatformPollState::Active,
+                note: Some("platform_unsupported".into()),
+            },
+        ]);
+        assert!(!p.allows_chat_vote(Platform::Twitch));
+        assert!(p.allows_chat_vote(Platform::Kick));
+        assert!(p.set_native_tally(Platform::Twitch, &[4, 2]));
+        assert!(!p.set_native_tally(Platform::Twitch, &[4, 2]));
+        p.vote("k1", 2, Millis(1_000_000)).unwrap();
+        assert_eq!(p.tally(), vec![4, 3]);
+        assert_eq!(p.view().total, 7);
+        assert!(p.close());
+        assert!(!p.is_open(Millis(1_000_001)));
+        assert_eq!(p.view().platforms[0].state, PlatformPollState::Ended);
+    }
+
+    #[test]
+    fn poll_spec_serde_distinguishes_omitted_null_and_seconds() {
+        let omitted: PollSpec = serde_json::from_str(r#"{"question":"Q?","options":["A","B"]}"#).unwrap();
+        assert_eq!(omitted.duration_s, Some(60));
+        assert!(omitted.chat_fallback);
+        let null_dur: PollSpec =
+            serde_json::from_str(r#"{"question":"Q?","options":["A","B"],"duration_s":null,"chat_fallback":false}"#)
+                .unwrap();
+        assert_eq!(null_dur.duration_s, None);
+        assert!(!null_dur.chat_fallback);
+        let timed: PollSpec = serde_json::from_str(r#"{"question":"Q?","options":["A","B"],"duration_s":30}"#).unwrap();
+        assert_eq!(timed.duration_s, Some(30));
+    }
+
+    #[test]
     fn results_and_announcements_read_well() {
         let mut p = Poll::start("p".into(), spec(&["Ascent", "Bind"]), Millis(0));
         assert_eq!(p.announcement(), "Poll: Which map? Type !vote 1 for Ascent, !vote 2 for Bind. You have 1 minute.");
@@ -305,7 +523,7 @@ mod tests {
         assert_eq!(p.result(), "Poll closed: Which map? Winner: Ascent with 2 votes (67%).");
         p.vote("d", 2, Millis(1)).unwrap();
         assert_eq!(p.result(), "Poll closed: Which map? It's a tie between Ascent and Bind (2 votes each).");
-        let short = Poll::start("s".into(), PollSpec { duration_s: 45, ..spec(&["a", "b"]) }, Millis(0));
+        let short = Poll::start("s".into(), PollSpec { duration_s: Some(45), ..spec(&["a", "b"]) }, Millis(0));
         assert!(short.announcement().ends_with("You have 45 seconds."));
     }
 

@@ -165,15 +165,22 @@ fn poll_spec(b: &Value) -> Result<PollSpec, ApiError> {
             .ok_or_else(|| invalid("options: every answer must be text."))?,
         _ => return Err(invalid("options: must be a list of 2 to 5 answers.")),
     };
-    let duration_s = match &b["duration_s"] {
-        Value::Null => 60,
-        Value::Number(n) => n
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| invalid("duration_s: polls run for 10 seconds to 30 minutes."))?,
-        _ => return Err(invalid("duration_s: must be a whole number of seconds.")),
+    let duration_s = match b.get("duration_s") {
+        None => Some(ferrocast_core::poll::DEFAULT_DURATION_S),
+        Some(Value::Null) => None,
+        Some(Value::Number(n)) => Some(
+            n.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| invalid("duration_s: polls run for 10 seconds to 30 minutes."))?,
+        ),
+        Some(_) => return Err(invalid("duration_s: must be a whole number of seconds or null.")),
     };
-    PollSpec { question, options, duration_s }.cleaned().map_err(invalid)
+    let chat_fallback = match b.get("chat_fallback") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(v)) => *v,
+        Some(_) => return Err(invalid("chat_fallback: must be true or false.")),
+    };
+    PollSpec { question, options, duration_s, chat_fallback }.cleaned().map_err(invalid)
 }
 
 /// `POST /c/api/v1/polls` → 201 `PollView`, announced in chat. 409 while another is open.
@@ -198,13 +205,15 @@ async fn start_poll(
     };
     push_poll(&bus);
     announce(&st, &a.account.id, poll.announcement());
-    // Closes on time, unless it was ended or replaced first.
-    let (w, st2, account, id) = (Arc::downgrade(&bus), st.clone(), a.account.id.clone(), poll.id.clone());
-    let wait = u64::try_from((poll.ends_at.0 - now_ms()).max(0)).unwrap_or(0);
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(wait)).await;
-        let _ = finish_poll(&st2, &account, &w, Some(&id));
-    });
+    // Closes on time when timed, unless it was ended or replaced first.
+    if let Some(ends_at) = poll.ends_at {
+        let (w, st2, account, id) = (Arc::downgrade(&bus), st.clone(), a.account.id.clone(), poll.id.clone());
+        let wait = u64::try_from((ends_at.0 - now_ms()).max(0)).unwrap_or(0);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            let _ = finish_poll(&st2, &account, &w, Some(&id));
+        });
+    }
     Ok(created(json!(poll.view())))
 }
 
