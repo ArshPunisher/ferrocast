@@ -378,8 +378,10 @@ pub struct Compositor {
     pub(crate) preview_pipelines: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
     /// Held to submit and to configure a window surface (see `configure`).
     submitting: Mutex<()>,
-    /// Number of uncaptured GPU errors reported by `device` on this compositor.
+    /// Number of uncaptured GPU errors reported by `device` on this compositor (read by the
+    /// macOS preview tests).
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) uncaptured_errors: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
