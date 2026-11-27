@@ -254,6 +254,10 @@ impl Hub {
             }
         } else if flv::video_is_header(&data) {
             st.stats.video_codec = flv::video_codec(&data);
+            if let Some((w, h)) = flv::avcc_sps_dimensions(&data) {
+                st.stats.width = Some(w);
+                st.stats.height = Some(h);
+            }
             st.headers.video = Some(data.clone());
         } else {
             if key {

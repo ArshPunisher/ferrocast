@@ -647,6 +647,10 @@ impl SentStreamInfo {
         if let Some(codec) = flv::video_codec(data) {
             self.codec = Some(codec);
         }
+        if let Some((w, h)) = flv::avcc_sps_dimensions(data) {
+            self.width = Some(w);
+            self.height = Some(h);
+        }
     }
 
     fn merge_hub_stats(&mut self, stats: crate::hub::StreamStats) {
