@@ -2824,6 +2824,7 @@ impl Engine {
             self.disarm_auto_config_if_output_changed(&saved);
         }
         self.sync_studio_settings_live(&saved, restart.as_deref()).await;
+        self.refresh_pc_budget().await;
         self.send_golive_pub();
         // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).
         let (restart, detail) = one_line(restart, "Some changes apply after a restart");
@@ -3692,9 +3693,10 @@ impl Engine {
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
         let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let switched_shelf = matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. });
         // Swapping what the Studio shows is refused during a show, benchmark, or while it streams
         // or records; with no desktop host attached (headless) the show/benchmark still count.
-        let _gate = if matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. }) {
+        let _gate = if switched_shelf {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
             let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
@@ -3708,8 +3710,20 @@ impl Engine {
         if let Some(host) = host {
             let out = host.shelf(kind.to_string(), act).await.map_err(failed)?;
             drop(_gate);
-            // Another collection may have its own vertical picture (or none): the stream follows.
-            self.studio_sync_vertical().await;
+            if switched_shelf && kind == "profiles" {
+                let saved = host.settings().await;
+                self.disarm_auto_config_if_output_changed(&saved);
+                self.note_studio_settings(&saved);
+                self.refresh_pc_budget().await;
+                self.send_golive_pub();
+            } else {
+                // Another collection may have its own vertical picture (or none): the stream follows.
+                self.studio_sync_vertical().await;
+                if switched_shelf {
+                    self.refresh_pc_budget().await;
+                    self.send_golive_pub();
+                }
+            }
             return Ok(out);
         }
 
@@ -5581,6 +5595,170 @@ mod tests {
             v.get("used_sessions").and_then(Value::as_u64),
             Some(2),
             "x264 stream + high recording must charge 2 CPU sessions: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn studio_shelf_switch_refreshes_golive_profile_and_collection_budget() {
+        #[derive(Debug)]
+        struct ShelfProfileHost {
+            settings: std::sync::Mutex<StudioSettings>,
+            budget: std::sync::Mutex<HostBudgetInfo>,
+        }
+        #[async_trait::async_trait]
+        impl StudioHost for ShelfProfileHost {
+            async fn status(&self) -> StudioStatus {
+                Default::default()
+            }
+            async fn start(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn stop(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn kinds(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn options(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+                Ok(())
+            }
+            async fn defaults(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn act(&self, _act: StudioAct) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn settings(&self) -> StudioSettings {
+                self.settings.lock().unwrap().clone()
+            }
+            async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String> {
+                *self.settings.lock().unwrap() = s;
+                Ok(None)
+            }
+            async fn stats(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({}))
+            }
+            async fn record(&self, _on: bool) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn record_pause(&self, _on: bool) -> Result<(), String> {
+                Ok(())
+            }
+            async fn monitoring(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_stop(&self) -> Result<(), String> {
+                Ok(())
+            }
+            async fn stream_stats(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn obs_collections(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn import_obs(&self, _id: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn shelf(&self, kind: String, _act: ShelfAct) -> Result<Value, String> {
+                if kind == "profiles" {
+                    *self.settings.lock().unwrap() = StudioSettings {
+                        encoder: "software".into(),
+                        video_encoder: Some("obs_x264".into()),
+                        width: 1280,
+                        height: 720,
+                        fps: 30,
+                        video_kbps: 2500,
+                        ..StudioSettings::default()
+                    };
+                } else if kind == "collections" {
+                    let mut b = self.budget.lock().unwrap();
+                    b.vertical_on = true;
+                    b.vertical_size = Some((720, 1280));
+                }
+                Ok(serde_json::json!({ "ok": true }))
+            }
+            async fn encode_budget(
+                &self,
+                _draft: Option<Value>,
+                _enhanced: bool,
+                _light: bool,
+            ) -> Result<Value, String> {
+                Ok(serde_json::json!({ "shared": false, "replay": false }))
+            }
+            async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+                Some(self.budget.lock().unwrap().clone())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let host = Arc::new(ShelfProfileHost {
+            settings: std::sync::Mutex::new(StudioSettings {
+                encoder: "software".into(),
+                video_encoder: Some("obs_x264".into()),
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                video_kbps: 6000,
+                ..StudioSettings::default()
+            }),
+            budget: std::sync::Mutex::new(HostBudgetInfo {
+                os: "windows".into(),
+                encoder_id: "obs_x264".into(),
+                cpu_cores: 8,
+                host_sig: "win|cores=8".into(),
+                vertical_on: false,
+                vertical_size: None,
+                ..Default::default()
+            }),
+        });
+        e.set_studio_host(host);
+        let _ = e
+            .add_golive_destination("YouTube", "rtmp://127.0.0.1:19906/app", "k", ferrocast_golive::Canvas::Main)
+            .await
+            .unwrap();
+        let _ = e
+            .add_golive_destination("Shorts", "rtmp://127.0.0.1:19907/app", "k", ferrocast_golive::Canvas::Vertical)
+            .await
+            .unwrap();
+
+        let before = e.golive_view().await;
+        let main_before =
+            before.encode_groups.iter().find(|g| g.canvas == ferrocast_golive::Canvas::Main).expect("main group");
+        assert_eq!((main_before.width, main_before.height, main_before.fps, main_before.kbps), (1920, 1080, 60, 6000));
+
+        e.studio_shelf("profiles", ShelfAct::Switch { id: "alt".into() }).await.unwrap();
+        let after_profile = e.golive_view().await;
+        let main_after = after_profile
+            .encode_groups
+            .iter()
+            .find(|g| g.canvas == ferrocast_golive::Canvas::Main)
+            .expect("main group after profile switch");
+        assert_eq!(
+            (main_after.width, main_after.height, main_after.fps, main_after.kbps),
+            (1280, 720, 30, 2500),
+            "GoLive view must reflect switched profile without waiting for a separate settings save"
+        );
+
+        e.studio_shelf("collections", ShelfAct::Switch { id: "c2".into() }).await.unwrap();
+        let after_collection = e.golive_view().await;
+        let vert_after = after_collection
+            .encode_groups
+            .iter()
+            .find(|g| g.canvas == ferrocast_golive::Canvas::Vertical)
+            .expect("vertical group after collection switch");
+        assert_eq!(
+            (vert_after.width, vert_after.height),
+            (720, 1280),
+            "GoLive view must refresh host budget vertical canvas on collection switch"
         );
     }
 }
