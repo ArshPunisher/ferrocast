@@ -2851,26 +2851,22 @@ async fn dynamic_hub_registry_routes_custom_group_checks_budget_and_promotes_bac
     assert_eq!(e.golive_running_group(&d_cust.id).as_deref(), Some(cust_group.as_str()));
     assert_eq!(e.golive_running_group(&d_low.id).as_deref(), Some(low_group.as_str()));
 
-    let mut saw_cust_publish = false;
-    for _ in 0..10 {
-        if let Ok(Some(msg)) = timeout(Duration::from_secs(30), got_cust.recv()).await
-            && matches!(msg, Got::Publish(ref k) if k == "cust-k")
-        {
-            saw_cust_publish = true;
-            break;
-        }
+    async fn wait_publish(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Got>, want: &str, msg: &str) {
+        timeout(Duration::from_secs(30), async {
+            loop {
+                match rx.recv().await {
+                    Some(Got::Publish(k)) if k == want => return,
+                    Some(_) => {}
+                    None => panic!("{msg}: channel closed before publish"),
+                }
+            }
+        })
+        .await
+        .expect(msg);
     }
-    assert!(saw_cust_publish, "dynamic hub must feed its assigned custom destination");
-    let mut saw_main_publish = false;
-    for _ in 0..10 {
-        if let Ok(Some(msg)) = timeout(Duration::from_secs(30), got_main.recv()).await
-            && matches!(msg, Got::Publish(ref k) if k == "main-k")
-        {
-            saw_main_publish = true;
-            break;
-        }
-    }
-    assert!(saw_main_publish, "main hub must keep serving its destination");
+
+    wait_publish(&mut got_cust, "cust-k", "dynamic hub must feed its assigned custom destination").await;
+    wait_publish(&mut got_main, "main-k", "main hub must keep serving its destination").await;
 
     // 1. Healthy throughput on `d_cust` matching its own group's ~4,500 kbps (NOT main's 12,000 kbps)
     // must NOT trigger a downgrade to `light`.
