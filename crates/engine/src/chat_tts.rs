@@ -688,7 +688,8 @@ mod tests {
     }
 
     async fn next_overlay_of(rx: &mut tokio::sync::broadcast::Receiver<OverlayFrame>, kind: &str) -> serde_json::Value {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // Only a guard against a hang: a loaded CI Mac can take seconds to voice the fallback.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let f = tokio::time::timeout_at(deadline, rx.recv())
                 .await
