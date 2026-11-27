@@ -139,7 +139,13 @@ fn judge_quiet(window: &VecDeque<QuietSample>, raised: bool) -> bool {
     speech.sort_by(f32::total_cmp);
     let good = window.iter().filter(|w| w.peak_db >= GOOD_PEAK_DB).count();
     if raised {
-        return good < GOOD_TICKS_CLEAR && !speech.is_empty() && percentile(&speech, 0.75) < QUIET_P75_DB;
+        if good >= GOOD_TICKS_CLEAR {
+            return false;
+        }
+        if speech.is_empty() {
+            return true;
+        }
+        return percentile(&speech, 0.75) < QUIET_P75_DB;
     }
     good == 0 && speech.len() >= SPEECH_TICKS_MIN && percentile(&speech, 0.75) < QUIET_P75_DB
 }
@@ -715,5 +721,24 @@ mod tests {
         w.reset();
         let a = feed(&mut w, &mut t, 64, quiet_talk);
         assert_eq!(ids(&a), [("mic:quiet:KREO".to_string(), false)], "new stream raises again: {a:?}");
+    }
+
+    #[test]
+    fn silence_after_quiet_warning_never_clears_as_loud_enough() {
+        let (mut w, mut t) = (LiveWatch::default(), 0);
+        let quiet_talk = |i: i64| {
+            let m = if i % 2 == 0 { mic_speech(-36.0, -44.0, -36.0) } else { mic(-64.0, -64.0, false) };
+            vec![m]
+        };
+        let raised = feed(&mut w, &mut t, 64, quiet_talk);
+        assert_eq!(ids(&raised), [("mic:quiet:KREO".to_string(), false)]);
+
+        // 90 s of complete silence (speech: false) must NOT clear mic:quiet as "loud enough now".
+        let during_silence = feed(&mut w, &mut t, 90, |_| vec![mic(-65.0, -65.0, false)]);
+        assert!(during_silence.is_empty(), "silence must not emit fake loud-enough clear: {during_silence:?}");
+
+        // Real loud speech clears it accurately.
+        let loud = feed(&mut w, &mut t, 12, |_| vec![mic_speech(-14.0, -22.0, -14.0)]);
+        assert_eq!(ids(&loud), [("mic:quiet:KREO".to_string(), true)]);
     }
 }

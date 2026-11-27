@@ -159,6 +159,8 @@ pub struct Poll {
     votes: HashMap<String, usize>,
     /// Latest option vote counts reported by native platform polls, keyed by platform.
     native_tallies: HashMap<Platform, Vec<u64>>,
+    /// Native platforms whose remote poll close request has not yet been confirmed.
+    pending_remote_end: HashSet<Platform>,
 }
 
 /// Why a vote didn't count.
@@ -212,6 +214,7 @@ impl Poll {
             platforms: Vec::new(),
             votes: HashMap::new(),
             native_tallies: HashMap::new(),
+            pending_remote_end: HashSet::new(),
         }
     }
 
@@ -241,6 +244,9 @@ impl Poll {
 
     /// Replaces the cached native counts for `platform`; returns `true` if values changed.
     pub fn set_native_tally(&mut self, platform: Platform, counts: &[u64]) -> bool {
+        if counts.is_empty() && !self.options.is_empty() {
+            return false;
+        }
         let mut next = vec![0u64; self.options.len()];
         for (dst, &src) in next.iter_mut().zip(counts.iter()) {
             *dst = src;
@@ -296,12 +302,38 @@ impl Poll {
         let changed = !std::mem::replace(&mut self.closed, true);
         if changed {
             for p in &mut self.platforms {
+                if p.mode == PlatformPollMode::Native && p.state == PlatformPollState::Active && p.external_id.is_some()
+                {
+                    self.pending_remote_end.insert(p.platform);
+                }
                 if p.state == PlatformPollState::Active {
                     p.state = PlatformPollState::Ended;
                 }
             }
         }
         changed
+    }
+
+    /// Native platforms that still need a remote end call (`end_native_poll`).
+    pub fn pending_remote_end_targets(&self) -> Vec<(Platform, String)> {
+        self.platforms
+            .iter()
+            .filter(|s| {
+                s.mode == PlatformPollMode::Native
+                    && (s.state == PlatformPollState::Active || self.pending_remote_end.contains(&s.platform))
+            })
+            .filter_map(|s| s.external_id.clone().map(|id| (s.platform, id)))
+            .collect()
+    }
+
+    /// Marks `platform` as confirmed ended remotely (returns `true` if it was still pending).
+    pub fn mark_remote_ended(&mut self, platform: Platform) -> bool {
+        self.pending_remote_end.remove(&platform)
+    }
+
+    /// Whether any native platform still awaits a confirmed remote end request.
+    pub fn has_pending_remote_end(&self) -> bool {
+        !self.pending_remote_end.is_empty()
     }
 
     pub fn tally(&self) -> Vec<u64> {
@@ -490,6 +522,8 @@ mod tests {
         assert!(p.allows_chat_vote(Platform::Kick));
         assert!(p.set_native_tally(Platform::Twitch, &[4, 2]));
         assert!(!p.set_native_tally(Platform::Twitch, &[4, 2]));
+        assert!(!p.set_native_tally(Platform::Twitch, &[]), "empty counts must preserve prior tallies");
+        assert_eq!(p.tally(), vec![4, 2]);
         p.vote("k1", 2, Millis(1_000_000)).unwrap();
         assert_eq!(p.tally(), vec![4, 3]);
         assert_eq!(p.view().total, 7);

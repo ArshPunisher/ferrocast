@@ -300,12 +300,24 @@ fn strip_command<'a>(text: &'a str, command: &str) -> Option<&'a str> {
     Some(rest.trim_start())
 }
 
+fn is_email_token(w: &str) -> bool {
+    let trimmed = w.trim_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '!' | '?' | ')' | '(' | '"' | '\''));
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !local.contains(['/', '\\', '?', '#', ':'])
+        && !domain.is_empty()
+        && !domain.contains(['/', '\\', '?', '#', '@', ':'])
+        && domain.contains('.')
+}
+
 fn has_any_link(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     if lower.contains("://") || lower.contains("www.") {
         return true;
     }
-    let without_emails: String = text.split_whitespace().filter(|w| !w.contains('@')).collect::<Vec<_>>().join(" ");
+    let without_emails: String = text.split_whitespace().filter(|w| !is_email_token(w)).collect::<Vec<_>>().join(" ");
     !filter::links(&without_emails).is_empty()
 }
 
@@ -357,29 +369,56 @@ fn is_emote_or_repeat_spam(text: &str, emote_count: usize) -> bool {
     false
 }
 
-/// Checks folded tokens against SHA-256 prefixes of severe slurs (none stored in plaintext).
-fn contains_severe_slur(text: &str) -> bool {
-    let folded_1 = filter::fold(text);
-    for token in folded_1.split(' ').filter(|t| !t.is_empty()) {
+fn contains_severe_slur_in(
+    folded: &str,
+    whole_word: &[[u8; 16]],
+    substring: &[[u8; 16]],
+    min_len: usize,
+    max_len: usize,
+) -> bool {
+    let tokens: Vec<&str> = folded.split(' ').filter(|t| !t.is_empty()).collect();
+    for token in &tokens {
         let h = sha256_prefix16(token.as_bytes());
-        if WHOLE_WORD_FOLDED_1.contains(&h) {
+        if whole_word.contains(&h) {
             return true;
         }
-        if contains_subtoken_hash(token, SUBSTRING_FOLDED_1, 5, 12) {
+        if contains_subtoken_hash(token, substring, min_len, max_len) {
             return true;
         }
     }
-    let folded_go = filter::fold_with(text, |c| c == 'g' || c == 'o');
-    for token in folded_go.split(' ').filter(|t| !t.is_empty()) {
-        let h = sha256_prefix16(token.as_bytes());
-        if WHOLE_WORD_FOLDED_GO.contains(&h) {
-            return true;
+    // Check adjacent 2..=4 token concatenations against stem/substring hashes (catches `"nig ger"` /
+    // `"re t ard"` / `"ni-gga"` splits without causing cross-boundary short-word false positives).
+    for span in 2..=4usize {
+        if tokens.len() < span {
+            break;
         }
-        if contains_subtoken_hash(token, SUBSTRING_FOLDED_GO, 5, 8) {
-            return true;
+        for i in 0..=tokens.len() - span {
+            let joined = tokens[i..i + span].concat();
+            let len = joined.chars().count();
+            if len >= min_len && len <= max_len + 1 {
+                if substring.contains(&sha256_prefix16(joined.as_bytes())) {
+                    return true;
+                }
+                if let Some(stem) = joined.strip_suffix('s')
+                    && stem.chars().count() >= min_len
+                    && substring.contains(&sha256_prefix16(stem.as_bytes()))
+                {
+                    return true;
+                }
+            }
         }
     }
     false
+}
+
+/// Checks folded tokens against SHA-256 prefixes of severe slurs (none stored in plaintext).
+fn contains_severe_slur(text: &str) -> bool {
+    let folded_1 = filter::fold(text);
+    if contains_severe_slur_in(&folded_1, WHOLE_WORD_FOLDED_1, SUBSTRING_FOLDED_1, 5, 12) {
+        return true;
+    }
+    let folded_go = filter::fold_with(text, |c| c == 'g' || c == 'o');
+    contains_severe_slur_in(&folded_go, WHOLE_WORD_FOLDED_GO, SUBSTRING_FOLDED_GO, 5, 8)
 }
 
 fn contains_subtoken_hash(token: &str, hashes: &[[u8; 16]], min_len: usize, max_len: usize) -> bool {
@@ -542,7 +581,8 @@ pub fn clean(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     for w in words {
         let w: String = w.chars().filter(|c| !c.is_control()).collect();
-        if out.chars().count() + w.chars().count() + 1 > max_chars {
+        let sep = usize::from(!out.is_empty());
+        if out.chars().count() + w.chars().count() + sep > max_chars {
             break;
         }
         if !out.is_empty() {
@@ -621,6 +661,8 @@ mod tests {
         assert_eq!(out, "call me number or visit at 221B Baker st, mail");
         assert_eq!(clean("hiiiiiiiiii !!!!!!", 200), "hiii");
         assert_eq!(clean("one two three four", 9), "one two");
+        assert_eq!(clean("abcdefghij", 10), "abcdefghij");
+        assert_eq!(clean("abcdefghij", 200), "abcdefghij");
     }
 
     #[test]
@@ -793,10 +835,14 @@ mod tests {
         let f = FilterConfig::default();
         let p = chat_on(ChatTtsMode::Everyone);
 
-        // Links skipped whole.
-        for msg in
-            ["check https://example.com right now", "visit www.evil.org for free skins", "go to cheap . xyz today"]
-        {
+        // Links skipped whole, including URLs containing `@` in path/handle.
+        for msg in [
+            "check https://example.com right now",
+            "visit www.evil.org for free skins",
+            "go to cheap . xyz today",
+            "free coins at evil.com/@promo click now",
+            "subscribe youtube.com/@Handle here",
+        ] {
             assert!(
                 matches!(
                     decide_chat(&p, &f, &chat_ev(Roles::empty(), Origin::Live, false, Content::plain(msg))),
@@ -911,7 +957,11 @@ mod tests {
         let stretched = format!("{}a{}g{}o{}t", "f", "aaaa", "ggg", "ooo");
         let zws = ["n", "i", "g", "g", "a"].join("\u{200b}");
         let embedded = format!("xx{}123", ["n", "1", "g", "g", "3", "r"].concat());
-        for hostile in [spaced, cyrillic, stretched, zws, embedded] {
+        let split2_space = format!("{} {}", ["n", "i", "g"].concat(), ["g", "e", "r"].concat());
+        let split2_dot = format!("{}.{}", ["f", "a", "g"].concat(), ["g", "o", "t"].concat());
+        let split3 = format!("{} t {}", ["r", "e"].concat(), ["a", "r", "d"].concat());
+        let split2_dash = format!("{}-{}", ["n", "i"].concat(), ["g", "g", "a"].concat());
+        for hostile in [spaced, cyrillic, stretched, zws, embedded, split2_space, split2_dot, split3, split2_dash] {
             assert!(
                 matches!(
                     decide_chat(&p, &f, &chat_ev(Roles::VIP, Origin::Live, false, Content::plain(&hostile))),
@@ -926,6 +976,7 @@ mod tests {
             "Greetings from Nigeria and Niger",
             "first class assistant",
             "we're tardy to the party",
+            "let's pic together",
             "visited Scunthorpe today",
             "comic con spicy raccoon",
         ] {
