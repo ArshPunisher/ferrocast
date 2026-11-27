@@ -2257,37 +2257,33 @@ impl Engine {
         Ok(view)
     }
 
-    async fn disarm_auto_config_if(&self, should_disarm: impl FnOnce(&AppliedInner) -> bool) -> bool {
+    fn disarm_auto_config_if(&self, should_disarm: impl FnOnce(&AppliedInner) -> bool) {
         let view = {
             let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
             let MachineState::Applied(a) = &slot.state else {
-                return false;
+                return;
             };
             if !should_disarm(a) {
-                return false;
+                return;
             }
             slot.seq = slot.seq.saturating_add(1);
             slot.state = MachineState::Idle;
             slot.view()
         };
-        let path = pending_apply_path(self.data_dir());
-        let _ = tokio::task::spawn_blocking(move || ferrocast_store::durable::remove_with_backup(&path)).await;
+        ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
         self.emit_auto_config_frame(&view);
-        true
     }
 
     /// Disarms any pending auto-rollback when the user manually edits one of the 6 output fields (H6).
-    pub(crate) async fn disarm_auto_config_if_output_changed(&self, saved: &StudioSettings) {
-        let _ = self.disarm_auto_config_if(|a| !a.summary.matches_output_fields(saved)).await;
+    pub(crate) fn disarm_auto_config_if_output_changed(&self, saved: &StudioSettings) {
+        self.disarm_auto_config_if(|a| !a.summary.matches_output_fields(saved));
     }
 
     /// Unconditionally disarms any pending auto-rollback and startup restore (e.g. on profile switch).
-    pub(crate) async fn disarm_auto_config(&self) {
+    pub(crate) fn disarm_auto_config(&self) {
         self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).take();
-        if !self.disarm_auto_config_if(|_| true).await {
-            let path = pending_apply_path(self.data_dir());
-            let _ = tokio::task::spawn_blocking(move || ferrocast_store::durable::remove_with_backup(&path)).await;
-        }
+        ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
+        self.disarm_auto_config_if(|_| true);
     }
 
     /// Immediately restores the pre-apply `StudioSettings` snapshot.
@@ -4236,25 +4232,5 @@ mod tests {
         };
         let hw_bench = super::persisted_bench_from_run(&hw_cands, &picked_hw, "win|nv=551.23", 1);
         assert!(hw_bench.max_mpx_s <= 600.0, "pipelined GPU submit must not extrapolate to 2500 Mpx/s: {hw_bench:?}");
-    }
-
-    #[tokio::test]
-    async fn disarm_auto_config_removes_pending_apply_async() {
-        let dir = tempfile::tempdir().unwrap();
-        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
-            .await
-            .unwrap();
-        let path = pending_apply_path(e.data_dir());
-        let pending = PendingApply {
-            version: 1,
-            snapshot: OutputSnapshot::from_settings(&StudioSettings::default()),
-            mode: AutoConfigMode::Stream,
-            applied_label: "test".into(),
-            saved_at_ms: 1,
-        };
-        ferrocast_store::durable::save_json_pretty(&path, &pending).unwrap();
-        assert!(path.exists());
-        e.disarm_auto_config().await;
-        assert!(!path.exists());
     }
 }
