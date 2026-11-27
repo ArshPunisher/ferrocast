@@ -8,9 +8,11 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
+use ferrocast_engine::golive::{GROUP_LIGHT, GROUP_MAIN};
 use ferrocast_engine::studio_host::{
-    CaptionsSet, FilePick, FilterEdit, FollowSet, HostBudgetInfo, ItemEdit as Edit, Monitor as Hear, PreviewRect,
-    ProjectorReq, STOPPED, ShelfAct, StreamCap, StudioAct, StudioHost, StudioSettings, StudioStatus,
+    CaptionsSet, EncodeCanvas, EncodeCodec, EncodeGroupSpec, FilePick, FilterEdit, FollowSet, HostBudgetInfo, Hub,
+    ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq, STOPPED, ShelfAct, StreamCap, StudioAct, StudioHost,
+    StudioSettings, StudioStatus,
 };
 // The Studio's scenes kept by Ferrocast's own engine (ENGINE.md step 3): no libobs.
 use ferrocast_studio::stage::Stage as Collection;
@@ -56,6 +58,8 @@ struct Held {
     lstream: Option<Streaming>,
     /// Whether `lstream` was started/reshaped with `no_bframes` (WHIP simulcast).
     lstream_no_bframes: bool,
+    /// Multi-encode group outputs keyed by group id (`"main"`, `"vertical"`, `"light"`, `"twitch_eb"`, `"g_<hash>"`).
+    groups: std::collections::HashMap<String, GroupSlot>,
     record: Option<(Recording, PathBuf, std::time::Instant)>,
     /// Sources recorded on their own (Source Record): name, recording, file.
     source_records: Vec<(String, Recording, PathBuf)>,
@@ -132,6 +136,14 @@ struct Held {
     /// True in Safe Mode when a temporary empty collection is running until the user confirms
     /// loading the saved collection; guards against overwriting the saved file on disk.
     collection_deferred: bool,
+}
+
+struct GroupSlot {
+    spec: EncodeGroupSpec,
+    output: Streaming,
+    started: std::time::Instant,
+    with: StreamSettings,
+    live_pct: Option<u8>,
 }
 
 /// `kbps` at auto quality's share `pct` (the floor a stream never goes under: 300).
@@ -432,6 +444,7 @@ fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held) {
         return;
     }
     let busy = h.stream.as_ref().is_some_and(|st| st.stats().active)
+        || h.groups.values().any(|g| g.output.stats().active)
         || h.record.as_ref().is_some_and(|r| r.0.stats().active)
         || h.replay.as_ref().is_some_and(|r| r.active())
         || h.ndi.is_some()
@@ -504,6 +517,7 @@ fn default_budget_mpx(
     engines.map(|n| f64::from(n) * ferrocast_studio::system::MPX_PER_ENGINE)
 }
 
+#[cfg(test)]
 fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32>, also: Also) -> Value {
     encode_budget_with_host(s, cap, engines, None, also)
 }
@@ -650,6 +664,83 @@ fn stream_settings(s: &StudioSettings, cap: Option<StreamCap>) -> StreamSettings
         own_encoder: s.own_encoder,
         video_tracks: Vec::new(),
     }
+}
+
+/// Builds [`StreamSettings`] matching an [`EncodeGroupSpec`] without mutating saved Studio settings.
+fn stream_settings_for_group(s: &StudioSettings, spec: &EncodeGroupSpec) -> StreamSettings {
+    let mut settings = stream_settings(s, None);
+    let mut enc = encode_of(s);
+    enc.video_kbps = spec.key.kbps;
+    if spec.key.strict_cbr {
+        enc.vbr = false;
+        enc.strict_cbr = true;
+    }
+    if spec.key.keyframe_s > 0 {
+        enc.keyframe_s = spec.key.keyframe_s;
+    }
+    if spec.key.no_bframes {
+        enc.bframes = false;
+    }
+    enc.audio_kbps = spec.key.audio_kbps;
+    enc.video_encoder = match spec.key.codec {
+        EncodeCodec::H264 => h264_encoder_for(&enc.video_encoder),
+        EncodeCodec::Hevc | EncodeCodec::Av1 | EncodeCodec::Vp9 => enc.video_encoder,
+    };
+    let native = match spec.key.canvas {
+        EncodeCanvas::Main => (s.width, s.height),
+        EncodeCanvas::Vertical => ferrocast_studio::VERTICAL_SIZE,
+    };
+    enc.scale = ((spec.key.width, spec.key.height) != native).then_some((spec.key.width, spec.key.height));
+    settings.encode = enc;
+    settings.vod_track = if spec.vod_track { (s.twitch_vod_track >= 2).then_some(s.twitch_vod_track) } else { None };
+    settings.video_tracks = spec.extra_tracks.clone();
+    settings
+}
+
+fn any_main_stream_active(h: &Held) -> bool {
+    h.stream.as_ref().is_some_and(|st| st.stats().active)
+        || h.groups.values().any(|g| g.spec.key.canvas == EncodeCanvas::Main && g.output.stats().active)
+}
+
+fn any_stream_group_active(h: &Held) -> bool {
+    h.stream.as_ref().is_some_and(|st| st.stats().active)
+        || h.vstream.as_ref().is_some_and(|st| st.stats().active)
+        || h.lstream.as_ref().is_some_and(|st| st.stats().active)
+        || h.groups.values().any(|g| g.output.stats().active)
+}
+
+fn main_stream_stats(h: &Held) -> Option<(&Streaming, Option<std::time::Instant>)> {
+    if let Some(s) = h.stream.as_ref() {
+        return Some((s, h.stream_started));
+    }
+    if let Some(g) = h.groups.get(GROUP_MAIN) {
+        return Some((&g.output, Some(g.started)));
+    }
+    h.groups
+        .values()
+        .find(|g| g.spec.key.canvas == EncodeCanvas::Main && g.output.stats().active)
+        .map(|g| (&g.output, Some(g.started)))
+}
+
+fn main_stream_mut(h: &mut Held) -> Option<&mut Streaming> {
+    if h.stream.as_ref().is_some_and(|s| s.stats().active) {
+        return h.stream.as_mut();
+    }
+    if h.groups.get(GROUP_MAIN).is_some_and(|g| g.output.stats().active) {
+        return h.groups.get_mut(GROUP_MAIN).map(|g| &mut g.output);
+    }
+    h.groups
+        .values_mut()
+        .find(|g| g.spec.key.canvas == EncodeCanvas::Main && g.output.stats().active)
+        .map(|g| &mut g.output)
+}
+
+fn active_direct_stats(h: &Held, id: &str) -> Option<ferrocast_studio::StreamStats> {
+    h.stream
+        .as_ref()
+        .and_then(|s| s.direct_stats(id))
+        .or_else(|| h.groups.get(GROUP_MAIN).and_then(|g| g.output.direct_stats(id)))
+        .or_else(|| h.groups.values().find_map(|g| g.output.direct_stats(id)))
 }
 
 /// What a recording uses: the stream's settings, or constant quality (high: near-lossless
@@ -809,6 +900,7 @@ fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -
     // The vertical preview and stream use the old collection's canvas: they go before it does.
     h.vertical.view = None;
     h.vstream = None;
+    h.groups.retain(|_, g| g.spec.key.canvas != EncodeCanvas::Vertical);
     h.captions = None;
     // NDI and the virtual camera send the old collection's picture: they stop with it.
     h.ndi = None;
@@ -964,7 +1056,7 @@ fn session_now(h: &Held) -> Option<ferrocast_engine::studio_host::Recovered> {
     Some(ferrocast_engine::studio_host::Recovered {
         record: h.record.is_some(),
         replay: h.replay.is_some(),
-        live: h.stream.is_some(),
+        live: h.stream.is_some() || !h.groups.is_empty(),
         ..Default::default()
     })
 }
@@ -1020,6 +1112,8 @@ fn take_outputs_from_held(h: &mut Held) -> Vec<Box<dyn FnOnce() + Send>> {
     push_opt_drain(&mut jobs, &mut h.vstream);
     push_opt_drain(&mut jobs, &mut h.lstream);
     push_opt_drain(&mut jobs, &mut h.stream);
+    let mut group_outputs: Vec<Streaming> = h.groups.drain().map(|(_, g)| g.output).collect();
+    push_vec_drain(&mut jobs, &mut group_outputs);
     push_opt_drain(&mut jobs, &mut h.record);
     push_vec_drain(&mut jobs, &mut h.source_records);
     push_opt_drain(&mut jobs, &mut h.replay);
@@ -1413,7 +1507,9 @@ fn refuses_while_shared(act: &StudioAct, shared: bool) -> Option<&'static str> {
 
 /// Whether the running stream and recording share one encode.
 fn shares_encoder(h: &Held) -> bool {
-    h.stream.as_ref().is_some_and(|s| s.shares_encoder()) || h.record.as_ref().is_some_and(|(r, ..)| r.shares_encoder())
+    h.stream.as_ref().is_some_and(|s| s.shares_encoder())
+        || h.groups.values().any(|g| g.output.shares_encoder())
+        || h.record.as_ref().is_some_and(|(r, ..)| r.shares_encoder())
 }
 
 fn item_edit(e: Edit) -> ItemEdit {
@@ -1975,7 +2071,12 @@ impl DesktopStudio {
             let _ = self
                 .on_main(|h| {
                     let Some(c) = h.collection.as_ref() else { return };
-                    for s in [h.stream.as_mut(), h.vstream.as_mut()].into_iter().flatten().filter(|s| s.drawn()) {
+                    for s in [h.stream.as_mut(), h.vstream.as_mut()]
+                        .into_iter()
+                        .flatten()
+                        .chain(h.groups.values_mut().map(|g| &mut g.output))
+                        .filter(|s| s.drawn())
+                    {
                         s.follow(c);
                     }
                     for p in
@@ -2080,9 +2181,7 @@ impl DesktopStudio {
         }
         let busy = self
             .on_main(|h| {
-                h.stream.is_some()
-                    || h.vstream.is_some()
-                    || h.lstream.is_some()
+                any_stream_group_active(h)
                     || h.record.is_some()
                     || !h.source_records.is_empty()
                     || h.replay.is_some()
@@ -2928,6 +3027,7 @@ impl StudioHost for DesktopStudio {
                 h.vertical.view = None;
                 if act == StudioAct::StopVertical {
                     h.vstream = None;
+                    h.groups.retain(|_, g| g.spec.key.canvas != EncodeCanvas::Vertical);
                     // A vertical item following a face goes back first (it's saved with the
                     // picture).
                     if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
@@ -2976,7 +3076,7 @@ impl StudioHost for DesktopStudio {
                 apply_audio_format(&s);
                 // Streaming now: what Optimize changes (frame rate, size, encoder) goes to the
                 // stream on air at once (owner, 15 Nov: "I have to end and stream again").
-                let live = h.stream.as_ref().is_some_and(|st| st.stats().active);
+                let live = any_main_stream_active(h);
                 if let Some(c) = h.collection.as_mut() {
                     let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
                     let now = c.canvas();
@@ -3059,6 +3159,11 @@ impl StudioHost for DesktopStudio {
                     if let Some(st) = h.vstream.as_mut() {
                         st.set_video_kbps(at_pct(s.video_kbps, h.live_pct));
                     }
+                    if let Some(slot) = h.groups.get_mut(GROUP_MAIN) {
+                        let k = at_pct(s.video_kbps, slot.live_pct);
+                        slot.output.set_video_kbps(k);
+                        slot.with.encode.video_kbps = k;
+                    }
                 }
                 save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
                 apply_audio_format(&s);
@@ -3105,7 +3210,7 @@ impl StudioHost for DesktopStudio {
                 // What Undo and Redo would do (labels for the buttons).
                 "history": { "undo": h.history.labels().0, "redo": h.history.labels().1 },
                 "canvas": studio.canvas(),
-                "stream": h.stream.as_ref().map(|s| stats_of(s, h.stream_started)),
+                "stream": main_stream_stats(h).map(|(s, started)| stats_of(s, started)),
                 "record": h.record.as_ref().map(record_stats),
                 // Sources recorded on their own.
                 "source_records": h.source_records.iter().map(|(n, _, f)| json!({
@@ -3181,7 +3286,7 @@ impl StudioHost for DesktopStudio {
                 Ok(json!({
                     "program": program,
                     "preview": preview,
-                    "stream": h.stream.as_ref().is_some_and(|s| s.stats().active),
+                    "stream": any_main_stream_active(h),
                     "record": h.record.as_ref().map(|r| {
                         let st = r.0.record_stats();
                         json!({
@@ -3294,7 +3399,10 @@ impl StudioHost for DesktopStudio {
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             // "Same as stream" while streaming: one encode for both (the Mac's one video
             // encoder can't do two at 4K60: 31 of 60 fps, 19 Nov), when they can share.
-            let live = h.stream.as_ref().filter(|st| st.stats().active).zip(h.stream_with.as_ref());
+            let live =
+                h.stream.as_ref().filter(|st| st.stats().active).zip(h.stream_with.as_ref()).or_else(|| {
+                    h.groups.get(GROUP_MAIN).filter(|g| g.output.stats().active).map(|g| (&g.output, &g.with))
+                });
             let rec = match live.map(|(st, with)| {
                 let can = if c.started(st) {
                     ferrocast_studio::stage::can_share(
@@ -4389,7 +4497,9 @@ impl StudioHost for DesktopStudio {
 
     async fn restart(&self) -> Result<(), String> {
         let busy = self
-            .on_main(|h| h.stream.is_some() || h.record.is_some() || h.replay.is_some() || h.virtualcam.is_some())
+            .on_main(|h| {
+                any_stream_group_active(h) || h.record.is_some() || h.replay.is_some() || h.virtualcam.is_some()
+            })
             .await?;
         if busy {
             return Err("Stop streaming and recording before Ferrocast opens again.".into());
@@ -4478,12 +4588,134 @@ impl StudioHost for DesktopStudio {
     async fn stream_stop(&self) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
+            h.groups.clear();
             h.vstream = None;
             h.lstream = None;
             h.lstream_no_bframes = false;
             h.stream = None;
             h.stream_started = None;
+            h.stream_with = None;
             apply_waiting_canvas(&app, h);
+        })
+        .await
+    }
+
+    async fn start_encode_group(&self, spec: EncodeGroupSpec, hub: std::sync::Arc<Hub>) -> Result<bool, String> {
+        let app = self.app.clone();
+        self.on_main(move |h| -> Result<bool, String> {
+            h.collection.as_ref().ok_or(STOPPED)?;
+            if let Some(existing) = h.groups.get(&spec.id)
+                && existing.spec == spec
+                && existing.output.stats().active
+            {
+                return Ok(true);
+            }
+            if !any_stream_group_active(h) {
+                apply_waiting_canvas(&app, h);
+            }
+            h.groups.remove(&spec.id);
+            let s = h.settings.clone().unwrap_or_default();
+            let settings = stream_settings_for_group(&s, &spec);
+            let c = h.collection.as_ref().ok_or(STOPPED)?;
+            let output = if spec.key.canvas == EncodeCanvas::Vertical {
+                if c.vertical().is_none() {
+                    return Ok(false);
+                }
+                c.vertical_group_to_hub(hub, &settings, Some(spec.key.fps)).map_err(|e| e.to_string())?
+            } else if spec.id == GROUP_MAIN {
+                let recording =
+                    h.record.as_ref().map(|r| &r.0).filter(|r| r.stats().active).zip(h.record_with.as_ref());
+                let shared = recording.map(|(r, (plan, same))| {
+                    let can = if r.record_stats().paused {
+                        Err("the recording is paused".to_string())
+                    } else if !c.started(r) {
+                        Err("the recording runs in another collection".to_string())
+                    } else {
+                        ferrocast_studio::stage::can_share(
+                            &settings,
+                            plan,
+                            *same,
+                            c.canvas().fps,
+                            spec.key.fps,
+                            c.has_selective_items(),
+                        )
+                    };
+                    (r, can)
+                });
+                match shared {
+                    Some((r, Ok(()))) => c.stream_sharing_to_hub(r, hub, &settings),
+                    Some((_, Err(why))) => {
+                        tracing::info!(group = %spec.id, "encode group uses its own encoder: {why}");
+                        c.stream_group_to_hub(hub, &settings, Some(spec.key.fps))
+                    }
+                    None => c.stream_group_to_hub(hub, &settings, Some(spec.key.fps)),
+                }
+                .map_err(|e| e.to_string())?
+            } else {
+                c.stream_group_to_hub(hub, &settings, Some(spec.key.fps)).map_err(|e| e.to_string())?
+            };
+            let now = std::time::Instant::now();
+            tracing::info!(
+                group = %spec.id,
+                width = spec.key.width,
+                height = spec.key.height,
+                fps = spec.key.fps,
+                kbps = spec.key.kbps,
+                "started encode group directly into Hub"
+            );
+            h.groups.insert(spec.id.clone(), GroupSlot { spec, output, started: now, with: settings, live_pct: None });
+            Ok(true)
+        })
+        .await?
+    }
+
+    async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
+        let app = self.app.clone();
+        let group_id = id.to_string();
+        self.on_main(move |h| {
+            h.groups.remove(&group_id);
+            if !any_stream_group_active(h) {
+                h.stream_started = None;
+                h.stream_with = None;
+                apply_waiting_canvas(&app, h);
+            }
+        })
+        .await
+    }
+
+    async fn set_group_live_quality(&self, id: &str, pct: u8) -> Result<(), String> {
+        let group_id = id.to_string();
+        let handled = self
+            .on_main(move |h| {
+                let Some(slot) = h.groups.get_mut(&group_id) else {
+                    return false;
+                };
+                slot.live_pct = (pct < 100).then_some(pct);
+                let kbps = at_pct(slot.spec.key.kbps, slot.live_pct);
+                slot.output.set_video_kbps(kbps);
+                slot.with.encode.video_kbps = kbps;
+                tracing::info!(group = %slot.spec.id, pct, kbps, "auto quality: group bitrate updated");
+                true
+            })
+            .await?;
+        if !handled && id == GROUP_MAIN {
+            return self.set_live_quality(pct).await;
+        }
+        Ok(())
+    }
+
+    async fn group_stats(&self) -> Result<Option<Value>, String> {
+        self.on_main(|h| {
+            let mut map = serde_json::Map::new();
+            for (id, slot) in &h.groups {
+                map.insert(id.clone(), stats_of(&slot.output, Some(slot.started)));
+            }
+            if !map.contains_key(GROUP_MAIN)
+                && let Some(st) = h.stream.as_ref()
+            {
+                map.insert(GROUP_MAIN.to_string(), stats_of(st, h.stream_started));
+            }
+            if map.is_empty() { None } else { Some(Value::Object(map)) }
         })
         .await
     }
@@ -4551,19 +4783,38 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn stream_stats(&self) -> Result<Value, String> {
-        self.on_main(|h| h.stream.as_ref().map_or(Value::Null, |s| stats_of(s, h.stream_started))).await
+        self.on_main(|h| main_stream_stats(h).map_or(Value::Null, |(s, started)| stats_of(s, started))).await
     }
 
     async fn direct_start(&self, id: String, url: String, key: String, simulcast: bool) -> Result<(), String> {
         self.on_main(move |h| {
-            let s = h.stream.as_mut().filter(|s| s.stats().active).ok_or("The Studio isn't streaming.")?;
-            tracing::info!(dest = %id, simulcast, "the Studio sends straight to a server (SRT, RIST or WebRTC)");
-            // Simulcast's lower layer is the lighter stream, when it runs.
-            match h.lstream.as_ref().filter(|l| simulcast && l.stats().active) {
-                Some(lower) => s.add_direct_layered(&id, &url, &key, lower),
-                None => s.add_direct(&id, &url, &key),
+            let lower = h
+                .lstream
+                .as_ref()
+                .filter(|l| simulcast && l.stats().active)
+                .or_else(|| h.groups.get(GROUP_LIGHT).filter(|g| g.output.stats().active).map(|g| &g.output))
+                .map(|_| ());
+            // Safety against borrowing h twice: extract lower pointer index cleanly by cloning StreamStats? No, StageOutput is not Clone;
+            // handle groups/lstream disjointly:
+            if lower.is_some() {
+                if let Some(l) = h.lstream.take() {
+                    let res = main_stream_mut(h)
+                        .ok_or_else(|| "The Studio isn't streaming.".to_string())
+                        .and_then(|s| s.add_direct_layered(&id, &url, &key, &l).map_err(|e| e.to_string()));
+                    h.lstream = Some(l);
+                    return res;
+                }
+                if let Some(lg) = h.groups.remove(GROUP_LIGHT) {
+                    let res = main_stream_mut(h)
+                        .ok_or_else(|| "The Studio isn't streaming.".to_string())
+                        .and_then(|s| s.add_direct_layered(&id, &url, &key, &lg.output).map_err(|e| e.to_string()));
+                    h.groups.insert(GROUP_LIGHT.to_string(), lg);
+                    return res;
+                }
             }
-            .map_err(|e| e.to_string())
+            let s = main_stream_mut(h).ok_or("The Studio isn't streaming.")?;
+            tracing::info!(dest = %id, simulcast, "the Studio sends straight to a server (SRT, RIST or WebRTC)");
+            s.add_direct(&id, &url, &key).map_err(|e| e.to_string())
         })
         .await?
     }
@@ -4573,13 +4824,15 @@ impl StudioHost for DesktopStudio {
             if let Some(s) = h.stream.as_mut() {
                 s.remove_direct(&id);
             }
+            for slot in h.groups.values_mut() {
+                slot.output.remove_direct(&id);
+            }
         })
         .await
     }
 
     async fn direct_stats(&self, id: String) -> Result<Value, String> {
-        self.on_main(move |h| h.stream.as_ref().and_then(|s| s.direct_stats(&id)).map_or(Value::Null, |st| json!(st)))
-            .await
+        self.on_main(move |h| active_direct_stats(h, &id).map_or(Value::Null, |st| json!(st))).await
     }
 }
 
@@ -5448,6 +5701,73 @@ mod budget_tests {
         };
         let sw_b = encode_budget_with_host(&s_sw, None, None, Some(&cpu8), Also::default());
         assert_eq!((sw_b["budget_mpx"].as_f64(), sw_b["level"].as_str()), (Some(180.0), Some("ok")), "{sw_b}");
+    }
+
+    #[test]
+    fn stream_settings_for_group_isolates_custom_and_vertical_profiles() {
+        let s = StudioSettings {
+            width: 2560,
+            height: 1440,
+            fps: 60,
+            video_kbps: 18_000,
+            audio_kbps: 160,
+            keyframe_s: 4,
+            bframes: true,
+            twitch_vod_track: 2,
+            ..StudioSettings::default()
+        };
+        let twitch_spec = EncodeGroupSpec {
+            id: "g_twitch".into(),
+            key: ferrocast_engine::studio_host::EncodeKey {
+                canvas: EncodeCanvas::Main,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                fps_ntsc: false,
+                kbps: 6_000,
+                codec: EncodeCodec::H264,
+                keyframe_s: 2,
+                strict_cbr: true,
+                no_bframes: true,
+                audio_kbps: 128,
+            },
+            extra_tracks: Vec::new(),
+            vod_track: true,
+            is_light: false,
+            is_twitch_eb: false,
+        };
+        let t_out = stream_settings_for_group(&s, &twitch_spec);
+        assert_eq!(t_out.encode.scale, Some((1920, 1080)));
+        assert_eq!(t_out.encode.video_kbps, 6_000);
+        assert!(t_out.encode.strict_cbr);
+        assert!(!t_out.encode.bframes);
+        assert_eq!(t_out.encode.keyframe_s, 2);
+        assert_eq!(t_out.encode.audio_kbps, 128);
+        assert_eq!(t_out.vod_track, Some(2));
+
+        let vert_spec = EncodeGroupSpec {
+            id: "g_vert".into(),
+            key: ferrocast_engine::studio_host::EncodeKey {
+                canvas: EncodeCanvas::Vertical,
+                width: 720,
+                height: 1280,
+                fps: 30,
+                fps_ntsc: false,
+                kbps: 3_500,
+                codec: EncodeCodec::H264,
+                keyframe_s: 2,
+                strict_cbr: true,
+                no_bframes: false,
+                audio_kbps: 160,
+            },
+            extra_tracks: Vec::new(),
+            vod_track: false,
+            is_light: false,
+            is_twitch_eb: false,
+        };
+        let v_out = stream_settings_for_group(&s, &vert_spec);
+        assert_eq!(v_out.encode.scale, Some((720, 1280)));
+        assert_eq!(v_out.vod_track, None);
     }
 
     /// A save that changes what only a restart can (the sound rate, broadcast timing) says so; a
