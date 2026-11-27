@@ -1,9 +1,10 @@
 //! Finding the live chat and holding the `streamList` stream open while live.
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use ferrocast_connector::EventSink;
+use ferrocast_connector::{EventSink, NativePollTally};
 use ferrocast_core::event::{ConnectorStatus, Event, EventKind, Millis, Origin, Platform};
 use tokio::sync::Notify;
 use tonic::Code;
@@ -215,6 +216,7 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
     let mut drops = 0u32;
     // The stream refused a token this many times in a row (reset when it delivers).
     let mut refused = 0u32;
+    let mut active_poll: Option<(String, Vec<u64>)> = None;
     loop {
         let ch = match channel(&api.ep.grpc).await {
             Ok(c) => c,
@@ -275,6 +277,7 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                     if let Some(next) = resp.next_page_token.clone().filter(|t| !t.is_empty()) {
                         page_token = Some(next);
                     }
+                    let mut closed_in_items = HashSet::new();
                     for item in &resp.items {
                         if let Some(mut e) = map::map(item, Millis(now_ms())) {
                             // The first answer replays recent chat; it's history, not new
@@ -287,13 +290,82 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                             if first_batch && published.is_none_or(|p| p < opened_at - crate::feed::BACKFILL_SLACK_MS) {
                                 e.origin = Origin::Backfill;
                             }
+                            if let EventKind::NativePoll { poll_id, counts, ended } = &e.kind {
+                                if e.origin == Origin::Backfill {
+                                    continue;
+                                }
+                                api.record_poll(&NativePollTally {
+                                    external_id: poll_id.clone(),
+                                    counts: counts.clone(),
+                                    ended: *ended,
+                                });
+                                if *ended {
+                                    closed_in_items.insert(poll_id.clone());
+                                    if active_poll.as_ref().is_some_and(|(id, _)| id == poll_id) {
+                                        active_poll = None;
+                                    }
+                                } else {
+                                    active_poll = Some((poll_id.clone(), counts.clone()));
+                                }
+                            }
                             if sink.send(e).await.is_err() {
                                 return End::Lost("the engine stopped".into());
                             }
                         }
                     }
+                    if let Some(poll_msg) = &resp.active_poll_item {
+                        if let Some(ev) = map::map(poll_msg, Millis(now_ms())) {
+                            if let EventKind::NativePoll { poll_id, counts, ended } = &ev.kind {
+                                api.record_poll(&NativePollTally {
+                                    external_id: poll_id.clone(),
+                                    counts: counts.clone(),
+                                    ended: *ended,
+                                });
+                                if *ended {
+                                    active_poll = None;
+                                } else {
+                                    active_poll = Some((poll_id.clone(), counts.clone()));
+                                }
+                            }
+                            if sink.send(ev).await.is_err() {
+                                return End::Lost("the engine stopped".into());
+                            }
+                        }
+                    } else if let Some((prev_id, prev_counts)) = active_poll.take()
+                        && !closed_in_items.contains(&prev_id)
+                    {
+                        api.record_poll(&NativePollTally {
+                            external_id: prev_id.clone(),
+                            counts: prev_counts.clone(),
+                            ended: true,
+                        });
+                        let ev = Event::live(
+                            Platform::Youtube,
+                            Some(format!("{prev_id}#POLL_EVENT")),
+                            Millis(now_ms()),
+                            EventKind::NativePoll { poll_id: prev_id, counts: prev_counts, ended: true },
+                        );
+                        if sink.send(ev).await.is_err() {
+                            return End::Lost("the engine stopped".into());
+                        }
+                    }
                     first_batch = false;
                     if resp.offline_at.as_deref().is_some_and(|s| !s.is_empty()) {
+                        if let Some((prev_id, prev_counts)) = active_poll.take() {
+                            api.record_poll(&NativePollTally {
+                                external_id: prev_id.clone(),
+                                counts: prev_counts.clone(),
+                                ended: true,
+                            });
+                            let _ = sink
+                                .send(Event::live(
+                                    Platform::Youtube,
+                                    Some(format!("{prev_id}#POLL_EVENT")),
+                                    Millis(now_ms()),
+                                    EventKind::NativePoll { poll_id: prev_id, counts: prev_counts, ended: true },
+                                ))
+                                .await;
+                        }
                         return End::ChatEnded;
                     }
                 }

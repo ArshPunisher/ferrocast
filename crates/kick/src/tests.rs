@@ -468,3 +468,15 @@ async fn connector_viewer_count_reads_channels_falls_back_to_livestreams_and_map
         "expected MissingScope(channel:read), got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn kick_poll_capability_reports_chat_fallback() {
+    use ferrocast_connector::Connector;
+    use ferrocast_core::poll::PollCapabilityMode;
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let c = KickConnector { api: Arc::new(api("http://127.0.0.1:1", seen)), broadcaster_id: "42".into() };
+    let cap = c.poll_capability().await.unwrap();
+    assert_eq!(cap.platform, Platform::Kick);
+    assert_eq!(cap.mode, PollCapabilityMode::ChatFallback);
+    assert_eq!(cap.reason.as_deref(), Some("platform_unsupported"));
+}

@@ -121,6 +121,8 @@ pub struct Api {
     active_broadcasts: StdMutex<ActiveBroadcastCache>,
     /// When daily quota ran out, stop polling viewer counts until this monotonic instant.
     quota_paused_until: StdMutex<Option<std::time::Instant>>,
+    /// Latest live-chat poll snapshot seen from create, streamList, or transition.
+    latest_poll: StdMutex<Option<ferrocast_connector::NativePollTally>>,
 }
 
 struct ActiveBroadcastCache {
@@ -208,6 +210,7 @@ impl Api {
             read_ttl_ms: READ_TTL_MS,
             active_broadcasts: StdMutex::new(ActiveBroadcastCache::default()),
             quota_paused_until: StdMutex::new(None),
+            latest_poll: StdMutex::new(None),
         }
     }
 
@@ -525,6 +528,78 @@ impl Api {
         self.call(Method::POST, "/liveChat/messages", &[("part", "snippet")], Some(body)).await.map(|_| ())
     }
 
+    /// Stores the most recent native poll tally observed from REST or `streamList`.
+    pub fn record_poll(&self, tally: &ferrocast_connector::NativePollTally) {
+        *self.latest_poll.lock().unwrap_or_else(|p| p.into_inner()) = Some(tally.clone());
+    }
+
+    /// Returns the latest cached snapshot for `external_id`, if any.
+    pub fn latest_poll(&self, external_id: &str) -> Option<ferrocast_connector::NativePollTally> {
+        self.latest_poll
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|t| t.external_id == external_id)
+            .cloned()
+    }
+
+    /// Creates a native YouTube live chat poll (`liveChatMessages.insert` with `type: "pollEvent"`).
+    pub async fn create_poll(
+        &self,
+        live_chat_id: &str,
+        question: &str,
+        options: &[String],
+    ) -> Result<ferrocast_connector::NativePollTally, YoutubeError> {
+        let opts: Vec<Value> = options.iter().map(|o| json!({ "optionText": o })).collect();
+        let body = json!({
+            "snippet": {
+                "liveChatId": live_chat_id,
+                "type": "pollEvent",
+                "pollDetails": {
+                    "metadata": {
+                        "questionText": question,
+                        "options": opts,
+                    }
+                }
+            }
+        });
+        let v = self.call(Method::POST, "/liveChat/messages", &[("part", "snippet")], Some(body)).await?;
+        let tally = parse_youtube_poll(&v, options.len(), false)?;
+        self.record_poll(&tally);
+        Ok(tally)
+    }
+
+    /// Closes an active YouTube live chat poll (`liveChatMessages.transition` with `status=closed`).
+    pub async fn close_poll(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<ferrocast_connector::NativePollTally>, YoutubeError> {
+        match self
+            .call(
+                Method::POST,
+                "/liveChat/messages/transition",
+                &[("id", message_id), ("status", "closed"), ("part", "snippet")],
+                None,
+            )
+            .await
+        {
+            Ok(v) => {
+                let tally = parse_youtube_poll(&v, 0, true)?;
+                self.record_poll(&tally);
+                Ok(Some(tally))
+            }
+            Err(YoutubeError::Refused(m)) => {
+                if let Some(existing) = self.latest_poll(message_id)
+                    && existing.ended
+                {
+                    return Ok(Some(existing));
+                }
+                Err(YoutubeError::Refused(m))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn delete(&self, message_id: &str) -> Result<(), YoutubeError> {
         self.call(Method::DELETE, "/liveChat/messages", &[("id", message_id)], None).await.map(|_| ())
     }
@@ -571,6 +646,47 @@ pub const VIDEO_CATEGORIES: &[(&str, &str)] = &[
 
 /// YouTube's title limit (Twitch allows 140).
 pub const MAX_TITLE_CHARS: usize = 100;
+
+/// Native YouTube live chat poll constraints (`liveChatMessages.insert` `pollEvent`).
+pub const YOUTUBE_POLL_LIMITS: ferrocast_core::poll::PollLimits = ferrocast_core::poll::PollLimits {
+    min_options: 2,
+    max_options: 4,
+    min_duration_s: 10,
+    max_duration_s: 1800,
+    supports_no_timer: true,
+    question_chars: 100,
+    option_chars: 35,
+};
+
+fn parse_youtube_poll(
+    v: &Value,
+    expected_options: usize,
+    force_ended: bool,
+) -> Result<ferrocast_connector::NativePollTally, YoutubeError> {
+    let external_id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| YoutubeError::Protocol("no poll id returned".into()))?
+        .to_string();
+    let counts = match v.pointer("/snippet/pollDetails/metadata/options").and_then(Value::as_array) {
+        Some(opts) => opts
+            .iter()
+            .map(|o| match o.get("tally") {
+                Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+                Some(Value::String(s)) => s.trim().parse::<u64>().unwrap_or(0),
+                _ => 0,
+            })
+            .collect(),
+        None => vec![0; expected_options],
+    };
+    let ended = force_ended
+        || v.pointer("/snippet/pollDetails/status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("closed"));
+    Ok(ferrocast_connector::NativePollTally { external_id, counts, ended })
+}
 
 impl Api {
     /// The channel's eligible normal broadcast (active first, else an upcoming one within the

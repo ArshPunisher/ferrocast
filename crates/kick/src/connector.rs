@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use ferrocast_connector::{Connector, ConnectorError, Result};
 use ferrocast_core::event::Platform;
 use ferrocast_core::moderation::{Capabilities, ModeChange};
+use ferrocast_core::poll::{DEFAULT_LIMITS, PlatformPollCapability, PollCapabilityMode};
 
 use crate::api::KickApi;
 
@@ -64,5 +65,14 @@ impl Connector for KickConnector {
 
     async fn viewer_count(&self) -> Result<Option<u64>> {
         Ok(self.api.stream_viewers(&self.broadcaster_id).await?)
+    }
+
+    async fn poll_capability(&self) -> Option<PlatformPollCapability> {
+        Some(PlatformPollCapability {
+            platform: Platform::Kick,
+            mode: PollCapabilityMode::ChatFallback,
+            reason: Some("platform_unsupported".into()),
+            limits: DEFAULT_LIMITS,
+        })
     }
 }

@@ -4,11 +4,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ferrocast_connector::{Connector, ConnectorError, Result};
+use ferrocast_connector::{Connector, ConnectorError, NativePollSpec, NativePollTally, Result};
 use ferrocast_core::event::Platform;
 use ferrocast_core::moderation::{Capabilities, ModeChange};
+use ferrocast_core::poll::{PlatformPollCapability, PollCapabilityMode};
 
-use crate::api::Api;
+use crate::api::{Api, YOUTUBE_POLL_LIMITS};
 use crate::stream::LiveChat;
 use crate::{YoutubeError, now_ms, quota_jitter_s, quota_resets_in};
 
@@ -166,5 +167,46 @@ impl Connector for YoutubeConnector {
             }
         }
         Ok(count)
+    }
+
+    async fn poll_capability(&self) -> Option<PlatformPollCapability> {
+        let is_live = self.live.read().unwrap_or_else(|p| p.into_inner()).is_some();
+        Some(PlatformPollCapability {
+            platform: Platform::Youtube,
+            mode: if is_live { PollCapabilityMode::Native } else { PollCapabilityMode::ChatFallback },
+            reason: if is_live { None } else { Some("not_live".into()) },
+            limits: YOUTUBE_POLL_LIMITS,
+        })
+    }
+
+    async fn create_native_poll(&self, spec: &NativePollSpec) -> Result<NativePollTally> {
+        if spec.question.chars().count() > YOUTUBE_POLL_LIMITS.question_chars {
+            return Err(ConnectorError::Refused {
+                platform: Platform::Youtube,
+                message: format!("Question exceeds YouTube {} character limit.", YOUTUBE_POLL_LIMITS.question_chars),
+            });
+        }
+        if spec.options.len() < YOUTUBE_POLL_LIMITS.min_options
+            || spec.options.len() > YOUTUBE_POLL_LIMITS.max_options
+            || spec.options.iter().any(|o| o.chars().count() > YOUTUBE_POLL_LIMITS.option_chars)
+        {
+            return Err(ConnectorError::Refused {
+                platform: Platform::Youtube,
+                message: format!(
+                    "YouTube polls allow {} to {} answers of at most {} characters.",
+                    YOUTUBE_POLL_LIMITS.min_options, YOUTUBE_POLL_LIMITS.max_options, YOUTUBE_POLL_LIMITS.option_chars
+                ),
+            });
+        }
+        let chat = self.chat()?;
+        self.api.create_poll(&chat, &spec.question, &spec.options).await.map_err(|e| self.map_err(e))
+    }
+
+    async fn get_native_poll(&self, external_id: &str) -> Result<Option<NativePollTally>> {
+        Ok(self.api.latest_poll(external_id))
+    }
+
+    async fn end_native_poll(&self, external_id: &str) -> Result<Option<NativePollTally>> {
+        self.api.close_poll(external_id).await.map_err(|e| self.map_err(e))
     }
 }

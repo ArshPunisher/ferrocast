@@ -2843,3 +2843,224 @@ async fn viewer_count_rediscovers_broadcasts_after_cached_broadcast_ends() {
         ]
     );
 }
+
+#[tokio::test]
+async fn native_poll_capability_create_transition_and_stream_updates() {
+    use axum::extract::{Query, State};
+    use ferrocast_connector::{Connector, ConnectorError, NativePollSpec};
+    use ferrocast_core::poll::PollCapabilityMode;
+    use serde_json::Value;
+    use std::collections::HashMap;
+
+    type PollCalls = Arc<Mutex<Vec<(String, Option<Value>)>>>;
+    #[derive(Clone, Default)]
+    struct PollMock {
+        calls: PollCalls,
+    }
+
+    let st = PollMock::default();
+    let app = axum::Router::new()
+        .route(
+            "/api/liveBroadcasts",
+            axum::routing::get(|| async {
+                axum::Json(json!({ "items": [{ "id": "b-1", "snippet": { "liveChatId": "chat-1" } }] }))
+            }),
+        )
+        .route(
+            "/api/liveChat/messages",
+            axum::routing::post(|State(st): State<PollMock>, axum::Json(body): axum::Json<Value>| async move {
+                st.calls.lock().unwrap().push(("POST /liveChat/messages".into(), Some(body.clone())));
+                let q = body["snippet"]["pollDetails"]["metadata"]["questionText"].as_str().unwrap_or("");
+                let opts =
+                    body["snippet"]["pollDetails"]["metadata"]["options"].as_array().cloned().unwrap_or_default();
+                axum::Json(json!({
+                    "id": "yt-poll-1",
+                    "snippet": {
+                        "type": "pollEvent",
+                        "pollDetails": {
+                            "status": "active",
+                            "metadata": {
+                                "questionText": q,
+                                "options": opts.iter().enumerate().map(|(i, o)| json!({
+                                    "optionText": o["optionText"],
+                                    "tally": if i == 0 { json!("2") } else { json!(1) }
+                                })).collect::<Vec<_>>()
+                            }
+                        }
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/api/liveChat/messages/transition",
+            axum::routing::post(|State(st): State<PollMock>, Query(q): Query<HashMap<String, String>>| async move {
+                st.calls.lock().unwrap().push((
+                    format!(
+                        "POST /liveChat/messages/transition id={} status={} part={}",
+                        q.get("id").map(String::as_str).unwrap_or(""),
+                        q.get("status").map(String::as_str).unwrap_or(""),
+                        q.get("part").map(String::as_str).unwrap_or(""),
+                    ),
+                    None,
+                ));
+                axum::Json(json!({
+                    "id": "yt-poll-1",
+                    "snippet": {
+                        "type": "pollEvent",
+                        "pollDetails": {
+                            "status": "closed",
+                            "metadata": {
+                                "questionText": "Map?",
+                                "options": [
+                                    { "optionText": "Ascent", "tally": "5" },
+                                    { "optionText": "Bind", "tally": "3" }
+                                ]
+                            }
+                        }
+                    }
+                }))
+            }),
+        )
+        .with_state(st.clone());
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await });
+    let ep =
+        Endpoints { authorize: String::new(), token: String::new(), api: format!("{base}/api"), grpc: String::new() };
+    let api = Arc::new(video_api(ep));
+    let live: stream::LiveChat = Arc::default();
+    let c = crate::YoutubeConnector { api: api.clone(), live: live.clone() };
+
+    // Offline -> ChatFallback("not_live"); live -> Native with max 4 options.
+    let off = c.poll_capability().await.unwrap();
+    assert_eq!(off.mode, PollCapabilityMode::ChatFallback);
+    assert_eq!(off.reason.as_deref(), Some("not_live"));
+    let spec =
+        NativePollSpec { question: "Map?".into(), options: vec!["Ascent".into(), "Bind".into()], duration_s: None };
+    assert!(matches!(c.create_native_poll(&spec).await, Err(ConnectorError::Refused { .. })));
+
+    *live.write().unwrap() = Some("chat-1".into());
+    let on = c.poll_capability().await.unwrap();
+    assert_eq!(on.mode, PollCapabilityMode::Native);
+    assert_eq!(on.limits.max_options, 4);
+
+    // 5 options rejected cleanly without burning YouTube insert quota.
+    let five = NativePollSpec {
+        question: "Pick?".into(),
+        options: vec!["1".into(), "2".into(), "3".into(), "4".into(), "5".into()],
+        duration_s: Some(60),
+    };
+    assert!(matches!(c.create_native_poll(&five).await, Err(ConnectorError::Refused { .. })));
+    assert!(st.calls.lock().unwrap().is_empty());
+
+    // Create + get_native_poll + close via transition.
+    let created = c.create_native_poll(&spec).await.unwrap();
+    assert_eq!(created.external_id, "yt-poll-1");
+    assert_eq!(created.counts, vec![2, 1]);
+    assert!(!created.ended);
+    assert_eq!(c.get_native_poll("yt-poll-1").await.unwrap(), Some(created));
+
+    let ended = c.end_native_poll("yt-poll-1").await.unwrap().unwrap();
+    assert_eq!(ended.counts, vec![5, 3]);
+    assert!(ended.ended);
+    let calls = st.calls.lock().unwrap().clone();
+    assert_eq!(calls[0].0, "POST /liveChat/messages");
+    assert_eq!(calls[0].1.as_ref().unwrap()["snippet"]["type"], "pollEvent");
+    assert_eq!(calls[1].0, "POST /liveChat/messages/transition id=yt-poll-1 status=closed part=snippet");
+
+    // StreamList mapping: active_poll_item emits NativePoll and disappearing active_poll_item emits ended=true.
+    struct PollStream {
+        step: Arc<Mutex<usize>>,
+    }
+    #[tonic::async_trait]
+    impl V3DataLiveChatMessageService for PollStream {
+        type StreamListStream = tokio_stream::wrappers::ReceiverStream<Result<LiveChatMessageListResponse, Status>>;
+        async fn stream_list(
+            &self,
+            _req: Request<LiveChatMessageListRequest>,
+        ) -> Result<Response<Self::StreamListStream>, Status> {
+            let (tx, rx) = mpsc::channel(8);
+            let mut n = self.step.lock().unwrap();
+            *n += 1;
+            tokio::spawn(async move {
+                let active = msg(
+                    "yt-poll-2",
+                    Type::PollEvent,
+                    Some(DisplayedContent::PollDetails(LiveChatPollDetails {
+                        metadata: Some(crate::proto::live_chat_poll_details::PollMetadata {
+                            question_text: Some("Next?".into()),
+                            options: vec![
+                                crate::proto::live_chat_poll_details::poll_metadata::PollOption {
+                                    option_text: Some("A".into()),
+                                    tally: Some(4),
+                                },
+                                crate::proto::live_chat_poll_details::poll_metadata::PollOption {
+                                    option_text: Some("B".into()),
+                                    tally: Some(6),
+                                },
+                            ],
+                        }),
+                        status: Some(
+                            crate::proto::live_chat_poll_details::poll_status_wrapper::PollStatus::Active as i32,
+                        ),
+                    })),
+                    "UCowner",
+                );
+                let _ = tx
+                    .send(Ok(LiveChatMessageListResponse {
+                        active_poll_item: Some(active),
+                        ..page(vec![], "p1", false)
+                    }))
+                    .await;
+                let _ = tx.send(Ok(page(vec![], "p2", true))).await;
+            });
+            Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        }
+    }
+
+    let grpc = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let grpc_addr = grpc.local_addr().unwrap();
+    let svc = V3DataLiveChatMessageServiceServer::new(PollStream { step: Arc::default() });
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc))
+            .await
+    });
+    let ep_stream = Endpoints {
+        authorize: String::new(),
+        token: String::new(),
+        api: format!("{base}/api"),
+        grpc: format!("http://{grpc_addr}"),
+    };
+    let api_stream = Arc::new(video_api(ep_stream));
+    let (sink, mut rx) = mpsc::channel(16);
+    let wake = Arc::new(Notify::new());
+    let h = tokio::spawn(stream::run_with(
+        api_stream.clone(),
+        sink,
+        wake,
+        Arc::default(),
+        stream::Waits { rate: Some(Duration::from_millis(10)), quota: Some(Duration::from_millis(10)) },
+    ));
+    let mut events = Vec::new();
+    for _ in 0..8 {
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+        let offline = matches!(ev.kind, EventKind::StreamOffline);
+        events.push(ev);
+        if offline {
+            break;
+        }
+    }
+    h.abort();
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::NativePoll { poll_id, counts, ended: false } if poll_id == "yt-poll-2" && counts == &[4, 6]
+    )));
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::NativePoll { poll_id, counts, ended: true } if poll_id == "yt-poll-2" && counts == &[4, 6]
+    )));
+    assert_eq!(api_stream.latest_poll("yt-poll-2").map(|t| t.ended), Some(true));
+}
