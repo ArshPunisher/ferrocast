@@ -3153,7 +3153,7 @@ async fn golive_quality_options_and_put_quality_cover_every_status_code() {
     let res_404 = r.put("/api/v1/golive/destinations/does_not_exist/quality", json!({ "mode": "same_as_main" })).await;
     assert_eq!(error_code(res_404).await, (StatusCode::NOT_FOUND, "not_found".into()));
 
-    // 400 malformed JSON, unknown fields (deny_unknown_fields), missing/invalid custom dims/fps/kbps/limits.
+    // 400 malformed JSON, unknown fields (deny_unknown_fields), invalid custom dims/fps/kbps/upscale/vp9.
     assert_eq!(
         error_code(r.raw(reqwest::Method::PUT, "/api/v1/golive/destinations/kick/quality", "{bad").await).await.0,
         StatusCode::BAD_REQUEST
@@ -3165,11 +3165,29 @@ async fn golive_quality_options_and_put_quality_cover_every_status_code() {
         json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "extra": true }),
         json!({ "mode": "custom", "width": 1281, "height": 720, "fps": 30, "kbps": 3000 }),
         json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 45, "kbps": 3000 }),
-        json!({ "mode": "custom", "width": 2560, "height": 1440, "fps": 60, "kbps": 8000 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 100 }),
+        json!({ "mode": "custom", "width": 3840, "height": 2160, "fps": 60, "kbps": 8000 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "codec": "vp9" }),
     ] {
         let res = r.put("/api/v1/golive/destinations/kick/quality", bad_body.clone()).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST, "expected 400 for {bad_body}");
     }
+
+    // 422 platform_limit_exceeded and golive_quality_locked domain rejections.
+    let over_kick = r
+        .put(
+            "/api/v1/golive/destinations/kick/quality",
+            json!({ "mode": "custom", "width": 2560, "height": 1440, "fps": 60, "kbps": 8000 }),
+        )
+        .await;
+    assert_eq!(error_code(over_kick).await, (StatusCode::UNPROCESSABLE_ENTITY, "platform_limit_exceeded".into()));
+    let locked_av1 = r
+        .put(
+            "/api/v1/golive/destinations/youtube/quality",
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "codec": "av1" }),
+        )
+        .await;
+    assert_eq!(error_code(locked_av1).await, (StatusCode::UNPROCESSABLE_ENTITY, "golive_quality_locked".into()));
 
     // 200 PUT custom quality offline + additive GoLiveView fields.
     let put_ok = r
