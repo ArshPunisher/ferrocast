@@ -389,9 +389,17 @@ const GO_LIVE_ROUTES: &[RouteDoc] = &[
         "GET",
         "/golive",
         "Go Live",
-        "Multistream destinations, protection, and vertical canvas configuration.",
+        "Multistream destinations, protection, encode groups/budget, and vertical canvas configuration.",
         None,
+        Some("GoLiveView"),
+    ),
+    doc(
+        "GET",
+        "/golive/quality-options",
+        "Go Live",
+        "Per-destination allowed resolutions, fps, bitrates, soft-limit notes, encoder sharing, and PC encode budget.",
         None,
+        Some("GoLiveQualityOptionsResponse"),
     ),
     doc("GET", "/golive/ingest", "Go Live", "Local RTMP/SRT ingest URL and stream keys (PC only; secret).", None, None),
     doc(
@@ -443,6 +451,14 @@ const GO_LIVE_ROUTES: &[RouteDoc] = &[
         "Toggle Enhanced Broadcasting settings for a destination.",
         None,
         None,
+    ),
+    doc(
+        "PUT",
+        "/golive/destinations/{id}/quality",
+        "Go Live",
+        "Set per-destination stream quality (`same_as_main` or `custom`, PC only). While Studio is streaming, performs a single-destination live switch without interrupting other destinations.",
+        Some("SetDestinationQualityRequest"),
+        Some("GoLiveView"),
     ),
     doc(
         "POST",
@@ -2307,13 +2323,33 @@ fn build_openapi() -> Value {
             })
         };
 
-        let responses = json!({
-            ok_status: ok_entry,
-            "401": { "description": "Missing, invalid, revoked, or expired credentials.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
-            "403": { "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } },
-            "429": { "description": "Per-key rate limit exceeded (see Retry-After header).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }
-        });
-        op.insert("responses".into(), responses);
+        let mut responses = Map::new();
+        responses.insert(ok_status.into(), ok_entry);
+        if r.method == "PUT" && r.rel_path == "/golive/destinations/{id}/quality" {
+            let err_schema = json!({ "$ref": "#/components/schemas/ApiError" });
+            for (code, desc) in [
+                (
+                    "400",
+                    "Invalid JSON, unknown field, invalid resolution/fps/bitrate/codec, over platform limit, or custom quality disallowed for Direct/Twitch EB/Cut.",
+                ),
+                ("404", "Unknown destination id."),
+                ("409", "A live quality switch is already in progress for this destination."),
+                ("415", "Missing or non-JSON Content-Type header."),
+                (
+                    "422",
+                    "Exceeds PC encode budget, OBS streaming mode requires restart, or live keyframe handover failed/cancelled.",
+                ),
+            ] {
+                responses.insert(
+                    code.into(),
+                    json!({ "description": desc, "content": { "application/json": { "schema": err_schema } } }),
+                );
+            }
+        }
+        responses.insert("401".into(), json!({ "description": "Missing, invalid, revoked, or expired credentials.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }));
+        responses.insert("403".into(), json!({ "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }));
+        responses.insert("429".into(), json!({ "description": "Per-key rate limit exceeded (see Retry-After header).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } } }));
+        op.insert("responses".into(), Value::Object(responses));
 
         paths.entry(full_path).or_default().insert(method_key, Value::Object(op));
     }
@@ -2654,6 +2690,271 @@ fn schedule_schemas() -> Map<String, Value> {
             "brand": { "type": "string", "enum": ["x", "instagram", "facebook"], "description": "Names a server and key pasted from that platform; changes nothing about how the stream is sent." }
         }
     }));
+    m
+}
+
+fn golive_quality_schemas() -> Map<String, Value> {
+    let mut m = Map::new();
+    let codec_enum = json!({ "type": "string", "enum": ["h264", "hevc", "av1", "vp9"] });
+    let quality_one_of = json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode"],
+                "properties": {
+                    "mode": { "const": "same_as_main" }
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mode", "width", "height", "fps", "kbps"],
+                "properties": {
+                    "mode": { "const": "custom" },
+                    "width": { "type": "integer", "minimum": 2 },
+                    "height": { "type": "integer", "minimum": 2 },
+                    "fps": { "type": "integer", "minimum": 1 },
+                    "kbps": { "type": "integer", "minimum": 500, "maximum": 60000 },
+                    "codec": { "oneOf": [codec_enum.clone(), { "type": "null" }] }
+                }
+            }
+        ]
+    });
+    m.insert("DestinationQuality".into(), quality_one_of.clone());
+    m.insert("SetDestinationQualityRequest".into(), quality_one_of);
+    m.insert(
+        "ResolvedQuality".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "width", "height", "fps", "kbps", "codec", "audio_kbps",
+                "auto_fitted", "separate_encode", "group_id", "shared_with"
+            ],
+            "properties": {
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "fps": { "type": "integer" },
+                "kbps": { "type": "integer" },
+                "codec": codec_enum.clone(),
+                "audio_kbps": { "type": "integer" },
+                "auto_fitted": { "type": "boolean" },
+                "separate_encode": { "type": "boolean" },
+                "group_id": { "type": "string" },
+                "shared_with": { "type": "array", "items": { "type": "string" } }
+            }
+        }),
+    );
+    m.insert(
+        "EncodeGroupView".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "id", "canvas", "width", "height", "fps", "kbps", "codec", "members",
+                "live_fps", "live_kbps", "dropped_frames", "encode_ms"
+            ],
+            "properties": {
+                "id": { "type": "string" },
+                "canvas": { "type": "string", "enum": ["main", "vertical"] },
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "fps": { "type": "integer" },
+                "kbps": { "type": "integer" },
+                "codec": codec_enum.clone(),
+                "members": { "type": "array", "items": { "type": "string" } },
+                "live_fps": { "type": ["number", "null"] },
+                "live_kbps": { "type": ["integer", "null"] },
+                "dropped_frames": { "type": ["integer", "null"] },
+                "encode_ms": { "type": ["number", "null"] }
+            }
+        }),
+    );
+    m.insert(
+        "EncodeBudgetCheck".into(),
+        json!({
+            "type": "object",
+            "required": ["status", "source", "used_mpx_s", "limit_mpx_s", "used_sessions", "max_sessions"],
+            "properties": {
+                "status": { "type": "string", "enum": ["ok", "limit", "over", "unknown"] },
+                "source": { "type": "string", "enum": ["apple_silicon", "bench", "nvenc_default", "hw_default", "cpu_default", "unknown"] },
+                "used_mpx_s": { "type": "number" },
+                "limit_mpx_s": { "type": ["number", "null"] },
+                "used_sessions": { "type": "integer" },
+                "max_sessions": { "type": ["integer", "null"] },
+                "note": { "type": ["string", "null"] }
+            }
+        }),
+    );
+    m.insert(
+        "DestinationView".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "id", "kind", "canvas", "name", "account", "enabled", "connected",
+                "health", "blocked", "rules", "issues", "quality", "resolved_quality", "switching_quality"
+            ],
+            "properties": {
+                "id": { "type": "string" },
+                "kind": { "type": "string", "enum": ["twitch", "youtube", "kick", "custom"] },
+                "canvas": { "type": "string", "enum": ["main", "vertical"] },
+                "name": { "type": "string" },
+                "account": { "type": ["string", "null"] },
+                "enabled": { "type": "boolean" },
+                "connected": { "type": "boolean" },
+                "health": { "type": ["object", "null"], "additionalProperties": true },
+                "blocked": { "type": ["string", "null"] },
+                "brand": { "type": ["string", "null"] },
+                "rules": { "type": "array", "items": { "type": "string" } },
+                "issues": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+                "capped": { "type": ["object", "null"], "additionalProperties": true },
+                "direct": { "type": ["string", "null"], "enum": ["srt", "rist", "whip", null] },
+                "light": { "type": "boolean" },
+                "enhanced": { "type": "boolean" },
+                "lighter_for_route": { "type": "boolean" },
+                "backup_for": { "type": ["string", "null"] },
+                "standby_for": { "type": ["string", "null"] },
+                "key_note": { "type": ["string", "null"] },
+                "quality_note": { "type": ["string", "null"] },
+                "quality": { "$ref": "#/components/schemas/DestinationQuality" },
+                "resolved_quality": { "$ref": "#/components/schemas/ResolvedQuality" },
+                "switching_quality": { "type": "boolean" }
+            }
+        }),
+    );
+    m.insert(
+        "GoLiveView".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "ingest", "obs", "live", "stats", "vertical_live", "vertical_stats",
+                "destinations", "encode_groups", "encode_budget", "upload",
+                "protect", "aitum_ok", "cut", "advanced", "auto_quality"
+            ],
+            "properties": {
+                "ingest": { "type": ["string", "null"] },
+                "obs": { "type": "object", "additionalProperties": true },
+                "live": { "type": "boolean" },
+                "stats": { "type": "object", "additionalProperties": true },
+                "vertical_live": { "type": "boolean" },
+                "vertical_stats": { "type": "object", "additionalProperties": true },
+                "destinations": { "type": "array", "items": { "$ref": "#/components/schemas/DestinationView" } },
+                "encode_groups": { "type": "array", "items": { "$ref": "#/components/schemas/EncodeGroupView" } },
+                "encode_budget": { "$ref": "#/components/schemas/EncodeBudgetCheck" },
+                "upload": { "type": ["object", "null"], "additionalProperties": true },
+                "protect": { "type": "boolean" },
+                "aitum_ok": { "type": "boolean" },
+                "cut": { "type": "object", "additionalProperties": true },
+                "advanced": { "type": "object", "additionalProperties": true },
+                "auto_quality": { "type": "boolean" }
+            }
+        }),
+    );
+    m.insert(
+        "QualityCanvasSummary".into(),
+        json!({
+            "type": "object",
+            "required": ["width", "height", "fps", "kbps", "codec", "audio_kbps"],
+            "properties": {
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "fps": { "type": "integer" },
+                "kbps": { "type": "integer" },
+                "codec": codec_enum.clone(),
+                "audio_kbps": { "type": "integer" }
+            }
+        }),
+    );
+    m.insert(
+        "QualityOptionResolved".into(),
+        json!({
+            "type": "object",
+            "required": ["width", "height", "fps", "kbps", "codec"],
+            "properties": {
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "fps": { "type": "integer" },
+                "kbps": { "type": "integer" },
+                "codec": codec_enum.clone()
+            }
+        }),
+    );
+    m.insert(
+        "QualityOption".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "id", "label", "quality", "resolved", "auto_fitted", "recommended",
+                "note", "shares_encoder_with", "allowed", "disabled_reason"
+            ],
+            "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" },
+                "quality": { "$ref": "#/components/schemas/DestinationQuality" },
+                "resolved": { "$ref": "#/components/schemas/QualityOptionResolved" },
+                "auto_fitted": { "type": "boolean" },
+                "recommended": { "type": "boolean" },
+                "note": { "type": ["string", "null"] },
+                "shares_encoder_with": { "type": "array", "items": { "type": "string" } },
+                "allowed": { "type": "boolean" },
+                "disabled_reason": { "type": ["string", "null"] }
+            }
+        }),
+    );
+    m.insert(
+        "CustomQualityLimits".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "max_width", "max_height", "min_kbps", "max_kbps", "fps_choices", "codecs",
+                "recommended_width", "recommended_height", "recommended_fps", "recommended_kbps"
+            ],
+            "properties": {
+                "max_width": { "type": "integer" },
+                "max_height": { "type": "integer" },
+                "min_kbps": { "type": "integer" },
+                "max_kbps": { "type": "integer" },
+                "fps_choices": { "type": "array", "items": { "type": "integer" } },
+                "codecs": { "type": "array", "items": codec_enum },
+                "recommended_width": { "type": "integer" },
+                "recommended_height": { "type": "integer" },
+                "recommended_fps": { "type": "integer" },
+                "recommended_kbps": { "type": "integer" }
+            }
+        }),
+    );
+    m.insert(
+        "DestinationQualityOptions".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "canvas", "locked_reason", "current", "resolved", "options", "custom_limits"],
+            "properties": {
+                "id": { "type": "string" },
+                "canvas": { "type": "string", "enum": ["main", "vertical"] },
+                "locked_reason": { "type": ["string", "null"] },
+                "current": { "$ref": "#/components/schemas/DestinationQuality" },
+                "resolved": { "$ref": "#/components/schemas/ResolvedQuality" },
+                "options": { "type": "array", "items": { "$ref": "#/components/schemas/QualityOption" } },
+                "custom_limits": { "oneOf": [{ "$ref": "#/components/schemas/CustomQualityLimits" }, { "type": "null" }] }
+            }
+        }),
+    );
+    m.insert(
+        "GoLiveQualityOptionsResponse".into(),
+        json!({
+            "type": "object",
+            "required": ["source", "main", "vertical", "budget", "destinations"],
+            "properties": {
+                "source": { "type": "string", "enum": ["studio", "obs", "none"] },
+                "main": { "$ref": "#/components/schemas/QualityCanvasSummary" },
+                "vertical": { "oneOf": [{ "$ref": "#/components/schemas/QualityCanvasSummary" }, { "type": "null" }] },
+                "budget": { "$ref": "#/components/schemas/EncodeBudgetCheck" },
+                "destinations": {
+                    "type": "object",
+                    "additionalProperties": { "$ref": "#/components/schemas/DestinationQualityOptions" }
+                }
+            }
+        }),
+    );
     m
 }
 
@@ -3071,6 +3372,7 @@ fn schemas() -> Value {
         map.extend(studio_source_schemas());
         map.extend(studio_stats_schemas());
         map.extend(auto_config_schemas());
+        map.extend(golive_quality_schemas());
         map.extend(store_schemas());
         map.extend(schedule_schemas());
         map.extend(links_and_labels_schemas());
@@ -3449,7 +3751,12 @@ fn build_asyncapi() -> Value {
                     "poll": live_message("poll", "Active poll progress or end state.", "read_only, chat", json!({ "type": "object" })),
                     "giveaway": live_message("giveaway", "Active giveaway state, entry count, or winner.", "read_only, chat", json!({ "type": "object" })),
                     "tts_pending": live_message("tts_pending", "TTS queue items awaiting approval.", "read_only, chat, alerts", json!({ "type": "array" })),
-                    "golive": live_message("golive", "Multistream output state and live bitrate telemetry.", "read_only, go_live, studio_control", json!({ "type": "object" })),
+                    "golive": live_message(
+                        "golive",
+                        "Multistream output state, per-destination resolved quality, encode groups/budget, and live bitrate telemetry.",
+                        "read_only, go_live, studio_control",
+                        golive_live_frame_schema(),
+                    ),
                     "smart_mod": live_message("smart_mod", "Smart Moderation triage card.", "read_only, chat", json!({ "type": "object" })),
                     "update": live_message("update", "Application update check/download state.", "read_only, studio_control", json!({ "type": "object" })),
                     "account": live_message("account", "Ferrocast cloud account sign-in transition (PC session only, never sent to API keys).", "session only (blocked for API keys)", json!({ "type": "object" })),
@@ -3517,6 +3824,11 @@ fn build_asyncapi() -> Value {
         "AutoConfigRecommendation",
         "AutoConfigUploadCheck",
         "AutoConfigAppliedSummary",
+        "DestinationQuality",
+        "ResolvedQuality",
+        "EncodeGroupView",
+        "EncodeBudgetCheck",
+        "DestinationView",
     ] {
         if let Some(def) = all.get(name) {
             shared.insert(name.to_string(), def.clone());
@@ -3524,4 +3836,21 @@ fn build_asyncapi() -> Value {
     }
     doc["components"] = json!({ "schemas": shared });
     doc
+}
+
+fn golive_live_frame_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "live": { "type": "boolean" },
+            "stats": { "type": "object" },
+            "vertical_live": { "type": "boolean" },
+            "vertical_stats": { "type": "object" },
+            "destinations": { "type": "array", "items": { "$ref": "#/components/schemas/DestinationView" } },
+            "encode_groups": { "type": "array", "items": { "$ref": "#/components/schemas/EncodeGroupView" } },
+            "encode_budget": { "$ref": "#/components/schemas/EncodeBudgetCheck" },
+            "cut_state": { "type": ["object", "string", "null"] },
+            "ffmpeg": { "type": ["object", "string", "null"] }
+        }
+    })
 }

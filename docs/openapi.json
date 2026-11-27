@@ -969,6 +969,467 @@
         ],
         "type": "object"
       },
+      "CustomQualityLimits": {
+        "properties": {
+          "codecs": {
+            "items": {
+              "enum": [
+                "h264",
+                "hevc",
+                "av1",
+                "vp9"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fps_choices": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "max_height": {
+            "type": "integer"
+          },
+          "max_kbps": {
+            "type": "integer"
+          },
+          "max_width": {
+            "type": "integer"
+          },
+          "min_kbps": {
+            "type": "integer"
+          },
+          "recommended_fps": {
+            "type": "integer"
+          },
+          "recommended_height": {
+            "type": "integer"
+          },
+          "recommended_kbps": {
+            "type": "integer"
+          },
+          "recommended_width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_width",
+          "max_height",
+          "min_kbps",
+          "max_kbps",
+          "fps_choices",
+          "codecs",
+          "recommended_width",
+          "recommended_height",
+          "recommended_fps",
+          "recommended_kbps"
+        ],
+        "type": "object"
+      },
+      "DestinationQuality": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "const": "same_as_main"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "codec": {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "h264",
+                      "hevc",
+                      "av1",
+                      "vp9"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "fps": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "height": {
+                "minimum": 2,
+                "type": "integer"
+              },
+              "kbps": {
+                "maximum": 60000,
+                "minimum": 500,
+                "type": "integer"
+              },
+              "mode": {
+                "const": "custom"
+              },
+              "width": {
+                "minimum": 2,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "mode",
+              "width",
+              "height",
+              "fps",
+              "kbps"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "DestinationQualityOptions": {
+        "properties": {
+          "canvas": {
+            "enum": [
+              "main",
+              "vertical"
+            ],
+            "type": "string"
+          },
+          "current": {
+            "$ref": "#/components/schemas/DestinationQuality"
+          },
+          "custom_limits": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CustomQualityLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "locked_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/QualityOption"
+            },
+            "type": "array"
+          },
+          "resolved": {
+            "$ref": "#/components/schemas/ResolvedQuality"
+          }
+        },
+        "required": [
+          "id",
+          "canvas",
+          "locked_reason",
+          "current",
+          "resolved",
+          "options",
+          "custom_limits"
+        ],
+        "type": "object"
+      },
+      "DestinationView": {
+        "properties": {
+          "account": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "backup_for": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "blocked": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "brand": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "canvas": {
+            "enum": [
+              "main",
+              "vertical"
+            ],
+            "type": "string"
+          },
+          "capped": {
+            "additionalProperties": true,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "direct": {
+            "enum": [
+              "srt",
+              "rist",
+              "whip",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "enhanced": {
+            "type": "boolean"
+          },
+          "health": {
+            "additionalProperties": true,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "issues": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "key_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "twitch",
+              "youtube",
+              "kick",
+              "custom"
+            ],
+            "type": "string"
+          },
+          "light": {
+            "type": "boolean"
+          },
+          "lighter_for_route": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "quality": {
+            "$ref": "#/components/schemas/DestinationQuality"
+          },
+          "quality_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_quality": {
+            "$ref": "#/components/schemas/ResolvedQuality"
+          },
+          "rules": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "standby_for": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "switching_quality": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "canvas",
+          "name",
+          "account",
+          "enabled",
+          "connected",
+          "health",
+          "blocked",
+          "rules",
+          "issues",
+          "quality",
+          "resolved_quality",
+          "switching_quality"
+        ],
+        "type": "object"
+      },
+      "EncodeBudgetCheck": {
+        "properties": {
+          "limit_mpx_s": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_sessions": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "enum": [
+              "apple_silicon",
+              "bench",
+              "nvenc_default",
+              "hw_default",
+              "cpu_default",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "limit",
+              "over",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "used_mpx_s": {
+            "type": "number"
+          },
+          "used_sessions": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "source",
+          "used_mpx_s",
+          "limit_mpx_s",
+          "used_sessions",
+          "max_sessions"
+        ],
+        "type": "object"
+      },
+      "EncodeGroupView": {
+        "properties": {
+          "canvas": {
+            "enum": [
+              "main",
+              "vertical"
+            ],
+            "type": "string"
+          },
+          "codec": {
+            "enum": [
+              "h264",
+              "hevc",
+              "av1",
+              "vp9"
+            ],
+            "type": "string"
+          },
+          "dropped_frames": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "encode_ms": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kbps": {
+            "type": "integer"
+          },
+          "live_fps": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "live_kbps": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "members": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "canvas",
+          "width",
+          "height",
+          "fps",
+          "kbps",
+          "codec",
+          "members",
+          "live_fps",
+          "live_kbps",
+          "dropped_frames",
+          "encode_ms"
+        ],
+        "type": "object"
+      },
       "GoLiveDestinationCreate": {
         "properties": {
           "brand": {
@@ -1005,6 +1466,133 @@
         "required": [
           "name",
           "url"
+        ],
+        "type": "object"
+      },
+      "GoLiveQualityOptionsResponse": {
+        "properties": {
+          "budget": {
+            "$ref": "#/components/schemas/EncodeBudgetCheck"
+          },
+          "destinations": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/DestinationQualityOptions"
+            },
+            "type": "object"
+          },
+          "main": {
+            "$ref": "#/components/schemas/QualityCanvasSummary"
+          },
+          "source": {
+            "enum": [
+              "studio",
+              "obs",
+              "none"
+            ],
+            "type": "string"
+          },
+          "vertical": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/QualityCanvasSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "source",
+          "main",
+          "vertical",
+          "budget",
+          "destinations"
+        ],
+        "type": "object"
+      },
+      "GoLiveView": {
+        "properties": {
+          "advanced": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "aitum_ok": {
+            "type": "boolean"
+          },
+          "auto_quality": {
+            "type": "boolean"
+          },
+          "cut": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "destinations": {
+            "items": {
+              "$ref": "#/components/schemas/DestinationView"
+            },
+            "type": "array"
+          },
+          "encode_budget": {
+            "$ref": "#/components/schemas/EncodeBudgetCheck"
+          },
+          "encode_groups": {
+            "items": {
+              "$ref": "#/components/schemas/EncodeGroupView"
+            },
+            "type": "array"
+          },
+          "ingest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "live": {
+            "type": "boolean"
+          },
+          "obs": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "protect": {
+            "type": "boolean"
+          },
+          "stats": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "upload": {
+            "additionalProperties": true,
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "vertical_live": {
+            "type": "boolean"
+          },
+          "vertical_stats": {
+            "additionalProperties": true,
+            "type": "object"
+          }
+        },
+        "required": [
+          "ingest",
+          "obs",
+          "live",
+          "stats",
+          "vertical_live",
+          "vertical_stats",
+          "destinations",
+          "encode_groups",
+          "encode_budget",
+          "upload",
+          "protect",
+          "aitum_ok",
+          "cut",
+          "advanced",
+          "auto_quality"
         ],
         "type": "object"
       },
@@ -1270,6 +1858,132 @@
         ],
         "type": "object"
       },
+      "QualityCanvasSummary": {
+        "properties": {
+          "audio_kbps": {
+            "type": "integer"
+          },
+          "codec": {
+            "enum": [
+              "h264",
+              "hevc",
+              "av1",
+              "vp9"
+            ],
+            "type": "string"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "kbps": {
+            "type": "integer"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "width",
+          "height",
+          "fps",
+          "kbps",
+          "codec",
+          "audio_kbps"
+        ],
+        "type": "object"
+      },
+      "QualityOption": {
+        "properties": {
+          "allowed": {
+            "type": "boolean"
+          },
+          "auto_fitted": {
+            "type": "boolean"
+          },
+          "disabled_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "quality": {
+            "$ref": "#/components/schemas/DestinationQuality"
+          },
+          "recommended": {
+            "type": "boolean"
+          },
+          "resolved": {
+            "$ref": "#/components/schemas/QualityOptionResolved"
+          },
+          "shares_encoder_with": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "quality",
+          "resolved",
+          "auto_fitted",
+          "recommended",
+          "note",
+          "shares_encoder_with",
+          "allowed",
+          "disabled_reason"
+        ],
+        "type": "object"
+      },
+      "QualityOptionResolved": {
+        "properties": {
+          "codec": {
+            "enum": [
+              "h264",
+              "hevc",
+              "av1",
+              "vp9"
+            ],
+            "type": "string"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "kbps": {
+            "type": "integer"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "width",
+          "height",
+          "fps",
+          "kbps",
+          "codec"
+        ],
+        "type": "object"
+      },
       "ResolvedLinks": {
         "properties": {
           "channel_name": {
@@ -1369,6 +2083,62 @@
         "required": [
           "custom",
           "socials"
+        ],
+        "type": "object"
+      },
+      "ResolvedQuality": {
+        "properties": {
+          "audio_kbps": {
+            "type": "integer"
+          },
+          "auto_fitted": {
+            "type": "boolean"
+          },
+          "codec": {
+            "enum": [
+              "h264",
+              "hevc",
+              "av1",
+              "vp9"
+            ],
+            "type": "string"
+          },
+          "fps": {
+            "type": "integer"
+          },
+          "group_id": {
+            "type": "string"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "kbps": {
+            "type": "integer"
+          },
+          "separate_encode": {
+            "type": "boolean"
+          },
+          "shared_with": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "width": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "width",
+          "height",
+          "fps",
+          "kbps",
+          "codec",
+          "audio_kbps",
+          "auto_fitted",
+          "separate_encode",
+          "group_id",
+          "shared_with"
         ],
         "type": "object"
       },
@@ -1541,6 +2311,71 @@
           "broadcasts"
         ],
         "type": "object"
+      },
+      "SetDestinationQualityRequest": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "const": "same_as_main"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "codec": {
+                "oneOf": [
+                  {
+                    "enum": [
+                      "h264",
+                      "hevc",
+                      "av1",
+                      "vp9"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "fps": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "height": {
+                "minimum": 2,
+                "type": "integer"
+              },
+              "kbps": {
+                "maximum": 60000,
+                "minimum": 500,
+                "type": "integer"
+              },
+              "mode": {
+                "const": "custom"
+              },
+              "width": {
+                "minimum": 2,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "mode",
+              "width",
+              "height",
+              "fps",
+              "kbps"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "SettingsPatch": {
         "description": "Partial update of non-sensitive local application preferences.",
@@ -9154,10 +9989,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/GoLiveView"
                 }
               }
             },
@@ -9199,7 +10031,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Multistream destinations, protection, and vertical canvas configuration.",
+        "summary": "Multistream destinations, protection, encode groups/budget, and vertical canvas configuration.",
         "tags": [
           "Go Live"
         ],
@@ -9775,6 +10607,134 @@
           }
         ],
         "summary": "Toggle low-bitrate/light output mode for a destination.",
+        "tags": [
+          "Go Live"
+        ],
+        "x-ferrocast-scopes": [],
+        "x-pc-only": true
+      }
+    },
+    "/api/v1/golive/destinations/{id}/quality": {
+      "put": {
+        "operationId": "put_golive_destinations__id__quality",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetDestinationQualityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoLiveView"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Invalid JSON, unknown field, invalid resolution/fps/bitrate/codec, over platform limit, or custom quality disallowed for Direct/Twitch EB/Cut."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Unknown destination id."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "A live quality switch is already in progress for this destination."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing or non-JSON Content-Type header."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Exceeds PC encode budget, OBS streaming mode requires restart, or live keyframe handover failed/cancelled."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Set per-destination stream quality (`same_as_main` or `custom`, PC only). While Studio is streaming, performs a single-destination live switch without interrupting other destinations.",
         "tags": [
           "Go Live"
         ],
@@ -10395,6 +11355,66 @@
           "Go Live"
         ],
         "x-ferrocast-scopes": [
+          "go_live"
+        ]
+      }
+    },
+    "/api/v1/golive/quality-options": {
+      "get": {
+        "operationId": "get_golive_quality_options",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoLiveQualityOptionsResponse"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Per-destination allowed resolutions, fps, bitrates, soft-limit notes, encoder sharing, and PC encode budget.",
+        "tags": [
+          "Go Live"
+        ],
+        "x-ferrocast-scopes": [
+          "read_only",
           "go_live"
         ]
       }

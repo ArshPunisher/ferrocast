@@ -542,3 +542,73 @@ fn creator_links_schema_allows_null_custom_and_documents_string_vs_array_clearin
     assert!(desc.contains("string"), "description must scope \"\" clearing to strings: {desc}");
     assert!(desc.contains("[]"), "description must mention [] for clearing custom: {desc}");
 }
+
+#[test]
+fn golive_quality_routes_and_additive_views_are_documented_in_openapi_and_asyncapi() {
+    let o = spec::openapi();
+    let schemas = &o["components"]["schemas"];
+
+    let qo = op(o, "/golive/quality-options", "get");
+    assert_eq!(qo["x-ferrocast-scopes"], json!(["read_only", "go_live"]));
+    assert_eq!(
+        qo["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/GoLiveQualityOptionsResponse"
+    );
+
+    let put_q = op(o, "/golive/destinations/{id}/quality", "put");
+    assert_eq!(put_q["x-pc-only"], json!(true));
+    assert_eq!(put_q["x-ferrocast-scopes"], json!([]));
+    assert_eq!(
+        put_q["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/SetDestinationQualityRequest"
+    );
+    assert_eq!(
+        put_q["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/GoLiveView"
+    );
+    for code in ["400", "404", "409", "415", "422"] {
+        assert!(put_q["responses"].get(code).is_some(), "missing {code} on PUT quality: {put_q}");
+    }
+
+    assert_eq!(
+        op(o, "/golive", "get")["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/GoLiveView"
+    );
+    for f in ["encode_groups", "encode_budget"] {
+        assert!(schemas["GoLiveView"]["properties"].get(f).is_some(), "GoLiveView missing {f}");
+    }
+    for f in ["quality", "resolved_quality", "switching_quality"] {
+        assert!(schemas["DestinationView"]["properties"].get(f).is_some(), "DestinationView missing {f}");
+    }
+    let status_enum =
+        schemas["EncodeBudgetCheck"]["properties"]["status"]["enum"].as_array().expect("EncodeBudgetCheck.status.enum");
+    for s in [
+        ferrocast_engine::golive::BudgetStatus::Ok,
+        ferrocast_engine::golive::BudgetStatus::Limit,
+        ferrocast_engine::golive::BudgetStatus::Over,
+        ferrocast_engine::golive::BudgetStatus::Unknown,
+    ] {
+        let v = serde_json::to_value(s).unwrap();
+        assert!(status_enum.contains(&v), "OpenAPI EncodeBudgetCheck.status missing {v}");
+    }
+
+    let a = spec::asyncapi();
+    let async_status_enum = a["components"]["schemas"]["EncodeBudgetCheck"]["properties"]["status"]["enum"]
+        .as_array()
+        .expect("AsyncAPI EncodeBudgetCheck.status.enum");
+    for s in [
+        ferrocast_engine::golive::BudgetStatus::Ok,
+        ferrocast_engine::golive::BudgetStatus::Limit,
+        ferrocast_engine::golive::BudgetStatus::Over,
+        ferrocast_engine::golive::BudgetStatus::Unknown,
+    ] {
+        let v = serde_json::to_value(s).unwrap();
+        assert!(async_status_enum.contains(&v), "AsyncAPI EncodeBudgetCheck.status missing {v}");
+    }
+    let golive_data = &a["channels"]["live"]["messages"]["golive"]["payload"]["properties"]["data"];
+    assert_eq!(golive_data["properties"]["encode_groups"]["items"]["$ref"], "#/components/schemas/EncodeGroupView");
+    assert_eq!(golive_data["properties"]["encode_budget"]["$ref"], "#/components/schemas/EncodeBudgetCheck");
+    for shared in ["DestinationView", "EncodeGroupView", "EncodeBudgetCheck", "ResolvedQuality", "DestinationQuality"] {
+        assert!(a["components"]["schemas"].get(shared).is_some(), "AsyncAPI missing shared schema {shared}");
+    }
+}
