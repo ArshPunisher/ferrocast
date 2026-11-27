@@ -285,6 +285,20 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn vertical_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
         Ok(())
     }
+    /// Updates preview, Studio Mode program, and vertical preview boxes together. A host that
+    /// can places them in one native batch (override this); the default is only the three
+    /// calls in that order, stops at the first error and keeps what was placed before it:
+    /// an error is not a rollback.
+    async fn set_previews(
+        &self,
+        preview: Option<PreviewRect>,
+        program: Option<PreviewRect>,
+        vertical: Option<PreviewRect>,
+    ) -> Result<(), String> {
+        self.preview(preview).await?;
+        self.program_view(program).await?;
+        self.vertical_view(vertical).await
+    }
     /// The cursor over the pictures, by its CSS name: on Windows they take the mouse
     /// themselves and pass it on to the page, which says what it shows there.
     async fn preview_cursor(&self, _cursor: String) -> Result<(), String> {
@@ -3891,10 +3905,7 @@ impl Engine {
         for r in rect.iter().chain(program.iter()).chain(vertical.iter()) {
             r.validate().map_err(EngineError::Invalid)?;
         }
-        let host = self.studio_host()?;
-        host.preview(rect).await.map_err(failed)?;
-        host.program_view(program).await.map_err(failed)?;
-        host.vertical_view(vertical).await.map_err(failed)
+        self.studio_host()?.set_previews(rect, program, vertical).await.map_err(failed)
     }
 
     /// Performance mode now: whether the preview is paused.
@@ -5280,6 +5291,109 @@ mod tests {
             assert!(matches!(e.studio_preview(None, None, Some(bad)).await.unwrap_err(), EngineError::Invalid(_)));
         }
         assert_eq!(*fake.rects.lock().unwrap(), vec![Some(r.clone()), None], "only good boxes reach the app");
+
+        type PreviewBatch = (Option<PreviewRect>, Option<PreviewRect>, Option<PreviewRect>);
+
+        #[derive(Debug, Default)]
+        struct BatchHost {
+            batches: std::sync::Mutex<Vec<PreviewBatch>>,
+            single_calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl StudioHost for BatchHost {
+            async fn status(&self) -> StudioStatus {
+                StudioStatus { available: true, running: true, ..Default::default() }
+            }
+            async fn start(&self) -> Result<StudioStatus, String> {
+                Ok(self.status().await)
+            }
+            async fn stop(&self) -> Result<StudioStatus, String> {
+                Ok(StudioStatus::default())
+            }
+            async fn kinds(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn options(&self, _kind: String) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+                self.single_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            async fn program_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+                self.single_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            async fn vertical_view(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+                self.single_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            async fn set_previews(
+                &self,
+                preview: Option<PreviewRect>,
+                program: Option<PreviewRect>,
+                vertical: Option<PreviewRect>,
+            ) -> Result<(), String> {
+                self.batches.lock().unwrap_or_else(|p| p.into_inner()).push((preview, program, vertical));
+                Ok(())
+            }
+            async fn defaults(&self, _kind: String) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn act(&self, _act: StudioAct) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn settings(&self) -> StudioSettings {
+                StudioSettings::default()
+            }
+            async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            async fn stats(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn record(&self, _on: bool) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn replay(&self, _on: bool) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn record_pause(&self, _on: bool) -> Result<(), String> {
+                Ok(())
+            }
+            async fn monitoring(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn stream_start(
+                &self,
+                _server: String,
+                _key: String,
+                _tracks: Vec<(u32, u32, u32)>,
+            ) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn stream_stop(&self) -> Result<(), String> {
+                Ok(())
+            }
+            async fn stream_stats(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn obs_collections(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn import_obs(&self, _id: String) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+        }
+        let batch_host = Arc::new(BatchHost::default());
+        e.set_studio_host(batch_host.clone());
+        e.studio_preview(Some(r.clone()), Some(staged.clone()), Some(holed.clone())).await.unwrap();
+        assert_eq!(batch_host.single_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            *batch_host.batches.lock().unwrap_or_else(|p| p.into_inner()),
+            vec![(Some(r.clone()), Some(staged), Some(holed))]
+        );
+        e.set_studio_host(fake.clone());
 
         let src =
             |kind: &str, name: &str, settings: Value| NewSource { kind: kind.into(), name: name.into(), settings };
