@@ -6236,8 +6236,10 @@ mod budget_tests {
             cap_kbps: None,
         };
         let gs = stream_settings_for_group(&s, &hevc_spec);
+        // The VideoToolbox id only stays itself on a Mac (elsewhere it becomes the generic
+        // hardware encoder, which has no HEVC id), so the mapping is checked there.
         assert!(
-            gs.encode.video_encoder.to_ascii_lowercase().contains("hevc"),
+            !cfg!(target_os = "macos") || gs.encode.video_encoder.to_ascii_lowercase().contains("hevc"),
             "HEVC encode group must map H.264 encoder to HEVC: {}",
             gs.encode.video_encoder
         );

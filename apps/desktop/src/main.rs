@@ -55,6 +55,7 @@ const MINIMIZED_ARG: &str = "--minimized";
 /// Launch directly in Safe Mode (no third-party plugins, VSTs, auto-start, or auto-loaded collection).
 const SAFE_MODE_ARG: &str = "--safe-mode";
 /// Bundle identifier in `tauri.conf.json`, used for LaunchServices relaunch when bundle path is unavailable.
+#[cfg(any(target_os = "macos", test))]
 const BUNDLE_ID: &str = "com.clearcraftlabs.ferrocast";
 /// Set before `app.exit(0)` on macOS so `RunEvent::Exit` schedules LaunchServices relaunch after exit.
 #[cfg(target_os = "macos")]
