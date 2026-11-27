@@ -934,8 +934,12 @@ OBS streams once to Ferrocast's local server (127.0.0.1 only, this install's key
 ```ts
 type Service = "twitch" | "youtube" | "kick" | "custom"
 type Canvas = "main" | "vertical"   // OBS's normal stream, or its vertical canvas (A2.3)
+type VideoCodec = "h264" | "hevc" | "av1" | "vp9"
+type DestinationQuality = { mode: "same_as_main" }
+                        | { mode: "custom"; width: number; height: number; fps: number; kbps: number; codec?: VideoCodec | null }
 type DestinationConfig = { id: string /* "twitch" | "youtube" | "kick" | "youtube_vertical" | "c_<hex>" */; kind: Service; name?: string; url?: string /* custom */;
-                           enabled: boolean; canvas?: Canvas /* left out: "main" */ }
+                           enabled: boolean; canvas?: Canvas /* left out: "main" */; light?: boolean; enhanced?: boolean;
+                           brand?: "x" | "instagram" | "facebook"; quality?: DestinationQuality /* left out when "same_as_main" */ }
 type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
                  | { state: "reconnecting"; attempt: number; retry_in_ms: number; reason: string }
                  | { state: "failed"; attempts: number; reason: string /* one short line */; detail?: string /* full cause and fix, behind (i) */; refused?: true /* server/platform refusal (bad key, Kick multistreaming) */ }
@@ -946,20 +950,30 @@ type PushHealth = ({ state: "waiting" | "connecting" | "live" | "stopped" }
                      via?: string /* RTMP: after a network failure (not the server refusing) to a server that isn't on this network,
                        the next try goes over the computer's next connection (Ethernet, Wi-Fi, a phone by USB or hotspot; not VPNs),
                        then the default again; this names the one in use ("iPhone USB"). Back to the default when the stream ends */ }
-type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_codec: "h264" | "hevc" | "av1" | "vp9" | null;
+type StreamStats = { kbps: number; keyframe_interval_ms: number | null; video_codec: VideoCodec | null;
                      width: number | null; height: number | null; fps: number | null }   // measured from the stream OBS sends; empty while nothing streams
 type RuleNotice = { code: "bitrate" | "codec" | "keyint"; summary: string; detail: string; fix_kbps?: number }
-type CappedInfo = { kbps: number; resolution?: [number, number]; separate_encode: boolean; summary: string; detail: string }
+type CappedInfo = { kbps: number; resolution?: [number, number]; fps?: number; separate_encode: boolean; summary: string; detail: string }
+type ResolvedQuality = { width: number; height: number; fps: number; kbps: number; codec: VideoCodec; audio_kbps: number;
+                         auto_fitted: boolean; separate_encode: boolean; group_id: string; shared_with: string[] }
+type EncodeGroupView = { id: string; canvas: Canvas; width: number; height: number; fps: number; kbps: number; codec: VideoCodec;
+                         members: string[]; live_fps: number | null; live_kbps: number | null; dropped_frames: number | null; encode_ms: number | null }
+type EncodeBudgetCheck = { status: "ok" | "limit" | "over" | "unknown";
+                           source: "apple_silicon" | "bench" | "nvenc_default" | "hw_default" | "cpu_default" | "unknown";
+                           used_mpx_s: number; limit_mpx_s: number | null; used_sessions: number; max_sessions: number | null; note?: string | null }
 type DestinationView = { id: string; kind: Service; canvas: Canvas; name: string; account: string | null /* platform account, or a custom server's host */;
                          enabled: boolean; connected: boolean; health: PushHealth | null /* while it runs */;
-                         blocked: string | null /* why it can't start, in words */; rules: string[] /* the platform's rules this stream breaks (legacy strings) */;
+                         blocked: string | null /* why it can't start, in words */; brand?: string; rules: string[] /* the platform's rules this stream breaks (legacy strings) */;
                          issues?: RuleNotice[] /* structured rules broken by the active stream (Contract C-2) */;
                          capped?: CappedInfo /* calm badge when Studio fits the shared stream to Twitch/Kick limits (Contract C-2) */;
+                         direct?: "srt" | "rist" | "whip"; light?: true; enhanced?: true;
                          lighter_for_route?: true /* on the lighter stream for now: its route fell behind while the others kept up
                                                      (RTMP on the main picture, while the Studio streams). It tries the full stream
                                                      again after 2 min, doubling up to 20 min if it comes back down within 5 */;
                          backup_for?: string /* a backup sending now, for this destination's name */;
-                         standby_for?: string /* a backup waiting: it sends only while that one can't */ }
+                         standby_for?: string /* a backup waiting: it sends only while that one can't */;
+                         key_note?: string; quality_note?: string;
+                         quality: DestinationQuality; resolved_quality: ResolvedQuality; switching_quality: boolean }
 type UploadRow = { id: string; name: string; server: string | null; delay_ms: number | null; need_kbps: number; problem?: string }
 type UploadCheck = { at: number; measured_by: "twitch" | "cloudflare"; rows: UploadRow[];
                      verdict: { upload_kbps: number; need_kbps: number; fits: boolean; fit_count: number; message: string } }
@@ -968,7 +982,8 @@ type GoLiveView = { ingest: string | null /* rtmp://127.0.0.1:<port>/live */;
                            aitum: { name: string; platform: Service | null /* "custom" never; null when unknown */; live: boolean }[] | null /* Aitum Multistream's outputs, when OBS has it */;
                            vertical: { points_here: boolean; streaming: boolean; before: string | null /* host */ } | null /* Aitum Vertical, when OBS has it */ };
                     live: boolean; stats: StreamStats; vertical_live: boolean; vertical_stats: StreamStats;
-                    destinations: DestinationView[] /* top first */; upload: UploadCheck | null;
+                    destinations: DestinationView[] /* top first */; encode_groups: EncodeGroupView[]; encode_budget: EncodeBudgetCheck;
+                    upload: UploadCheck | null;
                     protect: boolean /* upload protection, on by default */; aitum_ok: boolean /* "I use Aitum Multistream on purpose" */; auto_quality: boolean /* auto quality, on by default */;
                     advanced: Advanced;
                     cut: { source: "canvas" | "cut"; config: CutConfig; state: CutState | null /* null while not needed */; ffmpeg: FfmpegState } }
@@ -999,9 +1014,11 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 | Method | Path | Body → Response |
 |---|---|---|
 | GET | `/api/v1/golive` | → `GoLiveView` (asks OBS for its stream setting) |
+| GET | `/api/v1/golive/quality-options` | → `GoLiveQualityOptionsResponse` (`{ source: "studio" \| "obs" \| "none", main, vertical, budget, destinations: { [id]: { id, canvas, locked_reason, current, resolved, options, custom_limits } } }`): per-destination allowed resolutions, fps, bitrates, soft-limit notes, encoder sharing, and PC encode budget. Allowed for owner phone (read-only) |
 | GET | `/api/v1/golive/ingest` | → `{ server, key, vertical_key }` for setting OBS up by hand (`vertical_key` for its vertical canvas). Denied to phones. 422 `golive_off` when the local server didn't start |
-| PUT | `/api/v1/golive/destinations/{id}/light` | `{ on }` → `GoLiveConfig`: that platform takes the Ferrocast Studio's lighter stream (720p at the canvas's shape, 3,000 kbps at most, one sound) instead of the full one; the Studio sends it to the local server's light key only while a ticked platform takes it. A running platform starts again on its new stream. `DestinationConfig.light` (left out when off). 400 for the vertical stream or an SRT, RIST or WebRTC server, 404 for no such destination |
+| PUT | `/api/v1/golive/destinations/{id}/light` | `{ on }` → `GoLiveConfig`: that platform takes the Ferrocast Studio's lighter stream (720p at the canvas's shape, 3,000 kbps at most, one sound) instead of the full one; the Studio sends it to the local server's light key only while a ticked platform takes it. A running platform starts again on its new stream. `DestinationConfig.light` (left out when off). 400 for the vertical stream, 422 `golive_quality_locked` for an SRT, RIST or WebRTC server, 404 for no such destination |
 | PUT | `/api/v1/golive/destinations/{id}/enhanced` | `{ on }` → the Go live config: Twitch Enhanced Broadcasting for this destination (Twitch, main picture; 422 otherwise). From the next Studio stream: Twitch's plan (`GetClientConfiguration`) is fetched when it starts, the Studio encodes Twitch's smaller qualities too and sends them to Twitch only, as Enhanced RTMP video tracks, to the address the plan gives. When the plan can't be had, a normal stream goes out and the start's `also` says why. Destinations carry `enhanced` |
+| PUT | `/api/v1/golive/destinations/{id}/quality` | `{ mode: "same_as_main" }` \| `{ mode: "custom", width, height, fps, kbps, codec? }` → `GoLiveView`: sets per-destination stream quality (`DestinationConfig.quality`). PC-only (denied to phones). While Studio streams, performs a single-destination live switch (waits up to 3 s for target IDR keyframe, reconnects only that destination, retires unused encode group) without interrupting main, recording, or other live platforms. 400 malformed/invalid fields, 404 unknown id, 409 `conflict` while another switch for that destination is already running, 422 `platform_limit_exceeded` / `encode_budget_exceeded` / `golive_quality_locked` (direct server, Twitch EB, vertical cut, unsupported codec) / `golive_needs_new_encode` (OBS live or tight encoder) / `golive_switch_timeout` / `golive_switch_cancelled` |
 | PUT | `/api/v1/golive/destinations` | `{ destinations: [{ id, enabled }], confirm_upload?: boolean, confirm_last?: boolean }` (every destination once, top first) → `{ destinations: DestinationConfig[] }`. **While live** (R33), a newly ticked destination starts only its own output and an unticked one stops only its own, cleanly; the other outputs, the recording and the replay buffer are not touched, a platform just ticked gets the title and category last pushed, and the stream's session record (`StreamHealthRecord.destination_log: { id, name, at, on }[]`) notes each start and stop. The running encode is reused: a destination it can't serve (a Twitch or Kick limit below the stream's bitrate, H.264-only against an HEVC stream, WebRTC against B-frames, a vertical destination with no vertical stream) is **422 `golive_needs_new_encode`** with the reason, since changing the live encode would change every other output. **409 `golive_upload_exceeded`** when the last upload check says the ticked destinations (at the stream's current rate) would not fit; **409 `golive_last_destination`** when it would leave nothing ticked (the stream and recording keep going). Send `confirm_upload` / `confirm_last` `true` to go ahead. `GoLiveView.upload` is worked out again for the destinations ticked now while live. 400 for a missing, repeated or unknown id |
 | POST | `/api/v1/golive/destinations` | `{ name /* 1–40 */, url /* rtmp://, rtmps://, srt://, rist:// or https:// (WebRTC WHIP) */, key /* no spaces, ≤ 512 */, canvas?: Canvas, brand?: "x" \| "instagram" \| "facebook" }` → 201 `DestinationConfig` (ticked, added last; the key is never returned). `brand` marks a server and key pasted from X, Instagram or Facebook (those hand keys out only in their own app, so Ferrocast can't make them) and applies that platform's stream limits; `DestinationConfig.brand` carries it (left out when none), 400 for any other brand. SRT, RIST and WebRTC servers are sent straight from the Ferrocast Studio's main stream by Ferrocast's own senders (MPEG-TS over SRT, or RIST's simple profile; WebRTC with the H.264 as it is and the sound made Opus), not by the RTMP forwarders: their key is optional (SRT stream id; WHIP bearer token, sent only over https or to this computer; a RIST passphrase is refused, as it needs the main profile), they refuse `canvas: "vertical"`, their row carries `direct: "srt" \| "rist" \| "whip"` and the host as `account`, they show live health like the rest (and count for upload protection), and while live from outside OBS they're `blocked` with the reason. 400 names the field (`url: The server address must start with rtmp:// or rtmps://.`), 409 over 8. Denied to phones |
 | DELETE | `/api/v1/golive/destinations/{id}` | → 204 (custom servers only; its key is deleted). 400 for twitch / youtube / kick (switch them off), 404 unknown. Denied to phones |
@@ -1036,7 +1053,7 @@ type CutState = { state: "waiting" | "starting" } | { state: "running"; encoder:
 
 **Upload protection.** While OBS streams and 2 or more destinations are live, a destination getting under 70% of the stream's rate, or skipping packets, for 4 seconds in a row (each destination is judged after its first 3 live seconds) pauses the bottom-most live one in the streamer's order, so the ones above stay smooth: its health becomes `paused` with the reason. After 10 calm seconds, and no earlier than `until_ms` (60 s for the first pause in a stream, doubling each time up to 10 minutes), the highest paused one comes back. The last live destination is never paused. A paused destination isn't restarted by ticking changes; unticking it ends the pause. When the stream ends, nothing stays paused.
 
-Live frame `golive { live, stats, vertical_live, vertical_stats, destinations, cut_state, ffmpeg }` (§5): every second while OBS streams, and after every change.
+Live frame `golive { live, stats, vertical_live, vertical_stats, destinations, encode_groups, encode_budget, cut_state, ffmpeg }` (§5): every second while OBS or Studio streams, and after every change.
 
 ### Stream schedule (Phase 3 #24, free, local)
 
@@ -1164,7 +1181,7 @@ Errors: 400 `invalid` (`token:` doesn't look like a JWT, `platform:`, no file), 
 - `chat_highlight { highlight: ChatHighlight | null }` (when a chat message is pinned, replaced, dismissed, expired, deleted, or cleared)
 - `update UpdateView` (§4): on every change (a check starting or finishing, download progress at most 5 times a second, installing, ready, failed)
 - `account AccountView` (§4 Ferrocast account): on every change (sign-in started, finished, failed or cancelled, signed out, a refresh that changed it). Never sent to phones.
-- `golive { live, stats: StreamStats, vertical_live, vertical_stats: StreamStats, destinations: DestinationView[], cut_state: CutState | null, ffmpeg: FfmpegState }` (§4 Go live everywhere): every second while OBS streams to Ferrocast, and after every change
+- `golive { live, stats: StreamStats, vertical_live, vertical_stats: StreamStats, destinations: DestinationView[], encode_groups: EncodeGroupView[], encode_budget: EncodeBudgetCheck, cut_state: CutState | null, ffmpeg: FfmpegState }` (§4 Go live everywhere): every second while OBS or Studio streams, and after every change
 - `auto_config AutoConfigState` (§4 Studio): whenever the encoder benchmark progresses, completes, fails, applies, keeps, or rolls back
 - `smart_mod SmartSuggestion` (§4 Smart features): a new suggestion, or one that changed (done, undone, dismissed, an error). Never sent to a mod's phone.
 - `resync { missed }`: the socket fell behind; refetch status, queue and events
