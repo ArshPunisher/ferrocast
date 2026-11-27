@@ -12100,6 +12100,8 @@ mod tests {
         );
     }
 
+    // VideoToolbox B-frames, and the shared scene helper, are macOS only.
+    #[cfg(target_os = "macos")]
     #[test]
     fn midstream_bframe_half_fps_output_keeps_av_sync_within_40ms() {
         #[derive(Default)]
@@ -12277,6 +12279,8 @@ mod tests {
         assert_eq!((second.total_missed, second.total_encode_skipped), (5, 5));
     }
 
+    // `DROPPED_TEST_LOCK` and the tests that read `dropped_frames` are Unix only.
+    #[cfg(unix)]
     #[test]
     fn engine_miss_monitor_baselines_preexisting_encoder_drops() {
         let _guard = crate::video::DROPPED_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
