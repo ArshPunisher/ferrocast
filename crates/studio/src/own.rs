@@ -510,6 +510,8 @@ pub(crate) struct ReplaySaved {
 /// What a drawn output is: where it goes, how it's encoded, and which picture.
 pub(crate) struct Drawing<'a> {
     pub send_to: Option<Send<'a>>,
+    pub hub: Option<Arc<Hub>>,
+    pub fps: Option<u32>,
     pub record: Option<&'a std::path::Path>,
     pub encode: &'a EncodeSettings,
     /// OBS's sound tracks (1 to 6) a recording carries; empty is track 1.
@@ -1077,8 +1079,20 @@ impl OwnStream {
     /// A stream or recording drawn by our engine from the collection `doc` (as
     /// `Collection::save` gives it), as `how` says.
     pub(crate) fn drawn(shared: Arc<Shared>, doc: &serde_json::Value, how: Drawing<'_>) -> Result<Self, StudioError> {
-        let Drawing { send_to, record, encode: e, tracks, delay_s, vertical, replay, solo, video_tracks } = how;
-        let streaming = send_to.is_some();
+        let Drawing {
+            send_to,
+            hub: injected_hub,
+            fps: target_fps,
+            record,
+            encode: e,
+            tracks,
+            delay_s,
+            vertical,
+            replay,
+            solo,
+            video_tracks,
+        } = how;
+        let streaming = send_to.is_some() || injected_hub.is_some();
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
         let target = match &send_to {
             Some(d) => Some(Target::parse(d.server).map_err(|e| fail(e.to_string()))?),
@@ -1086,14 +1100,23 @@ impl OwnStream {
         };
         let engine = &shared.engine;
         let config = engine.config();
-        let video = video_config(e, config.width, config.height, config.fps, config.ntsc);
-        let video = if send_to.is_some() { for_stream(video) } else { video };
+        let every = target_fps.filter(|&f| streaming && f > 0 && f < config.fps).map_or(1, |f| (config.fps / f).max(1));
+        let eff_fps = (config.fps / every).max(1);
+        let video = video_config(e, config.width, config.height, eff_fps, config.ntsc);
+        let video = if streaming { for_stream(video) } else { video };
         let audio =
             AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
-        let hub = Hub::new();
-        let drain = Arc::new(DrainGate::default());
-        let (runtime, health, stop_push) = sender(send_to, target, &hub).map_err(fail)?;
+        let is_injected = injected_hub.is_some();
+        let (hub, runtime, health, stop_push) = match injected_hub {
+            Some(h) => (h, None, None, None),
+            None => {
+                let h = Hub::new();
+                let (rt, hp, sp) = sender(send_to, target, &h).map_err(fail)?;
+                (h, rt, hp, sp)
+            }
+        };
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
+        let drain = Arc::new(DrainGate::default());
         let begin = Arc::new(Begin::default());
         // A delayed stream is live on its hub only once its first packet is let go.
         let deferred = streaming && delay_s > 0;
@@ -1115,22 +1138,30 @@ impl OwnStream {
             }
         };
         // OBS's output resolution: the whole canvas, scaled (sides kept even for the encoder).
+        let filter = ferrocore::Filter::downscale_named(&e.scale_filter).unwrap_or(ferrocore::Filter::Bicubic);
         let mut out = match (vertical, e.scale) {
-            // The vertical picture: its own size and its own scene on air.
+            // The vertical picture: its own size and scene on air, optionally downscaled for an encode group.
+            (true, Some((w, h))) if (w.max(2) & !1, h.max(2) & !1) != VERTICAL_SIZE => {
+                let sw = w.max(2) & !1;
+                let sh = h.max(2) & !1;
+                AvCanvas {
+                    width: sw,
+                    height: sh,
+                    scene: vertical_on_air(doc),
+                    scaled_from: Some((VERTICAL_SIZE.0, VERTICAL_SIZE.1, filter)),
+                    ..AvCanvas::main(config)
+                }
+            }
             (true, _) => AvCanvas {
                 width: VERTICAL_SIZE.0,
                 height: VERTICAL_SIZE.1,
                 scene: vertical_on_air(doc),
                 ..AvCanvas::main(config)
             },
-            (false, Some((w, h))) => AvCanvas::scaled_with(
-                config,
-                w.max(2) & !1,
-                h.max(2) & !1,
-                ferrocore::Filter::downscale_named(&e.scale_filter).unwrap_or(ferrocore::Filter::Bicubic),
-            ),
+            (false, Some((w, h))) => AvCanvas::scaled_with(config, w.max(2) & !1, h.max(2) & !1, filter),
             (false, None) => AvCanvas::main(config),
         };
+        out.every = every;
         if let Some(name) = solo {
             let (scene, w, h) = show_alone(engine, name, (config.width, config.height))?;
             // The encoders' NV12 wants even sides: an odd last row or column is left out,
@@ -1153,7 +1184,7 @@ impl OwnStream {
             out.video_tracks = video_tracks.to_vec();
         }
         if streaming {
-            let meta = metadata_of(&video, &audio, out.width, out.height, fps_f32(config.fps, config.ntsc));
+            let meta = metadata_of(&video, &audio, out.width, out.height, fps_f32(eff_fps, config.ntsc));
             if deferred {
                 begin.set(move |hub| {
                     hub.start();
@@ -1163,7 +1194,7 @@ impl OwnStream {
                 hub.metadata(meta);
             }
         }
-        let replaces_tail = record.is_none() && replay.is_none();
+        let replaces_tail = !is_injected && record.is_none() && replay.is_none();
         let output = match engine.start_output_with(kind, out, video, audio) {
             Ok(id) => id,
             Err(e) => {
@@ -1264,18 +1295,47 @@ impl OwnStream {
         e: &EncodeSettings,
         delay_s: u32,
     ) -> Result<Self, StudioError> {
+        self.stream_joining_target(Some(send_to), None, e, delay_s)
+    }
+
+    pub(crate) fn stream_joining_to_hub(
+        &self,
+        hub: Arc<Hub>,
+        e: &EncodeSettings,
+        delay_s: u32,
+    ) -> Result<Self, StudioError> {
+        self.stream_joining_target(None, Some(hub), e, delay_s)
+    }
+
+    fn stream_joining_target(
+        &self,
+        send_to: Option<Send<'_>>,
+        injected_hub: Option<Arc<Hub>>,
+        e: &EncodeSettings,
+        delay_s: u32,
+    ) -> Result<Self, StudioError> {
         let d = self.drawn.as_ref().filter(|d| d.role == Role::Record).ok_or_else(|| {
             StudioError::Failed("Only a running recording's encoder can be shared with a stream.".into())
         })?;
         let fail = |e: String| StudioError::Failed(format!("Ferrocast's own engine couldn't start: {e}"));
-        let target = Target::parse(send_to.server).map_err(|e| fail(e.to_string()))?;
+        let target = match &send_to {
+            Some(s) => Some(Target::parse(s.server).map_err(|err| fail(err.to_string()))?),
+            None => None,
+        };
         let config = d.shared.engine.config();
         let video = for_stream(video_config(e, config.width, config.height, config.fps, config.ntsc));
         let audio =
             AudioConfig { sample_rate: config.sample_rate, channels: 2, bitrate_kbps: e.audio_kbps.clamp(64, 320) };
-        let hub = Hub::new();
+        let is_injected = injected_hub.is_some();
+        let (hub, runtime, health, stop_push) = match injected_hub {
+            Some(h) => (h, None, None, None),
+            None => {
+                let h = Hub::new();
+                let (rt, hp, sp) = sender(send_to, target, &h).map_err(fail)?;
+                (h, rt, hp, sp)
+            }
+        };
         let drain = Arc::new(DrainGate::default());
-        let (runtime, health, stop_push) = sender(Some(send_to), Some(target), &hub).map_err(fail)?;
         let counts = Arc::new(Counts { running: AtomicBool::new(true), ..Default::default() });
         let meta = metadata_of(&video, &audio, config.width, config.height, fps_f32(config.fps, config.ntsc));
         let begin = Arc::new(Begin::default());
@@ -1302,7 +1362,9 @@ impl OwnStream {
             return Err(fail(err.to_string()));
         }
         // The last stream's tail ends once this one has started (not when it fails to).
-        discard_delay();
+        if !is_injected {
+            discard_delay();
+        }
         // The shared encode takes the stream's bitrate (what "Same as stream" means): the
         // recording's file follows it from here.
         if let Err(err) = d.shared.engine.set_output_kbps(d.output, e.video_kbps) {
@@ -1543,12 +1605,16 @@ impl OwnStream {
         use ferrocast_golive::direct::{Direct, Kind};
         let kind = Kind::of(url)
             .ok_or_else(|| StudioError::Failed("url: an srt://, rist:// or https:// (WHIP) address.".into()))?;
-        if self.runtime.is_none() || self.hub.is_none() {
+        if self.hub.is_none() {
             return Err(StudioError::Failed(
                 "SRT, RIST and WebRTC go out with a stream: start streaming first.".into(),
             ));
         }
         self.remove_direct(id);
+        if self.runtime.is_none() {
+            self.runtime =
+                Some(push::sender_runtime("ferrocast-direct").map_err(|e| StudioError::Failed(e.to_string()))?);
+        }
         let (Some(rt), Some(hub)) = (self.runtime.as_ref(), self.hub.as_ref()) else { return Ok(()) };
         let d = Direct {
             id: id.to_string(),
@@ -2034,6 +2100,8 @@ mod tests {
         let enc = EncodeSettings::with_encoder("obs_x264");
         let how = Drawing {
             send_to: None,
+            hub: None,
+            fps: None,
             record: None,
             encode: &enc,
             tracks: &[],
@@ -2288,5 +2356,82 @@ mod tests {
             &serde_json::json!("hdmi-card-0"),
             |_| true,
         ));
+    }
+
+    #[test]
+    fn direct_hub_injection_streams_without_rtmp_loopback_and_decimates_fps() {
+        let doc = serde_json::json!({ "sources": [], "current_scene": "Main", "scenes": { "Main": [] } });
+        let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 60 }, &doc) else {
+            eprintln!("skipped: no engine here");
+            return;
+        };
+        let hub = Hub::new();
+        let mut enc = EncodeSettings::with_encoder("obs_x264");
+        enc.scale = Some((320, 180));
+        enc.video_kbps = 1_200;
+        let how = Drawing {
+            send_to: None,
+            hub: Some(hub.clone()),
+            fps: Some(30),
+            record: None,
+            encode: &enc,
+            tracks: &[1],
+            delay_s: 0,
+            vertical: false,
+            replay: None,
+            solo: None,
+            video_tracks: &[],
+        };
+        let own = OwnStream::drawn(shared, &doc, how).unwrap();
+        assert!(own.runtime.is_none(), "direct Hub injection must not spawn loopback RTMP sender runtime");
+        assert!(hub.live().borrow().on, "injected Hub must go live immediately");
+        let mut sub = hub.subscribe();
+        let meta = sub.headers.metadata.expect("Hub metadata set");
+        assert_eq!((meta.video_width, meta.video_height, meta.video_frame_rate), (Some(320), Some(180), Some(30.0)));
+        drop(own);
+        assert!(!hub.live().borrow().on, "dropping OwnStream must end injected Hub");
+        let _ = sub.rx.try_recv();
+    }
+
+    #[test]
+    fn vertical_direct_hub_scales_and_decimates_fps() {
+        let doc = serde_json::json!({
+            "sources": [
+                { "id": "scene", "versioned_id": "scene", "name": "Main", "settings": { "items": [] } },
+                { "id": "scene", "versioned_id": "scene", "name": "VScene", "settings": { "items": [] } }
+            ],
+            "current_scene": "Main",
+            "scene_order": [{ "name": "Main" }],
+            "ferrocast": {
+                "vertical": { "on": true, "current_scene": "VScene", "scene_order": [{ "name": "VScene" }] }
+            }
+        });
+        let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 60 }, &doc) else {
+            eprintln!("skipped: no engine here");
+            return;
+        };
+        let hub = Hub::new();
+        let mut enc = EncodeSettings::with_encoder("obs_x264");
+        enc.scale = Some((720, 1280));
+        enc.video_kbps = 2_000;
+        let how = Drawing {
+            send_to: None,
+            hub: Some(hub.clone()),
+            fps: Some(30),
+            record: None,
+            encode: &enc,
+            tracks: &[],
+            delay_s: 0,
+            vertical: true,
+            replay: None,
+            solo: None,
+            video_tracks: &[],
+        };
+        let own = OwnStream::drawn(shared, &doc, how).unwrap();
+        let mut sub = hub.subscribe();
+        let meta = sub.headers.metadata.expect("vertical Hub metadata set");
+        assert_eq!((meta.video_width, meta.video_height, meta.video_frame_rate), (Some(720), Some(1280), Some(30.0)));
+        drop(own);
+        let _ = sub.rx.try_recv();
     }
 }

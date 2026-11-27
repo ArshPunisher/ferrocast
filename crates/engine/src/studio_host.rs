@@ -19,6 +19,57 @@ pub struct StreamCap {
     pub no_bframes: bool,
 }
 
+/// Desired encode group passed to [`StudioHost::start_encode_group`] with a direct [`ferrocast_golive::Hub`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncodeGroupSpec {
+    pub id: String,
+    pub key: ferrocast_golive::probe::EncodeKey,
+    #[serde(default)]
+    pub extra_tracks: Vec<(u32, u32, u32)>,
+    #[serde(default)]
+    pub vod_track: bool,
+    #[serde(default)]
+    pub is_light: bool,
+    #[serde(default)]
+    pub is_twitch_eb: bool,
+}
+
+/// Host hardware/driver capabilities reported by [`StudioHost::host_budget_info`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct HostBudgetInfo {
+    /// OS identifier (`"macos"`, `"windows"`, `"linux"`).
+    pub os: String,
+    /// Active video encoder id from Studio settings (e.g. `ffmpeg_nvenc`, `obs_x264`).
+    pub encoder_id: String,
+    /// Apple Silicon / GPU video engine count when known (`None` on Intel Mac / discrete GPUs).
+    pub engines: Option<u32>,
+    /// Logical CPU core count.
+    pub cpu_cores: u32,
+    /// NVIDIA driver major version (`550`+) when NVENC is detected.
+    pub nvidia_driver_major: Option<u32>,
+    /// NVIDIA driver minor version (e.g. `23` in `551.23`) when NVENC is detected.
+    #[serde(default)]
+    pub nvidia_driver_minor: Option<u32>,
+    /// Hardware backend label when known (e.g. `"apple"`, `"nvenc"`, `"qsv"`, `"amf"`, `"mf"`, `"vaapi"`, `"x264"`).
+    #[serde(default)]
+    pub hw_backend: Option<String>,
+    /// Extra MP/s consumed by recording/replay when active or configured with stream.
+    pub record_extra_mpx_s: f64,
+    /// Extra hardware encoder sessions consumed by recording/replay.
+    pub record_extra_sessions: u32,
+    /// Whether recording is sharing the main stream encoder.
+    pub record_shares_main: bool,
+    /// Whether the vertical canvas is enabled.
+    #[serde(default)]
+    pub vertical_on: bool,
+    /// Native vertical canvas dimensions `(width, height)`.
+    #[serde(default)]
+    pub vertical_size: Option<(u32, u32)>,
+    /// Stable hardware+driver fingerprint so persisted `studio_bench` invalidates on change.
+    #[serde(default)]
+    pub host_sig: String,
+}
+
 /// What `GET /studio/engine` shows.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct StudioStatus {
@@ -393,6 +444,31 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Stops the lighter stream (the full one goes on).
     async fn light_stream_stop(&self) -> Result<(), String> {
         Ok(())
+    }
+    /// Starts an encode group directly into `hub` without a loopback RTMP connection.
+    /// Hosts that don't support direct Hub injection return `Ok(false)` and keep legacy ingest paths.
+    async fn start_encode_group(
+        &self,
+        _spec: EncodeGroupSpec,
+        _hub: Arc<ferrocast_golive::Hub>,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+    /// Stops a previously started encode group by `id`.
+    async fn stop_encode_group(&self, _id: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// Adjusts an individual active encode group's live bitrate share (`pct` in 1..=100).
+    async fn set_group_live_quality(&self, _id: &str, pct: u8) -> Result<(), String> {
+        self.set_live_quality(pct).await
+    }
+    /// Per-group stats keyed by group id (`{ [group_id]: StreamStats }`), if supported by the host.
+    async fn group_stats(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    /// Hardware/driver telemetry for cross-OS encode budget calculation.
+    async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+        None
     }
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;

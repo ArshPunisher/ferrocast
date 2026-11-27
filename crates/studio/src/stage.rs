@@ -3787,8 +3787,13 @@ impl Stage {
         own::OwnStream::drawn(self.engine()?, &doc, how)
     }
 
-    /// Streams what's on air over RTMP to `server` with `key`.
-    pub fn stream(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
+    fn stream_drawing(
+        &self,
+        send_to: Option<own::Send<'_>>,
+        hub: Option<Arc<ferrocast_golive::Hub>>,
+        fps: Option<u32>,
+        s: &StreamSettings,
+    ) -> Result<StageOutput, StudioError> {
         if let Some(why) = own::unsupported(s, true) {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
@@ -3798,7 +3803,9 @@ impl Stage {
         // Track 1 to viewers; Twitch's VOD track after it (sent as Enhanced RTMP multitrack audio).
         let tracks: Vec<u8> = std::iter::once(1).chain(s.vod_track).collect();
         let how = own::Drawing {
-            send_to: Some(own::Send { server, key, reconnect: s.reconnect }),
+            send_to,
+            hub,
+            fps,
             record: None,
             encode: &s.encode,
             tracks: &tracks,
@@ -3809,6 +3816,30 @@ impl Stage {
             video_tracks: &s.video_tracks,
         };
         Ok(StageOutput::new(self.output(how)?, None, self.canvas))
+    }
+
+    /// Streams what's on air over RTMP to `server` with `key`.
+    pub fn stream(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
+        self.stream_drawing(Some(own::Send { server, key, reconnect: s.reconnect }), None, None, s)
+    }
+
+    /// Streams what's on air straight into an injected [`ferrocast_golive::Hub`] without loopback RTMP.
+    pub fn stream_to_hub(
+        &self,
+        hub: Arc<ferrocast_golive::Hub>,
+        s: &StreamSettings,
+    ) -> Result<StageOutput, StudioError> {
+        self.stream_drawing(None, Some(hub), None, s)
+    }
+
+    /// Streams an encode group into `hub`, optionally decimating frame rate to `fps`.
+    pub fn stream_group_to_hub(
+        &self,
+        hub: Arc<ferrocast_golive::Hub>,
+        s: &StreamSettings,
+        fps: Option<u32>,
+    ) -> Result<StageOutput, StudioError> {
+        self.stream_drawing(None, Some(hub), fps, s)
     }
 
     /// Records what's on air (or `solo`, one scene or source on its own) to a file named as
@@ -3830,6 +3861,8 @@ impl Stage {
         let path = path.to_path_buf();
         let how = own::Drawing {
             send_to: None,
+            hub: None,
+            fps: None,
             record: Some(&path),
             encode: &plan.encode,
             tracks: &plan.tracks,
@@ -3886,6 +3919,20 @@ impl Stage {
         Ok(StageOutput::new(own, None, self.canvas))
     }
 
+    /// As [`Self::stream_sharing`], sending directly into `hub`.
+    pub fn stream_sharing_to_hub(
+        &self,
+        recording: &StageOutput,
+        hub: Arc<ferrocast_golive::Hub>,
+        s: &StreamSettings,
+    ) -> Result<StageOutput, StudioError> {
+        if !self.started(recording) {
+            return Err(StudioError::Failed("The recording runs in another collection.".into()));
+        }
+        let own = recording.own.stream_joining_to_hub(hub, &s.encode, s.delay_s)?;
+        Ok(StageOutput::new(own, None, self.canvas))
+    }
+
     /// `Collection`'s names for the same, so the app calls either.
     pub fn stream_drawn(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
         self.stream(server, key, s)
@@ -3919,6 +3966,8 @@ impl Stage {
         }
         let how = own::Drawing {
             send_to: None,
+            hub: None,
+            fps: None,
             record: None,
             encode: &plan.encode,
             tracks: &plan.tracks,
@@ -4946,19 +4995,30 @@ impl Stage {
     }
 
     /// Streams the vertical picture (its own scenes, 9:16), as `stream` streams the main one.
-    pub fn stream_vertical(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
+    fn vertical_drawing(
+        &self,
+        send_to: Option<own::Send<'_>>,
+        hub: Option<Arc<ferrocast_golive::Hub>>,
+        fps: Option<u32>,
+        allow_scale: bool,
+        s: &StreamSettings,
+    ) -> Result<StageOutput, StudioError> {
         if self.vertical().is_none() {
             return Err(fail("The vertical picture is off."));
         }
         let mut s = s.clone();
-        s.encode.scale = None;
+        if !allow_scale {
+            s.encode.scale = None;
+        }
         // Twitch's VOD track is the main picture's only.
         s.vod_track = None;
         if let Some(why) = own::unsupported(&s, true) {
             return Err(fail(format!("Ferrocast's own engine doesn't do {why} yet.")));
         }
         let how = own::Drawing {
-            send_to: Some(own::Send { server, key, reconnect: s.reconnect }),
+            send_to,
+            hub,
+            fps,
             record: None,
             encode: &s.encode,
             tracks: &[],
@@ -4969,6 +5029,28 @@ impl Stage {
             video_tracks: &[],
         };
         Ok(StageOutput::new(self.output(how)?, None, self.canvas))
+    }
+
+    pub fn stream_vertical(&self, server: &str, key: &str, s: &StreamSettings) -> Result<StageOutput, StudioError> {
+        self.vertical_drawing(Some(own::Send { server, key, reconnect: s.reconnect }), None, None, false, s)
+    }
+
+    pub fn vertical_stream_to_hub(
+        &self,
+        hub: Arc<ferrocast_golive::Hub>,
+        s: &StreamSettings,
+    ) -> Result<StageOutput, StudioError> {
+        self.vertical_drawing(None, Some(hub), None, false, s)
+    }
+
+    /// Streams a vertical encode group into `hub` with explicit output scaling and frame rate.
+    pub fn vertical_group_to_hub(
+        &self,
+        hub: Arc<ferrocast_golive::Hub>,
+        s: &StreamSettings,
+        fps: Option<u32>,
+    ) -> Result<StageOutput, StudioError> {
+        self.vertical_drawing(None, Some(hub), fps, true, s)
     }
 
     // ------------------------------------------------------------------ face follow
