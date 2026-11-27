@@ -65,9 +65,10 @@ pub(crate) mod mac {
     use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
         NSAutoresizingMaskOptions, NSResponder, NSView, NSWindowDidChangeBackingPropertiesNotification,
-        NSWindowDidEndLiveResizeNotification, NSWindowDidEnterFullScreenNotification,
-        NSWindowDidExitFullScreenNotification, NSWindowWillEnterFullScreenNotification,
-        NSWindowWillExitFullScreenNotification, NSWindowWillStartLiveResizeNotification,
+        NSWindowDidDeminiaturizeNotification, NSWindowDidEndLiveResizeNotification,
+        NSWindowDidEnterFullScreenNotification, NSWindowDidExitFullScreenNotification, NSWindowWillCloseNotification,
+        NSWindowWillEnterFullScreenNotification, NSWindowWillExitFullScreenNotification,
+        NSWindowWillMiniaturizeNotification, NSWindowWillStartLiveResizeNotification,
     };
     use objc2_foundation::{NSNotification, NSNotificationCenter, NSObject, NSPoint, NSRect, NSSize};
 
@@ -132,8 +133,6 @@ pub(crate) mod mac {
     pub struct PassIvars {
         /// Told the view's new size in device pixels whenever it changes (the engine draws at it).
         resized: std::cell::RefCell<Option<Resized>>,
-        /// It follows the window's size itself (fixed distances to the window's edges).
-        follows: std::cell::Cell<bool>,
         /// The page's cursor over the picture (an `NSCursor`), kept as this view's cursor area
         /// so AppKit shows it again whenever it redoes the window's cursor areas.
         cursor: std::cell::RefCell<Option<Retained<AnyObject>>>,
@@ -149,7 +148,7 @@ pub(crate) mod mac {
 
     impl std::fmt::Debug for PassIvars {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("PassIvars").field("follows", &self.follows.get()).finish_non_exhaustive()
+            f.debug_struct("PassIvars").finish_non_exhaustive()
         }
     }
 
@@ -162,12 +161,6 @@ pub(crate) mod mac {
         struct PassView;
 
         impl PassView {
-            #[unsafe(method(resizeWithOldSuperviewSize:))]
-            fn resize_with_old(&self, old: NSSize) {
-                // SAFETY: NSView's own resizeWithOldSuperviewSize: with AppKit's argument.
-                let _: () = unsafe { msg_send![super(self), resizeWithOldSuperviewSize: old] };
-            }
-
             /// A new size from anywhere (AppKit or the page): the engine queues it lock-free.
             #[unsafe(method(setFrameSize:))]
             fn set_frame_size(&self, size: NSSize) {
@@ -311,32 +304,56 @@ pub(crate) mod mac {
         impl WindowObserver {
             #[unsafe(method(willStartLiveResize:))]
             fn will_start_live_resize(&self, _note: &NSNotification) {
-                (self.ivars().on_live_resize)(true);
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_live_resize)(true);
             }
 
             #[unsafe(method(didEndLiveResize:))]
             fn did_end_live_resize(&self, _note: &NSNotification) {
-                (self.ivars().on_live_resize)(false);
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_live_resize)(false);
             }
 
             #[unsafe(method(willEnterFullScreen:))]
             fn will_enter_full_screen(&self, _note: &NSNotification) {
-                (self.ivars().on_live_resize)(true);
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_fullscreen)(true);
             }
 
             #[unsafe(method(didEnterFullScreen:))]
             fn did_enter_full_screen(&self, _note: &NSNotification) {
-                (self.ivars().on_live_resize)(false);
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_fullscreen)(false);
             }
 
             #[unsafe(method(willExitFullScreen:))]
             fn will_exit_full_screen(&self, _note: &NSNotification) {
-                (self.ivars().on_live_resize)(true);
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_fullscreen)(true);
             }
 
             #[unsafe(method(didExitFullScreen:))]
             fn did_exit_full_screen(&self, _note: &NSNotification) {
-                (self.ivars().on_live_resize)(false);
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_fullscreen)(false);
+            }
+
+            #[unsafe(method(willClose:))]
+            fn will_close(&self, _note: &NSNotification) {
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_window_reset)();
+            }
+
+            #[unsafe(method(willMiniaturize:))]
+            fn will_miniaturize(&self, _note: &NSNotification) {
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_window_reset)();
+            }
+
+            #[unsafe(method(didDeminiaturize:))]
+            fn did_deminiaturize(&self, _note: &NSNotification) {
+                let hooks = Rc::clone(self.ivars());
+                (hooks.on_window_reset)();
             }
 
             #[unsafe(method(didChangeBackingProperties:))]
@@ -345,7 +362,8 @@ pub(crate) mod mac {
                     // SAFETY: `object` is the NSWindow registered with `addObserver_selector_name_object`.
                     let scale: f64 = unsafe { msg_send![&*obj, backingScaleFactor] };
                     if scale.is_finite() && scale > 0.0 {
-                        (self.ivars().on_scale_changed)(scale);
+                        let hooks = Rc::clone(self.ivars());
+                        (hooks.on_scale_changed)(scale);
                     }
                 }
             }
@@ -381,7 +399,7 @@ pub(crate) mod mac {
         view.window().is_some_and(|w| w.inLiveResize())
     }
 
-    /// Observes live-resize, fullscreen, and backing-scale notifications for the window owning `ns_view`.
+    /// Observes live-resize, fullscreen, close/minimize, and backing-scale notifications for the window owning `ns_view`.
     pub fn watch_window(ns_view: *mut c_void, hooks: crate::WindowWatchHooks) -> Option<WindowWatch> {
         let mtm = MainThreadMarker::new()?;
         if ns_view.is_null() {
@@ -403,6 +421,9 @@ pub(crate) mod mac {
                 (NSWindowDidEnterFullScreenNotification, sel!(didEnterFullScreen:)),
                 (NSWindowWillExitFullScreenNotification, sel!(willExitFullScreen:)),
                 (NSWindowDidExitFullScreenNotification, sel!(didExitFullScreen:)),
+                (NSWindowWillCloseNotification, sel!(willClose:)),
+                (NSWindowWillMiniaturizeNotification, sel!(willMiniaturize:)),
+                (NSWindowDidDeminiaturizeNotification, sel!(didDeminiaturize:)),
                 (NSWindowDidChangeBackingPropertiesNotification, sel!(didChangeBackingProperties:)),
             ] {
                 center.addObserver_selector_name_object(&observer, selector, Some(name), Some(&window));
@@ -531,28 +552,6 @@ pub(crate) mod mac {
             Some((px(f.size.width), px(f.size.height)))
         }
 
-        /// Follows the window's size itself, as a native widget in the window's own layout does
-        /// (OBS's preview is one): its distances to the window's edges stay as they are, so
-        /// while the window is resized it is resized with it in the same step, not a beat later
-        /// when the page has laid out. For a view whose page box keeps those distances (the
-        /// stage between fixed panels). Main thread only.
-        pub fn follow_window(&self, on: bool) {
-            if MainThreadMarker::new().is_none() {
-                return;
-            }
-            self.pass.ivars().follows.set(on);
-            let fixed_top = NSAutoresizingMaskOptions::ViewMinYMargin;
-            // SAFETY: on the main thread (checked above); only reads the tree.
-            let flipped = unsafe { self.view.superview() }.is_some_and(|p| p.isFlipped());
-            self.view.setAutoresizingMask(if on {
-                NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable
-            } else if flipped {
-                NSAutoresizingMaskOptions::empty()
-            } else {
-                fixed_top
-            });
-        }
-
         /// `f` is told the view's size in device pixels each time it changes. Main thread only.
         pub fn on_resize(&self, f: Box<dyn Fn(u32, u32)>) {
             if MainThreadMarker::new().is_some() {
@@ -572,16 +571,11 @@ pub(crate) mod mac {
         }
 
         /// Moves and resizes it (the page's box moved). Main thread only; ignored elsewhere.
-        /// While a view that follows the window is resized with it, the page's boxes are left
-        /// out: they're a beat behind the window, and moving to them made the picture lag and
-        /// jump. The page places it exactly again once the resize settles.
         pub fn set_frame(&self, x: f64, y: f64, w: f64, h: f64, vh: f64) {
             if MainThreadMarker::new().is_none() {
                 return;
             }
-            if self.pass.ivars().follows.get() && self.window_resizing() {
-                return;
-            }
+            let prev = self.view.bounds().size;
             // SAFETY: on the main thread (checked above); `superview` only reads the view tree.
             if let Some(parent) = unsafe { self.view.superview() } {
                 let box_asked = wanted(&parent, Some(&self.view), x, y, w, h, vh);
@@ -589,6 +583,10 @@ pub(crate) mod mac {
                 self.pass.ivars().wanted.set(Some(box_asked));
                 self.pass.ivars().overhang.set(overhang(&parent, box_asked, frame));
                 self.view.setFrame(frame);
+            }
+            let next = self.view.bounds().size;
+            if (prev.width - next.width).abs() > 1e-3 || (prev.height - next.height).abs() > 1e-3 {
+                *self.pass.ivars().mask_key.borrow_mut() = None;
             }
         }
 
@@ -662,7 +660,11 @@ pub(crate) mod mac {
         /// sub-menu over its menu, a list over a dialog) stay holes, and rounded corners show
         /// the page's rounded panel, not a square cut of what's under it.
         pub fn set_holes(&self, holes: &[(f64, f64, f64, f64, f64)]) {
-            if MainThreadMarker::new().is_none() || self.window_resizing() {
+            if MainThreadMarker::new().is_none() {
+                return;
+            }
+            if self.window_resizing() {
+                *self.pass.ivars().mask_key.borrow_mut() = None;
                 return;
             }
             // SAFETY: `layer` on a layer-backed NSView (wantsLayer is set when it's made).
@@ -766,7 +768,7 @@ pub(crate) mod projector_window {
         NSBackingStoreType, NSEvent, NSResponder, NSScreen, NSView, NSWindow, NSWindowCollectionBehavior,
         NSWindowDelegate, NSWindowStyleMask,
     };
-    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+    use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString};
 
     /// What a projector window tells its owner.
     pub struct Hooks {
@@ -776,6 +778,8 @@ pub(crate) mod projector_window {
         pub close: Box<dyn Fn()>,
         /// The view's new size in pixels.
         pub resize: Box<dyn Fn(u32, u32)>,
+        /// True while the user is interactively dragging a window border/corner.
+        pub live_resize: Box<dyn Fn(bool)>,
         /// The pointer is hidden over the window (a blank cursor over the whole view).
         pub hide_cursor: std::cell::Cell<bool>,
     }
@@ -923,6 +927,24 @@ pub(crate) mod projector_window {
             fn window_should_close(&self, _w: &NSWindow) -> bool {
                 later(self.ivars(), |h| (h.close)());
                 false
+            }
+
+            #[unsafe(method(windowWillStartLiveResize:))]
+            fn window_will_start_live_resize(&self, _note: &NSNotification) {
+                let hooks = Rc::clone(self.ivars());
+                (hooks.live_resize)(true);
+            }
+
+            #[unsafe(method(windowDidEndLiveResize:))]
+            fn window_did_end_live_resize(&self, _note: &NSNotification) {
+                let hooks = Rc::clone(self.ivars());
+                (hooks.live_resize)(false);
+            }
+
+            #[unsafe(method(windowWillClose:))]
+            fn window_will_close(&self, _note: &NSNotification) {
+                let hooks = Rc::clone(self.ivars());
+                (hooks.live_resize)(false);
             }
         }
     );

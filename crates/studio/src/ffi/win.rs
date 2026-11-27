@@ -9,7 +9,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::rc::Rc;
 use std::sync::Once;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -25,11 +27,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DeferWindowPos, DestroyWindow, EndDeferWindowPos,
     GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, HTCLIENT, HWND_TOP, IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM,
     IDC_NO, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE, LoadCursorW, MA_NOACTIVATE,
-    RegisterClassW, SW_HIDE, SW_SHOWNA, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_DPICHANGED, WM_ENTERSIZEMOVE,
-    WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE,
+    RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_SHOWNA, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SetCursor, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_CANCELMODE, WM_DPICHANGED,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZING, WM_SYSCOMMAND, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_VISIBLE,
 };
 
 use crate::PreviewInput as Input;
@@ -66,6 +69,7 @@ struct WinBatchOp {
     hwnd: HWND,
     pos: Option<(i32, i32, i32, i32)>,
     visible: Option<bool>,
+    region: Option<Option<crate::HoleMaskKey>>,
 }
 
 thread_local! {
@@ -84,9 +88,30 @@ fn queue_batch_op(hwnd: HWND, pos: Option<(i32, i32, i32, i32)>, visible: Option
                 existing.visible = visible;
             }
         } else {
-            ops.push(WinBatchOp { hwnd, pos, visible });
+            ops.push(WinBatchOp { hwnd, pos, visible, region: None });
         }
         true
+    })
+}
+
+fn queue_batch_rgn(hwnd: HWND, region: Option<crate::HoleMaskKey>) -> bool {
+    WIN_BATCH.with(|b| {
+        let mut borrow = b.borrow_mut();
+        let Some(ops) = borrow.as_mut() else { return false };
+        if let Some(existing) = ops.iter_mut().find(|o| std::ptr::eq(o.hwnd, hwnd)) {
+            existing.region = Some(region);
+        } else {
+            ops.push(WinBatchOp { hwnd, pos: None, visible: None, region: Some(region) });
+        }
+        true
+    })
+}
+
+fn pending_batch_rgn(hwnd: HWND) -> Option<Option<crate::HoleMaskKey>> {
+    WIN_BATCH.with(|b| {
+        let borrow = b.borrow();
+        let ops = borrow.as_ref()?;
+        ops.iter().find(|o| std::ptr::eq(o.hwnd, hwnd)).and_then(|o| o.region.clone())
     })
 }
 
@@ -96,6 +121,42 @@ fn drop_batch_ops(hwnd: HWND) {
             ops.retain(|o| !std::ptr::eq(o.hwnd, hwnd));
         }
     });
+}
+
+/// Applies `key` as `hwnd`'s window region (`None` clears the region).
+/// Returns `true` iff `SetWindowRgn` succeeded; deletes any created `HRGN` on failure.
+///
+/// # Safety
+/// `hwnd` must be a live window created by this module on the main thread.
+unsafe fn apply_window_rgn(hwnd: HWND, key: Option<&crate::HoleMaskKey>) -> bool {
+    let Some(key) = key else {
+        // SAFETY: `hwnd` is live; passing null clears the custom window region.
+        return unsafe { SetWindowRgn(hwnd, std::ptr::null_mut(), 1) } != 0;
+    };
+    // SAFETY: creates GDI regions for `hwnd`; on `SetWindowRgn` success the OS owns `shown`,
+    // and on any failure all locally created GDI region handles are deleted.
+    unsafe {
+        let shown: HRGN = CreateRectRgn(0, 0, key.width as i32, key.height as i32);
+        if shown.is_null() {
+            return false;
+        }
+        for &(hx, hy, hw, hh, d) in &key.holes {
+            // CreateRoundRectRgn leaves out its right and bottom edges: one more each.
+            let hole = CreateRoundRectRgn(hx, hy, hx + hw + 1, hy + hh + 1, d, d);
+            if hole.is_null() {
+                DeleteObject(shown);
+                return false;
+            }
+            CombineRgn(shown, shown, hole, RGN_DIFF);
+            DeleteObject(hole);
+        }
+        if SetWindowRgn(hwnd, shown, 1) != 0 {
+            true
+        } else {
+            DeleteObject(shown);
+            false
+        }
+    }
 }
 
 /// Runs `f` and commits all child-window moves/resizes/visibility changes in one `DeferWindowPos` batch.
@@ -114,34 +175,48 @@ pub fn batch_update<T>(f: impl FnOnce() -> T) -> T {
             }
             // SAFETY: `ops` only contains live child HWNDs created by this module (destroyed ones are pruned).
             unsafe {
-                let mut hdwp = BeginDeferWindowPos(ops.len() as i32);
-                if !hdwp.is_null() {
-                    for op in &ops {
-                        let (x, y, w, h, mut flags) = match op.pos {
-                            Some((x, y, w, h)) => (x, y, w, h, SWP_NOACTIVATE),
-                            None => (0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE),
-                        };
-                        match op.visible {
-                            Some(true) => flags |= SWP_SHOWWINDOW,
-                            Some(false) => flags |= SWP_HIDEWINDOW,
-                            None => {}
-                        }
-                        hdwp = DeferWindowPos(hdwp, op.hwnd, HWND_TOP, x, y, w, h, flags);
-                        if hdwp.is_null() {
-                            break;
+                let swp_count = ops.iter().filter(|o| o.pos.is_some() || o.visible.is_some()).count();
+                if swp_count > 0 {
+                    let mut hdwp = BeginDeferWindowPos(swp_count as i32);
+                    if !hdwp.is_null() {
+                        for op in &ops {
+                            if op.pos.is_none() && op.visible.is_none() {
+                                continue;
+                            }
+                            let (x, y, w, h, mut flags) = match op.pos {
+                                Some((x, y, w, h)) => (x, y, w, h, SWP_NOACTIVATE),
+                                None => (0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE),
+                            };
+                            match op.visible {
+                                Some(true) => flags |= SWP_SHOWWINDOW,
+                                Some(false) => flags |= SWP_HIDEWINDOW,
+                                None => {}
+                            }
+                            hdwp = DeferWindowPos(hdwp, op.hwnd, HWND_TOP, x, y, w, h, flags);
+                            if hdwp.is_null() {
+                                break;
+                            }
                         }
                     }
-                    if !hdwp.is_null() {
-                        EndDeferWindowPos(hdwp);
-                        return;
+                    if hdwp.is_null() || EndDeferWindowPos(hdwp) == 0 {
+                        for op in &ops {
+                            if let Some((x, y, w, h)) = op.pos {
+                                SetWindowPos(op.hwnd, HWND_TOP, x, y, w, h, SWP_NOACTIVATE);
+                            }
+                            if let Some(show) = op.visible {
+                                ShowWindow(op.hwnd, if show { SW_SHOWNA } else { SW_HIDE });
+                            }
+                        }
                     }
                 }
+                // Apply region updates after child bounds and visibility are committed so
+                // `SetWindowRgn(..., bRedraw=TRUE)` never paints against stale dimensions.
                 for op in &ops {
-                    if let Some((x, y, w, h)) = op.pos {
-                        SetWindowPos(op.hwnd, HWND_TOP, x, y, w, h, SWP_NOACTIVATE);
-                    }
-                    if let Some(show) = op.visible {
-                        ShowWindow(op.hwnd, if show { SW_SHOWNA } else { SW_HIDE });
+                    if let Some(ref next_key) = op.region
+                        && apply_window_rgn(op.hwnd, next_key.as_ref())
+                        && let Some(state) = (GetWindowLongPtrW(op.hwnd, GWLP_USERDATA) as *const State).as_ref()
+                    {
+                        *state.mask_key.borrow_mut() = Some(next_key.clone());
                     }
                 }
             }
@@ -451,7 +526,7 @@ impl ChildView {
         self.state.origin_css.set((x, y));
         self.state.origin.set((dx, dy));
         let next_size = (dw.max(1) as u32, dh.max(1) as u32);
-        if self.state.size.replace(next_size) != next_size {
+        if self.state.size.replace(next_size) != next_size && !matches!(*self.state.mask_key.borrow(), Some(None)) {
             *self.state.mask_key.borrow_mut() = None;
         }
         if !queue_batch_op(self.hwnd, Some((dx, dy, dw, dh)), None) {
@@ -491,26 +566,19 @@ impl ChildView {
         let s = scale(self.hwnd);
         let origin_css = self.state.origin_css.get();
         let next_key = crate::hole_mask_key_px(origin_css, (pw, ph), holes, s);
-        if self.state.mask_key.borrow().as_ref() == Some(&next_key) {
+        if let Some(pending) = pending_batch_rgn(self.hwnd) {
+            if pending == next_key {
+                return;
+            }
+        } else if self.state.mask_key.borrow().as_ref() == Some(&next_key) {
             return;
         }
-        // SAFETY: regions made here; the one handed to SetWindowRgn belongs to the system after
-        // (not deleted here), the others are deleted.
-        unsafe {
-            let Some(key) = next_key else {
-                SetWindowRgn(self.hwnd, std::ptr::null_mut(), 1);
-                *self.state.mask_key.borrow_mut() = Some(None);
-                return;
-            };
-            let shown: HRGN = CreateRectRgn(0, 0, pw as i32, ph as i32);
-            for &(hx, hy, hw, hh, d) in &key.holes {
-                // CreateRoundRectRgn leaves out its right and bottom edges: one more each.
-                let hole = CreateRoundRectRgn(hx, hy, hx + hw + 1, hy + hh + 1, d, d);
-                CombineRgn(shown, shown, hole, RGN_DIFF);
-                DeleteObject(hole);
-            }
-            SetWindowRgn(self.hwnd, shown, 1);
-            *self.state.mask_key.borrow_mut() = Some(Some(key));
+        if queue_batch_rgn(self.hwnd, next_key.clone()) {
+            return;
+        }
+        // SAFETY: `self.hwnd` is live while `ChildView` exists; `mask_key` updates only on success.
+        if unsafe { apply_window_rgn(self.hwnd, next_key.as_ref()) } {
+            *self.state.mask_key.borrow_mut() = Some(next_key);
         }
     }
 
@@ -543,12 +611,25 @@ impl ChildView {
     }
 }
 
-const SUBCLASS_ID: usize = 0x4643_5757;
+static NEXT_SUBCLASS_ID: AtomicUsize = AtomicUsize::new(0x4643_5757);
 
-#[derive(Debug)]
+struct SubclassState {
+    hooks: crate::WindowWatchHooks,
+    in_size_move: Cell<bool>,
+    live_resizing: Cell<bool>,
+    removed: Cell<bool>,
+}
+
 pub struct WindowWatch {
     hwnd: HWND,
-    hooks_ptr: *mut crate::WindowWatchHooks,
+    uid: usize,
+    state: Rc<SubclassState>,
+}
+
+impl std::fmt::Debug for WindowWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WindowWatch").field("hwnd", &self.hwnd).field("uid", &self.uid).finish_non_exhaustive()
+    }
 }
 
 unsafe extern "system" fn window_subclass_proc(
@@ -560,41 +641,110 @@ unsafe extern "system" fn window_subclass_proc(
     ref_data: usize,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
-    // SAFETY: `ref_data` is the boxed `WindowWatchHooks` kept alive by `WindowWatch` until `Drop`
-    // removes the subclass; null only if `ref_data == 0`.
-    let hooks = unsafe { (ref_data as *const crate::WindowWatchHooks).as_ref() };
-    if let Some(h) = hooks {
-        match msg {
-            WM_ENTERSIZEMOVE => (h.on_live_resize)(true),
-            WM_EXITSIZEMOVE => (h.on_live_resize)(false),
-            WM_DPICHANGED => {
-                let dpi = (wparam.0 & 0xffff) as u32;
-                if dpi > 0 {
-                    (h.on_scale_changed)(f64::from(dpi) / 96.0);
+    let ptr = ref_data as *const SubclassState;
+    if ptr.is_null() {
+        // SAFETY: forwards messages when no subclass state is attached.
+        return unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+    }
+    // SAFETY: `ref_data` holds a live `Rc<SubclassState>` until `RemoveWindowSubclass` runs.
+    // Incrementing before running callbacks keeps `state` valid even if a hook detaches `WindowWatch`.
+    let state = unsafe {
+        Rc::increment_strong_count(ptr);
+        Rc::from_raw(ptr)
+    };
+    if state.removed.get() {
+        // SAFETY: forwards messages after subclass removal has begun.
+        return unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+    }
+    match msg {
+        WM_ENTERSIZEMOVE => {
+            // Pure title-bar moves must keep video live; only enter live-resize hiding on WM_SIZING.
+            state.in_size_move.set(true);
+            // SAFETY: forwards message to the next window procedure in the subclass chain.
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_SIZING => {
+            if state.in_size_move.get() && !state.live_resizing.replace(true) {
+                (state.hooks.on_live_resize)(true);
+            }
+            // SAFETY: forwards message to the next window procedure in the subclass chain.
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_EXITSIZEMOVE => {
+            // SAFETY: let Tao clear its size-move state before notifying the host.
+            let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            state.in_size_move.set(false);
+            if state.live_resizing.replace(false) {
+                (state.hooks.on_live_resize)(false);
+            }
+            res
+        }
+        WM_DPICHANGED => {
+            // SAFETY: let Tao update scale factor and resize the parent HWND/WebView2 first.
+            let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            let dpi = (wparam.0 & 0xffff) as u32;
+            if dpi > 0 {
+                (state.hooks.on_scale_changed)(f64::from(dpi) / 96.0);
+            }
+            res
+        }
+        WM_SYSCOMMAND if (wparam.0 & 0xfff0) == SC_MINIMIZE as usize => {
+            // SAFETY: forwards minimize command before clearing active resize state.
+            let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+            state.in_size_move.set(false);
+            state.live_resizing.set(false);
+            (state.hooks.on_window_reset)();
+            res
+        }
+        WM_NCDESTROY => {
+            state.in_size_move.set(false);
+            state.live_resizing.set(false);
+            if !state.removed.replace(true) {
+                // SAFETY: detaches this subclass as the host window tears down and frees its `Rc` ref.
+                unsafe {
+                    let _ = RemoveWindowSubclass(hwnd, Some(window_subclass_proc), uid);
+                    Rc::decrement_strong_count(ptr);
                 }
             }
-            WM_NCDESTROY => {
-                // SAFETY: detaches this subclass as the host window is destroyed.
-                let _ = unsafe { RemoveWindowSubclass(hwnd, Some(window_subclass_proc), uid) };
-            }
-            _ => {}
+            // SAFETY: forwards final non-client destroy to the original window procedure chain.
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
+        // SAFETY: forwards all unhandled messages down the subclass chain.
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
     }
-    // SAFETY: forwards all window messages to the original window procedure chain.
-    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 impl Drop for WindowWatch {
     fn drop(&mut self) {
         use windows::Win32::Foundation::HWND as WinHWND;
         use windows::Win32::UI::Shell::RemoveWindowSubclass;
-        // SAFETY: removes our subclass on the live window before freeing the boxed hooks.
-        unsafe {
-            let _ = RemoveWindowSubclass(WinHWND(self.hwnd), Some(window_subclass_proc), SUBCLASS_ID);
-            if !self.hooks_ptr.is_null() {
-                drop(Box::from_raw(self.hooks_ptr));
+        if !self.state.removed.replace(true) {
+            // SAFETY: removes our unique `uid` subclass on the live window and releases its `Rc` ref.
+            unsafe {
+                let _ = RemoveWindowSubclass(WinHWND(self.hwnd), Some(window_subclass_proc), self.uid);
+                Rc::decrement_strong_count(Rc::as_ptr(&self.state));
             }
         }
+    }
+}
+
+pub fn window_in_live_resize(hwnd: *mut c_void) -> bool {
+    use windows::Win32::Foundation::HWND as WinHWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GUI_INMOVESIZE, GUITHREADINFO, GetGUIThreadInfo, GetWindowThreadProcessId,
+    };
+    if hwnd.is_null() {
+        return false;
+    }
+    // SAFETY: queries Win32 GUI state for the thread owning `hwnd`.
+    unsafe {
+        let target = WinHWND(hwnd);
+        let tid = GetWindowThreadProcessId(target, None);
+        if tid == 0 {
+            return false;
+        }
+        let mut info = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+        GetGUIThreadInfo(tid, &mut info).is_ok() && info.flags.contains(GUI_INMOVESIZE) && info.hwndMoveSize.0 == hwnd
     }
 }
 
@@ -604,15 +754,22 @@ pub fn watch_window(hwnd: *mut c_void, hooks: crate::WindowWatchHooks) -> Option
     if hwnd.is_null() {
         return None;
     }
-    let boxed = Box::into_raw(Box::new(hooks));
-    // SAFETY: `hwnd` is the main Tauri window's live HWND; `WindowWatch` owns `boxed` until `Drop`.
-    let ok = unsafe { SetWindowSubclass(WinHWND(hwnd), Some(window_subclass_proc), SUBCLASS_ID, boxed as usize) };
+    let uid = NEXT_SUBCLASS_ID.fetch_add(1, Ordering::Relaxed);
+    let state = Rc::new(SubclassState {
+        hooks,
+        in_size_move: Cell::new(false),
+        live_resizing: Cell::new(false),
+        removed: Cell::new(false),
+    });
+    let raw = Rc::into_raw(state.clone());
+    // SAFETY: `hwnd` is the main Tauri window's live HWND; the subclass holds `raw` until removed.
+    let ok = unsafe { SetWindowSubclass(WinHWND(hwnd), Some(window_subclass_proc), uid, raw as usize) };
     if !ok.as_bool() {
-        // SAFETY: installation failed; reclaim the boxed hooks immediately.
-        unsafe { drop(Box::from_raw(boxed)) };
+        // SAFETY: installation failed; reclaim the subclass `Rc` ref immediately.
+        unsafe { drop(Rc::from_raw(raw)) };
         return None;
     }
-    Some(WindowWatch { hwnd, hooks_ptr: boxed })
+    Some(WindowWatch { hwnd, uid, state })
 }
 
 #[cfg(test)]
@@ -635,7 +792,8 @@ pub mod projector {
 
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW,
+        MonitorFromWindow,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
@@ -643,10 +801,11 @@ pub mod projector {
         AdjustWindowRectEx, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_USERDATA,
         GetClientRect, GetWindowLongPtrW, HTCLIENT, HWND_NOTOPMOST, HWND_TOPMOST, IDC_ARROW, LoadCursorW,
         MONITORINFOF_PRIMARY, PostMessageW, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP, WM_CLOSE,
-        WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_NCDESTROY, WM_SETCURSOR, WM_SIZE, WM_SIZING,
-        WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT,
-        WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+        SWP_NOZORDER, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_APP,
+        WM_CANCELMODE, WM_CLOSE, WM_DPICHANGED, WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN,
+        WM_LBUTTONDOWN, WM_NCDESTROY, WM_SETCURSOR, WM_SIZE, WM_SIZING, WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT,
+        WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT, WMSZ_TOPRIGHT, WNDCLASSW, WS_EX_TOPMOST, WS_OVERLAPPEDWINDOW,
+        WS_POPUP, WS_VISIBLE,
     };
 
     use super::point_of;
@@ -659,6 +818,8 @@ pub mod projector {
         pub close: Box<dyn Fn()>,
         /// The view's new size in pixels.
         pub resize: Box<dyn Fn(u32, u32)>,
+        /// True while the user is interactively dragging a window border/corner.
+        pub live_resize: Box<dyn Fn(bool)>,
         /// The pointer is hidden over the window.
         pub hide_cursor: Cell<bool>,
     }
@@ -694,6 +855,8 @@ pub mod projector {
         /// Width over height of the picture (a windowed projector keeps it as it's resized).
         aspect: f64,
         full: bool,
+        in_size_move: Cell<bool>,
+        live_resizing: Cell<bool>,
     }
 
     unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -737,36 +900,75 @@ pub mod projector {
                 unsafe { SetCursor(std::ptr::null_mut()) };
                 1
             }
+            WM_ENTERSIZEMOVE => {
+                state.in_size_move.set(true);
+                // SAFETY: forwards message to the default window procedure.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+            WM_EXITSIZEMOVE | WM_CANCELMODE => {
+                state.in_size_move.set(false);
+                if state.live_resizing.replace(false) {
+                    let hooks = state.hooks.clone();
+                    (hooks.live_resize)(false);
+                }
+                // SAFETY: forwards message to the default window procedure.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
             WM_SIZE => {
                 let (w, h) = (lparam as u32 & 0xffff, (lparam as u32 >> 16) & 0xffff);
                 (state.hooks.resize)(w.max(1), h.max(1));
                 0
             }
             WM_DPICHANGED => {
-                // SAFETY: Windows passes the suggested RECT in lparam for a top-level DPI change.
-                let r = unsafe { &*(lparam as *const RECT) };
-                // SAFETY: resizes this live projector window to the OS-suggested DPI rect.
-                unsafe {
-                    SetWindowPos(
-                        hwnd,
-                        std::ptr::null_mut(),
-                        r.left,
-                        r.top,
-                        r.right - r.left,
-                        r.bottom - r.top,
-                        SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
+                if state.full {
+                    // Fullscreen projectors stay snapped to their monitor instead of scaling across displays.
+                    // SAFETY: queries monitor bounds for this live fullscreen projector window.
+                    unsafe {
+                        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                        let mut info: MONITORINFO = std::mem::zeroed();
+                        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                        if !mon.is_null() && GetMonitorInfoW(mon, &mut info) != 0 {
+                            let r = info.rcMonitor;
+                            SetWindowPos(
+                                hwnd,
+                                std::ptr::null_mut(),
+                                r.left,
+                                r.top,
+                                r.right - r.left,
+                                r.bottom - r.top,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
+                        }
+                    }
+                    return 0;
                 }
-                let mut client = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                // SAFETY: reads this live window's client size into `client`.
-                unsafe { GetClientRect(hwnd, &mut client) };
-                (state.hooks.resize)(
-                    (client.right - client.left).max(1) as u32,
-                    (client.bottom - client.top).max(1) as u32,
-                );
+                if lparam != 0 {
+                    // SAFETY: Windows passes the suggested RECT in lparam for a top-level DPI change.
+                    let r = unsafe { &*(lparam as *const RECT) };
+                    // SAFETY: resizes this live projector window; `WM_SIZE` delivers `hooks.resize` if size changed.
+                    unsafe {
+                        SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            r.left,
+                            r.top,
+                            r.right - r.left,
+                            r.bottom - r.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                }
                 0
             }
-            WM_SIZING if !state.full && state.aspect > 0.0 => {
+            WM_SIZING if !state.full => {
+                if state.in_size_move.get() && !state.live_resizing.replace(true) {
+                    let hooks = state.hooks.clone();
+                    (hooks.live_resize)(true);
+                }
+                if state.aspect <= 0.0 {
+                    // SAFETY: forwards to the default window procedure when no aspect lock is active.
+                    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+                }
                 // Keeps the picture's shape: the edge dragged leads, the other follows.
                 // SAFETY: lparam is the RECT Windows passes with WM_SIZING, ours to change.
                 let r = unsafe { &mut *(lparam as *mut RECT) };
@@ -793,6 +995,11 @@ pub mod projector {
             // Ferrocore draws all of it.
             WM_ERASEBKGND => 1,
             WM_NCDESTROY => {
+                state.in_size_move.set(false);
+                if state.live_resizing.replace(false) {
+                    let hooks = state.hooks.clone();
+                    (hooks.live_resize)(false);
+                }
                 // SAFETY: clears the pointer before Win drops the State it points to.
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
                 // SAFETY: the default procedure finishes destroying the window.
@@ -918,7 +1125,13 @@ pub mod projector {
         if hwnd.is_null() {
             return None;
         }
-        let state = Box::new(State { hooks: Rc::new(hooks), aspect, full: full.is_some() });
+        let state = Box::new(State {
+            hooks: Rc::new(hooks),
+            aspect,
+            full: full.is_some(),
+            in_size_move: Cell::new(false),
+            live_resizing: Cell::new(false),
+        });
         // SAFETY: the window keeps a pointer to the boxed State, which Win owns and frees only
         // after DestroyWindow (whose WM_NCDESTROY clears it). Then shown and given the keys (Esc).
         unsafe {

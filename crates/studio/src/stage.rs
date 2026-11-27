@@ -7195,6 +7195,65 @@ impl Stage {
     }
 }
 
+/// Consolidated look and layout configuration for a [`StageView`].
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[derive(Debug)]
+pub struct StageViewConfig<'a> {
+    pub rect: crate::Rect,
+    pub canvas: Option<(f64, f64, f64, f64)>,
+    pub bg: Option<u32>,
+    pub stripe: Option<u32>,
+    pub holes: &'a [(f64, f64, f64, f64, f64)],
+    pub opacity: Option<f64>,
+    pub shade: f64,
+    pub scale: f64,
+    pub hide_for_resize: bool,
+}
+
+/// Coordinates projector live-resize parking with deferred multiview layout updates so
+/// dragging a projector window never stalls live compositing or text rasterization.
+#[derive(Debug, Default)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+pub(crate) struct ProjectorResizeGate {
+    live_resizing: bool,
+    mv_dirty: bool,
+}
+
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+impl ProjectorResizeGate {
+    /// Returns whether multiview layout should apply immediately on this resize tick.
+    pub(crate) fn on_resize(&mut self, has_multiview: bool) -> bool {
+        if self.live_resizing {
+            if has_multiview {
+                self.mv_dirty = true;
+            }
+            false
+        } else {
+            has_multiview
+        }
+    }
+
+    /// Transitions live-resize state, returning `(engine_active_change, flush_multiview)`.
+    pub(crate) fn on_live_resize(&mut self, active: bool) -> (Option<bool>, bool) {
+        if self.live_resizing == active {
+            return (None, false);
+        }
+        self.live_resizing = active;
+        let flush = !active && std::mem::take(&mut self.mv_dirty);
+        (Some(active), flush)
+    }
+
+    /// Returns whether an external multiview update should apply now or defer until settle.
+    pub(crate) fn on_multiview_update(&mut self) -> bool {
+        if self.live_resizing {
+            self.mv_dirty = true;
+            false
+        } else {
+            true
+        }
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageView {
     /// Returns a handle to the engine backing this view.
@@ -7203,11 +7262,75 @@ impl StageView {
         EngineRef(self.shared.clone())
     }
 
+    /// Applies background, stripes, frame/canvas area, holes, shade, opacity, and live-resize
+    /// visibility in a single engine look update with hide-before-opacity and wake-before-reveal.
+    pub fn configure(&mut self, cfg: StageViewConfig<'_>) {
+        if cfg.hide_for_resize {
+            self.set_hidden_for_resize(true);
+            self.set_live_resize(true);
+        }
+        match cfg.canvas {
+            Some(canvas) => {
+                place(&self.view, &cfg.rect);
+                let (canvas_px, outer_px) = crate::canvas_area_px(cfg.rect, canvas, cfg.scale);
+                let (cx, cy) = self.view.pixels().unwrap_or(outer_px);
+                {
+                    let mut l = self.look.borrow_mut();
+                    if let Some(abgr) = cfg.bg {
+                        let c = |shift: u32| ((abgr >> shift) & 0xff) as f32 / 255.0;
+                        l.background = [c(0), c(8), c(16), 1.0];
+                    }
+                    l.stripe = cfg.stripe;
+                    l.area = Some(canvas_px);
+                    l.area_for = Some((cx, cy));
+                    l.ppp = ppp(cfg.scale);
+                    l.shade = cfg.shade.clamp(0.0, 1.0) as f32;
+                }
+                if let Some(abgr) = cfg.bg {
+                    self.view.set_backdrop(abgr);
+                }
+                self.shared.engine.resize_preview(self.id, cx, cy);
+            }
+            None => {
+                let r = crate::with_edge(cfg.rect);
+                place(&self.view, &r);
+                let (cx, cy) = self.view.pixels().unwrap_or_else(|| {
+                    let d = crate::device_rect(r.x, r.y, r.w, r.h, cfg.scale);
+                    (d.w, d.h)
+                });
+                {
+                    let mut l = self.look.borrow_mut();
+                    if let Some(abgr) = cfg.bg {
+                        let c = |shift: u32| ((abgr >> shift) & 0xff) as f32 / 255.0;
+                        l.background = [c(0), c(8), c(16), 1.0];
+                    }
+                    l.stripe = cfg.stripe;
+                    l.area = None;
+                    l.area_for = None;
+                    l.margin = crate::edge_px(cfg.scale) as f32;
+                    l.ppp = ppp(cfg.scale);
+                    l.shade = cfg.shade.clamp(0.0, 1.0) as f32;
+                }
+                if let Some(abgr) = cfg.bg {
+                    self.view.set_backdrop(abgr);
+                }
+                self.shared.engine.resize_preview(self.id, cx, cy);
+            }
+        }
+        self.set_holes(cfg.holes);
+        self.push();
+        self.opacity.set(cfg.opacity.unwrap_or(1.0));
+        if cfg.hide_for_resize {
+            self.view.set_opacity(self.shown_opacity());
+        } else {
+            self.set_live_resize(false);
+            self.set_hidden_for_resize(false);
+            self.view.set_opacity(self.shown_opacity());
+        }
+    }
+
     /// Moves or resizes it (the page's box changed). Main thread.
     pub fn set_rect(&mut self, rect: crate::Rect, scale: f64) {
-        // Explicit frame updates on all platforms: native never autoresizing-follows during drag.
-        #[cfg(target_os = "macos")]
-        self.view.follow_window(false);
         let r = crate::with_edge(rect);
         place(&self.view, &r);
         {
@@ -7228,8 +7351,6 @@ impl StageView {
     /// Covers `area` (the page's whole stage) with the canvas at `canvas` inside it (points
     /// from the area's top left). Main thread.
     pub fn set_area(&mut self, area: crate::Rect, canvas: (f64, f64, f64, f64), scale: f64) {
-        #[cfg(target_os = "macos")]
-        self.view.follow_window(false);
         place(&self.view, &area);
         let (canvas_px, outer_px) = crate::canvas_area_px(area, canvas, scale);
         let (cx, cy) = self.view.pixels().unwrap_or(outer_px);
@@ -7429,6 +7550,8 @@ pub struct StageProjector {
     win: crate::ffi::projector_window::Win,
     /// A multiview's layout (shared with its window's clicks and resizes).
     multiview: Option<std::rc::Rc<RefCell<MultiviewState>>>,
+    /// Tracks projector live-resize parking and deferred multiview layout updates.
+    resize_gate: std::rc::Rc<RefCell<ProjectorResizeGate>>,
     /// Source name pinned via `keep_alone`, released on `Drop`.
     alone: Option<String>,
 }
@@ -7568,17 +7691,36 @@ impl Stage {
         });
         // Resizes reach the engine once the preview is there (a multiview is laid out again).
         let id_cell = std::rc::Rc::new(std::cell::Cell::new(None::<u64>));
+        let resize_gate = std::rc::Rc::new(RefCell::new(ProjectorResizeGate::default()));
         let resize = {
             // Weak, as the stage view's: the window can outlive the projector a moment.
-            let (weak, id_cell, mv) = (Arc::downgrade(&shared), id_cell.clone(), multiview.clone());
+            let (weak, id_cell, mv, gate) =
+                (Arc::downgrade(&shared), id_cell.clone(), multiview.clone(), resize_gate.clone());
             Box::new(move |w: u32, h: u32| {
                 let Some(shared) = weak.upgrade() else { return };
                 if let Some(id) = id_cell.get() {
                     shared.engine.resize_preview(id, w, h);
                     if let Some(mv) = &mv {
                         mv.borrow_mut().view = (w, h);
-                        mv.borrow().apply(&shared, id);
+                        if gate.borrow_mut().on_resize(true) {
+                            mv.borrow().apply(&shared, id);
+                        }
                     }
+                }
+            })
+        };
+        let live_resize = {
+            let (weak, id_cell, mv, gate) =
+                (Arc::downgrade(&shared), id_cell.clone(), multiview.clone(), resize_gate.clone());
+            Box::new(move |active: bool| {
+                let Some(shared) = weak.upgrade() else { return };
+                let Some(id) = id_cell.get() else { return };
+                let (engine_active, flush_mv) = gate.borrow_mut().on_live_resize(active);
+                if flush_mv && let Some(mv) = &mv {
+                    mv.borrow().apply(&shared, id);
+                }
+                if let Some(on) = engine_active {
+                    shared.engine.set_preview_live_resize(id, on);
                 }
             })
         };
@@ -7594,8 +7736,13 @@ impl Stage {
             }
             None => Box::new(|_, _, _, _| {}),
         };
-        let hooks =
-            crate::ffi::projector_window::Hooks { click, close: on_close, resize, hide_cursor: Default::default() };
+        let hooks = crate::ffi::projector_window::Hooks {
+            click,
+            close: on_close,
+            resize,
+            live_resize,
+            hide_cursor: Default::default(),
+        };
         let Some(win) = crate::ffi::projector_window::open(&title, aspect, screen, hooks) else {
             if let Some(name) = &alone {
                 shared.release_alone(name);
@@ -7624,7 +7771,7 @@ impl Stage {
             mv.borrow_mut().view = (pw, ph);
             mv.borrow().apply(&shared, id);
         }
-        Ok(StageProjector { shared, id, win, multiview, alone })
+        Ok(StageProjector { shared, id, win, multiview, resize_gate, alone })
     }
 }
 
@@ -7658,8 +7805,10 @@ impl StageProjector {
         let names: Vec<String> = stage.scenes().into_iter().map(|s| s.name).collect();
         let next = MultiviewState { names, preview: stage.preview_scene(), look, ..mv.borrow().clone() };
         if *mv.borrow() != next {
-            next.apply(&self.shared, self.id);
             *mv.borrow_mut() = next;
+            if self.resize_gate.borrow_mut().on_multiview_update() {
+                mv.borrow().apply(&self.shared, self.id);
+            }
         }
     }
 }
@@ -7684,6 +7833,7 @@ pub struct StageView(());
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(clippy::unused_self)]
 impl StageView {
+    pub fn configure(&mut self, _cfg: StageViewConfig<'_>) {}
     pub fn set_rect(&mut self, _rect: crate::Rect, _scale: f64) {}
     pub fn set_area(&mut self, _area: crate::Rect, _canvas: (f64, f64, f64, f64), _scale: f64) {}
     pub fn show_scene(&self, _scene: Option<&str>) {}
@@ -11579,5 +11729,31 @@ mod tests {
         );
         assert!(s.is_matching_camera_waiting(cam_kind, cam_key, &val));
         assert!(s.matching_device_picture_job(cam_kind, cam_key, &val, 160).is_none());
+    }
+
+    #[test]
+    fn projector_resize_gate_parks_and_defers_multiview_until_settle() {
+        let mut gate = super::ProjectorResizeGate::default();
+        // Outside live resize, multiview layout updates apply immediately.
+        assert!(gate.on_resize(true));
+        assert!(!gate.on_resize(false));
+        assert!(gate.on_multiview_update());
+
+        // Starting live resize notifies the engine once and suppresses duplicate starts.
+        assert_eq!(gate.on_live_resize(true), (Some(true), false));
+        assert_eq!(gate.on_live_resize(true), (None, false));
+
+        // Resizing during live drag defers multiview layout rebuilds instead of running per pixel.
+        assert!(!gate.on_resize(true));
+        assert!(!gate.on_multiview_update());
+
+        // Settling flushes the deferred multiview layout once before unparking the engine.
+        assert_eq!(gate.on_live_resize(false), (Some(false), true));
+        assert_eq!(gate.on_live_resize(false), (None, false));
+
+        // Without any dirty multiview work, settling unparks with flush=false.
+        assert_eq!(gate.on_live_resize(true), (Some(true), false));
+        assert!(!gate.on_resize(false));
+        assert_eq!(gate.on_live_resize(false), (Some(false), false));
     }
 }

@@ -181,6 +181,11 @@ pub(crate) fn sanitize_scale(scale: f64) -> f64 {
     if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }
 }
 
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+fn finite_or(v: f64, fallback: f64) -> f64 {
+    if v.is_finite() { v } else { fallback }
+}
+
 /// Outer child-view rectangle in device pixels (`floor` origin, `ceil` far edge).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
@@ -196,17 +201,17 @@ pub(crate) struct DeviceRect {
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
 pub(crate) fn device_rect(x: f64, y: f64, w: f64, h: f64, scale: f64) -> DeviceRect {
     let s = sanitize_scale(scale);
+    let x = finite_or(x, 0.0);
+    let y = finite_or(y, 0.0);
+    let w = finite_or(w, 1.0).clamp(1.0, 16_384.0);
+    let h = finite_or(h, 1.0).clamp(1.0, 16_384.0);
     let x0 = (x * s).floor();
     let y0 = (y * s).floor();
-    let x1 = ((x + w.max(1.0)) * s).ceil();
-    let y1 = ((y + h.max(1.0)) * s).ceil();
-    let clamp_i32 = |v: f64| v.clamp(-32_768.0, 32_767.0) as i32;
-    DeviceRect {
-        x: clamp_i32(x0),
-        y: clamp_i32(y0),
-        w: (x1 - x0).round().clamp(1.0, 16_384.0) as u32,
-        h: (y1 - y0).round().clamp(1.0, 16_384.0) as u32,
-    }
+    let x1 = ((x + w) * s).ceil();
+    let y1 = ((y + h) * s).ceil();
+    let clamp_i32 = |v: f64| if v.is_finite() { v.clamp(-32_768.0, 32_767.0) as i32 } else { 0 };
+    let clamp_u32 = |v: f64| if v.is_finite() { v.round().clamp(1.0, 16_384.0) as u32 } else { 1 };
+    DeviceRect { x: clamp_i32(x0), y: clamp_i32(y0), w: clamp_u32(x1 - x0), h: clamp_u32(y1 - y0) }
 }
 
 /// Converts a child-relative CSS rectangle `(rx, ry, w, h)` anchored at `origin_css` into
@@ -214,8 +219,12 @@ pub(crate) fn device_rect(x: f64, y: f64, w: f64, h: f64, scale: f64) -> DeviceR
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 pub(crate) fn device_rect_relative(origin_css: (f64, f64), rel: (f64, f64, f64, f64), scale: f64) -> DeviceRect {
     let s = sanitize_scale(scale);
-    let base = device_rect(origin_css.0, origin_css.1, 1.0, 1.0, s);
-    let abs = device_rect(origin_css.0 + rel.0, origin_css.1 + rel.1, rel.2, rel.3, s);
+    let ox = finite_or(origin_css.0, 0.0);
+    let oy = finite_or(origin_css.1, 0.0);
+    let rx = finite_or(rel.0, 0.0);
+    let ry = finite_or(rel.1, 0.0);
+    let base = device_rect(ox, oy, 1.0, 1.0, s);
+    let abs = device_rect(ox + rx, oy + ry, rel.2, rel.3, s);
     DeviceRect { x: abs.x - base.x, y: abs.y - base.y, w: abs.w, h: abs.h }
 }
 
@@ -228,16 +237,22 @@ pub(crate) fn canvas_area_px(
     scale: f64,
 ) -> ((f32, f32, f32, f32), (u32, u32)) {
     let s = sanitize_scale(scale);
-    let outer = device_rect(outer_area.x, outer_area.y, outer_area.w, outer_area.h, s);
-    let cx0 = ((outer_area.x + canvas.0) * s).round();
-    let cy0 = ((outer_area.y + canvas.1) * s).round();
-    let cx1 = ((outer_area.x + canvas.0 + canvas.2.max(1.0)) * s).round();
-    let cy1 = ((outer_area.y + canvas.1 + canvas.3.max(1.0)) * s).round();
+    let ox = finite_or(outer_area.x, 0.0);
+    let oy = finite_or(outer_area.y, 0.0);
+    let outer = device_rect(ox, oy, outer_area.w, outer_area.h, s);
+    let cx = finite_or(canvas.0, 0.0);
+    let cy = finite_or(canvas.1, 0.0);
+    let cw = finite_or(canvas.2, 1.0).clamp(1.0, 16_384.0);
+    let ch = finite_or(canvas.3, 1.0).clamp(1.0, 16_384.0);
+    let cx0 = ((ox + cx) * s).round();
+    let cy0 = ((oy + cy) * s).round();
+    let cx1 = ((ox + cx + cw) * s).round();
+    let cy1 = ((oy + cy + ch) * s).round();
     let area = (
-        (cx0 - f64::from(outer.x)) as f32,
-        (cy0 - f64::from(outer.y)) as f32,
-        (cx1 - cx0).max(1.0) as f32,
-        (cy1 - cy0).max(1.0) as f32,
+        finite_or(cx0 - f64::from(outer.x), 0.0) as f32,
+        finite_or(cy0 - f64::from(outer.y), 0.0) as f32,
+        finite_or(cx1 - cx0, 1.0).max(1.0) as f32,
+        finite_or(cy1 - cy0, 1.0).max(1.0) as f32,
     );
     (area, (outer.w, outer.h))
 }
@@ -255,6 +270,8 @@ pub(crate) struct HoleMaskKey {
     pub scale_q: u32,
     /// Hole boxes in device pixels from the view's top left (macOS: x, y, w, h, corner radius;
     /// Windows: x, y, w, h, corner diameter).
+    /// The view's size in 1/8 points: a sub-point change of size is a new key.
+    pub bounds_q: (u32, u32),
     pub holes: Vec<(i32, i32, i32, i32, i32)>,
 }
 
@@ -281,18 +298,29 @@ pub(crate) fn hole_mask_key(
     let ph = (bounds_h * s).round().clamp(1.0, 16_384.0) as u32;
     let q = |v: f64| (v * s).round().clamp(-65_536.0, 65_536.0) as i32;
     let (pw_i, ph_i) = (pw as i32, ph as i32);
+    let bounds_q =
+        ((bounds_w.clamp(1.0, 16_384.0) * 8.0).round() as u32, (bounds_h.clamp(1.0, 16_384.0) * 8.0).round() as u32);
     let mut out = Vec::new();
     for &(x, y, w, h, rad) in holes {
         if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && rad.is_finite()) {
             continue;
         }
-        let (qx, qy, qw, qh) = (q(x), q(y), q(w), q(h));
+        // Both edges are rounded, not the origin and the size apart: a far edge at 600.8 pixels
+        // is 601, not 200 + 400 (a column of picture left beside the panel).
+        let (qx, qy) = (q(x), q(y));
+        let (qw, qh) = (q(x + w) - qx, q(y + h) - qy);
         if qw <= 0 || qh <= 0 || qx >= pw_i || qy >= ph_i || qx + qw <= 0 || qy + qh <= 0 {
             continue;
         }
         out.push((qx, qy, qw, qh, q(rad.max(0.0)).min(qw / 2).min(qh / 2)));
     }
-    (!out.is_empty()).then_some(HoleMaskKey { width: pw, height: ph, scale_q: (s * 1000.0).round() as u32, holes: out })
+    (!out.is_empty()).then_some(HoleMaskKey {
+        width: pw,
+        height: ph,
+        bounds_q,
+        scale_q: (s * 1000.0).round() as u32,
+        holes: out,
+    })
 }
 
 /// Builds a device-pixel hole region key for Windows `SetWindowRgn` (`None` when no visible holes apply).
@@ -323,14 +351,22 @@ pub(crate) fn hole_mask_key_px(
         let d = (rad.max(0.0).min(w / 2.0).min(h / 2.0) * 2.0 * s).round() as i32;
         out.push((r.x, r.y, r.w as i32, r.h as i32, d));
     }
-    (!out.is_empty()).then_some(HoleMaskKey { width: pw, height: ph, scale_q: (s * 1000.0).round() as u32, holes: out })
+    (!out.is_empty()).then_some(HoleMaskKey {
+        width: pw,
+        height: ph,
+        bounds_q: (pw, ph),
+        scale_q: (s * 1000.0).round() as u32,
+        holes: out,
+    })
 }
 
-/// Callbacks invoked on the main thread for native window resize and DPI transitions.
+/// Callbacks invoked on the main thread for native window resize, fullscreen, DPI, and reset transitions.
 #[allow(missing_debug_implementations)]
 pub struct WindowWatchHooks {
     pub on_live_resize: Box<dyn Fn(bool)>,
+    pub on_fullscreen: Box<dyn Fn(bool)>,
     pub on_scale_changed: Box<dyn Fn(f64)>,
+    pub on_window_reset: Box<dyn Fn()>,
 }
 
 /// Guard keeping native OS window observers active until dropped.
@@ -386,7 +422,7 @@ pub fn batch_preview_updates<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Returns whether the OS window is actively in a live drag-resize loop (macOS AppKit query).
+/// Returns whether the OS window is actively in a live drag-resize loop (macOS AppKit / Win32 GUI state).
 pub fn window_in_live_resize(window: raw_window_handle::RawWindowHandle) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -395,7 +431,14 @@ pub fn window_in_live_resize(window: raw_window_handle::RawWindowHandle) -> bool
         }
         false
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        if let raw_window_handle::RawWindowHandle::Win32(h) = window {
+            return ffi::win::window_in_live_resize(h.hwnd.get() as *mut std::ffi::c_void);
+        }
+        false
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = window;
         false
@@ -1239,6 +1282,10 @@ mod tests {
         assert_eq!((k_reach.width, k_reach.height), (802, 602));
         let (x, y, w, h, _) = k_reach.holes[0];
         assert_eq!((x, y, x + w, y + h), (0, 0, 802, 602), "{k_reach:?}");
+        // Both edges of a hole are rounded, not its size: at 2x a hole from 100.2 wide 200.2
+        // ends at 300.4 pt, pixel 601 (rounding the size apart left it at 600).
+        let edge = hole_mask_key(bw, bh, 2.0, &[(100.2, 10.0, 200.2, 20.0, 0.0)]).expect("a hole").holes[0];
+        assert_eq!((edge.0, edge.0 + edge.2), (200, 601), "{edge:?}");
         // A one-device-pixel gap the page left at 2x stays a pixel.
         let gap = [(0.5, 0.5, 399.9, 299.8, 0.0)];
         let (gx, gy, ..) = hole_mask_key(bw, bh, 2.0, &gap).expect("a hole").holes[0];
@@ -1251,6 +1298,32 @@ mod tests {
         let a = fit_holes(&inner, Overhang { left: 0.5, top: 0.5, ..Overhang::default() }, 400.4, 300.3);
         let b = fit_holes(&inner, Overhang::default(), 400.4, 300.3);
         assert_ne!(hole_mask_key(bw, bh, 2.0, &a), hole_mask_key(bw, bh, 2.0, &b));
+    }
+
+    #[test]
+    fn a_burst_of_unchanged_holes_builds_one_mask() {
+        // 120 updates of the same dialog hole while the page's float rects wobble by a fifth
+        // of a point (what getBoundingClientRect gives frame to frame): one mask, not 120.
+        let mut keys = Vec::new();
+        let mut builds = 0;
+        let mut cached = None;
+        for i in 0..120 {
+            let wobble = f64::from(i % 5) * 0.04;
+            let holes = [(50.0 + wobble, 40.0, 100.0, 80.0, 8.0)];
+            let next = hole_mask_key(401.0, 301.0, 2.0, &holes);
+            if cached.as_ref() != Some(&next) {
+                builds += 1;
+                cached = Some(next.clone());
+            }
+            if !keys.contains(&next) {
+                keys.push(next);
+            }
+        }
+        assert_eq!(keys.len(), 1, "float noise under half a device pixel is one key");
+        assert_eq!(builds, 1, "and so one rebuild for the whole burst");
+        // A real change (the view a pixel wider) is a rebuild, and only that one.
+        let next = hole_mask_key(401.5, 301.0, 2.0, &[(50.0, 40.0, 100.0, 80.0, 8.0)]);
+        assert_ne!(cached.as_ref(), Some(&next));
     }
 
     #[test]
@@ -1268,6 +1341,38 @@ mod tests {
                 assert!(v.0 + v.2 >= r.0 + r.2 - 1e-9 && v.1 + v.3 >= r.1 + r.3 - 1e-9);
             }
         }
+    }
+
+    #[test]
+    fn device_rect_and_canvas_area_handle_non_finite_inputs() {
+        let d = device_rect(f64::NAN, f64::NEG_INFINITY, f64::NAN, f64::INFINITY, f64::NAN);
+        assert!(d.w >= 1 && d.h >= 1, "non-finite inputs must preserve >= 1 pixel bounds: {d:?}");
+
+        let (area, outer) = canvas_area_px(
+            Rect { x: f64::NAN, y: 10.0, w: f64::NAN, h: 100.0, vh: 100.0 },
+            (f64::NAN, 5.0, f64::INFINITY, f64::NAN),
+            2.0,
+        );
+        assert!(outer.0 >= 1 && outer.1 >= 1, "outer bounds must stay >= 1: {outer:?}");
+        assert!(
+            area.0.is_finite()
+                && area.1.is_finite()
+                && area.2.is_finite()
+                && area.3.is_finite()
+                && area.2 >= 1.0
+                && area.3 >= 1.0,
+            "canvas area must stay finite and >= 1: {area:?}"
+        );
+    }
+
+    #[test]
+    fn hole_mask_key_distinguishes_subpoint_bounds() {
+        let holes = [(10.0, 10.0, 50.0, 50.0, 4.0)];
+        // At 1x, 800.5 and 801.0 points both round to 801 pixels: only the bounds tell them apart.
+        let k_half = hole_mask_key(800.5, 450.0, 1.0, &holes);
+        let k_whole = hole_mask_key(801.0, 450.0, 1.0, &holes);
+        assert!(k_half.is_some() && k_whole.is_some());
+        assert_ne!(k_half, k_whole, "800.5pt and 801.0pt bounds must not collide in the mask cache");
     }
 
     #[test]
