@@ -852,6 +852,7 @@ mod tests {
             light: false,
             enhanced: false,
             brand: None,
+            quality: crate::golive::DestinationQuality::SameAsMain,
         };
         let dests = vec![
             dest("tw-custom", ferrocast_golive::Service::Twitch),
@@ -884,6 +885,7 @@ mod tests {
             light: false,
             enhanced: false,
             brand: None,
+            quality: crate::golive::DestinationQuality::SameAsMain,
         };
         let t0 = Instant::now();
         let next = Some(t0 + Duration::from_secs(30));
