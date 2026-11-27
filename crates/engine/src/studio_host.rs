@@ -449,6 +449,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn light_stream_stop(&self) -> Result<(), String> {
         Ok(())
     }
+    /// Returns true if this host supports direct-Hub encode groups (`start_encode_group`).
+    fn supports_encode_groups(&self) -> bool {
+        false
+    }
     /// Starts an encode group directly into `hub` without a loopback RTMP connection.
     /// Hosts that don't support direct Hub injection return `Ok(false)` and keep legacy ingest paths.
     async fn start_encode_group(
@@ -461,6 +465,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     /// Stops a previously started encode group by `id`.
     async fn stop_encode_group(&self, _id: &str) -> Result<(), String> {
         Ok(())
+    }
+    /// Aborts a failed/cancelled encode group immediately without draining a stream-delay tail.
+    async fn abort_encode_group(&self, id: &str) -> Result<(), String> {
+        self.stop_encode_group(id).await
     }
     /// Adjusts an individual active encode group's live bitrate share (`pct` in 1..=100).
     async fn set_group_live_quality(&self, _id: &str, pct: u8) -> Result<(), String> {
@@ -3434,15 +3442,15 @@ impl Engine {
                 let mut extra_mpx = 0.0;
                 let mut extra_sessions = 0u32;
                 let counts_rec = !draft_is_sw || s.encoder == "software" || rec_sw;
-                if counts_rec && s.record_when_streaming && !shared && !draft_is_sw && !rec_sw {
+                if counts_rec && s.record_when_streaming && !shared && (!rec_sw || draft_is_sw) {
                     extra_mpx += mpx_canvas;
                     extra_sessions += 1;
                 }
-                if replay_by_host.unwrap_or(s.replay_when_streaming) && !rec_sw {
+                if replay_by_host.unwrap_or(s.replay_when_streaming) && (!rec_sw || draft_is_sw) {
                     extra_mpx += mpx_canvas;
                     extra_sessions += 1;
                 }
-                info.record_shares_main = s.record_when_streaming && shared && !draft_is_sw;
+                info.record_shares_main = s.record_when_streaming && shared && (!rec_sw || draft_is_sw);
                 info.record_extra_mpx_s = extra_mpx;
                 info.record_extra_sessions = extra_sessions;
             }
@@ -5401,5 +5409,116 @@ mod tests {
             failed("At least one transition must remain.".into()),
             EngineError::Refused { status: 409, code: "studio_last_transition", .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn studio_encode_budget_bills_x264_recording_and_replay() {
+        #[derive(Debug)]
+        struct SwBudgetHost;
+        #[async_trait::async_trait]
+        impl StudioHost for SwBudgetHost {
+            async fn status(&self) -> StudioStatus {
+                Default::default()
+            }
+            async fn start(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn stop(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn kinds(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn options(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+                Ok(())
+            }
+            async fn defaults(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn act(&self, _act: StudioAct) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn settings(&self) -> StudioSettings {
+                Default::default()
+            }
+            async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            async fn stats(&self) -> Result<Value, String> {
+                Ok(serde_json::json!({}))
+            }
+            async fn record(&self, _on: bool) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn record_pause(&self, _on: bool) -> Result<(), String> {
+                Ok(())
+            }
+            async fn monitoring(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_stop(&self) -> Result<(), String> {
+                Ok(())
+            }
+            async fn stream_stats(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn obs_collections(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn import_obs(&self, _id: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn encode_budget(
+                &self,
+                _draft: Option<Value>,
+                _enhanced: bool,
+                _light: bool,
+            ) -> Result<Value, String> {
+                Ok(serde_json::json!({ "shared": false, "replay": false }))
+            }
+            async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+                Some(HostBudgetInfo {
+                    os: "windows".into(),
+                    encoder_id: "obs_x264".into(),
+                    cpu_cores: 8,
+                    host_sig: "win|cores=8".into(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        e.set_studio_host(Arc::new(SwBudgetHost));
+        let _ = e
+            .add_golive_destination("YouTube", "rtmp://127.0.0.1:19905/app", "k", ferrocast_golive::Canvas::Main)
+            .await
+            .unwrap();
+
+        let draft = StudioSettings {
+            encoder: "software".into(),
+            video_encoder: Some("obs_x264".into()),
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            record_when_streaming: true,
+            record_quality: "high".into(),
+            replay_when_streaming: false,
+            ..StudioSettings::default()
+        };
+        let v = e.studio_encode_budget(Some(serde_json::to_value(draft).unwrap())).await.unwrap();
+        assert_eq!(
+            v.get("used_sessions").and_then(Value::as_u64),
+            Some(2),
+            "x264 stream + high recording must charge 2 CPU sessions: {v}"
+        );
     }
 }

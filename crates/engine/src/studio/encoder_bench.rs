@@ -1453,12 +1453,15 @@ pub(crate) fn persisted_bench_from_run(
         let mpx = f64::from(c.width) * f64::from(c.height) * f64::from(c.fps) / 1e6;
         let budget_ms = 1000.0 / f64::from(c.fps.max(1));
         let avg_ms = c.encode_ms_avg.max(0.25);
-        ((mpx * (budget_ms / avg_ms) * 0.80).max(mpx)).min(2_500.0)
+        let fps_factor =
+            if c.fps_achieved > 0.0 { (c.fps_achieved / f64::from(c.fps.max(1))).clamp(0.1, 1.0) } else { 1.0 };
+        ((mpx * (budget_ms / avg_ms) * 0.80 * fps_factor).max(mpx)).min(mpx * 4.0).min(1_000.0)
     };
+    let preset_matches = |c: &BenchCandidate| !want_sw || picked.preset.is_none() || c.preset == picked.preset;
     let mut best_exact: Option<f64> = None;
     let mut best_class: Option<f64> = None;
     for c in candidates {
-        if !c.passed || c.encode_ms_avg <= 0.0 {
+        if !c.passed || c.encode_ms_avg <= 0.0 || !preset_matches(c) {
             continue;
         }
         let est = estimate_mpx(c);
@@ -4148,5 +4151,75 @@ mod tests {
         info_upgraded.host_sig = "windows|nv=560.70".into();
         let b_stale = crate::golive_plan::PcBudget::from_host_info(&info_upgraded, Some(&saved), true);
         assert_eq!(b_stale.source, crate::golive_plan::BudgetSource::NvencDefault);
+    }
+
+    #[test]
+    fn persisted_bench_isolates_x264_presets_and_caps_hw_pipelined_extrapolation() {
+        let mk = |enc: &str, preset: Option<&str>, ms: f64| BenchCandidate {
+            encoder_backend: if enc == "obs_x264" { "x264".into() } else { "nvenc".into() },
+            studio_encoder_id: enc.into(),
+            label: enc.into(),
+            family: if enc == "obs_x264" { EncoderFamily::X264 } else { EncoderFamily::Nvenc },
+            hardware: enc != "obs_x264",
+            preset: preset.map(str::to_string),
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 6_000,
+            frames_tested: 120,
+            encode_ms_avg: ms,
+            encode_ms_p95: ms * 1.2,
+            encode_ms_max: ms * 1.5,
+            budget_ms: 16.67,
+            fps_achieved: 60.0,
+            headroom_pct: 50.0,
+            skipped_frames: 0,
+            lagged_frames: 0,
+            cpu_pct: None,
+            gpu_pct: None,
+            elapsed_ms: 200,
+            passed: true,
+            reason: "ok".into(),
+        };
+
+        let cands = [mk("obs_x264", Some("ultrafast"), 0.8), mk("obs_x264", Some("veryfast"), 7.0)];
+        let picked_sw = BenchRecommendation {
+            encoder: "software".into(),
+            video_encoder: Some("obs_x264".into()),
+            studio_encoder_id: "obs_x264".into(),
+            encoder_settings: serde_json::Map::new(),
+            label: "x264 veryfast".into(),
+            preset: Some("veryfast".into()),
+            scale: None,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            video_kbps: 6_000,
+            headroom_pct: 58.0,
+            limited_by: ferrocast_golive::bench::LimitedBy::Upload,
+            why: "test".into(),
+        };
+        let sw_bench = super::persisted_bench_from_run(&cands, &picked_sw, "win|cores=8", 1);
+        assert!(sw_bench.max_mpx_s < 400.0, "ultrafast must not inflate veryfast ceiling: {sw_bench:?}");
+
+        let hw_cands = [mk("ffmpeg_nvenc", None, 0.35)];
+        let picked_hw = BenchRecommendation {
+            encoder: "hardware".into(),
+            video_encoder: Some("ffmpeg_nvenc".into()),
+            studio_encoder_id: "ffmpeg_nvenc".into(),
+            encoder_settings: serde_json::Map::new(),
+            label: "NVENC".into(),
+            preset: None,
+            scale: None,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            video_kbps: 8_000,
+            headroom_pct: 95.0,
+            limited_by: ferrocast_golive::bench::LimitedBy::Upload,
+            why: "test".into(),
+        };
+        let hw_bench = super::persisted_bench_from_run(&hw_cands, &picked_hw, "win|nv=551.23", 1);
+        assert!(hw_bench.max_mpx_s <= 600.0, "pipelined GPU submit must not extrapolate to 2500 Mpx/s: {hw_bench:?}");
     }
 }

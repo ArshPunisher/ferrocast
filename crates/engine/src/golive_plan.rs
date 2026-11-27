@@ -105,9 +105,16 @@ fn cpu_default_sessions(cpu_cores: u32) -> u32 {
     }
 }
 
-fn encoder_is_nvenc(info: &crate::studio_host::HostBudgetInfo) -> bool {
+pub(crate) fn encoder_is_nvenc(info: &crate::studio_host::HostBudgetInfo) -> bool {
     let enc = info.encoder_id.to_ascii_lowercase();
-    enc.contains("nvenc") || info.hw_backend.as_deref() == Some("nvenc") || info.nvidia_driver_major.is_some()
+    enc.contains("nvenc")
+        || info.hw_backend.as_deref() == Some("nvenc")
+        || (info.hw_backend.is_none()
+            && !enc.contains("qsv")
+            && !enc.contains("amf")
+            && !enc.contains("vaapi")
+            && !enc.contains("videotoolbox")
+            && info.nvidia_driver_major.is_some())
 }
 
 /// Overall encode budget status.
@@ -228,7 +235,7 @@ impl PcBudget {
             let is_nvenc = encoder_is_nvenc(info);
             let max_sess =
                 if is_nvenc { nvenc_session_cap(info.nvidia_driver_major, info.nvidia_driver_minor) } else { 3 };
-            let bench_or_default = valid_bench.map_or(if is_nvenc { 250.0 } else { 125.0 }, |b| b.max_mpx_s);
+            let bench_or_default = valid_bench.map_or(250.0, |b| b.max_mpx_s);
             let sessions = valid_bench.and_then(|b| b.max_sessions_ok).map_or(max_sess, |m| m.min(max_sess).max(1));
             Self {
                 source: if valid_bench.is_some() {
@@ -269,6 +276,19 @@ impl PcBudget {
     }
 }
 
+/// Picks secondary Twitch Enhanced Broadcasting tracks strictly smaller than `out_h`.
+pub(crate) fn select_eb_extra_tracks(plan: &ferrocast_golive::twitch_eb::Plan, out_h: u32) -> Vec<(u32, u32, u32)> {
+    plan.encodes
+        .iter()
+        .skip(1)
+        .filter(|e| {
+            e.height < out_h && e.width >= 2 && e.height >= 2 && e.width.is_multiple_of(2) && e.height.is_multiple_of(2)
+        })
+        .map(|e| (e.width, e.height, e.kbps().max(300)))
+        .take(4)
+        .collect()
+}
+
 /// Twitch Enhanced Broadcasting ladder specification used during planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TwitchEbSpec {
@@ -305,16 +325,7 @@ impl TwitchEbSpec {
             no_bframes: main.no_bframes,
             audio_kbps: main.audio_kbps,
         };
-        let extra_tracks = plan
-            .encodes
-            .iter()
-            .skip(1)
-            .filter(|e| {
-                e.height <= enc0.height && e.width >= 2 && e.height >= 2 && e.width % 2 == 0 && e.height % 2 == 0
-            })
-            .map(|e| (e.width, e.height, e.kbps().max(300)))
-            .take(4)
-            .collect();
+        let extra_tracks = select_eb_extra_tracks(plan, enc0.height);
         Some(Self { top_key, extra_tracks })
     }
 
@@ -462,7 +473,7 @@ pub fn group_id_for_key(key: &EncodeKey) -> GroupId {
     hasher.update(key.kbps.to_be_bytes());
     hasher.update([codec_tag]);
     hasher.update(key.keyframe_s.to_be_bytes());
-    hasher.update([u8::from(key.strict_cbr), u8::from(key.no_bframes)]);
+    hasher.update([u8::from(key.no_bframes)]);
     hasher.update(key.audio_kbps.to_be_bytes());
     let digest = hasher.finalize();
     let short_hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
@@ -561,13 +572,19 @@ fn clamp_custom_for_fit(
     limit: Option<&PlatformLimit>,
     ignore_limits: bool,
 ) -> CustomQuality {
-    let max_w = (base.canvas_width & !1).max(128);
+    let max_w = (base.canvas_width & !1).max(72);
     let max_h = (base.canvas_height & !1).max(72);
     let (mut w, mut h) = if q.width <= max_w && q.height <= max_h {
-        ((q.width & !1).max(128), (q.height & !1).max(72))
+        ((q.width & !1).max(2), (q.height & !1).max(2))
     } else {
-        probe::fit_dimensions(q.width.max(2), q.height.max(2), max_w.max(max_h), max_w.min(max_h))
+        let scale = (f64::from(max_w) / f64::from(q.width.max(2))).min(f64::from(max_h) / f64::from(q.height.max(2)));
+        let sw = (((f64::from(q.width) * scale).floor() as u32) & !1).clamp(2, max_w);
+        let sh = (((f64::from(q.height) * scale).floor() as u32) & !1).clamp(2, max_h);
+        (sw, sh)
     };
+    if w.min(h) < 72 || w.max(h) < 128 {
+        (w, h) = (base.width.min(max_w), base.height.min(max_h));
+    }
     if base.canvas == Canvas::Vertical && h <= w {
         (w, h) = (base.width.min(base.height), base.width.max(base.height));
     }
@@ -657,6 +674,7 @@ struct WorkingGroup {
     key: EncodeKey,
     members: Vec<usize>,
     extra_tracks: Vec<(u32, u32, u32)>,
+    vod_track: bool,
     is_light: bool,
     is_twitch_eb: bool,
 }
@@ -679,7 +697,9 @@ fn evaluate_budget(groups: &[WorkingGroup], main: &MainEncode, budget: &PcBudget
                 used_sessions = used_sessions.saturating_add(1);
             }
         }
-        if budget.record_shares_main && !groups.iter().any(|g| g.id == GROUP_MAIN) {
+        let main_shares_with_record =
+            groups.iter().any(|g| g.id == GROUP_MAIN && g.extra_tracks.is_empty() && !g.vod_track);
+        if budget.record_shares_main && !main_shares_with_record {
             used_mpx_s += mpx_s(main.width, main.height, main.fps);
             used_sessions = used_sessions.saturating_add(1);
         }
@@ -711,6 +731,8 @@ fn rebuild_groups(dests: &[WorkingDest], eb_extra: &[(u32, u32, u32)]) -> Vec<Wo
     for (idx, d) in dests.iter().enumerate() {
         if let Some(g) = by_id.get_mut(&d.group_id) {
             g.members.push(idx);
+            g.key.strict_cbr |= d.key.strict_cbr;
+            g.vod_track |= d.input.vod_track;
             if d.is_eb {
                 g.is_twitch_eb = true;
                 if g.extra_tracks.is_empty() {
@@ -729,6 +751,7 @@ fn rebuild_groups(dests: &[WorkingDest], eb_extra: &[(u32, u32, u32)]) -> Vec<Wo
                     key: d.key.clone(),
                     members: vec![idx],
                     extra_tracks: if d.is_eb { eb_extra.to_vec() } else { Vec::new() },
+                    vod_track: d.input.vod_track,
                     is_light: d.on_light,
                     is_twitch_eb: d.is_eb,
                 },
@@ -1082,9 +1105,17 @@ fn apply_on_demand_light(
     whip_simulcast: bool,
     any_whip: bool,
     eb_extra: &[(u32, u32, u32)],
+    ignore_service_limits: bool,
     budget: &PcBudget,
 ) {
     let light_key = light_encode_key(main, any_whip);
+    let member_light_key = |d: &WorkingDest| {
+        let mut k = light_key.clone();
+        if !effective_ignore_limits(&d.input, ignore_service_limits) && d.limit.as_ref().is_some_and(|l| l.strict_cbr) {
+            k.strict_cbr = true;
+        }
+        k
+    };
     let route_light_indices: Vec<usize> = dests
         .iter()
         .enumerate()
@@ -1095,6 +1126,7 @@ fn apply_on_demand_light(
                 && !d.is_eb
                 && !d.is_manual_light
                 && is_heavier_than_light(&d.key, &light_key)
+                && key_satisfies_member(&member_light_key(d), d, ignore_service_limits)
         })
         .map(|(i, _)| i)
         .collect();
@@ -1104,8 +1136,9 @@ fn apply_on_demand_light(
 
     let mut sim_dests = dests.to_vec();
     for &idx in &route_light_indices {
+        let k = member_light_key(&sim_dests[idx]);
         sim_dests[idx].group_id = GROUP_LIGHT.to_string();
-        sim_dests[idx].key = light_key.clone();
+        sim_dests[idx].key = k;
         sim_dests[idx].separate_encode = true;
         sim_dests[idx].on_light = true;
     }
@@ -1116,6 +1149,7 @@ fn apply_on_demand_light(
             key: light_key.clone(),
             members: Vec::new(),
             extra_tracks: Vec::new(),
+            vod_track: false,
             is_light: true,
             is_twitch_eb: false,
         });
@@ -1202,6 +1236,11 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
     let any_whip = input.destinations.iter().any(|d| {
         d.enabled && d.can_start && !d.standby && d.canvas == Canvas::Main && d.direct == Some(DirectKind::Whip)
     });
+    let mut main_eff = input.main;
+    if any_whip {
+        main_eff.no_bframes = true;
+    }
+    let light_key = light_encode_key(&main_eff, any_whip);
 
     let has_active_eb = input.destinations.iter().any(|d| {
         d.enabled
@@ -1211,10 +1250,9 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
             && d.kind == Service::Twitch
             && d.canvas == Canvas::Main
             && d.direct.is_none()
-            && !(d.light && d.quality == DestinationQuality::SameAsMain)
+            && !d.wants_light_flag()
     });
-    let eb_spec =
-        has_active_eb.then(|| input.twitch_eb.clone().unwrap_or_else(|| TwitchEbSpec::estimated(&input.main)));
+    let eb_spec = has_active_eb.then(|| input.twitch_eb.clone().unwrap_or_else(|| TwitchEbSpec::estimated(&main_eff)));
     let eb_extra: Vec<(u32, u32, u32)> = eb_spec.as_ref().map_or_else(Vec::new, |s| s.extra_tracks.clone());
 
     let mut working: Vec<WorkingDest> = Vec::new();
@@ -1222,14 +1260,14 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
         if !d.enabled || !d.can_start || d.standby {
             continue;
         }
-        let is_manual_light = d.light && d.canvas == Canvas::Main && d.direct.is_none();
+        let is_manual_light = d.wants_light_flag();
         let is_eb = d.enhanced
             && d.kind == Service::Twitch
             && d.canvas == Canvas::Main
             && d.direct.is_none()
             && !d.wants_light_flag();
         if is_eb && let Some(eb) = &eb_spec {
-            let matches_main = eb.top_key == input.main.as_key();
+            let matches_main = eb.top_key == main_eff.as_key();
             let group_id = if matches_main { GROUP_MAIN.into() } else { GROUP_TWITCH_EB.into() };
             working.push(WorkingDest {
                 input: d.clone(),
@@ -1250,17 +1288,18 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
             });
             continue;
         }
-        let base = if d.canvas == Canvas::Vertical { &vertical_base } else { &input.main };
+        let base = if d.canvas == Canvas::Vertical { &vertical_base } else { &main_eff };
         let (fitted, limit) = resolve_normal_fit(d, base, input.vertical_cut, input.ignore_service_limits);
-        let group_id = if d.canvas == Canvas::Main && fitted.key == input.main.as_key() {
+        let group_id = if d.canvas == Canvas::Main && fitted.key == main_eff.as_key() {
             GROUP_MAIN.to_string()
-        } else if is_manual_light {
+        } else if is_manual_light && fitted.key.same_shape(&light_key) {
             GROUP_LIGHT.to_string()
         } else if d.canvas == Canvas::Vertical && fitted.key == vertical_base.as_key() {
             GROUP_VERTICAL.to_string()
         } else {
             group_id_for_key(&fitted.key)
         };
+        let on_light = group_id == GROUP_LIGHT;
         let is_same_as_main = d.quality == DestinationQuality::SameAsMain && !is_manual_light;
         let is_auto_fitted_same_as_main = is_same_as_main && fitted.auto_fitted;
         working.push(WorkingDest {
@@ -1277,39 +1316,42 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
             is_auto_fitted_same_as_main,
             is_eb: false,
             is_manual_light,
-            on_light: is_manual_light,
+            on_light,
             limit,
         });
     }
 
     let mut groups = rebuild_groups(&working, &eb_extra);
-    if evaluate_budget(&groups, &input.main, &input.budget).status == BudgetStatus::Over {
+    if evaluate_budget(&groups, &main_eff, &input.budget).status == BudgetStatus::Over {
         coalesce_pass(
             &mut working,
             &mut groups,
-            &input.main,
+            &main_eff,
             &vertical_base,
             &eb_extra,
             input.ignore_service_limits,
             &input.budget,
         );
     }
-    if evaluate_budget(&groups, &input.main, &input.budget).status == BudgetStatus::Over {
-        shared_cap_pass(&mut working, &mut groups, input, &vertical_base, &eb_extra);
+    if evaluate_budget(&groups, &main_eff, &input.budget).status == BudgetStatus::Over {
+        let mut eff_input = input.clone();
+        eff_input.main = main_eff;
+        shared_cap_pass(&mut working, &mut groups, &eff_input, &vertical_base, &eb_extra);
     }
     let has_whip_simulcast = input.whip_simulcast && any_whip;
     apply_on_demand_light(
         &mut working,
         &mut groups,
-        &input.main,
+        &main_eff,
         has_whip_simulcast,
         any_whip,
         &eb_extra,
+        input.ignore_service_limits,
         &input.budget,
     );
     sort_groups(&mut groups);
 
-    let budget = evaluate_budget(&groups, &input.main, &input.budget);
+    let budget = evaluate_budget(&groups, &main_eff, &input.budget);
     let mut group_member_names: BTreeMap<GroupId, Vec<(String, String)>> = BTreeMap::new();
     for g in &groups {
         let names = g.members.iter().map(|&i| (working[i].input.id.clone(), working[i].input.name.clone())).collect();
@@ -1362,7 +1404,7 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
         .collect();
 
     EncodePlan {
-        main: input.main.as_key(),
+        main: main_eff.as_key(),
         vertical: any_active_vertical.then(|| vertical_base.as_key()),
         groups: out_groups,
         destinations: dest_map,
@@ -1811,12 +1853,12 @@ mod tests {
         assert_eq!(b_nv_new.max_sessions, Some(8));
         assert_eq!(b_nv_new.effective_max_sessions(), Some(7));
 
-        // Windows QSV / AMF fallback: 3 sessions minus 1 spare when auto_quality = true.
+        // Windows QSV / AMF fallback: 250 Mpx/s default, 3 sessions minus 1 spare when auto_quality = true.
         let mut qsv = base_host("windows", "ffmpeg_hardware");
         qsv.hw_backend = Some("qsv".into());
         let b_qsv = PcBudget::from_host_info(&qsv, None, true);
         assert_eq!(b_qsv.source, BudgetSource::HwDefault);
-        assert_eq!(b_qsv.limit_mpx_s, Some(125.0));
+        assert_eq!(b_qsv.limit_mpx_s, Some(250.0));
         assert_eq!(b_qsv.effective_max_sessions(), Some(2));
 
         // Software x264 core tiers (<8 -> 125/1, 8-11 -> 180/2, 12-15 -> 250/2, 16+ -> 250/3).
@@ -1913,5 +1955,197 @@ mod tests {
             "software Bench limit must still count software stream encodes"
         );
         assert!(plan.budget.used_mpx_s > 200.0);
+    }
+
+    #[test]
+    fn whip_folds_no_bframes_into_main_without_orphan_encoder() {
+        let mut yt = dest("youtube", "YouTube", Service::Youtube, Canvas::Main);
+        let mut whip = dest("whip", "WebRTC", Service::Custom, Canvas::Main);
+        whip.direct = Some(DirectKind::Whip);
+        let mut main = base_1440p60();
+        main.no_bframes = false;
+        let plan = plan_encodes(&PlannerInput {
+            main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![yt.clone(), whip],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: PcBudget::apple_silicon(2),
+        });
+        assert_eq!(plan.groups.len(), 1, "WHIP + YouTube must share main without orphan encoder: {:?}", plan.groups);
+        assert_eq!(plan.groups[0].id, GROUP_MAIN);
+        assert!(plan.groups[0].key.no_bframes);
+        assert_eq!(plan.destinations["youtube"].group_id, GROUP_MAIN);
+        assert_eq!(plan.destinations["whip"].group_id, GROUP_MAIN);
+
+        // Enhanced + Custom + light=true must NOT trigger Twitch EB planning in `has_active_eb`.
+        yt.enhanced = true;
+        let mut tw = dest("twitch", "Twitch", Service::Twitch, Canvas::Main);
+        tw.enhanced = true;
+        tw.light = true;
+        tw.quality = DestinationQuality::Custom(CustomQuality {
+            width: 1280,
+            height: 720,
+            fps: 60,
+            kbps: 3_000,
+            codec: Some(VideoCodec::H264),
+        });
+        let p_eb = plan_encodes(&PlannerInput {
+            main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![tw],
+            ignore_service_limits: false,
+            twitch_eb: Some(TwitchEbSpec { top_key: main.as_key(), extra_tracks: vec![(1280, 720, 3_000)] }),
+            whip_simulcast: false,
+            budget: PcBudget::apple_silicon(2),
+        });
+        assert!(p_eb.groups.iter().all(|g| !g.is_twitch_eb && g.extra_tracks.is_empty()));
+    }
+
+    #[test]
+    fn qsv_with_nvidia_driver_uses_qsv_sessions_and_250_mpx_default() {
+        let mut info = base_host("windows", "obs_qsv11");
+        info.hw_backend = Some("qsv".into());
+        info.nvidia_driver_major = Some(551);
+        info.nvidia_driver_minor = Some(23);
+        let budget = PcBudget::from_host_info(&info, None, false);
+        assert_eq!(budget.source, BudgetSource::HwDefault);
+        assert_eq!(budget.limit_mpx_s, Some(250.0));
+        assert_eq!(budget.max_sessions, Some(3));
+    }
+
+    #[test]
+    fn kick_auto_dedups_with_youtube_custom_regardless_of_strict_cbr() {
+        let mut yt = dest("youtube", "YouTube", Service::Youtube, Canvas::Main);
+        yt.quality = DestinationQuality::Custom(CustomQuality {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            kbps: 8_000,
+            codec: Some(VideoCodec::H264),
+        });
+        let kick = dest("kick", "Kick", Service::Kick, Canvas::Main);
+        let mut main = base_1440p60();
+        main.vbr = false;
+        main.strict_cbr = false;
+        let plan = plan_encodes(&PlannerInput {
+            main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![yt, kick],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: PcBudget::apple_silicon(2),
+        });
+        assert_eq!(plan.groups.len(), 1, "strict_cbr must union rather than split matching keys: {:?}", plan.groups);
+        assert!(plan.groups[0].key.strict_cbr);
+        assert_eq!(plan.destinations["youtube"].group_id, plan.destinations["kick"].group_id);
+    }
+
+    #[test]
+    fn record_shares_main_charges_extra_when_main_has_vod_or_eb() {
+        let main = MainEncode::from_canvas(Canvas::Main, 1920, 1080, 60, 6_000, VideoCodec::H264);
+        let mut tw_vod = dest("twitch", "Twitch", Service::Twitch, Canvas::Main);
+        tw_vod.vod_track = true;
+        let mut budget = PcBudget::apple_silicon(2);
+        budget.record_shares_main = true;
+
+        let p_vod = plan_encodes(&PlannerInput {
+            main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![tw_vod],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: budget.clone(),
+        });
+        assert_eq!(p_vod.groups[0].id, GROUP_MAIN);
+        assert_eq!(p_vod.budget.used_sessions, 2, "VOD track on main prevents sharing with recording");
+
+        let mut tw_eb = dest("twitch", "Twitch", Service::Twitch, Canvas::Main);
+        tw_eb.enhanced = true;
+        let p_eb = plan_encodes(&PlannerInput {
+            main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![tw_eb],
+            ignore_service_limits: false,
+            twitch_eb: Some(TwitchEbSpec { top_key: main.as_key(), extra_tracks: vec![(1280, 720, 3_000)] }),
+            whip_simulcast: false,
+            budget,
+        });
+        assert_eq!(p_eb.groups[0].id, GROUP_MAIN);
+        assert_eq!(p_eb.budget.used_sessions, 3, "EB tracks on main prevent sharing with recording");
+    }
+
+    #[test]
+    fn on_demand_and_manual_light_respect_platform_fps_limits() {
+        let main = MainEncode::from_canvas(Canvas::Main, 1920, 1080, 60, 6_000, VideoCodec::H264);
+        let mut fb = dest("fb", "Facebook", Service::Custom, Canvas::Main);
+        fb.brand = Some("facebook".into());
+        fb.route_light = true;
+        let mut kick = dest("kick", "Kick", Service::Kick, Canvas::Main);
+        kick.route_light = true;
+        let p = plan_encodes(&PlannerInput {
+            main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![dest("yt", "YouTube", Service::Youtube, Canvas::Main), fb, kick],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: PcBudget::apple_silicon(2),
+        });
+        assert_eq!(p.destinations["kick"].group_id, GROUP_LIGHT);
+        assert_ne!(
+            p.destinations["fb"].group_id, GROUP_LIGHT,
+            "Facebook 30 fps max must not route onto 60 fps GROUP_LIGHT"
+        );
+    }
+
+    #[test]
+    fn clamp_custom_for_fit_does_not_swap_portrait_dimensions_into_landscape_canvas() {
+        let main = MainEncode::from_canvas(Canvas::Main, 1920, 1080, 60, 6_000, VideoCodec::H264);
+        let portrait = CustomQuality { width: 1080, height: 1920, fps: 60, kbps: 4_000, codec: Some(VideoCodec::H264) };
+        let clamped = super::clamp_custom_for_fit(&portrait, &main, None, true);
+        assert!(clamped.width <= main.canvas_width && clamped.height <= main.canvas_height, "{clamped:?}");
+        assert!(
+            clamped.validate(main.canvas, main.canvas_width, main.canvas_height, main.canvas_fps, None, true).is_ok()
+        );
+    }
+
+    #[test]
+    fn twitch_eb_from_plan_excludes_equal_height_secondary_tracks() {
+        let eb_plan = ferrocast_golive::twitch_eb::Plan {
+            config_id: "cfg".into(),
+            url: "rtmps://ingest/app/key".into(),
+            encodes: vec![
+                ferrocast_golive::twitch_eb::Encode {
+                    kind: "obs_x264".into(),
+                    width: 1920,
+                    height: 1080,
+                    framerate: Some(ferrocast_golive::twitch_eb::Fps { numerator: 60, denominator: 1 }),
+                    settings: serde_json::json!({ "bitrate": 6000 }),
+                    canvas_index: 0,
+                },
+                ferrocast_golive::twitch_eb::Encode {
+                    kind: "obs_x264".into(),
+                    width: 1920,
+                    height: 1080,
+                    framerate: Some(ferrocast_golive::twitch_eb::Fps { numerator: 30, denominator: 1 }),
+                    settings: serde_json::json!({ "bitrate": 4500 }),
+                    canvas_index: 0,
+                },
+            ],
+            warning: None,
+        };
+        let main = MainEncode::from_canvas(Canvas::Main, 1920, 1080, 60, 6_000, VideoCodec::H264);
+        let spec = TwitchEbSpec::from_plan(&eb_plan, &main).unwrap();
+        assert!(spec.extra_tracks.is_empty(), "equal-height encode must not duplicate top track");
     }
 }

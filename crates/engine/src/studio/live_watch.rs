@@ -272,21 +272,24 @@ impl Engine {
                 return;
             }
             let s = ferrocast_core::auto_quality::Signals { dests: senders, feed_dropped, paused };
-            let changed = {
+            let (prev_pct, changed) = {
                 let mut aq = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+                let prev = aq.pct();
                 if !enabled {
                     aq.observe(ts, s);
                     return;
                 }
-                aq.tick(ts, s)
+                (prev, aq.tick(ts, s))
             };
             let Some(pct) = changed else { return };
             if self.ffenc_handover_session_exhausted() {
+                self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).revert_to(prev_pct);
                 tracing::warn!(pct, "auto quality skipped bitrate change: no spare FFmpeg/NVENC session left");
                 return;
             }
             tracing::info!(pct, "auto quality changed the stream's bitrate share");
             if let Err(e) = host.set_live_quality(pct).await {
+                self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).revert_to(prev_pct);
                 tracing::warn!(error = %e, "auto quality couldn't change the bitrate");
                 return;
             }
@@ -334,18 +337,22 @@ impl Engine {
             let _ = min_pct;
         }
 
-        for (gid, _prev_pct, pct) in group_changes {
+        for (gid, prev_pct, pct) in group_changes {
             if self.ffenc_handover_session_exhausted() {
                 // Revert the controller's internal step so it doesn't silently think bitrate changed.
                 let mut map = self.studio().group_auto_quality.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(aq) = map.get_mut(&gid) {
-                    let _ = aq.back_to_full();
+                    aq.revert_to(prev_pct);
                 }
                 tracing::warn!(group = %gid, pct, "auto quality skipped step: FFmpeg/NVENC session limit reached");
                 continue;
             }
             tracing::info!(group = %gid, pct, "auto quality changed encode group bitrate share");
             if let Err(e) = host.set_group_live_quality(&gid, pct).await {
+                let mut map = self.studio().group_auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(aq) = map.get_mut(&gid) {
+                    aq.revert_to(prev_pct);
+                }
                 tracing::warn!(group = %gid, error = %e, "auto quality couldn't change the group's bitrate");
                 continue;
             }
@@ -852,5 +859,150 @@ mod tests {
         // Disabling auto_quality restores lowered group (`g_kick`) to 100%.
         e.auto_quality_off().await;
         assert!(host.group_calls.lock().unwrap().contains(&("g_kick".to_string(), 100)));
+    }
+
+    #[tokio::test]
+    async fn auto_quality_exhaustion_counts_eb_tracks_and_reverts_to_prior_pct() {
+        use crate::golive::{Canvas, GROUP_MAIN};
+        use crate::studio_host::{EncodeGroupSpec, HostBudgetInfo, StudioHost, StudioSettings, StudioStatus};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct EbMockHost {
+            budget: HostBudgetInfo,
+            group_calls: Mutex<Vec<(String, u8)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl StudioHost for EbMockHost {
+            async fn status(&self) -> StudioStatus {
+                Default::default()
+            }
+            async fn start(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn stop(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn kinds(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn options(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn preview(&self, _rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+                Ok(())
+            }
+            async fn defaults(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn act(&self, _act: crate::studio_host::StudioAct) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn settings(&self) -> StudioSettings {
+                Default::default()
+            }
+            async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            async fn stats(&self) -> Result<Value, String> {
+                Ok(json!({}))
+            }
+            async fn record(&self, _on: bool) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn record_pause(&self, _on: bool) -> Result<(), String> {
+                Ok(())
+            }
+            async fn monitoring(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_stop(&self) -> Result<(), String> {
+                Ok(())
+            }
+            async fn stream_stats(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn obs_collections(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn import_obs(&self, _id: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn set_live_quality(&self, _pct: u8) -> Result<(), String> {
+                Ok(())
+            }
+            async fn set_group_live_quality(&self, id: &str, pct: u8) -> Result<(), String> {
+                self.group_calls.lock().unwrap().push((id.to_string(), pct));
+                Ok(())
+            }
+            async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+                Some(self.budget.clone())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let host = Arc::new(EbMockHost {
+            budget: HostBudgetInfo {
+                os: "windows".into(),
+                encoder_id: "ffmpeg_nvenc".into(),
+                cpu_cores: 8,
+                nvidia_driver_major: Some(525),
+                host_sig: "win|nv=525".into(),
+                ..Default::default()
+            },
+            group_calls: Mutex::new(Vec::new()),
+        });
+        e.set_studio_host(host.clone());
+        let tw = e.add_golive_destination("Twitch", "rtmp://127.0.0.1:19904/app", "k", Canvas::Main).await.unwrap();
+        let tw_rx = e.replace_running_health_for_test(&tw.id, GROUP_MAIN, 6_000, 60_000);
+        let key = ferrocast_golive::probe::MainEncode::from_canvas(
+            Canvas::Main,
+            1920,
+            1080,
+            60,
+            6_000,
+            ferrocast_golive::VideoCodec::H264,
+        )
+        .as_key();
+        e.set_active_group_for_test(EncodeGroupSpec {
+            id: GROUP_MAIN.into(),
+            key: key.clone(),
+            extra_tracks: Vec::new(),
+            vod_track: false,
+            is_light: false,
+            is_twitch_eb: true,
+        });
+        let _ = e.refresh_pc_budget().await;
+
+        // First drop: 1 session active (< 3 NVENC limit), so step 100% -> 85% applies.
+        let t0 = now().0;
+        e.auto_quality_tick_at(t0, 0).await;
+        tw_rx.send_modify(|h| h.dropped = 50);
+        e.auto_quality_tick_at(t0 + 12_000, 0).await;
+        assert_eq!(*host.group_calls.lock().unwrap(), vec![(GROUP_MAIN.to_string(), 85)]);
+
+        // Now EB adds 2 extra tracks -> 3 total sessions (>= 3 cap): further step 85% -> 70% must be
+        // skipped AND internal pct must revert to 85% (not 100%).
+        e.set_active_group_for_test(EncodeGroupSpec {
+            id: GROUP_MAIN.into(),
+            key,
+            extra_tracks: vec![(1280, 720, 3_000), (852, 480, 1_500)],
+            vod_track: false,
+            is_light: false,
+            is_twitch_eb: true,
+        });
+        host.group_calls.lock().unwrap().clear();
+        tw_rx.send_modify(|h| h.dropped = 120);
+        e.auto_quality_tick_at(t0 + 25_000, 0).await;
+        assert!(host.group_calls.lock().unwrap().is_empty(), "EB extra tracks must exhaust session cap");
+        let pct = e.studio().group_auto_quality.lock().unwrap().get(GROUP_MAIN).unwrap().pct();
+        assert_eq!(pct, 85, "exhausted handover must revert to 85%, not jump back to 100%");
     }
 }

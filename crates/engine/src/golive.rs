@@ -1470,6 +1470,11 @@ impl Engine {
         health_tx
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_active_group_for_test(&self, spec: crate::studio_host::EncodeGroupSpec) {
+        lock(&self.golive().active_groups).insert(spec.id.clone(), spec);
+    }
+
     /// Whether a stream is running that a destination change would be applied to.
     pub(crate) fn health_end_deferred(&self) {
         self.golive().health_end_pending.store(true, std::sync::atomic::Ordering::Release);
@@ -2039,9 +2044,7 @@ impl Engine {
         }
         let bench = self.studio().studio_bench.read().unwrap_or_else(|p| p.into_inner()).clone();
         let valid_bench = bench.as_ref().filter(|b| b.is_valid_for(&info.host_sig, false));
-        let is_nvenc = info.encoder_id.to_ascii_lowercase().contains("nvenc")
-            || info.hw_backend.as_deref() == Some("nvenc")
-            || info.nvidia_driver_major.is_some();
+        let is_nvenc = crate::golive_plan::encoder_is_nvenc(&info);
         let raw_cap = if is_nvenc {
             crate::golive_plan::nvenc_session_cap(info.nvidia_driver_major, info.nvidia_driver_minor)
         } else {
@@ -2049,10 +2052,16 @@ impl Engine {
         };
         let eff_cap = valid_bench.and_then(|b| b.max_sessions_ok).map_or(raw_cap, |m| m.min(raw_cap).max(1));
         let g = self.golive();
-        let active_groups = lock(&g.active_groups).len();
-        let running_groups = self.golive_group_senders().len();
-        let live_main_fallback = usize::from(active_groups == 0 && running_groups == 0 && self.golive_stream_running());
-        let used_stream = u32::try_from(active_groups.max(running_groups).max(live_main_fallback)).unwrap_or(u32::MAX);
+        let (active_sessions, active_ids): (usize, std::collections::HashSet<GroupId>) = {
+            let active = lock(&g.active_groups);
+            let sessions = active.values().map(|spec| 1 + spec.extra_tracks.len()).sum();
+            let ids = active.keys().cloned().collect();
+            (sessions, ids)
+        };
+        let running_extra = self.golive_group_senders().keys().filter(|id| !active_ids.contains(*id)).count();
+        let live_main_fallback =
+            usize::from(active_ids.is_empty() && running_extra == 0 && self.golive_stream_running());
+        let used_stream = u32::try_from((active_sessions + running_extra).max(live_main_fallback)).unwrap_or(u32::MAX);
         used_stream.saturating_add(info.record_extra_sessions) >= eff_cap
     }
 
@@ -3008,13 +3017,7 @@ impl Engine {
         match twitch_eb::fetch(&client, &ask).await {
             Ok(plan) => {
                 // The main picture is track 0; Twitch's smaller ones follow (even sides, a few).
-                let tracks: Vec<(u32, u32, u32)> = plan
-                    .encodes
-                    .iter()
-                    .filter(|e| e.height < out.1 && e.width % 2 == 0 && e.height % 2 == 0)
-                    .map(|e| (e.width, e.height, e.kbps().max(300)))
-                    .take(4)
-                    .collect();
+                let tracks = crate::golive_plan::select_eb_extra_tracks(&plan, out.1);
                 tracing::info!(config = %plan.config_id, qualities = tracks.len() + 1, "Twitch Enhanced Broadcasting");
                 let note = plan.warning.clone().map(|w| format!("Twitch says: {w}"));
                 *lock(&self.golive().enhanced) = Some(plan);
