@@ -3332,6 +3332,7 @@ impl Engine {
             let enhanced = cfg.destinations.iter().any(|d| d.enabled && d.enhanced);
             if host.encode_budget(None, enhanced, true).await.ok().is_some_and(|v| v["level"].as_str() == Some("over"))
             {
+                self.cancel_route_light_destinations();
                 wanted = false;
             }
         }
@@ -3346,6 +3347,9 @@ impl Engine {
             Err(e) => Err(e.to_string()),
         };
         started.err().map(|e| {
+            if route_light && !manual_or_simulcast {
+                self.cancel_route_light_destinations();
+            }
             tracing::warn!(error = %e, "the Studio's lighter stream didn't start");
             "The lighter stream didn't start; the full one did.".to_string()
         })

@@ -4175,6 +4175,15 @@ async fn f10_planner_includes_failover_backup_and_upload_now_uses_draft_bitrate(
     let check = e.upload_now_for_test(&cfg).unwrap();
     let row = check.rows.iter().find(|r| r.id == custom.id).unwrap();
     assert_eq!(row.need_kbps, 3_160, "offline upload_now must bill planned custom bitrate: {row:?}");
+
+    // Turning light off midstream evaluates `midstream_misfit` with updated config (`light = false`),
+    // and `studio_sync_light` cancels `route_light` when encode budget rejects the light stream.
+    e.seed_light_route_for_test("youtube");
+    let yt_d = e.golive_config().destinations.into_iter().find(|d| d.id == "youtube").unwrap();
+    assert!(e.wants_light_now(&yt_d));
+    e.cancel_route_light_destinations();
+    let yt_d = e.golive_config().destinations.into_iter().find(|d| d.id == "youtube").unwrap();
+    assert!(!e.wants_light_now(&yt_d));
 }
 
 #[tokio::test]

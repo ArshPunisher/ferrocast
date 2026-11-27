@@ -2376,35 +2376,20 @@ impl Engine {
                 Ok(false) => {
                     g.end_and_remove_hub(&spec.id);
                     if spec.is_light {
-                        let mut q = lock(&g.quality);
-                        for (id, pd) in &plan.destinations {
-                            if pd.on_light {
-                                q.cancel_light(id);
-                            }
-                        }
+                        self.cancel_route_light_destinations();
                     }
                 }
                 Err(e) => {
                     g.end_and_remove_hub(&spec.id);
                     if spec.is_light {
-                        let mut q = lock(&g.quality);
-                        for (id, pd) in &plan.destinations {
-                            if pd.on_light {
-                                q.cancel_light(id);
-                            }
-                        }
+                        self.cancel_route_light_destinations();
                     }
                     tracing::warn!(group = %spec.id, error = %e, "couldn't start planned encode group mid-stream");
                 }
             }
         }
         if !desired_ids.contains(GROUP_LIGHT) {
-            let mut q = lock(&g.quality);
-            for d in &cfg.destinations {
-                if !d.wants_light() && q.is_light(&d.id) {
-                    q.cancel_light(&d.id);
-                }
-            }
+            self.cancel_route_light_destinations();
         }
         let in_use: std::collections::HashSet<GroupId> =
             lock(&g.running).values().map(|r| r.group_id.clone()).collect();
@@ -2632,6 +2617,16 @@ impl Engine {
     /// as it is. Only `d` itself is judged (the others already take this stream), against the
     /// encode actually on air. Changing that encode would change every other output, so a
     /// destination that needs it changed is refused instead.
+    pub(crate) fn cancel_route_light_destinations(&self) {
+        let cfg = self.golive_config();
+        let mut q = lock(&self.golive().quality);
+        for d in &cfg.destinations {
+            if !d.wants_light() && q.is_light(&d.id) {
+                q.cancel_light(&d.id);
+            }
+        }
+    }
+
     fn midstream_misfit(&self, next: &[DestinationConfig], d: &DestinationConfig) -> Option<String> {
         use ferrocast_golive::flv::VideoCodec;
         let g = self.golive();
@@ -2647,7 +2642,9 @@ impl Engine {
         let planned_light = plan.destinations.get(&d.id).is_some_and(|pd| pd.on_light);
         // On the Studio's lighter stream only while that stream really runs; from OBS "light"
         // has no lighter copy and the destination takes the full stream.
-        if (planned_light && g.light_hub().live().borrow().on) || self.on_light(d) {
+        if (planned_light && g.light_hub().live().borrow().on)
+            || (!self.golive_uses_encode_groups() && d.wants_light() && g.light_hub().live().borrow().on)
+        {
             return None;
         }
         let (group_id, hub) = self.resolve_hub_for_destination(d, Some(&plan));
