@@ -7047,7 +7047,9 @@ pub struct StageView {
     /// Performance mode: nothing is drawn and the view is clear (the page shows its
     /// "Preview paused" card there). Outputs are never touched.
     paused: Cell<bool>,
-    /// The opacity the page asked for (a paused view is clear whatever it is).
+    /// True while a window live-resize or fullscreen transition holds the native view hidden.
+    hidden_for_resize: Cell<bool>,
+    /// The opacity the page asked for (a paused or resizing view is clear whatever it is).
     opacity: Cell<f64>,
 }
 
@@ -7139,7 +7141,10 @@ impl Stage {
             _ => return Err(fail("that isn't this system's window")),
         };
         let view = made.ok_or_else(|| fail("the preview can only be made on the main thread"))?;
-        let (cx, cy) = view.pixels().unwrap_or_else(|| crate::px(r, scale));
+        let (cx, cy) = view.pixels().unwrap_or_else(|| {
+            let d = crate::device_rect(r.x, r.y, r.w, r.h, scale);
+            (d.w, d.h)
+        });
         let (size, scene) = if vertical {
             (crate::collection::VERTICAL_SIZE, self.vertical().map(|v| v.current))
         } else {
@@ -7162,8 +7167,7 @@ impl Stage {
             ppp: ppp(scale),
             ..Default::default()
         };
-        // The engine draws at the view's size the moment it changes (AppKit following the
-        // window included), not when the page next says.
+        // The engine queues backing-size updates lock-free when AppKit/backing scale changes it.
         #[cfg(target_os = "macos")]
         {
             // Weak: AppKit can keep the view (and this) a moment after the preview is dropped,
@@ -7183,6 +7187,7 @@ impl Stage {
             look: RefCell::new(look),
             vertical,
             paused: Cell::new(false),
+            hidden_for_resize: Cell::new(false),
             opacity: Cell::new(1.0),
         };
         v.follow(self);
@@ -7200,7 +7205,7 @@ impl StageView {
 
     /// Moves or resizes it (the page's box changed). Main thread.
     pub fn set_rect(&mut self, rect: crate::Rect, scale: f64) {
-        // A box of the page's own (Studio Mode's halves): placed by the page only.
+        // Explicit frame updates on all platforms: native never autoresizing-follows during drag.
         #[cfg(target_os = "macos")]
         self.view.follow_window(false);
         let r = crate::with_edge(rect);
@@ -7208,10 +7213,14 @@ impl StageView {
         {
             let mut l = self.look.borrow_mut();
             l.area = None;
+            l.area_for = None;
             l.margin = crate::edge_px(scale) as f32;
             l.ppp = ppp(scale);
         }
-        let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(r, scale));
+        let (cx, cy) = self.view.pixels().unwrap_or_else(|| {
+            let d = crate::device_rect(r.x, r.y, r.w, r.h, scale);
+            (d.w, d.h)
+        });
         self.shared.engine.resize_preview(self.id, cx, cy);
         self.push();
     }
@@ -7219,18 +7228,15 @@ impl StageView {
     /// Covers `area` (the page's whole stage) with the canvas at `canvas` inside it (points
     /// from the area's top left). Main thread.
     pub fn set_area(&mut self, area: crate::Rect, canvas: (f64, f64, f64, f64), scale: f64) {
-        // The whole stage, between panels of fixed size: it follows the window itself. Not
-        // the vertical picture's, which shares the stage's width with it.
         #[cfg(target_os = "macos")]
-        self.view.follow_window(!self.vertical);
+        self.view.follow_window(false);
         place(&self.view, &area);
-        let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-        self.look.borrow_mut().area =
-            Some(((canvas.0 * s) as f32, (canvas.1 * s) as f32, (canvas.2 * s) as f32, (canvas.3 * s) as f32));
-        let (cx, cy) = self.view.pixels().unwrap_or_else(|| crate::px(area, scale));
+        let (canvas_px, outer_px) = crate::canvas_area_px(area, canvas, scale);
+        let (cx, cy) = self.view.pixels().unwrap_or(outer_px);
         {
             let mut l = self.look.borrow_mut();
-            l.area_for = Some(crate::px(area, scale));
+            l.area = Some(canvas_px);
+            l.area_for = Some((cx, cy));
             l.ppp = ppp(scale);
         }
         self.shared.engine.resize_preview(self.id, cx, cy);
@@ -7303,7 +7309,19 @@ impl StageView {
     }
 
     fn shown_opacity(&self) -> f64 {
-        view_opacity(self.paused.get(), self.opacity.get())
+        view_opacity(self.paused.get() || self.hidden_for_resize.get(), self.opacity.get())
+    }
+
+    /// Hides or reveals the native child view while preserving the page's requested opacity.
+    pub fn set_hidden_for_resize(&self, hidden: bool) {
+        if self.hidden_for_resize.replace(hidden) != hidden {
+            self.view.set_opacity(self.shown_opacity());
+        }
+    }
+
+    /// Pauses or resumes GPU swapchain reconfiguration and rendering during live window drags.
+    pub fn set_live_resize(&self, active: bool) {
+        self.shared.engine.set_preview_live_resize(self.id, active);
     }
 
     /// Performance mode: stops (or resumes) drawing this view; while paused it is clear so the
@@ -7680,6 +7698,8 @@ impl StageView {
     pub fn set_shade(&self, _shade: f64) {}
     pub fn set_holes(&self, _holes: &[(f64, f64, f64, f64, f64)]) {}
     pub fn set_opacity(&self, _opacity: f64) {}
+    pub fn set_hidden_for_resize(&self, _hidden: bool) {}
+    pub fn set_live_resize(&self, _active: bool) {}
     pub fn set_paused(&self, _paused: bool) {}
     pub fn is_paused(&self) -> bool {
         false

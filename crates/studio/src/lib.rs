@@ -175,10 +175,237 @@ pub(crate) fn with_edge(r: Rect) -> Rect {
     }
 }
 
+/// Sanitizes a display scale factor (defaults to `1.0` when non-positive or non-finite).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+pub(crate) fn sanitize_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }
+}
+
+/// Outer child-view rectangle in device pixels (`floor` origin, `ceil` far edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+pub(crate) struct DeviceRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Converts a CSS-pixel box `(x, y, w, h)` to outer device pixels using floor-origin /
+/// ceil-far-edge rounding at `scale` so macOS, Windows, and canvas layout share one grid.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+pub(crate) fn device_rect(x: f64, y: f64, w: f64, h: f64, scale: f64) -> DeviceRect {
+    let s = sanitize_scale(scale);
+    let x0 = (x * s).floor();
+    let y0 = (y * s).floor();
+    let x1 = ((x + w.max(1.0)) * s).ceil();
+    let y1 = ((y + h.max(1.0)) * s).ceil();
+    let clamp_i32 = |v: f64| v.clamp(-32_768.0, 32_767.0) as i32;
+    DeviceRect {
+        x: clamp_i32(x0),
+        y: clamp_i32(y0),
+        w: (x1 - x0).round().clamp(1.0, 16_384.0) as u32,
+        h: (y1 - y0).round().clamp(1.0, 16_384.0) as u32,
+    }
+}
+
+/// Converts a child-relative CSS rectangle `(rx, ry, w, h)` anchored at `origin_css` into
+/// device pixels relative to `device_rect(origin_css.0, origin_css.1, ...)`.
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+pub(crate) fn device_rect_relative(origin_css: (f64, f64), rel: (f64, f64, f64, f64), scale: f64) -> DeviceRect {
+    let s = sanitize_scale(scale);
+    let base = device_rect(origin_css.0, origin_css.1, 1.0, 1.0, s);
+    let abs = device_rect(origin_css.0 + rel.0, origin_css.1 + rel.1, rel.2, rel.3, s);
+    DeviceRect { x: abs.x - base.x, y: abs.y - base.y, w: abs.w, h: abs.h }
+}
+
+/// Computes the inner canvas `(x, y, w, h)` in device pixels relative to `outer_area`'s
+/// `device_rect` origin, along with `(outer.w, outer.h)` for `area_for`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+pub(crate) fn canvas_area_px(
+    outer_area: Rect,
+    canvas: (f64, f64, f64, f64),
+    scale: f64,
+) -> ((f32, f32, f32, f32), (u32, u32)) {
+    let s = sanitize_scale(scale);
+    let outer = device_rect(outer_area.x, outer_area.y, outer_area.w, outer_area.h, s);
+    let cx0 = ((outer_area.x + canvas.0) * s).round();
+    let cy0 = ((outer_area.y + canvas.1) * s).round();
+    let cx1 = ((outer_area.x + canvas.0 + canvas.2.max(1.0)) * s).round();
+    let cy1 = ((outer_area.y + canvas.1 + canvas.3.max(1.0)) * s).round();
+    let area = (
+        (cx0 - f64::from(outer.x)) as f32,
+        (cy0 - f64::from(outer.y)) as f32,
+        (cx1 - cx0).max(1.0) as f32,
+        (cy1 - cy0).max(1.0) as f32,
+    );
+    (area, (outer.w, outer.h))
+}
+
+/// Quantized cache key for preview hole cutouts so unchanged overlays avoid mask rebuilds.
+/// It is also everything the mask is made from: equal keys give the same mask, so a cached
+/// mask is only ever reused for the same holes, view size and scale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows", test)), allow(dead_code))]
+pub(crate) struct HoleMaskKey {
+    /// The view's size in device pixels (the mask bitmap's size).
+    pub width: u32,
+    pub height: u32,
+    /// The scale in thousandths: a new scale is a new key even when the pixels are the same.
+    pub scale_q: u32,
+    /// Hole boxes in device pixels from the view's top left (macOS: x, y, w, h, corner radius;
+    /// Windows: x, y, w, h, corner diameter).
+    pub holes: Vec<(i32, i32, i32, i32, i32)>,
+}
+
+/// Builds a hole mask key for macOS `CALayer.mask` (`None` when no visible holes apply): the
+/// holes (x, y, w, h, corner radius in points from the view's top left, already fitted to the
+/// snapped view by [`fit_holes`]) on whole device pixels at `scale`, for a view of
+/// `bounds_w` x `bounds_h` points. The mask is one pixel per screen pixel, not per point, so a
+/// hole reaching the view's edge fills its last pixel (a coarser mask left a thin strip of
+/// picture across a dialog) and a one-pixel gap the page left on purpose stays one pixel.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) fn hole_mask_key(
+    bounds_w: f64,
+    bounds_h: f64,
+    scale: f64,
+    holes: &[(f64, f64, f64, f64, f64)],
+) -> Option<HoleMaskKey> {
+    if !bounds_w.is_finite() || !bounds_h.is_finite() || bounds_w < 1.0 || bounds_h < 1.0 {
+        return None;
+    }
+    let s = sanitize_scale(scale);
+    // The view is on whole device pixels: rounding (not rounding up) keeps float noise from
+    // making the mask a pixel bigger than the view, which stretched it.
+    let pw = (bounds_w * s).round().clamp(1.0, 16_384.0) as u32;
+    let ph = (bounds_h * s).round().clamp(1.0, 16_384.0) as u32;
+    let q = |v: f64| (v * s).round().clamp(-65_536.0, 65_536.0) as i32;
+    let (pw_i, ph_i) = (pw as i32, ph as i32);
+    let mut out = Vec::new();
+    for &(x, y, w, h, rad) in holes {
+        if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && rad.is_finite()) {
+            continue;
+        }
+        let (qx, qy, qw, qh) = (q(x), q(y), q(w), q(h));
+        if qw <= 0 || qh <= 0 || qx >= pw_i || qy >= ph_i || qx + qw <= 0 || qy + qh <= 0 {
+            continue;
+        }
+        out.push((qx, qy, qw, qh, q(rad.max(0.0)).min(qw / 2).min(qh / 2)));
+    }
+    (!out.is_empty()).then_some(HoleMaskKey { width: pw, height: ph, scale_q: (s * 1000.0).round() as u32, holes: out })
+}
+
+/// Builds a device-pixel hole region key for Windows `SetWindowRgn` (`None` when no visible holes apply).
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+pub(crate) fn hole_mask_key_px(
+    origin_css: (f64, f64),
+    bounds_px: (u32, u32),
+    holes: &[(f64, f64, f64, f64, f64)],
+    scale: f64,
+) -> Option<HoleMaskKey> {
+    let (pw, ph) = bounds_px;
+    if pw == 0 || ph == 0 {
+        return None;
+    }
+    let s = sanitize_scale(scale);
+    let mut out = Vec::new();
+    for &(x, y, w, h, rad) in holes {
+        if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() && rad.is_finite()) {
+            continue;
+        }
+        if w <= 0.0 || h <= 0.0 {
+            continue;
+        }
+        let r = device_rect_relative(origin_css, (x, y, w, h), s);
+        if r.x >= pw as i32 || r.y >= ph as i32 || r.x + r.w as i32 <= 0 || r.y + r.h as i32 <= 0 {
+            continue;
+        }
+        let d = (rad.max(0.0).min(w / 2.0).min(h / 2.0) * 2.0 * s).round() as i32;
+        out.push((r.x, r.y, r.w as i32, r.h as i32, d));
+    }
+    (!out.is_empty()).then_some(HoleMaskKey { width: pw, height: ph, scale_q: (s * 1000.0).round() as u32, holes: out })
+}
+
+/// Callbacks invoked on the main thread for native window resize and DPI transitions.
+#[allow(missing_debug_implementations)]
+pub struct WindowWatchHooks {
+    pub on_live_resize: Box<dyn Fn(bool)>,
+    pub on_scale_changed: Box<dyn Fn(f64)>,
+}
+
+/// Guard keeping native OS window observers active until dropped.
+#[derive(Debug)]
+pub struct WindowWatch {
+    #[cfg(target_os = "macos")]
+    _inner: ffi::mac::WindowWatch,
+    #[cfg(target_os = "windows")]
+    _inner: ffi::win::WindowWatch,
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    _inner: (),
+}
+
+/// Attaches native live-resize, fullscreen, and DPI/backing-scale observers to `window`.
+/// Must be called on the main thread.
+pub fn watch_window(window: raw_window_handle::RawWindowHandle, hooks: WindowWatchHooks) -> Option<WindowWatch> {
+    #[cfg(target_os = "macos")]
+    {
+        if let raw_window_handle::RawWindowHandle::AppKit(h) = window {
+            return ffi::mac::watch_window(h.ns_view.as_ptr(), hooks).map(|_inner| WindowWatch { _inner });
+        }
+        None
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let raw_window_handle::RawWindowHandle::Win32(h) = window {
+            return ffi::win::watch_window(h.hwnd.get() as *mut std::ffi::c_void, hooks)
+                .map(|_inner| WindowWatch { _inner });
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (window, hooks);
+        None
+    }
+}
+
+/// Runs `f` inside a native compositor / window-position batch transaction so preview,
+/// program, and vertical views update together in a single frame.
+pub fn batch_preview_updates<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(target_os = "macos")]
+    {
+        ffi::mac::batch_update(f)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        ffi::win::batch_update(f)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        f()
+    }
+}
+
+/// Returns whether the OS window is actively in a live drag-resize loop (macOS AppKit query).
+pub fn window_in_live_resize(window: raw_window_handle::RawWindowHandle) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if let raw_window_handle::RawWindowHandle::AppKit(h) = window {
+            return ffi::mac::window_in_live_resize(h.ns_view.as_ptr());
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        false
+    }
+}
+
 /// The margin in device pixels.
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) fn edge_px(scale: f64) -> u32 {
-    let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let s = sanitize_scale(scale);
     (PREVIEW_EDGE * s).round() as u32
 }
 
@@ -193,14 +420,15 @@ pub(crate) struct Overhang {
     pub bottom: f64,
 }
 
-/// A box (x, y, w, h) on whole device pixels at `scale`, covering it: a frame on a half pixel
-/// left a row of the GL surface undrawn, a black line along the stage.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// A box (x, y, w, h) in points on whole device pixels at `scale`, covering it: a frame on a
+/// half pixel left a row of the GL surface undrawn, a black line along the stage. It is
+/// [`device_rect`] (the one rounding every platform and the canvas layout use) divided back
+/// by the scale, so the Mac view's frame and the engine's pixel size always agree.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) fn snap_out(r: (f64, f64, f64, f64), scale: f64) -> (f64, f64, f64, f64) {
-    let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
-    let (x0, y0) = ((r.0 * s).floor() / s, (r.1 * s).floor() / s);
-    let (x1, y1) = (((r.0 + r.2) * s).ceil() / s, ((r.1 + r.3) * s).ceil() / s);
-    (x0, y0, x1 - x0, y1 - y0)
+    let s = sanitize_scale(scale);
+    let d = device_rect(r.0, r.1, r.2, r.3, s);
+    (f64::from(d.x) / s, f64::from(d.y) / s, f64::from(d.w) / s, f64::from(d.h) / s)
 }
 
 /// How far `view` (a box made by [`snap_out`] from `want`, both x, y, w, h in the parent's
@@ -266,9 +494,9 @@ pub(crate) fn fit_holes(
 }
 
 /// A rectangle in device pixels (at least 1x1).
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn px(rect: Rect, scale: f64) -> (u32, u32) {
-    let s = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let s = sanitize_scale(scale);
     ((rect.w * s).round().clamp(1.0, 16_384.0) as u32, (rect.h * s).round().clamp(1.0, 16_384.0) as u32)
 }
 
@@ -938,6 +1166,108 @@ mod tests {
         assert_eq!(px(r, 2.0), (1280, 720));
         assert_eq!(px(r, f64::NAN), (640, 360), "a bad scale is 1");
         assert_eq!(px(Rect { w: 0.0, h: -5.0, ..r }, 1.0), (1, 1), "never zero");
+    }
+
+    #[test]
+    fn device_rect_and_canvas_area_align_across_fractional_scales() {
+        let outer = Rect { x: 240.3, y: 64.5, w: 800.4, h: 450.2, vh: 800.0 };
+        let canvas = (16.2, 4.1, 768.0, 432.0);
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 3.0] {
+            let d = device_rect(outer.x, outer.y, outer.w, outer.h, scale);
+            let (c_area, area_for) = canvas_area_px(outer, canvas, scale);
+            assert_eq!(area_for, (d.w, d.h), "area_for must match outer pixel bounds at {scale}");
+            let expected_cx = ((outer.x + canvas.0) * scale).round() as i32;
+            let expected_cy = ((outer.y + canvas.1) * scale).round() as i32;
+            assert_eq!(
+                d.x + c_area.0 as i32,
+                expected_cx,
+                "canvas origin x must align with round((outer.x + cx) * scale) at {scale}"
+            );
+            assert_eq!(
+                d.y + c_area.1 as i32,
+                expected_cy,
+                "canvas origin y must align with round((outer.y + cy) * scale) at {scale}"
+            );
+            assert!(c_area.0 >= 0.0 && c_area.1 >= 0.0, "canvas stays inside outer view at {scale}");
+        }
+    }
+
+    #[test]
+    fn hole_mask_key_dedups_unchanged_holes_and_invalidates_on_bounds_or_scale() {
+        let holes = [(10.1, 20.2, 120.4, 80.3, 8.0), (500.0, 10.0, 40.0, 40.0, 4.0)];
+        let k1 = hole_mask_key(640.0, 360.0, 2.0, &holes);
+        assert!(k1.is_some());
+        // Sub-pixel float noise (a quarter point is half a device pixel at 2x) hits the exact
+        // same key.
+        let jitter = [(10.15, 20.18, 120.42, 80.28, 8.0), (500.0, 10.0, 40.0, 40.0, 4.0)];
+        assert_eq!(hole_mask_key(640.0, 360.0, 2.0, &jitter), k1);
+        // Bounds change invalidates.
+        assert_ne!(hole_mask_key(641.0, 360.0, 2.0, &holes), k1);
+        // A new scale invalidates (the mask is in device pixels).
+        assert_ne!(hole_mask_key(640.0, 360.0, 1.0, &holes), k1);
+        assert_ne!(hole_mask_key(640.0, 360.0, 3.0, &holes), k1);
+        // Off-stage or empty holes collapse to None.
+        assert_eq!(hole_mask_key(640.0, 360.0, 2.0, &[(700.0, 10.0, 50.0, 50.0, 4.0)]), None);
+        assert_eq!(hole_mask_key(640.0, 360.0, 2.0, &[]), None);
+
+        // Windows pixel key shifts cleanly with fractional DPI scale changes.
+        let p1 = hole_mask_key_px((100.4, 50.4), (960, 540), &holes, 1.0);
+        let p15 = hole_mask_key_px((100.4, 50.4), (1440, 810), &holes, 1.5);
+        assert!(p1.is_some() && p15.is_some());
+        assert_ne!(p1, p15);
+        // Relative origin alignment matches outer origin floor.
+        let rel = device_rect_relative((100.4, 50.4), (10.4, 20.4, 50.0, 30.0), 1.5);
+        let abs = device_rect(110.8, 70.8, 50.0, 30.0, 1.5);
+        let outer = device_rect(100.4, 50.4, 640.0, 360.0, 1.5);
+        assert_eq!((rel.x, rel.y), (abs.x - outer.x, abs.y - outer.y));
+    }
+
+    #[test]
+    fn the_hole_mask_key_follows_the_overhang_so_a_stale_mask_is_never_reused() {
+        // A dialog covering the stage is sent as the whole box; the view is that box rounded
+        // out, so the fitted hole is the view's size, not the box's.
+        let whole = [(0.0, 0.0, 400.4, 300.3, 6.0)];
+        let (bw, bh) = (401.0, 301.0);
+        let none = fit_holes(&whole, Overhang::default(), 400.4, 300.3);
+        let over = Overhang { left: 0.0, top: 0.0, right: 0.6, bottom: 0.7 };
+        let reach = fit_holes(&whole, over, 400.4, 300.3);
+        let k_none = hole_mask_key(bw, bh, 2.0, &none).expect("a hole");
+        let k_reach = hole_mask_key(bw, bh, 2.0, &reach).expect("a hole");
+        assert_ne!(k_none, k_reach, "a changed overhang must not reuse the old mask");
+        // The mask is the view's size in device pixels, and the whole-box hole fills all of it
+        // (not a pixel short on the right and bottom, which is the thin line over a dialog).
+        assert_eq!((k_reach.width, k_reach.height), (802, 602));
+        let (x, y, w, h, _) = k_reach.holes[0];
+        assert_eq!((x, y, x + w, y + h), (0, 0, 802, 602), "{k_reach:?}");
+        // A one-device-pixel gap the page left at 2x stays a pixel.
+        let gap = [(0.5, 0.5, 399.9, 299.8, 0.0)];
+        let (gx, gy, ..) = hole_mask_key(bw, bh, 2.0, &gap).expect("a hole").holes[0];
+        assert_eq!((gx, gy), (1, 1));
+        // Corner radius never exceeds half a side, in device pixels.
+        let r = hole_mask_key(bw, bh, 2.0, &[(10.0, 10.0, 20.0, 8.0, 50.0)]).expect("a hole").holes[0].4;
+        assert_eq!(r, 8);
+        // A hole shifted by the overhang (an interior hole) is a different key.
+        let inner = [(50.0, 40.0, 100.0, 80.0, 0.0)];
+        let a = fit_holes(&inner, Overhang { left: 0.5, top: 0.5, ..Overhang::default() }, 400.4, 300.3);
+        let b = fit_holes(&inner, Overhang::default(), 400.4, 300.3);
+        assert_ne!(hole_mask_key(bw, bh, 2.0, &a), hole_mask_key(bw, bh, 2.0, &b));
+    }
+
+    #[test]
+    fn snap_out_is_the_device_rect_rounding_in_points() {
+        for scale in [1.0, 1.25, 1.5, 2.0, 3.0] {
+            for r in [(10.25, 100.5, 400.5, 200.25), (0.3, 0.7, 33.3, 77.7), (240.3, 64.5, 800.4, 450.2)] {
+                let d = device_rect(r.0, r.1, r.2, r.3, scale);
+                let v = snap_out(r, scale);
+                assert_eq!((v.0 * scale).round() as i32, d.x, "{r:?} at {scale}: the same floor as device_rect");
+                assert_eq!((v.1 * scale).round() as i32, d.y);
+                assert_eq!((v.2 * scale).round() as u32, d.w, "{r:?} at {scale}: the same far edge");
+                assert_eq!((v.3 * scale).round() as u32, d.h);
+                // And it covers the box.
+                assert!(v.0 <= r.0 + 1e-9 && v.1 <= r.1 + 1e-9);
+                assert!(v.0 + v.2 >= r.0 + r.2 - 1e-9 && v.1 + v.3 >= r.1 + r.3 - 1e-9);
+            }
+        }
     }
 
     #[test]

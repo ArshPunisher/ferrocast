@@ -57,13 +57,19 @@ pub(crate) use headless as web;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac {
     use std::ffi::c_void;
+    use std::rc::Rc;
 
     use objc2::encode::{Encoding, RefEncode};
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject};
-    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
-    use objc2_app_kit::{NSAutoresizingMaskOptions, NSResponder, NSView};
-    use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize};
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+    use objc2_app_kit::{
+        NSAutoresizingMaskOptions, NSResponder, NSView, NSWindowDidChangeBackingPropertiesNotification,
+        NSWindowDidEndLiveResizeNotification, NSWindowDidEnterFullScreenNotification,
+        NSWindowDidExitFullScreenNotification, NSWindowWillEnterFullScreenNotification,
+        NSWindowWillExitFullScreenNotification, NSWindowWillStartLiveResizeNotification,
+    };
+    use objc2_foundation::{NSNotification, NSNotificationCenter, NSObject, NSPoint, NSRect, NSSize};
 
     /// CoreGraphics' path (`CGPathRef`), only passed along.
     #[repr(C)]
@@ -108,7 +114,6 @@ pub(crate) mod mac {
         ) -> *mut c_void;
         fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *mut c_void;
         fn CGContextRelease(ctx: *mut c_void);
-        fn CGContextScaleCTM(ctx: *mut c_void, sx: f64, sy: f64);
         fn CGContextSetRGBFillColor(ctx: *mut c_void, r: f64, g: f64, b: f64, a: f64);
         fn CGContextFillRect(ctx: *mut c_void, rect: NSRect);
         fn CGContextSetBlendMode(ctx: *mut c_void, mode: i32);
@@ -138,6 +143,8 @@ pub(crate) mod mac {
         /// How far the view reaches past `wanted` on each side, from when it was placed: the
         /// rounding only, never the distance the view has moved since.
         overhang: std::cell::Cell<crate::Overhang>,
+        /// Cached 1x hole mask key (`None` = uninitialized, `Some(None)` = nil mask, `Some(Some(k))` = built).
+        mask_key: std::cell::RefCell<Option<Option<crate::HoleMaskKey>>>,
     }
 
     impl std::fmt::Debug for PassIvars {
@@ -155,38 +162,29 @@ pub(crate) mod mac {
         struct PassView;
 
         impl PassView {
-            /// Resized (by the page, or by AppKit as the window is resized): the picture is
-            /// redrawn at the new size at once, as OBS's preview does, instead of a frame or
-            /// two later stretched.
-            /// The window jumped in size (full screen, zoom): hidden at once, as the page can't
-            /// say where it goes until the change settles (the main thread is busy with the
-            /// animation), and a view left at the old size spills over the panels. The page
-            /// shows it again where things ended up. A drag's small steps leave it alone: the
-            /// page shows a still of it then.
             #[unsafe(method(resizeWithOldSuperviewSize:))]
             fn resize_with_old(&self, old: NSSize) {
                 // SAFETY: NSView's own resizeWithOldSuperviewSize: with AppKit's argument.
                 let _: () = unsafe { msg_send![super(self), resizeWithOldSuperviewSize: old] };
-                // Following the window, it already is where the page will be: nothing to hide.
-                if self.ivars().follows.get() {
-                    return;
-                }
-                // SAFETY: on the main thread (AppKit calls this there); only reads the tree.
-                if let Some(p) = unsafe { self.superview() } {
-                    let now = p.bounds().size;
-                    if (now.width - old.width).abs() > 60.0 || (now.height - old.height).abs() > 60.0 {
-                        self.setAlphaValue(0.0);
-                    }
-                }
             }
 
-            /// A new size from anywhere (AppKit following the window, or the page): the engine
-            /// draws at it from its next frame, so the picture never lags its view.
+            /// A new size from anywhere (AppKit or the page): the engine queues it lock-free.
             #[unsafe(method(setFrameSize:))]
             fn set_frame_size(&self, size: NSSize) {
                 // SAFETY: NSView's own setFrameSize: on this view, with the size given.
                 let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
                 let px = self.convertSizeToBacking(size);
+                if let Some(f) = self.ivars().resized.borrow().as_ref() {
+                    f(px.width.round().max(1.0) as u32, px.height.round().max(1.0) as u32);
+                }
+            }
+
+            /// Re-queues backing pixel dimensions when the view moves between 1x/2x monitors.
+            #[unsafe(method(viewDidChangeBackingProperties))]
+            fn view_did_change_backing_properties(&self) {
+                // SAFETY: NSView's own viewDidChangeBackingProperties on the main thread.
+                let _: () = unsafe { msg_send![super(self), viewDidChangeBackingProperties] };
+                let px = self.convertSizeToBacking(self.bounds().size);
                 if let Some(f) = self.ivars().resized.borrow().as_ref() {
                     f(px.width.round().max(1.0) as u32, px.height.round().max(1.0) as u32);
                 }
@@ -255,9 +253,10 @@ pub(crate) mod mac {
         // The page's visible top: `vh` up from the webview's bottom (it can be lower than the
         // webview's top when the page draws under the title bar).
         let vh = if vh > 0.0 && vh <= p.size.height { vh } else { p.size.height };
+        let hh = h.max(1.0);
         // AppKit counts from the bottom unless the view is flipped; the page counts from the top.
-        let top = if parent.isFlipped() { p.origin.y + (p.size.height - vh) + y } else { p.origin.y + vh - y - h };
-        NSRect::new(NSPoint::new(p.origin.x + x, top), NSSize::new(w.max(1.0), h.max(1.0)))
+        let top = if parent.isFlipped() { p.origin.y + (p.size.height - vh) + y } else { p.origin.y + vh - y - hh };
+        NSRect::new(NSPoint::new(p.origin.x + x, top), NSSize::new(w.max(1.0), hh))
     }
 
     /// `r` on whole device pixels, covering it: a frame on a half pixel (the page's boxes
@@ -272,6 +271,144 @@ pub(crate) mod mac {
     fn overhang(parent: &NSView, want: NSRect, view: NSRect) -> crate::Overhang {
         let t = |r: NSRect| (r.origin.x, r.origin.y, r.size.width, r.size.height);
         crate::overhang_of(t(want), t(view), parent.isFlipped())
+    }
+
+    /// Runs `f` inside a `CATransaction` with implicit CoreAnimation actions disabled so
+    /// preview, program, and vertical updates commit atomically in one compositor frame.
+    pub fn batch_update<T>(f: impl FnOnce() -> T) -> T {
+        if MainThreadMarker::new().is_none() {
+            return f();
+        }
+        struct TxGuard(Option<&'static AnyClass>);
+        impl Drop for TxGuard {
+            fn drop(&mut self) {
+                if let Some(cls) = self.0 {
+                    // SAFETY: balances `[CATransaction begin]` on the main thread.
+                    let _: () = unsafe { msg_send![cls, commit] };
+                }
+            }
+        }
+        let cls = AnyClass::get(c"CATransaction");
+        if let Some(c) = cls {
+            // SAFETY: CoreAnimation transaction calls on the main thread, paired by `TxGuard`.
+            unsafe {
+                let _: () = msg_send![c, begin];
+                let _: () = msg_send![c, setDisableActions: Bool::YES];
+            }
+        }
+        let _guard = TxGuard(cls);
+        f()
+    }
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing constraints; WindowObserver is main-thread-only.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "FerrocastWindowObserver"]
+        #[ivars = Rc<crate::WindowWatchHooks>]
+        struct WindowObserver;
+
+        impl WindowObserver {
+            #[unsafe(method(willStartLiveResize:))]
+            fn will_start_live_resize(&self, _note: &NSNotification) {
+                (self.ivars().on_live_resize)(true);
+            }
+
+            #[unsafe(method(didEndLiveResize:))]
+            fn did_end_live_resize(&self, _note: &NSNotification) {
+                (self.ivars().on_live_resize)(false);
+            }
+
+            #[unsafe(method(willEnterFullScreen:))]
+            fn will_enter_full_screen(&self, _note: &NSNotification) {
+                (self.ivars().on_live_resize)(true);
+            }
+
+            #[unsafe(method(didEnterFullScreen:))]
+            fn did_enter_full_screen(&self, _note: &NSNotification) {
+                (self.ivars().on_live_resize)(false);
+            }
+
+            #[unsafe(method(willExitFullScreen:))]
+            fn will_exit_full_screen(&self, _note: &NSNotification) {
+                (self.ivars().on_live_resize)(true);
+            }
+
+            #[unsafe(method(didExitFullScreen:))]
+            fn did_exit_full_screen(&self, _note: &NSNotification) {
+                (self.ivars().on_live_resize)(false);
+            }
+
+            #[unsafe(method(didChangeBackingProperties:))]
+            fn did_change_backing_properties(&self, note: &NSNotification) {
+                if let Some(obj) = note.object() {
+                    // SAFETY: `object` is the NSWindow registered with `addObserver_selector_name_object`.
+                    let scale: f64 = unsafe { msg_send![&*obj, backingScaleFactor] };
+                    if scale.is_finite() && scale > 0.0 {
+                        (self.ivars().on_scale_changed)(scale);
+                    }
+                }
+            }
+        }
+    );
+
+    pub struct WindowWatch {
+        observer: Retained<WindowObserver>,
+    }
+
+    impl std::fmt::Debug for WindowWatch {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("WindowWatch").finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for WindowWatch {
+        fn drop(&mut self) {
+            // SAFETY: unregisters our live observer before `WindowObserver` deallocates.
+            unsafe {
+                NSNotificationCenter::defaultCenter().removeObserver(&self.observer);
+            }
+        }
+    }
+
+    /// Returns whether the AppKit window owning `ns_view` is actively in a live resize drag.
+    pub fn window_in_live_resize(ns_view: *mut c_void) -> bool {
+        if MainThreadMarker::new().is_none() || ns_view.is_null() {
+            return false;
+        }
+        // SAFETY: `ns_view` is a live NSView handed out by Tao/Tauri on the main thread.
+        let view: &NSView = unsafe { &*(ns_view as *const NSView) };
+        view.window().is_some_and(|w| w.inLiveResize())
+    }
+
+    /// Observes live-resize, fullscreen, and backing-scale notifications for the window owning `ns_view`.
+    pub fn watch_window(ns_view: *mut c_void, hooks: crate::WindowWatchHooks) -> Option<WindowWatch> {
+        let mtm = MainThreadMarker::new()?;
+        if ns_view.is_null() {
+            return None;
+        }
+        // SAFETY: `ns_view` is a live NSView handed out by Tao/Tauri on the main thread.
+        let view: &NSView = unsafe { &*(ns_view as *const NSView) };
+        let window = view.window()?;
+        let alloc = WindowObserver::alloc(mtm).set_ivars(Rc::new(hooks));
+        // SAFETY: NSObject's designated initializer on a freshly allocated WindowObserver.
+        let observer: Retained<WindowObserver> = unsafe { msg_send![super(alloc), init] };
+        let center = NSNotificationCenter::defaultCenter();
+        // SAFETY: `observer` stays alive in `WindowWatch` until `Drop` removes it from `center`.
+        unsafe {
+            for (name, selector) in [
+                (NSWindowWillStartLiveResizeNotification, sel!(willStartLiveResize:)),
+                (NSWindowDidEndLiveResizeNotification, sel!(didEndLiveResize:)),
+                (NSWindowWillEnterFullScreenNotification, sel!(willEnterFullScreen:)),
+                (NSWindowDidEnterFullScreenNotification, sel!(didEnterFullScreen:)),
+                (NSWindowWillExitFullScreenNotification, sel!(willExitFullScreen:)),
+                (NSWindowDidExitFullScreenNotification, sel!(didExitFullScreen:)),
+                (NSWindowDidChangeBackingPropertiesNotification, sel!(didChangeBackingProperties:)),
+            ] {
+                center.addObserver_selector_name_object(&observer, selector, Some(name), Some(&window));
+            }
+        }
+        Some(WindowWatch { observer })
     }
 
     /// The Mac cursor for a CSS one, from AppKit's public cursors: macOS 15's frame-resize
@@ -428,6 +565,12 @@ pub(crate) mod mac {
             MainThreadMarker::new().is_some() && self.view.window().is_some_and(|w| w.inLiveResize())
         }
 
+        /// The window's backing scale (1.0 until it has a window): the same one the view is
+        /// snapped to whole device pixels at.
+        fn scale(&self) -> f64 {
+            self.view.window().map(|w| w.backingScaleFactor()).filter(|s| *s > 0.0).unwrap_or(1.0)
+        }
+
         /// Moves and resizes it (the page's box moved). Main thread only; ignored elsewhere.
         /// While a view that follows the window is resized with it, the page's boxes are left
         /// out: they're a beat behind the window, and moving to them made the picture lag and
@@ -519,7 +662,7 @@ pub(crate) mod mac {
         /// sub-menu over its menu, a list over a dialog) stay holes, and rounded corners show
         /// the page's rounded panel, not a square cut of what's under it.
         pub fn set_holes(&self, holes: &[(f64, f64, f64, f64, f64)]) {
-            if MainThreadMarker::new().is_none() {
+            if MainThreadMarker::new().is_none() || self.window_resizing() {
                 return;
             }
             // SAFETY: `layer` on a layer-backed NSView (wantsLayer is set when it's made).
@@ -527,46 +670,44 @@ pub(crate) mod mac {
             let Some(layer) = layer else { return };
             let b = self.view.bounds();
             // The page measures holes from its box; the view is that box rounded out to whole
-            // device pixels (see `crate::fit_holes`).
-            let holes = match self.pass.ivars().wanted.get() {
+            // device pixels (see `crate::fit_holes`). The overhang is the rounding measured when
+            // the view was placed, so a later move of the view (the window's own autoresizing)
+            // is never read as rounding.
+            let fitted = match self.pass.ivars().wanted.get() {
                 Some(want) => {
                     crate::fit_holes(holes, self.pass.ivars().overhang.get(), want.size.width, want.size.height)
                 }
                 None => holes.to_vec(),
             };
-            let inside: Vec<(NSRect, f64)> = holes
-                .iter()
-                .filter_map(|&(x, y, w, h, rad)| {
-                    // The whole box, drawn past the view's edge where it reaches over it: only
-                    // its own corners are round (rounding the part inside cut round notches
-                    // where a dialog crosses the stage's edge).
-                    let inside = x < b.size.width && y < b.size.height && x + w > 0.0 && y + h > 0.0;
-                    (inside && w > 0.0 && h > 0.0).then(|| {
-                        // The layer counts up from the bottom like its view (not flipped).
-                        let y0 = if self.view.isFlipped() { y } else { b.size.height - y - h };
-                        let rad = rad.max(0.0).min(w / 2.0).min(h / 2.0);
-                        (NSRect::new(NSPoint::new(x, y0), NSSize::new(w, h)), rad)
-                    })
-                })
-                .collect();
-            let none: Option<&AnyObject> = None;
-            if inside.is_empty() || b.size.width < 1.0 || b.size.height < 1.0 {
-                // SAFETY: CALayer's `mask` property takes nil.
-                let _: () = unsafe { msg_send![&*layer, setMask: none] };
+            let scale = self.scale();
+            // The mask is made from this key alone (the fitted holes on whole device pixels, the
+            // view's size and the scale), so a cached mask is reused only when it would come out
+            // the same: a change of holes, overhang (it moves the fitted holes), size or scale
+            // makes a new key and a new mask.
+            let next_key = crate::hole_mask_key(b.size.width, b.size.height, scale, &fitted);
+            if self.pass.ivars().mask_key.borrow().as_ref() == Some(&next_key) {
                 return;
             }
-            let scale: f64 = self.view.window().map(|w| w.backingScaleFactor()).unwrap_or(2.0);
-            // The view is on whole device pixels; rounding (not rounding up) keeps float noise
-            // from making the mask a pixel bigger than the view, which stretched it.
-            let (pw, ph) =
-                ((b.size.width * scale).round().max(1.0) as usize, (b.size.height * scale).round().max(1.0) as usize);
+            let none: Option<&AnyObject> = None;
+            let Some(key) = next_key else {
+                // SAFETY: CALayer's `mask` property takes nil.
+                let _: () = unsafe { msg_send![&*layer, setMask: none] };
+                *self.pass.ivars().mask_key.borrow_mut() = Some(None);
+                return;
+            };
+            // The bitmap is the view on whole device pixels (one mask pixel is one screen pixel),
+            // so a hole that reaches the view's edge fills its last pixel and a gap of one device
+            // pixel stays one; the key's own size is that of the view, rounded, never a pixel
+            // more from float noise (which stretched it).
+            let (pw, ph) = (key.width as usize, key.height as usize);
             let Some(class) = AnyClass::get(c"CALayer") else { return };
             // SAFETY: `+[CALayer layer]` makes a new layer (QuartzCore is linked above).
             let mask: Option<Retained<AnyObject>> = unsafe { msg_send![class, layer] };
             let Some(mask) = mask else { return };
-            // SAFETY: a fresh RGBA bitmap context of the view's size in pixels, filled opaque,
-            // then each hole cleared; its image is handed to the layer (which keeps its own
-            // reference) and everything made here is released here.
+            let flipped = self.view.isFlipped();
+            // SAFETY: a fresh RGBA bitmap context of the view's size in device pixels, filled
+            // opaque, then each hole cleared; its image is handed to the layer (which keeps its
+            // own reference) and everything made here is released here.
             unsafe {
                 let space = CGColorSpaceCreateDeviceRGB();
                 // kCGImageAlphaPremultipliedLast
@@ -575,13 +716,19 @@ pub(crate) mod mac {
                 if ctx.is_null() {
                     return;
                 }
-                CGContextScaleCTM(ctx, scale, scale);
                 CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
-                CGContextFillRect(ctx, NSRect::new(NSPoint::new(0.0, 0.0), b.size));
+                CGContextFillRect(ctx, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(pw as f64, ph as f64)));
                 // kCGBlendModeClear: what's drawn now becomes see-through.
                 CGContextSetBlendMode(ctx, 16);
-                for (r, rad) in &inside {
-                    let path = CGPathCreateWithRoundedRect(*r, *rad, *rad, std::ptr::null());
+                for &(x, y, w, h, rad) in &key.holes {
+                    // The whole box, drawn past the view's edge where it reaches over it: only
+                    // its own corners are round (rounding the part inside cut round notches
+                    // where a dialog crosses the stage's edge). The layer counts up from the
+                    // bottom like its view (not flipped).
+                    let y0 = if flipped { y } else { ph as i32 - y - h };
+                    let r =
+                        NSRect::new(NSPoint::new(f64::from(x), f64::from(y0)), NSSize::new(f64::from(w), f64::from(h)));
+                    let path = CGPathCreateWithRoundedRect(r, f64::from(rad), f64::from(rad), std::ptr::null());
                     if path.is_null() {
                         continue;
                     }
@@ -596,11 +743,12 @@ pub(crate) mod mac {
                 }
                 let frame = NSRect::new(NSPoint::new(0.0, 0.0), b.size);
                 let _: () = msg_send![&*mask, setFrame: frame];
-                let _: () = msg_send![&*mask, setContentsScale: scale];
+                let _: () = msg_send![&*mask, setContentsScale: f64::from(key.scale_q) / 1000.0];
                 let _: () = msg_send![&*mask, setContents: image as *mut AnyObject];
                 let _: () = msg_send![&*layer, setMask: &*mask];
                 CGImageRelease(image);
             }
+            *self.pass.ivars().mask_key.borrow_mut() = Some(Some(key));
         }
     }
 }
@@ -730,6 +878,14 @@ pub(crate) mod projector_window {
                 // SAFETY: NSView's own setFrameSize: on this view, with the size AppKit gave.
                 let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
                 let px = self.convertSizeToBacking(size);
+                (self.ivars().resize)(px.width.round().max(1.0) as u32, px.height.round().max(1.0) as u32);
+            }
+
+            #[unsafe(method(viewDidChangeBackingProperties))]
+            fn view_did_change_backing_properties(&self) {
+                // SAFETY: NSView's own viewDidChangeBackingProperties on the main thread.
+                let _: () = unsafe { msg_send![super(self), viewDidChangeBackingProperties] };
+                let px = self.convertSizeToBacking(self.bounds().size);
                 (self.ivars().resize)(px.width.round().max(1.0) as u32, px.height.round().max(1.0) as u32);
             }
         }
