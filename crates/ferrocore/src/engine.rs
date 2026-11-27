@@ -1399,8 +1399,6 @@ struct State {
     delay_conv: Option<DelayConv>,
     /// Frames drawn and on their way back from the card, oldest first (`deliver`).
     in_flight: std::collections::VecDeque<InFlight>,
-    /// Shared first-frame epoch (`now_ns`) anchored while at least one output runs.
-    stream_epoch_ns: Option<u64>,
     /// Cameras just taken out, still running for [`PARK_NS`]: one added again meanwhile (Undo,
     /// a rename, the same camera added back) comes back at once instead of being opened again,
     /// which takes seconds on Windows. What each was, and when it was parked.
@@ -1838,7 +1836,6 @@ impl Engine {
             notices: Default::default(),
             previews: HashMap::new(),
             in_flight: std::collections::VecDeque::new(),
-            stream_epoch_ns: None,
             parked: Vec::new(),
             sleep_want: false,
             sleep_epoch: 0,
@@ -3165,10 +3162,6 @@ impl Engine {
         let more = canvas.more_tracks.len();
         let mut pipe = Pipeline::with_tracks(video, audio, record.as_deref(), more)?;
         pipe.set_track_names(canvas.track_names.clone());
-        // Pre-anchor to the active engine stream epoch before adding to `st.outputs`.
-        if let Some(epoch) = self.lock().stream_epoch_ns {
-            pipe.set_epoch_ns(epoch);
-        }
         // The AAC work off the render thread (FERROCORE_AAC_ON_RENDER_THREAD keeps it there, to compare).
         if std::env::var_os("FERROCORE_AAC_ON_RENDER_THREAD").is_none()
             && let Err(e) = pipe.audio_off_thread()
@@ -3219,9 +3212,6 @@ impl Engine {
         }
         let id = st.next_output;
         st.next_output += 1;
-        if let Some(epoch) = st.stream_epoch_ns {
-            pipe.set_epoch_ns(epoch);
-        }
         // A stream draws what the stream shows, a recording what the recording shows.
         let canvas = Canvas { audience: audience_of(&kind), ..canvas };
         st.outputs.push((id, pipe, kind, canvas));
@@ -3678,9 +3668,6 @@ impl Engine {
             deliver(&mut st, &self.gpu, true, &self.recycle_tx);
             tracing::info!(id, at_ms = t.elapsed().as_millis() as u64, "an output stops: its last frames handed over");
             let taken = st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at));
-            if st.outputs.is_empty() {
-                st.stream_epoch_ns = None;
-            }
             st.errors.remove(&id);
             st.heal.remove(&id);
             sync_heard(&mut st, &self.audio.cmd_sender());
@@ -3702,17 +3689,6 @@ impl Engine {
             self.sync_sleep(ticket);
         }
         Ok(())
-    }
-
-    /// Shared first-frame stream epoch (`now_ns`) anchored while outputs are active.
-    pub fn stream_epoch_ns(&self) -> Option<u64> {
-        self.lock().stream_epoch_ns
-    }
-
-    /// Output's own first-frame timestamp and shared stream epoch (`(start_ns, epoch_ns)`).
-    pub fn output_epoch_ns(&self, id: u64) -> Option<(Option<u64>, Option<u64>)> {
-        let st = self.lock();
-        st.outputs.iter().find(|(i, ..)| *i == id).map(|(_, pipe, ..)| (pipe.start_ns(), pipe.epoch_ns()))
     }
 
     /// As of the loop's last frame (it never waits for the frame being made).
@@ -6173,7 +6149,6 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
     if st.outputs.is_empty() {
         // Nothing encodes: the next output's time starts afresh.
         st.stats.encode_ms = 0.0;
-        st.stream_epoch_ns = None;
     }
     while let Some(front) = st.in_flight.front() {
         let ready = front.drawn.iter().all(|(_, f)| f.as_ref().map_or(true, PendingNv12::ready));
@@ -6198,7 +6173,6 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             .chain(st.heal.iter().filter(|(_, h)| h.retry_at.is_some()).map(|(id, _)| *id))
             .collect();
         let mut encoding = Duration::ZERO;
-        let mut epoch = st.stream_epoch_ns;
         for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
             if !outputs.contains(id) {
                 continue;
@@ -6222,15 +6196,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                         let w = canvas.width as usize;
                         let t0 = Instant::now();
                         match pipe.video(f.as_frame(w), ts) {
-                            Ok(t) => {
-                                if let Some(s) = pipe.start_ns() {
-                                    let e = *epoch.get_or_insert(s);
-                                    if pipe.epoch_ns().is_none() {
-                                        pipe.set_epoch_ns(e);
-                                    }
-                                }
-                                tags = t;
-                            }
+                            Ok(t) => tags = t,
                             Err(e) => failed = Some(e.to_string()),
                         }
                         encoding += t0.elapsed();
@@ -6276,7 +6242,6 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
         for (id, why) in failures {
             note_failure(st, id, &why);
         }
-        st.stream_epoch_ns = epoch;
         // Only frames that went through an encoder count (a canvas drawn every other frame, or
         // one that failed to draw, would pull the average down by half).
         st.stats.encoding_us += encoding.as_micros() as u64;
@@ -11987,17 +11952,60 @@ mod tests {
     }
 
     #[test]
-    fn midstream_output_shares_epoch_and_keeps_av_sync_within_40ms() {
+    fn midstream_bframe_half_fps_output_keeps_av_sync_within_40ms() {
+        #[derive(Default)]
+        struct TagLog {
+            items: Vec<(bool, i64, i64, bool)>, // (is_video, dts_ms, pts_ms, is_header)
+        }
+        fn collect(log: &Arc<(Mutex<TagLog>, std::sync::Condvar)>) -> Box<dyn FnMut(Tag) + Send> {
+            let log = log.clone();
+            Box::new(move |t: Tag| {
+                let item = match t {
+                    Tag::Video { ms, body } => {
+                        let is_hdr = body.get(1).copied() == Some(0);
+                        let cts = if body.len() >= 5 {
+                            ((body[2] as i32) << 16 | (body[3] as i32) << 8 | (body[4] as i32)) << 8 >> 8
+                        } else {
+                            0
+                        };
+                        (true, i64::from(ms), i64::from(ms) + i64::from(cts), is_hdr)
+                    }
+                    Tag::Audio { ms, body } => (false, i64::from(ms), i64::from(ms), body.get(1).copied() == Some(0)),
+                };
+                let (lk, cv) = &*log;
+                lk.lock().unwrap_or_else(|p| p.into_inner()).items.push(item);
+                cv.notify_all();
+            })
+        }
+        fn wait_until(
+            log: &Arc<(Mutex<TagLog>, std::sync::Condvar)>,
+            want_video: usize,
+            want_audio: usize,
+        ) -> Vec<(bool, i64, i64, bool)> {
+            let (lk, cv) = &**log;
+            let mut st = lk.lock().unwrap_or_else(|p| p.into_inner());
+            let mut waited = 0u32;
+            loop {
+                let v = st.items.iter().filter(|x| x.0 && !x.3).count();
+                let a = st.items.iter().filter(|x| !x.0 && !x.3).count();
+                if v >= want_video && a >= want_audio {
+                    return st.items.clone();
+                }
+                assert!(waited < 40, "timed out waiting for engine tags: v={v} a={a}");
+                let (next, _) = cv.wait_timeout(st, Duration::from_millis(250)).unwrap_or_else(|p| p.into_inner());
+                st = next;
+                waited += 1;
+            }
+        }
+
         let Some(e) = engine() else { return };
         shared_scene(&e);
-        let main_tags: Sent = Arc::default();
-        let out1 = e.start_output(OutputKind::Stream(sink_into(&main_tags))).unwrap_or_else(|x| panic!("{x}"));
-        std::thread::sleep(Duration::from_millis(800));
-        let (s1, e1) = e.output_epoch_ns(out1).expect("out1 running");
-        assert!(s1.is_some() && e1 == s1, "first output anchors stream epoch: s1={s1:?} e1={e1:?}");
+        let main_log: Arc<(Mutex<TagLog>, std::sync::Condvar)> = Arc::default();
+        let out1 = e.start_output(OutputKind::Stream(collect(&main_log))).unwrap_or_else(|x| panic!("{x}"));
+        let _ = wait_until(&main_log, 3, 2);
 
         let half_canvas = Canvas { every: 2, ..Canvas::main(e.config()) };
-        let mid_tags: Sent = Arc::default();
+        let mid_log: Arc<(Mutex<TagLog>, std::sync::Condvar)> = Arc::default();
         let vcfg = VideoConfig {
             codec: VideoCodec::H264,
             input: PixelFormat::Nv12,
@@ -12008,29 +12016,29 @@ mod tests {
             bitrate_kbps: 2000,
             rate: RateControl::Cbr,
             keyframe_secs: 1,
-            software: false,
+            software: true,
             profile: crate::video::H264Profile::High,
-            bframes: false,
+            bframes: true,
             preset: None,
             tune: None,
         };
         let acfg = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         let out2 = e
-            .start_output_with(OutputKind::Stream(sink_into(&mid_tags)), half_canvas, vcfg, acfg)
+            .start_output_with(OutputKind::Stream(collect(&mid_log)), half_canvas, vcfg, acfg)
             .unwrap_or_else(|x| panic!("{x}"));
-        std::thread::sleep(Duration::from_millis(1200));
-        let (s2, e2) = e.output_epoch_ns(out2).expect("out2 running");
-        assert_eq!(e2, e1, "mid-stream output must share the active stream epoch");
-        assert!(s2.zip(s1).is_some_and(|(a, b)| a > b), "mid-stream output started later: s2={s2:?} s1={s1:?}");
+        let _ = wait_until(&mid_log, 10, 6);
 
         e.stop_output(out2).unwrap();
         e.stop_output(out1).unwrap();
-        assert_eq!(e.stream_epoch_ns(), None, "epoch resets once all outputs stop");
 
-        let collected = mid_tags.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let first_v = collected.iter().find_map(|(v, ms, _, hdr)| (*v && !hdr).then_some(i64::from(*ms)));
-        let first_a = collected.iter().find_map(|(v, ms, _, hdr)| (!*v && !hdr).then_some(i64::from(*ms)));
-        let (fv, fa) = (first_v.expect("midstream video"), first_a.expect("midstream audio"));
-        assert!((fv - fa).abs() < 40, "mid-stream A/V start out of sync: video={fv}ms audio={fa}ms");
+        let collected = mid_log.0.lock().unwrap_or_else(|p| p.into_inner()).items.clone();
+        let video_dts: Vec<i64> = collected.iter().filter(|x| x.0 && !x.3).map(|x| x.1).collect();
+        let first_v_pts = collected.iter().find_map(|x| (x.0 && !x.3).then_some(x.2)).expect("midstream video");
+        let first_a = collected.iter().find_map(|x| (!x.0 && !x.3).then_some(x.1)).expect("midstream audio");
+        assert!(
+            (first_v_pts - first_a).abs() < 40,
+            "mid-stream B-frame A/V start skewed: video_pts={first_v_pts}ms audio={first_a}ms"
+        );
+        assert!(video_dts.windows(2).all(|w| w[1] >= w[0]), "non-monotonic mid-stream video DTS: {video_dts:?}");
     }
 }
