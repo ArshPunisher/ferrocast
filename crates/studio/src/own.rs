@@ -2400,6 +2400,10 @@ mod tests {
     #[test]
     fn direct_hub_injection_streams_without_rtmp_loopback_and_decimates_fps() {
         let doc = serde_json::json!({ "sources": [], "current_scene": "Main", "scenes": { "Main": [] } });
+        if !ferrocore::ffenc::available() {
+            eprintln!("skipped: x264 needs FFmpeg here");
+            return;
+        }
         let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 60 }, &doc) else {
             eprintln!("skipped: no engine here");
             return;
@@ -2445,6 +2449,10 @@ mod tests {
                 "vertical": { "on": true, "current_scene": "VScene", "scene_order": [{ "name": "VScene" }] }
             }
         });
+        if !ferrocore::ffenc::available() {
+            eprintln!("skipped: x264 needs FFmpeg here");
+            return;
+        }
         let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 60 }, &doc) else {
             eprintln!("skipped: no engine here");
             return;

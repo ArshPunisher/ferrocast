@@ -18,6 +18,16 @@ async fn engine() -> (Engine, tempfile::TempDir) {
     (e, dir)
 }
 
+/// Puts a stand-in FFmpeg where `e` looks for its fetched one, so an x264 host's stream start
+/// isn't refused with "ffmpeg_downloading" on a machine without FFmpeg (CI). The fake hosts never
+/// run it.
+fn pretend_ffmpeg(e: &Engine) {
+    let data = e.golive_data_dir().expect("the test engine has a data folder");
+    let p = crate::ffmpeg_get::tools_path(&data);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, b"").unwrap();
+}
+
 #[tokio::test]
 async fn obs_is_pointed_here_and_put_back_exactly() {
     let (e, _dir) = engine().await;
@@ -3589,6 +3599,7 @@ async fn v37_legacy_host_falls_back_to_single_stream_start() {
         ..Default::default()
     });
     e2.set_studio_host(cpu_host.clone());
+    pretend_ffmpeg(&e2);
     let (p1, _g1) = ferrocast_testkit::rtmp::platform("k1").await;
     let (p2, _g2) = ferrocast_testkit::rtmp::platform("k2").await;
     let _yt = e2
@@ -5548,6 +5559,7 @@ async fn r_f1b_enabling_or_switching_third_dest_never_disrupts_live_peer_on_tigh
         ..Default::default()
     });
     e.set_studio_host(host.clone());
+    pretend_ffmpeg(&e);
 
     let (port_yt, mut got_yt) = platform("yt-1b").await;
     let (port_kick, mut got_kick) = platform("kick-1b").await;
@@ -5891,6 +5903,7 @@ async fn q5_4_options_match_put_for_live_same_as_main_and_offline_over_shared_cu
         ..Default::default()
     });
     e.set_studio_host(host);
+    pretend_ffmpeg(&e);
 
     let (port_a, mut got_a) = platform("ka-54").await;
     let (port_b, mut got_b) = platform("kb-54").await;
@@ -6164,6 +6177,7 @@ async fn q5_9_live_set_golive_light_checks_budget_and_preserves_old_stream_on_ov
         ..Default::default()
     });
     e.set_studio_host(host);
+    pretend_ffmpeg(&e);
 
     let (port_a, mut got_a) = platform("la-59").await;
     let (port_b, mut got_b) = platform("lb-59").await;
