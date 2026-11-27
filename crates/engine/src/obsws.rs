@@ -1286,18 +1286,24 @@ impl Engine {
             }
             "SetCurrentSceneCollection" | "SetCurrentProfile" => {
                 let key = if shelf_kind == "collections" { "sceneCollectionName" } else { "profileName" };
-                let want = str_field(d, key)?;
-                let v = self.studio_shelf(shelf_kind, ShelfAct::List).await.map_err(obs_error)?;
-                let id = v["list"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|e| e["name"].as_str() == Some(want) || e["id"].as_str() == Some(want))
-                    .and_then(|e| e["id"].as_str())
-                    .map(String::from)
-                    .ok_or_else(|| fail(ST_NOT_FOUND, "No entry was found by that name."))?;
-                self.studio_shelf(shelf_kind, ShelfAct::Switch { id }).await.map_err(obs_error)?;
-                Ok(Value::Null)
+                let want = str_field(d, key)?.to_string();
+                let engine = self.clone();
+                // Detach so a closing WebSocket session cannot cancel an active switch mid-flight.
+                tokio::spawn(async move {
+                    let v = engine.studio_shelf(shelf_kind, ShelfAct::List).await.map_err(obs_error)?;
+                    let id = v["list"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|e| e["name"].as_str() == Some(&want) || e["id"].as_str() == Some(&want))
+                        .and_then(|e| e["id"].as_str())
+                        .map(String::from)
+                        .ok_or_else(|| fail(ST_NOT_FOUND, "No entry was found by that name."))?;
+                    engine.studio_shelf(shelf_kind, ShelfAct::Switch { id }).await.map_err(obs_error)?;
+                    Ok(Value::Null)
+                })
+                .await
+                .map_err(|e| fail(ST_FAILED, format!("The shelf operation failed: {e}")))?
             }
             "CreateSceneCollection" => {
                 let name = str_field(d, "sceneCollectionName")?.trim().to_string();
@@ -4422,5 +4428,168 @@ mod tests {
         e.studio_shelf("profiles", ShelfAct::New { name: "ExternalProf".into(), copy: false }).await.unwrap();
         assert_eq!(c.event("ProfileListChanged").await["profiles"], json!(["1080p60", "720p30", "ExternalProf"]));
         assert_eq!(c.event("CurrentProfileChanged").await["profileName"], "ExternalProf");
+    }
+
+    #[derive(Debug)]
+    struct OwsDropHost {
+        data: std::path::PathBuf,
+        held_collection_id: Mutex<String>,
+        held_profile_id: Mutex<String>,
+        hold_next_save: std::sync::atomic::AtomicBool,
+        swapped: Arc<tokio::sync::Notify>,
+        release_save: Arc<tokio::sync::Notify>,
+        finished_or_aborted: Arc<tokio::sync::Notify>,
+    }
+
+    struct OwsOpGuard {
+        done: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for OwsOpGuard {
+        fn drop(&mut self) {
+            self.done.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StudioHost for OwsDropHost {
+        async fn status(&self) -> StudioStatus {
+            StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<StudioStatus, String> {
+            Ok(StudioStatus::default())
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn options(&self, _k: String) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn preview(&self, _r: Option<PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _k: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn settings(&self) -> StudioSettings {
+            StudioSettings::default()
+        }
+        async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn import_obs(&self, _id: String) -> Result<Value, String> {
+            Err("n/a".into())
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn record(&self, _on: bool) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn act(&self, act: StudioAct) -> Result<Value, String> {
+            match act {
+                StudioAct::Scenes => Ok(json!({
+                    "scenes": [{ "name": "Game" }],
+                    "current": "Game",
+                    "collection_id": self.held_collection_id.lock().unwrap().clone(),
+                })),
+                _ => Ok(Value::Null),
+            }
+        }
+        async fn shelf(&self, kind: String, act: ShelfAct) -> Result<Value, String> {
+            use ferrocast_store::studio_library as lib;
+            match act {
+                ShelfAct::List => lib::headless_shelf_list(&self.data, &kind),
+                ShelfAct::Switch { id } => {
+                    let _guard = OwsOpGuard { done: self.finished_or_aborted.clone() };
+                    if kind == "profiles" {
+                        *self.held_profile_id.lock().unwrap() = id.clone();
+                    } else {
+                        *self.held_collection_id.lock().unwrap() = id.clone();
+                    }
+                    if self.hold_next_save.swap(false, Ordering::SeqCst) {
+                        self.swapped.notify_one();
+                        self.release_save.notified().await;
+                    }
+                    lib::headless_shelf_switch(&self.data, &kind, &id)
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn obsws_collection_and_profile_switches_complete_when_dropped() {
+        use ferrocast_store::studio_library as lib;
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let mut initial = lib::load(dir.path());
+        initial.collections.list.push(lib::Entry { id: "irl".into(), name: "IRL".into() });
+        initial.profiles.list.push(lib::Entry { id: "720p30".into(), name: "720p30".into() });
+        lib::save(dir.path(), &initial);
+        assert!(ferrocast_store::durable::flush_saves(Duration::from_secs(5)));
+
+        let host = Arc::new(OwsDropHost {
+            data: dir.path().to_path_buf(),
+            held_collection_id: Mutex::new("untitled".into()),
+            held_profile_id: Mutex::new("untitled".into()),
+            hold_next_save: std::sync::atomic::AtomicBool::new(false),
+            swapped: Arc::new(tokio::sync::Notify::new()),
+            release_save: Arc::new(tokio::sync::Notify::new()),
+            finished_or_aborted: Arc::new(tokio::sync::Notify::new()),
+        });
+        e.set_studio_host(host.clone());
+
+        host.hold_next_save.store(true, Ordering::SeqCst);
+        let req = json!({ "sceneCollectionName": "IRL" });
+        let mut fut = Box::pin(e.ows_request("SetCurrentSceneCollection", &req));
+        tokio::select! {
+            biased;
+            _ = &mut fut => panic!("SetCurrentSceneCollection finished before drop"),
+            _ = host.swapped.notified() => {}
+        }
+        drop(fut);
+        host.release_save.notify_one();
+        host.finished_or_aborted.notified().await;
+        assert_eq!(lib::load(dir.path()).collections.current, "irl");
+        assert_eq!(e.studio_act(StudioAct::Scenes).await.unwrap()["collection_id"], "irl");
+
+        host.hold_next_save.store(true, Ordering::SeqCst);
+        let req = json!({ "profileName": "720p30" });
+        let mut fut = Box::pin(e.ows_request("SetCurrentProfile", &req));
+        tokio::select! {
+            biased;
+            _ = &mut fut => panic!("SetCurrentProfile finished before drop"),
+            _ = host.swapped.notified() => {}
+        }
+        drop(fut);
+        host.release_save.notify_one();
+        host.finished_or_aborted.notified().await;
+        assert_eq!(lib::load(dir.path()).profiles.current, "720p30");
+        assert_eq!(*host.held_profile_id.lock().unwrap(), "720p30");
     }
 }
