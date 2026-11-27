@@ -43,9 +43,14 @@ pub(crate) struct PressedKeys {
     held: HashMap<String, HashSet<String>>,
     /// Keys released forcefully by a collection switch so the later physical key-up is ignored.
     suppressed_ups: HashSet<(String, String)>,
+    epoch: u64,
 }
 
 impl PressedKeys {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// `key` went down for `action` → whether the action's press goes on (the first key down).
     pub(crate) fn down(&mut self, action: &str, key: &str) -> bool {
         self.suppressed_ups.remove(&(action.to_string(), key.to_string()));
@@ -79,9 +84,11 @@ impl PressedKeys {
         self.held.drain().map(|(a, _)| a).collect()
     }
 
-    /// Collection switch release: drains every held shortcut, suppresses the eventual physical
-    /// key-up so it cannot touch the incoming collection, and returns held PTT/PTM actions.
+    /// Collection switch release: bumps the epoch, drains every held shortcut, suppresses the
+    /// eventual physical key-up so it cannot touch the incoming collection, and returns held
+    /// PTT/PTM actions.
     pub(crate) fn release_on_switch(&mut self) -> Vec<String> {
+        self.epoch = self.epoch.wrapping_add(1);
         let mut ptt = Vec::new();
         for (action, keys) in self.held.drain() {
             let is_audio = action.starts_with("push_to_talk:") || action.starts_with("push_to_mute:");
@@ -168,7 +175,7 @@ impl StudioKeys {
                 if msg_epoch != worker_epoch.load(std::sync::atomic::Ordering::Acquire) {
                     continue;
                 }
-                if let Err(e) = run(&engine, &action, pressed).await {
+                if let Err(e) = run_with_epoch(&engine, &action, pressed, Some((msg_epoch, &worker_epoch))).await {
                     tracing::warn!(action, error = %e, "a Studio shortcut didn't work");
                 }
             }
@@ -186,17 +193,49 @@ impl StudioKeys {
     fn current_epoch(&self) -> u64 {
         self.epoch.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    fn enqueue(&self, action: &str, key: &str, pressed: bool) {
+        let mut down = self.down.lock().unwrap_or_else(|p| p.into_inner());
+        if acts_on_release(action) {
+            let go = if pressed { down.down(action, key) } else { down.up(action, key) };
+            if !go {
+                return;
+            }
+        }
+        let epoch = down.epoch();
+        let _ = self.queue.send((epoch, action.to_string(), pressed));
+    }
+
+    fn enqueue_release_all(&self) {
+        let mut down = self.down.lock().unwrap_or_else(|p| p.into_inner());
+        let epoch = down.epoch();
+        let _ = self.queue.send((epoch, RELEASE_HOLDS.to_string(), false));
+        for action in down.clear().into_iter().filter(|a| !push_hold::is_push_hold(a)) {
+            let _ = self.queue.send((epoch, action, false));
+        }
+    }
+
+    fn release_switch(&self) -> Vec<String> {
+        let mut down = self.down.lock().unwrap_or_else(|p| p.into_inner());
+        let ptt = down.release_on_switch();
+        self.epoch.store(down.epoch(), std::sync::atomic::Ordering::Release);
+        ptt
+    }
+}
+
+/// Returns whether a shortcut act's captured epoch still matches the live key state.
+pub(crate) fn epoch_matches(app: &AppHandle, epoch: u64) -> bool {
+    app.try_state::<StudioKeys>().is_none_or(|k| k.current_epoch() == epoch)
 }
 
 /// Drains held PTT/PTM keys on collection switch without touching the async queue (avoiding
-/// any deadlock behind `output_gate`), bumps the shortcut epoch, and returns released audio
-/// actions so the caller restores the outgoing collection before saving it.
+/// any deadlock behind `output_gate`), bumps the shortcut epoch under `down`, and returns
+/// released audio actions so the caller restores the outgoing collection before saving it.
 pub(crate) fn release_active(app: &AppHandle) -> Vec<String> {
     let Some(keys) = app.try_state::<StudioKeys>() else {
         return Vec::new();
     };
-    keys.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    keys.down.lock().unwrap_or_else(|p| p.into_inner()).release_on_switch()
+    keys.release_switch()
 }
 
 /// What the settings ask for: each key once, with every action it runs (a key may be shared by
@@ -234,12 +273,7 @@ pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> 
     }
     let mut map = state.keys.lock().unwrap_or_else(|p| p.into_inner());
     // Shortcuts about to be replaced can't report a key let go any more: nothing stays held.
-    let epoch = state.current_epoch();
-    let _ = state.queue.send((epoch, RELEASE_HOLDS.to_string(), false));
-    let held = state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
-    for action in held.into_iter().filter(|a| !push_hold::is_push_hold(a)) {
-        let _ = state.queue.send((epoch, action, false));
-    }
+    state.enqueue_release_all();
     for (sc, _) in map.drain() {
         let _ = app.global_shortcut().unregister(sc);
     }
@@ -270,12 +304,7 @@ pub(crate) fn capture(app: &AppHandle, on: bool) {
         Capture::Suspend => {
             tracing::info!("the shortcuts are let go while a shortcut field waits for a key");
             // A key held now would never be seen coming up.
-            let epoch = state.current_epoch();
-            let _ = state.queue.send((epoch, RELEASE_HOLDS.to_string(), false));
-            let held = state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
-            for action in held.into_iter().filter(|a| !push_hold::is_push_hold(a)) {
-                let _ = state.queue.send((epoch, action, false));
-            }
+            state.enqueue_release_all();
             let _ = app.global_shortcut().unregister_all();
             watch_capture(app.clone());
         }
@@ -322,14 +351,7 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> boo
         if !pressed && !acts_on_release(&action) {
             continue;
         }
-        if acts_on_release(&action) {
-            let mut down = keys.down.lock().unwrap_or_else(|p| p.into_inner());
-            let go = if pressed { down.down(&action, &key) } else { down.up(&action, &key) };
-            if !go {
-                continue;
-            }
-        }
-        let _ = keys.queue.send((keys.current_epoch(), action, pressed));
+        keys.enqueue(&action, &key, pressed);
     }
     true
 }
@@ -339,14 +361,32 @@ pub(crate) fn acts_on_release(action: &str) -> bool {
     action.starts_with("push_to_talk:") || action.starts_with("push_to_mute:") || push_hold::is_push_hold(action)
 }
 
+fn epoch_is_current(epoch: Option<(u64, &std::sync::Arc<std::sync::atomic::AtomicU64>)>) -> bool {
+    epoch.is_none_or(|(expected, current)| current.load(std::sync::atomic::Ordering::Acquire) == expected)
+}
+
+#[cfg(test)]
 async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineError> {
+    run_with_epoch(engine, action, pressed, None).await
+}
+
+async fn run_with_epoch(
+    engine: &Engine,
+    action: &str,
+    pressed: bool,
+    epoch: Option<(u64, &std::sync::Arc<std::sync::atomic::AtomicU64>)>,
+) -> Result<(), EngineError> {
+    if !epoch_is_current(epoch) {
+        return Ok(());
+    }
     if action == RELEASE_HOLDS {
         engine.studio_release_holds().await;
         return Ok(());
     }
     if push_hold::is_push_hold(action) {
-        return engine.studio_push_hold(action, pressed).await;
+        return engine.studio_push_hold_with_epoch(action, pressed, epoch.map(|(m, w)| (m, w.as_ref()))).await;
     }
+    let key_epoch = epoch.map(|(m, _)| m);
     match action {
         "go_live" => {
             engine.go_live().await?;
@@ -356,58 +396,68 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
         }
         "record" => {
             let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
-            engine.studio_record(!on).await?;
+            if epoch_is_current(epoch) {
+                engine.studio_record(!on).await?;
+            }
         }
         "start_record" => {
             let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
-            if !on {
+            if !on && epoch_is_current(epoch) {
                 engine.studio_record(true).await?;
             }
         }
         "stop_record" => {
             let on = engine.studio_stats().await?["record"]["active"].as_bool().unwrap_or(false);
-            if on {
+            if on && epoch_is_current(epoch) {
                 engine.studio_record(false).await?;
             }
         }
         "unpause_record" => {
             let paused = engine.studio_stats().await?["record"]["paused"].as_bool().unwrap_or(false);
-            if paused {
+            if paused && epoch_is_current(epoch) {
                 engine.studio_record_pause(false).await?;
             }
         }
         "start_replay" | "stop_replay" => {
             let on = engine.studio_stats().await?["replay"]["active"].as_bool().unwrap_or(false);
-            if on != (action == "start_replay") {
+            if on != (action == "start_replay") && epoch_is_current(epoch) {
                 engine.studio_replay(action == "start_replay").await?;
             }
         }
         "start_virtualcam" | "stop_virtualcam" => {
             let on = engine.studio_stats().await?["virtualcam"]["active"].as_bool().unwrap_or(false);
-            if on != (action == "start_virtualcam") {
+            if on != (action == "start_virtualcam") && epoch_is_current(epoch) {
                 engine.studio_virtual_camera(action == "start_virtualcam", None).await?;
             }
         }
         "pause_record" => {
             let paused = engine.studio_stats().await?["record"]["paused"].as_bool().unwrap_or(false);
-            engine.studio_record_pause(!paused).await?;
+            if epoch_is_current(epoch) {
+                engine.studio_record_pause(!paused).await?;
+            }
         }
         "replay" => {
             let on = engine.studio_stats().await?["replay"]["active"].as_bool().unwrap_or(false);
-            engine.studio_replay(!on).await?;
+            if epoch_is_current(epoch) {
+                engine.studio_replay(!on).await?;
+            }
         }
         "save_replay" => {
             engine.studio_replay_save().await?;
         }
         "virtualcam" => {
             let on = engine.studio_stats().await?["virtualcam"]["active"].as_bool().unwrap_or(false);
-            engine.studio_virtual_camera(!on, None).await?;
+            if epoch_is_current(epoch) {
+                engine.studio_virtual_camera(!on, None).await?;
+            }
         }
         "split_record" => engine.studio_record_split().await?,
         "chapter" => engine.studio_record_chapter(String::new()).await?,
         "studio_mode" => {
             let on = !engine.studio_act(StudioAct::Scenes).await?["preview"].is_null();
-            engine.studio_act(StudioAct::StudioMode { on: !on }).await?;
+            if epoch_is_current(epoch) {
+                engine.studio_act(StudioAct::StudioMode { on: !on }).await?;
+            }
         }
         "transition" => {
             engine.studio_act(StudioAct::TransitionNow { quick: None }).await?;
@@ -430,6 +480,9 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                 return Ok(());
             }
             let on = !engine.studio_act(StudioAct::Scenes).await?["vertical"].is_null();
+            if !epoch_is_current(epoch) {
+                return Ok(());
+            }
             let want = match action {
                 "vertical:show_preview" => true,
                 "vertical:hide_preview" => false,
@@ -443,13 +496,18 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
         }
         "vertical:screenshot" => {
             let scenes = engine.studio_act(StudioAct::Scenes).await?;
+            if !epoch_is_current(epoch) {
+                return Ok(());
+            }
             if let Some(name) = scenes["vertical"]["current"].as_str().filter(|s| !s.is_empty()) {
                 engine.studio_act(StudioAct::Screenshot { name: name.to_string(), item: None }).await?;
             }
         }
         "performance_mode" => {
             let on = engine.studio_preview_paused().await?;
-            engine.studio_set_preview_paused(!on).await?;
+            if epoch_is_current(epoch) {
+                engine.studio_set_preview_paused(!on).await?;
+            }
         }
         "performance_mode_on" | "performance_mode_off" => {
             engine.studio_set_preview_paused(action == "performance_mode_on").await?;
@@ -463,7 +521,12 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
         a => {
             let audio = |name: &str, muted: bool| StudioAct::SetAudio {
                 name: name.to_string(),
-                change: AudioChange { muted: Some(muted), by_shortcut: true, ..Default::default() },
+                change: AudioChange {
+                    muted: Some(muted),
+                    by_shortcut: true,
+                    shortcut_epoch: key_epoch,
+                    ..Default::default()
+                },
             };
             let pair = |p: &str| a.strip_prefix(p).and_then(|r| r.split_once('\n'));
             if let Some(scene) = a.strip_prefix("scene:") {
@@ -471,12 +534,18 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
             } else if let Some(n) = a.strip_prefix("quick:").and_then(|n| n.parse::<usize>().ok()) {
                 // Quick transitions are numbered from 1, as they're listed.
                 let scenes = engine.studio_act(StudioAct::Scenes).await?;
+                if !epoch_is_current(epoch) {
+                    return Ok(());
+                }
                 if let Some(q) = scenes["quick"].get(n.saturating_sub(1)) {
                     let quick = serde_json::from_value(q.clone()).ok();
                     engine.studio_act(StudioAct::TransitionNow { quick }).await?;
                 }
             } else if let Some((scene, source)) = pair("show:").or_else(|| pair("hide:")) {
                 let items = engine.studio_act(StudioAct::Items { scene: scene.to_string() }).await?;
+                if !epoch_is_current(epoch) {
+                    return Ok(());
+                }
                 // Inside a group too.
                 let id = push_hold::find_item(&items, source).map(|(id, _)| id);
                 if let Some(id) = id {
@@ -485,6 +554,9 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                 }
             } else if let Some((source, filter)) = pair("filter:") {
                 let list = engine.studio_act(StudioAct::Filters { name: source.to_string(), item: None }).await?;
+                if !epoch_is_current(epoch) {
+                    return Ok(());
+                }
                 let on = list
                     .as_array()
                     .and_then(|l| l.iter().find(|f| f["name"] == Value::String(filter.into())))
@@ -515,17 +587,37 @@ async fn run(engine: &Engine, action: &str, pressed: bool) -> Result<(), EngineE
                 // Switched on for the sound: the mixer gates it (with its release delay, in samples).
                 // Not: held mutes it, let go hears it, as before.
                 let gated = engine
-                    .studio_act(StudioAct::PushKey { name: name.to_string(), talk: false, down: pressed })
+                    .studio_act(StudioAct::PushKey {
+                        name: name.to_string(),
+                        talk: false,
+                        down: pressed,
+                        epoch: key_epoch,
+                    })
                     .await?;
+                if !epoch_is_current(epoch) {
+                    return Ok(());
+                }
                 if gated != Value::Bool(true) {
                     engine.studio_act(audio(name, pressed)).await?;
                 }
             } else if let Some(name) = a.strip_prefix("mute:") {
                 let muted = muted(engine, name).await?;
+                if !epoch_is_current(epoch) {
+                    return Ok(());
+                }
                 engine.studio_act(audio(name, !muted)).await?;
             } else if let Some(name) = a.strip_prefix("push_to_talk:") {
-                let gated =
-                    engine.studio_act(StudioAct::PushKey { name: name.to_string(), talk: true, down: pressed }).await?;
+                let gated = engine
+                    .studio_act(StudioAct::PushKey {
+                        name: name.to_string(),
+                        talk: true,
+                        down: pressed,
+                        epoch: key_epoch,
+                    })
+                    .await?;
+                if !epoch_is_current(epoch) {
+                    return Ok(());
+                }
                 if gated != Value::Bool(true) {
                     // Held: heard; let go: muted.
                     engine.studio_act(audio(name, !pressed)).await?;
@@ -672,6 +764,8 @@ mod tests {
         vstream_stops: std::sync::atomic::AtomicUsize,
         /// Performance mode: the preview is paused.
         paused: std::sync::atomic::AtomicBool,
+        on_push_key_bump: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
+        on_items_bump: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>>,
     }
 
     impl FakeHost {
@@ -746,11 +840,22 @@ mod tests {
                     self.vertical_on.store(false, std::sync::atomic::Ordering::SeqCst);
                     Ok(Value::Null)
                 }
-                StudioAct::Items { .. } => Ok(serde_json::json!([
-                    { "id": 4, "name": "Banner", "visible": false, "children": [
-                        { "id": 9, "name": "Deep", "visible": false, "children": [] }
-                    ] },
-                ])),
+                StudioAct::Items { .. } => {
+                    if let Some(ep) = &*self.on_items_bump.lock().unwrap_or_else(|p| p.into_inner()) {
+                        ep.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                    Ok(serde_json::json!([
+                        { "id": 4, "name": "Banner", "visible": false, "children": [
+                            { "id": 9, "name": "Deep", "visible": false, "children": [] }
+                        ] },
+                    ]))
+                }
+                StudioAct::PushKey { .. } => {
+                    if let Some(ep) = &*self.on_push_key_bump.lock().unwrap_or_else(|p| p.into_inner()) {
+                        ep.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    }
+                    Ok(Value::Bool(false))
+                }
                 _ => Ok(Value::Null),
             }
         }
@@ -877,8 +982,8 @@ mod tests {
             acts,
             vec![
                 StudioAct::Items { scene: "Main".into() },
-                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: true, release: false },
-                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: false, release: true },
+                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: true, release: false, epoch: None },
+                StudioAct::PushItem { scene: "Main".into(), id: 9, visible: false, release: true, epoch: None },
             ]
         );
         assert!(acts.iter().all(|a| !matches!(a, StudioAct::EditItem { .. }) && !a.changes()));
@@ -888,7 +993,7 @@ mod tests {
         run(&engine, RELEASE_HOLDS, false).await.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             host.take_acts(),
-            vec![StudioAct::PushItem { scene: "Main".into(), id: 4, visible: false, release: true }]
+            vec![StudioAct::PushItem { scene: "Main".into(), id: 4, visible: false, release: true, epoch: None }]
         );
         // Nothing held: asking again does nothing.
         run(&engine, RELEASE_HOLDS, false).await.unwrap_or_else(|e| panic!("{e}"));
@@ -1047,5 +1152,76 @@ mod tests {
         assert!(pk.down("push_to_mute:Desk", "F7"));
         assert_eq!(pk.clear(), vec!["push_to_mute:Desk".to_string()]);
         assert!(pk.up("push_to_mute:Desk", "F7"));
+    }
+
+    #[tokio::test]
+    async fn col11_worker_aborts_ptt_and_push_hold_when_epoch_bumps_mid_await() {
+        let host = std::sync::Arc::new(FakeHost::default());
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        *host.on_push_key_bump.lock().unwrap_or_else(|p| p.into_inner()) = Some(epoch.clone());
+        let (engine, _dir) = test_engine(host.clone()).await;
+
+        run_with_epoch(&engine, "push_to_talk:Mic", true, Some((0, &epoch))).await.unwrap_or_else(|e| panic!("{e}"));
+        let acts = host.take_acts();
+        assert!(
+            !acts.iter().any(|a| matches!(a, StudioAct::SetAudio { .. })),
+            "worker must abort PTT fallback SetAudio when epoch bumped mid-await: {acts:?}"
+        );
+
+        *host.on_push_key_bump.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *host.on_items_bump.lock().unwrap_or_else(|p| p.into_inner()) = Some(epoch.clone());
+        let start_epoch = epoch.load(std::sync::atomic::Ordering::Acquire);
+        run_with_epoch(&engine, "push_show:Main\nBanner", true, Some((start_epoch, &epoch)))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let acts = host.take_acts();
+        assert!(
+            !acts.iter().any(|a| matches!(a, StudioAct::PushItem { .. })),
+            "worker must abort push_hold PushItem when epoch bumped mid-await: {acts:?}"
+        );
+        engine.shutdown();
+    }
+
+    #[test]
+    fn col12_pressed_keys_epoch_and_enqueue_serialize_under_down_lock() {
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (queue, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, String, bool)>();
+        let sk = StudioKeys {
+            keys: Mutex::new(HashMap::new()),
+            queue,
+            epoch: epoch.clone(),
+            wanted: Mutex::new(BTreeMap::new()),
+            gate: Mutex::new(CaptureGate::default()),
+            down: Mutex::new(PressedKeys::default()),
+        };
+
+        sk.enqueue("push_to_talk:Mic", "F8", true);
+        sk.enqueue("push_to_talk:Mic", "F8", true); // Repeat press ignored while down.
+        sk.enqueue("mute:Desk", "F6", true);
+
+        let (e1, a1, p1) = rx.try_recv().unwrap();
+        let (e2, a2, p2) = rx.try_recv().unwrap();
+        assert_eq!((e1, a1.as_str(), p1), (0, "push_to_talk:Mic", true));
+        assert_eq!((e2, a2.as_str(), p2), (0, "mute:Desk", true));
+        assert!(rx.try_recv().is_err());
+
+        let released = sk.release_switch();
+        assert_eq!(released, vec!["push_to_talk:Mic".to_string()]);
+        assert_eq!(sk.current_epoch(), 1);
+        assert_eq!(sk.down.lock().unwrap().epoch(), 1);
+
+        // Suppressed key-up from pre-switch hold does not enqueue onto epoch 1.
+        sk.enqueue("push_to_talk:Mic", "F8", false);
+        assert!(rx.try_recv().is_err());
+
+        // New press after switch enqueues on epoch 1, and capture/apply clear keeps epoch 1.
+        sk.enqueue("push_to_talk:Mic", "F8", true);
+        let (e3, a3, p3) = rx.try_recv().unwrap();
+        assert_eq!((e3, a3.as_str(), p3), (1, "push_to_talk:Mic", true));
+
+        sk.enqueue_release_all();
+        assert_eq!(rx.try_recv().unwrap(), (1, RELEASE_HOLDS.to_string(), false));
+        assert_eq!(rx.try_recv().unwrap(), (1, "push_to_talk:Mic".to_string(), false));
+        assert_eq!(sk.current_epoch(), 1, "clear/capture must not bump collection-switch epoch");
     }
 }

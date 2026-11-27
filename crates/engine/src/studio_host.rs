@@ -1568,6 +1568,10 @@ pub struct AudioChange {
     /// Sent by a shortcut (mute, push-to-talk): not an undo step, as in OBS. Never from the API.
     #[serde(skip)]
     pub by_shortcut: bool,
+    /// Shortcut epoch captured when the key event was queued; stale dispatches are dropped after
+    /// a collection switch. Never from the API.
+    #[serde(skip)]
+    pub shortcut_epoch: Option<u64>,
 }
 
 /// Who hears a sound besides the stream.
@@ -1774,6 +1778,8 @@ pub enum StudioAct {
         name: String,
         talk: bool,
         down: bool,
+        #[serde(default, skip_serializing)]
+        epoch: Option<u64>,
     },
     /// One look for the live watch's two-second tick, taken together on the Studio's thread:
     /// `{ scenes, audio, items }`: the scenes (as `Scenes`), the sounds of the scene on air (as
@@ -1789,6 +1795,8 @@ pub enum StudioAct {
         /// The key is let go: the held view is dropped (`visible` is what it was before).
         #[serde(default)]
         release: bool,
+        #[serde(default, skip_serializing)]
+        epoch: Option<u64>,
     },
     /// A push-to-enable / push-to-disable key on a source's own filter; as `PushItem`.
     PushFilter {
@@ -1797,6 +1805,8 @@ pub enum StudioAct {
         enabled: bool,
         #[serde(default)]
         release: bool,
+        #[serde(default, skip_serializing)]
+        epoch: Option<u64>,
     },
     /// How these sources' pictures look now: `{ name: { luma, spread, sig } }` (a black or
     /// frozen camera).
@@ -3740,6 +3750,7 @@ impl Engine {
     pub(crate) async fn finish_collection_switch(&self, switched: bool, has_host: bool) {
         if switched {
             self.clear_collection_pending();
+            let _ = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).release_all();
         }
         if has_host {
             // Another collection may have its own vertical picture (or none): the stream follows.

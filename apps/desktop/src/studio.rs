@@ -1470,6 +1470,7 @@ fn swap_collection(
 
 /// Saves the scenes in use to `from` and puts `to`'s in their place (a missing file is a new
 /// set with one empty scene). If `to` won't load, the old collection and all views remain intact.
+#[cfg(test)]
 fn swap_collection_to(
     ctx: ViewCtx<'_>,
     h: &mut Held,
@@ -1478,6 +1479,18 @@ fn swap_collection_to(
     from: &std::path::Path,
     to: &std::path::Path,
     release_keys: &[String],
+) -> Result<(), String> {
+    swap_collection_releasing(ctx, h, data, to_id, from, to, || release_keys.to_vec())
+}
+
+fn swap_collection_releasing(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    data: &std::path::Path,
+    to_id: Option<&str>,
+    from: &std::path::Path,
+    to: &std::path::Path,
+    release: impl FnOnce() -> Vec<String>,
 ) -> Result<(), String> {
     let Some(canvas) = h.collection.as_ref().map(Collection::canvas) else {
         // Not running: the next Start loads it.
@@ -1520,8 +1533,11 @@ fn swap_collection_to(
     h.history.clear();
     h.selected = None;
     h.frames = None;
+    // Drain active shortcut holds only once the switch commits so a failed load leaves PTT/PTM
+    // keys intact and responsive on the surviving collection.
+    let release_keys = release();
     if let Some(old_c) = h.collection.take() {
-        release_push_keys_on(&old_c, release_keys);
+        release_push_keys_on(&old_c, &release_keys);
         save_confirmed(h.collection_deferred, &old_c, from);
         drop(old_c);
     }
@@ -2430,11 +2446,11 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
         A::EditItem { scene, id, edit } => done(c.edit_item(&scene, id, item_edit(edit))),
         // A key held down: shown or hidden for as long as it is held, never saved (the engine
         // puts it back on release).
-        A::PushItem { scene, id, visible, release } => {
+        A::PushItem { scene, id, visible, release, .. } => {
             // The engine's view only: nothing is written to the collection.
             done(c.hold_item(&scene, id, (!release).then_some(visible)))
         }
-        A::PushFilter { name, filter, enabled, release } => {
+        A::PushFilter { name, filter, enabled, release, .. } => {
             done(c.hold_filter(&name, &filter, (!release).then_some(enabled)))
         }
         A::Sources => v(to_json!(c.sources())),
@@ -2486,7 +2502,7 @@ fn run(c: &Collection, act: StudioAct) -> Result<Value, ferrocast_studio::Studio
             done(c.set_channel(channel, device.as_ref().map(|d| (d.kind.as_str(), d.name.as_str(), &d.settings))))
         }
         A::Levels { names } => v(to_json!(c.levels(&names))),
-        A::PushKey { name, talk, down } => v(Ok(json!(c.push_key(&name, talk, down)?))),
+        A::PushKey { name, talk, down, .. } => v(Ok(json!(c.push_key(&name, talk, down)?))),
         A::Look { names } => v(to_json!(c.look(&names)?)),
         A::AudioCare => v(Ok(c.audio_care())),
         A::SetAudioCare { care } => done(c.set_audio_care(&care)),
@@ -2697,6 +2713,16 @@ pub struct DesktopStudio {
     shelf_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+fn act_shortcut_epoch(act: &StudioAct) -> Option<u64> {
+    match act {
+        StudioAct::PushKey { epoch, .. } | StudioAct::PushItem { epoch, .. } | StudioAct::PushFilter { epoch, .. } => {
+            *epoch
+        }
+        StudioAct::SetAudio { change, .. } => change.shortcut_epoch,
+        _ => None,
+    }
+}
+
 fn shelf_switch_is_noop(h: &Held, kind: Kind, current: &str, id: &str) -> bool {
     if current != id {
         return false;
@@ -2878,21 +2904,20 @@ impl DesktopStudio {
         let to = library::file(&data, kind, id);
         match kind {
             Kind::Collections => {
-                let release_keys = crate::studio_keys::release_active(&self.app);
                 let app = self.app.clone();
                 let data_main = data.clone();
                 let id_main = id.to_string();
                 let to_main = to.clone();
                 self.on_main(move |h| {
                     let from = h.collection_file.clone().unwrap_or(from_fallback);
-                    swap_collection_to(
+                    swap_collection_releasing(
                         ViewCtx::App(&app),
                         h,
                         &data_main,
                         Some(&id_main),
                         &from,
                         &to_main,
-                        &release_keys,
+                        || crate::studio_keys::release_active(&app),
                     )
                 })
                 .await??;
@@ -3389,14 +3414,15 @@ impl StudioHost for DesktopStudio {
         let _shelf_lock = self.shelf_lock.lock().await;
         let data = self.data.clone();
         let app = self.app.clone();
-        let release_keys = crate::studio_keys::release_active(&self.app);
         self.on_main(move |h| {
             let from = active_collection_file(h, &data);
             let lib = library::load(&data);
             let to_id = lib.collections.current.clone();
             let to = lib.current_file(&data, Kind::Collections);
             if h.collection.is_some() {
-                swap_collection_to(ViewCtx::App(&app), h, &data, Some(&to_id), &from, &to, &release_keys)?;
+                swap_collection_releasing(ViewCtx::App(&app), h, &data, Some(&to_id), &from, &to, || {
+                    crate::studio_keys::release_active(&app)
+                })?;
                 write_session(session_now(h).as_ref());
             }
             Ok(Self::status_of(h))
@@ -3904,6 +3930,11 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         let app = self.app.clone();
         self.on_main(move |h| {
+            if let Some(ep) = act_shortcut_epoch(&act)
+                && !crate::studio_keys::epoch_matches(&app, ep)
+            {
+                return Ok(Value::Null);
+            }
             let file = active_collection_file(h, &data);
             // The Studio off: its scenes from the saved file, so the show, BRB and the scene
             // switcher can still be set up (owner, 30 Oct: "it's not showing my screens").
@@ -9295,5 +9326,79 @@ mod collection_profile_tests {
         let names: Vec<String> = h.collection.as_ref().unwrap().scenes().into_iter().map(|s| s.name).collect();
         assert!(names.contains(&"SavedMain".to_string()), "expected SavedMain after reload, got {names:?}");
         assert!(!names.contains(&"SafeTemp".to_string()));
+    }
+
+    #[test]
+    fn col18_failed_collection_load_keeps_held_ptt_keys() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let bad_b = dir.path().join("collections").join("bad.json");
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", None, "A");
+        write_json_sync(&scenes_a, &doc_a);
+        let bad_doc = json!({
+            "ferrocast": { "program_copy": { "scene": "X", "items": [{ "name": "Main" }] } },
+            "sources": [{ "id": "color_source_v3", "name": "Main" }],
+            "scene_order": []
+        });
+        write_json_sync(&bad_b, &bad_doc);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap();
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let mic_kind = if cfg!(target_os = "macos") {
+            "coreaudio_input_capture"
+        } else if cfg!(windows) {
+            "wasapi_input_capture"
+        } else {
+            "pulse_input_capture"
+        };
+        col_a.add_source("MainA", mic_kind, "Mic", &json!({}), false).unwrap();
+        col_a.set_muted("Mic", false).unwrap();
+        let mut h = Held { settings: Some(StudioSettings::default()), collection: Some(col_a), ..Held::default() };
+
+        let mut pk = crate::studio_keys::PressedKeys::default();
+        assert!(pk.down("push_to_talk:Mic", "F8"));
+
+        let res = swap_collection_releasing(ViewCtx::Test, &mut h, dir.path(), Some("bad"), &scenes_a, &bad_b, || {
+            pk.release_on_switch()
+        });
+        assert!(res.is_err(), "corrupt target collection must fail to load");
+        assert!(pk.up("push_to_talk:Mic", "F8"), "failed load must not drain held keys or suppress key-up");
+        assert!(!h.collection.as_ref().unwrap().audio_of("Mic").unwrap().muted);
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn col19_stale_shortcut_acts_carry_epoch_for_main_thread_filtering() {
+        let pkey = StudioAct::PushKey { name: "Mic".into(), talk: true, down: true, epoch: Some(3) };
+        let pitem = StudioAct::PushItem { scene: "Main".into(), id: 1, visible: true, release: false, epoch: Some(4) };
+        let pflt = StudioAct::PushFilter {
+            name: "Cam".into(),
+            filter: "Blur".into(),
+            enabled: true,
+            release: false,
+            epoch: Some(5),
+        };
+        let paudio = StudioAct::SetAudio {
+            name: "Mic".into(),
+            change: ferrocast_engine::studio_host::AudioChange {
+                muted: Some(false),
+                by_shortcut: true,
+                shortcut_epoch: Some(6),
+                ..Default::default()
+            },
+        };
+        assert_eq!(act_shortcut_epoch(&pkey), Some(3));
+        assert_eq!(act_shortcut_epoch(&pitem), Some(4));
+        assert_eq!(act_shortcut_epoch(&pflt), Some(5));
+        assert_eq!(act_shortcut_epoch(&paudio), Some(6));
+        assert_eq!(act_shortcut_epoch(&StudioAct::Scenes), None);
     }
 }

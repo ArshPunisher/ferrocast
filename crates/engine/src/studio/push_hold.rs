@@ -181,24 +181,45 @@ fn gone(e: &EngineError) -> bool {
     ["no such", "has no", "no scene", "no source", "doesn't exist", "not found"].iter().any(|p| m.contains(p))
 }
 
+fn key_epoch_is_current(key_epoch: Option<(u64, &std::sync::atomic::AtomicU64)>) -> bool {
+    key_epoch.is_none_or(|(expected, current)| current.load(std::sync::atomic::Ordering::Acquire) == expected)
+}
+
 impl Engine {
     /// A push-to-show / hide / filter key went down (`pressed`) or came up. Down: the target is
     /// found by its names now, remembered with its state, and put in its held state. Up: put back.
     /// A name that isn't there (renamed, deleted) is a plain error on the way down and nothing
     /// on the way up.
     pub async fn studio_push_hold(&self, action: &str, pressed: bool) -> Result<(), EngineError> {
+        self.studio_push_hold_with_epoch(action, pressed, None).await
+    }
+
+    pub async fn studio_push_hold_with_epoch(
+        &self,
+        action: &str,
+        pressed: bool,
+        key_epoch: Option<(u64, &std::sync::atomic::AtomicU64)>,
+    ) -> Result<(), EngineError> {
+        if !key_epoch_is_current(key_epoch) {
+            return Ok(());
+        }
         let Some((kind, a, b)) = parse(action) else {
             return Err(EngineError::Invalid("action: a push-to-show, push-to-hide or push-to-filter key.".into()));
         };
+        let tag_epoch = key_epoch.map(|(e, _)| e);
         if !pressed {
             let back = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).release(action);
-            if let Some((target, was)) = back {
-                self.restore(target, was).await;
+            if let Some((target, was)) = back
+                && key_epoch_is_current(key_epoch)
+            {
+                self.restore_with_epoch(target, was, tag_epoch).await;
             }
             return Ok(());
         }
         self.retry_pending().await;
-        if self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).holding(action) {
+        if !key_epoch_is_current(key_epoch)
+            || self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).holding(action)
+        {
             return Ok(());
         }
         let epoch = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).epoch();
@@ -222,11 +243,18 @@ impl Engine {
                 (Target::Filter { source: a.to_string(), filter: b.to_string() }, on)
             }
         };
+        if !key_epoch_is_current(key_epoch) {
+            return Ok(());
+        }
         let first =
             self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).press_at(epoch, action, target.clone(), now);
-        if first && let Err(e) = self.apply_hold(&target, kind.held_state(), false).await {
+        if first && key_epoch_is_current(key_epoch) {
+            if let Err(e) = self.apply_hold(&target, kind.held_state(), false, tag_epoch).await {
+                self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).forget(action);
+                return Err(e);
+            }
+        } else if first {
             self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).forget(action);
-            return Err(e);
         }
         Ok(())
     }
@@ -236,7 +264,7 @@ impl Engine {
     pub async fn studio_release_holds(&self) {
         let back = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).release_all();
         for (target, was) in back {
-            self.restore(target, was).await;
+            self.restore_with_epoch(target, was, None).await;
         }
         self.retry_pending().await;
     }
@@ -244,8 +272,8 @@ impl Engine {
     /// Puts a target back. A target that is gone (deleted, renamed, another collection) is
     /// nothing to put back; a failure that may pass (the Studio was busy) is kept and tried
     /// again, now and a few times in the next seconds.
-    async fn restore(&self, target: Target, was: bool) {
-        let Err(e) = self.apply_hold(&target, was, true).await else { return };
+    async fn restore_with_epoch(&self, target: Target, was: bool, epoch: Option<u64>) {
+        let Err(e) = self.apply_hold(&target, was, true, epoch).await else { return };
         if gone(&e) {
             tracing::debug!(error = %e, "a held item or filter is gone: nothing to put back");
             return;
@@ -267,7 +295,7 @@ impl Engine {
     async fn retry_pending(&self) {
         let todo = self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).take_pending();
         for (target, was) in todo {
-            match self.apply_hold(&target, was, true).await {
+            match self.apply_hold(&target, was, true, None).await {
                 Ok(()) => {}
                 Err(e) if gone(&e) => {}
                 Err(_) => self.studio().holds.lock().unwrap_or_else(|p| p.into_inner()).keep_pending(target, was),
@@ -275,11 +303,19 @@ impl Engine {
         }
     }
 
-    async fn apply_hold(&self, target: &Target, on: bool, release: bool) -> Result<(), EngineError> {
+    async fn apply_hold(
+        &self,
+        target: &Target,
+        on: bool,
+        release: bool,
+        epoch: Option<u64>,
+    ) -> Result<(), EngineError> {
         let act = match target {
-            Target::Item { scene, id } => StudioAct::PushItem { scene: scene.clone(), id: *id, visible: on, release },
+            Target::Item { scene, id } => {
+                StudioAct::PushItem { scene: scene.clone(), id: *id, visible: on, release, epoch }
+            }
             Target::Filter { source, filter } => {
-                StudioAct::PushFilter { name: source.clone(), filter: filter.clone(), enabled: on, release }
+                StudioAct::PushFilter { name: source.clone(), filter: filter.clone(), enabled: on, release, epoch }
             }
         };
         // Straight to the host: this runs inside the release that Undo and collection switches
@@ -577,16 +613,34 @@ mod tests {
 
     #[test]
     fn a_hold_is_never_saved_and_never_an_undo_step() {
-        assert!(!StudioAct::PushItem { scene: "Main".into(), id: 1, visible: true, release: false }.changes());
         assert!(
-            !StudioAct::PushFilter { name: "Cam".into(), filter: "Blur".into(), enabled: true, release: false }
-                .changes()
+            !StudioAct::PushItem { scene: "Main".into(), id: 1, visible: true, release: false, epoch: None }.changes()
         );
-        assert!(StudioAct::PushItem { scene: "".into(), id: 1, visible: true, release: false }.check().is_err());
         assert!(
-            StudioAct::PushFilter { name: "Cam".into(), filter: "x\ny".into(), enabled: true, release: false }
+            !StudioAct::PushFilter {
+                name: "Cam".into(),
+                filter: "Blur".into(),
+                enabled: true,
+                release: false,
+                epoch: None,
+            }
+            .changes()
+        );
+        assert!(
+            StudioAct::PushItem { scene: "".into(), id: 1, visible: true, release: false, epoch: None }
                 .check()
                 .is_err()
+        );
+        assert!(
+            StudioAct::PushFilter {
+                name: "Cam".into(),
+                filter: "x\ny".into(),
+                enabled: true,
+                release: false,
+                epoch: None,
+            }
+            .check()
+            .is_err()
         );
     }
 
