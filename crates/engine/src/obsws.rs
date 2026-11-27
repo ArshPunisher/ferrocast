@@ -69,7 +69,6 @@ const MAX_BATCH: usize = 100;
 // Event subscription bits (EventSubscription).
 #[allow(dead_code)]
 const SUB_GENERAL: u64 = 1 << 0;
-#[allow(dead_code)]
 const SUB_CONFIG: u64 = 1 << 1;
 const SUB_SCENES: u64 = 1 << 2;
 const SUB_INPUTS: u64 = 1 << 3;
@@ -201,6 +200,12 @@ impl Default for Runtime {
             pending: Arc::new(Semaphore::new(MAX_PENDING)),
             poller: std::sync::Mutex::new(None),
         }
+    }
+}
+
+impl Engine {
+    pub(crate) fn notify_obsws_poll(&self) {
+        self.inner.obsws.poll_now.notify_one();
     }
 }
 
@@ -1272,17 +1277,7 @@ impl Engine {
         match kind {
             "GetSceneCollectionList" | "GetProfileList" => {
                 let v = self.studio_shelf(shelf_kind, ShelfAct::List).await.map_err(obs_error)?;
-                let current_id = v["current"].as_str().unwrap_or_default();
-                let mut current_name = current_id.to_string();
-                let mut names = Vec::new();
-                for entry in v["list"].as_array().into_iter().flatten() {
-                    if let Some(name) = entry["name"].as_str() {
-                        if entry["id"].as_str() == Some(current_id) {
-                            current_name = name.to_string();
-                        }
-                        names.push(name.to_string());
-                    }
-                }
+                let (current_name, names) = shelf_summary(&v);
                 if shelf_kind == "collections" {
                     Ok(json!({ "currentSceneCollectionName": current_name, "sceneCollections": names }))
                 } else {
@@ -2295,12 +2290,24 @@ impl Engine {
         }
     }
 
+    async fn ows_shelf_state(&self, raw: Option<&Value>, kind: &str) -> (String, Vec<String>) {
+        if let Some(v) = raw.filter(|v| v.is_object()) {
+            return shelf_summary(v);
+        }
+        match self.studio_shelf(kind, ShelfAct::List).await {
+            Ok(v) => shelf_summary(&v),
+            Err(_) => (String::new(), Vec::new()),
+        }
+    }
+
     async fn ows_snap(&self) -> Option<Snap> {
         let host = self.studio_host().ok()?;
         if let Some(res) = host.obsws_snapshot().await {
             let raw = res.ok()?;
             let program = raw["program"].as_str().unwrap_or_default().to_string();
             let preview = raw["preview"].as_str().map(String::from);
+            let (collection, collections) = self.ows_shelf_state(raw.get("collections"), "collections").await;
+            let (profile, profiles) = self.ows_shelf_state(raw.get("profiles"), "profiles").await;
             let mut snap = Snap {
                 program,
                 studio_mode: preview.is_some(),
@@ -2311,6 +2318,10 @@ impl Engine {
                     .flatten()
                     .filter_map(|s| s.as_str().map(String::from))
                     .collect(),
+                collection,
+                collections,
+                profile,
+                profiles,
                 transition: (
                     raw["transition"]["kind"].as_str().unwrap_or_default().to_string(),
                     raw["transition"]["ms"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0),
@@ -2350,6 +2361,8 @@ impl Engine {
         }
         let scenes = self.studio_act(StudioAct::Scenes).await.ok()?;
         let stats = self.studio_stats().await.ok()?;
+        let (collection, collections) = self.ows_shelf_state(None, "collections").await;
+        let (profile, profiles) = self.ows_shelf_state(None, "profiles").await;
         let program = scenes["current"].as_str().unwrap_or_default().to_string();
         let preview = scenes["preview"].as_str().map(String::from);
         let mut snap = Snap {
@@ -2362,6 +2375,10 @@ impl Engine {
                 .flatten()
                 .filter_map(|s| s["name"].as_str().map(String::from))
                 .collect(),
+            collection,
+            collections,
+            profile,
+            profiles,
             transition: transition_parts(&scenes),
             stream: stats["stream"]["active"].as_bool().unwrap_or(false),
             record: stats["record"]["active"].as_bool().unwrap_or(false),
@@ -2459,12 +2476,31 @@ fn ows_mutates(kind: &str) -> bool {
     )
 }
 
+fn shelf_summary(v: &Value) -> (String, Vec<String>) {
+    let current_id = v["current"].as_str().unwrap_or_default();
+    let mut current_name = current_id.to_string();
+    let mut names = Vec::new();
+    for entry in v["list"].as_array().into_iter().flatten() {
+        if let Some(name) = entry["name"].as_str() {
+            if entry["id"].as_str() == Some(current_id) {
+                current_name = name.to_string();
+            }
+            names.push(name.to_string());
+        }
+    }
+    (current_name, names)
+}
+
 /// What the Studio looked like at one look.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct Snap {
     program: String,
     preview: Option<String>,
     scenes: Vec<String>,
+    collection: String,
+    collections: Vec<String>,
+    profile: String,
+    profiles: Vec<String>,
     transition: (String, u32),
     studio_mode: bool,
     stream: bool,
@@ -2618,6 +2654,18 @@ fn diff(was: &Snap, is: &Snap) -> Vec<(u64, String)> {
     }
     if was.vcam != is.vcam {
         out.push(output_event("VirtualcamStateChanged", is.vcam, json!({})));
+    }
+    if !was.collections.is_empty() && !is.collections.is_empty() && was.collections != is.collections {
+        out.push(event(SUB_CONFIG, "SceneCollectionListChanged", json!({ "sceneCollections": is.collections })));
+    }
+    if !was.collection.is_empty() && !is.collection.is_empty() && was.collection != is.collection {
+        out.push(event(SUB_CONFIG, "CurrentSceneCollectionChanged", json!({ "sceneCollectionName": is.collection })));
+    }
+    if !was.profiles.is_empty() && !is.profiles.is_empty() && was.profiles != is.profiles {
+        out.push(event(SUB_CONFIG, "ProfileListChanged", json!({ "profiles": is.profiles })));
+    }
+    if !was.profile.is_empty() && !is.profile.is_empty() && was.profile != is.profile {
+        out.push(event(SUB_CONFIG, "CurrentProfileChanged", json!({ "profileName": is.profile })));
     }
     out
 }
@@ -4345,5 +4393,34 @@ mod tests {
             true
         );
         assert_eq!(fake.with(|s| (s.splits, s.chapters.clone())), (1, vec!["Boss Fight".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn col14_scene_collection_and_profile_events_emitted() {
+        let (e, _fake, port, pw, _dir) = on().await;
+        let mut c = Client::open(port).await.unwrap();
+        let ident = c.identify(&pw, Some(SUB_ALL)).await;
+        assert_eq!(ident["op"], 2);
+        // Ensure `ows_poll_loop` has recorded its initial baseline snapshot before shelf mutations.
+        c.req("SetStudioModeEnabled", json!({ "studioModeEnabled": true })).await;
+        assert_eq!(c.event("StudioModeStateChanged").await["studioModeEnabled"], true);
+
+        c.req("CreateSceneCollection", json!({ "sceneCollectionName": "Podcast" })).await;
+        assert_eq!(c.event("SceneCollectionListChanged").await["sceneCollections"], json!(["Main", "IRL", "Podcast"]));
+        assert_eq!(c.event("CurrentSceneCollectionChanged").await["sceneCollectionName"], "Podcast");
+
+        // Switching collections even when the active scene name stays identical must still emit.
+        c.req("SetCurrentSceneCollection", json!({ "sceneCollectionName": "IRL" })).await;
+        assert_eq!(c.event("CurrentSceneCollectionChanged").await["sceneCollectionName"], "IRL");
+
+        c.req("SetCurrentProfile", json!({ "profileName": "720p30" })).await;
+        assert_eq!(c.event("CurrentProfileChanged").await["profileName"], "720p30");
+
+        // External shelf change (not initiated by obsws) also wakes poll_now and emits events.
+        e.studio_shelf("collections", ShelfAct::New { name: "External".into(), copy: false }).await.unwrap();
+        assert_eq!(c.event("CurrentSceneCollectionChanged").await["sceneCollectionName"], "External");
+        e.studio_shelf("profiles", ShelfAct::New { name: "ExternalProf".into(), copy: false }).await.unwrap();
+        assert_eq!(c.event("ProfileListChanged").await["profiles"], json!(["1080p60", "720p30", "ExternalProf"]));
+        assert_eq!(c.event("CurrentProfileChanged").await["profileName"], "ExternalProf");
     }
 }

@@ -2711,7 +2711,9 @@ impl Engine {
             let (load_collection, allow_auto_start, enabled_normal) = self.apply_start_options(&opts)?;
             let status = if load_collection {
                 self.studio_release_holds().await;
-                host.confirm_collection().await.map_err(failed)?
+                let s = host.confirm_collection().await.map_err(failed)?;
+                self.notify_obsws_poll();
+                s
             } else {
                 host.status().await
             };
@@ -3743,6 +3745,7 @@ impl Engine {
                 self.send_golive_pub();
             }
         }
+        self.notify_obsws_poll();
     }
 
     /// Scene collections or profiles: one act on that list. Falls back to file-backed storage on
@@ -3792,10 +3795,13 @@ impl Engine {
                 let saved = host.settings().await;
                 self.finish_profile_settings_sync(&saved, None).await;
             }
+            self.notify_obsws_poll();
         } else {
             drop(_auto_op);
             if kind == "collections" && mutating {
                 self.finish_collection_switch(switched_shelf, host.is_some()).await;
+            } else if mutating {
+                self.notify_obsws_poll();
             }
         }
         Ok(out)
