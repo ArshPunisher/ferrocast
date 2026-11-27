@@ -788,11 +788,34 @@ fn rebuild_views(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, prev_pr
     let _ = (data, prev_projectors);
 }
 
-/// Reopens the engine for `canvas` (or the current audio/NTSC format) after releasing all old
-/// views and projectors, then rebuilds every cached view and open projector on the new engine.
-fn apply_canvas(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, canvas: Canvas) -> Result<(), String> {
+fn finish_canvas_views(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    data: &std::path::Path,
+    prev_projectors: Vec<ProjectorReq>,
+    reopen_engine: bool,
+) {
+    rebuild_views(ctx, h, data, prev_projectors);
+    if let Some(c) = &h.collection
+        && reopen_engine
+        && !c.has_engine()
+        && let Err(e) = c.engine_ref()
+    {
+        tracing::warn!(error = %e, "the engine didn't reopen after a canvas change");
+    }
+    sync_views(h);
+}
+
+fn try_apply_canvas(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    data: &std::path::Path,
+    canvas: Canvas,
+) -> Result<(), (String, Vec<ProjectorReq>, bool)> {
     let (old_canvas, had_engine) = {
-        let c = h.collection.as_ref().ok_or(STOPPED)?;
+        let Some(c) = h.collection.as_ref() else {
+            return Err((STOPPED.into(), Vec::new(), false));
+        };
         (c.canvas(), c.has_engine())
     };
     drop_inactive_outputs(h);
@@ -803,31 +826,33 @@ fn apply_canvas(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, canvas: 
     // They send the old engine's picture: stopped (turned on again by hand).
     h.ndi = None;
     h.virtualcam = None;
-    let changed = h.collection.as_mut().ok_or(STOPPED)?.set_canvas(canvas);
-    if changed.is_ok()
-        && (u64::from(old_canvas.width) * u64::from(canvas.height)
-            != u64::from(canvas.width) * u64::from(old_canvas.height))
+    let changed = match h.collection.as_mut() {
+        Some(c) => c.set_canvas(canvas),
+        None => return Err((STOPPED.into(), prev_projectors, had_engine)),
+    };
+    if let Err(e) = changed {
+        return Err((e.to_string(), prev_projectors, had_engine));
+    }
+    if u64::from(old_canvas.width) * u64::from(canvas.height) != u64::from(canvas.width) * u64::from(old_canvas.height)
     {
         // A different aspect ratio invalidates the cached preview canvas rect until the UI resizes.
         h.preview_canvas = None;
     }
-    rebuild_views(ctx, h, data, prev_projectors);
-    if let Some(c) = &h.collection
-        && had_engine
-        && !c.has_engine()
-        && let Err(e) = c.engine_ref()
-    {
-        tracing::warn!(error = %e, "the engine didn't reopen after a canvas change");
-    }
-    sync_views(h);
-    changed.map_err(|e| e.to_string())
+    finish_canvas_views(ctx, h, data, prev_projectors, had_engine);
+    Ok(())
 }
 
-/// A frame rate changed while live waited for the stream to end: the canvas takes it once
-/// nothing that draws from it runs (called when a stream, recording or replay buffer stops, and
-/// before a stream starts). The virtual camera and NDI would be stopped by it, so while one is
-/// on it waits longer (the next stream still goes out at the chosen rate, see `stream_start`).
-fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held, data: &std::path::Path) {
+/// Reopens the engine for `canvas` (or the current audio/NTSC format) after releasing all old
+/// views and projectors, then rebuilds every cached view and open projector on the new engine.
+fn apply_canvas(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, canvas: Canvas) -> Result<(), String> {
+    if let Err((e, prev_projectors, had_engine)) = try_apply_canvas(ctx, h, data, canvas) {
+        finish_canvas_views(ctx, h, data, prev_projectors, had_engine);
+        return Err(e);
+    }
+    Ok(())
+}
+
+fn apply_waiting_canvas_ctx(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path) {
     let Some(s) = h.settings.clone() else { return };
     let want = Canvas { width: s.width, height: s.height, fps: s.fps };
     if h.collection.as_ref().is_none_or(|c| c.canvas() == want) {
@@ -836,9 +861,26 @@ fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held, data: &std::path::
     if outputs_busy_for_switch(h) {
         return;
     }
-    if let Err(e) = apply_canvas(ViewCtx::App(app), h, data, want) {
+    if let Err(e) = apply_canvas(ctx, h, data, want) {
         tracing::warn!(error = %e, "the frame rate chosen while live couldn't be applied after the stream");
     }
+}
+
+/// A frame rate changed while live waited for the stream to end: the canvas takes it once
+/// nothing that draws from it runs (called when a stream, recording or replay buffer stops, and
+/// before a stream starts). The virtual camera and NDI would be stopped by it, so while one is
+/// on it waits longer (the next stream still goes out at the chosen rate, see `stream_start`).
+fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held, data: &std::path::Path) {
+    apply_waiting_canvas_ctx(ViewCtx::App(app), h, data);
+}
+
+fn stop_source_record(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, name: &str) -> Value {
+    // Dropping it waits for the file to be finished.
+    if let Some(i) = h.source_records.iter().position(|(n, _, _)| n == name) {
+        h.source_records.remove(i);
+    }
+    apply_waiting_canvas_ctx(ctx, h, data);
+    json!({ "file": null })
 }
 
 /// A Studio task the window's thread hasn't started in this long is given up on (the caller is
@@ -2586,6 +2628,10 @@ fn make_program_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.program_at else { return Ok(()) };
     // What's on air, drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
     let c = h.collection.as_ref().ok_or(STOPPED)?;
+    if c.preview_scene().is_none() {
+        h.program_view = None;
+        return Ok(());
+    }
     let p = create_stage_view(ctx, c, rect, scale, false)?;
     // Made again (a new canvas size): the stage keeps the page's colour.
     if let Some(c) = h.program_bg {
@@ -3153,9 +3199,10 @@ fn apply_settings_for_profile(
                     "The new size and frame rate apply once streaming, recording, replay, NDI and the virtual camera are off."
                         .into(),
                 );
-            } else if let Err(e) = apply_canvas(ctx, h, data, canvas) {
+            } else if let Err((e, prev_projectors, had_engine)) = try_apply_canvas(ctx, h, data, canvas) {
                 h.settings = prev_settings.clone();
                 apply_audio_format(prev_settings.as_ref().unwrap_or(&StudioSettings::default()));
+                finish_canvas_views(ctx, h, data, prev_projectors, had_engine);
                 return Err(e);
             }
         } else if rate_only && canvas.fps > now.fps {
@@ -4298,14 +4345,12 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn record_source(&self, name: String, on: bool) -> Result<Value, String> {
+        let app = self.app.clone();
+        let data = self.data.clone();
         self.on_main(move |h| {
             let at = h.source_records.iter().position(|(n, _, _)| *n == name);
             if !on {
-                // Dropping it waits for the file to be finished.
-                if let Some(i) = at {
-                    h.source_records.remove(i);
-                }
-                return Ok(json!({ "file": null }));
+                return Ok(stop_source_record(ViewCtx::App(&app), h, &data, &name));
             }
             if let Some(i) = at {
                 if h.source_records[i].1.stats().active {
@@ -9010,5 +9055,189 @@ mod collection_profile_tests {
         assert!(reply["note"].as_str().is_some_and(|n| n.contains("Heads up.") && n.contains("Ctrl+Shift+X")));
 
         ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn col14_failed_profile_apply_restores_projectors_with_previous_settings() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let initial = StudioSettings {
+            width: 1280,
+            height: 720,
+            fps: 30,
+            multiview_layout: "top".into(),
+            multiview_labels: true,
+            multiview_safe_areas: false,
+            projector_on_top: false,
+            projector_hide_cursor: false,
+            projector_restore: false,
+            ..StudioSettings::default()
+        };
+        let canvas = Canvas { width: initial.width, height: initial.height, fps: initial.fps };
+        let doc = make_collection_doc(canvas, "MainA", "PreviewA", Some("VertA"), "SharedColor");
+        let col = Collection::load(canvas, &doc, FIRST_SCENE).unwrap_or_else(|e| panic!("load: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col.engine_ref().is_err() {
+            return;
+        }
+        let prof_a = library::file(dir.path(), Kind::Profiles, "pa");
+        let prof_bad = library::file(dir.path(), Kind::Profiles, "pbad");
+        let mut h = Held {
+            settings: Some(initial.clone()),
+            collection: Some(col),
+            profile_id: Some("pa".into()),
+            profile_file: Some(prof_a.clone()),
+            ..Held::default()
+        };
+        populate_cached_views(&mut h, dir.path(), false);
+
+        // 1. Invalid canvas (width: 0) in incoming profile must roll back before views/projectors rebuild.
+        let s_invalid = StudioSettings {
+            width: 0,
+            height: 1080,
+            fps: 60,
+            multiview_layout: "left".into(),
+            multiview_labels: false,
+            multiview_safe_areas: true,
+            projector_on_top: true,
+            projector_hide_cursor: true,
+            projector_restore: true,
+            ..initial.clone()
+        };
+        assert!(
+            apply_settings_for_profile(ViewCtx::Test, &mut h, dir.path(), s_invalid, Some(("pbad".into(), prof_bad)))
+                .is_err()
+        );
+        assert_eq!(h.settings.as_ref(), Some(&initial));
+        assert_eq!(h.profile_id.as_deref(), Some("pa"));
+        assert!(
+            !projectors_file(dir.path()).exists(),
+            "rolled back projector_restore=false must not write projectors.json"
+        );
+        assert!(h.preview.is_some());
+        assert!(h.program_view.is_some());
+        assert!(h.vertical.view.is_some());
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(h.projectors.len(), 3);
+            for (_, p, req) in &h.projectors {
+                let tp = p.test_proj().expect("test projector");
+                assert_eq!(tp.on_top.get(), req.on_top, "on_top must reflect rolled back settings for {}", req.what);
+                assert!(!tp.hide_cursor.get(), "hide_cursor must roll back for {}", req.what);
+                if req.what == "multiview" {
+                    assert!(matches!(tp.look.borrow().layout, ferrocast_studio::MultiviewLayout::Top));
+                    assert!(tp.look.borrow().labels);
+                    assert!(!tp.look.borrow().safe_areas);
+                }
+            }
+        }
+
+        // 2. Pinned engine failure must also rebuild projectors using rolled back settings.
+        let pin = h.collection.as_ref().expect("col").engine_ref().expect("pin");
+        let prof_pin = library::file(dir.path(), Kind::Profiles, "ppin");
+        let s_pinned = StudioSettings {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            multiview_layout: "right".into(),
+            projector_on_top: true,
+            projector_hide_cursor: true,
+            ..initial.clone()
+        };
+        assert!(
+            apply_settings_for_profile(ViewCtx::Test, &mut h, dir.path(), s_pinned, Some(("ppin".into(), prof_pin)))
+                .is_err()
+        );
+        assert_eq!(h.settings.as_ref(), Some(&initial));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(h.projectors.len(), 3);
+            for (_, p, req) in &h.projectors {
+                let tp = p.test_proj().expect("test projector");
+                assert_eq!(tp.on_top.get(), req.on_top);
+                assert!(!tp.hide_cursor.get());
+                if req.what == "multiview" {
+                    assert!(matches!(tp.look.borrow().layout, ferrocast_studio::MultiviewLayout::Top));
+                }
+            }
+        }
+        drop(pin);
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn col15_swap_studio_mode_on_to_off_clears_program_view() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_b = dir.path().join("collections").join("b.json");
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", None, "SharedColor");
+        let col_b_builder = Collection::new(canvas, "MainB").unwrap_or_else(|e| panic!("{e}"));
+        col_b_builder.set_studio_mode(false);
+        let doc_b = col_b_builder.save(COLLECTION);
+        write_json_sync(&scenes_a, &doc_a);
+        write_json_sync(&scenes_b, &doc_b);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap_or_else(|e| panic!("load A: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held { settings: Some(StudioSettings::default()), collection: Some(col_a), ..Held::default() };
+        populate_cached_views(&mut h, dir.path(), false);
+        assert!(h.program_view.is_some(), "Studio Mode ON collection opens program_view");
+        let saved_program_at = h.program_at;
+        assert!(saved_program_at.is_some());
+
+        // Switching to a collection with Studio Mode OFF must drop program_view while preserving program_at.
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_a, &scenes_b)
+            .unwrap_or_else(|e| panic!("swap A->B: {e}"));
+        assert_eq!(h.collection.as_ref().and_then(Collection::preview_scene), None);
+        assert!(h.program_view.is_none(), "Studio Mode OFF collection must not keep an orphaned program_view");
+        assert_eq!(
+            h.program_at.map(|(r, s)| ((r.x, r.y, r.w, r.h, r.vh), s)),
+            saved_program_at.map(|(r, s)| ((r.x, r.y, r.w, r.h, r.vh), s))
+        );
+
+        // Switching back to a Studio Mode ON collection rebuilds program_view at the preserved rect.
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_b, &scenes_a)
+            .unwrap_or_else(|e| panic!("swap B->A: {e}"));
+        assert!(h.program_view.is_some(), "switching back to Studio Mode ON collection rebuilds program_view");
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn col16_stop_source_record_applies_waiting_canvas() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let initial = Canvas { width: 1280, height: 720, fps: 30 };
+        let doc = make_collection_doc(initial, "MainA", "PreviewA", None, "SharedColor");
+        let col = Collection::load(initial, &doc, FIRST_SCENE).unwrap_or_else(|e| panic!("load: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col.engine_ref().is_err() {
+            return;
+        }
+        let target = Canvas { width: 1920, height: 1080, fps: 60 };
+        let mut h = Held {
+            settings: Some(StudioSettings {
+                width: target.width,
+                height: target.height,
+                fps: target.fps,
+                ..StudioSettings::default()
+            }),
+            collection: Some(col),
+            ..Held::default()
+        };
+        let _ = stop_source_record(ViewCtx::Test, &mut h, dir.path(), "SharedColor");
+        assert_eq!(h.collection.as_ref().map(Collection::canvas), Some(target));
     }
 }
