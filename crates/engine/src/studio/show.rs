@@ -1470,21 +1470,37 @@ impl Engine {
         }
     }
 
-    async fn stop_stream_step_locked(&self) -> Step {
+    async fn stop_stream_step_locked(&self, group_ops: &tokio::sync::MutexGuard<'_, ()>) -> Step {
         let rig = match self.rig().await {
             Ok(r) => r,
             Err(e) => return Step::new("stop_stream", "Stop streaming", "failed", e.to_string()),
         };
-        match self.rig_set_streaming_locked(&rig, false).await {
+        match self.rig_set_streaming_locked(group_ops, &rig, false).await {
             Ok(()) => Step::new("stop_stream", "Stop streaming", "done", format!("{} stopped streaming.", rig.title())),
             Err(e) => Step::new("stop_stream", "Stop streaming", "failed", e.to_string()),
         }
     }
 
-    /// The delayed Stop Streaming of an ended show. Serialized with `output_lock` and guarded
-    /// by BOTH `show_gen`, `stream_gen`, and a still-waiting `stop_stream` step, so it never
-    /// fires after "stop now", a new Show, or a plain stream started without a Show.
+    /// The delayed Stop Streaming of an ended show. Serialized with `group_ops -> output_lock`
+    /// and guarded by BOTH `show_gen`, `stream_gen`, and a still-waiting `stop_stream` step, so
+    /// it never fires after "stop now", a new Show, or a plain stream started without a Show.
     async fn stop_stream_later(&self, show_gen: u64, stream_gen: u64, show_id: &str) {
+        let maybe_ours = {
+            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            let waiting = |r: &ShowRun| {
+                r.id == show_id
+                    && r.phase == Phase::Ended
+                    && r.steps.iter().any(|s| s.id == "stop_stream" && s.status == "waiting")
+            };
+            m.epoch == show_gen && m.stream_epoch == stream_gen && m.stop_waiting && m.run.as_ref().is_some_and(waiting)
+        };
+        if !maybe_ours {
+            return;
+        }
+        if matches!(self.rig().await, Ok(crate::studio::rig::Rig::Studio)) {
+            self.cancel_golive_switches();
+        }
+        let group_ops = self.golive().group_ops.lock().await;
         let _out = self.studio().output_lock.lock().await;
         let still_ours = {
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
@@ -1506,7 +1522,7 @@ impl Engine {
         if !still_ours {
             return;
         }
-        let step = self.stop_stream_step_locked().await;
+        let step = self.stop_stream_step_locked(&group_ops).await;
         let emit = {
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
             if m.epoch == show_gen && m.phase == BroadcastPhase::Ending {

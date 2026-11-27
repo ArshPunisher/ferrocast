@@ -344,12 +344,21 @@ impl Engine {
     }
 
     pub(crate) async fn rig_set_streaming(&self, rig: &Rig, on: bool) -> Result<(), EngineError> {
+        if !on && matches!(rig, Rig::Studio) {
+            self.cancel_golive_switches();
+        }
+        let group_ops = self.golive().group_ops.lock().await;
         let _out = self.studio().output_lock.lock().await;
-        self.rig_set_streaming_locked(rig, on).await
+        self.rig_set_streaming_locked(&group_ops, rig, on).await
     }
 
-    /// Runs Start/Stop Streaming on `rig` while the caller already holds `studio().output_lock`.
-    pub(crate) async fn rig_set_streaming_locked(&self, rig: &Rig, on: bool) -> Result<(), EngineError> {
+    /// Runs Start/Stop Streaming on `rig` while the caller already holds `golive().group_ops` and `studio().output_lock`.
+    pub(crate) async fn rig_set_streaming_locked(
+        &self,
+        group_ops: &tokio::sync::MutexGuard<'_, ()>,
+        rig: &Rig,
+        on: bool,
+    ) -> Result<(), EngineError> {
         match rig {
             Rig::Obs(c) if on => {
                 let _gate = self.studio().output_gate.lock().await;
@@ -359,7 +368,7 @@ impl Engine {
                 Ok(())
             }
             Rig::Obs(c) => ferrocast_obs::control::stop_stream(c).await.map_err(obs_error),
-            Rig::Studio => self.studio_stream_locked(on).await.map(drop),
+            Rig::Studio => self.studio_stream_locked(group_ops, on).await.map(drop),
         }
     }
 

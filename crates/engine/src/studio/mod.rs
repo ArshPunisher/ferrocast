@@ -89,10 +89,11 @@ pub(crate) struct Studio {
     /// Single locked state machine for the Show, countdown, and delayed stream stop.
     pub machine: Mutex<show::BroadcastMachine>,
     ///
-    /// Lock order, wherever more than one is taken: `auto_config_op`, then `output_lock`, then
-    /// `output_gate` (innermost). Nothing waits for an outer lock while holding an inner one,
-    /// and a start that a running start would only queue behind is refused from the
-    /// `machine` state first (`Engine::refuse_if_show_busy`), before any of the three is awaited.
+    /// Lock order, wherever more than one is taken: `auto_config_op`, then `golive().group_ops`,
+    /// then `output_lock`, then `output_gate` (innermost), and `group_ops` before `config_lock`.
+    /// Nothing waits for an outer lock while holding an inner one, and a start that a running
+    /// start would only queue behind is refused from the `machine` state first
+    /// (`Engine::refuse_if_show_busy`), before any of the locks is awaited.
     /// Serializes stream start/stop, delayed stop, and Studio stop so no click order races.
     pub output_lock: tokio::sync::Mutex<()>,
     /// Mutual exclusion gate between starting any output and claiming a benchmark run (C2).

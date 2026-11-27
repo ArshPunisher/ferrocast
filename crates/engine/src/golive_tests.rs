@@ -293,7 +293,10 @@ async fn adding_or_removing_a_destination_while_live_never_reshapes_the_encoder(
     push_main(&e, 20_000);
     let _keep = keep_streaming(e.golive().main_hub(), 20_000, 4_000);
     e.set_studio_live(true);
-    e.sync_stream_cap().await;
+    {
+        let group_ops = e.golive().group_ops.lock().await;
+        e.sync_stream_cap_locked(&group_ops).await;
+    }
     let before = studio.caps.lock().unwrap().len();
     // Kick (8,000 kbps limit) fits the 1,600 kbps stream: it joins without touching the encoder.
     e.set_golive_destinations(order(&e, &["youtube", "kick"])).await.unwrap();
@@ -1832,7 +1835,10 @@ async fn a_destination_that_cannot_start_sets_no_limit() {
     // Runtime block (e.g. token revoked at Go Live): the stream is YouTube's alone.
     e.golive().blocked.lock().unwrap().insert("twitch".into(), "Twitch needs sign-in.".into());
     assert_eq!(e.studio_limit(), None);
-    e.sync_stream_cap().await;
+    {
+        let group_ops = e.golive().group_ops.lock().await;
+        e.sync_stream_cap_locked(&group_ops).await;
+    }
     assert_eq!(studio.caps.lock().unwrap().last().copied().flatten(), None, "lifted for the stream on air");
     // Unblocked: the limit is back.
     e.golive().blocked.lock().unwrap().clear();
@@ -2142,7 +2148,10 @@ async fn a_cap_that_could_not_be_applied_is_not_claimed_and_hides_nothing() {
     assert_eq!(twitch(&v).issues[0].code, ferrocast_golive::probe::RuleCode::Bitrate);
     // Applied again (the recording stopped): held, as before.
     *studio.cap_refused.lock().unwrap() = None;
-    e.sync_stream_cap().await;
+    {
+        let group_ops = e.golive().group_ops.lock().await;
+        e.sync_stream_cap_locked(&group_ops).await;
+    }
     let v = e.golive_view().await;
     assert!(twitch(&v).capped.is_some() && twitch(&v).issues.is_empty());
     feed.abort();
@@ -3821,7 +3830,7 @@ async fn f5_delay_switch_wakes_on_encoded_idr_and_clears_route_light() {
 
     // Place destination on route_light -> reconcile onto GROUP_LIGHT.
     e.mark_route_light_for_test(&d.id);
-    e.reconcile_midstream().await;
+    e.reconcile().await;
     assert_eq!(e.golive_running_group(&d.id).as_deref(), Some(GROUP_LIGHT));
 
     // Switch quality under delay (target Hub deferred `live.on = false`, emits only `note_encoded_idr`):
@@ -3842,7 +3851,7 @@ async fn f5_delay_switch_wakes_on_encoded_idr_and_clears_route_light() {
         .expect("live switch under delay must succeed");
     assert_eq!(e.golive_running_group(&d.id).as_deref(), Some(gid_6m.as_str()));
 
-    e.reconcile_midstream().await;
+    e.reconcile().await;
     assert_eq!(
         e.golive_running_group(&d.id).as_deref(),
         Some(gid_6m.as_str()),
@@ -5382,7 +5391,9 @@ async fn r_f4b_concurrent_switches_preserve_shared_group_on_single_cancel_and_cl
     let notify = Arc::new(tokio::sync::Notify::new());
     host.idr_gate.lock().unwrap().insert(target_gid.clone(), notify.clone());
 
-    // Spawn A and B switching to the same `target_gid`, then cancel A mid-wait.
+    // Spawn A and B switching to `target_gid`, then cancel A mid-wait via untick.
+    // With `group_ops` serializing lifecycle operations, unticking A cancels A's pending switch token
+    // immediately before waiting on `group_ops`; B then finishes cleanly on `target_gid`.
     let (ea, eb) = (e.clone(), e.clone());
     let (ida, idb, qa, qb) = (a.id.clone(), b.id.clone(), q720.clone(), q720.clone());
     let task_a = tokio::spawn(async move { ea.set_golive_quality(&ida, DestinationQuality::Custom(qa)).await });
@@ -5392,6 +5403,7 @@ async fn r_f4b_concurrent_switches_preserve_shared_group_on_single_cancel_and_cl
         }
         tokio::task::yield_now().await;
     }
+    host.idr_gate.lock().unwrap().remove(&target_gid);
     let task_b = tokio::spawn(async move { eb.set_golive_quality(&idb, DestinationQuality::Custom(qb)).await });
     for _ in 0..20 {
         tokio::task::yield_now().await;
@@ -6946,9 +6958,10 @@ async fn shared_switch_group_cleans_up_after_commit_untick_sibling_fail_and_task
         }
     }
 
-    // 1. Commit-then-untick + sibling failure leak:
-    //    A and YouTube both switch to shared `q720` (G). YouTube blocks in `resolve()` while A commits,
-    //    then A is unticked, then YouTube fails `resolve()`: G must be stopped and removed!
+    // 1. Serialized switch failure + sibling commit + untick cleanup:
+    //    YouTube blocks in `resolve()` under `group_ops` while A is queued to switch to shared `q720`.
+    //    Once YouTube fails `resolve()`, G is aborted immediately; A then acquires `group_ops`, starts G,
+    //    commits, and unticking A stops and cleans up G with zero leaks!
     let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 4_500, codec: Some(VideoCodec::H264) };
     let gid_720 = {
         let mut input = e.golive_planner_input(e.cached_pc_budget());
@@ -6963,19 +6976,18 @@ async fn shared_switch_group_cleans_up_after_commit_untick_sibling_fail_and_task
     let task_b = tokio::spawn(async move { eb.set_golive_quality("youtube", DestinationQuality::Custom(qb)).await });
     timeout(Duration::from_secs(3), entered_resolve.notified()).await.expect("YouTube entered gated resolve");
 
-    // Now switch A onto the same shared group `gid_720` and commit, then untick A!
-    e.set_golive_quality(&a.id, DestinationQuality::Custom(q720)).await.unwrap();
+    let ea = e.clone();
+    let aid = a.id.clone();
+    let qa = q720.clone();
+    let task_a = tokio::spawn(async move { ea.set_golive_quality(&aid, DestinationQuality::Custom(qa)).await });
+    release_resolve.notify_waiters();
+    assert!(task_b.await.unwrap().is_err(), "gated YouTube switch must fail");
+    task_a.await.unwrap().unwrap();
+    assert!(host.started.lock().unwrap().contains_key(&gid_720), "committed switch A keeps shared group alive");
     let only_yt: Vec<(String, bool)> =
         e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
     e.set_golive_destinations(only_yt).await.unwrap();
-    assert!(host.started.lock().unwrap().contains_key(&gid_720), "G held alive for pending sibling B");
-
-    release_resolve.notify_waiters();
-    assert!(task_b.await.unwrap().is_err(), "gated YouTube switch must fail");
-    assert!(
-        !host.started.lock().unwrap().contains_key(&gid_720),
-        "shared group G must be stopped after commit+untick + sibling fail"
-    );
+    assert!(!host.started.lock().unwrap().contains_key(&gid_720), "shared group G must be stopped after unticking A");
     assert!(!e.active_encode_groups().iter().any(|g| g.id == gid_720));
 
     // 2. Cancelled HTTP / aborted switch future leak (no manual reconcile):
@@ -6998,7 +7010,6 @@ async fn shared_switch_group_cleans_up_after_commit_untick_sibling_fail_and_task
     eventually_async(|| async {
         !host.started.lock().unwrap().contains_key(&gid_540)
             && !e.active_encode_groups().iter().any(|g| g.id == gid_540)
-            && e.uncommitted_switch_groups_for_test().is_empty()
     })
     .await;
     e.studio_stream(false).await.unwrap();
@@ -7170,7 +7181,7 @@ async fn legacy_light_options_current_avoids_same_as_main_alias_and_same_quality
     }
 
     e.mark_route_light_for_test(&d.id);
-    e.reconcile_midstream().await;
+    e.reconcile().await;
     assert_eq!(e.golive_running_group(&d.id).as_deref(), Some(GROUP_LIGHT));
 
     // Selecting `SameAsMain` (or `set_golive_light(false)`) must clear `route_light` and restore GROUP_MAIN.
@@ -7212,4 +7223,702 @@ async fn obs_live_put_custom_quality_returns_422_before_canvas_fps_validation() 
         matches!(err, EngineError::Refused { status: 422, code: "golive_needs_new_encode", .. }),
         "OBS live Custom 60fps must return 422 golive_needs_new_encode, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn studio_stop_cancels_pending_switch_in_resolve_and_clears_encode_groups() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    #[derive(Debug)]
+    struct StoppableMultiHost {
+        inner: Arc<MultiGroupHost>,
+        running: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::studio_host::StudioHost for StoppableMultiHost {
+        async fn status(&self) -> crate::studio_host::StudioStatus {
+            crate::studio_host::StudioStatus {
+                available: true,
+                running: self.running.load(std::sync::atomic::Ordering::Acquire),
+                ..Default::default()
+            }
+        }
+        async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            self.running.store(true, std::sync::atomic::Ordering::Release);
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            self.running.store(false, std::sync::atomic::Ordering::Release);
+            self.inner.stream_stop().await?;
+            Ok(self.status().await)
+        }
+        async fn kinds(&self) -> Result<serde_json::Value, String> {
+            self.inner.kinds().await
+        }
+        async fn options(&self, kind: String) -> Result<serde_json::Value, String> {
+            self.inner.options(kind).await
+        }
+        async fn preview(&self, rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+            self.inner.preview(rect).await
+        }
+        async fn defaults(&self, kind: String) -> Result<serde_json::Value, String> {
+            self.inner.defaults(kind).await
+        }
+        async fn act(&self, act: crate::studio_host::StudioAct) -> Result<serde_json::Value, String> {
+            self.inner.act(act).await
+        }
+        async fn settings(&self) -> crate::studio_host::StudioSettings {
+            self.inner.settings().await
+        }
+        async fn set_settings(&self, s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+            self.inner.set_settings(s).await
+        }
+        async fn stats(&self) -> Result<serde_json::Value, String> {
+            self.inner.stats().await
+        }
+        async fn record(&self, on: bool) -> Result<serde_json::Value, String> {
+            self.inner.record(on).await
+        }
+        async fn record_pause(&self, on: bool) -> Result<(), String> {
+            self.inner.record_pause(on).await
+        }
+        async fn monitoring(&self) -> Result<serde_json::Value, String> {
+            self.inner.monitoring().await
+        }
+        async fn stream_start(
+            &self,
+            server: String,
+            key: String,
+            t: Vec<(u32, u32, u32)>,
+        ) -> Result<serde_json::Value, String> {
+            self.inner.stream_start(server, key, t).await
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            self.inner.stream_stop().await
+        }
+        async fn stream_stats(&self) -> Result<serde_json::Value, String> {
+            self.inner.stream_stats().await
+        }
+        async fn obs_collections(&self) -> Result<serde_json::Value, String> {
+            self.inner.obs_collections().await
+        }
+        async fn import_obs(&self, id: String) -> Result<serde_json::Value, String> {
+            self.inner.import_obs(id).await
+        }
+        fn supports_encode_groups(&self) -> bool {
+            true
+        }
+        async fn start_encode_group(
+            &self,
+            spec: crate::studio_host::EncodeGroupSpec,
+            hub: Arc<ferrocast_golive::Hub>,
+        ) -> Result<bool, String> {
+            self.inner.start_encode_group(spec, hub).await
+        }
+        async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
+            self.inner.stop_encode_group(id).await
+        }
+        async fn abort_encode_group(&self, id: &str) -> Result<(), String> {
+            self.inner.abort_encode_group(id).await
+        }
+        async fn live_group_key(&self, id: &str) -> Option<crate::studio_host::EncodeKey> {
+            self.inner.live_group_key(id).await
+        }
+        async fn group_stats(&self) -> Result<Option<serde_json::Value>, String> {
+            self.inner.group_stats().await
+        }
+        async fn host_budget_info(&self) -> Option<crate::studio_host::HostBudgetInfo> {
+            self.inner.host_budget_info().await
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingResolveYt {
+        url: String,
+        key: String,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        gate_next: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ferrocast_connector::Connector for BlockingResolveYt {
+        fn platform(&self) -> Platform {
+            Platform::Youtube
+        }
+        fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+            Default::default()
+        }
+        async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+            Ok(())
+        }
+        async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+            if self.gate_next.load(std::sync::atomic::Ordering::Acquire) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(ferrocast_connector::Ingest { url: self.url.clone(), key: self.key.clone(), backup: None, note: None })
+        }
+    }
+
+    let (e, _dir) = engine().await;
+    let inner = Arc::new(MultiGroupHost::default());
+    *inner.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 6_000,
+        ..Default::default()
+    };
+    *inner.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    let host = Arc::new(StoppableMultiHost { inner: inner.clone(), running: std::sync::atomic::AtomicBool::new(true) });
+    e.set_studio_host(host);
+
+    let (p_yt, mut got_yt) = platform("stop-yt").await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let yt_conn = Arc::new(BlockingResolveYt {
+        url: format!("rtmp://127.0.0.1:{p_yt}/app"),
+        key: "stop-yt".into(),
+        entered: entered.clone(),
+        release: release.clone(),
+        gate_next: std::sync::atomic::AtomicBool::new(false),
+    });
+    e.register_connector(yt_conn.clone());
+
+    let only_yt: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
+    e.set_golive_destinations(only_yt).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "stop-yt")
+        {
+            break;
+        }
+    }
+
+    yt_conn.gate_next.store(true, std::sync::atomic::Ordering::Release);
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let e_sw = e.clone();
+    let sw = tokio::spawn(async move { e_sw.set_golive_quality("youtube", DestinationQuality::Custom(q720)).await });
+    timeout(Duration::from_secs(3), entered.notified()).await.expect("switch entered resolve");
+
+    // studio_stop must cancel the pending switch inside resolve() immediately and clear all encode groups.
+    timeout(Duration::from_secs(3), e.studio_stop())
+        .await
+        .expect("studio_stop must not wait on stalled resolve")
+        .unwrap();
+    let sw_err = timeout(Duration::from_secs(3), sw)
+        .await
+        .expect("switch must abort on studio_stop without waiting for release")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(sw_err, EngineError::Refused { code: "golive_switch_cancelled", .. }), "{sw_err:?}");
+    assert!(e.active_encode_groups().is_empty(), "studio_stop must clear active encode groups");
+    assert!(!e.golive_uses_encode_groups());
+    assert!(inner.started.lock().unwrap().is_empty(), "studio_stop must stop all host encode groups");
+    assert!(e.golive_running().is_empty(), "studio_stop must stop all running destinations");
+    let _ = Canvas::Main;
+}
+
+#[derive(Debug)]
+struct SlowStopHost {
+    inner: Arc<MultiGroupHost>,
+    studio_running: std::sync::atomic::AtomicBool,
+    arm_gid: std::sync::Mutex<Option<String>>,
+    entered_stop: Arc<tokio::sync::Notify>,
+    release_stop: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl crate::studio_host::StudioHost for SlowStopHost {
+    async fn status(&self) -> crate::studio_host::StudioStatus {
+        crate::studio_host::StudioStatus {
+            available: true,
+            running: self.studio_running.load(std::sync::atomic::Ordering::Acquire),
+            ..Default::default()
+        }
+    }
+    async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        self.studio_running.store(true, std::sync::atomic::Ordering::Release);
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        self.studio_running.store(false, std::sync::atomic::Ordering::Release);
+        Ok(self.status().await)
+    }
+    async fn kinds(&self) -> Result<serde_json::Value, String> {
+        self.inner.kinds().await
+    }
+    async fn options(&self, kind: String) -> Result<serde_json::Value, String> {
+        self.inner.options(kind).await
+    }
+    async fn preview(&self, rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+        self.inner.preview(rect).await
+    }
+    async fn defaults(&self, kind: String) -> Result<serde_json::Value, String> {
+        self.inner.defaults(kind).await
+    }
+    async fn act(&self, act: crate::studio_host::StudioAct) -> Result<serde_json::Value, String> {
+        self.inner.act(act).await
+    }
+    async fn settings(&self) -> crate::studio_host::StudioSettings {
+        self.inner.settings().await
+    }
+    async fn set_settings(&self, s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        self.inner.set_settings(s).await
+    }
+    async fn stats(&self) -> Result<serde_json::Value, String> {
+        self.inner.stats().await
+    }
+    async fn record(&self, on: bool) -> Result<serde_json::Value, String> {
+        self.inner.record(on).await
+    }
+    async fn record_pause(&self, on: bool) -> Result<(), String> {
+        self.inner.record_pause(on).await
+    }
+    async fn monitoring(&self) -> Result<serde_json::Value, String> {
+        self.inner.monitoring().await
+    }
+    async fn stream_start(
+        &self,
+        server: String,
+        key: String,
+        t: Vec<(u32, u32, u32)>,
+    ) -> Result<serde_json::Value, String> {
+        self.inner.stream_start(server, key, t).await
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        self.inner.stream_stop().await
+    }
+    async fn stream_stats(&self) -> Result<serde_json::Value, String> {
+        self.inner.stream_stats().await
+    }
+    async fn obs_collections(&self) -> Result<serde_json::Value, String> {
+        self.inner.obs_collections().await
+    }
+    async fn import_obs(&self, id: String) -> Result<serde_json::Value, String> {
+        self.inner.import_obs(id).await
+    }
+    fn supports_encode_groups(&self) -> bool {
+        true
+    }
+    async fn start_encode_group(
+        &self,
+        spec: crate::studio_host::EncodeGroupSpec,
+        hub: Arc<ferrocast_golive::Hub>,
+    ) -> Result<bool, String> {
+        self.inner.start_encode_group(spec, hub).await
+    }
+    async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
+        let pause = {
+            let mut g = self.arm_gid.lock().unwrap();
+            if g.as_deref() == Some(id) {
+                *g = None;
+                true
+            } else {
+                false
+            }
+        };
+        if pause {
+            self.entered_stop.notify_one();
+            self.release_stop.notified().await;
+        }
+        self.inner.stop_encode_group(id).await
+    }
+    async fn abort_encode_group(&self, id: &str) -> Result<(), String> {
+        self.inner.abort_encode_group(id).await
+    }
+    async fn live_group_key(&self, id: &str) -> Option<crate::studio_host::EncodeKey> {
+        self.inner.live_group_key(id).await
+    }
+    async fn group_stats(&self) -> Result<Option<serde_json::Value>, String> {
+        self.inner.group_stats().await
+    }
+    async fn host_budget_info(&self) -> Option<crate::studio_host::HostBudgetInfo> {
+        self.inner.host_budget_info().await
+    }
+}
+
+#[tokio::test]
+async fn set_golive_destinations_does_not_stall_config_lock_behind_encoder_io() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let inner = Arc::new(MultiGroupHost::default());
+    *inner.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        ..Default::default()
+    };
+    *inner.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    let entered_stop = Arc::new(tokio::sync::Notify::new());
+    let release_stop = Arc::new(tokio::sync::Notify::new());
+    let host = Arc::new(SlowStopHost {
+        inner: inner.clone(),
+        studio_running: std::sync::atomic::AtomicBool::new(true),
+        arm_gid: std::sync::Mutex::new(None),
+        entered_stop: entered_stop.clone(),
+        release_stop: release_stop.clone(),
+    });
+    e.set_studio_host(host.clone());
+
+    let (pa, mut got_a) = platform("cfg-a").await;
+    let (pb, _got_b) = platform("cfg-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "cfg-a", Canvas::Main).await.unwrap();
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "cfg-b", Canvas::Main).await.unwrap();
+    let only_a: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == a.id)).collect();
+    e.set_golive_destinations(only_a).await.unwrap();
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&a.id, DestinationQuality::Custom(q720)).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_a.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "cfg-a")
+        {
+            break;
+        }
+    }
+    let gid_720 = e.golive_running_group(&a.id).unwrap();
+    *host.arm_gid.lock().unwrap() = Some(gid_720);
+
+    // Pause a switch inside stop_encode_group while holding the group lifecycle lock.
+    let e_sw = e.clone();
+    let a_id = a.id.clone();
+    let sw = tokio::spawn(async move { e_sw.set_golive_quality(&a_id, DestinationQuality::SameAsMain).await });
+    timeout(Duration::from_secs(3), entered_stop.notified()).await.expect("switch entered stop_encode_group");
+
+    // Start set_golive_destinations enabling B (which waits on the group lifecycle lock): it must NOT hold config_lock!
+    let enable_ab: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == a.id || d.id == b.id)).collect();
+    let e_dest = e.clone();
+    let dest_task = tokio::spawn(async move { e_dest.set_golive_destinations(enable_ab).await });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Unrelated config_lock writer must finish immediately without waiting for release_stop!
+    timeout(Duration::from_secs(3), e.set_golive_aitum_ok(true))
+        .await
+        .expect("config_lock must not stall behind encoder I/O")
+        .unwrap();
+
+    release_stop.notify_waiters();
+    sw.await.unwrap().unwrap();
+    dest_task.await.unwrap().unwrap();
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stress_parallel_switch_reconcile_untick_and_stop_under_group_ops() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2-max".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host.clone());
+
+    let (p_yt, mut got_yt) = platform("stress-yt").await;
+    let (p_a, mut got_a) = platform("stress-a").await;
+    let (p_b, mut got_b) = platform("stress-b").await;
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "stress-yt".into(),
+    )));
+    let a =
+        e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{p_a}/app"), "stress-a", Canvas::Main).await.unwrap();
+    let b =
+        e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{p_b}/app"), "stress-b", Canvas::Main).await.unwrap();
+
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let q480 = CustomQuality { width: 852, height: 480, fps: 30, kbps: 1_500, codec: Some(VideoCodec::H264) };
+
+    const ITERATIONS: usize = 25;
+    for iter in 0..ITERATIONS {
+        // Ensure all three destinations start enabled and on SameAsMain before each stream.
+        e.set_golive_quality(&a.id, DestinationQuality::SameAsMain).await.unwrap();
+        e.set_golive_quality(&b.id, DestinationQuality::SameAsMain).await.unwrap();
+        let enable_all: Vec<(String, bool)> = e
+            .golive_config()
+            .destinations
+            .into_iter()
+            .map(|d| (d.id.clone(), d.id == "youtube" || d.id == a.id || d.id == b.id))
+            .collect();
+        e.set_golive_destinations(enable_all.clone()).await.unwrap();
+        while got_yt.try_recv().is_ok() {}
+        while got_a.try_recv().is_ok() {}
+        while got_b.try_recv().is_ok() {}
+
+        let starts_before = host.start_counts.lock().unwrap().get(GROUP_MAIN).copied().unwrap_or(0);
+        e.studio_stream(true).await.unwrap();
+        for (rx, want) in [(&mut got_yt, "stress-yt"), (&mut got_a, "stress-a"), (&mut got_b, "stress-b")] {
+            loop {
+                if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+                {
+                    break;
+                }
+            }
+        }
+        while got_yt.try_recv().is_ok() {}
+
+        let sw_q_a = if iter % 2 == 0 {
+            DestinationQuality::Custom(q720.clone())
+        } else {
+            DestinationQuality::Custom(q480.clone())
+        };
+        let sw_q_b = if iter % 2 == 0 {
+            DestinationQuality::Custom(q480.clone())
+        } else {
+            DestinationQuality::Custom(q720.clone())
+        };
+        let untick_a: Vec<(String, bool)> = e
+            .golive_config()
+            .destinations
+            .into_iter()
+            .map(|d| (d.id.clone(), d.id == "youtube" || d.id == b.id))
+            .collect();
+
+        // Phase A (while live): fire switch(a), switch(b), reconcile, untick(a) in parallel (NOT stop yet).
+        // YouTube (untouched sibling on GROUP_MAIN) must experience zero disconnects (`Got::Closed`).
+        while got_yt.try_recv().is_ok() {}
+        let (e1, e2, e3, e4) = (e.clone(), e.clone(), e.clone(), e.clone());
+        let (aid_a, bid_a, qa_a, qb_a) = (a.id.clone(), b.id.clone(), sw_q_a.clone(), sw_q_b.clone());
+        let t_sw_a = tokio::spawn(async move { e1.set_golive_quality(&aid_a, qa_a).await });
+        let t_sw_b = tokio::spawn(async move { e2.set_golive_quality(&bid_a, qb_a).await });
+        let t_rec = tokio::spawn(async move { e3.reconcile().await });
+        let untick_a_clone = untick_a.clone();
+        let t_untick = tokio::spawn(async move { e4.set_golive_destinations(untick_a_clone).await });
+        let (r_a, r_b, r_rec, r_untick) = tokio::join!(t_sw_a, t_sw_b, t_rec, t_untick);
+        let _ = r_a.unwrap();
+        r_b.unwrap().unwrap();
+        r_rec.unwrap();
+        r_untick.unwrap().unwrap();
+        let mut yt_closed_live = 0usize;
+        while let Ok(msg) = got_yt.try_recv() {
+            if matches!(msg, Got::Closed) {
+                yt_closed_live += 1;
+            }
+        }
+        assert_eq!(
+            yt_closed_live, 0,
+            "iteration {iter}: YouTube on GROUP_MAIN must have 0 disconnects during live switch+reconcile+untick"
+        );
+
+        // Phase B: re-enable A, wait for publish, then fire switch(a) + switch(b) + reconcile + untick(a) + Stop in parallel!
+        e.set_golive_destinations(enable_all.clone()).await.unwrap();
+        loop {
+            if matches!(timeout(Duration::from_secs(3), got_a.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "stress-a")
+            {
+                break;
+            }
+        }
+
+        let (e1, e2, e3, e4, e5) = (e.clone(), e.clone(), e.clone(), e.clone(), e.clone());
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        let t_sw_a = tokio::spawn(async move { e1.set_golive_quality(&aid, sw_q_a).await });
+        let t_sw_b = tokio::spawn(async move { e2.set_golive_quality(&bid, sw_q_b).await });
+        let t_rec = tokio::spawn(async move { e3.reconcile().await });
+        let t_untick = tokio::spawn(async move { e4.set_golive_destinations(untick_a).await });
+        let t_stop = tokio::spawn(async move {
+            if iter % 3 == 0 {
+                tokio::task::yield_now().await;
+            }
+            e5.studio_stream(false).await
+        });
+
+        let (r_a, r_b, r_rec, r_untick, r_stop) = tokio::join!(t_sw_a, t_sw_b, t_rec, t_untick, t_stop);
+        let _ = r_a.unwrap();
+        let _ = r_b.unwrap();
+        r_rec.unwrap();
+        r_untick.unwrap().unwrap();
+        r_stop.unwrap().unwrap();
+
+        // While Stop may have caused YouTube's final Got::Closed, main must have started ONLY once for this stream.
+        let starts_after = host.start_counts.lock().unwrap().get(GROUP_MAIN).copied().unwrap_or(0);
+        assert_eq!(
+            starts_after - starts_before,
+            1,
+            "iteration {iter}: GROUP_MAIN must start exactly once per stream and never restart"
+        );
+        assert!(
+            host.started.lock().unwrap().is_empty(),
+            "iteration {iter}: no leaked groups on host after Stop: {:?}",
+            host.started.lock().unwrap().keys().collect::<Vec<_>>()
+        );
+        assert!(e.active_encode_groups().is_empty(), "iteration {iter}: active_groups must be empty after Stop");
+        assert!(e.golive_running().is_empty(), "iteration {iter}: golive_running must be empty after Stop");
+
+        // Verify next stream publishes cleanly to every enabled destination (no broken stale Arc<Hub>!).
+        let enabled_ids: Vec<String> =
+            e.golive_config().destinations.into_iter().filter(|d| d.enabled).map(|d| d.id).collect();
+        assert!(!enabled_ids.contains(&a.id), "iteration {iter}: unticked A must remain disabled");
+    }
+
+    // Final fresh stream check after stress loop: YouTube and B still connect and publish cleanly, and A stays stopped.
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_yt, "stress-yt"), (&mut got_b, "stress-b")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+    assert!(!e.golive_running().contains(&a.id));
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn switch_commit_serialized_with_studio_stop_and_remove_leaves_no_orphans() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let inner = Arc::new(MultiGroupHost::default());
+    *inner.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        ..Default::default()
+    };
+    *inner.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    let entered_stop = Arc::new(tokio::sync::Notify::new());
+    let release_stop = Arc::new(tokio::sync::Notify::new());
+    let host = Arc::new(SlowStopHost {
+        inner: inner.clone(),
+        studio_running: std::sync::atomic::AtomicBool::new(true),
+        arm_gid: std::sync::Mutex::new(None),
+        entered_stop: entered_stop.clone(),
+        release_stop: release_stop.clone(),
+    });
+    e.set_studio_host(host.clone());
+
+    let (pa, mut got_a) = platform("f52-a").await;
+    let (pb, mut got_b) = platform("f52-b").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "f52-a", Canvas::Main).await.unwrap();
+    let b = e.add_golive_destination("B", &format!("rtmp://127.0.0.1:{pb}/app"), "f52-b", Canvas::Main).await.unwrap();
+    let only_ab: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == a.id || d.id == b.id)).collect();
+    e.set_golive_destinations(only_ab).await.unwrap();
+
+    // Case 1: switch commits replacement forwarder into `g.running`, enters `stop_group_if_unused_locked`
+    // under `group_ops`; `studio_stop()` fires before `group_ops` drops -> zero leaked forwarders/groups.
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&a.id, DestinationQuality::Custom(q720.clone())).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_a, "f52-a"), (&mut got_b, "f52-b")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+    let gid_720 = e.golive_running_group(&a.id).unwrap();
+    *host.arm_gid.lock().unwrap() = Some(gid_720.clone());
+
+    let e_sw = e.clone();
+    let aid = a.id.clone();
+    let sw = tokio::spawn(async move { e_sw.set_golive_quality(&aid, DestinationQuality::SameAsMain).await });
+    timeout(Duration::from_secs(3), entered_stop.notified()).await.expect("entered stop_encode_group post-commit");
+
+    let e_stop = e.clone();
+    let stop_task = tokio::spawn(async move { e_stop.studio_stop().await });
+    release_stop.notify_waiters();
+    sw.await.unwrap().unwrap();
+    stop_task.await.unwrap().unwrap();
+
+    assert!(inner.started.lock().unwrap().is_empty(), "studio_stop must clear every group including new commit");
+    assert!(e.active_encode_groups().is_empty());
+    assert!(e.golive_running().is_empty());
+
+    // Case 2: same post-commit window raced against `remove_golive_destination`: deleted dest's new forwarder stops cleanly.
+    e.set_golive_quality(&a.id, DestinationQuality::Custom(q720)).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_a, "f52-a"), (&mut got_b, "f52-b")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+    *host.arm_gid.lock().unwrap() = Some(gid_720);
+    let e_sw2 = e.clone();
+    let aid2 = a.id.clone();
+    let sw2 = tokio::spawn(async move { e_sw2.set_golive_quality(&aid2, DestinationQuality::SameAsMain).await });
+    timeout(Duration::from_secs(3), entered_stop.notified()).await.expect("entered stop_encode_group case 2");
+
+    let e_rm = e.clone();
+    let aid_rm = a.id.clone();
+    let rm_task = tokio::spawn(async move { e_rm.remove_golive_destination(&aid_rm).await });
+    release_stop.notify_waiters();
+    sw2.await.unwrap().unwrap();
+    rm_task.await.unwrap().unwrap();
+
+    assert!(!e.golive_running().contains(&a.id), "deleted destination's newly committed forwarder must stop");
+    assert_eq!(e.golive_running_group(&b.id).as_deref(), Some(GROUP_MAIN));
+    e.studio_stream(false).await.unwrap();
 }

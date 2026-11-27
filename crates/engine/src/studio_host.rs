@@ -2755,12 +2755,24 @@ impl Engine {
         if was_running || !matches!(self.rig().await, Ok(crate::studio::rig::Rig::Obs(_))) {
             self.cancel_show_on_studio_stop("Studio stopped.");
         }
-        let _out = self.studio().output_lock.lock().await;
-        if was_running {
-            *crate::golive::lock_enhanced(self) = None;
-            self.set_studio_live(false);
+        self.cancel_golive_switches();
+        let group_ops = self.golive().group_ops.lock().await;
+        let had_groups = self.golive_uses_encode_groups();
+        let status = {
+            let _out = self.studio().output_lock.lock().await;
+            if was_running || had_groups {
+                *crate::golive::lock_enhanced(self) = None;
+                self.set_studio_live(false);
+                crate::golive::clear_applied_cap(self);
+                self.stop_all_studio_encode_groups_locked(&group_ops).await;
+            }
+            host.stop().await.map_err(failed)?
+        };
+        if was_running || had_groups {
+            self.reconcile_locked(&group_ops).await;
         }
-        let status = host.stop().await.map_err(failed)?;
+        drop(group_ops);
+        self.send_golive_pub();
         self.send_update_frame();
         Ok(status)
     }
@@ -3153,8 +3165,12 @@ impl Engine {
     /// Starts or stops streaming the Studio into this PC's Go live ingest, which sends it on
     /// to every destination switched on, as a stream from OBS would.
     pub async fn studio_stream(&self, on: bool) -> Result<Value, EngineError> {
+        if !on {
+            self.cancel_golive_switches();
+        }
+        let group_ops = self.golive().group_ops.lock().await;
         let _out = self.studio().output_lock.lock().await;
-        self.studio_stream_locked(on).await
+        self.studio_stream_locked(&group_ops, on).await
     }
 
     /// Stops the stream; with `discard_delay` the delay's tail (what the stream delay still holds)
@@ -3167,8 +3183,12 @@ impl Engine {
         Ok(out)
     }
 
-    /// Runs `studio_stream` while the caller already holds `studio().output_lock`.
-    pub(crate) async fn studio_stream_locked(&self, on: bool) -> Result<Value, EngineError> {
+    /// Runs `studio_stream` while the caller already holds `golive().group_ops` and `studio().output_lock`.
+    pub(crate) async fn studio_stream_locked(
+        &self,
+        group_ops: &tokio::sync::MutexGuard<'_, ()>,
+        on: bool,
+    ) -> Result<Value, EngineError> {
         let _gate = if on {
             let g = self.studio().output_gate.lock().await;
             self.ensure_no_benchmark_running()?;
@@ -3189,8 +3209,9 @@ impl Engine {
             // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
             *crate::golive::lock_enhanced(self) = None;
             crate::golive::clear_applied_cap(self);
-            self.stop_all_studio_encode_groups().await;
+            self.stop_all_studio_encode_groups_locked(group_ops).await;
             host.stream_stop().await.map_err(failed)?;
+            self.reconcile_locked(group_ops).await;
             // A countdown (or a show waiting for its live scene) with no stream is over: Go
             // live again must start a new show, not say one is running.
             self.end_show_whose_stream_stopped();
@@ -3218,11 +3239,11 @@ impl Engine {
             if !running && host.supports_encode_groups() {
                 self.set_studio_live(true);
             }
-            match self.try_start_studio_encode_groups(&host, &budget).await {
+            match self.try_start_studio_encode_groups_locked(group_ops, &host, &budget).await {
                 Ok(m) => m,
                 Err(e) => {
                     if !running {
-                        self.stop_all_studio_encode_groups().await;
+                        self.stop_all_studio_encode_groups_locked(group_ops).await;
                         *crate::golive::lock_enhanced(self) = None;
                         self.set_studio_live(false);
                     }
@@ -3240,7 +3261,7 @@ impl Engine {
                 (stats, group_notes)
             }
             None => {
-                self.sync_stream_cap().await;
+                self.sync_stream_cap_locked(group_ops).await;
                 let (server, key) = self.golive_ingest().await?;
                 let stats = match host.stream_start(server, key, tracks).await {
                     Ok(v) => v,
@@ -3267,10 +3288,10 @@ impl Engine {
         if let Some(note) = used_groups {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         } else if !self.golive_uses_encode_groups() {
-            if let Some(note) = self.studio_sync_vertical().await {
+            if let Some(note) = self.studio_sync_vertical_locked(group_ops).await {
                 also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
             }
-            if let Some(note) = self.studio_sync_light().await {
+            if let Some(note) = self.studio_sync_light_locked(group_ops).await {
                 also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
             }
         }
@@ -3285,14 +3306,22 @@ impl Engine {
         Ok(v)
     }
 
+    pub(crate) async fn studio_sync_vertical(&self) -> Option<String> {
+        let group_ops = self.golive().group_ops.lock().await;
+        self.studio_sync_vertical_locked(&group_ops).await
+    }
+
     /// Starts or stops the Studio's vertical stream to match: while the Studio streams, its
     /// vertical picture goes to Go live's vertical key (as OBS's vertical canvas does) when a
     /// vertical platform is ticked and the picture comes from a canvas. Called when the stream
     /// starts and whenever Go live's platforms, the source or the vertical picture change →
     /// a note when it should send but can't.
-    pub(crate) async fn studio_sync_vertical(&self) -> Option<String> {
+    pub(crate) async fn studio_sync_vertical_locked(
+        &self,
+        group_ops: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Option<String> {
         if self.golive_uses_encode_groups() {
-            self.reconcile_studio_groups_now().await;
+            self.reconcile_studio_groups_now_locked(group_ops).await;
             return None;
         }
         let host = self.studio_host().ok()?;
@@ -3318,11 +3347,16 @@ impl Engine {
         }
     }
 
+    pub(crate) async fn studio_sync_light(&self) -> Option<String> {
+        let group_ops = self.golive().group_ops.lock().await;
+        self.studio_sync_light_locked(&group_ops).await
+    }
+
     /// Starts or stops the Studio's lighter stream to match: while the Studio streams, it goes
     /// to Go live's light key when a ticked platform takes it → a note when it can't.
-    pub(crate) async fn studio_sync_light(&self) -> Option<String> {
+    pub(crate) async fn studio_sync_light_locked(&self, group_ops: &tokio::sync::MutexGuard<'_, ()>) -> Option<String> {
         if self.golive_uses_encode_groups() {
-            self.reconcile_studio_groups_now().await;
+            self.reconcile_studio_groups_now_locked(group_ops).await;
             return None;
         }
         let host = self.studio_host().ok()?;
@@ -3658,6 +3692,7 @@ impl Engine {
         };
         if let Some(host) = host {
             let out = host.shelf(kind.to_string(), act).await.map_err(failed)?;
+            drop(_gate);
             // Another collection may have its own vertical picture (or none): the stream follows.
             self.studio_sync_vertical().await;
             return Ok(out);
