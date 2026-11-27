@@ -4052,9 +4052,6 @@ pub(crate) fn failed(message: String) -> EngineError {
     if message.contains("already has a filter called") {
         return refused(409, "studio_name_taken", message, "Each filter on a source needs its own name.");
     }
-    if message.contains("already in this scene") {
-        return refused(409, "studio_already_here", message, "Pick it in the Sources list instead.");
-    }
     if message.contains("isn't here yet") {
         return refused(422, "studio_not_supported", message, "Use Reload for now.");
     }
@@ -5177,7 +5174,6 @@ mod tests {
             ("There's no profile with that id.", "studio_no_such"),
             ("\"Main\" is taken: pick another name.", "studio_name_taken"),
             ("\"Cam\" already has a filter called \"Crop\".", "studio_name_taken"),
-            ("This device is already in this scene, as \"Cam\".", "studio_already_here"),
         ] {
             assert!(matches!(failed(m.into()), EngineError::Refused { code: c, .. } if c == code), "{m}");
         }

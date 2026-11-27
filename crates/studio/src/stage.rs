@@ -1025,14 +1025,6 @@ impl Stage {
         })
     }
 
-    /// Whether `scene` shows the source `name` (in a group too).
-    fn shows(&self, scene: &str, name: &str) -> bool {
-        fn has(items: &[ItemInfo], name: &str) -> bool {
-            items.iter().any(|i| i.name == name || has(&i.children, name))
-        }
-        self.items(scene).is_ok_and(|l| has(&l, name))
-    }
-
     fn sources_list(&self) -> Vec<Value> {
         self.doc.borrow().get("sources").and_then(Value::as_array).cloned().unwrap_or_default()
     }
@@ -1840,14 +1832,12 @@ impl Stage {
         fit: bool,
     ) -> Result<(ItemInfo, bool), StudioError> {
         self.scene_items(scene)?;
-        // A camera or capture card already used here: that source again, never the device
-        // opened twice. A capture card can't be: both stopped sending and it wouldn't open
-        // again ("isn't connected") until one was removed (owner, 17 Nov: added as a Capture
-        // card, then again as a Camera).
+        // A camera or capture card already used: that source again (a new item of it, in this
+        // scene too, with its own place, size and crop), never the device opened twice. A
+        // capture card can't be: both stopped sending and it wouldn't open again ("isn't
+        // connected") until one was removed (owner, 17 Nov: added as a Capture card, then again
+        // as a Camera).
         if let Some(have) = self.using_device(kind, settings) {
-            if self.shows(scene, &have) {
-                return Err(fail(format!("This device is already in this scene, as \"{have}\".")));
-            }
             // One switched off would never show here: it's asked for, so it's on again.
             self.with_source(&have, |s| s["enabled"] = json!(true))?;
             let mut info = self.add_existing(scene, &have)?;
@@ -10229,8 +10219,11 @@ mod tests {
         let again = ok(s.add_source("Other", "macos-avcapture", "Camera", &dev, false));
         assert_eq!(again.name, "Card");
         assert_eq!(s.sources().iter().filter(|x| x.kind.contains("capture")).count(), 1);
-        // In the same scene twice: said, not added.
-        assert!(s.add_source("Main", "av_capture_input_v2", "Card 2", &dev, false).is_err());
+        // In the same scene twice: a second item of the same source (own place and size).
+        let (second, reused) = ok(s.add_source_or_reuse("Main", "av_capture_input_v2", "Card 2", &dev, false));
+        assert!(reused);
+        assert_eq!(second.name, "Card");
+        assert_eq!(s.sources().iter().filter(|x| x.kind.contains("capture")).count(), 1);
         // Another device is a source of its own.
         ok(s.add_source("Main", "av_capture_input_v2", "Phone", &json!({ "device": "phone" }), false));
         assert_eq!(s.sources().len(), 2);
@@ -10245,6 +10238,68 @@ mod tests {
         let card = ok(s.items("Main")).into_iter().find(|i| i.name == "Card").map(|i| i.id).unwrap_or_default();
         ok(s.edit_item("Main", card, ItemEdit::Duplicate));
         assert_eq!(s.sources().len(), 4);
+    }
+
+    /// The same camera added twice to one scene is two items of one source: the device opens
+    /// once, each item keeps its own place, and taking one away leaves the other (and the
+    /// device) alone.
+    #[test]
+    fn the_same_camera_twice_in_one_scene_is_two_items_of_one_source() {
+        let s = stage();
+        let dev = json!({ "device": "no-such-card" });
+        let (a, first_reused) = ok(s.add_source_or_reuse("Main", "av_capture_input_v2", "Cam", &dev, false));
+        assert!(!first_reused);
+        let (b, reused) = ok(s.add_source_or_reuse("Main", "av_capture_input_v2", "Cam again", &dev, false));
+        assert!(reused, "the same feed, said so");
+        assert_ne!(a.id, b.id, "two items");
+        assert_eq!((a.name.as_str(), b.name.as_str()), ("Cam", "Cam"), "one source");
+        let cams = || s.sources().iter().filter(|x| x.kind.contains("capture")).count();
+        assert_eq!(cams(), 1, "the device is opened once");
+        // A third, as a Camera kind: still the one source.
+        let (c, _) = ok(s.add_source_or_reuse("Main", "macos-avcapture", "Camera", &dev, false));
+        assert_eq!(c.name, "Cam");
+        assert_eq!(cams(), 1);
+        assert_eq!(ok(s.items("Main")).len(), 3);
+
+        // Each item has its own place, size and crop.
+        let mut t = ok(s.transform("Main", b.id));
+        (t.x, t.y, t.scale_x, t.scale_y, t.crop_left) = (100.0, 50.0, 0.5, 0.5, 10);
+        ok(s.set_transform("Main", b.id, &t));
+        let (ta, tb) = (ok(s.transform("Main", a.id)), ok(s.transform("Main", b.id)));
+        assert_eq!((ta.x, ta.scale_x, ta.crop_left), (0.0, 1.0, 0));
+        assert_eq!((tb.x, tb.scale_x, tb.crop_left), (100.0, 0.5, 10));
+
+        // Saved and loaded: still two items of one source.
+        let doc = s.save("Show");
+        let back = ok(Stage::load(Canvas { width: 1920, height: 1080, fps: 30 }, &doc, "Main"));
+        assert_eq!(ok(back.items("Main")).len(), 3);
+        assert_eq!(back.sources().iter().filter(|x| x.kind.contains("capture")).count(), 1);
+
+        // A scene copied keeps all of them, on the one source.
+        ok(s.duplicate_scene("Main", "Copy"));
+        let copy = ok(s.items("Copy"));
+        assert_eq!(copy.len(), 3);
+        assert!(copy.iter().all(|i| i.name == "Cam"));
+        assert_eq!(cams(), 1);
+
+        // Undo (the collection as it was) puts the item back, still on the one source.
+        let before = s.snapshot();
+        ok(s.edit_item("Main", c.id, ItemEdit::Remove));
+        s.restore_all(&before);
+        assert_eq!(ok(s.items("Main")).len(), 3);
+
+        // Removing items one at a time: the source stays while any item (in any scene) shows it.
+        ok(s.edit_item("Main", b.id, ItemEdit::Remove));
+        ok(s.edit_item("Main", c.id, ItemEdit::Remove));
+        let left = ok(s.items("Main"));
+        assert_eq!(left.iter().map(|i| i.id).collect::<Vec<_>>(), vec![a.id]);
+        assert_eq!(cams(), 1, "the other item still uses the device");
+        ok(s.edit_item("Main", a.id, ItemEdit::Remove));
+        assert_eq!(cams(), 1, "the copied scene still shows it");
+        for i in ok(s.items("Copy")) {
+            ok(s.edit_item("Copy", i.id, ItemEdit::Remove));
+        }
+        assert_eq!(cams(), 0, "nothing shows it any more: the device is closed");
     }
 
     #[test]
