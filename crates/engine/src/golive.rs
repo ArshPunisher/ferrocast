@@ -590,6 +590,19 @@ pub(crate) struct GoLive {
     studio_video: Mutex<Option<StudioCapConfig>>,
     /// Cached hardware/driver/recording budget telemetry reported by [`StudioHost::host_budget_info`].
     cached_host_budget: RwLock<Option<crate::studio_host::HostBudgetInfo>>,
+    /// Direct Hub encode groups currently started on [`StudioHost`].
+    active_groups: Mutex<HashMap<GroupId, crate::studio_host::EncodeGroupSpec>>,
+    /// Destination IDs currently executing a mid-stream quality switch (`409` per-dest guard).
+    switching: Mutex<std::collections::HashSet<String>>,
+    /// Encode group IDs temporarily held live by an in-flight switch (protected from `reconcile` cleanup).
+    switching_groups: Mutex<std::collections::HashSet<GroupId>>,
+    /// Monotonic switch generation per destination (`switch_seq` increments on every switch or Stop).
+    switch_gen: Mutex<HashMap<String, u64>>,
+    switch_seq: std::sync::atomic::AtomicU64,
+    /// Broadcast signal cancelled immediately when Studio stops the stream.
+    stream_cancel: Mutex<watch::Sender<bool>>,
+    /// Timeout waiting for a newly started encode group's first IDR frame (3 s default; configurable in tests).
+    keyframe_wait_timeout: Mutex<std::time::Duration>,
     /// Whether Ferrocast Studio itself started the live main stream (vs external OBS ingest).
     studio_live: std::sync::atomic::AtomicBool,
     /// The Studio couldn't put the platform's cap on the stream on air (its encoder is shared with
@@ -813,6 +826,13 @@ impl Default for GoLive {
             enhanced: Mutex::new(None),
             studio_video: Mutex::new(None),
             cached_host_budget: RwLock::new(None),
+            active_groups: Mutex::new(HashMap::new()),
+            switching: Mutex::new(std::collections::HashSet::new()),
+            switching_groups: Mutex::new(std::collections::HashSet::new()),
+            switch_gen: Mutex::new(HashMap::new()),
+            switch_seq: std::sync::atomic::AtomicU64::new(0),
+            stream_cancel: Mutex::new(watch::channel(false).0),
+            keyframe_wait_timeout: Mutex::new(std::time::Duration::from_secs(3)),
             studio_live: std::sync::atomic::AtomicBool::new(false),
             cap_failed: std::sync::atomic::AtomicBool::new(false),
             applied_cap: Mutex::new(None),
@@ -1550,6 +1570,10 @@ impl Engine {
     }
 
     pub(crate) async fn sync_stream_cap(&self) {
+        if !lock(&self.golive().active_groups).is_empty() {
+            self.send_golive_pub();
+            return;
+        }
         // A stream is running and its cap was applied: its encoder (shared by every output and a
         // "Same as stream" recording) keeps it, whatever is ticked or unticked now. The next
         // stream starts with a cap worked out again. (A cap that failed is tried again.)
@@ -1564,6 +1588,13 @@ impl Engine {
     /// on purpose (the Advanced switch that ignores the platforms' limits).
     pub(crate) async fn sync_stream_cap_now(&self) {
         let Ok(host) = self.studio_host() else { return };
+        if !lock(&self.golive().active_groups).is_empty() {
+            clear_applied_cap(self);
+            let _ = host.set_stream_cap(None).await;
+            self.reconcile_studio_groups_now().await;
+            self.send_golive_pub();
+            return;
+        }
         let limit = self.studio_limit();
         let no_bframes = self.studio_no_bframes();
         let cap = (limit.is_some() || no_bframes).then(|| crate::studio_host::StreamCap {
@@ -1621,7 +1652,7 @@ impl Engine {
         let vertical_live = vertical_hub.live().borrow().on;
         let vertical_stats = vertical_hub.stats();
         let cfg = self.golive_config();
-        let plan = self.plan_golive_encodes(PcBudget::unknown());
+        let plan = self.plan_golive_encodes(self.cached_pc_budget());
         let upload = if live || vertical_live {
             self.upload_now(&cfg).or_else(|| lock(&g.upload).clone())
         } else {
@@ -1976,6 +2007,258 @@ impl Engine {
         (dropped, !lock(&g.paused).is_empty())
     }
 
+    /// Active Go live senders grouped by their encode group ID for per-group auto-quality control.
+    pub(crate) fn golive_group_senders(
+        &self,
+    ) -> std::collections::BTreeMap<GroupId, Vec<ferrocast_core::auto_quality::Dest>> {
+        let now_ms = u64::try_from(now().0).unwrap_or(0);
+        let mut by_group: std::collections::BTreeMap<GroupId, Vec<ferrocast_core::auto_quality::Dest>> =
+            std::collections::BTreeMap::new();
+        for (id, r) in &*lock(&self.golive().running) {
+            let h = r.health.borrow();
+            let live = h.state == PushState::Live;
+            by_group.entry(r.group_id.clone()).or_default().push(ferrocast_core::auto_quality::Dest {
+                id: id.clone(),
+                dropped: h.dropped,
+                live_ms: if live { now_ms.saturating_sub(h.since_ms) } else { 0 },
+                live,
+            });
+        }
+        by_group
+    }
+
+    /// Returns true if an FFmpeg handover backend (`NVENC` / `QSV` / `AMF`) is already at its physical
+    /// session cap with no spare session left for `ffenc`'s transient second encoder process.
+    pub(crate) fn ffenc_handover_session_exhausted(&self) -> bool {
+        let Some(info) = self.cached_host_budget_info() else {
+            return false;
+        };
+        let is_sw = crate::golive_plan::encoder_is_software(&info.encoder_id);
+        if is_sw || info.os == "macos" {
+            return false;
+        }
+        let bench = self.studio().studio_bench.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let valid_bench = bench.as_ref().filter(|b| b.is_valid_for(&info.host_sig, false));
+        let is_nvenc = info.encoder_id.to_ascii_lowercase().contains("nvenc")
+            || info.hw_backend.as_deref() == Some("nvenc")
+            || info.nvidia_driver_major.is_some();
+        let raw_cap = if is_nvenc {
+            crate::golive_plan::nvenc_session_cap(info.nvidia_driver_major, info.nvidia_driver_minor)
+        } else {
+            3
+        };
+        let eff_cap = valid_bench.and_then(|b| b.max_sessions_ok).map_or(raw_cap, |m| m.min(raw_cap).max(1));
+        let g = self.golive();
+        let active_groups = lock(&g.active_groups).len();
+        let running_groups = self.golive_group_senders().len();
+        let live_main_fallback = usize::from(active_groups == 0 && running_groups == 0 && self.golive_stream_running());
+        let used_stream = u32::try_from(active_groups.max(running_groups).max(live_main_fallback)).unwrap_or(u32::MAX);
+        used_stream.saturating_add(info.record_extra_sessions) >= eff_cap
+    }
+
+    /// Cancels any in-flight live quality switches (e.g. on Studio Stop).
+    pub(crate) fn cancel_golive_switches(&self) {
+        let g = self.golive();
+        g.switch_seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        lock(&g.stream_cancel).send_replace(true);
+    }
+
+    /// Starts a fresh cancellation channel for a new stream session.
+    pub(crate) fn reset_golive_switch_cancel(&self) {
+        let (tx, _) = watch::channel(false);
+        *lock(&self.golive().stream_cancel) = tx;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_keyframe_wait_timeout_for_test(&self, timeout: std::time::Duration) {
+        *lock(&self.golive().keyframe_wait_timeout) = timeout;
+    }
+
+    pub(crate) fn golive_uses_encode_groups(&self) -> bool {
+        !lock(&self.golive().active_groups).is_empty()
+    }
+
+    /// Stops every Studio direct-Hub encode group owned by `GoLive` and clears dynamic hubs.
+    pub(crate) async fn stop_all_studio_encode_groups(&self) {
+        let g = self.golive();
+        let ids: Vec<GroupId> = lock(&g.active_groups).keys().cloned().collect();
+        lock(&g.active_groups).clear();
+        if let Ok(host) = self.studio_host() {
+            for id in &ids {
+                if let Err(e) = host.stop_encode_group(id).await {
+                    tracing::warn!(group = %id, error = %e, "couldn't stop encode group cleanly");
+                }
+            }
+        }
+        for id in ids {
+            g.remove_hub(&id);
+        }
+    }
+
+    /// Starts direct-Hub encode groups for a Studio stream start; returns `Ok(None)` when the
+    /// attached `StudioHost` doesn't support `start_encode_group` (e.g. mock/legacy hosts).
+    pub(crate) async fn try_start_studio_encode_groups(
+        &self,
+        host: &std::sync::Arc<dyn crate::studio_host::StudioHost>,
+        budget: &PcBudget,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let cfg = self.golive_config();
+        let plan = self.plan_golive_encodes(budget.clone());
+        let specs = self.encode_group_specs_for_plan(&cfg, &plan);
+        let Some(first) = specs.first() else {
+            return Ok(None);
+        };
+        let g = self.golive();
+        let first_hub = g.ensure_hub(&first.id, first.key.canvas);
+        match host.start_encode_group(first.clone(), first_hub).await {
+            Ok(false) => {
+                g.remove_hub(&first.id);
+                return Ok(None);
+            }
+            Ok(true) => {
+                lock(&g.active_groups).insert(first.id.clone(), first.clone());
+            }
+            Err(e) => {
+                g.remove_hub(&first.id);
+                return Err(e);
+            }
+        }
+        let mut notes: Vec<String> = Vec::new();
+        for spec in specs.iter().skip(1) {
+            let hub = g.ensure_hub(&spec.id, spec.key.canvas);
+            match host.start_encode_group(spec.clone(), hub).await {
+                Ok(true) => {
+                    lock(&g.active_groups).insert(spec.id.clone(), spec.clone());
+                }
+                Ok(false) => {
+                    g.remove_hub(&spec.id);
+                    if spec.key.canvas == Canvas::Vertical {
+                        notes.push(
+                            "A vertical platform is on, but there's no vertical picture: add one in Go live.".into(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    g.remove_hub(&spec.id);
+                    tracing::warn!(group = %spec.id, error = %e, "secondary encode group failed to start");
+                    if spec.key.canvas == Canvas::Vertical {
+                        notes.push("The vertical stream didn't start; the wide one did.".into());
+                    } else if spec.is_light {
+                        notes.push("The lighter stream didn't start; the full one did.".into());
+                    } else {
+                        notes.push(format!("Encode group {} didn't start.", spec.id));
+                    }
+                }
+            }
+        }
+        // Only apply a shared cap badge if Pass-2 tightened `main` to a platform ceiling.
+        let shared_cap_dest = plan.destinations.values().find(|d| d.shared_cap_fallback);
+        if shared_cap_dest.is_none() {
+            clear_applied_cap(self);
+        } else {
+            let limit = self.studio_limit();
+            let no_bframes = self.studio_no_bframes();
+            *lock(&g.applied_cap) = (limit.is_some() || no_bframes).then(|| crate::studio_host::StreamCap {
+                max_kbps: limit.map(|l| l.max_kbps),
+                h264_only: limit.is_some_and(|l| l.is_h264_only()),
+                keyframe_secs: limit.map_or(0, |l| l.keyframe_secs),
+                no_bframes,
+            });
+            *lock(&g.applied_limit) = limit;
+        }
+        let mut v = host
+            .stream_stats()
+            .await
+            .ok()
+            .filter(|v| !v.is_null())
+            .unwrap_or_else(|| serde_json::json!({ "active": true }));
+        if !notes.is_empty()
+            && let Some(obj) = v.as_object_mut()
+        {
+            obj.insert("_group_notes".into(), serde_json::Value::String(notes.join(" ")));
+        }
+        Ok(Some(v))
+    }
+
+    pub(crate) async fn reconcile_studio_groups_now(&self) {
+        let budget = self.refresh_pc_budget().await;
+        let plan = self.plan_golive_encodes(budget);
+        self.reconcile_studio_groups(&plan).await;
+    }
+
+    async fn reconcile_studio_groups(&self, plan: &crate::golive_plan::EncodePlan) {
+        let Ok(host) = self.studio_host() else { return };
+        let g = self.golive();
+        if lock(&g.active_groups).is_empty() {
+            return;
+        }
+        let cfg = self.golive_config();
+        let specs = self.encode_group_specs_for_plan(&cfg, plan);
+        let desired_ids: std::collections::HashSet<GroupId> = specs.iter().map(|s| s.id.clone()).collect();
+        for spec in &specs {
+            let same_running = lock(&g.active_groups).get(&spec.id).is_some_and(|prev| prev == spec);
+            if same_running {
+                continue;
+            }
+            let hub = g.ensure_hub(&spec.id, spec.key.canvas);
+            match host.start_encode_group(spec.clone(), hub).await {
+                Ok(true) => {
+                    lock(&g.active_groups).insert(spec.id.clone(), spec.clone());
+                }
+                Ok(false) => {
+                    g.remove_hub(&spec.id);
+                }
+                Err(e) => {
+                    tracing::warn!(group = %spec.id, error = %e, "couldn't start planned encode group mid-stream");
+                }
+            }
+        }
+        let in_use: std::collections::HashSet<GroupId> =
+            lock(&g.running).values().map(|r| r.group_id.clone()).collect();
+        let switch_held = lock(&g.switching_groups).clone();
+        let stale: Vec<GroupId> = lock(&g.active_groups)
+            .keys()
+            .filter(|id| !desired_ids.contains(*id) && !in_use.contains(*id) && !switch_held.contains(*id))
+            .cloned()
+            .collect();
+        for id in stale {
+            lock(&g.active_groups).remove(&id);
+            if let Err(e) = host.stop_encode_group(&id).await {
+                tracing::warn!(group = %id, error = %e, "couldn't stop unneeded encode group");
+            }
+            g.remove_hub(&id);
+        }
+    }
+
+    fn encode_group_specs_for_plan(
+        &self,
+        cfg: &GoLiveConfig,
+        plan: &crate::golive_plan::EncodePlan,
+    ) -> Vec<crate::studio_host::EncodeGroupSpec> {
+        let mut specs: Vec<crate::studio_host::EncodeGroupSpec> =
+            plan.groups.iter().map(encode_group_spec_from).collect();
+        let has_main = specs.iter().any(|s| s.id == GROUP_MAIN);
+        let any_direct = cfg.destinations.iter().any(|d| d.enabled && d.url.as_deref().and_then(direct_kind).is_some());
+        let record_shares = self.cached_host_budget_info().is_some_and(|i| i.record_shares_main)
+            || (*lock(&self.golive().studio_video)).is_some_and(|c| c.record_shares_main);
+        if !has_main && (specs.is_empty() || any_direct || record_shares) {
+            let studio = (*lock(&self.golive().studio_video)).unwrap_or_default();
+            let main_key = plan.main.clone();
+            specs.insert(
+                0,
+                crate::studio_host::EncodeGroupSpec {
+                    id: GROUP_MAIN.to_string(),
+                    key: main_key,
+                    extra_tracks: Vec::new(),
+                    vod_track: studio.vod_track,
+                    is_light: false,
+                    is_twitch_eb: false,
+                },
+            );
+        }
+        specs
+    }
+
     /// Each platform Go live runs: whether it is live, what it skipped and for how long (auto quality
     /// judges the upload by them together).
     pub(crate) fn golive_senders(&self) -> Vec<ferrocast_core::auto_quality::Dest> {
@@ -2163,7 +2446,7 @@ impl Engine {
         if self.on_light(d) {
             return None;
         }
-        let plan = self.plan_golive_encodes(PcBudget::unknown());
+        let plan = self.plan_golive_encodes(self.cached_pc_budget());
         let (group_id, hub) = self.resolve_hub_for_destination(d, Some(&plan));
         if group_id != GROUP_MAIN && hub.live().borrow().on {
             return None;
@@ -2241,7 +2524,7 @@ impl Engine {
     fn upload_now(&self, cfg: &GoLiveConfig) -> Option<UploadCheck> {
         let g = self.golive();
         let last = lock(&g.upload).clone()?;
-        let plan = self.plan_golive_encodes(PcBudget::unknown());
+        let plan = self.plan_golive_encodes(self.cached_pc_budget());
         let rate = |d: &DestinationConfig| {
             // What the destination really gets: its resolved encode group's measured rate if live.
             let live_rate = self.resolve_hub_for_destination(d, Some(&plan)).1.stats().kbps;
@@ -2370,51 +2653,307 @@ impl Engine {
     }
 
     /// Sets per-destination stream quality (`same_as_main` or explicit `custom` encode settings).
+    /// When the destination is live, starts or reuses the target encode group, keeps the existing
+    /// forwarder live until the target hub emits its first IDR keyframe (with timeout + Stop cancellation),
+    /// atomically swaps only this destination's forwarder, and stops the old encode group once refcount reaches 0.
     pub async fn set_golive_quality(&self, id: &str, quality: DestinationQuality) -> Result<GoLiveConfig, EngineError> {
         let studio = self.current_studio_cap_config().await;
-        let one_at_a_time = self.config_lock().await;
-        let mut cfg = self.golive_config();
-        let ignore = cfg.advanced.ignore_service_limits;
-        let d = cfg.destinations.iter_mut().find(|d| d.id == id).ok_or(EngineError::NotFound("destination"))?;
-        if let DestinationQuality::Custom(ref q) = quality {
-            if d.url.as_deref().and_then(direct_kind).is_some() {
-                return Err(EngineError::Invalid(
-                    "quality: SRT, RIST and WebRTC servers get the full stream from the Studio.".into(),
+        let host_vert = self.cached_host_budget_info().and_then(|i| i.vertical_size);
+        let (cfg_snapshot, moved_snapshot, live_and_active) = {
+            let _one_at_a_time = self.config_lock().await;
+            let mut cfg = self.golive_config();
+            let ignore = cfg.advanced.ignore_service_limits;
+            let d = cfg.destinations.iter_mut().find(|d| d.id == id).ok_or(EngineError::NotFound("destination"))?;
+            if let DestinationQuality::Custom(ref q) = quality {
+                if d.url.as_deref().and_then(direct_kind).is_some() {
+                    return Err(EngineError::Invalid(
+                        "quality: SRT, RIST and WebRTC servers get the full stream from the Studio.".into(),
+                    ));
+                }
+                if d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main {
+                    return Err(EngineError::Invalid(
+                        "quality: turn off Twitch Enhanced Broadcasting before choosing a custom quality.".into(),
+                    ));
+                }
+                let (canvas_w, canvas_h, canvas_fps) = if d.canvas == Canvas::Vertical {
+                    let (vw, vh) = host_vert.unwrap_or((1080, 1920));
+                    (vw, vh, studio.fps.max(1))
+                } else {
+                    (studio.canvas_width, studio.canvas_height, studio.fps.max(1))
+                };
+                let limit = (!ignore).then(|| probe::ceiling(d.kind, d.enhanced)).flatten();
+                q.validate(d.canvas, canvas_w, canvas_h, canvas_fps, limit.as_ref(), ignore)
+                    .map_err(|e| EngineError::Invalid(format!("quality: {e}")))?;
+            }
+            if d.quality == quality && !d.light {
+                return Ok(cfg);
+            }
+            d.quality = quality.clone();
+            d.light = false;
+            let moved = d.clone();
+            let failing = lock(&self.golive().backup).failing.clone();
+            let live_active =
+                self.golive_stream_running() && (moved.enabled || destination_sends(&cfg, &failing, &moved));
+            if !live_active {
+                self.save_golive(cfg.clone()).await?;
+                return Ok(cfg);
+            }
+            (cfg, moved, live_active)
+        };
+        let _ = live_and_active;
+
+        let g = self.golive();
+        if !g.studio_live.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(refused(
+                "golive_needs_new_encode",
+                "Stop and start the stream again to change a destination's quality while streaming from OBS.",
+                "Stop and start the stream in OBS again, or switch to Ferrocast Studio for live per-destination switching.",
+            ));
+        }
+
+        // Per-destination switch guard (`409` while a switch for `id` is already running).
+        struct DestSwitchGuard {
+            engine: Engine,
+            id: String,
+            held_group: Option<GroupId>,
+        }
+        impl Drop for DestSwitchGuard {
+            fn drop(&mut self) {
+                let g = self.engine.golive();
+                lock(&g.switching).remove(&self.id);
+                if let Some(gid) = self.held_group.take() {
+                    lock(&g.switching_groups).remove(&gid);
+                }
+            }
+        }
+        {
+            let mut active_sw = lock(&g.switching);
+            if !active_sw.insert(id.to_string()) {
+                return Err(EngineError::Conflict(
+                    "A quality switch is already in progress for this destination.".into(),
                 ));
             }
-            if d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main {
-                return Err(EngineError::Invalid(
-                    "quality: turn off Twitch Enhanced Broadcasting before choosing a custom quality.".into(),
+        }
+        let mut guard = DestSwitchGuard { engine: self.clone(), id: id.to_string(), held_group: None };
+
+        let my_gen = g.switch_seq.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        lock(&g.switch_gen).insert(id.to_string(), my_gen);
+        let mut cancel_rx = lock(&g.stream_cancel).subscribe();
+        let timeout = *lock(&g.keyframe_wait_timeout);
+
+        let budget = self.refresh_pc_budget().await;
+        let planner_in = self.planner_input_for(&cfg_snapshot, &studio, budget.clone());
+        let plan = crate::golive_plan::plan_encodes(&planner_in);
+        if matches!(quality, DestinationQuality::Custom(_))
+            && plan.budget.status == crate::golive_plan::BudgetStatus::Over
+        {
+            return Err(refused(
+                "encode_budget_exceeded",
+                plan.budget
+                    .note
+                    .clone()
+                    .unwrap_or_else(|| "This quality would exceed your computer's encode limit.".into()),
+                "Lower main quality or keep more destinations on Same as main.",
+            ));
+        }
+
+        let target_group_id = plan.destinations.get(id).map_or_else(
+            || match moved_snapshot.canvas {
+                Canvas::Main => GROUP_MAIN.to_string(),
+                Canvas::Vertical => GROUP_VERTICAL.to_string(),
+            },
+            |pd| pd.group_id.clone(),
+        );
+        let target_spec =
+            plan.groups.iter().find(|grp| grp.id == target_group_id).map(encode_group_spec_from).unwrap_or_else(|| {
+                crate::studio_host::EncodeGroupSpec {
+                    id: target_group_id.clone(),
+                    key: match moved_snapshot.canvas {
+                        Canvas::Vertical => {
+                            planner_in.vertical.unwrap_or_else(|| studio.as_vertical_encode(1080, 1920)).as_key()
+                        }
+                        Canvas::Main => studio.as_main_encode().as_key(),
+                    },
+                    extra_tracks: Vec::new(),
+                    vod_track: moved_snapshot.kind == Service::Twitch && studio.vod_track,
+                    is_light: target_group_id == GROUP_LIGHT,
+                    is_twitch_eb: target_group_id == GROUP_TWITCH_EB,
+                }
+            });
+
+        let target_hub = g.ensure_hub(&target_group_id, moved_snapshot.canvas);
+        lock(&g.switching_groups).insert(target_group_id.clone());
+        guard.held_group = Some(target_group_id.clone());
+
+        let old_group_id = lock(&g.running).get(id).map(|r| r.group_id.clone());
+        let already_live = target_hub.live().borrow().on;
+        let mut started_here: Option<GroupId> = None;
+
+        if !already_live {
+            let host = self.studio_host()?;
+            if *cancel_rx.borrow() || !self.golive_stream_running() {
+                return Err(refused(
+                    "golive_switch_cancelled",
+                    "The stream stopped before the quality switch completed.",
+                    "Start streaming again to apply the new quality.",
                 ));
             }
-            let (canvas_w, canvas_h, canvas_fps) = if d.canvas == Canvas::Vertical {
-                (1080, 1920, studio.fps.max(1))
-            } else {
-                (studio.canvas_width, studio.canvas_height, studio.fps.max(1))
+            match host.start_encode_group(target_spec.clone(), target_hub.clone()).await {
+                Ok(true) => {
+                    started_here = Some(target_group_id.clone());
+                    lock(&g.active_groups).insert(target_group_id.clone(), target_spec.clone());
+                }
+                Ok(false) => {
+                    g.remove_hub(&target_group_id);
+                    return Err(refused(
+                        "golive_needs_new_encode",
+                        "This host doesn't support live multi-encode switching.",
+                        "Stop and start the stream again to apply this quality.",
+                    ));
+                }
+                Err(e) => {
+                    g.remove_hub(&target_group_id);
+                    return Err(crate::studio_host::failed(e));
+                }
+            }
+        }
+
+        let wait_res = await_hub_idr(&target_hub, &mut cancel_rx, timeout).await;
+        let gen_current = lock(&g.switch_gen).get(id).copied() == Some(my_gen);
+        let live_still = self.golive_stream_running();
+        if wait_res.is_err() || *cancel_rx.borrow() || !gen_current || !live_still {
+            self.cleanup_failed_switch_group(started_here.as_deref()).await;
+            return match wait_res {
+                Err(SwitchWaitError::Cancelled) => Err(refused(
+                    "golive_switch_cancelled",
+                    "The stream stopped before the quality switch completed.",
+                    "The previous stream stayed live until the stop requested.",
+                )),
+                Err(SwitchWaitError::Timeout) => Err(refused(
+                    "golive_switch_timeout",
+                    "The new encode didn't emit a keyframe in time, so your existing destination stream stayed live.",
+                    "Try again or check encoder load.",
+                )),
+                Err(SwitchWaitError::HubEnded) => Err(refused(
+                    "golive_switch_cancelled",
+                    "The new encode stopped before sending a keyframe.",
+                    "Your existing destination stream stayed live.",
+                )),
+                Ok(()) => Err(refused(
+                    "golive_switch_cancelled",
+                    "The quality switch was superseded before completing.",
+                    "Your existing destination stream stayed live.",
+                )),
             };
-            let limit = (!ignore).then(|| probe::ceiling(d.kind, d.enhanced)).flatten();
-            q.validate(d.canvas, canvas_w, canvas_h, canvas_fps, limit.as_ref(), ignore)
-                .map_err(|e| EngineError::Invalid(format!("quality: {e}")))?;
         }
-        if d.quality == quality && !d.light {
-            return Ok(cfg);
+
+        // Ensure target group is active in registry and resolve outbound target BEFORE dropping old forwarder.
+        let dest = match self.resolve(&moved_snapshot).await {
+            Ok(d) => d,
+            Err(why) => {
+                self.cleanup_failed_switch_group(started_here.as_deref()).await;
+                return Err(refused(
+                    "golive_dest_error",
+                    format!("{} couldn't reconnect with the new quality: {why}", dest_name(&moved_snapshot)),
+                    "Your existing destination stream stayed live.",
+                ));
+            }
+        };
+
+        // Persist the new quality while re-checking stream didn't stop mid-resolve.
+        let final_cfg = {
+            let _one_at_a_time = self.config_lock().await;
+            if *cancel_rx.borrow() || !self.golive_stream_running() {
+                self.cleanup_failed_switch_group(started_here.as_deref()).await;
+                return Err(refused(
+                    "golive_switch_cancelled",
+                    "The stream stopped before the quality switch completed.",
+                    "Start streaming again to apply the new quality.",
+                ));
+            }
+            let mut cfg = self.golive_config();
+            if let Some(d) = cfg.destinations.iter_mut().find(|d| d.id == id) {
+                d.quality = quality;
+                d.light = false;
+            }
+            if let Err(e) = self.save_golive(cfg.clone()).await {
+                self.cleanup_failed_switch_group(started_here.as_deref()).await;
+                return Err(e);
+            }
+            cfg
+        };
+
+        // Spawn the new forwarder cleanly on `target_hub`, atomically replace `g.running[id]`,
+        // then stop ONLY the old forwarder (`old.stop.send_replace(true)`).
+        lock(&g.blocked).remove(id);
+        lock(&g.failed).remove(id);
+        lock(&g.failed_alerted).remove(id);
+        let (health_tx, health) = watch::channel(Health {
+            state: PushState::Waiting,
+            kbps: 0,
+            dropped: 0,
+            sent: 0,
+            link: None,
+            via: None,
+            since_ms: 0,
+        });
+        let (stop, stop_rx) = watch::channel(false);
+        tokio::spawn(ferrocast_golive::push::run(dest, target_hub, health_tx, stop_rx));
+        let prev = lock(&g.running)
+            .insert(id.to_string(), Running { stop, health, group_id: target_group_id.clone(), light: false });
+        if let Some(old) = prev {
+            old.stop.send_replace(true);
         }
-        d.quality = quality;
-        d.light = false;
-        let moved = d.clone();
-        if moved.enabled && self.golive_stream_running() {
-            let now: Vec<DestinationConfig> = cfg.destinations.clone();
-            if let Some(why) = self.midstream_misfit(&now, &moved) {
-                return Err(refused("golive_needs_new_encode", why, "Stop and start the stream again to change it."));
+
+        // Drop guard's `switching_groups` hold BEFORE checking whether `old_group_id` can retire.
+        if let Some(gid) = guard.held_group.take() {
+            lock(&g.switching_groups).remove(&gid);
+        }
+        if let Some(old_gid) = old_group_id
+            && old_gid != target_group_id
+        {
+            self.stop_group_if_unused(&old_gid, &final_cfg).await;
+        }
+        self.send_golive();
+        Ok(final_cfg)
+    }
+
+    async fn cleanup_failed_switch_group(&self, started_here: Option<&str>) {
+        let Some(gid) = started_here else { return };
+        let g = self.golive();
+        let still_used = lock(&g.running).values().any(|r| r.group_id == gid);
+        if still_used {
+            return;
+        }
+        lock(&g.active_groups).remove(gid);
+        if let Ok(host) = self.studio_host() {
+            let _ = host.stop_encode_group(gid).await;
+        }
+        g.remove_hub(gid);
+    }
+
+    async fn stop_group_if_unused(&self, group_id: &str, cfg: &GoLiveConfig) {
+        let g = self.golive();
+        let in_use = lock(&g.running).values().any(|r| r.group_id == group_id);
+        if in_use || lock(&g.switching_groups).contains(group_id) {
+            return;
+        }
+        if group_id == GROUP_MAIN {
+            let any_direct =
+                cfg.destinations.iter().any(|d| d.enabled && d.url.as_deref().and_then(direct_kind).is_some());
+            let record_shares = self.cached_host_budget_info().is_some_and(|i| i.record_shares_main)
+                || (*lock(&g.studio_video)).is_some_and(|c| c.record_shares_main);
+            if any_direct || record_shares {
+                return;
             }
         }
-        self.save_golive(cfg.clone()).await?;
-        drop(one_at_a_time);
-        if let Some(r) = lock(&self.golive().running).remove(id) {
-            r.stop.send_replace(true);
+        if lock(&g.active_groups).remove(group_id).is_some()
+            && let Ok(host) = self.studio_host()
+            && let Err(e) = host.stop_encode_group(group_id).await
+        {
+            tracing::warn!(group = %group_id, error = %e, "couldn't stop retired encode group");
         }
-        self.reconcile_midstream().await;
-        Ok(cfg)
+        g.remove_hub(group_id);
     }
 
     /// Twitch Enhanced Broadcasting for the Studio stream about to start (`out` its size,
@@ -3080,7 +3619,11 @@ impl Engine {
         let (main_on, vertical_on, light_on) =
             (g.main_hub().live().borrow().on, g.vertical_hub().live().borrow().on, g.light_hub().live().borrow().on);
         let cfg = self.golive_config();
-        let plan = self.plan_golive_encodes(PcBudget::unknown());
+        let budget = self.refresh_pc_budget().await;
+        let plan = self.plan_golive_encodes(budget);
+        if g.studio_live.load(std::sync::atomic::Ordering::Acquire) && !lock(&g.active_groups).is_empty() {
+            self.reconcile_studio_groups(&plan).await;
+        }
         let on = |d: &DestinationConfig| {
             let (_, target_hub) = self.resolve_hub_for_destination(d, Some(&plan));
             if target_hub.live().borrow().on {
@@ -3096,6 +3639,9 @@ impl Engine {
             cfg.destinations.iter().filter(|d| destination_sends(&cfg, &failing, d) && on(d)).cloned().collect();
         // One whose target encode hub changed (e.g. moved to/from lighter or a dedicated group) restarts there.
         for d in &want {
+            if lock(&g.switching).contains(&d.id) {
+                continue;
+            }
             let (target_group, _) = self.resolve_hub_for_destination(d, Some(&plan));
             let target_light = target_group == GROUP_LIGHT || self.on_light(d);
             let moved =
@@ -3105,7 +3651,8 @@ impl Engine {
             }
         }
         let wanted = |id: &String| want.iter().any(|d| &d.id == id);
-        let stale: Vec<String> = lock(&g.running).keys().filter(|id| !wanted(id)).cloned().collect();
+        let stale: Vec<String> =
+            lock(&g.running).keys().filter(|id| !wanted(id) && !lock(&g.switching).contains(*id)).cloned().collect();
         for id in stale {
             if let Some(r) = lock(&g.running).remove(&id) {
                 r.stop.send_replace(true);
@@ -3119,6 +3666,7 @@ impl Engine {
             // The next stream starts with every destination given its own chance again.
             *lock(&g.backup) = BackupState::default();
             lock(&g.quality).reset();
+            lock(&g.active_groups).clear();
         }
         // Apply stream caps (e.g. WebRTC no-B-frames) BEFORE launching new direct destinations so
         // an already-live Studio stream reshapes before WHIP subscribes to it.
@@ -3139,6 +3687,10 @@ impl Engine {
             self.start_destination(&d).await;
         }
         self.reconcile_cut().await;
+        // Clean up any encode groups left unreferenced after stale destinations stopped.
+        if g.studio_live.load(std::sync::atomic::Ordering::Acquire) && !lock(&g.active_groups).is_empty() {
+            self.reconcile_studio_groups(&plan).await;
+        }
         // The Studio's vertical and lighter streams follow the ticked platforms and the source.
         self.studio_sync_vertical().await;
         self.studio_sync_light().await;
@@ -3295,7 +3847,7 @@ impl Engine {
                     via: None,
                     since_ms: 0,
                 });
-                let plan = self.plan_golive_encodes(PcBudget::unknown());
+                let plan = self.plan_golive_encodes(self.cached_pc_budget());
                 let (group_id, hub) = self.resolve_hub_for_destination(d, Some(&plan));
                 let on_light = group_id == GROUP_LIGHT || self.on_light(d);
                 let (stop, stop_rx) = watch::channel(false);
@@ -3728,7 +4280,7 @@ impl Engine {
         let cfg = self.golive_config();
         let now_ms = u64::try_from(now().0).unwrap_or(0);
         let studio_main = (*lock(&g.studio_video)).unwrap_or_default().as_main_encode();
-        let plan = self.plan_golive_encodes(PcBudget::unknown());
+        let plan = self.plan_golive_encodes(self.cached_pc_budget());
         let any_whip_simulcast = cfg.destinations.iter().any(|d| d.enabled && self.simulcast(d));
         let light_key = light_encode_key(&studio_main, studio_main.no_bframes || any_whip_simulcast);
         // RTMP destinations on the main picture whose encode is heavier than the lighter fallback
@@ -4005,6 +4557,65 @@ pub(crate) async fn run(engine: Engine) {
         engine.quality_tick().await;
         engine.protect_tick().await;
         engine.send_golive();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchWaitError {
+    Timeout,
+    Cancelled,
+    HubEnded,
+}
+
+fn encode_group_spec_from(g: &crate::golive_plan::EncodeGroup) -> crate::studio_host::EncodeGroupSpec {
+    crate::studio_host::EncodeGroupSpec {
+        id: g.id.clone(),
+        key: g.key.clone(),
+        extra_tracks: g.extra_tracks.clone(),
+        vod_track: g.vod_track,
+        is_light: g.is_light,
+        is_twitch_eb: g.is_twitch_eb,
+    }
+}
+
+async fn await_hub_idr(
+    hub: &Hub,
+    cancel_rx: &mut watch::Receiver<bool>,
+    timeout: std::time::Duration,
+) -> Result<(), SwitchWaitError> {
+    if *cancel_rx.borrow() {
+        return Err(SwitchWaitError::Cancelled);
+    }
+    let mut sub = hub.subscribe();
+    if hub.live().borrow().on && hub.newest_key_ts().is_some() {
+        return Ok(());
+    }
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return Err(SwitchWaitError::Timeout),
+            res = cancel_rx.changed() => {
+                if res.is_err() || *cancel_rx.borrow() {
+                    return Err(SwitchWaitError::Cancelled);
+                }
+            }
+            msg = sub.rx.recv() => match msg {
+                Ok(ferrocast_golive::hub::Frame::Video { key: true, .. }) => return Ok(()),
+                Ok(ferrocast_golive::hub::Frame::End) => return Err(SwitchWaitError::HubEnded),
+                Ok(_) => {
+                    if hub.live().borrow().on && hub.newest_key_ts().is_some() {
+                        return Ok(());
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if hub.live().borrow().on && hub.newest_key_ts().is_some() {
+                        return Ok(());
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(SwitchWaitError::HubEnded),
+            }
+        }
     }
 }
 

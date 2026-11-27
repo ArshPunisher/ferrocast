@@ -215,7 +215,7 @@ impl PcBudget {
                 Self {
                     source: if valid_bench.is_some() { BudgetSource::Bench } else { BudgetSource::HwDefault },
                     limit_mpx_s: Some(valid_bench.map_or(125.0, |b| b.max_mpx_s)),
-                    max_sessions: Some(valid_bench.and_then(|b| b.max_sessions_ok).map_or(2, |m| m.min(2).max(1))),
+                    max_sessions: Some(valid_bench.and_then(|b| b.max_sessions_ok).map_or(2, |m| m.clamp(1, 2))),
                     reserve_spare_session: false,
                     stream_is_software: false,
                     note: valid_bench.is_none().then(|| {

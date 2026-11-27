@@ -186,6 +186,7 @@ impl Engine {
                     *engine.studio().last_watch_mono.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     *engine.studio().scene_now.lock().unwrap_or_else(|p| p.into_inner()) = None;
                     *engine.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+                    engine.studio().group_auto_quality.lock().unwrap_or_else(|p| p.into_inner()).clear();
                     *engine.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     was_live = live;
                 }
@@ -251,41 +252,111 @@ impl Engine {
         }
     }
 
-    /// Auto quality: trouble getting the stream out lowers its bitrate a step, calm raises it
-    /// back (when Go live's switch is on).
-    /// Auto quality's look at the sender's skipped packets (read once a tick).
+    /// Auto quality: trouble getting the stream out lowers an encode group's bitrate a step,
+    /// calm raises it back (when Go live's switch is on). Scoped per encode group so one struggling
+    /// group never drags down healthy destinations on another group.
     pub(crate) async fn auto_quality_tick_with(&self, feed_dropped: u64) {
+        self.auto_quality_tick_at(now().0, feed_dropped).await;
+    }
+
+    pub(crate) async fn auto_quality_tick_at(&self, ts: i64, feed_dropped: u64) {
         let Ok(host) = self.studio_host() else { return };
         let (_, paused) = self.golive_trouble();
-        let senders = self.golive_senders();
-        // Live with nothing sending to a platform (kept on for a recording): no upload to judge,
-        // so the bitrate isn't stepped down or up for it.
-        if senders.is_empty() && self.golive_stream_running() {
-            return;
-        }
-        let s = ferrocast_core::auto_quality::Signals { dests: senders, feed_dropped, paused };
-        let changed = {
-            let mut aq = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
-            // Switched off, it still watches: the status bar says when the upload struggles.
-            if !self.golive_config().auto_quality {
-                aq.observe(now().0, s);
+        let grouped = self.golive_group_senders();
+        let enabled = self.golive_config().auto_quality;
+
+        if grouped.is_empty() {
+            let senders = self.golive_senders();
+            // Live with nothing sending to a platform (kept on for a recording): no upload to judge.
+            if senders.is_empty() && self.golive_stream_running() {
                 return;
             }
-            aq.tick(now().0, s)
-        };
-        let Some(pct) = changed else { return };
-        tracing::info!(pct, "auto quality changed the stream's bitrate share");
-        if let Err(e) = host.set_live_quality(pct).await {
-            tracing::warn!(error = %e, "auto quality couldn't change the bitrate");
+            let s = ferrocast_core::auto_quality::Signals { dests: senders, feed_dropped, paused };
+            let changed = {
+                let mut aq = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+                if !enabled {
+                    aq.observe(ts, s);
+                    return;
+                }
+                aq.tick(ts, s)
+            };
+            let Some(pct) = changed else { return };
+            if self.ffenc_handover_session_exhausted() {
+                tracing::warn!(pct, "auto quality skipped bitrate change: no spare FFmpeg/NVENC session left");
+                return;
+            }
+            tracing::info!(pct, "auto quality changed the stream's bitrate share");
+            if let Err(e) = host.set_live_quality(pct).await {
+                tracing::warn!(error = %e, "auto quality couldn't change the bitrate");
+                return;
+            }
+            let alert = if pct >= 100 {
+                LiveAlert::fixed("auto_quality", "warn", "Your stream is back to full quality.")
+            } else {
+                LiveAlert::raised("auto_quality", "warn", format!("Upload struggled: quality is at {pct}%"))
+                    .detail("Ferrocast lowered the quality to keep the stream smooth. It goes back up by itself.")
+            };
+            self.studio_frame("live_alert", &alert);
             return;
         }
-        let alert = if pct >= 100 {
-            LiveAlert::fixed("auto_quality", "warn", "Your stream is back to full quality.")
-        } else {
-            LiveAlert::raised("auto_quality", "warn", format!("Upload struggled: quality is at {pct}%"))
-                .detail("Ferrocast lowered the quality to keep the stream smooth. It goes back up by itself.")
-        };
-        self.studio_frame("live_alert", &alert);
+
+        let group_stats = host.group_stats().await.ok().flatten();
+        let active_ids: std::collections::HashSet<String> = grouped.keys().cloned().collect();
+        let mut group_changes: Vec<(String, u8, u8)> = Vec::new();
+        {
+            let mut map = self.studio().group_auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+            map.retain(|k, _| active_ids.contains(k));
+            let mut agg_dests = Vec::new();
+            for (gid, senders) in &grouped {
+                let g_dropped = group_stats
+                    .as_ref()
+                    .and_then(|v| v.get(gid))
+                    .and_then(|s| s.get("dropped"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(if gid == crate::golive::GROUP_MAIN { feed_dropped } else { 0 });
+                let sig =
+                    ferrocast_core::auto_quality::Signals { dests: senders.clone(), feed_dropped: g_dropped, paused };
+                let entry = map.entry(gid.clone()).or_default();
+                let prev_pct = entry.pct();
+                if enabled {
+                    if let Some(next_pct) = entry.tick(ts, sig) {
+                        group_changes.push((gid.clone(), prev_pct, next_pct));
+                    }
+                } else {
+                    entry.observe(ts, sig);
+                }
+                agg_dests.extend(senders.iter().cloned());
+            }
+            let min_pct = map.values().map(ferrocast_core::auto_quality::AutoQuality::pct).min().unwrap_or(100);
+            let agg_sig = ferrocast_core::auto_quality::Signals { dests: agg_dests, feed_dropped, paused };
+            let mut legacy = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+            legacy.observe(ts, agg_sig);
+            let _ = min_pct;
+        }
+
+        for (gid, _prev_pct, pct) in group_changes {
+            if self.ffenc_handover_session_exhausted() {
+                // Revert the controller's internal step so it doesn't silently think bitrate changed.
+                let mut map = self.studio().group_auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(aq) = map.get_mut(&gid) {
+                    let _ = aq.back_to_full();
+                }
+                tracing::warn!(group = %gid, pct, "auto quality skipped step: FFmpeg/NVENC session limit reached");
+                continue;
+            }
+            tracing::info!(group = %gid, pct, "auto quality changed encode group bitrate share");
+            if let Err(e) = host.set_group_live_quality(&gid, pct).await {
+                tracing::warn!(group = %gid, error = %e, "auto quality couldn't change the group's bitrate");
+                continue;
+            }
+            let alert = if pct >= 100 {
+                LiveAlert::fixed("auto_quality", "warn", "Your stream is back to full quality.")
+            } else {
+                LiveAlert::raised("auto_quality", "warn", format!("Upload struggled: quality is at {pct}%"))
+                    .detail("Ferrocast lowered the quality to keep the stream smooth. It goes back up by itself.")
+            };
+            self.studio_frame("live_alert", &alert);
+        }
     }
 
     /// The stream's health: the engine's and the network's counters into the score.
@@ -296,6 +367,17 @@ impl Engine {
         let (e, s) = (&v["engine"], &v["stream"]);
         let n = |x: &Value| x.as_u64().unwrap_or(0);
         let (net_dropped, paused) = self.golive_trouble();
+        let quality_pct = {
+            let group_min = self
+                .studio()
+                .group_auto_quality
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .map(ferrocast_core::auto_quality::AutoQuality::pct)
+                .min();
+            group_min.unwrap_or_else(|| self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct())
+        };
         let sample = ferrocast_core::health::Sample {
             frames: n(&e["frames"]),
             lagged: n(&e["lagged"]),
@@ -307,7 +389,7 @@ impl Engine {
             net_dropped,
             reconnecting: s["reconnecting"].as_bool() == Some(true) || self.golive_main_reconnecting().is_some(),
             paused,
-            quality_pct: self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct(),
+            quality_pct,
             cpu: e["cpu"].as_f64().unwrap_or(0.0),
             encoding_ms: n(&e["encoding_ms"]),
             at_ms: u64::try_from(now().0).unwrap_or(0),
@@ -317,19 +399,31 @@ impl Engine {
         h.1 = Some(now);
     }
 
-    /// Auto quality turned off: a lowered stream goes back to full quality.
+    /// Auto quality turned off: lowered streams go back to full quality.
     pub(crate) async fn auto_quality_off(&self) {
-        let lowered = {
+        let lowered_groups: Vec<String> = {
+            let mut map = self.studio().group_auto_quality.lock().unwrap_or_else(|p| p.into_inner());
+            map.iter_mut().filter_map(|(gid, aq)| aq.back_to_full().then(|| gid.clone())).collect()
+        };
+        let legacy_lowered = {
             let mut aq = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner());
             aq.back_to_full()
         };
-        if !lowered {
+        if lowered_groups.is_empty() && !legacy_lowered {
             return;
         }
-        if let Ok(host) = self.studio_host()
-            && let Err(e) = host.set_live_quality(100).await
-        {
-            tracing::warn!(error = %e, "auto quality couldn't put the bitrate back");
+        if let Ok(host) = self.studio_host() {
+            for gid in &lowered_groups {
+                if let Err(e) = host.set_group_live_quality(gid, 100).await {
+                    tracing::warn!(group = %gid, error = %e, "auto quality couldn't put the group's bitrate back");
+                }
+            }
+            if lowered_groups.is_empty()
+                && legacy_lowered
+                && let Err(e) = host.set_live_quality(100).await
+            {
+                tracing::warn!(error = %e, "auto quality couldn't put the bitrate back");
+            }
         }
         self.studio_frame(
             "live_alert",
@@ -616,5 +710,147 @@ mod tests {
         assert_eq!(one["KREO"]["peak"], json!([-30.0, -31.0]));
         assert_eq!(one["KREO"]["gated"], json!(false));
         assert_eq!(peak_hold(&[]), Value::Null);
+    }
+
+    #[tokio::test]
+    async fn per_group_auto_quality_throttles_only_struggling_group_and_guards_nvenc_sessions() {
+        use crate::golive::{Canvas, GROUP_MAIN};
+        use crate::studio_host::{HostBudgetInfo, StudioHost, StudioSettings, StudioStatus};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct GroupMockHost {
+            budget: Mutex<Option<HostBudgetInfo>>,
+            stats: Mutex<Value>,
+            group_calls: Mutex<Vec<(String, u8)>>,
+            legacy_calls: Mutex<Vec<u8>>,
+        }
+
+        #[async_trait::async_trait]
+        impl StudioHost for GroupMockHost {
+            async fn status(&self) -> StudioStatus {
+                Default::default()
+            }
+            async fn start(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn stop(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn kinds(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn options(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn preview(&self, _rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+                Ok(())
+            }
+            async fn defaults(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn act(&self, _act: crate::studio_host::StudioAct) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn settings(&self) -> StudioSettings {
+                Default::default()
+            }
+            async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            async fn stats(&self) -> Result<Value, String> {
+                Ok(json!({}))
+            }
+            async fn record(&self, _on: bool) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn record_pause(&self, _on: bool) -> Result<(), String> {
+                Ok(())
+            }
+            async fn monitoring(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_stop(&self) -> Result<(), String> {
+                Ok(())
+            }
+            async fn stream_stats(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn obs_collections(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn import_obs(&self, _id: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn set_live_quality(&self, pct: u8) -> Result<(), String> {
+                self.legacy_calls.lock().unwrap().push(pct);
+                Ok(())
+            }
+            async fn set_group_live_quality(&self, id: &str, pct: u8) -> Result<(), String> {
+                self.group_calls.lock().unwrap().push((id.to_string(), pct));
+                Ok(())
+            }
+            async fn group_stats(&self) -> Result<Option<Value>, String> {
+                Ok(Some(self.stats.lock().unwrap().clone()))
+            }
+            async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+                self.budget.lock().unwrap().clone()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let host = Arc::new(GroupMockHost {
+            budget: Mutex::new(Some(HostBudgetInfo {
+                os: "windows".into(),
+                encoder_id: "ffmpeg_nvenc".into(),
+                cpu_cores: 8,
+                nvidia_driver_major: Some(525),
+                host_sig: "win|nv=525".into(),
+                ..Default::default()
+            })),
+            stats: Mutex::new(json!({ GROUP_MAIN: { "dropped": 0 }, "g_kick": { "dropped": 0 } })),
+            group_calls: Mutex::new(Vec::new()),
+            legacy_calls: Mutex::new(Vec::new()),
+        });
+        e.set_studio_host(host.clone());
+        let d_yt = e.add_golive_destination("YT", "rtmp://127.0.0.1:19901/app", "k1", Canvas::Main).await.unwrap();
+        let d_kick = e.add_golive_destination("Kick", "rtmp://127.0.0.1:19902/app", "k2", Canvas::Main).await.unwrap();
+        let d_fb = e.add_golive_destination("FB", "rtmp://127.0.0.1:19903/app", "k3", Canvas::Main).await.unwrap();
+
+        let _yt_rx = e.replace_running_health_for_test(&d_yt.id, GROUP_MAIN, 12_000, 60_000);
+        let kick_rx = e.replace_running_health_for_test(&d_kick.id, "g_kick", 6_000, 60_000);
+        let _ = e.refresh_pc_budget().await;
+
+        // 2 active groups against NVENC max=3 -> spare handover session exists; g_kick drops trigger ONLY g_kick step-down.
+        let t0 = now().0;
+        e.auto_quality_tick_at(t0, 0).await;
+        kick_rx.send_modify(|h| h.dropped = 50);
+        e.auto_quality_tick_at(t0 + 12_000, 0).await;
+
+        let calls = host.group_calls.lock().unwrap().clone();
+        assert_eq!(calls, vec![("g_kick".to_string(), 85)], "only struggling group should step down: {calls:?}");
+        assert!(host.legacy_calls.lock().unwrap().is_empty());
+
+        // Exhaust NVENC session cap (3 groups >= 3 sessions on driver <531): further step-downs must be blocked.
+        let fb_rx = e.replace_running_health_for_test(&d_fb.id, "g_fb", 4_000, 60_000);
+        e.auto_quality_tick_at(t0 + 15_000, 0).await;
+        fb_rx.send_modify(|h| h.dropped = 50);
+        host.group_calls.lock().unwrap().clear();
+        e.auto_quality_tick_at(t0 + 30_000, 0).await;
+        assert!(
+            host.group_calls.lock().unwrap().is_empty(),
+            "exhausted NVENC session cap must skip FFmpeg handover bitrate change: {:?}",
+            host.group_calls.lock().unwrap()
+        );
+
+        // Disabling auto_quality restores lowered group (`g_kick`) to 100%.
+        e.auto_quality_off().await;
+        assert!(host.group_calls.lock().unwrap().contains(&("g_kick".to_string(), 100)));
     }
 }

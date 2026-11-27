@@ -8,6 +8,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use ferrocast_golive::Hub;
+pub use ferrocast_golive::flv::VideoCodec as EncodeCodec;
+pub use ferrocast_golive::probe::{Canvas as EncodeCanvas, EncodeKey};
+
 use crate::{Engine, EngineError};
 
 /// Shared-stream ceiling passed to [`StudioHost::set_stream_cap`] when Twitch, Kick, or WebRTC (WHIP) is enabled.
@@ -2821,8 +2825,16 @@ impl Engine {
         }
         // The upload itself struggling (most platforms behind at once): the status bar says
         // so, and not when only the drawing is slow or one platform has trouble of its own.
+        let now_ts = crate::now().0;
+        let group_struggling = self
+            .studio()
+            .group_auto_quality
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|a| a.struggling(now_ts));
         let struggling =
-            self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).struggling(crate::now().0);
+            group_struggling || self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).struggling(now_ts);
         // The stream delay: what it holds while live, or how long its tail still has to go after Stop.
         let drain = self.studio_host().ok().and_then(|h| h.delay_drain());
         let held_mb = v.pointer("/stream/delay_mb").and_then(Value::as_f64).unwrap_or(0.0);
@@ -3160,10 +3172,12 @@ impl Engine {
             self.ffmpeg_first(s.stream_needs_ffmpeg()).await?;
         }
         if !on {
+            self.cancel_golive_switches();
             self.set_studio_live(false);
             // Its Enhanced Broadcasting plan ends with it: OBS going live later sends as usual.
             *crate::golive::lock_enhanced(self) = None;
             crate::golive::clear_applied_cap(self);
+            self.stop_all_studio_encode_groups().await;
             host.stream_stop().await.map_err(failed)?;
             // A countdown (or a show waiting for its live scene) with no stream is over: Go
             // live again must start a new show, not say one is running.
@@ -3174,8 +3188,8 @@ impl Engine {
                 .await
                 .map_or(Value::Null, |also| serde_json::json!({ "also": also })));
         }
-        self.sync_stream_cap().await;
-        let (server, key) = self.golive_ingest().await?;
+        self.reset_golive_switch_cancel();
+        let budget = self.refresh_pc_budget().await;
         // Twitch Enhanced Broadcasting: its other qualities, when Twitch's destination wants it.
         // Not while one already runs: its plan stays with it (Start then only says how it is).
         let running = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
@@ -3185,14 +3199,44 @@ impl Engine {
         let out = s.scale.map_or((s.width, s.height), |[w, h]| (w, h));
         let (tracks, eb_note) =
             if running { (Vec::new(), None) } else { self.enhanced_tracks(out, s.fps, s.twitch_vod_track > 0).await };
-        let mut v = match host.stream_start(server, key, tracks).await {
-            Ok(v) => v,
-            Err(e) => {
-                if !running {
-                    *crate::golive::lock_enhanced(self) = None;
-                    self.set_studio_live(false);
+
+        let multi = if running && !self.golive_uses_encode_groups() {
+            None
+        } else {
+            match self.try_start_studio_encode_groups(&host, &budget).await {
+                Ok(m) => m,
+                Err(e) => {
+                    if !running {
+                        *crate::golive::lock_enhanced(self) = None;
+                        self.set_studio_live(false);
+                    }
+                    return Err(failed(e));
                 }
-                return Err(failed(e));
+            }
+        };
+
+        let (mut v, used_groups) = match multi {
+            Some(mut stats) => {
+                let group_notes = stats
+                    .as_object_mut()
+                    .and_then(|o| o.remove("_group_notes"))
+                    .and_then(|n| n.as_str().map(String::from));
+                (stats, group_notes)
+            }
+            None => {
+                self.sync_stream_cap().await;
+                let (server, key) = self.golive_ingest().await?;
+                let stats = match host.stream_start(server, key, tracks).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if !running {
+                            *crate::golive::lock_enhanced(self) = None;
+                            self.set_studio_live(false);
+                        }
+                        return Err(failed(e));
+                    }
+                };
+                (stats, None)
             }
         };
         // Mark a new stream session (even when `running` was still true during a prior Show's
@@ -3204,11 +3248,15 @@ impl Engine {
         if let Some(note) = eb_note {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
         }
-        if let Some(note) = self.studio_sync_vertical().await {
+        if let Some(note) = used_groups {
             also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
-        }
-        if let Some(note) = self.studio_sync_light().await {
-            also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
+        } else if !self.golive_uses_encode_groups() {
+            if let Some(note) = self.studio_sync_vertical().await {
+                also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
+            }
+            if let Some(note) = self.studio_sync_light().await {
+                also = Some(also.map_or(note.clone(), |a| format!("{a} {note}")));
+            }
         }
         // One short line (`also`), the full words behind the page's (i) (`also_detail`).
         let (also, detail) = one_line(also, "Part of what goes with the stream didn't start");
@@ -3227,6 +3275,10 @@ impl Engine {
     /// starts and whenever Go live's platforms, the source or the vertical picture change →
     /// a note when it should send but can't.
     pub(crate) async fn studio_sync_vertical(&self) -> Option<String> {
+        if self.golive_uses_encode_groups() {
+            self.reconcile_studio_groups_now().await;
+            return None;
+        }
         let host = self.studio_host().ok()?;
         // The wide stream is on (connecting or live) unless it isn't there or failed.
         let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
@@ -3253,6 +3305,10 @@ impl Engine {
     /// Starts or stops the Studio's lighter stream to match: while the Studio streams, it goes
     /// to Go live's light key when a ticked platform takes it → a note when it can't.
     pub(crate) async fn studio_sync_light(&self) -> Option<String> {
+        if self.golive_uses_encode_groups() {
+            self.reconcile_studio_groups_now().await;
+            return None;
+        }
         let host = self.studio_host().ok()?;
         let streaming = host.stream_stats().await.ok().is_some_and(|v| !v.is_null() && v["error"].is_null());
         // For a platform that takes it, or as a WebRTC server's simulcast layer.

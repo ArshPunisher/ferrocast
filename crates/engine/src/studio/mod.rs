@@ -130,8 +130,12 @@ pub(crate) struct Studio {
     pub auto_brb: Mutex<std::collections::BTreeSet<String>>,
     /// The stream's health now (None while it isn't live) and its memory.
     pub live_health: Mutex<(ferrocast_core::health::HealthMeter, Option<ferrocast_core::health::Health>)>,
-    /// Auto quality's state for the stream now.
+    /// Auto quality's summary state across the stream (and fallback when single-group/OBS).
     pub auto_quality: Mutex<ferrocast_core::auto_quality::AutoQuality>,
+    /// Independent auto-quality controllers keyed by active encode group ID so one lagging
+    /// group steps down without dragging unrelated groups' bitrates down.
+    pub group_auto_quality:
+        Mutex<std::collections::HashMap<crate::golive::GroupId, ferrocast_core::auto_quality::AutoQuality>>,
     /// The scene on air while the Studio streams (a change is a chapter marker).
     pub scene_now: Mutex<Option<String>>,
     /// Auto-replies: the rules, compiled, their cooldowns and the send budget.
@@ -187,6 +191,7 @@ impl Default for Studio {
             auto_brb: Mutex::default(),
             live_health: Mutex::default(),
             auto_quality: Mutex::default(),
+            group_auto_quality: Mutex::default(),
             scene_now: Mutex::default(),
             autoreplies: autoreplies::AutoReplies::default(),
             rules_busy: Mutex::default(),
