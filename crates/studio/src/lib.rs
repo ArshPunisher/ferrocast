@@ -182,6 +182,47 @@ pub(crate) fn edge_px(scale: f64) -> u32 {
     (PREVIEW_EDGE * s).round() as u32
 }
 
+/// How far a view snapped outward to whole device pixels reaches past the box the page asked
+/// for, on each side, in points.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Overhang {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
+/// The page's holes (x, y, w, h, corner radius, in points from the asked-for box's top left) as
+/// the snapped view needs them, from the view's own top left. A hole is measured against the
+/// box the page asked for, but the view is that box rounded out to whole device pixels: a hole
+/// that reaches a side of the box (a dialog covering most of the stage is sent as the whole box)
+/// has to reach the view's side too, or a thin strip of picture and shade is left across the
+/// dialog along the right and bottom edges. A hole that stops short of a side keeps its place.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn fit_holes(
+    holes: &[(f64, f64, f64, f64, f64)],
+    over: Overhang,
+    box_w: f64,
+    box_h: f64,
+) -> Vec<(f64, f64, f64, f64, f64)> {
+    // Half a device pixel is well under any gap a page leaves on purpose.
+    const NEAR: f64 = 0.5;
+    holes
+        .iter()
+        .map(|&(x, y, w, h, r)| {
+            let (x1, y1) = (x + w, y + h);
+            let nx0 = if x <= NEAR { (x + over.left).min(0.0) } else { x + over.left };
+            let ny0 = if y <= NEAR { (y + over.top).min(0.0) } else { y + over.top };
+            let nx1 =
+                if x1 >= box_w - NEAR { (x1 + over.left).max(box_w + over.left + over.right) } else { x1 + over.left };
+            let ny1 =
+                if y1 >= box_h - NEAR { (y1 + over.top).max(box_h + over.top + over.bottom) } else { y1 + over.top };
+            (nx0, ny0, nx1 - nx0, ny1 - ny0, r)
+        })
+        .collect()
+}
+
 /// A rectangle in device pixels (at least 1x1).
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) fn px(rect: Rect, scale: f64) -> (u32, u32) {
@@ -759,6 +800,30 @@ pub fn running_apps() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hole_reaching_the_box_reaches_the_snapped_view() {
+        // A 400.4 x 300.3 box on a 2x screen: the view is out to whole pixels, half a pixel
+        // more on the left and top, 0.3 on the right and bottom.
+        let over = Overhang { left: 0.4, top: 0.1, right: 0.3, bottom: 0.4 };
+        // A dialog covering most of the stage is sent as the whole box.
+        let whole = [(0.0, 0.0, 400.4, 300.3, 0.0)];
+        let fit = fit_holes(&whole, over, 400.4, 300.3);
+        let (x, y, w, h, _) = fit[0];
+        assert_eq!((x, y), (0.0, 0.0), "from the view's own corner");
+        assert!((x + w - (400.4 + 0.4 + 0.3)).abs() < 1e-9, "to the view's right edge: {fit:?}");
+        assert!((y + h - (300.3 + 0.1 + 0.4)).abs() < 1e-9, "to the view's bottom edge: {fit:?}");
+        // A hole that stops short of the sides moves with the box and keeps its size.
+        let inner = [(50.0, 40.0, 100.0, 80.0, 12.0)];
+        assert_eq!(fit_holes(&inner, over, 400.4, 300.3), vec![(50.4, 40.1, 100.0, 80.0, 12.0)]);
+        // One reaching past a side already covers the view's side: it stays at least that far.
+        let past = [(300.0, 200.0, 200.0, 200.0, 8.0)];
+        let (x, y, w, h, r) = fit_holes(&past, over, 400.4, 300.3)[0];
+        assert_eq!((x, y, r), (300.4, 200.1, 8.0));
+        assert!(x + w >= 401.1 && y + h >= 300.8, "{x} {y} {w} {h}");
+        // No overhang (a box already on whole pixels) changes nothing.
+        assert_eq!(fit_holes(&whole, Overhang::default(), 400.4, 300.3), whole.to_vec());
+    }
 
     #[test]
     fn preview_sizes_are_device_pixels() {

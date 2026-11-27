@@ -132,6 +132,9 @@ pub(crate) mod mac {
         /// The page's cursor over the picture (an `NSCursor`), kept as this view's cursor area
         /// so AppKit shows it again whenever it redoes the window's cursor areas.
         cursor: std::cell::RefCell<Option<Retained<AnyObject>>>,
+        /// The box the page asked for, in the parent's coordinates: the view is that box
+        /// rounded out to whole device pixels, and the page's holes are measured from the box.
+        wanted: std::cell::Cell<Option<NSRect>>,
     }
 
     impl std::fmt::Debug for PassIvars {
@@ -243,18 +246,23 @@ pub(crate) mod mac {
         best
     }
 
-    fn frame(parent: &NSView, except: Option<&NSView>, x: f64, y: f64, w: f64, h: f64, vh: f64) -> NSRect {
+    /// The box the page asked for, in `parent`'s coordinates.
+    fn wanted(parent: &NSView, except: Option<&NSView>, x: f64, y: f64, w: f64, h: f64, vh: f64) -> NSRect {
         let p = page(parent, except);
         // The page's visible top: `vh` up from the webview's bottom (it can be lower than the
         // webview's top when the page draws under the title bar).
         let vh = if vh > 0.0 && vh <= p.size.height { vh } else { p.size.height };
         // AppKit counts from the bottom unless the view is flipped; the page counts from the top.
         let top = if parent.isFlipped() { p.origin.y + (p.size.height - vh) + y } else { p.origin.y + vh - y - h };
-        // On whole device pixels, covering the box: a frame on a half pixel (the page's boxes
-        // often are) left a row of the GL surface undrawn, a black line along the stage.
+        NSRect::new(NSPoint::new(p.origin.x + x, top), NSSize::new(w.max(1.0), h.max(1.0)))
+    }
+
+    /// `r` on whole device pixels, covering it: a frame on a half pixel (the page's boxes
+    /// often are) left a row of the GL surface undrawn, a black line along the stage.
+    fn snapped(parent: &NSView, r: NSRect) -> NSRect {
         let s = parent.window().map(|w| w.backingScaleFactor()).filter(|s| *s > 0.0).unwrap_or(1.0);
-        let (x0, y0) = (((p.origin.x + x) * s).floor() / s, (top * s).floor() / s);
-        let (x1, y1) = (((p.origin.x + x + w.max(1.0)) * s).ceil() / s, ((top + h.max(1.0)) * s).ceil() / s);
+        let (x0, y0) = ((r.origin.x * s).floor() / s, (r.origin.y * s).floor() / s);
+        let (x1, y1) = (((r.origin.x + r.size.width) * s).ceil() / s, ((r.origin.y + r.size.height) * s).ceil() / s);
         NSRect::new(NSPoint::new(x0, y0), NSSize::new(x1 - x0, y1 - y0))
     }
 
@@ -327,9 +335,10 @@ pub(crate) mod mac {
         // used on the main thread while that window exists.
         let parent: &NSView = unsafe { &*(parent as *const NSView) };
         let pass = PassView::alloc(mtm).set_ivars(PassIvars::default());
+        let box_asked = wanted(parent, None, x, y, w, h, vh);
         // SAFETY: NSView's designated initialiser on a freshly allocated PassView.
-        let pass: Retained<PassView> =
-            unsafe { msg_send![super(pass), initWithFrame: frame(parent, None, x, y, w, h, vh)] };
+        let pass: Retained<PassView> = unsafe { msg_send![super(pass), initWithFrame: snapped(parent, box_asked)] };
+        pass.ivars().wanted.set(Some(box_asked));
         let view: Retained<NSView> = Retained::into_super(pass.clone());
         view.setWantsLayer(true);
         // Kept the same distance from the top when the window's height changes: unflipped,
@@ -422,7 +431,9 @@ pub(crate) mod mac {
             }
             // SAFETY: on the main thread (checked above); `superview` only reads the view tree.
             if let Some(parent) = unsafe { self.view.superview() } {
-                self.view.setFrame(frame(&parent, Some(&self.view), x, y, w, h, vh));
+                let box_asked = wanted(&parent, Some(&self.view), x, y, w, h, vh);
+                self.pass.ivars().wanted.set(Some(box_asked));
+                self.view.setFrame(snapped(&parent, box_asked));
             }
         }
 
@@ -503,6 +514,26 @@ pub(crate) mod mac {
             let layer: Option<Retained<AnyObject>> = unsafe { msg_send![&*self.view, layer] };
             let Some(layer) = layer else { return };
             let b = self.view.bounds();
+            // The page measures holes from its box; the view is that box rounded out to whole
+            // device pixels (see `crate::fit_holes`).
+            let flipped = self.view.isFlipped();
+            let holes = match self.pass.ivars().wanted.get() {
+                Some(want) => {
+                    let f = self.view.frame();
+                    let (before, after) =
+                        (want.origin.y - f.origin.y, f.origin.y + f.size.height - want.origin.y - want.size.height);
+                    // The overhang is under a point: more is the window mid-resize, not rounding.
+                    let ok = |v: f64| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+                    let over = crate::Overhang {
+                        left: ok(want.origin.x - f.origin.x),
+                        right: ok(f.origin.x + f.size.width - want.origin.x - want.size.width),
+                        top: ok(if flipped { before } else { after }),
+                        bottom: ok(if flipped { after } else { before }),
+                    };
+                    crate::fit_holes(holes, over, want.size.width, want.size.height)
+                }
+                None => holes.to_vec(),
+            };
             let inside: Vec<(NSRect, f64)> = holes
                 .iter()
                 .filter_map(|&(x, y, w, h, rad)| {
@@ -525,7 +556,10 @@ pub(crate) mod mac {
                 return;
             }
             let scale: f64 = self.view.window().map(|w| w.backingScaleFactor()).unwrap_or(2.0);
-            let (pw, ph) = ((b.size.width * scale).ceil() as usize, (b.size.height * scale).ceil() as usize);
+            // The view is on whole device pixels; rounding (not rounding up) keeps float noise
+            // from making the mask a pixel bigger than the view, which stretched it.
+            let (pw, ph) =
+                ((b.size.width * scale).round().max(1.0) as usize, (b.size.height * scale).round().max(1.0) as usize);
             let Some(class) = AnyClass::get(c"CALayer") else { return };
             // SAFETY: `+[CALayer layer]` makes a new layer (QuartzCore is linked above).
             let mask: Option<Retained<AnyObject>> = unsafe { msg_send![class, layer] };
