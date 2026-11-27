@@ -5,6 +5,44 @@ the text of its GitHub release. Write it for streamers: what changed for them, i
 words. The Release workflow reads the section whose heading is the version being released
 (`packaging/release-notes.sh`).
 
+## 3.8.0
+
+Pick the quality for each platform, see who is watching, run real polls, let chat talk, and a
+steadier Studio that stays smooth when you resize it.
+
+- **Quality per platform**: each destination in Go live has a small quality chip. One click
+  shows a few choices: Same as main, Best for that platform, or your own resolution, frame rate
+  and bitrate. The lists only offer what the platform accepts and what your computer can encode.
+  Kick never gets more than 1080p (it closes anything bigger), Twitch can still take 1440p with a
+  small note that 1080p is its recommended maximum. Platforms that want the same quality share
+  one encode, so you only pay for what is different. You can change it while live: only that
+  platform switches, your main stream and recording keep going.
+- **Your bitrate, explained**: next to the bitrate setting you now see what each platform really
+  gets (for example "Twitch 6 Mbps (max)").
+- **Watching now and Peak**: viewer counts from Twitch, YouTube and Kick, live on Home while you
+  stream. Peak never goes down during a stream.
+- **Real polls**: polls run as native Twitch and YouTube polls where your account allows it, and
+  as "!vote" in chat everywhere else. New "No timer" option: the poll ends when you press End.
+- **Read chat aloud**: Settings > Text-to-speech can read chat messages: everyone, subs and mods,
+  or only "!tts" messages. Links, emote spam, slurs and your blocked words are skipped, it waits
+  between messages, and Panic mode or deleting a message stops it at once.
+- **Mic**: Clean up my mic never raises the room noise while you are silent, and has an Auto boost
+  switch. The "mic is very quiet" warning only appears while you are actually speaking quietly,
+  and you can dismiss it for the rest of the stream. Remove a sound straight from the Audio list's
+  "..." menu (undo brings it back).
+- **Steadier Studio**: every menu, tooltip and dialog opens fully visible, never hidden behind
+  the preview. Resizing the window is smooth (the preview holds a still picture while you drag),
+  the sidebar folds instantly, and below 900 px the Studio switches to a compact layout.
+- **macOS**: after an update or a restart, Ferrocast opens again in your pinned Dock icon instead
+  of a second one.
+- **Fixes**: Kick closing the stream now says why (over 1080p) instead of blaming multistreaming,
+  chat's pin button no longer overlaps messages, clearer missed-frame and falling-behind details
+  in Stats and the log, and graphics card errors after a restart are gone.
+- **API**: new `GET /api/v1/golive/quality-options` and `PUT /api/v1/golive/destinations/{id}/quality`,
+  `GET /api/v1/polls/capabilities`, chat settings in `/api/v1/tts`, and new fields on Go live
+  destinations (effective quality, shared encode, capped reason). Twitch asks for the
+  `channel:manage:polls` permission the next time you reconnect it.
+
 ## 3.7.0
 
 Your own names and links in every overlay, a calmer layout editor, picking only the parts of a theme
