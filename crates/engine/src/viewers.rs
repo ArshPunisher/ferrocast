@@ -279,8 +279,10 @@ pub(crate) fn effective_next_deadline_since(
 }
 
 fn live_snapshot(engine: &Engine) -> ([bool; 3], [bool; 3]) {
+    let mut golive_ids = engine.golive_running();
+    golive_ids.extend(engine.golive().active_switching_ids());
+    let golive_active = golive_active_platforms_from(&golive_ids, &engine.golive_config().destinations);
     let st = engine.state();
-    let golive_active = golive_active_platforms_from(&engine.golive_running(), &engine.golive_config().destinations);
     let mut active = [false; 3];
     let mut has_conn = [false; 3];
     for (i, p) in PLATFORMS.iter().enumerate() {
@@ -429,7 +431,7 @@ pub(crate) fn overlay_clear_payload(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -442,8 +444,8 @@ mod tests {
 
     use super::*;
 
-    struct FakeClock {
-        origin: Instant,
+    pub(crate) struct FakeClock {
+        pub(crate) origin: Instant,
         now_tx: watch::Sender<Instant>,
         _now_rx: watch::Receiver<Instant>,
         sleep_tx: watch::Sender<(u64, Option<Instant>)>,
@@ -452,19 +454,19 @@ mod tests {
     }
 
     impl FakeClock {
-        fn new() -> Arc<Self> {
+        pub(crate) fn new() -> Arc<Self> {
             let t0 = Instant::now();
             let (now_tx, _now_rx) = watch::channel(t0);
             let (sleep_tx, _sleep_rx) = watch::channel((0u64, None));
             Arc::new(FakeClock { origin: t0, now_tx, _now_rx, sleep_tx, _sleep_rx, sleep_gen: AtomicUsize::new(0) })
         }
 
-        async fn wait_sleep_after(&self, prev_gen: u64) -> (u64, Option<Instant>) {
+        pub(crate) async fn wait_sleep_after(&self, prev_gen: u64) -> (u64, Option<Instant>) {
             let mut rx = self.sleep_tx.subscribe();
             rx.wait_for(|&(g, _)| g > prev_gen).await.map(|v| *v).unwrap_or_default()
         }
 
-        fn advance(&self, d: Duration) {
+        pub(crate) fn advance(&self, d: Duration) {
             self.now_tx.send_modify(|t| *t += d);
         }
     }
@@ -489,7 +491,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct MockViewerConnector {
+    pub(crate) struct MockViewerConnector {
         platform: Platform,
         calls: AtomicUsize,
         script: Mutex<VecDeque<Result<Option<u64>, ConnectorError>>>,
@@ -497,7 +499,7 @@ mod tests {
     }
 
     impl MockViewerConnector {
-        fn new(platform: Platform, fallback: Result<Option<u64>, ConnectorError>) -> Arc<Self> {
+        pub(crate) fn new(platform: Platform, fallback: Result<Option<u64>, ConnectorError>) -> Arc<Self> {
             Arc::new(MockViewerConnector {
                 platform,
                 calls: AtomicUsize::new(0),
@@ -506,14 +508,14 @@ mod tests {
             })
         }
 
-        fn push(&self, items: impl IntoIterator<Item = Result<Option<u64>, ConnectorError>>) {
+        pub(crate) fn push(&self, items: impl IntoIterator<Item = Result<Option<u64>, ConnectorError>>) {
             let mut q = self.script.lock().unwrap();
             for item in items {
                 q.push_back(item);
             }
         }
 
-        fn calls(&self) -> usize {
+        pub(crate) fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
     }

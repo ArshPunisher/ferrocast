@@ -682,6 +682,18 @@ impl Engine {
         }
     }
 
+    fn current_auto_quality_pct(&self) -> u8 {
+        let group_min = self
+            .studio()
+            .group_auto_quality
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(ferrocast_core::auto_quality::AutoQuality::pct)
+            .min();
+        group_min.unwrap_or_else(|| self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct())
+    }
+
     /// The stream's health: the engine's and the network's counters into the score.
     pub(crate) async fn health_tick(&self) {
         let Ok(host) = self.studio_host() else { return };
@@ -690,17 +702,7 @@ impl Engine {
         let (e, s) = (&v["engine"], &v["stream"]);
         let n = |x: &Value| x.as_u64().unwrap_or(0);
         let (net_dropped, paused) = self.golive_trouble();
-        let quality_pct = {
-            let group_min = self
-                .studio()
-                .group_auto_quality
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .values()
-                .map(ferrocast_core::auto_quality::AutoQuality::pct)
-                .min();
-            group_min.unwrap_or_else(|| self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct())
-        };
+        let quality_pct = self.current_auto_quality_pct();
         let sample = ferrocast_core::health::Sample {
             frames: n(&e["frames"]),
             lagged: n(&e["lagged"]),
@@ -740,46 +742,7 @@ impl Engine {
     /// Diagnoses output freezes and falling-behind destinations with queue depth, dropped counts,
     /// and bitrate vs measured upload capacity (rate-limited at warn).
     pub(crate) async fn output_lag_tick(&self, sender: Option<&Value>) {
-        let Some(s) = sender else { return };
-        let active = s["active"].as_bool() == Some(true);
-        let reconnecting = s["reconnecting"].as_bool() == Some(true);
-        let sender_bytes = s["bytes"].as_u64().unwrap_or(0);
-        let sender_dropped = s["dropped"].as_u64().unwrap_or(0);
-        let queue_mb = s["delay_mb"].as_f64().unwrap_or(0.0);
-        let (_, paused) = self.golive_trouble();
-        let dests = self.golive_senders();
-
-        let hit =
-            self.studio().output_lag_watch.lock().unwrap_or_else(|p| p.into_inner()).detect_trouble(&OutputLagTick {
-                at_ms: now().0,
-                sender_active: active,
-                sender_reconnecting: reconnecting,
-                sender_bytes,
-                sender_dropped,
-                dests: &dests,
-                paused,
-            });
-        let Some((cause, sender_kbps, dropped_delta)) = hit else { return };
-
-        let gl = self.golive_view().await;
-        let upload = gl.upload.as_ref().map(|u| (u.verdict.upload_kbps, u.measured_by.clone()));
-        let dest_details = gl
-            .destinations
-            .iter()
-            .filter_map(|d| d.health.as_ref().map(|h| (d.name.clone(), h.dropped, h.kbps)))
-            .collect();
-        let aq_pct = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct();
-        let r = OutputLagWatch::build_report(OutputLagInput {
-            cause,
-            queue_mb,
-            dropped_delta,
-            sender_dropped,
-            sender_kbps,
-            hub_kbps: gl.stats.kbps,
-            upload,
-            auto_quality_pct: aq_pct,
-            dest_details,
-        });
+        let Some(r) = self.build_output_lag_report(sender).await else { return };
         tracing::warn!(
             cause = r.cause,
             queue_mb = r.queue_mb,
@@ -795,6 +758,50 @@ impl Engine {
             "output falling behind: {}",
             r.cause
         );
+    }
+
+    async fn build_output_lag_report(&self, sender: Option<&Value>) -> Option<OutputLagReport> {
+        let s = sender?;
+        let active = s["active"].as_bool() == Some(true);
+        let reconnecting = s["reconnecting"].as_bool() == Some(true);
+        let sender_bytes = s["bytes"].as_u64().unwrap_or(0);
+        let sender_dropped = s["dropped"].as_u64().unwrap_or(0);
+        let queue_mb = s["delay_mb"].as_f64().unwrap_or(0.0);
+        let (_, paused) = self.golive_trouble();
+        let dests = self.golive_senders();
+
+        let (cause, sender_kbps, dropped_delta) =
+            self.studio().output_lag_watch.lock().unwrap_or_else(|p| p.into_inner()).detect_trouble(
+                &OutputLagTick {
+                    at_ms: now().0,
+                    sender_active: active,
+                    sender_reconnecting: reconnecting,
+                    sender_bytes,
+                    sender_dropped,
+                    dests: &dests,
+                    paused,
+                },
+            )?;
+
+        let gl = self.golive_view().await;
+        let upload = gl.upload.as_ref().map(|u| (u.verdict.upload_kbps, u.measured_by.clone()));
+        let dest_details = gl
+            .destinations
+            .iter()
+            .filter_map(|d| d.health.as_ref().map(|h| (d.name.clone(), h.dropped, h.kbps)))
+            .collect();
+        let aq_pct = self.current_auto_quality_pct();
+        Some(OutputLagWatch::build_report(OutputLagInput {
+            cause,
+            queue_mb,
+            dropped_delta,
+            sender_dropped,
+            sender_kbps,
+            hub_kbps: gl.stats.kbps,
+            upload,
+            auto_quality_pct: aq_pct,
+            dest_details,
+        }))
     }
 
     /// Auto quality turned off: lowered streams go back to full quality.
@@ -1682,5 +1689,124 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cause, "output stalled (0 bytes sent)");
+    }
+
+    #[tokio::test]
+    async fn output_lag_tick_reports_per_group_auto_quality_pct() {
+        use crate::golive::{Canvas, GROUP_MAIN};
+        use crate::studio_host::{HostBudgetInfo, StudioHost, StudioSettings, StudioStatus};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct LagHost {
+            budget: HostBudgetInfo,
+        }
+
+        #[async_trait::async_trait]
+        impl StudioHost for LagHost {
+            async fn status(&self) -> StudioStatus {
+                Default::default()
+            }
+            async fn start(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn stop(&self) -> Result<StudioStatus, String> {
+                Err("n/a".into())
+            }
+            async fn kinds(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn options(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn preview(&self, _rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+                Ok(())
+            }
+            async fn defaults(&self, _kind: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn act(&self, _act: crate::studio_host::StudioAct) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn settings(&self) -> StudioSettings {
+                Default::default()
+            }
+            async fn set_settings(&self, _s: StudioSettings) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            async fn stats(&self) -> Result<Value, String> {
+                Ok(json!({}))
+            }
+            async fn record(&self, _on: bool) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn record_pause(&self, _on: bool) -> Result<(), String> {
+                Ok(())
+            }
+            async fn monitoring(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn stream_stop(&self) -> Result<(), String> {
+                Ok(())
+            }
+            async fn stream_stats(&self) -> Result<Value, String> {
+                Ok(Value::Null)
+            }
+            async fn obs_collections(&self) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn import_obs(&self, _id: String) -> Result<Value, String> {
+                Err("n/a".into())
+            }
+            async fn set_group_live_quality(&self, _id: &str, _pct: u8) -> Result<(), String> {
+                Ok(())
+            }
+            async fn group_stats(&self) -> Result<Option<Value>, String> {
+                Ok(Some(json!({ GROUP_MAIN: { "dropped": 0 }, "g_kick": { "dropped": 0 } })))
+            }
+            async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+                Some(self.budget.clone())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        e.set_studio_host(Arc::new(LagHost {
+            budget: HostBudgetInfo {
+                os: "windows".into(),
+                encoder_id: "ffmpeg_nvenc".into(),
+                cpu_cores: 8,
+                nvidia_driver_major: Some(555),
+                host_sig: "win|nv=555".into(),
+                ..Default::default()
+            },
+        }));
+        let d_yt = e.add_golive_destination("YT", "rtmp://127.0.0.1:19911/app", "k1", Canvas::Main).await.unwrap();
+        let d_kick = e.add_golive_destination("Kick", "rtmp://127.0.0.1:19912/app", "k2", Canvas::Main).await.unwrap();
+        let _yt_rx = e.replace_running_health_for_test(&d_yt.id, GROUP_MAIN, 12_000, 60_000);
+        let kick_rx = e.replace_running_health_for_test(&d_kick.id, "g_kick", 6_000, 60_000);
+        let _ = e.refresh_pc_budget().await;
+
+        let t0 = now().0;
+        e.auto_quality_tick_at(t0, 0).await;
+        kick_rx.send_modify(|h| h.dropped = 50);
+        e.auto_quality_tick_at(t0 + 12_000, 0).await;
+        assert_eq!(e.studio().group_auto_quality.lock().unwrap().get("g_kick").unwrap().pct(), 85);
+        assert_eq!(e.studio().auto_quality.lock().unwrap().pct(), 100);
+
+        assert!(
+            e.build_output_lag_report(Some(&json!({ "active": true, "bytes": 100_000, "dropped": 0 }))).await.is_none()
+        );
+        let report = e
+            .build_output_lag_report(Some(&json!({ "active": true, "bytes": 100_000, "dropped": 0 })))
+            .await
+            .expect("stalled sender should produce an output lag report");
+        assert_eq!(report.auto_quality_pct, 85, "output lag report must reflect per-group auto_quality minimum");
+        let _ = Mutex::new(());
     }
 }
