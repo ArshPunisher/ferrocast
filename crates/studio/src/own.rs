@@ -1719,6 +1719,16 @@ impl OwnStream {
         self.drawn.as_ref().and_then(|d| d.shared.engine.output_encoder(d.output))
     }
 
+    /// Approximate per-frame encode time in milliseconds for this output's encoder, while it runs.
+    pub(crate) fn encode_ms(&self) -> Option<f64> {
+        self.drawn.as_ref().and_then(|d| d.shared.engine.output_encode_ms(d.output)).map(f64::from)
+    }
+
+    /// Engine-skipped frames observed since this output started.
+    pub(crate) fn engine_skipped(&self) -> u64 {
+        self.drawn.as_ref().map(|d| d.shared.engine.stats().skipped.saturating_sub(d.from.1)).unwrap_or(0)
+    }
+
     pub(crate) fn last_error(&self) -> Option<String> {
         if let Some(e) = self.drawn.as_ref().and_then(|d| d.shared.engine.output_error(d.output)) {
             return Some(e);

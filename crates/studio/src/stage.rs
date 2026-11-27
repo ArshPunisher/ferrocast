@@ -6801,6 +6801,16 @@ impl StageOutput {
         self.own.encoder()
     }
 
+    /// Approximate per-frame encode time in milliseconds for this output's encoder, while it runs.
+    pub fn encode_ms(&self) -> Option<f64> {
+        self.own.encode_ms()
+    }
+
+    /// Engine-skipped frames observed since this output started.
+    pub fn engine_skipped(&self) -> u64 {
+        self.own.engine_skipped()
+    }
+
     pub fn last_error(&self) -> Option<String> {
         self.own.last_error().or_else(|| {
             self.replay.as_ref().and_then(|(_, d)| d.lock().unwrap_or_else(|e| e.into_inner()).failed.clone())
