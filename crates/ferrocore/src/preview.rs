@@ -4,6 +4,9 @@
 //! canvas too), and a dimming layer while a dialog is open. Into a window's surface
 //! (`present`), or read back (`render_preview`) for tests and screenshots.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
 use crate::compose::Target;
 use crate::{AvError, Compositor, Scene, Transition};
 
@@ -104,10 +107,74 @@ impl Shown<'_> {
     }
 }
 
+/// Coalesces rapid preview surface resize requests without blocking the caller thread.
+#[derive(Debug, Default)]
+pub struct PendingResize {
+    /// Packed `(width << 32) | height` (both >= 1); `0` means no pending resize.
+    packed: AtomicU64,
+    /// True while a live window resize is active so `preview_loop` skips swapchain reconfigures.
+    live_resizing: AtomicBool,
+}
+
+impl PendingResize {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn pack(width: u32, height: u32) -> u64 {
+        (u64::from(width.max(1)) << 32) | u64::from(height.max(1))
+    }
+
+    fn unpack(raw: u64) -> Option<(u32, u32)> {
+        if raw == 0 {
+            return None;
+        }
+        Some((((raw >> 32) as u32).max(1), (raw as u32).max(1)))
+    }
+
+    /// Queues the latest target dimensions in device pixels, overwriting any unconsumed request.
+    pub fn request(&self, width: u32, height: u32) {
+        self.packed.store(Self::pack(width, height), Ordering::Release);
+    }
+
+    /// Marks whether an OS live-resize drag is active.
+    pub fn set_live_resizing(&self, active: bool) {
+        self.live_resizing.store(active, Ordering::Release);
+    }
+
+    /// Whether an OS live-resize drag is active.
+    pub fn is_live_resizing(&self) -> bool {
+        self.live_resizing.load(Ordering::Acquire)
+    }
+
+    /// Returns and clears the latest queued dimensions if no live resize is active.
+    pub fn take_if_ready(&self) -> Option<(u32, u32)> {
+        self.take_after(|| {})
+    }
+
+    /// `take_if_ready`, with `between` run after the live check and before the swap (where a
+    /// drag on another thread can begin; a test makes it do so).
+    fn take_after(&self, between: impl FnOnce()) -> Option<(u32, u32)> {
+        if self.is_live_resizing() {
+            return None;
+        }
+        between();
+        let raw = self.packed.swap(0, Ordering::AcqRel);
+        // A drag may have begun between the check and the swap, and its first size with it:
+        // that size stays queued until the drag settles (a newer one, if any, wins).
+        if raw != 0 && self.is_live_resizing() {
+            let _ = self.packed.compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire);
+            return None;
+        }
+        Self::unpack(raw)
+    }
+}
+
 /// A window surface the preview is presented to.
 pub struct PreviewSurface {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    pending: Arc<PendingResize>,
 }
 
 impl std::fmt::Debug for PreviewSurface {
@@ -119,6 +186,16 @@ impl std::fmt::Debug for PreviewSurface {
 impl PreviewSurface {
     pub fn size(&self) -> (u32, u32) {
         (self.config.width, self.config.height)
+    }
+
+    /// Handle for queuing async surface resizes off the render thread.
+    pub fn pending_resize(&self) -> Arc<PendingResize> {
+        self.pending.clone()
+    }
+
+    /// Queues a resize without blocking on GPU submission or surface locks.
+    pub fn request_resize(&self, width: u32, height: u32) {
+        self.pending.request(width, height);
     }
 }
 
@@ -181,7 +258,7 @@ impl Compositor {
     }
 
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
-    fn surface_from(
+    pub(crate) fn surface_from(
         &self,
         surface: wgpu::Surface<'static>,
         width: u32,
@@ -210,7 +287,7 @@ impl Compositor {
             color_space: Default::default(),
         };
         self.configure(&surface, &config);
-        Ok(PreviewSurface { surface, config })
+        Ok(PreviewSurface { surface, config, pending: Arc::new(PendingResize::new()) })
     }
 
     fn clamped_surface_size(&self, width: u32, height: u32) -> (u32, u32) {
@@ -220,11 +297,27 @@ impl Compositor {
 
     /// The view changed size (device pixels).
     pub fn resize_preview(&self, s: &mut PreviewSurface, width: u32, height: u32) {
+        let _ = s.pending.packed.swap(0, Ordering::AcqRel);
         let (w, h) = self.clamped_surface_size(width, height);
         if (s.config.width, s.config.height) != (w, h) {
             (s.config.width, s.config.height) = (w, h);
             self.configure(&s.surface, &s.config);
         }
+    }
+
+    /// Applies any queued surface resize when no live resize is active.
+    /// Returns `true` if the surface dimensions changed and `configure` ran.
+    pub fn apply_pending_resize(&self, s: &mut PreviewSurface) -> bool {
+        let Some((width, height)) = s.pending.take_if_ready() else {
+            return false;
+        };
+        let (w, h) = self.clamped_surface_size(width, height);
+        if (s.config.width, s.config.height) != (w, h) {
+            (s.config.width, s.config.height) = (w, h);
+            self.configure(&s.surface, &s.config);
+            return true;
+        }
+        false
     }
 
     /// Draws `shown` and presents it in the surface. A frame the window can't take now (hidden,
@@ -633,7 +726,7 @@ fn layout(size: (u32, u32), canvas: (u32, u32), look: &PreviewLook) -> Vec<Verte
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{Item, Picture, Placement};
 
@@ -844,7 +937,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
-    fn test_metal_surface(
+    pub(crate) fn test_metal_surface(
         gpu: &Compositor,
         width: u32,
         height: u32,
@@ -940,6 +1033,67 @@ mod tests {
         );
         drop(layer_b);
         drop(layer_a);
+    }
+
+    #[test]
+    fn pending_resize_coalesces_100_writes_and_gates_on_live_resize() {
+        let pending = PendingResize::new();
+        assert_eq!(pending.take_if_ready(), None);
+
+        pending.set_live_resizing(true);
+        for i in 1..=100u32 {
+            pending.request(640 + i, 360 + i);
+        }
+        assert_eq!(pending.take_if_ready(), None, "must not consume while live resizing");
+
+        pending.set_live_resizing(false);
+        assert_eq!(pending.take_if_ready(), Some((740, 460)));
+        assert_eq!(pending.take_if_ready(), None, "consumed once");
+    }
+
+    #[test]
+    fn a_drag_that_begins_while_a_size_is_taken_keeps_its_size_queued() {
+        let pending = PendingResize::new();
+        pending.request(500, 300);
+        // The drag starts (and queues its first size) after the check, before the swap.
+        let taken = pending.take_after(|| {
+            pending.set_live_resizing(true);
+            pending.request(510, 310);
+        });
+        assert_eq!(taken, None, "no reconfigure mid-drag");
+        assert_eq!(pending.take_if_ready(), None, "still held while the drag lasts");
+        pending.set_live_resizing(false);
+        assert_eq!(pending.take_if_ready(), Some((510, 310)), "the drag's size, once it settles");
+    }
+
+    #[test]
+    fn pending_resize_clamps_zero_dimensions_without_dropping_sentinel() {
+        let pending = PendingResize::new();
+        pending.request(0, 0);
+        assert_eq!(pending.take_if_ready(), Some((1, 1)));
+        assert_eq!(pending.take_if_ready(), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pending_resize_coalesces_100_writes_into_one_metal_reconfigure() {
+        let Ok(gpu) = Compositor::new() else { return };
+        let (layer, mut surf) = test_metal_surface(&gpu, 320, 180);
+        let pending = surf.pending_resize();
+        pending.set_live_resizing(true);
+        for i in 0..100u32 {
+            pending.request(400 + i, 220 + i);
+        }
+        assert!(!gpu.apply_pending_resize(&mut surf), "must defer reconfigure while live resizing");
+        assert_eq!(surf.size(), (320, 180));
+
+        pending.set_live_resizing(false);
+        assert!(gpu.apply_pending_resize(&mut surf), "single reconfigure on end");
+        assert_eq!(surf.size(), (499, 319));
+        assert!(!gpu.apply_pending_resize(&mut surf), "no redundant second reconfigure");
+        assert_eq!(gpu.uncaptured_errors.load(Ordering::Relaxed), 0);
+        drop(surf);
+        drop(layer);
     }
 
     #[test]

@@ -1738,37 +1738,50 @@ struct Multiview {
     boxes: Vec<(MultiviewBox, Option<Picture>)>,
 }
 
-/// The preview's own thread and its window: a window that's slow to take a frame (hidden,
-/// covered) only ever holds this thread up, never the outputs.
-struct PreviewThread {
-    surface: Arc<Mutex<crate::preview::PreviewSurface>>,
+/// Shared pause, resize, and stop coordination between `Engine` and a `preview_loop` thread.
+struct PreviewSignal {
+    resize: Arc<crate::preview::PendingResize>,
     stop: Arc<AtomicBool>,
-    thread: JoinHandle<()>,
     /// Performance mode for this thread, readable without the engine's state lock.
     paused: Arc<AtomicBool>,
-    /// Wakes the thread from its wait while paused (resume or stop).
+    /// Wakes the thread from its wait while paused or resizing.
     wake: Arc<(Mutex<()>, Condvar)>,
 }
 
-/// Blocks while `paused` (and not `stop`): no timer, no lock on the engine state, no wakeups
-/// until `wake` is notified. Returns at once when it isn't paused.
-fn wait_while_paused(paused: &AtomicBool, stop: &AtomicBool, wake: &(Mutex<()>, Condvar)) {
-    wait_while_paused_with(paused, stop, wake, || {});
+/// The preview's own thread and its window: a window that's slow to take a frame (hidden,
+/// covered) only ever holds this thread up, never the outputs.
+struct PreviewThread {
+    signal: Arc<PreviewSignal>,
+    thread: JoinHandle<()>,
 }
 
-/// [`wait_while_paused`], calling `about_to_wait` (lock held) just before each wait: a test's way
-/// of knowing the thread is parked, without guessing at a delay.
-fn wait_while_paused_with(
+/// Blocks while `paused` or an active OS live resize holds the view hidden, waking immediately
+/// on resume, resize settle, or stop.
+fn wait_while_paused_or_resizing_with(
     paused: &AtomicBool,
+    resize: &crate::preview::PendingResize,
     stop: &AtomicBool,
     wake: &(Mutex<()>, Condvar),
     mut about_to_wait: impl FnMut(),
 ) {
     let mut guard = wake.0.lock().unwrap_or_else(|e| e.into_inner());
-    while paused.load(Ordering::Acquire) && !stop.load(Ordering::Acquire) {
+    while (paused.load(Ordering::Acquire) || resize.is_live_resizing()) && !stop.load(Ordering::Acquire) {
         about_to_wait();
         guard = wake.1.wait(guard).unwrap_or_else(|e| e.into_inner());
     }
+}
+
+/// [`wait_while_paused_or_resizing_with`] for pause-only tests, calling `about_to_wait` (lock held)
+/// just before each wait.
+#[cfg(test)]
+fn wait_while_paused_with(
+    paused: &AtomicBool,
+    stop: &AtomicBool,
+    wake: &(Mutex<()>, Condvar),
+    about_to_wait: impl FnMut(),
+) {
+    let idle = crate::preview::PendingResize::new();
+    wait_while_paused_or_resizing_with(paused, &idle, stop, wake, about_to_wait);
 }
 
 /// Wakes a preview thread waiting in [`wait_while_paused`]. The lock is taken first so a
@@ -3489,20 +3502,22 @@ impl Engine {
         self.lock()
             .previews
             .insert(id, Preview { look: Default::default(), scene, size, multiview: None, paused: false });
+        let signal = Arc::new(PreviewSignal {
+            resize: surface.pending_resize(),
+            stop: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new((Mutex::new(()), Condvar::new())),
+        });
         let surface = Arc::new(Mutex::new(surface));
-        let stop = Arc::new(AtomicBool::new(false));
-        let paused = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new((Mutex::new(()), Condvar::new()));
         let thread = {
-            let (state, gpu, surface, stop) = (self.state.clone(), self.gpu.clone(), surface.clone(), stop.clone());
-            let (paused, wake) = (paused.clone(), wake.clone());
+            let (state, gpu, signal) = (self.state.clone(), self.gpu.clone(), signal.clone());
             let every = Duration::from_secs(1) / self.config.fps.max(1);
             std::thread::Builder::new()
                 .name("ferrocast-preview".into())
-                .spawn(move || preview_loop(id, &state, &gpu, &surface, &stop, &(paused, wake), every))
+                .spawn(move || preview_loop(id, &state, &gpu, &surface, &signal, every))
                 .map_err(|e| AvError::Source(format!("the preview's thread didn't start ({e})")))?
         };
-        self.preview_threads().insert(id, PreviewThread { surface, stop, thread, paused, wake });
+        self.preview_threads().insert(id, PreviewThread { signal, thread });
         Ok(id)
     }
 
@@ -3514,17 +3529,27 @@ impl Engine {
     pub fn stop_preview(&self, id: u64) {
         let running = self.preview_threads().remove(&id);
         if let Some(p) = running {
-            p.stop.store(true, Ordering::Release);
-            wake_preview(&p.wake);
+            p.signal.stop.store(true, Ordering::Release);
+            wake_preview(&p.signal.wake);
             let _ = p.thread.join();
         }
         self.lock().previews.remove(&id);
     }
 
-    /// A preview's view changed size (device pixels).
+    /// Queues a view size change (device pixels) without blocking on GPU or surface locks.
     pub fn resize_preview(&self, id: u64, width: u32, height: u32) {
         if let Some(p) = self.preview_threads().get(&id) {
-            self.gpu.resize_preview(&mut p.surface.lock().unwrap_or_else(|e| e.into_inner()), width, height);
+            p.signal.resize.request(width, height);
+        }
+    }
+
+    /// Marks whether an OS live resize is active on this preview, parking the render loop until settled.
+    pub fn set_preview_live_resize(&self, id: u64, active: bool) {
+        if let Some(p) = self.preview_threads().get(&id) {
+            p.signal.resize.set_live_resizing(active);
+            if !active {
+                wake_preview(&p.signal.wake);
+            }
         }
     }
 
@@ -3536,8 +3561,8 @@ impl Engine {
             p.paused = paused;
         }
         if let Some(t) = self.preview_threads().get(&id) {
-            t.paused.store(paused, Ordering::Release);
-            wake_preview(&t.wake);
+            t.signal.paused.store(paused, Ordering::Release);
+            wake_preview(&t.signal.wake);
         }
     }
 
@@ -4506,16 +4531,13 @@ fn preview_loop(
     state: &Mutex<State>,
     gpu: &Compositor,
     surface: &Mutex<crate::preview::PreviewSurface>,
-    stop: &AtomicBool,
-    pause: &(Arc<AtomicBool>, Arc<(Mutex<()>, Condvar)>),
+    signal: &PreviewSignal,
     every: Duration,
 ) {
-    let (paused_flag, wake) = (&*pause.0, &*pause.1);
-    while !stop.load(Ordering::Acquire) {
-        // Paused: asleep until resumed or stopped. No timer and no look at the engine's state,
-        // so it never competes with the outputs for that lock.
-        wait_while_paused(paused_flag, stop, wake);
-        if stop.load(Ordering::Acquire) {
+    while !signal.stop.load(Ordering::Acquire) {
+        // Paused or live resizing: asleep until settled or stopped so preview never contends with outputs.
+        wait_while_paused_or_resizing_with(&signal.paused, &signal.resize, &signal.stop, &signal.wake, || {});
+        if signal.stop.load(Ordering::Acquire) {
             break;
         }
         let started = Instant::now();
@@ -4547,6 +4569,10 @@ fn preview_loop(
                 Draw::Moving(t) => crate::preview::Shown::Moving(t),
             };
             let mut s = surface.lock().unwrap_or_else(|e| e.into_inner());
+            if signal.resize.is_live_resizing() {
+                continue;
+            }
+            gpu.apply_pending_resize(&mut s);
             if let Err(e) = gpu.present(&mut s, shown, &look) {
                 tracing::warn!("the preview couldn't be drawn: {e}");
             }
@@ -7224,6 +7250,68 @@ mod tests {
         let waited = std::cell::Cell::new(false);
         wait_while_paused_with(&paused, &stop, &wake, || waited.set(true));
         assert!(!waited.get(), "an unpaused thread does not wait");
+    }
+
+    #[test]
+    fn a_live_resizing_preview_thread_sleeps_until_settled() {
+        let paused = Arc::new(AtomicBool::new(false));
+        let resize = Arc::new(crate::preview::PendingResize::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((Mutex::new(()), Condvar::new()));
+
+        resize.set_live_resizing(true);
+        let (done_tx, done_rx) = mpsc::channel();
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (p, r, st, w) = (paused.clone(), resize.clone(), stop.clone(), wake.clone());
+        let h = std::thread::spawn(move || {
+            wait_while_paused_or_resizing_with(&p, &r, &st, &w, || {
+                let _ = parked_tx.send(());
+            });
+            let _ = done_tx.send(());
+        });
+        parked_rx.recv_timeout(Duration::from_secs(10)).expect("the thread parked while resizing");
+        drop(wake.0.lock().unwrap_or_else(|e| e.into_inner()));
+        assert!(done_rx.try_recv().is_err(), "stays parked during live resize");
+
+        resize.set_live_resizing(false);
+        wake_preview(&wake);
+        done_rx.recv_timeout(Duration::from_secs(10)).expect("wakes immediately when live resize ends");
+        h.join().unwrap_or_else(|e| panic!("join: {e:?}"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resize_preview_does_not_block_while_surface_mutex_is_held() {
+        let Some(e) = engine() else { return };
+        let (layer, surf) = crate::preview::tests::test_metal_surface(&e.gpu, 320, 180);
+        let signal = Arc::new(PreviewSignal {
+            resize: surf.pending_resize(),
+            stop: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new((Mutex::new(()), Condvar::new())),
+        });
+        let surf = Arc::new(Mutex::new(surf));
+        let idle = std::thread::spawn(|| {});
+        e.preview_threads().insert(77, PreviewThread { signal, thread: idle });
+
+        // Holding `surf` lock on the SAME thread proves `resize_preview` and `set_preview_live_resize`
+        // never acquire `PreviewSurface` (which would self-deadlock synchronously).
+        let mut guard = surf.lock().unwrap_or_else(|err| err.into_inner());
+        e.set_preview_live_resize(77, true);
+        for i in 0..100u32 {
+            e.resize_preview(77, 400 + i, 225 + i);
+        }
+        assert!(!e.gpu.apply_pending_resize(&mut guard));
+        assert_eq!(guard.size(), (320, 180));
+        e.set_preview_live_resize(77, false);
+        assert!(e.gpu.apply_pending_resize(&mut guard));
+        assert_eq!(guard.size(), (499, 324));
+        drop(guard);
+        let removed = e.preview_threads().remove(&77);
+        if let Some(t) = removed {
+            let _ = t.thread.join();
+        }
+        drop(layer);
     }
 
     #[test]
