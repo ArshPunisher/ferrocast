@@ -24,7 +24,9 @@ pub(crate) const RELEASE_HOLDS: &str = "release_holds";
 /// through: one worker runs them in order, so a quick push-to-talk tap never ends unmuted.
 pub struct StudioKeys {
     keys: Mutex<HashMap<Shortcut, Vec<String>>>,
-    queue: tokio::sync::mpsc::UnboundedSender<(String, bool)>,
+    queue: tokio::sync::mpsc::UnboundedSender<(u64, String, bool)>,
+    /// Bumped on collection switch so queued pre-switch shortcut events are skipped by the worker.
+    epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// What the settings last asked for (kept while the keys are let go for a shortcut field).
     wanted: Mutex<BTreeMap<String, String>>,
     /// Whether a shortcut field is waiting for a key (the global shortcuts are let go).
@@ -37,12 +39,17 @@ pub struct StudioKeys {
 /// The physical shortcuts down for each action that acts on letting go. Two keys bound to one
 /// action are one hold: it starts with the first down and ends with the last up.
 #[derive(Debug, Default)]
-pub(crate) struct PressedKeys(HashMap<String, HashSet<String>>);
+pub(crate) struct PressedKeys {
+    held: HashMap<String, HashSet<String>>,
+    /// Keys released forcefully by a collection switch so the later physical key-up is ignored.
+    suppressed_ups: HashSet<(String, String)>,
+}
 
 impl PressedKeys {
     /// `key` went down for `action` → whether the action's press goes on (the first key down).
     pub(crate) fn down(&mut self, action: &str, key: &str) -> bool {
-        let set = self.0.entry(action.to_string()).or_default();
+        self.suppressed_ups.remove(&(action.to_string(), key.to_string()));
+        let set = self.held.entry(action.to_string()).or_default();
         let first = set.is_empty();
         set.insert(key.to_string());
         first
@@ -50,12 +57,15 @@ impl PressedKeys {
 
     /// `key` came up → whether the action's release goes on (nothing else of it is down). A key
     /// that was never seen going down (pressed before the shortcuts were replaced) still ends it
-    /// when nothing is down.
+    /// when nothing is down — unless a collection switch already released that hold while down.
     pub(crate) fn up(&mut self, action: &str, key: &str) -> bool {
-        let Some(set) = self.0.get_mut(action) else { return true };
+        if self.suppressed_ups.remove(&(action.to_string(), key.to_string())) {
+            return false;
+        }
+        let Some(set) = self.held.get_mut(action) else { return true };
         set.remove(key);
         if set.is_empty() {
-            self.0.remove(action);
+            self.held.remove(action);
             true
         } else {
             false
@@ -66,7 +76,23 @@ impl PressedKeys {
     /// Every action that had a key down, forgotten: they are to be let go by the caller (a key
     /// held while the shortcuts were replaced would never be seen coming up).
     pub(crate) fn clear(&mut self) -> Vec<String> {
-        self.0.drain().map(|(a, _)| a).collect()
+        self.held.drain().map(|(a, _)| a).collect()
+    }
+
+    /// Collection switch release: drains every held shortcut, suppresses the eventual physical
+    /// key-up so it cannot touch the incoming collection, and returns held PTT/PTM actions.
+    pub(crate) fn release_on_switch(&mut self) -> Vec<String> {
+        let mut ptt = Vec::new();
+        for (action, keys) in self.held.drain() {
+            let is_audio = action.starts_with("push_to_talk:") || action.starts_with("push_to_mute:");
+            for key in keys {
+                self.suppressed_ups.insert((action.clone(), key));
+            }
+            if is_audio {
+                ptt.push(action);
+            }
+        }
+        ptt
     }
 }
 
@@ -134,9 +160,14 @@ impl CaptureGate {
 impl StudioKeys {
     /// Starts the worker that runs shortcut actions, one after another.
     pub fn new(engine: Engine) -> StudioKeys {
-        let (queue, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, bool)>();
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let worker_epoch = epoch.clone();
+        let (queue, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u64, String, bool)>();
         tauri::async_runtime::spawn(async move {
-            while let Some((action, pressed)) = rx.recv().await {
+            while let Some((msg_epoch, action, pressed)) = rx.recv().await {
+                if msg_epoch != worker_epoch.load(std::sync::atomic::Ordering::Acquire) {
+                    continue;
+                }
                 if let Err(e) = run(&engine, &action, pressed).await {
                     tracing::warn!(action, error = %e, "a Studio shortcut didn't work");
                 }
@@ -145,11 +176,27 @@ impl StudioKeys {
         StudioKeys {
             keys: Mutex::new(HashMap::new()),
             queue,
+            epoch,
             wanted: Mutex::new(BTreeMap::new()),
             gate: Mutex::new(CaptureGate::default()),
             down: Mutex::new(PressedKeys::default()),
         }
     }
+
+    fn current_epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Drains held PTT/PTM keys on collection switch without touching the async queue (avoiding
+/// any deadlock behind `output_gate`), bumps the shortcut epoch, and returns released audio
+/// actions so the caller restores the outgoing collection before saving it.
+pub(crate) fn release_active(app: &AppHandle) -> Vec<String> {
+    let Some(keys) = app.try_state::<StudioKeys>() else {
+        return Vec::new();
+    };
+    keys.epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    keys.down.lock().unwrap_or_else(|p| p.into_inner()).release_on_switch()
 }
 
 /// What the settings ask for: each key once, with every action it runs (a key may be shared by
@@ -187,10 +234,11 @@ pub fn apply(app: &AppHandle, wanted: &BTreeMap<String, String>) -> Vec<String> 
     }
     let mut map = state.keys.lock().unwrap_or_else(|p| p.into_inner());
     // Shortcuts about to be replaced can't report a key let go any more: nothing stays held.
-    let _ = state.queue.send((RELEASE_HOLDS.to_string(), false));
+    let epoch = state.current_epoch();
+    let _ = state.queue.send((epoch, RELEASE_HOLDS.to_string(), false));
     let held = state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
     for action in held.into_iter().filter(|a| !push_hold::is_push_hold(a)) {
-        let _ = state.queue.send((action, false));
+        let _ = state.queue.send((epoch, action, false));
     }
     for (sc, _) in map.drain() {
         let _ = app.global_shortcut().unregister(sc);
@@ -222,10 +270,11 @@ pub(crate) fn capture(app: &AppHandle, on: bool) {
         Capture::Suspend => {
             tracing::info!("the shortcuts are let go while a shortcut field waits for a key");
             // A key held now would never be seen coming up.
-            let _ = state.queue.send((RELEASE_HOLDS.to_string(), false));
+            let epoch = state.current_epoch();
+            let _ = state.queue.send((epoch, RELEASE_HOLDS.to_string(), false));
             let held = state.down.lock().unwrap_or_else(|p| p.into_inner()).clear();
             for action in held.into_iter().filter(|a| !push_hold::is_push_hold(a)) {
-                let _ = state.queue.send((action, false));
+                let _ = state.queue.send((epoch, action, false));
             }
             let _ = app.global_shortcut().unregister_all();
             watch_capture(app.clone());
@@ -280,7 +329,7 @@ pub fn handle(app: &AppHandle, shortcut: &Shortcut, state: ShortcutState) -> boo
                 continue;
             }
         }
-        let _ = keys.queue.send((action, pressed));
+        let _ = keys.queue.send((keys.current_epoch(), action, pressed));
     }
     true
 }
@@ -976,5 +1025,27 @@ mod tests {
             vec![StudioAct::SetCurrent { scene: "Tall".into() }, StudioAct::TransitionNow { quick: None }]
         );
         engine.shutdown();
+    }
+
+    #[test]
+    fn col09_release_on_switch_drains_keys_suppresses_physical_up_and_preserves_clear() {
+        let mut pk = PressedKeys::default();
+        assert!(pk.down("push_to_talk:Mic", "F8"));
+        assert!(!pk.down("push_to_talk:Mic", "F9"));
+        assert!(pk.down("push_show:Main\nCam", "F10"));
+
+        let released = pk.release_on_switch();
+        assert_eq!(released, vec!["push_to_talk:Mic".to_string()]);
+        // Physical releases of F8 and F9 after switch must be suppressed once.
+        assert!(!pk.up("push_to_talk:Mic", "F8"));
+        assert!(!pk.up("push_to_talk:Mic", "F9"));
+        // Next physical press+release on the new collection works normally.
+        assert!(pk.down("push_to_talk:Mic", "F8"));
+        assert!(pk.up("push_to_talk:Mic", "F8"));
+
+        // Releasing a key never seen down after normal clear() still returns true.
+        assert!(pk.down("push_to_mute:Desk", "F7"));
+        assert_eq!(pk.clear(), vec!["push_to_mute:Desk".to_string()]);
+        assert!(pk.up("push_to_mute:Desk", "F7"));
     }
 }
