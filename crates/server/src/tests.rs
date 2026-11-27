@@ -3027,3 +3027,22 @@ async fn put_links_refuses_to_overwrite_corrupt_creator_links_row() {
     // Best-effort GET /api/v1/links display path still returns 200 with empty fallback.
     assert_eq!(r.get("/api/v1/links").await.status(), StatusCode::OK);
 }
+
+#[test]
+fn poll_spec_max_length_and_asyncapi_status_tts_stop_match_runtime() {
+    let openapi = crate::spec::openapi();
+    assert_eq!(openapi["components"]["schemas"]["PollSpec"]["properties"]["question"]["maxLength"], 120);
+    let asyncapi = crate::spec::asyncapi();
+    assert!(
+        asyncapi["channels"]["live"]["messages"]["status"]["payload"]["properties"]["data"]["properties"]
+            .get("viewers")
+            .is_some(),
+        "AsyncAPI status payload must document viewers"
+    );
+    assert!(
+        asyncapi["channels"]["overlay"]["messages"]["tts_stop"]["payload"]["properties"]["data"]["properties"]
+            .get("ids")
+            .is_some(),
+        "AsyncAPI tts_stop payload must document ids"
+    );
+}

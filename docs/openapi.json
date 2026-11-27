@@ -1409,7 +1409,7 @@
             "type": "array"
           },
           "question": {
-            "maxLength": 140,
+            "maxLength": 120,
             "minLength": 1,
             "type": "string"
           }

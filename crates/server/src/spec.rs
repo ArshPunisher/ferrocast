@@ -3102,7 +3102,7 @@ fn poll_schemas() -> Map<String, Value> {
             "type": "object",
             "required": ["question", "options"],
             "properties": {
-                "question": { "type": "string", "minLength": 1, "maxLength": 140 },
+                "question": { "type": "string", "minLength": 1, "maxLength": 120 },
                 "options": { "type": "array", "minItems": 2, "maxItems": 5, "items": { "type": "string" } },
                 "duration_s": { "type": ["integer", "null"], "minimum": 10, "maximum": 1800, "description": "Duration in seconds (10..1800), or null for an untimed poll." },
                 "chat_fallback": { "type": "boolean", "default": true }
@@ -3554,7 +3554,7 @@ fn build_asyncapi() -> Value {
                 "messages": {
                     "hello": live_message("hello", "Initial handshake with highest sequence number (`{ seq }`).", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "seq": { "type": "integer" } } })),
                     "resync": live_message("resync", "Ring buffer gap notice (`{ missed }`); clients should re-fetch state over REST.", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "missed": { "type": "integer" } } })),
-                    "status": live_message("status", "Connector and OBS health snapshots.", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "connectors": { "type": "object" } } })),
+                    "status": live_message("status", "Connector and OBS health snapshots.", "read_only, chat, alerts, studio_control, go_live", json!({ "type": "object", "properties": { "connectors": { "type": "object" }, "viewers": { "type": "object", "additionalProperties": { "type": ["integer", "null"] } } } })),
                     "queue": live_message("queue", "Alert queue snapshot (active/paused/muted/pending count).", "read_only, alerts", json!({ "type": "object" })),
                     "event": live_message("event", "Normalized stream event (follow, sub, gift_sub, tip, bits, raid, chat_message, etc.).", "read_only; chat (chat/mod kinds); alerts (stream events)", json!({ "type": "object", "properties": { "id": { "type": "string" }, "platform": { "type": "string" }, "kind": { "type": "object" } } })),
                     "notice": live_message("notice", "Engine status notice or panic warning (`account:*` notices suppressed for API keys).", "read_only, alerts, studio_control, go_live (chat sees panic only)", json!({ "type": "object", "properties": { "level": { "type": "string" }, "message": { "type": "string" }, "key": { "type": ["string", "null"] } } })),
@@ -3597,7 +3597,7 @@ fn build_asyncapi() -> Value {
                     "alert": overlay_message("alert", "Show alert visual & sound frame.", json!({ "type": "object" })),
                     "alert_hide": overlay_message("alert_hide", "Dismiss active alert frame (`{ alert_id }`).", json!({ "type": "object" })),
                     "tts": overlay_message("tts", "Play synthesized TTS audio in overlay.", json!({ "type": "object" })),
-                    "tts_stop": overlay_message("tts_stop", "Stop active overlay TTS playback and clear queued lines.", json!({ "type": "object" })),
+                    "tts_stop": overlay_message("tts_stop", "Stop active overlay TTS playback and clear queued lines (optionally scoped to `ids`).", json!({ "type": "object", "properties": { "ids": { "type": "array", "items": { "type": "string" } } } })),
                     "music": overlay_message("music", "Visualizer spectrum levels & track info.", json!({ "type": "object" })),
                     "delete_message": overlay_message("delete_message", "Remove moderated chat message from overlay chatbox.", json!({ "type": "object" })),
                     "delete_user": overlay_message("delete_user", "Remove all messages from a timed-out/banned user.", json!({ "type": "object" })),

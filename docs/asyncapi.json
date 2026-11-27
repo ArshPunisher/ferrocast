@@ -887,6 +887,15 @@
                 "properties": {
                   "connectors": {
                     "type": "object"
+                  },
+                  "viewers": {
+                    "additionalProperties": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "type": "object"
                   }
                 },
                 "type": "object"
@@ -1414,6 +1423,14 @@
           "payload": {
             "properties": {
               "data": {
+                "properties": {
+                  "ids": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
                 "type": "object"
               },
               "seq": {
@@ -1436,7 +1453,7 @@
             ],
             "type": "object"
           },
-          "summary": "Stop active overlay TTS playback and clear queued lines."
+          "summary": "Stop active overlay TTS playback and clear queued lines (optionally scoped to `ids`)."
         }
       },
       "parameters": {

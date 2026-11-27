@@ -63,6 +63,6 @@ pub async fn end(State(app): State<AppState>) -> ApiResult<Json<Value>> {
 }
 
 pub async fn clear(State(app): State<AppState>) -> ApiResult<StatusCode> {
-    app.engine.clear_poll()?;
+    app.engine.clear_poll().await?;
     Ok(StatusCode::NO_CONTENT)
 }
