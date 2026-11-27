@@ -800,6 +800,10 @@ impl DrainGate {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).running
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).cancel
+    }
+
     /// Blocks until the drain is over (sent, or cancelled).
     fn wait_done(&self) {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -885,6 +889,10 @@ impl Delayed {
                 return;
             }
         }
+        // Notify upstream watchers that a coded IDR left the encoder, even while delay holds packets.
+        if is_keyframe(&t) {
+            self.hub.note_encoded_idr();
+        }
         self.held_bytes += tag_len(&t);
         self.held.push_back((std::time::Instant::now(), t));
         while self.held.front().is_some_and(|(at, _)| at.elapsed() >= self.delay) {
@@ -947,7 +955,9 @@ fn pass(hub: &Hub, counts: &Counts, begin: &Begin, t: Tag) {
 
 impl Drop for Delayed {
     fn drop(&mut self) {
-        if self.held.is_empty() {
+        if self.held.is_empty() || self.gate.is_cancelled() {
+            self.held.clear();
+            self.counts.delay_bytes.store(0, Ordering::Relaxed);
             return;
         }
         // The tail goes on at its own pace (each tag when it is `delay` old), on a thread of its
@@ -1119,10 +1129,21 @@ impl OwnStream {
         let drain = Arc::new(DrainGate::default());
         let begin = Arc::new(Begin::default());
         // A delayed stream is live on its hub only once its first packet is let go.
-        let deferred = streaming && delay_s > 0;
-        if !deferred {
-            hub.start();
+        struct HubGuard(Option<Arc<Hub>>);
+        impl Drop for HubGuard {
+            fn drop(&mut self) {
+                if let Some(h) = self.0.take() {
+                    h.end();
+                }
+            }
         }
+        let deferred = streaming && delay_s > 0;
+        let mut hub_guard = if streaming && !deferred {
+            hub.start();
+            HubGuard(Some(hub.clone()))
+        } else {
+            HubGuard(None)
+        };
         let kind = match (record, replay) {
             (_, Some((seconds, mb))) => OutputKind::Replay { seconds, mb },
             (Some(p), None) => OutputKind::Record(p.to_path_buf()),
@@ -1214,6 +1235,7 @@ impl OwnStream {
         }
         let begun = engine.stats();
         let from = (begun.frames, begun.skipped);
+        hub_guard.0 = None;
         tracing::info!(codec = ?video.codec, kbps = video.bitrate_kbps, recording = record.is_some(), "Ferrocast's own engine draws");
         Ok(Self {
             stop: Arc::new(AtomicBool::new(false)),
@@ -1358,7 +1380,9 @@ impl OwnStream {
         );
         if let Err(err) = d.shared.engine.stream_on(d.output, Box::new(move |t: Tag| out.send(t))) {
             // The push started above ends with it (projects-60).
-            hub.end();
+            if delay_s == 0 {
+                hub.end();
+            }
             return Err(fail(err.to_string()));
         }
         // The last stream's tail ends once this one has started (not when it fails to).
@@ -1444,6 +1468,11 @@ impl OwnStream {
             }
             None => self.counts.new_kbps.store(kbps, Ordering::Release),
         }
+    }
+
+    /// Aborts any buffered stream-delay tail immediately rather than draining on drop.
+    pub(crate) fn abort_without_drain(&self) {
+        self.drain.cancel();
     }
 
     /// Keeps a recording's plan: what the next file is called, and when it splits on its own.
@@ -2433,5 +2462,53 @@ mod tests {
         assert_eq!((meta.video_width, meta.video_height, meta.video_frame_rate), (Some(720), Some(1280), Some(30.0)));
         drop(own);
         let _ = sub.rx.try_recv();
+    }
+
+    #[test]
+    fn failed_start_does_not_leave_injected_hub_live() {
+        let doc = serde_json::json!({ "sources": [], "current_scene": "Main", "scenes": { "Main": [] } });
+        let Ok(shared) = Shared::open_at(crate::Canvas { width: 640, height: 360, fps: 60 }, &doc) else {
+            eprintln!("skipped: no engine here");
+            return;
+        };
+        let hub = Hub::new();
+        let enc = EncodeSettings::with_encoder("obs_x264");
+        let how = Drawing {
+            send_to: None,
+            hub: Some(hub.clone()),
+            fps: Some(60),
+            record: None,
+            encode: &enc,
+            tracks: &[1],
+            delay_s: 0,
+            vertical: false,
+            replay: None,
+            solo: Some("__missing_source__"),
+            video_tracks: &[],
+        };
+        assert!(OwnStream::drawn(shared, &doc, how).is_err());
+        assert!(!hub.live().borrow().on, "failed OwnStream::drawn must not leave injected Hub marked live");
+    }
+
+    #[test]
+    fn delayed_emits_encoded_idr_before_delay_and_abort_skips_drain() {
+        let hub = Hub::new();
+        let counts = Arc::new(Counts::default());
+        let drain = Arc::new(DrainGate::default());
+        let begin = Arc::new(Begin::default());
+        begin.set(|h| h.start());
+        let mut delayed = Delayed::new(hub.clone(), counts.clone(), Duration::from_secs(10), drain.clone(), begin);
+
+        delayed.send(Tag::Video { ms: 0, body: vec![0x17, 0x00, 1, 2] });
+        assert_eq!(hub.encoded_idr_count(), 0, "sequence header must not notify encoded_idr");
+
+        delayed.send(Tag::Video { ms: 0, body: vec![0x17, 0x01, 0, 0, 0] });
+        assert!(!hub.live().borrow().on, "delay must keep Hub deferred while holding packet");
+        assert_eq!(hub.encoded_idr_count(), 1, "coded IDR must notify Hub before delay expires");
+
+        drain.cancel();
+        drop(delayed);
+        assert!(!drain.is_running(), "cancelled drain must drop held tags without spawning drain thread");
+        assert_eq!(counts.delay_bytes.load(Ordering::Relaxed), 0);
     }
 }

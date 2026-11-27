@@ -6822,6 +6822,11 @@ impl StageOutput {
         self.own.reshape(e, fps)
     }
 
+    /// Aborts any buffered stream-delay tail immediately instead of spawning a drain thread on drop.
+    pub fn abort_without_drain(&self) {
+        self.own.abort_without_drain();
+    }
+
     /// The file a recording writes now (empty for a stream).
     pub fn path(&self) -> &Path {
         self.path.as_deref().unwrap_or(Path::new(""))

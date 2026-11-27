@@ -163,14 +163,20 @@ fn detect_non_apple_gpu() -> (Option<String>, String, Option<(u32, u32)>) {
     } else {
         None
     };
-    if nv.is_none()
-        && let Ok(out) = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=driver_version", "--format=csv,noheader"])
-            .output()
-        && out.status.success()
-    {
-        let txt = String::from_utf8_lossy(&out.stdout);
-        nv = parse_nvidia_driver_version(&txt);
+    if nv.is_none() {
+        let mut cmd = std::process::Command::new("nvidia-smi");
+        cmd.args(["--query-gpu=driver_version", "--format=csv,noheader"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        if let Ok(out) = cmd.output()
+            && out.status.success()
+        {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            nv = parse_nvidia_driver_version(&txt);
+        }
     }
     let hw_backend = if backend.is_none() && nv.is_some() { Some("nvenc".to_string()) } else { backend };
     (hw_backend, gpu.name, nv)
