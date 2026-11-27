@@ -32,6 +32,7 @@ pub use crate::golive_plan::{
     BudgetCheck, BudgetSource, BudgetStatus, EncodeGroup, EncodePlan, GROUP_LIGHT, GROUP_MAIN, GROUP_TWITCH_EB,
     GROUP_VERTICAL, GroupId, PcBudget, PlannedDestination, PlannerDestination, PlannerInput, TwitchEbSpec,
     group_id_for_key, is_heavier_than_light, legacy_light_custom_quality, light_encode_key, plan_encodes,
+    resolve_preview,
 };
 use crate::studio::save_setting;
 use crate::{Engine, EngineError, now};
@@ -381,6 +382,127 @@ pub struct UploadCheck {
     pub verdict: Verdict,
 }
 
+/// Resolved encode output for a single destination after platform fitting, budget coalescing,
+/// and group deduplication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedQuality {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub kbps: u32,
+    pub codec: VideoCodec,
+    pub audio_kbps: u32,
+    pub auto_fitted: bool,
+    pub separate_encode: bool,
+    pub group_id: GroupId,
+    pub shared_with: Vec<String>,
+}
+
+/// Live or planned encode pipeline shown on [`GoLiveView`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EncodeGroupView {
+    pub id: GroupId,
+    pub canvas: Canvas,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub kbps: u32,
+    pub codec: VideoCodec,
+    pub members: Vec<String>,
+    pub live_fps: Option<f32>,
+    pub live_kbps: Option<u32>,
+    pub dropped_frames: Option<u64>,
+    pub encode_ms: Option<f64>,
+}
+
+/// Active video source driving Go live's quality options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualitySource {
+    Studio,
+    Obs,
+    None,
+}
+
+/// Canvas stream configuration summary returned by `GET /api/v1/golive/quality-options`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QualityCanvasSummary {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub kbps: u32,
+    pub codec: VideoCodec,
+    pub audio_kbps: u32,
+}
+
+impl From<&MainEncode> for QualityCanvasSummary {
+    fn from(m: &MainEncode) -> Self {
+        Self { width: m.width, height: m.height, fps: m.fps, kbps: m.kbps, codec: m.codec, audio_kbps: m.audio_kbps }
+    }
+}
+
+/// Output video parameters a candidate quality option resolves to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QualityOptionResolved {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub kbps: u32,
+    pub codec: VideoCodec,
+}
+
+/// One selectable quality preset or `same_as_main` option for a destination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QualityOption {
+    pub id: String,
+    pub label: String,
+    pub quality: DestinationQuality,
+    pub resolved: QualityOptionResolved,
+    pub auto_fitted: bool,
+    pub recommended: bool,
+    pub note: Option<String>,
+    pub shares_encoder_with: Vec<String>,
+    pub allowed: bool,
+    pub disabled_reason: Option<String>,
+}
+
+/// Hard custom input boundaries and recommended defaults for a destination's Custom quality editor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CustomQualityLimits {
+    pub max_width: u32,
+    pub max_height: u32,
+    pub min_kbps: u32,
+    pub max_kbps: u32,
+    pub fps_choices: Vec<u32>,
+    pub codecs: Vec<VideoCodec>,
+    pub recommended_width: u32,
+    pub recommended_height: u32,
+    pub recommended_fps: u32,
+    pub recommended_kbps: u32,
+}
+
+/// Per-destination allowed quality rungs, lock state, resolved preview, and custom bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DestinationQualityOptions {
+    pub id: String,
+    pub canvas: Canvas,
+    pub locked_reason: Option<String>,
+    pub current: DestinationQuality,
+    pub resolved: ResolvedQuality,
+    pub options: Vec<QualityOption>,
+    pub custom_limits: Option<CustomQualityLimits>,
+}
+
+/// Response for `GET /api/v1/golive/quality-options`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QualityOptionsResponse {
+    pub source: QualitySource,
+    pub main: QualityCanvasSummary,
+    pub vertical: Option<QualityCanvasSummary>,
+    pub budget: BudgetCheck,
+    pub destinations: std::collections::BTreeMap<String, DestinationQualityOptions>,
+}
+
 /// Everything the Go live tab shows.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GoLiveView {
@@ -393,6 +515,10 @@ pub struct GoLiveView {
     pub vertical_live: bool,
     pub vertical_stats: StreamStats,
     pub destinations: Vec<DestinationView>,
+    /// Active or planned multi-encode groups and their telemetry.
+    pub encode_groups: Vec<EncodeGroupView>,
+    /// Current hardware/software encode budget headroom against planned groups.
+    pub encode_budget: BudgetCheck,
     pub upload: Option<UploadCheck>,
     /// Upload protection is on (A1.8).
     pub protect: bool,
@@ -529,6 +655,12 @@ pub struct DestinationView {
     /// Advisory note when a destination exceeds a platform's recommendation without hitting a hard cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality_note: Option<String>,
+    /// Configured per-destination quality preference (`same_as_main` or `custom`).
+    pub quality: DestinationQuality,
+    /// Effective output parameters and encode group sharing resolved for this destination.
+    pub resolved_quality: ResolvedQuality,
+    /// True while a live quality switch for this destination is waiting on a keyframe and reconnecting.
+    pub switching_quality: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -590,6 +722,8 @@ pub(crate) struct GoLive {
     studio_video: Mutex<Option<StudioCapConfig>>,
     /// Cached hardware/driver/recording budget telemetry reported by [`StudioHost::host_budget_info`].
     cached_host_budget: RwLock<Option<crate::studio_host::HostBudgetInfo>>,
+    /// Latest per-group telemetry from [`StudioHost::group_stats`] while Studio is streaming.
+    cached_group_stats: Mutex<Option<serde_json::Value>>,
     /// Direct Hub encode groups currently started on [`StudioHost`].
     active_groups: Mutex<HashMap<GroupId, crate::studio_host::EncodeGroupSpec>>,
     /// Destination IDs currently executing a mid-stream quality switch (`409` per-dest guard).
@@ -832,6 +966,7 @@ impl Default for GoLive {
             enhanced: Mutex::new(None),
             studio_video: Mutex::new(None),
             cached_host_budget: RwLock::new(None),
+            cached_group_stats: Mutex::new(None),
             active_groups: Mutex::new(HashMap::new()),
             switching: Mutex::new(std::collections::HashSet::new()),
             switching_groups: Mutex::new(HashMap::new()),
@@ -1327,29 +1462,15 @@ impl Engine {
             .destinations
             .iter()
             .map(|d| {
-                let direct = d.url.as_deref().and_then(|u| match direct_kind(u) {
-                    Some("srt") => Some(ferrocast_golive::direct::Kind::Srt),
-                    Some("rist") => Some(ferrocast_golive::direct::Kind::Rist),
-                    Some("whip") => Some(ferrocast_golive::direct::Kind::Whip),
-                    _ => None,
-                });
                 let standby = backs_up(cfg, &d.id).is_some_and(|p| p.enabled && !failing.contains(&p.id));
-                PlannerDestination {
-                    id: d.id.clone(),
-                    name: dest_name(d),
-                    kind: d.kind,
-                    brand: d.brand.clone(),
-                    canvas: d.canvas,
-                    enabled: destination_sends(cfg, &failing, d),
-                    can_start: self.can_start_destination(d, &blocked),
+                Self::planner_destination_for(
+                    d,
+                    studio,
+                    destination_sends(cfg, &failing, d),
+                    self.can_start_destination(d, &blocked),
                     standby,
-                    direct,
-                    light: d.light,
-                    enhanced: d.enhanced,
-                    route_light: route_light_ids.contains(&d.id),
-                    quality: d.quality.clone(),
-                    vod_track: d.kind == Service::Twitch && studio.vod_track,
-                }
+                    route_light_ids.contains(&d.id),
+                )
             })
             .collect();
         let twitch_eb = enhanced_plan.as_ref().and_then(|p| TwitchEbSpec::from_plan(p, &main));
@@ -1370,6 +1491,38 @@ impl Engine {
             twitch_eb,
             whip_simulcast,
             budget,
+        }
+    }
+
+    fn planner_destination_for(
+        d: &DestinationConfig,
+        studio: &StudioCapConfig,
+        enabled: bool,
+        can_start: bool,
+        standby: bool,
+        route_light: bool,
+    ) -> PlannerDestination {
+        let direct = d.url.as_deref().and_then(|u| match direct_kind(u) {
+            Some("srt") => Some(ferrocast_golive::direct::Kind::Srt),
+            Some("rist") => Some(ferrocast_golive::direct::Kind::Rist),
+            Some("whip") => Some(ferrocast_golive::direct::Kind::Whip),
+            _ => None,
+        });
+        PlannerDestination {
+            id: d.id.clone(),
+            name: dest_name(d),
+            kind: d.kind,
+            brand: d.brand.clone(),
+            canvas: d.canvas,
+            enabled,
+            can_start,
+            standby,
+            direct,
+            light: d.light,
+            enhanced: d.enhanced,
+            route_light,
+            quality: d.quality.clone(),
+            vod_track: d.kind == Service::Twitch && studio.vod_track,
         }
     }
 
@@ -1732,12 +1885,23 @@ impl Engine {
         self.send_golive_pub();
     }
 
+    pub(crate) fn note_golive_group_stats(&self, group_stats: Option<serde_json::Value>) {
+        *lock(&self.golive().cached_group_stats) = group_stats;
+    }
+
     /// The Go live tab: destinations with their health, OBS's setting, the stream's numbers.
     pub async fn golive_view(&self) -> GoLiveView {
         if lock(&self.golive().studio_video).is_none()
             && let Ok(host) = self.studio_host()
         {
             self.note_studio_settings(&host.settings().await);
+        }
+        if self.golive().studio_live.load(std::sync::atomic::Ordering::Acquire)
+            && let Ok(host) = self.studio_host()
+        {
+            self.note_golive_group_stats(host.group_stats().await.ok().flatten());
+        } else {
+            self.note_golive_group_stats(None);
         }
         let ingest = lock(&self.golive().ingest).clone();
         let obs = self.golive_obs_view(ingest.as_deref()).await;
@@ -1792,6 +1956,21 @@ impl Engine {
         let studio_cfg = *lock(&g.studio_video);
         let key_notes = lock(&g.key_notes).clone();
         let cut_state = lock(&g.cut).as_ref().map(|c| c.state.borrow().clone());
+        let switching_ids = lock(&g.switching).clone();
+        let cached_group_stats = lock(&g.cached_group_stats).clone();
+        let studio_for_resolve = studio_cfg.unwrap_or_default();
+        let main_for_resolve = studio_for_resolve.as_main_encode();
+        let host_info_for_resolve = self.cached_host_budget_info();
+        let vert_for_resolve = (cfg.vertical_source == VerticalSource::Canvas
+            && (host_info_for_resolve.as_ref().is_some_and(|i| i.vertical_on)
+                || cfg.destinations.iter().any(|x| x.canvas == Canvas::Vertical)))
+        .then(|| {
+            let (vw, vh) = host_info_for_resolve.as_ref().and_then(|i| i.vertical_size).unwrap_or((1080, 1920));
+            studio_for_resolve.as_vertical_encode(vw, vh)
+        });
+        let enhanced_plan_for_resolve = lock(&g.enhanced).clone();
+        let eb_spec_for_resolve =
+            enhanced_plan_for_resolve.as_ref().and_then(|p| TwitchEbSpec::from_plan(p, &main_for_resolve));
         let limiter_still_active = !studio_streaming
             || eff_limit.is_some_and(|limit| {
                 cfg.destinations.iter().any(|x| {
@@ -1954,6 +2133,45 @@ impl Engine {
                                 }
                             })
                     }),
+                    quality: d.quality.clone(),
+                    resolved_quality: Self::resolved_quality_for(
+                        &cfg,
+                        &studio_for_resolve,
+                        &main_for_resolve,
+                        vert_for_resolve.as_ref(),
+                        eb_spec_for_resolve.as_ref(),
+                        &plan,
+                        d,
+                    ),
+                    switching_quality: switching_ids.contains(&d.id),
+                }
+            })
+            .collect();
+        let encode_groups = plan
+            .groups
+            .iter()
+            .map(|grp| {
+                let (hub_live, hub_stats) = snapshots
+                    .iter()
+                    .find(|(hid, _, _)| hid == &grp.id)
+                    .map(|(_, _, h)| (h.live().borrow().on, h.stats()))
+                    .unwrap_or_default();
+                let gs_entry = cached_group_stats.as_ref().and_then(|v| v.get(&grp.id));
+                let dropped_frames = gs_entry.and_then(|v| v.get("dropped")).and_then(serde_json::Value::as_u64);
+                let encode_ms = gs_entry.and_then(|v| v.get("encode_ms")).and_then(serde_json::Value::as_f64);
+                EncodeGroupView {
+                    id: grp.id.clone(),
+                    canvas: grp.key.canvas,
+                    width: grp.key.width,
+                    height: grp.key.height,
+                    fps: grp.key.fps,
+                    kbps: grp.key.kbps,
+                    codec: grp.key.codec,
+                    members: grp.members.clone(),
+                    live_fps: if hub_live { hub_stats.fps } else { None },
+                    live_kbps: hub_live.then_some(hub_stats.kbps),
+                    dropped_frames,
+                    encode_ms,
                 }
             })
             .collect();
@@ -1965,6 +2183,8 @@ impl Engine {
             vertical_live,
             vertical_stats,
             destinations,
+            encode_groups,
+            encode_budget: plan.budget,
             upload,
             protect: cfg.protect,
             aitum_ok: cfg.aitum_ok,
@@ -2493,6 +2713,7 @@ impl Engine {
             "golive",
             &serde_json::json!({ "live": v.live, "stats": v.stats, "vertical_live": v.vertical_live,
                                   "vertical_stats": v.vertical_stats, "destinations": v.destinations,
+                                  "encode_groups": v.encode_groups, "encode_budget": v.encode_budget,
                                   "cut_state": v.cut.state, "ffmpeg": v.cut.ffmpeg }),
         ));
     }
@@ -2874,6 +3095,7 @@ impl Engine {
     /// atomically swaps only this destination's forwarder, and stops the old encode group once refcount reaches 0.
     pub async fn set_golive_quality(&self, id: &str, quality: DestinationQuality) -> Result<GoLiveConfig, EngineError> {
         let studio = self.current_studio_cap_config().await;
+        let initial_budget = self.refresh_pc_budget().await;
         let host_info = self.cached_host_budget_info();
         let host_vert = host_info.as_ref().and_then(|i| i.vertical_size);
         let cfg_snapshot = {
@@ -2937,9 +3159,26 @@ impl Engine {
             d.light = false;
             let moved = d.clone();
             let failing = lock(&self.golive().backup).failing.clone();
-            let live_active =
-                self.golive_stream_running() && (moved.enabled || destination_sends(&cfg, &failing, &moved));
+            let sends_now = moved.enabled || destination_sends(&cfg, &failing, &moved);
+            let live_active = self.golive_stream_running() && sends_now;
             if !live_active {
+                if sends_now && matches!(quality, DestinationQuality::Custom(_)) {
+                    let mut planner_in = self.planner_input_for(&cfg, &studio, initial_budget.clone());
+                    if let Some(pd) = planner_in.destinations.iter_mut().find(|x| x.id == id) {
+                        pd.route_light = false;
+                    }
+                    let plan = crate::golive_plan::plan_encodes(&planner_in);
+                    if plan.budget.status == crate::golive_plan::BudgetStatus::Over {
+                        return Err(refused(
+                            "encode_budget_exceeded",
+                            plan.budget
+                                .note
+                                .clone()
+                                .unwrap_or_else(|| "This quality would exceed your computer's encode limit.".into()),
+                            "Lower main quality, pick a quality shared with another destination, or keep more destinations on Same as main.",
+                        ));
+                    }
+                }
                 self.save_golive(cfg.clone()).await?;
                 return Ok(cfg);
             }
@@ -4814,6 +5053,579 @@ impl Engine {
             None => {}
         }
     }
+
+    fn resolved_quality_for(
+        cfg: &GoLiveConfig,
+        studio: &StudioCapConfig,
+        main: &MainEncode,
+        vertical: Option<&MainEncode>,
+        eb_spec: Option<&TwitchEbSpec>,
+        plan: &EncodePlan,
+        d: &DestinationConfig,
+    ) -> ResolvedQuality {
+        if let Some(pd) = plan.destinations.get(&d.id) {
+            return ResolvedQuality {
+                width: pd.key.width,
+                height: pd.key.height,
+                fps: pd.key.fps,
+                kbps: pd.key.kbps,
+                codec: pd.key.codec,
+                audio_kbps: pd.key.audio_kbps,
+                auto_fitted: pd.auto_fitted,
+                separate_encode: pd.separate_encode,
+                group_id: pd.group_id.clone(),
+                shared_with: pd.shared_with.clone(),
+            };
+        }
+        let pd_in = Self::planner_destination_for(d, studio, false, false, false, false);
+        let preview =
+            resolve_preview(main, vertical, cfg_cut_source(cfg), &pd_in, cfg.advanced.ignore_service_limits, eb_spec);
+        let shared_with = plan
+            .groups
+            .iter()
+            .find(|g| g.id == preview.group_id)
+            .map(|g| {
+                g.members
+                    .iter()
+                    .filter(|m| *m != &d.id)
+                    .filter_map(|m| cfg.destinations.iter().find(|x| &x.id == m).map(dest_name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ResolvedQuality {
+            width: preview.key.width,
+            height: preview.key.height,
+            fps: preview.key.fps,
+            kbps: preview.key.kbps,
+            codec: preview.key.codec,
+            audio_kbps: preview.key.audio_kbps,
+            auto_fitted: preview.auto_fitted,
+            separate_encode: preview.separate_encode,
+            group_id: preview.group_id,
+            shared_with,
+        }
+    }
+
+    /// Per-destination allowed resolutions/fps/bitrates, auto-fit previews, encoder-sharing hints,
+    /// soft-limit notes, and PC encode budget for `GET /api/v1/golive/quality-options`.
+    pub async fn golive_quality_options(&self) -> QualityOptionsResponse {
+        use std::collections::{BTreeMap, HashSet};
+
+        let studio = self.current_studio_cap_config().await;
+        let budget = self.refresh_pc_budget().await;
+        let host_info = self.cached_host_budget_info();
+        let studio_running = match self.studio_host() {
+            Ok(h) => h.status().await.running,
+            Err(_) => false,
+        };
+        let ingest = lock(&self.golive().ingest).clone();
+        let obs = self.golive_obs_view(ingest.as_deref()).await;
+
+        let g = self.golive();
+        let cfg = self.golive_config();
+        let studio_live = g.studio_live.load(std::sync::atomic::Ordering::Acquire);
+        let live_any = self.golive_stream_running();
+        let source = if studio_live {
+            QualitySource::Studio
+        } else if live_any || obs.streaming {
+            QualitySource::Obs
+        } else if studio_running {
+            QualitySource::Studio
+        } else if obs.connected && obs.points_here {
+            QualitySource::Obs
+        } else {
+            QualitySource::None
+        };
+
+        let planner_in = self.planner_input_for(&cfg, &studio, budget);
+        let base_plan = plan_encodes(&planner_in);
+        let main_encode = planner_in.main;
+        let vertical_encode = (cfg.vertical_source == VerticalSource::Canvas
+            && (host_info.as_ref().is_some_and(|i| i.vertical_on)
+                || cfg.destinations.iter().any(|d| d.canvas == Canvas::Vertical)))
+        .then(|| {
+            let (vw, vh) = host_info.as_ref().and_then(|i| i.vertical_size).unwrap_or((1080, 1920));
+            studio.as_vertical_encode(vw, vh)
+        });
+        let vertical_summary = vertical_encode.as_ref().map(QualityCanvasSummary::from);
+        let vertical_for_dest = planner_in.vertical.or(vertical_encode);
+        let eb_spec = lock(&g.enhanced).as_ref().and_then(|p| TwitchEbSpec::from_plan(p, &main_encode));
+
+        let failing = lock(&g.backup).failing.clone();
+        let active_group_ids: HashSet<GroupId> = lock(&g.active_groups).keys().cloned().collect();
+        let live_main_spec = lock(&g.active_groups).get(GROUP_MAIN).cloned();
+        let supports_hevc = host_info.as_ref().map_or(cfg!(target_os = "macos"), |i| i.os == "macos");
+        let ignore_global = cfg.advanced.ignore_service_limits;
+
+        let mut destinations = BTreeMap::new();
+        for d in &cfg.destinations {
+            let sends = d.enabled || destination_sends(&cfg, &failing, d);
+            let direct = d.url.as_deref().and_then(direct_kind);
+            let obs_live_locked = !studio_live && live_any && sends;
+            let locked_reason = if direct.is_some() {
+                Some("SRT, RIST and WebRTC servers get the full stream from the Studio.".into())
+            } else if obs_live_locked {
+                Some(
+                    "Stop and start the stream again to change a destination's quality while streaming from OBS."
+                        .into(),
+                )
+            } else if d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main {
+                Some("Twitch Enhanced Broadcasting sets the quality ladder automatically.".into())
+            } else if d.canvas == Canvas::Vertical && cfg.vertical_source == VerticalSource::Cut {
+                Some(
+                    "Cut-from-stream copies from your main stream; switch Vertical source to Canvas for custom vertical quality."
+                        .into(),
+                )
+            } else {
+                None
+            };
+
+            let resolved = Self::resolved_quality_for(
+                &cfg,
+                &studio,
+                &main_encode,
+                vertical_for_dest.as_ref(),
+                eb_spec.as_ref(),
+                &base_plan,
+                d,
+            );
+
+            let base = if d.canvas == Canvas::Vertical {
+                vertical_for_dest.unwrap_or_else(|| studio.as_vertical_encode(1080, 1920))
+            } else {
+                main_encode
+            };
+            let is_eb = d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main && direct.is_none();
+            let ignore_dest = ignore_global && direct != Some("whip");
+            let lim =
+                (!ignore_dest && !is_eb).then(|| probe::platform_limit(d.kind, d.brand.as_deref(), d.canvas)).flatten();
+
+            let fps_choices = destination_fps_choices(base.canvas_fps.max(1), lim.as_ref());
+            let codecs = destination_codecs(supports_hevc, lim.as_ref());
+            let custom_limits = (direct.is_none()).then(|| {
+                let cw = (base.canvas_width & !1).max(2);
+                let ch = (base.canvas_height & !1).max(2);
+                let (max_width, max_height) = match lim {
+                    Some(ref l) => probe::fit_dimensions(cw, ch, l.max_long_edge, l.max_short_edge),
+                    None => (cw, ch),
+                };
+                let max_kbps = lim.map_or(probe::MAX_CUSTOM_KBPS, |l| l.max_kbps.min(probe::MAX_CUSTOM_KBPS));
+                let (rec_w, rec_h, rec_fps, rec_kbps) = recommended_values_for_destination(
+                    d,
+                    base,
+                    max_width,
+                    max_height,
+                    &fps_choices,
+                    lim.as_ref(),
+                    ignore_dest,
+                );
+                CustomQualityLimits {
+                    max_width,
+                    max_height,
+                    min_kbps: probe::MIN_CUSTOM_KBPS,
+                    max_kbps,
+                    fps_choices: fps_choices.clone(),
+                    codecs: codecs.clone(),
+                    recommended_width: rec_w,
+                    recommended_height: rec_h,
+                    recommended_fps: rec_fps,
+                    recommended_kbps: rec_kbps,
+                }
+            });
+
+            let mut options = Vec::new();
+            let same_sim = simulate_quality_option(
+                d,
+                &DestinationQuality::SameAsMain,
+                &planner_in,
+                &base_plan,
+                studio_live,
+                &active_group_ids,
+                live_main_spec.as_ref(),
+                locked_reason.as_deref(),
+                obs_live_locked,
+                lim.as_ref(),
+                ignore_dest,
+            );
+            let same_label = if is_eb {
+                "Twitch Enhanced Broadcasting (Auto)".to_string()
+            } else {
+                let summary = format!(
+                    "{} · {}",
+                    probe::format_res_fps(same_sim.resolved.width, same_sim.resolved.height, same_sim.resolved.fps),
+                    probe::bitrate_chip(same_sim.resolved.kbps),
+                );
+                if same_sim.auto_fitted {
+                    format!("Same as main (Auto-fit: {summary})")
+                } else {
+                    format!("Same as main ({summary})")
+                }
+            };
+            let same_has_soft_note = same_sim.note.is_some();
+            options.push(QualityOption {
+                id: "same_as_main".into(),
+                label: same_label,
+                quality: DestinationQuality::SameAsMain,
+                resolved: same_sim.resolved,
+                auto_fitted: same_sim.auto_fitted,
+                recommended: !same_has_soft_note,
+                note: same_sim.note,
+                shares_encoder_with: same_sim.shares_encoder_with,
+                allowed: same_sim.allowed,
+                disabled_reason: same_sim.disabled_reason,
+            });
+
+            if direct.is_none()
+                && let Some(ref limits) = custom_limits
+            {
+                let primary_codec = if codecs.contains(&base.codec) { base.codec } else { codecs[0] };
+                let mut candidates =
+                    standard_quality_candidates(d, base, &fps_choices, primary_codec, lim.as_ref(), ignore_dest);
+                // Also surface exact active encode-group shapes on the same canvas so zero-cost
+                // encoder sharing stays discoverable even when PC encode budget is full.
+                for grp in &base_plan.groups {
+                    if grp.key.canvas != d.canvas || grp.is_twitch_eb {
+                        continue;
+                    }
+                    if grp.members.iter().all(|m| m == &d.id) {
+                        continue;
+                    }
+                    if !codecs.contains(&grp.key.codec) {
+                        continue;
+                    }
+                    candidates.push(CustomQuality {
+                        width: grp.key.width,
+                        height: grp.key.height,
+                        fps: grp.key.fps,
+                        kbps: grp.key.kbps,
+                        codec: Some(grp.key.codec),
+                    });
+                }
+
+                let mut seen_rungs = HashSet::new();
+                let mut valid_rungs = Vec::new();
+                for cand in candidates {
+                    if cand
+                        .validate(
+                            d.canvas,
+                            base.canvas_width,
+                            base.canvas_height,
+                            base.canvas_fps.max(1),
+                            lim.as_ref(),
+                            ignore_dest,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let eff_codec = cand.codec.unwrap_or(primary_codec);
+                    if !codecs.contains(&eff_codec) {
+                        continue;
+                    }
+                    let dedup_key = (cand.width, cand.height, cand.fps, cand.kbps, eff_codec);
+                    if seen_rungs.insert(dedup_key) {
+                        valid_rungs.push(CustomQuality { codec: Some(eff_codec), ..cand });
+                    }
+                }
+                valid_rungs.sort_by(|a, b| {
+                    b.height
+                        .cmp(&a.height)
+                        .then_with(|| b.width.cmp(&a.width))
+                        .then_with(|| b.fps.cmp(&a.fps))
+                        .then_with(|| b.kbps.cmp(&a.kbps))
+                });
+
+                let mut rec_marked = !same_has_soft_note;
+                for rung in valid_rungs {
+                    let q = DestinationQuality::Custom(rung.clone());
+                    let sim = simulate_quality_option(
+                        d,
+                        &q,
+                        &planner_in,
+                        &base_plan,
+                        studio_live,
+                        &active_group_ids,
+                        live_main_spec.as_ref(),
+                        locked_reason.as_deref(),
+                        obs_live_locked,
+                        lim.as_ref(),
+                        ignore_dest,
+                    );
+                    let id = if d.canvas == Canvas::Vertical {
+                        format!("{}x{}p{}_{}", rung.width, rung.height, rung.fps, rung.kbps)
+                    } else {
+                        format!("{}p{}_{}", rung.height, rung.fps, rung.kbps)
+                    };
+                    let codec_suffix = if rung.codec.is_some_and(|c| c != VideoCodec::H264 && codecs.len() > 1) {
+                        " · HEVC"
+                    } else {
+                        ""
+                    };
+                    let label = format!(
+                        "{} · {}{codec_suffix}",
+                        probe::format_res_fps(rung.width, rung.height, rung.fps),
+                        probe::bitrate_chip(rung.kbps)
+                    );
+                    let is_recommended = !rec_marked
+                        && sim.note.is_none()
+                        && (rung.width, rung.height, rung.fps)
+                            == (limits.recommended_width, limits.recommended_height, limits.recommended_fps);
+                    if is_recommended {
+                        rec_marked = true;
+                    }
+                    options.push(QualityOption {
+                        id,
+                        label,
+                        quality: q,
+                        resolved: sim.resolved,
+                        auto_fitted: false,
+                        recommended: is_recommended,
+                        note: sim.note,
+                        shares_encoder_with: sim.shares_encoder_with,
+                        allowed: sim.allowed,
+                        disabled_reason: sim.disabled_reason,
+                    });
+                }
+            }
+
+            destinations.insert(
+                d.id.clone(),
+                DestinationQualityOptions {
+                    id: d.id.clone(),
+                    canvas: d.canvas,
+                    locked_reason,
+                    current: d.quality.clone(),
+                    resolved,
+                    options,
+                    custom_limits,
+                },
+            );
+        }
+
+        QualityOptionsResponse {
+            source,
+            main: QualityCanvasSummary::from(&main_encode),
+            vertical: vertical_summary,
+            budget: base_plan.budget,
+            destinations,
+        }
+    }
+}
+
+struct SimulatedQualityOption {
+    resolved: QualityOptionResolved,
+    auto_fitted: bool,
+    note: Option<String>,
+    shares_encoder_with: Vec<String>,
+    allowed: bool,
+    disabled_reason: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn simulate_quality_option(
+    d: &DestinationConfig,
+    candidate: &DestinationQuality,
+    base_input: &PlannerInput,
+    base_plan: &EncodePlan,
+    studio_live: bool,
+    active_group_ids: &std::collections::HashSet<GroupId>,
+    live_main_spec: Option<&crate::studio_host::EncodeGroupSpec>,
+    locked_reason: Option<&str>,
+    obs_live_locked: bool,
+    lim: Option<&PlatformLimit>,
+    ignore_dest: bool,
+) -> SimulatedQualityOption {
+    let mut sim_in = base_input.clone();
+    let was_active = base_plan.destinations.contains_key(&d.id);
+    if let Some(pd) = sim_in.destinations.iter_mut().find(|x| x.id == d.id) {
+        pd.quality = candidate.clone();
+        pd.light = false;
+        pd.route_light = false;
+        if !was_active {
+            pd.enabled = true;
+            pd.can_start = true;
+            pd.standby = false;
+        }
+    }
+    let sim_plan = plan_encodes(&sim_in);
+    let sim_pd = sim_plan.destinations.get(&d.id);
+    let key = sim_pd.map_or_else(|| base_input.main.as_key(), |p| p.key.clone());
+    let group_id = sim_pd.map_or_else(|| GROUP_MAIN.to_string(), |p| p.group_id.clone());
+    let auto_fitted = sim_pd.is_some_and(|p| p.auto_fitted);
+    let note = if let Some(pd_note) = sim_pd.and_then(|p| p.note.clone()) {
+        Some(pd_note)
+    } else if !ignore_dest {
+        lim.and_then(|l| l.recommendation_note(key.width, key.height, key.fps))
+    } else {
+        None
+    };
+    let shares_encoder_with = sim_pd.map_or_else(Vec::new, |p| p.shared_with.clone());
+
+    let mut allowed = true;
+    let mut disabled_reason = None;
+    if let Some(lock_msg) = locked_reason {
+        let disallowed_by_lock =
+            if obs_live_locked { *candidate != d.quality } else { matches!(candidate, DestinationQuality::Custom(_)) };
+        if disallowed_by_lock {
+            allowed = false;
+            disabled_reason = Some(lock_msg.to_string());
+        }
+    }
+
+    if allowed && matches!(candidate, DestinationQuality::Custom(_)) {
+        let shares_existing = base_plan.groups.iter().any(|g| g.id == group_id && g.members.iter().any(|m| m != &d.id));
+        let group_already_running = studio_live && active_group_ids.contains(&group_id);
+        if studio_live
+            && let Some(main_spec) = live_main_spec
+            && (sim_pd.is_some_and(|p| p.shared_cap_fallback)
+                || (group_id == GROUP_MAIN && main_spec.key != key && !group_already_running))
+        {
+            allowed = false;
+            disabled_reason = Some("Changing to that quality now would restart the main stream.".into());
+        } else if !group_already_running && !shares_existing && sim_plan.budget.status == BudgetStatus::Over {
+            allowed = false;
+            disabled_reason =
+                Some(sim_plan.budget.note.clone().unwrap_or_else(|| "Exceeds your computer's encode budget.".into()));
+        }
+    }
+
+    SimulatedQualityOption {
+        resolved: QualityOptionResolved {
+            width: key.width,
+            height: key.height,
+            fps: key.fps,
+            kbps: key.kbps,
+            codec: key.codec,
+        },
+        auto_fitted,
+        note,
+        shares_encoder_with,
+        allowed,
+        disabled_reason,
+    }
+}
+
+fn destination_fps_choices(canvas_fps: u32, lim: Option<&PlatformLimit>) -> Vec<u32> {
+    let max_fps = lim.map_or(canvas_fps, |l| l.max_fps.min(canvas_fps));
+    let mut out = Vec::new();
+    for f in [120u32, 60, 50, 48, 30, 25, 24, 15] {
+        if f <= max_fps && canvas_fps.is_multiple_of(f) {
+            out.push(f);
+        }
+    }
+    if out.is_empty() && max_fps > 0 && canvas_fps.is_multiple_of(max_fps) {
+        out.push(max_fps);
+    }
+    if out.is_empty() {
+        out.push(canvas_fps);
+    }
+    out
+}
+
+fn destination_codecs(supports_hevc: bool, lim: Option<&PlatformLimit>) -> Vec<VideoCodec> {
+    let mut out = vec![VideoCodec::H264];
+    if supports_hevc {
+        out.push(VideoCodec::Hevc);
+    }
+    if let Some(l) = lim {
+        out.retain(|c| l.allows_codec(*c));
+    }
+    if out.is_empty() {
+        out.push(VideoCodec::H264);
+    }
+    out
+}
+
+fn default_rung_kbps(kind: Service, w: u32, h: u32, fps: u32, lim: Option<&PlatformLimit>) -> u32 {
+    let short = w.min(h);
+    let raw = if short >= 2160 {
+        25_000
+    } else if short >= 1440 {
+        if kind == Service::Youtube { 18_000 } else { 14_000 }
+    } else if short >= 1080 {
+        if fps > 30 {
+            match kind {
+                Service::Twitch => 6_000,
+                Service::Kick => 8_000,
+                _ => 9_000,
+            }
+        } else if kind == Service::Twitch {
+            4_500
+        } else {
+            6_000
+        }
+    } else if short >= 720 {
+        if fps > 30 { 4_500 } else { 3_000 }
+    } else {
+        1_500
+    };
+    lim.map_or(raw, |l| raw.min(l.max_kbps_for(w, h, fps))).clamp(probe::MIN_CUSTOM_KBPS, probe::MAX_CUSTOM_KBPS)
+}
+
+fn recommended_values_for_destination(
+    d: &DestinationConfig,
+    base: MainEncode,
+    max_width: u32,
+    max_height: u32,
+    fps_choices: &[u32],
+    lim: Option<&PlatformLimit>,
+    ignore_dest: bool,
+) -> (u32, u32, u32, u32) {
+    let (mut rec_w, mut rec_h) = (max_width, max_height);
+    let mut rec_fps = fps_choices[0];
+    if !ignore_dest && let Some(l) = lim {
+        if let (Some(rl), Some(rs)) = (l.rec_long_edge, l.rec_short_edge) {
+            (rec_w, rec_h) = probe::fit_dimensions(rec_w, rec_h, rl, rs);
+        }
+        if let Some(rf) = l.rec_fps {
+            rec_fps = probe::largest_fps_divisor(base.canvas_fps.max(1), rec_fps.min(rf));
+        }
+    }
+    let rec_kbps = default_rung_kbps(d.kind, rec_w, rec_h, rec_fps, lim);
+    (rec_w, rec_h, rec_fps, rec_kbps)
+}
+
+fn standard_quality_candidates(
+    d: &DestinationConfig,
+    base: MainEncode,
+    fps_choices: &[u32],
+    primary_codec: VideoCodec,
+    lim: Option<&PlatformLimit>,
+    ignore_dest: bool,
+) -> Vec<CustomQuality> {
+    let top_fps = fps_choices[0];
+    let second_fps = fps_choices.get(1).copied();
+    let dims: &[(u32, u32)] = if d.canvas == Canvas::Vertical {
+        &[(1080, 1920), (720, 1280), (540, 960)]
+    } else {
+        &[(3840, 2160), (2560, 1440), (1920, 1080), (1280, 720), (852, 480)]
+    };
+
+    let mut res_list: Vec<(u32, u32)> = dims.to_vec();
+    let native = ((base.width & !1).max(2), (base.height & !1).max(2));
+    if !res_list.contains(&native)
+        && ((d.canvas == Canvas::Vertical && native.1 > native.0) || (d.canvas == Canvas::Main && native.0 >= native.1))
+    {
+        res_list.push(native);
+    }
+
+    let eff_lim = (!ignore_dest).then_some(lim).flatten();
+    let mut out = Vec::new();
+    for (w, h) in res_list {
+        let short = w.min(h);
+        let mut rung_fps = vec![if short < 600 { second_fps.unwrap_or(top_fps) } else { top_fps }];
+        if matches!(short, 1080 | 720)
+            && let Some(sf) = second_fps
+            && sf != rung_fps[0]
+        {
+            rung_fps.push(sf);
+        }
+        for fps in rung_fps {
+            let kbps = default_rung_kbps(d.kind, w, h, fps, eff_lim);
+            out.push(CustomQuality { width: w, height: h, fps, kbps, codec: Some(primary_codec) });
+        }
+    }
+    out
 }
 
 /// Cloudflare's speed-test upload endpoint (no account, nothing kept).

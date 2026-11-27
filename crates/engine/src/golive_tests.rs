@@ -4831,3 +4831,198 @@ async fn scenario_e_live_switch_timeout_aborts_and_keeps_kick_old_stream() {
 
     e.studio_stream(false).await.unwrap();
 }
+
+#[tokio::test]
+async fn offline_set_golive_quality_refuses_custom_over_pc_budget_422() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use ferrocast_core::event::Platform;
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    let s = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 10_000,
+        ..Default::default()
+    };
+    *host.settings.lock().unwrap() = s.clone();
+    // Windows pre-531 NVENC: max 3 sessions, auto_quality=true reserves 1 spare -> effective cap 2.
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        nvidia_driver_major: Some(525),
+        cpu_cores: 8,
+        host_sig: "win|nv=525".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host);
+    e.note_studio_settings(&s);
+    e.register_connector(Arc::new(SignedIn(Platform::Youtube)));
+    e.register_connector(Arc::new(SignedIn(Platform::Twitch)));
+    e.register_connector(Arc::new(SignedIn(Platform::Kick)));
+
+    let custom = e.add_golive_destination("Extra", "rtmp://127.0.0.1:9/app", "k", Canvas::Main).await.unwrap();
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "twitch" || d.id == custom.id))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    // Group 1: YouTube + Custom (main 1080p60@10000); Group 2: Twitch Custom (1080p60@6000) -> fills 2/2 effective sessions.
+    let tw_1080 = CustomQuality { width: 1920, height: 1080, fps: 60, kbps: 6_000, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality("twitch", DestinationQuality::Custom(tw_1080)).await.unwrap();
+    // Moving enabled `custom` onto a 3rd un-collapsible encode offline must fail with 422 encode_budget_exceeded.
+    let distinct = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let err = e.set_golive_quality(&custom.id, DestinationQuality::Custom(distinct)).await.unwrap_err();
+    assert!(
+        matches!(err, EngineError::Refused { status: 422, code: "encode_budget_exceeded", .. }),
+        "expected 422 encode_budget_exceeded offline, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn quality_options_enforces_hard_vs_soft_limits_sharing_budget_and_locks() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, QualitySource, VerticalSource, VideoCodec};
+    use ferrocast_core::event::Platform;
+
+    let (e, _dir) = engine().await;
+
+    // Before any Studio or OBS source is running: `"source": "none"`.
+    let cold_opts = e.golive_quality_options().await;
+    assert_eq!(cold_opts.source, QualitySource::None);
+    assert!(cold_opts.destinations.contains_key("twitch"));
+    assert!(cold_opts.destinations.contains_key("kick"));
+    assert!(cold_opts.destinations.contains_key("youtube"));
+    assert!(cold_opts.destinations.contains_key("youtube_vertical"));
+
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 1);
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 2560,
+        height: 1440,
+        fps: 60,
+        video_kbps: 18_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        nvidia_driver_major: Some(535),
+        cpu_cores: 8,
+        vertical_on: false,
+        vertical_size: Some((1080, 1920)),
+        host_sig: "win|nv=535".into(),
+        ..Default::default()
+    });
+    *e.studio().studio_bench.write().unwrap() = Some(crate::golive_plan::PersistedStudioBench {
+        encoder_id: "ffmpeg_nvenc".into(),
+        is_software: false,
+        max_mpx_s: 600.0,
+        max_sessions_ok: Some(3),
+        measured_at: 1,
+        host_sig: "win|nv=535".into(),
+    });
+    e.set_studio_host(host.clone());
+    e.register_connector(Arc::new(SignedIn(Platform::Youtube)));
+    e.register_connector(Arc::new(SignedIn(Platform::Twitch)));
+    e.register_connector(Arc::new(SignedIn(Platform::Kick)));
+
+    let whip = e.add_golive_destination("WHIP", "https://whip.example.com/whip", "", Canvas::Main).await.unwrap();
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "twitch"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    // First verify Twitch's soft 1080p recommendation before switching Twitch to Custom 1080p60@6M:
+    // `same_as_main` resolves 1440p@6M with advisory note; 1440p60 remains selectable; 1080p60 is recommended.
+    let pre_opts = e.golive_quality_options().await;
+    let twitch = &pre_opts.destinations["twitch"];
+    let tw_same = twitch.options.iter().find(|o| o.id == "same_as_main").unwrap();
+    assert_eq!((tw_same.resolved.width, tw_same.resolved.height, tw_same.resolved.kbps), (2560, 1440, 6_000));
+    assert_eq!(tw_same.note.as_deref(), Some("Above Twitch's recommended 1080p"));
+    assert!(!tw_same.recommended);
+    let tw_1440 = twitch.options.iter().find(|o| o.id == "1440p60_6000").unwrap();
+    assert!(tw_1440.note.as_deref().is_some_and(|n| n.contains("recommended 1080p")));
+    assert!(!tw_1440.recommended);
+    let tw_1080 = twitch.options.iter().find(|o| o.id == "1080p60_6000").unwrap();
+    assert!(tw_1080.recommended, "1080p60 should be Twitch default recommendation");
+    assert_eq!(tw_1080.note, None);
+
+    // Pin Twitch to recommended 1080p60@6M so YouTube (1440p) + Twitch (1080p60@6M) occupy 2/2 NVENC sessions.
+    e.set_golive_quality(
+        "twitch",
+        DestinationQuality::Custom(CustomQuality {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            kbps: 6_000,
+            codec: Some(VideoCodec::H264),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let opts = e.golive_quality_options().await;
+    // Windows host filters HEVC out of custom_limits.
+    let yt = &opts.destinations["youtube"];
+    assert_eq!(yt.custom_limits.as_ref().unwrap().codecs, vec![VideoCodec::H264]);
+    assert!(yt.custom_limits.as_ref().unwrap().fps_choices == vec![60, 30, 15]);
+
+    // Kick: HARD 1080p limit (never offers 1440p or 2160p rungs), budget 2/2 full from YouTube+Twitch:
+    // separate Kick 1080p60@8M must be disallowed with disabled_reason, while Kick 1080p60@6M
+    // shares Twitch's encoder and stays allowed!
+    let kick = &opts.destinations["kick"];
+    assert!(kick.locked_reason.is_none());
+    let kick_limits = kick.custom_limits.as_ref().unwrap();
+    assert_eq!((kick_limits.max_width, kick_limits.max_height, kick_limits.max_kbps), (1920, 1080, 8_000));
+    assert!(kick.options.iter().all(|o| o.resolved.height <= 1080));
+    let kick_8m = kick.options.iter().find(|o| o.id == "1080p60_8000").expect("Kick 1080p60@8M rung");
+    assert!(!kick_8m.allowed, "new 3rd encode on 2/2 NVENC budget must be disallowed");
+    assert!(kick_8m.disabled_reason.is_some());
+    let kick_6m = kick.options.iter().find(|o| o.id == "1080p60_6000").expect("Kick shared 1080p60@6M rung");
+    assert!(kick_6m.allowed, "shared 1080p60@6M rung must stay allowed: {kick_6m:?}");
+    assert_eq!(kick_6m.shares_encoder_with, vec!["Twitch".to_string()]);
+
+    // Direct WHIP destination is locked and omits custom_limits.
+    let whip_opts = &opts.destinations[&whip.id];
+    assert!(whip_opts.locked_reason.is_some());
+    assert!(whip_opts.custom_limits.is_none());
+
+    // Vertical under Cut mode is locked.
+    e.set_vertical_source(VerticalSource::Cut).await.unwrap();
+    let opts_cut = e.golive_quality_options().await;
+    assert!(opts_cut.destinations["youtube_vertical"].locked_reason.is_some());
+    e.set_vertical_source(VerticalSource::Canvas).await.unwrap();
+
+    // Twitch Enhanced Broadcasting locks Twitch custom options.
+    e.set_golive_enhanced("twitch", true).await.unwrap();
+    let opts_eb = e.golive_quality_options().await;
+    assert!(opts_eb.destinations["twitch"].locked_reason.as_deref().is_some_and(|s| s.contains("Enhanced")));
+    e.set_golive_enhanced("twitch", false).await.unwrap();
+
+    // GoLiveView / DestinationView carry additive quality, resolved_quality, switching_quality, encode_groups, encode_budget.
+    let view = e.golive_view().await;
+    assert!(!view.encode_groups.is_empty());
+    assert_eq!(view.encode_budget.used_sessions, 2);
+    let tw_view = view.destinations.iter().find(|d| d.id == "twitch").unwrap();
+    assert!(matches!(tw_view.quality, DestinationQuality::Custom(_)));
+    assert_eq!(tw_view.resolved_quality.kbps, 6_000);
+    assert!(!tw_view.switching_quality);
+    assert_ne!(tw_view.resolved_quality.group_id, crate::golive::GROUP_MAIN);
+
+    // Live Studio stream sets `"source": "studio"` and populates `live_fps` / `live_kbps`.
+    let order_live: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
+    e.set_golive_destinations(order_live).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    let live_opts = e.golive_quality_options().await;
+    assert_eq!(live_opts.source, QualitySource::Studio);
+    let live_view = e.golive_view().await;
+    assert!(live_view.encode_groups.iter().any(|g| g.id == crate::golive::GROUP_MAIN && g.live_kbps.is_some()));
+    e.studio_stream(false).await.unwrap();
+}

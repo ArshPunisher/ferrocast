@@ -304,6 +304,7 @@ impl Engine {
         }
 
         let group_stats = host.group_stats().await.ok().flatten();
+        self.note_golive_group_stats(group_stats.clone());
         let active_ids: std::collections::HashSet<String> = grouped.keys().cloned().collect();
         let mut group_changes: Vec<(String, u8, u8)> = Vec::new();
         {
