@@ -452,7 +452,7 @@ fn main() {
                             Some((new_inner_size.width, new_inner_size.height)),
                         );
                     }
-                    WindowEvent::Destroyed => studio::detach_window_watcher(),
+                    WindowEvent::Destroyed => studio::on_window_destroyed(window.app_handle()),
                     WindowEvent::CloseRequested { api, .. } => {
                         let app = window.app_handle();
                         let _ = app.save_window_state(StateFlags::all());
@@ -463,6 +463,7 @@ fn main() {
                             // Closing hides: the engine keeps alerts and the bot running from the tray.
                             api.prevent_close();
                             let _ = window.hide();
+                            studio::on_window_hidden(app);
                         } else {
                             // Closing the window quits: asked first when something is on air.
                             api.prevent_close();
@@ -1461,6 +1462,7 @@ pub(crate) fn show_window(app: &AppHandle) {
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+        studio::on_window_shown(app);
         return;
     }
     let Some(running) = app.try_state::<Running>() else {

@@ -169,6 +169,26 @@ impl Preview {
         }
     }
 
+    fn configure(&mut self, cfg: ferrocast_studio::stage::StageViewConfig<'_>) {
+        match self {
+            Preview::Real(p) => p.configure(cfg),
+            Preview::Test(p) => {
+                p.rect = cfg.rect;
+                p.scale = cfg.scale;
+                *p.area.borrow_mut() = cfg.canvas;
+                if let Some(c) = cfg.bg {
+                    p.bg.set(Some(c));
+                }
+                p.stripe.set(cfg.stripe);
+                *p.holes.borrow_mut() = cfg.holes.to_vec();
+                p.shade.set(cfg.shade);
+                p.opacity.set(cfg.opacity.unwrap_or(1.0));
+                p.hidden_for_resize.set(cfg.hide_for_resize);
+                p.live_resize.set(cfg.hide_for_resize);
+            }
+        }
+    }
+
     fn set_hidden_for_resize(&self, hidden: bool) {
         match self {
             Preview::Real(p) => p.set_hidden_for_resize(hidden),
@@ -577,26 +597,29 @@ fn make_vertical_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
         return Ok(());
     }
     // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
-    let mut p = create_stage_view(ctx, c, rect, scale, true)?;
-    let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
-    let v = &h.vertical;
-    configure_stage_view(
-        &mut p,
-        ViewProps {
-            rect,
-            canvas: v.canvas,
-            bg: v.bg,
-            stripe: v.stripe,
-            holes: &v.holes,
-            opacity: v.opacity,
-            shade: v.shade,
-            scale,
-            hide_for_resize,
-        },
-    );
-    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
-    p.frames(h.frames.as_deref());
-    p.set_paused(h.preview_paused);
+    let hide_for_resize = current_hide_for_resize_in(ctx);
+    let p = ferrocast_studio::batch_preview_updates(|| -> Result<Preview, String> {
+        let mut p = create_stage_view(ctx, c, rect, scale, true)?;
+        let v = &h.vertical;
+        configure_stage_view(
+            &mut p,
+            ViewProps {
+                rect,
+                canvas: v.canvas,
+                bg: v.bg,
+                stripe: v.stripe,
+                holes: &v.holes,
+                opacity: v.opacity,
+                shade: v.shade,
+                scale,
+                hide_for_resize,
+            },
+        );
+        p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
+        p.frames(h.frames.as_deref());
+        p.set_paused(h.preview_paused);
+        Ok(p)
+    })?;
     h.vertical.view = Some(p);
     Ok(())
 }
@@ -668,7 +691,14 @@ thread_local! {
     static HELD: RefCell<Held> = RefCell::default();
     static WINDOW_RESIZE: RefCell<WindowResizeState> = RefCell::default();
     static WINDOW_WATCHER: RefCell<Option<ferrocast_studio::WindowWatch>> = const { RefCell::new(None) };
+    static PENDING_RESIZE_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+const SETTLE_FAILSAFE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const DRAG_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const DRAG_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const DRAG_MAX_DURATION: std::time::Duration = std::time::Duration::from_secs(15);
+const FULLSCREEN_FAILSAFE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -701,11 +731,38 @@ fn scale_changed_script(detail: &ScaleChangedEvent) -> Option<String> {
     Some(format!("window.dispatchEvent(new CustomEvent('fc://scale-changed', {{ detail: {json} }}))"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerKind {
+    DragPoll,
+    Fullscreen,
+    Settle,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResizeActions {
+    hide_and_park: bool,
+    restore_and_unpark: bool,
+    emit: Vec<(bool, u64)>,
+    schedule_timer: Option<(u64, std::time::Duration)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DragSession {
+    started_at: std::time::Instant,
+    last_heartbeat: std::time::Instant,
+}
+
 #[derive(Debug, Default)]
 struct WindowResizeState {
-    live_resizing: bool,
+    drag: Option<DragSession>,
+    fullscreen_started: Option<std::time::Instant>,
+    awaiting_settle: bool,
+    hidden: bool,
+    timer_token: u64,
+    timer_kind: Option<TimerKind>,
     scale: Option<f64>,
     logical_size: Option<(u32, u32)>,
+    dpi_changing: bool,
     seq: u64,
 }
 
@@ -719,22 +776,116 @@ impl WindowResizeState {
         ((f64::from(phys_w) / s).round().max(1.0) as u32, (f64::from(phys_h) / s).round().max(1.0) as u32)
     }
 
-    fn on_live_resize(&mut self, active: bool) -> Option<u64> {
-        if self.live_resizing == active {
-            return None;
-        }
-        self.live_resizing = active;
+    fn next_seq(&mut self) -> u64 {
         self.seq = self.seq.saturating_add(1);
-        Some(self.seq)
+        self.seq
+    }
+
+    fn arm_timer(&mut self, kind: TimerKind, delay: std::time::Duration) -> (u64, std::time::Duration) {
+        self.timer_token = self.timer_token.saturating_add(1);
+        self.timer_kind = Some(kind);
+        (self.timer_token, delay)
+    }
+
+    fn disarm_timer(&mut self) {
+        self.timer_token = self.timer_token.saturating_add(1);
+        self.timer_kind = None;
     }
 
     fn is_live_resizing(&self) -> bool {
-        self.live_resizing
+        self.drag.is_some() || self.fullscreen_started.is_some() || self.awaiting_settle
+    }
+
+    fn on_live_resize_at(&mut self, active: bool, now: std::time::Instant) -> ResizeActions {
+        let mut out = ResizeActions::default();
+        if active {
+            self.awaiting_settle = false;
+            if self.drag.is_none() {
+                self.drag = Some(DragSession { started_at: now, last_heartbeat: now });
+                if !self.hidden {
+                    self.hidden = true;
+                    out.hide_and_park = true;
+                }
+                out.emit.push((true, self.next_seq()));
+                out.schedule_timer = Some(self.arm_timer(TimerKind::DragPoll, DRAG_CHECK_INTERVAL));
+            }
+            return out;
+        }
+        if self.drag.take().is_none() {
+            return out;
+        }
+        if let Some(fs_at) = self.fullscreen_started {
+            let remaining = FULLSCREEN_FAILSAFE_DELAY.saturating_sub(now.saturating_duration_since(fs_at));
+            out.schedule_timer = Some(self.arm_timer(TimerKind::Fullscreen, remaining.max(SETTLE_FAILSAFE_DELAY)));
+            return out;
+        }
+        self.awaiting_settle = true;
+        out.emit.push((false, self.next_seq()));
+        out.schedule_timer = Some(self.arm_timer(TimerKind::Settle, SETTLE_FAILSAFE_DELAY));
+        out
+    }
+
+    fn on_fullscreen_at(&mut self, active: bool, now: std::time::Instant) -> ResizeActions {
+        let mut out = ResizeActions::default();
+        if active {
+            self.awaiting_settle = false;
+            let was_fs = self.fullscreen_started.is_some();
+            self.fullscreen_started = Some(now);
+            if !self.hidden {
+                self.hidden = true;
+                out.hide_and_park = true;
+            }
+            if !was_fs {
+                out.emit.push((true, self.next_seq()));
+            }
+            if self.drag.is_none() {
+                out.schedule_timer = Some(self.arm_timer(TimerKind::Fullscreen, FULLSCREEN_FAILSAFE_DELAY));
+            }
+            return out;
+        }
+        if self.fullscreen_started.take().is_none() {
+            return out;
+        }
+        if self.drag.is_some() {
+            return out;
+        }
+        self.awaiting_settle = true;
+        out.emit.push((false, self.next_seq()));
+        out.schedule_timer = Some(self.arm_timer(TimerKind::Settle, SETTLE_FAILSAFE_DELAY));
+        out
+    }
+
+    #[cfg(test)]
+    fn on_live_resize(&mut self, active: bool) -> Option<u64> {
+        let actions = self.on_live_resize_at(active, std::time::Instant::now());
+        actions.emit.last().map(|(_, seq)| *seq)
+    }
+
+    #[cfg(test)]
+    fn on_window_resized(&mut self, phys_w: u32, phys_h: u32, raw_scale: f64) -> bool {
+        self.on_window_resized_at(phys_w, phys_h, raw_scale, std::time::Instant::now()).hide_and_park
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn prepare_scale_change(&mut self, raw_scale: f64, phys_size: Option<(u32, u32)>) {
+        if let Some(next) = Self::sanitize_scale(raw_scale) {
+            if let Some((pw, ph)) = phys_size
+                && pw > 0
+                && ph > 0
+            {
+                self.logical_size = Some(Self::logical_of(pw, ph, next));
+            }
+            self.dpi_changing = true;
+        }
     }
 
     fn on_scale_changed(&mut self, raw_scale: f64, phys_size: Option<(u32, u32)>) -> Option<(f64, Option<f64>)> {
+        self.dpi_changing = false;
         let next = Self::sanitize_scale(raw_scale)?;
-        if let Some((pw, ph)) = phys_size {
+        if let Some((pw, ph)) = phys_size
+            && pw > 0
+            && ph > 0
+        {
             self.logical_size = Some(Self::logical_of(pw, ph, next));
         }
         if self.scale.is_some_and(|prev| (prev - next).abs() <= 1e-4) {
@@ -744,14 +895,175 @@ impl WindowResizeState {
         Some((next, prev))
     }
 
-    fn on_window_resized(&mut self, phys_w: u32, phys_h: u32, raw_scale: f64) -> bool {
+    fn on_window_resized_at(
+        &mut self,
+        phys_w: u32,
+        phys_h: u32,
+        raw_scale: f64,
+        _now: std::time::Instant,
+    ) -> ResizeActions {
+        // Minimized windows report 0x0 on Windows: never overwrite baseline logical_size and clear active hides.
+        if phys_w == 0 || phys_h == 0 {
+            return self.force_reset(true);
+        }
         let scale = Self::sanitize_scale(raw_scale).or(self.scale).unwrap_or(1.0);
         let logical = Self::logical_of(phys_w, phys_h, scale);
-        if self.live_resizing {
+        if self.drag.is_some() || self.fullscreen_started.is_some() || self.dpi_changing {
             self.logical_size = Some(logical);
-            return false;
+            return ResizeActions::default();
         }
-        self.logical_size.replace(logical).is_some_and(|prev| prev != logical)
+        let mut out = ResizeActions::default();
+        if self.logical_size.replace(logical).is_some_and(|prev| prev != logical) {
+            self.awaiting_settle = true;
+            if !self.hidden {
+                self.hidden = true;
+                out.hide_and_park = true;
+            }
+            // Pulse active:true then active:false so web clears `last` even inside its 350 ms grace window.
+            out.emit.push((true, self.next_seq()));
+            out.emit.push((false, self.next_seq()));
+            out.schedule_timer = Some(self.arm_timer(TimerKind::Settle, SETTLE_FAILSAFE_DELAY));
+        }
+        out
+    }
+
+    fn reconcile_sessions(&mut self, os_in_live_resize: bool, now: std::time::Instant, out: &mut ResizeActions) {
+        if let Some(drag) = self.drag
+            && (!os_in_live_resize || now.saturating_duration_since(drag.started_at) >= DRAG_MAX_DURATION)
+        {
+            self.drag = None;
+            out.emit.push((false, self.next_seq()));
+        }
+        if let Some(fs_at) = self.fullscreen_started
+            && now.saturating_duration_since(fs_at) >= FULLSCREEN_FAILSAFE_DELAY
+        {
+            self.fullscreen_started = None;
+            out.emit.push((false, self.next_seq()));
+        }
+    }
+
+    fn on_previews_put_at(&mut self, os_in_live_resize: bool, now: std::time::Instant) -> (bool, ResizeActions) {
+        let mut out = ResizeActions::default();
+        let had_hold = self.drag.is_some() || self.fullscreen_started.is_some() || self.hidden;
+        self.reconcile_sessions(os_in_live_resize, now, &mut out);
+        if self.drag.is_none() && self.fullscreen_started.is_none() {
+            self.awaiting_settle = false;
+            self.disarm_timer();
+            if self.hidden {
+                self.hidden = false;
+                if had_hold {
+                    out.restore_and_unpark = true;
+                }
+            }
+        } else if let Some(drag) = self.drag.as_mut()
+            && os_in_live_resize
+        {
+            drag.last_heartbeat = now;
+            out.emit.push((true, self.next_seq()));
+        } else if self.fullscreen_started.is_some() && self.timer_kind != Some(TimerKind::Fullscreen) {
+            out.schedule_timer = Some(self.arm_timer(TimerKind::Fullscreen, FULLSCREEN_FAILSAFE_DELAY));
+        }
+        (self.is_live_resizing(), out)
+    }
+
+    fn reconcile_for_sync_at(&mut self, os_in_live_resize: bool, now: std::time::Instant) -> (bool, ResizeActions) {
+        let mut out = ResizeActions::default();
+        self.reconcile_sessions(os_in_live_resize, now, &mut out);
+        if self.drag.is_none() && self.fullscreen_started.is_none() && !self.awaiting_settle {
+            self.hidden = false;
+            self.disarm_timer();
+        }
+        (self.is_live_resizing(), out)
+    }
+
+    fn on_timer_tick_at(&mut self, token: u64, os_in_live_resize: bool, now: std::time::Instant) -> ResizeActions {
+        let mut out = ResizeActions::default();
+        if token != self.timer_token {
+            return out;
+        }
+        let Some(kind) = self.timer_kind else {
+            return out;
+        };
+        match kind {
+            TimerKind::Settle => {
+                self.awaiting_settle = false;
+                self.timer_kind = None;
+                if self.drag.is_none() && self.fullscreen_started.is_none() && self.hidden {
+                    self.hidden = false;
+                    out.restore_and_unpark = true;
+                }
+            }
+            TimerKind::Fullscreen => {
+                self.fullscreen_started = None;
+                self.timer_kind = None;
+                if self.drag.is_none() {
+                    self.awaiting_settle = false;
+                    if self.hidden {
+                        self.hidden = false;
+                        out.restore_and_unpark = true;
+                    }
+                    out.emit.push((false, self.next_seq()));
+                } else {
+                    out.schedule_timer = Some(self.arm_timer(TimerKind::DragPoll, DRAG_CHECK_INTERVAL));
+                }
+            }
+            TimerKind::DragPoll => {
+                let Some(mut drag) = self.drag else {
+                    self.timer_kind = None;
+                    return out;
+                };
+                if now.saturating_duration_since(drag.started_at) >= DRAG_MAX_DURATION {
+                    self.drag = None;
+                    self.timer_kind = None;
+                    if self.fullscreen_started.is_none() {
+                        self.awaiting_settle = false;
+                        if self.hidden {
+                            self.hidden = false;
+                            out.restore_and_unpark = true;
+                        }
+                        out.emit.push((false, self.next_seq()));
+                    } else {
+                        out.schedule_timer = Some(self.arm_timer(TimerKind::Fullscreen, FULLSCREEN_FAILSAFE_DELAY));
+                    }
+                } else if !os_in_live_resize {
+                    self.drag = None;
+                    if self.fullscreen_started.is_none() {
+                        self.awaiting_settle = true;
+                        out.emit.push((false, self.next_seq()));
+                        out.schedule_timer = Some(self.arm_timer(TimerKind::Settle, SETTLE_FAILSAFE_DELAY));
+                    } else {
+                        out.schedule_timer = Some(self.arm_timer(TimerKind::Fullscreen, FULLSCREEN_FAILSAFE_DELAY));
+                    }
+                } else {
+                    if now.saturating_duration_since(drag.last_heartbeat) >= DRAG_HEARTBEAT_INTERVAL {
+                        drag.last_heartbeat = now;
+                        self.drag = Some(drag);
+                        out.emit.push((true, self.next_seq()));
+                    }
+                    out.schedule_timer = Some(self.arm_timer(TimerKind::DragPoll, DRAG_CHECK_INTERVAL));
+                }
+            }
+        }
+        out
+    }
+
+    fn force_reset(&mut self, emit_inactive: bool) -> ResizeActions {
+        let mut out = ResizeActions::default();
+        let was_active =
+            self.drag.is_some() || self.fullscreen_started.is_some() || self.awaiting_settle || self.hidden;
+        self.drag = None;
+        self.fullscreen_started = None;
+        self.awaiting_settle = false;
+        self.dpi_changing = false;
+        self.disarm_timer();
+        if self.hidden {
+            self.hidden = false;
+            out.restore_and_unpark = true;
+        }
+        if emit_inactive && was_active {
+            out.emit.push((false, self.next_seq()));
+        }
+        out
     }
 }
 
@@ -766,25 +1078,260 @@ fn hide_active_previews_for_resize(h: &Held, pause_gpu: bool) {
     });
 }
 
-fn handle_live_resize_event(app: &AppHandle, active: bool) {
-    let Some(seq) = WINDOW_RESIZE.with(|w| w.borrow_mut().on_live_resize(active)) else {
-        return;
+fn restore_active_previews(h: &Held) {
+    ferrocast_studio::batch_preview_updates(|| {
+        for p in [h.preview.as_ref(), h.program_view.as_ref(), h.vertical.view.as_ref()].into_iter().flatten() {
+            p.set_live_resize(false);
+            p.set_hidden_for_resize(false);
+        }
+    });
+}
+
+fn os_in_live_resize(app: &AppHandle) -> bool {
+    let Some(win) = app.get_webview_window("main") else {
+        return false;
     };
-    if active {
-        HELD.with(|h| {
+    if win.is_minimized().unwrap_or(false) {
+        return false;
+    }
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(&win) else {
+        return false;
+    };
+    ferrocast_studio::window_in_live_resize(handle.as_raw())
+}
+
+fn spawn_resize_timer(app: &AppHandle, token: u64, delay: std::time::Duration) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let run = app.clone();
+        let _ = app.run_on_main_thread(move || on_resize_timer_tick(&run, token));
+    });
+}
+
+fn on_resize_timer_tick(app: &AppHandle, token: u64) {
+    let os_drag = os_in_live_resize(app);
+    let now = std::time::Instant::now();
+    let actions = WINDOW_RESIZE.with(|w| w.borrow_mut().on_timer_tick_at(token, os_drag, now));
+    apply_resize_actions(app, actions);
+}
+
+fn schedule_resync(app: &AppHandle) {
+    if PENDING_RESIZE_SYNC.replace(true) {
+        return;
+    }
+    let a = app.clone();
+    if app.run_on_main_thread(move || resync_held_after_reentry(&a)).is_err() {
+        PENDING_RESIZE_SYNC.set(false);
+    }
+}
+
+fn reconfigure_held_previews(h: &mut Held, scale: Option<f64>, hide_for_resize: bool) {
+    let Held {
+        preview,
+        preview_at,
+        preview_canvas,
+        preview_bg,
+        preview_stripe,
+        preview_holes,
+        preview_opacity,
+        preview_shade,
+        program_view,
+        program_at,
+        program_bg,
+        program_stripe,
+        program_holes,
+        program_opacity,
+        program_shade,
+        vertical,
+        ..
+    } = h;
+    ferrocast_studio::batch_preview_updates(|| {
+        if let (Some(p), Some((rect, stored_scale))) = (preview.as_mut(), preview_at.as_mut()) {
+            let s = scale.unwrap_or(*stored_scale);
+            *stored_scale = s;
+            configure_stage_view(
+                p,
+                ViewProps {
+                    rect: *rect,
+                    canvas: *preview_canvas,
+                    bg: *preview_bg,
+                    stripe: *preview_stripe,
+                    holes: preview_holes,
+                    opacity: *preview_opacity,
+                    shade: *preview_shade,
+                    scale: s,
+                    hide_for_resize,
+                },
+            );
+        }
+        if let (Some(p), Some((rect, stored_scale))) = (program_view.as_mut(), program_at.as_mut()) {
+            let s = scale.unwrap_or(*stored_scale);
+            *stored_scale = s;
+            configure_stage_view(
+                p,
+                ViewProps {
+                    rect: *rect,
+                    canvas: None,
+                    bg: *program_bg,
+                    stripe: *program_stripe,
+                    holes: program_holes,
+                    opacity: *program_opacity,
+                    shade: *program_shade,
+                    scale: s,
+                    hide_for_resize,
+                },
+            );
+        }
+        if let (Some(p), Some((rect, stored_scale))) = (vertical.view.as_mut(), vertical.at.as_mut()) {
+            let s = scale.unwrap_or(*stored_scale);
+            *stored_scale = s;
+            configure_stage_view(
+                p,
+                ViewProps {
+                    rect: *rect,
+                    canvas: vertical.canvas,
+                    bg: vertical.bg,
+                    stripe: vertical.stripe,
+                    holes: &vertical.holes,
+                    opacity: vertical.opacity,
+                    shade: vertical.shade,
+                    scale: s,
+                    hide_for_resize,
+                },
+            );
+        }
+    });
+}
+
+fn resync_held_after_reentry(app: &AppHandle) {
+    PENDING_RESIZE_SYNC.set(false);
+    let os_drag = os_in_live_resize(app);
+    let now = std::time::Instant::now();
+    let (hide_for_resize, actions, scale) = WINDOW_RESIZE.with(|w| {
+        let mut st = w.borrow_mut();
+        let (hide, actions) = st.reconcile_for_sync_at(os_drag, now);
+        let scale = st.scale;
+        (hide, actions, scale)
+    });
+    if !actions.emit.is_empty() || actions.schedule_timer.is_some() {
+        apply_resize_actions(app, ResizeActions { hide_and_park: false, restore_and_unpark: false, ..actions });
+    }
+    let fallback_scale = scale.or_else(|| {
+        app.get_webview_window("main").and_then(|w| w.scale_factor().ok()).and_then(WindowResizeState::sanitize_scale)
+    });
+    let synced = HELD.with(|h| {
+        let Ok(mut h) = h.try_borrow_mut() else {
+            return false;
+        };
+        reconfigure_held_previews(&mut h, fallback_scale, hide_for_resize);
+        true
+    });
+    if !synced {
+        schedule_resync(app);
+    }
+}
+
+fn apply_resize_window_effects(app: &AppHandle, actions: ResizeActions) {
+    if !actions.emit.is_empty()
+        && let Some(win) = app.get_webview_window("main")
+    {
+        let scale = win.scale_factor().ok().and_then(WindowResizeState::sanitize_scale).unwrap_or(1.0);
+        let (width, height) =
+            win.inner_size().map(|s| (f64::from(s.width) / scale, f64::from(s.height) / scale)).unwrap_or((0.0, 0.0));
+        let scripts: Vec<String> = actions
+            .emit
+            .into_iter()
+            .filter_map(|(active, seq)| {
+                preview_live_resize_script(&PreviewLiveResizeEvent {
+                    active,
+                    reason: "window",
+                    seq,
+                    scale,
+                    width,
+                    height,
+                })
+            })
+            .collect();
+        if !scripts.is_empty() {
+            let _ = win.eval(scripts.join("; "));
+        }
+    }
+    if let Some((token, delay)) = actions.schedule_timer {
+        spawn_resize_timer(app, token, delay);
+    }
+}
+
+fn apply_resize_actions(app: &AppHandle, mut actions: ResizeActions) {
+    if actions.hide_and_park {
+        let borrowed = HELD.with(|h| {
             if let Ok(h) = h.try_borrow() {
                 hide_active_previews_for_resize(&h, true);
+                true
+            } else {
+                false
             }
         });
+        if !borrowed {
+            schedule_resync(app);
+        }
     }
-    let Some(win) = app.get_webview_window("main") else { return };
-    let scale = win.scale_factor().ok().and_then(WindowResizeState::sanitize_scale).unwrap_or(1.0);
-    let (width, height) =
-        win.inner_size().map(|s| (f64::from(s.width) / scale, f64::from(s.height) / scale)).unwrap_or((0.0, 0.0));
-    let event = PreviewLiveResizeEvent { active, reason: "window", seq, scale, width, height };
-    if let Some(script) = preview_live_resize_script(&event) {
-        let _ = win.eval(script);
+    if actions.restore_and_unpark {
+        let borrowed = HELD.with(|h| {
+            if let Ok(h) = h.try_borrow() {
+                restore_active_previews(&h);
+                true
+            } else {
+                false
+            }
+        });
+        if !borrowed {
+            schedule_resync(app);
+        }
     }
+    actions.hide_and_park = false;
+    actions.restore_and_unpark = false;
+    apply_resize_window_effects(app, actions);
+}
+
+fn current_hide_for_resize(app: &AppHandle) -> bool {
+    let os_drag = os_in_live_resize(app);
+    let now = std::time::Instant::now();
+    let (hide, actions) = WINDOW_RESIZE.with(|w| w.borrow_mut().reconcile_for_sync_at(os_drag, now));
+    apply_resize_window_effects(app, actions);
+    hide
+}
+
+/// Whether a view made now starts hidden for a window resize (a test has no window).
+fn current_hide_for_resize_in(ctx: ViewCtx<'_>) -> bool {
+    match ctx {
+        ViewCtx::App(app) => current_hide_for_resize(app),
+        #[cfg(test)]
+        ViewCtx::Test => false,
+    }
+}
+
+fn prepare_preview_put(app: &AppHandle) -> (bool, ResizeActions) {
+    let os_drag = os_in_live_resize(app);
+    let now = std::time::Instant::now();
+    WINDOW_RESIZE.with(|w| w.borrow_mut().on_previews_put_at(os_drag, now))
+}
+
+fn handle_live_resize_event(app: &AppHandle, active: bool) {
+    let now = std::time::Instant::now();
+    let actions = WINDOW_RESIZE.with(|w| w.borrow_mut().on_live_resize_at(active, now));
+    apply_resize_actions(app, actions);
+}
+
+fn handle_fullscreen_event(app: &AppHandle, active: bool) {
+    let now = std::time::Instant::now();
+    let actions = WINDOW_RESIZE.with(|w| w.borrow_mut().on_fullscreen_at(active, now));
+    apply_resize_actions(app, actions);
+}
+
+fn on_window_reset_event(app: &AppHandle) {
+    let actions = WINDOW_RESIZE.with(|w| w.borrow_mut().force_reset(true));
+    apply_resize_actions(app, actions);
 }
 
 fn handle_scale_changed_event(app: &AppHandle, new_scale: f64, phys_size: Option<(u32, u32)>) {
@@ -793,83 +1340,22 @@ fn handle_scale_changed_event(app: &AppHandle, new_scale: f64, phys_size: Option
     let Some((scale, previous_scale)) = WINDOW_RESIZE.with(|w| w.borrow_mut().on_scale_changed(new_scale, size)) else {
         return;
     };
-    let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
-    HELD.with(|h| {
-        if let Ok(mut h) = h.try_borrow_mut() {
-            let Held {
-                preview,
-                preview_at,
-                preview_canvas,
-                preview_bg,
-                preview_stripe,
-                preview_holes,
-                preview_opacity,
-                preview_shade,
-                program_view,
-                program_at,
-                program_bg,
-                program_stripe,
-                program_holes,
-                program_opacity,
-                program_shade,
-                vertical,
-                ..
-            } = &mut *h;
-            ferrocast_studio::batch_preview_updates(|| {
-                if let (Some(p), Some((rect, old_scale))) = (preview.as_mut(), preview_at.as_mut()) {
-                    *old_scale = scale;
-                    configure_stage_view(
-                        p,
-                        ViewProps {
-                            rect: *rect,
-                            canvas: *preview_canvas,
-                            bg: *preview_bg,
-                            stripe: *preview_stripe,
-                            holes: preview_holes,
-                            opacity: *preview_opacity,
-                            shade: *preview_shade,
-                            scale,
-                            hide_for_resize,
-                        },
-                    );
-                }
-                if let (Some(p), Some((rect, old_scale))) = (program_view.as_mut(), program_at.as_mut()) {
-                    *old_scale = scale;
-                    configure_stage_view(
-                        p,
-                        ViewProps {
-                            rect: *rect,
-                            canvas: None,
-                            bg: *program_bg,
-                            stripe: *program_stripe,
-                            holes: program_holes,
-                            opacity: *program_opacity,
-                            shade: *program_shade,
-                            scale,
-                            hide_for_resize,
-                        },
-                    );
-                }
-                if let (Some(p), Some((rect, old_scale))) = (vertical.view.as_mut(), vertical.at.as_mut()) {
-                    *old_scale = scale;
-                    configure_stage_view(
-                        p,
-                        ViewProps {
-                            rect: *rect,
-                            canvas: vertical.canvas,
-                            bg: vertical.bg,
-                            stripe: vertical.stripe,
-                            holes: &vertical.holes,
-                            opacity: vertical.opacity,
-                            shade: vertical.shade,
-                            scale,
-                            hide_for_resize,
-                        },
-                    );
-                }
-            });
-        }
+    let os_drag = os_in_live_resize(app);
+    let now = std::time::Instant::now();
+    let (hide_for_resize, actions) = WINDOW_RESIZE.with(|w| w.borrow_mut().reconcile_for_sync_at(os_drag, now));
+    if !actions.emit.is_empty() || actions.schedule_timer.is_some() {
+        apply_resize_actions(app, ResizeActions { hide_and_park: false, restore_and_unpark: false, ..actions });
+    }
+    let updated = HELD.with(|h| {
+        let Ok(mut h) = h.try_borrow_mut() else {
+            return false;
+        };
+        reconfigure_held_previews(&mut h, Some(scale), hide_for_resize);
+        true
     });
+    if !updated {
+        schedule_resync(app);
+    }
     if let Some(win) = win {
         let display = win.current_monitor().ok().flatten().and_then(|m| m.name().cloned());
         let event = ScaleChangedEvent { scale, previous_scale, display };
@@ -880,22 +1366,35 @@ fn handle_scale_changed_event(app: &AppHandle, new_scale: f64, phys_size: Option
 }
 
 fn attach_window_watcher_on_main(window: &tauri::WebviewWindow) {
+    WINDOW_WATCHER.with(|slot| *slot.borrow_mut() = None);
+    let app = window.app_handle();
+    if app.get_webview_window("main").is_none() {
+        return;
+    }
     let scale = window.scale_factor().ok().and_then(WindowResizeState::sanitize_scale).unwrap_or(1.0);
-    let logical = window.inner_size().ok().map(|s| WindowResizeState::logical_of(s.width, s.height, scale));
+    let logical = window
+        .inner_size()
+        .ok()
+        .filter(|s| s.width > 0 && s.height > 0)
+        .map(|s| WindowResizeState::logical_of(s.width, s.height, scale));
     WINDOW_RESIZE.with(|w| {
         let mut st = w.borrow_mut();
-        st.live_resizing = false;
+        let _ = st.force_reset(false);
         st.scale = Some(scale);
         st.logical_size = logical;
     });
     let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else { return };
-    let app_resize = window.app_handle().clone();
-    let app_scale = window.app_handle().clone();
+    let app_resize = app.clone();
+    let app_fs = app.clone();
+    let app_scale = app.clone();
+    let app_reset = app.clone();
     let watcher = ferrocast_studio::watch_window(
         handle.as_raw(),
         ferrocast_studio::WindowWatchHooks {
             on_live_resize: Box::new(move |active| handle_live_resize_event(&app_resize, active)),
+            on_fullscreen: Box::new(move |active| handle_fullscreen_event(&app_fs, active)),
             on_scale_changed: Box::new(move |s| handle_scale_changed_event(&app_scale, s, None)),
+            on_window_reset: Box::new(move || on_window_reset_event(&app_reset)),
         },
     );
     WINDOW_WATCHER.with(|slot| *slot.borrow_mut() = watcher);
@@ -907,30 +1406,80 @@ pub(crate) fn attach_window_watcher(window: &tauri::WebviewWindow) {
     let _ = window.app_handle().run_on_main_thread(move || attach_window_watcher_on_main(&w));
 }
 
-/// Drops the main window's native observers when the window is destroyed.
+/// Drops the main window's native observers and resets resize state.
 pub(crate) fn detach_window_watcher() {
     WINDOW_WATCHER.with(|slot| *slot.borrow_mut() = None);
-    WINDOW_RESIZE.with(|w| *w.borrow_mut() = WindowResizeState::default());
+    WINDOW_RESIZE.with(|w| {
+        let _ = w.borrow_mut().force_reset(false);
+    });
+    PENDING_RESIZE_SYNC.set(false);
 }
 
-/// Hides native previews synchronously when a non-drag window resize (maximize, tile, snap)
-/// jumps the window bounds before the webview layout settles.
-pub(crate) fn on_window_resized(window: &tauri::Window, width: u32, height: u32) {
-    let scale = window.scale_factor().unwrap_or(1.0);
-    let jumped = WINDOW_RESIZE.with(|w| w.borrow_mut().on_window_resized(width, height, scale));
-    if jumped {
-        HELD.with(|h| {
-            if let Ok(h) = h.try_borrow() {
-                hide_active_previews_for_resize(&h, true);
+fn clear_preview_views(h: &mut Held) {
+    h.preview = None;
+    h.preview_at = None;
+    h.program_view = None;
+    h.program_at = None;
+    h.vertical.view = None;
+    h.vertical.at = None;
+}
+
+/// Drops main-window child preview views and detaches window observers on window destruction.
+pub(crate) fn on_window_destroyed(app: &AppHandle) {
+    detach_window_watcher();
+    let cleared = HELD.with(|h| {
+        let Ok(mut h) = h.try_borrow_mut() else {
+            return false;
+        };
+        clear_preview_views(&mut h);
+        true
+    });
+    if !cleared {
+        let a = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if a.get_webview_window("main").is_none() {
+                HELD.with(|h| {
+                    if let Ok(mut h) = h.try_borrow_mut() {
+                        clear_preview_views(&mut h);
+                    }
+                });
             }
         });
     }
 }
 
+/// Clears any pending resize hide/park state when the window hides to the tray.
+pub(crate) fn on_window_hidden(app: &AppHandle) {
+    on_window_reset_event(app);
+}
+
+/// Clears any stale resize hide/park state when the window is re-shown or unminimized.
+pub(crate) fn on_window_shown(app: &AppHandle) {
+    on_window_reset_event(app);
+}
+
+/// Hides native previews synchronously when a non-drag window resize (maximize, tile, snap)
+/// jumps the window bounds before the webview layout settles, backed by a bounded failsafe.
+pub(crate) fn on_window_resized(window: &tauri::Window, width: u32, height: u32) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let now = std::time::Instant::now();
+    let actions = WINDOW_RESIZE.with(|w| w.borrow_mut().on_window_resized_at(width, height, scale, now));
+    apply_resize_actions(window.app_handle(), actions);
+}
+
 /// Handles Tauri `WindowEvent::ScaleFactorChanged` by re-applying cached rects/holes and
 /// notifying the webview via `fc://scale-changed`.
 pub(crate) fn on_window_scale_changed(window: &tauri::Window, scale_factor: f64, new_inner_size: Option<(u32, u32)>) {
-    handle_scale_changed_event(window.app_handle(), scale_factor, new_inner_size);
+    let app = window.app_handle().clone();
+    #[cfg(target_os = "windows")]
+    {
+        WINDOW_RESIZE.with(|w| w.borrow_mut().prepare_scale_change(scale_factor, new_inner_size));
+        let _ = window.app_handle().run_on_main_thread(move || {
+            handle_scale_changed_event(&app, scale_factor, new_inner_size);
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    handle_scale_changed_event(&app, scale_factor, new_inner_size);
 }
 
 const CAPTURE_RECORDING: u8 = 1 << 0;
@@ -2184,6 +2733,7 @@ pub fn end_session() {
 /// stops and drains active outputs in parallel off the main thread (bounded) BEFORE dropping the
 /// scene collection. Returns `true` when outputs drained cleanly within the bound.
 pub fn close() -> bool {
+    detach_window_watcher();
     // Taken out first, then drained/dropped: nothing borrows HELD while the engine closes.
     let Some(mut held) = HELD.with(|h| h.try_borrow_mut().ok().map(|mut h| std::mem::take(&mut *h))) else {
         tracing::warn!("Studio state is still borrowed on close");
@@ -2946,19 +3496,17 @@ struct ViewProps<'a> {
 }
 
 fn configure_stage_view(p: &mut Preview, props: ViewProps<'_>) {
-    if let Some(c) = props.bg {
-        p.background(c);
-    }
-    p.overflow_stripes(props.stripe);
-    match props.canvas {
-        Some(c) => p.set_area(props.rect, c, props.scale),
-        None => p.set_rect(props.rect, props.scale),
-    }
-    p.set_holes(props.holes);
-    p.set_shade(props.shade);
-    p.set_opacity(props.opacity.unwrap_or(1.0));
-    p.set_hidden_for_resize(props.hide_for_resize);
-    p.set_live_resize(props.hide_for_resize);
+    p.configure(ferrocast_studio::stage::StageViewConfig {
+        rect: props.rect,
+        canvas: props.canvas,
+        bg: props.bg,
+        stripe: props.stripe,
+        holes: props.holes,
+        opacity: props.opacity,
+        shade: props.shade,
+        scale: props.scale,
+        hide_for_resize: props.hide_for_resize,
+    });
 }
 
 /// Makes Studio Mode's picture of what's on air at its last place (main thread).
@@ -2970,24 +3518,26 @@ fn make_program_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
         h.program_view = None;
         return Ok(());
     }
-    let mut p = create_stage_view(ctx, c, rect, scale, false)?;
-    let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
-    // Made again (a new canvas size): the stage keeps the page's colour.
-    configure_stage_view(
-        &mut p,
-        ViewProps {
-            rect,
-            canvas: None,
-            bg: h.program_bg,
-            stripe: h.program_stripe,
-            holes: &h.program_holes,
-            opacity: h.program_opacity,
-            shade: h.program_shade,
-            scale,
-            hide_for_resize,
-        },
-    );
-    p.set_paused(h.preview_paused);
+    let hide_for_resize = current_hide_for_resize_in(ctx);
+    let p = ferrocast_studio::batch_preview_updates(|| -> Result<Preview, String> {
+        let mut p = create_stage_view(ctx, c, rect, scale, false)?;
+        configure_stage_view(
+            &mut p,
+            ViewProps {
+                rect,
+                canvas: None,
+                bg: h.program_bg,
+                stripe: h.program_stripe,
+                holes: &h.program_holes,
+                opacity: h.program_opacity,
+                shade: h.program_shade,
+                scale,
+                hide_for_resize,
+            },
+        );
+        p.set_paused(h.preview_paused);
+        Ok(p)
+    })?;
     h.program_view = Some(p);
     Ok(())
 }
@@ -2997,25 +3547,28 @@ fn make_preview(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.preview_at else { return Ok(()) };
     // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
     let c = h.collection.as_ref().ok_or(STOPPED)?;
-    let mut p = create_stage_view(ctx, c, rect, scale, false)?;
-    let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
-    configure_stage_view(
-        &mut p,
-        ViewProps {
-            rect,
-            canvas: h.preview_canvas,
-            bg: h.preview_bg,
-            stripe: h.preview_stripe,
-            holes: &h.preview_holes,
-            opacity: h.preview_opacity,
-            shade: h.preview_shade,
-            scale,
-            hide_for_resize,
-        },
-    );
-    p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
-    p.frames(h.frames.as_deref());
-    p.set_paused(h.preview_paused);
+    let hide_for_resize = current_hide_for_resize_in(ctx);
+    let p = ferrocast_studio::batch_preview_updates(|| -> Result<Preview, String> {
+        let mut p = create_stage_view(ctx, c, rect, scale, false)?;
+        configure_stage_view(
+            &mut p,
+            ViewProps {
+                rect,
+                canvas: h.preview_canvas,
+                bg: h.preview_bg,
+                stripe: h.preview_stripe,
+                holes: &h.preview_holes,
+                opacity: h.preview_opacity,
+                shade: h.preview_shade,
+                scale,
+                hide_for_resize,
+            },
+        );
+        p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
+        p.frames(h.frames.as_deref());
+        p.set_paused(h.preview_paused);
+        Ok(p)
+    })?;
     h.preview = Some(p);
     sync_views(h);
     Ok(())
@@ -3167,6 +3720,38 @@ fn apply_vertical_preview(
         return Ok(());
     }
     make_vertical_view(ctx, h)
+}
+
+fn clear_none_preview_slots(h: &mut Held, drop_preview: bool, drop_program: bool, drop_vertical: bool) {
+    if drop_preview {
+        h.preview = None;
+        h.preview_at = None;
+    }
+    if drop_program {
+        h.program_view = None;
+        h.program_at = None;
+    }
+    if drop_vertical {
+        h.vertical.view = None;
+        h.vertical.at = None;
+    }
+}
+
+fn set_previews_with<F>(
+    h: &mut Held,
+    preview: Option<PreviewRect>,
+    program: Option<PreviewRect>,
+    vertical: Option<PreviewRect>,
+    apply_some: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut Held, Option<PreviewRect>, Option<PreviewRect>, Option<PreviewRect>) -> Result<(), String>,
+{
+    clear_none_preview_slots(h, preview.is_none(), program.is_none(), vertical.is_none());
+    if preview.is_none() && program.is_none() && vertical.is_none() {
+        return Ok(());
+    }
+    apply_some(h, preview, program, vertical)
 }
 
 #[derive(Debug, Clone)]
@@ -3963,10 +4548,19 @@ impl StudioHost for DesktopStudio {
     async fn program_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
+            let Some(r) = rect else {
+                clear_none_preview_slots(h, false, true, false);
+                return Ok(());
+            };
             let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
             let scale = window.scale_factor().unwrap_or(1.0);
-            let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
-            apply_program_preview(ViewCtx::App(&app), h, rect, scale, hide_for_resize)
+            let (hide_for_resize, actions) = prepare_preview_put(&app);
+            let res = apply_program_preview(ViewCtx::App(&app), h, Some(r), scale, hide_for_resize);
+            if actions.restore_and_unpark {
+                restore_active_previews(h);
+            }
+            apply_resize_window_effects(&app, actions);
+            res
         })
         .await?
     }
@@ -3983,10 +4577,19 @@ impl StudioHost for DesktopStudio {
     async fn vertical_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
+            let Some(r) = rect else {
+                clear_none_preview_slots(h, false, false, true);
+                return Ok(());
+            };
             let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
             let scale = window.scale_factor().unwrap_or(1.0);
-            let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
-            apply_vertical_preview(ViewCtx::App(&app), h, rect, scale, hide_for_resize)
+            let (hide_for_resize, actions) = prepare_preview_put(&app);
+            let res = apply_vertical_preview(ViewCtx::App(&app), h, Some(r), scale, hide_for_resize);
+            if actions.restore_and_unpark {
+                restore_active_previews(h);
+            }
+            apply_resize_window_effects(&app, actions);
+            res
         })
         .await?
     }
@@ -3994,10 +4597,19 @@ impl StudioHost for DesktopStudio {
     async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
+            let Some(r) = rect else {
+                clear_none_preview_slots(h, true, false, false);
+                return Ok(());
+            };
             let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
             let scale = window.scale_factor().unwrap_or(1.0);
-            let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
-            apply_main_preview(ViewCtx::App(&app), h, rect, scale, hide_for_resize)
+            let (hide_for_resize, actions) = prepare_preview_put(&app);
+            let res = apply_main_preview(ViewCtx::App(&app), h, Some(r), scale, hide_for_resize);
+            if actions.restore_and_unpark {
+                restore_active_previews(h);
+            }
+            apply_resize_window_effects(&app, actions);
+            res
         })
         .await?
     }
@@ -4010,14 +4622,24 @@ impl StudioHost for DesktopStudio {
     ) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
-            let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
-            let scale = window.scale_factor().unwrap_or(1.0);
-            let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
-            ferrocast_studio::batch_preview_updates(|| -> Result<(), String> {
-                apply_main_preview(ViewCtx::App(&app), h, preview, scale, hide_for_resize)?;
-                apply_program_preview(ViewCtx::App(&app), h, program, scale, hide_for_resize)?;
-                apply_vertical_preview(ViewCtx::App(&app), h, vertical, scale, hide_for_resize)?;
-                Ok(())
+            set_previews_with(h, preview, program, vertical, |h, preview, program, vertical| {
+                let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
+                let scale = window.scale_factor().unwrap_or(1.0);
+                let (hide_for_resize, actions) = prepare_preview_put(&app);
+                let res = ferrocast_studio::batch_preview_updates(|| -> Result<(), String> {
+                    if preview.is_some() {
+                        apply_main_preview(ViewCtx::App(&app), h, preview, scale, hide_for_resize)?;
+                    }
+                    if program.is_some() {
+                        apply_program_preview(ViewCtx::App(&app), h, program, scale, hide_for_resize)?;
+                    }
+                    if vertical.is_some() {
+                        apply_vertical_preview(ViewCtx::App(&app), h, vertical, scale, hide_for_resize)?;
+                    }
+                    Ok(())
+                });
+                apply_resize_window_effects(&app, actions);
+                res
             })
         })
         .await?
@@ -8670,21 +9292,26 @@ mod import_tests {
     #[test]
     fn window_resize_state_tracks_monotonic_seq_scale_dedup_and_jumps() {
         use super::{
-            PreviewLiveResizeEvent, ScaleChangedEvent, WindowResizeState, preview_live_resize_script,
-            scale_changed_script,
+            PreviewLiveResizeEvent, SETTLE_FAILSAFE_DELAY, ScaleChangedEvent, WindowResizeState,
+            preview_live_resize_script, scale_changed_script,
         };
 
+        let t0 = std::time::Instant::now();
         let mut st = WindowResizeState::default();
         assert!(!st.on_window_resized(2480, 1600, 2.0), "first observed size initializes baseline without hiding");
         assert!(!st.on_window_resized(2480, 1600, 2.0), "unchanged size never triggers hide");
         assert!(st.on_window_resized(1920, 1200, 2.0), "logical jump outside drag hides immediately");
+        assert!(!st.on_previews_put_at(false, t0).0);
 
         assert_eq!(st.on_live_resize(false), None, "duplicate inactive edge ignored");
-        assert_eq!(st.on_live_resize(true), Some(1));
+        assert_eq!(st.on_live_resize(true), Some(3));
         assert_eq!(st.on_live_resize(true), None, "duplicate active edge ignored");
         assert!(st.is_live_resizing());
         assert!(!st.on_window_resized(2200, 1400, 2.0), "resized events during drag stay quiet");
-        assert_eq!(st.on_live_resize(false), Some(2));
+        assert_eq!(st.on_live_resize(false), Some(4));
+        assert!(st.is_live_resizing(), "stays hidden briefly until settle PUT or failsafe timer");
+        let stale_put = st.on_timer_tick_at(st.timer_token, false, t0 + SETTLE_FAILSAFE_DELAY);
+        assert!(stale_put.restore_and_unpark);
         assert!(!st.is_live_resizing());
 
         assert_eq!(st.on_scale_changed(f64::NAN, None), None);
@@ -8716,6 +9343,191 @@ mod import_tests {
         assert!(scale_js.contains("fc://scale-changed"));
         assert!(scale_js.contains("\"previousScale\":2.0"));
         assert!(scale_js.contains("\"display\":\"Built-in Retina Display\""));
+    }
+
+    #[test]
+    fn window_resize_state_ignores_zero_minimized_dimensions() {
+        use super::WindowResizeState;
+
+        let t0 = std::time::Instant::now();
+        let mut st = WindowResizeState::default();
+        assert!(!st.on_window_resized(2480, 1600, 2.0));
+        assert!(!st.on_window_resized(0, 0, 2.0), "0x0 minimized size must not trigger hide");
+        assert!(!st.on_window_resized(2480, 1600, 2.0), "restoring to same logical size must not hide");
+
+        // Minimizing mid-drag must clear active hide/park state instead of latching.
+        let start = st.on_live_resize_at(true, t0);
+        assert!(start.hide_and_park);
+        let min_reset = st.on_window_resized_at(0, 0, 2.0, t0 + std::time::Duration::from_millis(50));
+        assert!(min_reset.restore_and_unpark);
+        assert!(!st.is_live_resizing());
+    }
+
+    #[test]
+    fn window_resize_state_jump_resize_pulses_and_failsafe_restores() {
+        use super::{SETTLE_FAILSAFE_DELAY, WindowResizeState};
+
+        let t0 = std::time::Instant::now();
+        let mut st = WindowResizeState::default();
+        st.on_window_resized_at(2480, 1600, 2.0, t0);
+        let jump = st.on_window_resized_at(1920, 1200, 2.0, t0 + std::time::Duration::from_millis(10));
+        assert!(jump.hide_and_park);
+        assert_eq!(jump.emit, vec![(true, 1), (false, 2)]);
+        let (tok, delay) = jump.schedule_timer.unwrap();
+        assert_eq!(delay, SETTLE_FAILSAFE_DELAY);
+
+        // Stale token is ignored.
+        assert!(!st.on_timer_tick_at(tok - 1, false, t0 + SETTLE_FAILSAFE_DELAY).restore_and_unpark);
+        assert!(st.is_live_resizing());
+
+        // Real failsafe token restores & unparks unconditionally if no PUT arrived.
+        let restored = st.on_timer_tick_at(tok, false, t0 + SETTLE_FAILSAFE_DELAY);
+        assert!(restored.restore_and_unpark);
+        assert!(!st.is_live_resizing());
+
+        // Subsequent jump cleared by PUT cancels the pending timer.
+        let jump2 = st.on_window_resized_at(2480, 1600, 2.0, t0 + std::time::Duration::from_secs(1));
+        let (tok2, _) = jump2.schedule_timer.unwrap();
+        let (hide, put_actions) = st.on_previews_put_at(false, t0 + std::time::Duration::from_millis(1020));
+        assert!(!hide);
+        assert!(put_actions.restore_and_unpark);
+        assert!(!st.on_timer_tick_at(tok2, false, t0 + std::time::Duration::from_secs(2)).restore_and_unpark);
+    }
+
+    #[test]
+    fn window_resize_state_fullscreen_failsafe_recovers_if_did_enter_never_arrives() {
+        use super::{FULLSCREEN_FAILSAFE_DELAY, WindowResizeState};
+
+        let t0 = std::time::Instant::now();
+        let mut st = WindowResizeState::default();
+        let start = st.on_fullscreen_at(true, t0);
+        assert!(start.hide_and_park);
+        assert_eq!(start.emit.len(), 1);
+        assert!(start.emit[0].0);
+        let (tok, delay) = start.schedule_timer.unwrap();
+        assert_eq!(delay, FULLSCREEN_FAILSAFE_DELAY);
+
+        let done = st.on_timer_tick_at(tok, false, t0 + FULLSCREEN_FAILSAFE_DELAY);
+        assert!(done.restore_and_unpark);
+        assert_eq!(done.emit.len(), 1);
+        assert!(!done.emit[0].0);
+        assert!(!st.is_live_resizing());
+    }
+
+    #[test]
+    fn window_resize_state_drag_reconciles_os_truth_refreshes_watchdog_and_caps() {
+        use super::{DRAG_CHECK_INTERVAL, DRAG_HEARTBEAT_INTERVAL, DRAG_MAX_DURATION, WindowResizeState};
+
+        let t0 = std::time::Instant::now();
+        let mut st = WindowResizeState::default();
+        let start = st.on_live_resize_at(true, t0);
+        assert!(start.hide_and_park);
+        let (mut tok, delay) = start.schedule_timer.unwrap();
+        assert_eq!(delay, DRAG_CHECK_INTERVAL);
+
+        // Genuine drag active at 500 ms: no heartbeat yet, re-arms poll.
+        let early = st.on_timer_tick_at(tok, true, t0 + DRAG_CHECK_INTERVAL);
+        assert!(!early.restore_and_unpark && early.emit.is_empty());
+        tok = early.schedule_timer.unwrap().0;
+
+        // At 2 s with OS drag still active: emits active=true refresh to keep web still intact.
+        let hb = st.on_timer_tick_at(tok, true, t0 + DRAG_HEARTBEAT_INTERVAL);
+        assert!(!hb.restore_and_unpark);
+        assert_eq!(hb.emit.len(), 1);
+        assert!(hb.emit[0].0);
+        tok = hb.schedule_timer.unwrap().0;
+
+        // If OS drag stopped (missed DidEndLiveResize/WM_EXITSIZEMOVE), poll enters short settle.
+        let missed = st.on_timer_tick_at(tok, false, t0 + DRAG_HEARTBEAT_INTERVAL + DRAG_CHECK_INTERVAL);
+        assert_eq!(missed.emit.len(), 1);
+        assert!(!missed.emit[0].0);
+        let settle_tok = missed.schedule_timer.unwrap().0;
+        let restored = st.on_timer_tick_at(settle_tok, false, t0 + DRAG_HEARTBEAT_INTERVAL + DRAG_CHECK_INTERVAL * 2);
+        assert!(restored.restore_and_unpark);
+        assert!(!st.is_live_resizing());
+
+        // Hard safety cap clears drag even if OS continues reporting in-live-resize.
+        let mut capped = WindowResizeState::default();
+        let s2 = capped.on_live_resize_at(true, t0);
+        let tok_cap = s2.schedule_timer.unwrap().0;
+        let forced = capped.on_timer_tick_at(tok_cap, true, t0 + DRAG_MAX_DURATION);
+        assert!(forced.restore_and_unpark);
+        assert_eq!(forced.emit.len(), 1);
+        assert!(!forced.emit[0].0);
+        assert!(!capped.is_live_resizing());
+
+        // PUT reconciles stale drag immediately against OS ground truth.
+        let mut rec = WindowResizeState::default();
+        rec.on_live_resize_at(true, t0);
+        let (hide, put_act) = rec.on_previews_put_at(false, t0 + std::time::Duration::from_millis(100));
+        assert!(!hide);
+        assert!(put_act.restore_and_unpark);
+        assert_eq!(put_act.emit.len(), 1);
+        assert!(!put_act.emit[0].0);
+    }
+
+    #[test]
+    fn window_resize_state_dpi_change_suppresses_spurious_jump_and_resets_cleanly() {
+        use super::WindowResizeState;
+
+        let t0 = std::time::Instant::now();
+        let mut st = WindowResizeState::default();
+        st.on_window_resized_at(1240, 800, 1.0, t0);
+        st.prepare_scale_change(1.5, Some((1860, 1200)));
+        let during_dpi = st.on_window_resized_at(1862, 1200, 1.5, t0 + std::time::Duration::from_millis(5));
+        assert!(!during_dpi.hide_and_park, "WM_DPICHANGED SetWindowPos must not trigger spurious hide");
+        assert_eq!(st.on_scale_changed(1.5, Some((1862, 1200))), Some((1.5, None)));
+
+        st.on_live_resize_at(true, t0);
+        let reset = st.force_reset(true);
+        assert!(reset.restore_and_unpark);
+        assert_eq!(reset.emit.len(), 1);
+        assert!(!reset.emit[0].0);
+        assert!(!st.is_live_resizing());
+    }
+
+    #[test]
+    fn none_teardown_clears_slots_without_main_window() {
+        use ferrocast_engine::studio_host::PreviewRect;
+
+        use super::{Held, clear_none_preview_slots, set_previews_with};
+        use ferrocast_studio::Rect;
+
+        let mut h = Held::default();
+        let at = (Rect { x: 0.0, y: 0.0, w: 640.0, h: 360.0, vh: 800.0 }, 2.0);
+        h.preview_at = Some(at);
+        h.program_at = Some(at);
+        h.vertical.at = Some(at);
+
+        let res =
+            set_previews_with(&mut h, None, None, None, |_, _, _, _| Err("The Ferrocast window isn't open.".into()));
+        assert_eq!(res, Ok(()), "all-None teardown must succeed without an open main window");
+        assert!(h.preview_at.is_none() && h.program_at.is_none() && h.vertical.at.is_none());
+
+        h.preview_at = Some(at);
+        h.program_at = Some(at);
+        let sample = PreviewRect {
+            x: 10.0,
+            y: 20.0,
+            w: 640.0,
+            h: 360.0,
+            vh: 800.0,
+            canvas: None,
+            bg: None,
+            stripe: None,
+            holes: Vec::new(),
+            opacity: None,
+            shade: None,
+        };
+        let partial = set_previews_with(&mut h, Some(sample), None, None, |_, _, _, _| {
+            Err("The Ferrocast window isn't open.".into())
+        });
+        assert!(partial.is_err(), "Some rect still requires main window");
+        assert!(h.program_at.is_none(), "None slots must still be torn down even if another slot needs window");
+
+        h.vertical.at = Some(at);
+        clear_none_preview_slots(&mut h, true, true, true);
+        assert!(h.preview_at.is_none() && h.program_at.is_none() && h.vertical.at.is_none());
     }
 }
 
