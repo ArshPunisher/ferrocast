@@ -1899,6 +1899,10 @@ impl Engine {
         }
     }
 
+    pub(crate) fn is_studio_live(&self) -> bool {
+        self.golive().studio_live.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn set_studio_live(&self, on: bool) {
         self.golive().studio_live.store(on, std::sync::atomic::Ordering::Release);
     }
@@ -2645,13 +2649,23 @@ impl Engine {
         guard.1 = CancellationToken::new();
     }
 
+    /// Resets the cancellation token only when `expected_session` still owns it and was cancelled.
+    pub(crate) fn reset_golive_switch_cancel_if_session(&self, expected_session: u64) {
+        let mut guard = lock(&self.golive().stream_cancel);
+        if guard.0 == expected_session && guard.1.is_cancelled() {
+            guard.0 = guard.0.wrapping_add(1);
+            guard.1 = CancellationToken::new();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn set_keyframe_wait_timeout_for_test(&self, timeout: std::time::Duration) {
         *lock(&self.golive().keyframe_wait_timeout) = timeout;
     }
 
     pub(crate) fn golive_uses_encode_groups(&self) -> bool {
-        !lock(&self.golive().active_groups).is_empty()
+        let g = self.golive();
+        !lock(&g.active_groups).is_empty() || g.encode_groups_active.load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn drain_orphaned_groups_locked(&self, _group_ops: &tokio::sync::MutexGuard<'_, ()>) {
@@ -2845,7 +2859,7 @@ impl Engine {
     ) -> bool {
         let Ok(host) = self.studio_host() else { return false };
         let g = self.golive();
-        if lock(&g.active_groups).is_empty() {
+        if !self.golive_uses_encode_groups() {
             return false;
         }
         let cfg = self.golive_config();
@@ -3575,12 +3589,25 @@ impl Engine {
             registered: bool,
             uncommitted_group: Option<GroupId>,
         }
+        impl DestSwitchGuard {
+            fn clear_switch(&mut self) -> bool {
+                self.uncommitted_group = None;
+                if !self.registered {
+                    return false;
+                }
+                self.registered = false;
+                lock(&self.engine.golive().switching).remove(&self.id).is_some_and(|s| s.active)
+            }
+        }
         impl Drop for DestSwitchGuard {
             fn drop(&mut self) {
                 let g = self.engine.golive();
-                if self.registered {
-                    lock(&g.switching).remove(&self.id);
-                }
+                let active_removed = if self.registered {
+                    self.registered = false;
+                    lock(&g.switching).remove(&self.id).is_some_and(|s| s.active)
+                } else {
+                    false
+                };
                 if let Some(gid) = self.uncommitted_group.take() {
                     lock(&g.orphaned_groups).insert(gid);
                     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -3591,7 +3618,17 @@ impl Engine {
                         });
                     }
                 }
+                if active_removed {
+                    self.engine.send_golive();
+                    self.engine.wake_viewer_poller();
+                }
             }
+        }
+        // Field declaration order drops `guard` before `ops` (`group_ops`) on every exit, panic,
+        // and async future cancellation.
+        struct LockedSwitch<'a> {
+            guard: DestSwitchGuard,
+            ops: tokio::sync::MutexGuard<'a, ()>,
         }
 
         let dest_cancel = CancellationToken::new();
@@ -3651,8 +3688,8 @@ impl Engine {
         }
         let pre_stream_cancel = pre_studio_live.then(|| self.current_golive_switch_cancel());
 
-        let group_ops = g.group_ops.lock().await;
-        self.drain_orphaned_groups_locked(&group_ops).await;
+        let mut locked = LockedSwitch { guard, ops: g.group_ops.lock().await };
+        self.drain_orphaned_groups_locked(&locked.ops).await;
         if dest_cancel.is_cancelled() || pre_stream_cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
             return Err(refused(
                 "golive_switch_cancelled",
@@ -3741,7 +3778,7 @@ impl Engine {
                 "Stop and start the stream in OBS again, or switch to Ferrocast Studio for live per-destination switching.",
             ));
         }
-        if !guard.registered {
+        if !locked.guard.registered {
             use std::collections::hash_map::Entry;
             let mut active_sw = lock(&g.switching);
             match active_sw.entry(id.to_string()) {
@@ -3752,7 +3789,7 @@ impl Engine {
                 }
                 Entry::Vacant(v) => {
                     v.insert(SwitchState { cancel: dest_cancel.clone(), active: false });
-                    guard.registered = true;
+                    locked.guard.registered = true;
                 }
             }
         }
@@ -3930,7 +3967,7 @@ impl Engine {
                     Ok(true) => {
                         lock(&g.active_groups).insert(target_group_id.clone(), target_spec.clone());
                         started_new_group = true;
-                        guard.uncommitted_group = Some(target_group_id.clone());
+                        locked.guard.uncommitted_group = Some(target_group_id.clone());
                     }
                     Ok(false) => {
                         g.end_and_remove_hub(&target_group_id);
@@ -3962,8 +3999,8 @@ impl Engine {
             || !live_still
             || !dest_still_on
         {
-            guard.uncommitted_group = None;
-            self.cleanup_failed_switch_group_locked(&group_ops, &target_group_id, started_new_group).await;
+            locked.guard.uncommitted_group = None;
+            self.cleanup_failed_switch_group_locked(&locked.ops, &target_group_id, started_new_group).await;
             return match wait_res {
                 Err(SwitchWaitError::Cancelled) => Err(refused(
                     "golive_switch_cancelled",
@@ -3992,8 +4029,8 @@ impl Engine {
         let dest = tokio::select! {
             biased;
             () = stream_cancel.cancelled() => {
-                guard.uncommitted_group = None;
-                self.cleanup_failed_switch_group_locked(&group_ops, &target_group_id, started_new_group).await;
+                locked.guard.uncommitted_group = None;
+                self.cleanup_failed_switch_group_locked(&locked.ops, &target_group_id, started_new_group).await;
                 return Err(refused(
                     "golive_switch_cancelled",
                     "The stream stopped before the quality switch completed.",
@@ -4001,8 +4038,8 @@ impl Engine {
                 ));
             }
             () = dest_cancel.cancelled() => {
-                guard.uncommitted_group = None;
-                self.cleanup_failed_switch_group_locked(&group_ops, &target_group_id, started_new_group).await;
+                locked.guard.uncommitted_group = None;
+                self.cleanup_failed_switch_group_locked(&locked.ops, &target_group_id, started_new_group).await;
                 return Err(refused(
                     "golive_switch_cancelled",
                     "The destination was disabled before the quality switch completed.",
@@ -4012,8 +4049,8 @@ impl Engine {
             res = self.resolve(&moved_after_budget) => match res {
                 Ok(d) => d,
                 Err(why) => {
-                    guard.uncommitted_group = None;
-                    self.cleanup_failed_switch_group_locked(&group_ops, &target_group_id, started_new_group).await;
+                    locked.guard.uncommitted_group = None;
+                    self.cleanup_failed_switch_group_locked(&locked.ops, &target_group_id, started_new_group).await;
                     return Err(refused(
                         "golive_dest_error",
                         format!("{} couldn't reconnect with the new quality: {why}", dest_name(&moved_after_budget)),
@@ -4030,8 +4067,8 @@ impl Engine {
             && g.studio_live.load(std::sync::atomic::Ordering::Acquire)
             && is_dest_sending(&self.golive_config());
         if !pre_drain_valid {
-            guard.uncommitted_group = None;
-            self.cleanup_failed_switch_group_locked(&group_ops, &target_group_id, started_new_group).await;
+            locked.guard.uncommitted_group = None;
+            self.cleanup_failed_switch_group_locked(&locked.ops, &target_group_id, started_new_group).await;
             return Err(refused(
                 "golive_switch_cancelled",
                 "The stream or destination stopped before the quality switch completed.",
@@ -4046,12 +4083,12 @@ impl Engine {
             && let Err(SwitchWaitError::Cancelled) =
                 stop_and_drain_running_cancellable(old, &stream_cancel, &dest_cancel).await
         {
-            guard.uncommitted_group = None;
-            self.cleanup_failed_switch_group_locked(&group_ops, &target_group_id, started_new_group).await;
+            locked.guard.uncommitted_group = None;
+            self.cleanup_failed_switch_group_locked(&locked.ops, &target_group_id, started_new_group).await;
             if let Some(ref old_gid) = old_group_id
                 && old_gid != &target_group_id
             {
-                self.stop_group_if_unused_locked(&group_ops, old_gid, &self.golive_config()).await;
+                self.stop_group_if_unused_locked(&locked.ops, old_gid, &self.golive_config()).await;
             }
             return Err(refused(
                 "golive_switch_cancelled",
@@ -4064,12 +4101,12 @@ impl Engine {
             && g.studio_live.load(std::sync::atomic::Ordering::Acquire)
             && is_dest_sending(&self.golive_config());
         if !still_valid {
-            guard.uncommitted_group = None;
-            self.cleanup_failed_switch_group_locked(&group_ops, &target_group_id, started_new_group).await;
+            locked.guard.uncommitted_group = None;
+            self.cleanup_failed_switch_group_locked(&locked.ops, &target_group_id, started_new_group).await;
             if let Some(ref old_gid) = old_group_id
                 && old_gid != &target_group_id
             {
-                self.stop_group_if_unused_locked(&group_ops, old_gid, &self.golive_config()).await;
+                self.stop_group_if_unused_locked(&locked.ops, old_gid, &self.golive_config()).await;
             }
             return Err(refused(
                 "golive_switch_cancelled",
@@ -4105,18 +4142,20 @@ impl Engine {
         let final_cfg = match save_res {
             Ok(cfg) => cfg,
             Err(e) => {
-                guard.uncommitted_group = None;
-                self.cleanup_failed_switch_group_locked(&group_ops, &target_group_id, started_new_group).await;
+                locked.guard.uncommitted_group = None;
+                self.cleanup_failed_switch_group_locked(&locked.ops, &target_group_id, started_new_group).await;
                 let cur_cfg = self.golive_config();
                 if g.studio_live.load(std::sync::atomic::Ordering::Acquire)
                     && !stream_cancel.is_cancelled()
+                    && !dest_cancel.is_cancelled()
                     && is_dest_sending(&cur_cfg)
                 {
-                    self.reconcile_locked(&group_ops).await;
+                    let _ = locked.guard.clear_switch();
+                    self.reconcile_locked(&locked.ops).await;
                 } else if let Some(ref old_gid) = old_group_id
                     && old_gid != &target_group_id
                 {
-                    self.stop_group_if_unused_locked(&group_ops, old_gid, &cur_cfg).await;
+                    self.stop_group_if_unused_locked(&locked.ops, old_gid, &cur_cfg).await;
                 }
                 return Err(e);
             }
@@ -4147,7 +4186,7 @@ impl Engine {
             stop_rx,
             Some(other_rx),
         ));
-        guard.uncommitted_group = None;
+        locked.guard.uncommitted_group = None;
         if let Some(prev) = lock(&g.running).insert(
             id.to_string(),
             Running {
@@ -4166,11 +4205,12 @@ impl Engine {
         if let Some(old_gid) = old_group_id
             && old_gid != target_group_id
         {
-            self.stop_group_if_unused_locked(&group_ops, &old_gid, &final_cfg).await;
+            self.stop_group_if_unused_locked(&locked.ops, &old_gid, &final_cfg).await;
         }
-        drop(guard);
+        let _ = locked.guard.clear_switch();
         self.send_golive();
-        drop(group_ops);
+        self.wake_viewer_poller();
+        drop(locked);
         Ok(final_cfg)
     }
 
@@ -4598,7 +4638,10 @@ impl Engine {
             }
         };
         if let Err(e) = res {
-            if cancelled_switch && self.golive().any_stream_hub_live() {
+            if cancelled_switch
+                && (self.golive().any_stream_hub_live()
+                    || self.golive().studio_live.load(std::sync::atomic::Ordering::Acquire))
+            {
                 self.reconcile_locked(&group_ops).await;
             }
             return Err(e);
@@ -4942,7 +4985,7 @@ impl Engine {
         let cfg = self.golive_config();
         let budget = self.refresh_pc_budget().await;
         let studio_on = g.studio_live.load(std::sync::atomic::Ordering::Acquire);
-        if studio_on && !lock(&g.active_groups).is_empty() {
+        if studio_on && self.golive_uses_encode_groups() {
             let failing_now = lock(&g.backup).failing.clone();
             let blocked_now = lock(&g.blocked).clone();
             let new_backups: Vec<String> = cfg
@@ -4995,7 +5038,7 @@ impl Engine {
             }
         }
         let mut plan = self.plan_golive_encodes(budget.clone());
-        let studio_groups_mode = studio_on && !lock(&g.active_groups).is_empty();
+        let studio_groups_mode = studio_on && self.golive_uses_encode_groups();
         let legacy_active_groups = !lock(&g.active_groups).is_empty();
 
         // Phase 1: Drain forwarders that are no longer wanted, blocked, paused, or changing groups
@@ -5121,6 +5164,7 @@ impl Engine {
             // The next stream starts with every destination given its own chance again.
             *lock(&g.backup) = BackupState::default();
             lock(&g.quality).reset();
+            g.encode_groups_active.store(false, std::sync::atomic::Ordering::Release);
             lock(&g.active_groups).clear();
         }
         // Apply stream caps (e.g. WebRTC no-B-frames) BEFORE launching new direct destinations so
@@ -5144,7 +5188,7 @@ impl Engine {
         }
         self.reconcile_cut().await;
         // Clean up any encode groups left unreferenced after stale destinations stopped.
-        if g.studio_live.load(std::sync::atomic::Ordering::Acquire) && !lock(&g.active_groups).is_empty() {
+        if g.studio_live.load(std::sync::atomic::Ordering::Acquire) && self.golive_uses_encode_groups() {
             let plan = self.plan_golive_encodes(budget);
             self.reconcile_studio_groups_locked(group_ops, &plan).await;
         }
@@ -5165,9 +5209,11 @@ impl Engine {
             }
             known.clone()
         };
+        let mut running_changed = false;
         for id in was_running.union(&now_running) {
             let (was, is) = (was_running.contains(id), now_running.contains(id));
             if was != is {
+                running_changed = true;
                 self.note_destination(id, names.get(id).map_or(id.as_str(), String::as_str), is);
             }
         }
@@ -5175,6 +5221,9 @@ impl Engine {
             self.health_stream_ended(now()).await;
         }
         self.send_golive();
+        if running_changed {
+            self.wake_viewer_poller();
+        }
     }
 
     /// Runs the cutter while the vertical picture is cut from the stream and a vertical
@@ -5717,6 +5766,7 @@ impl Engine {
         }
         if let Some(r) = lock(&g.running).remove(&id) {
             r.stop.send_replace(true);
+            self.wake_viewer_poller();
         }
         g.sync_other_live();
         let now_ms = u64::try_from(now().0).unwrap_or(0);
@@ -5805,11 +5855,16 @@ impl Engine {
     /// One second of quality per destination: one that falls behind alone (others keep up, so
     /// it's its route, not the upload) takes the lighter stream, and tries the full one again
     /// later. OBS can only lower every destination at once.
-    async fn quality_tick(&self) {
+    pub(crate) async fn quality_tick(&self) {
+        let _ = self.quality_tick_try_at(std::time::Instant::now()).await;
+    }
+
+    pub(crate) async fn quality_tick_try_at(&self, at: std::time::Instant) -> bool {
         let Ok(group_ops) = self.golive().group_ops.try_lock() else {
-            return;
+            return false;
         };
-        self.quality_tick_at_locked(&group_ops, std::time::Instant::now()).await;
+        self.quality_tick_at_locked(&group_ops, at).await;
+        true
     }
 
     #[cfg(test)]
@@ -6736,6 +6791,7 @@ pub(crate) async fn run(engine: Engine) {
             let now_main_any = next_live.iter().any(|(_, (canvas, on))| *on && *canvas == Canvas::Main);
             let now_vertical_any = next_live.values().any(|(canvas, on)| *on && *canvas == Canvas::Vertical);
             let now_any = now_main_any || now_vertical_any;
+            let any_edge = now_any != was_any;
             if now_main_any != was_main_any {
                 tracing::info!(live = now_main_any, "Go live: the stream changed");
                 if now_main_any {
@@ -6755,15 +6811,28 @@ pub(crate) async fn run(engine: Engine) {
                 }
             }
             if !now_any && was_any {
-                g.studio_live.store(false, std::sync::atomic::Ordering::Release);
-                g.encode_groups_active.store(false, std::sync::atomic::Ordering::Release);
-                *lock(&g.applied_cap) = None;
-                *lock(&g.applied_limit) = None;
-                *lock(&g.cached_group_stats) = None;
-                lock(&g.group_start_failed).clear();
+                let group_ops = g.group_ops.lock().await;
+                let ended = !g.any_hub_live();
+                if ended {
+                    g.studio_live.store(false, std::sync::atomic::Ordering::Release);
+                    g.encode_groups_active.store(false, std::sync::atomic::Ordering::Release);
+                    *lock(&g.applied_cap) = None;
+                    *lock(&g.applied_limit) = None;
+                    *lock(&g.cached_group_stats) = None;
+                    lock(&g.group_start_failed).clear();
+                }
+                was_live = next_live;
+                engine.reconcile_locked(&group_ops).await;
+                if ended {
+                    engine.wake_viewer_poller();
+                }
+                continue;
             }
             was_live = next_live;
             engine.reconcile().await;
+            if any_edge {
+                engine.wake_viewer_poller();
+            }
             continue;
         }
         was_live = next_live;

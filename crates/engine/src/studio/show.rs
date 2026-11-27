@@ -180,6 +180,35 @@ impl Drop for EndingGuard<'_> {
     }
 }
 
+/// Restores `ending_in_flight` and any cancelled switch token if `stop_stream_later` exits or drops without stopping.
+struct DelayedStopGuard<'a> {
+    engine: &'a Engine,
+    epoch: u64,
+    cancel_session: u64,
+    cancelled_switches: bool,
+    committed: bool,
+}
+
+impl Drop for DelayedStopGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        {
+            let mut m = self.engine.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            if m.epoch == self.epoch && m.ending_in_flight {
+                m.ending_in_flight = false;
+                if !m.stop_waiting && m.phase == BroadcastPhase::Ending {
+                    m.phase = BroadcastPhase::Idle;
+                }
+            }
+        }
+        if self.cancelled_switches && self.engine.is_studio_live() {
+            self.engine.reset_golive_switch_cancel_if_session(self.cancel_session);
+        }
+    }
+}
+
 /// Clears `transitioning_live` if `go_live_now` exits early or is dropped mid-await.
 struct LiveTransitionGuard<'a> {
     engine: &'a Engine,
@@ -1518,7 +1547,7 @@ impl Engine {
         }
         let rig = self.rig().await;
         {
-            let m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
+            let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
             let still_ours_now = m.epoch == show_gen
                 && m.stream_epoch == stream_gen
                 && m.stop_waiting
@@ -1526,9 +1555,18 @@ impl Engine {
             if !still_ours_now {
                 return;
             }
-            if matches!(rig, Ok(crate::studio::rig::Rig::Studio)) {
-                self.cancel_golive_switches_if_session(cancel_session);
-            }
+            m.ending_in_flight = true;
+        }
+        let mut guard = DelayedStopGuard {
+            engine: self,
+            epoch: show_gen,
+            cancel_session,
+            cancelled_switches: false,
+            committed: false,
+        };
+        if matches!(rig, Ok(crate::studio::rig::Rig::Studio)) {
+            guard.cancelled_switches = true;
+            self.cancel_golive_switches_if_session(cancel_session);
         }
         let group_ops = self.golive().group_ops.lock().await;
         let _out = self.studio().output_lock.lock().await;
@@ -1541,17 +1579,29 @@ impl Engine {
             if ok {
                 m.stop_task = None;
                 m.stop_waiting = false;
+            } else if m.epoch == show_gen && m.ending_in_flight {
+                m.ending_in_flight = false;
+                if !m.stop_waiting && m.phase == BroadcastPhase::Ending {
+                    m.phase = BroadcastPhase::Idle;
+                }
             }
             ok
         };
         if !still_ours {
+            if guard.cancelled_switches && self.is_studio_live() {
+                self.reset_golive_switch_cancel_if_session(cancel_session);
+            }
+            guard.committed = true;
             return;
         }
         let step = self.stop_stream_step_locked(&group_ops).await;
         let emit = {
             let mut m = self.studio().machine.lock().unwrap_or_else(|p| p.into_inner());
-            if m.epoch == show_gen && m.phase == BroadcastPhase::Ending {
-                m.phase = BroadcastPhase::Idle;
+            if m.epoch == show_gen {
+                m.ending_in_flight = false;
+                if m.phase == BroadcastPhase::Ending {
+                    m.phase = BroadcastPhase::Idle;
+                }
             }
             if let Some(r) = m.run.as_mut().filter(|r| r.id == show_id) {
                 match r.steps.iter_mut().find(|s| s.id == "stop_stream") {
@@ -1563,6 +1613,7 @@ impl Engine {
                 None
             }
         };
+        guard.committed = true;
         if let Some(run) = emit {
             self.emit_show(Some(run));
         }
