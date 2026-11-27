@@ -2257,14 +2257,13 @@ impl Engine {
         Ok(view)
     }
 
-    /// Disarms any pending auto-rollback when the user manually edits one of the 6 output fields (H6).
-    pub(crate) fn disarm_auto_config_if_output_changed(&self, saved: &StudioSettings) {
+    fn disarm_auto_config_if(&self, should_disarm: impl FnOnce(&AppliedInner) -> bool) {
         let view = {
             let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
             let MachineState::Applied(a) = &slot.state else {
                 return;
             };
-            if a.summary.matches_output_fields(saved) {
+            if !should_disarm(a) {
                 return;
             }
             slot.seq = slot.seq.saturating_add(1);
@@ -2273,6 +2272,18 @@ impl Engine {
         };
         ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
         self.emit_auto_config_frame(&view);
+    }
+
+    /// Disarms any pending auto-rollback when the user manually edits one of the 6 output fields (H6).
+    pub(crate) fn disarm_auto_config_if_output_changed(&self, saved: &StudioSettings) {
+        self.disarm_auto_config_if(|a| !a.summary.matches_output_fields(saved));
+    }
+
+    /// Unconditionally disarms any pending auto-rollback and startup restore (e.g. on profile switch).
+    pub(crate) fn disarm_auto_config(&self) {
+        self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).take();
+        ferrocast_store::durable::remove_with_backup(&pending_apply_path(self.data_dir()));
+        self.disarm_auto_config_if(|_| true);
     }
 
     /// Immediately restores the pre-apply `StudioSettings` snapshot.

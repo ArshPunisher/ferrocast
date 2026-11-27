@@ -248,6 +248,13 @@ impl Engine {
         Ok((load_collection, allow_auto_start, enabled_normal))
     }
 
+    /// Clears Safe Mode's held-back collection offer once another collection has been loaded.
+    pub(crate) fn clear_collection_pending(&self) {
+        let mut slot = self.inner.safe_mode.lock().unwrap_or_else(|e| e.into_inner());
+        slot.status.collection_pending = false;
+        slot.status.offer = false;
+    }
+
     #[cfg(test)]
     pub(crate) fn set_safe_mode_for_test(&self, unclean_exit: bool, explicit_flag: bool) {
         let mut slot = self.inner.safe_mode.lock().unwrap_or_else(|e| e.into_inner());

@@ -89,8 +89,9 @@ pub(crate) struct Studio {
     /// Single locked state machine for the Show, countdown, and delayed stream stop.
     pub machine: Mutex<show::BroadcastMachine>,
     ///
-    /// Lock order, wherever more than one is taken: `auto_config_op`, then `golive().group_ops`,
-    /// then `output_lock`, then `output_gate` (innermost), and `group_ops` before `config_lock`.
+    /// Lock order, wherever more than one is taken: `import_busy`, then `auto_config_op`, then
+    /// `library_lock`, then `golive().group_ops`, then `output_lock`, then `output_gate`
+    /// (innermost), and `group_ops` before `config_lock`.
     /// Nothing waits for an outer lock while holding an inner one, and a start that a running
     /// start would only queue behind is refused from the `machine` state first
     /// (`Engine::refuse_if_show_busy`), before any of the locks is awaited.
@@ -98,6 +99,8 @@ pub(crate) struct Studio {
     pub output_lock: tokio::sync::Mutex<()>,
     /// Mutual exclusion gate between starting any output and claiming a benchmark run (C2).
     pub output_gate: tokio::sync::Mutex<()>,
+    /// Serializes collection/profile shelf mutations and imports against switches and settings saves.
+    pub library_lock: tokio::sync::Mutex<()>,
     /// Set once `request_update_restart` admits restart under `output_gate` so late recordings cannot start before exit.
     pub update_committing: std::sync::atomic::AtomicBool,
     /// Serializes `auto_config_benchmark` / `cancel` / `apply` / `undo` state transitions (C2/H7).
@@ -179,6 +182,7 @@ impl Default for Studio {
             machine: Mutex::default(),
             output_lock: tokio::sync::Mutex::new(()),
             output_gate: tokio::sync::Mutex::new(()),
+            library_lock: tokio::sync::Mutex::new(()),
             update_committing: std::sync::atomic::AtomicBool::new(false),
             auto_config_op: tokio::sync::Mutex::new(()),
             mono_origin: std::time::Instant::now(),

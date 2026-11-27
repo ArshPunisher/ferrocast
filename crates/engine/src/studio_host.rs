@@ -2705,20 +2705,27 @@ impl Engine {
         let confirming = was_running
             && self.safe_mode_status().collection_pending
             && (opts.confirm_collection || opts.safe_mode == Some(false));
-        if confirming {
-            self.ensure_idle_for_switch("scene collections").await?;
-        }
-        let (load_collection, allow_auto_start, _enabled_normal) = self.apply_start_options(&opts)?;
-        let mut status = if was_running {
-            if confirming && load_collection {
+        let (load_collection, allow_auto_start, _enabled_normal, mut status) = if confirming {
+            let _lib = self.studio().library_lock.lock().await;
+            let _gate = self.prepare_shelf_mutation("collections", false).await?;
+            let (load_collection, allow_auto_start, enabled_normal) = self.apply_start_options(&opts)?;
+            let status = if load_collection {
                 self.studio_release_holds().await;
                 host.confirm_collection().await.map_err(failed)?
             } else {
                 host.status().await
-            }
+            };
+            (load_collection, allow_auto_start, enabled_normal, status)
         } else {
-            host.start_with_mode(load_collection).await.map_err(failed)?
+            let (load_collection, allow_auto_start, enabled_normal) = self.apply_start_options(&opts)?;
+            let status = if was_running {
+                host.status().await
+            } else {
+                host.start_with_mode(load_collection).await.map_err(failed)?
+            };
+            (load_collection, allow_auto_start, enabled_normal, status)
         };
+        let _ = load_collection;
         // After a crash: the replay buffer and the recording come back on as they were (a new
         // file) unless Safe Mode has auto-start disabled; the stream always waits for the streamer.
         if let Some(r) = status.recovered.as_mut() {
@@ -2803,6 +2810,19 @@ impl Engine {
         self.studio_set_settings_inner(s, false).await
     }
 
+    pub(crate) async fn ensure_ffmpeg_for_settings(&self, s: &StudioSettings) {
+        if s.needs_ffmpeg() && self.ffmpeg_path().is_none() {
+            let _ = self.get_ffmpeg().await;
+        }
+    }
+
+    pub(crate) async fn finish_profile_settings_sync(&self, saved: &StudioSettings, restart: Option<&str>) {
+        self.ensure_ffmpeg_for_settings(saved).await;
+        self.sync_studio_settings_live(saved, restart).await;
+        self.refresh_pc_budget().await;
+        self.send_golive_pub();
+    }
+
     pub(crate) async fn studio_set_settings_inner(
         &self,
         s: StudioSettings,
@@ -2814,12 +2834,12 @@ impl Engine {
         s.check()?;
         // x264 runs through FFmpeg in Ferrocast's own engine: fetched now, so it's here by the
         // time Record or Go live is pressed.
-        if s.needs_ffmpeg() && self.ffmpeg_path().is_none() {
-            let _ = self.get_ffmpeg().await;
-        }
+        self.ensure_ffmpeg_for_settings(&s).await;
+        let _lib = self.studio().library_lock.lock().await;
         let host = self.studio_host()?;
         let restart = host.set_settings(s).await.map_err(failed)?;
         let saved = host.settings().await;
+        drop(_lib);
         if !from_auto_config {
             self.disarm_auto_config_if_output_changed(&saved);
         }
@@ -3083,9 +3103,8 @@ impl Engine {
         if !collection_id_ok(id) {
             return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
         }
-        self.ensure_idle_for_switch("scene collections").await?;
-        // Keys held now belong to the collection being left.
-        self.studio_release_holds().await;
+        let _lib = self.studio().library_lock.lock().await;
+        let _gate = self.prepare_shelf_mutation("collections", true).await?;
         let host = self.studio_host()?;
         let list = host.streamlabs_collections().await.map_err(failed)?;
         if !list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id)) {
@@ -3097,7 +3116,11 @@ impl Engine {
                 retry_after: None,
             });
         }
-        host.import_streamlabs(id.to_string()).await.map_err(failed)
+        let out = host.import_streamlabs(id.to_string()).await.map_err(failed)?;
+        drop(_gate);
+        drop(_lib);
+        self.finish_collection_switch(true, true).await;
+        Ok(out)
     }
 
     /// Brings in OBS's scene collection `id` in place of the Studio's scenes.
@@ -3105,8 +3128,8 @@ impl Engine {
         if !collection_id_ok(id) {
             return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
         }
-        self.ensure_idle_for_switch("scene collections").await?;
-        self.studio_release_holds().await;
+        let _lib = self.studio().library_lock.lock().await;
+        let _gate = self.prepare_shelf_mutation("collections", true).await?;
         let host = self.studio_host()?;
         let list = host.obs_collections().await.map_err(failed)?;
         let known = list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id));
@@ -3119,7 +3142,11 @@ impl Engine {
                 retry_after: None,
             });
         }
-        host.import_obs(id.to_string()).await.map_err(failed)
+        let out = host.import_obs(id.to_string()).await.map_err(failed)?;
+        drop(_gate);
+        drop(_lib);
+        self.finish_collection_switch(true, true).await;
+        Ok(out)
     }
 
     pub async fn studio_monitoring(&self) -> Result<Value, EngineError> {
@@ -3688,65 +3715,90 @@ impl Engine {
         .await
     }
 
+    pub(crate) async fn prepare_shelf_mutation(
+        &self,
+        kind: &str,
+        release_holds: bool,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, EngineError> {
+        let gate = self.studio().output_gate.lock().await;
+        self.ensure_no_benchmark_running()?;
+        let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
+        self.ensure_idle_for_switch(noun).await?;
+        // A held key's item is in the collection being left: put it back before swapping scenes.
+        if release_holds && kind == "collections" {
+            self.studio_release_holds().await;
+        }
+        Ok(gate)
+    }
+
+    pub(crate) async fn finish_collection_switch(&self, switched: bool, has_host: bool) {
+        if switched {
+            self.clear_collection_pending();
+        }
+        if has_host {
+            // Another collection may have its own vertical picture (or none): the stream follows.
+            self.studio_sync_vertical().await;
+            if switched {
+                self.refresh_pc_budget().await;
+                self.send_golive_pub();
+            }
+        }
+    }
+
     /// Scene collections or profiles: one act on that list. Falls back to file-backed storage on
     /// disk when no desktop [`StudioHost`] is attached (such as in `ferrocast-headless`).
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         act.check(kind)?;
         let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let mutating = !matches!(act, ShelfAct::List | ShelfAct::Export { .. });
         let switched_shelf = matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. });
-        // Swapping what the Studio shows is refused during a show, benchmark, or while it streams
-        // or records; with no desktop host attached (headless) the show/benchmark still count.
-        let _gate = if switched_shelf {
-            let g = self.studio().output_gate.lock().await;
-            self.ensure_no_benchmark_running()?;
-            let noun = if kind == "profiles" { "profiles" } else { "scene collections" };
-            self.ensure_idle_for_switch(noun).await?;
-            // A held key's item is in the collection being left: put it back first.
-            self.studio_release_holds().await;
-            Some(g)
+        // Swapping, renaming, removing, or importing shelves is serialized with `library_lock` and
+        // refused while live, recording, in a show, or benchmarking (`output_gate`). When changing
+        // profiles, `auto_config_op` is acquired outermost so rollback cannot race the switch.
+        let _auto_op =
+            if kind == "profiles" && switched_shelf { Some(self.studio().auto_config_op.lock().await) } else { None };
+        let _lib = if mutating { Some(self.studio().library_lock.lock().await) } else { None };
+        let _gate = if mutating { Some(self.prepare_shelf_mutation(kind, switched_shelf).await?) } else { None };
+        let out = if let Some(host) = &host {
+            host.shelf(kind.to_string(), act).await.map_err(failed)?
         } else {
-            None
+            let data = self.store().dir().to_path_buf();
+            let kind_owned = kind.to_string();
+            let res = tokio::task::spawn_blocking(move || {
+                use ferrocast_store::studio_library as lib;
+                match act {
+                    ShelfAct::List => lib::headless_shelf_list(&data, &kind_owned),
+                    ShelfAct::New { name, copy } => lib::headless_shelf_new(&data, &kind_owned, &name, copy),
+                    ShelfAct::Switch { id } => lib::headless_shelf_switch(&data, &kind_owned, &id),
+                    ShelfAct::Rename { id, name } => lib::headless_shelf_rename(&data, &kind_owned, &id, &name),
+                    ShelfAct::Remove { id } => lib::headless_shelf_remove(&data, &kind_owned, &id),
+                    ShelfAct::Export { id } => lib::headless_shelf_export(&data, &kind_owned, &id),
+                    ShelfAct::Import { name, doc } => {
+                        let (id, prev, saved_name) = lib::import_collection_doc(&data, &name, doc)?;
+                        Ok(serde_json::json!({ "id": id, "previous_id": prev, "name": saved_name }))
+                    }
+                }
+            })
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+            res.map_err(failed)?
         };
-        if let Some(host) = host {
-            let out = host.shelf(kind.to_string(), act).await.map_err(failed)?;
-            drop(_gate);
-            if switched_shelf && kind == "profiles" {
+        drop(_gate);
+        drop(_lib);
+        if switched_shelf && kind == "profiles" {
+            self.disarm_auto_config();
+            drop(_auto_op);
+            if let Some(host) = &host {
                 let saved = host.settings().await;
-                self.disarm_auto_config_if_output_changed(&saved);
-                self.note_studio_settings(&saved);
-                self.refresh_pc_budget().await;
-                self.send_golive_pub();
-            } else {
-                // Another collection may have its own vertical picture (or none): the stream follows.
-                self.studio_sync_vertical().await;
-                if switched_shelf {
-                    self.refresh_pc_budget().await;
-                    self.send_golive_pub();
-                }
+                self.finish_profile_settings_sync(&saved, None).await;
             }
-            return Ok(out);
+        } else {
+            drop(_auto_op);
+            if kind == "collections" && mutating {
+                self.finish_collection_switch(switched_shelf, host.is_some()).await;
+            }
         }
-
-        let data = self.store().dir().to_path_buf();
-        let kind_owned = kind.to_string();
-        let res = tokio::task::spawn_blocking(move || {
-            use ferrocast_store::studio_library as lib;
-            match act {
-                ShelfAct::List => lib::headless_shelf_list(&data, &kind_owned),
-                ShelfAct::New { name, copy } => lib::headless_shelf_new(&data, &kind_owned, &name, copy),
-                ShelfAct::Switch { id } => lib::headless_shelf_switch(&data, &kind_owned, &id),
-                ShelfAct::Rename { id, name } => lib::headless_shelf_rename(&data, &kind_owned, &id, &name),
-                ShelfAct::Remove { id } => lib::headless_shelf_remove(&data, &kind_owned, &id),
-                ShelfAct::Export { id } => lib::headless_shelf_export(&data, &kind_owned, &id),
-                ShelfAct::Import { name, doc } => {
-                    let (id, _prev, saved_name) = lib::import_collection_doc(&data, &name, doc)?;
-                    Ok(serde_json::json!({ "id": id, "name": saved_name }))
-                }
-            }
-        })
-        .await
-        .map_err(|e| EngineError::Internal(e.to_string()))?;
-        res.map_err(failed)
+        Ok(out)
     }
 
     pub async fn studio_screens(&self) -> Result<Value, EngineError> {
@@ -5760,5 +5812,298 @@ mod tests {
             (720, 1280),
             "GoLive view must refresh host budget vertical canvas on collection switch"
         );
+    }
+
+    #[derive(Debug, Default)]
+    struct ColTestHost {
+        streaming: std::sync::atomic::AtomicBool,
+        settings: std::sync::Mutex<StudioSettings>,
+        events: std::sync::Mutex<Vec<String>>,
+        switch_entered: tokio::sync::Notify,
+        switch_release: tokio::sync::Notify,
+        hold_collection_switch: std::sync::atomic::AtomicBool,
+        obs_list_entered: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl StudioHost for ColTestHost {
+        async fn status(&self) -> StudioStatus {
+            StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn start(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<StudioStatus, String> {
+            Ok(Default::default())
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn options(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn act(&self, _act: StudioAct) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn settings(&self) -> StudioSettings {
+            self.settings.lock().unwrap().clone()
+        }
+        async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String> {
+            *self.settings.lock().unwrap() = s;
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn record(&self, _on: bool) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+            self.streaming.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Value::Null)
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            self.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({ "active": self.streaming.load(std::sync::atomic::Ordering::SeqCst) }))
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            self.obs_list_entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.events.lock().unwrap().push("obs_collections".into());
+            Ok(serde_json::json!([{ "id": "obs_one", "name": "OBS One" }]))
+        }
+        async fn import_obs(&self, id: String) -> Result<Value, String> {
+            self.events.lock().unwrap().push(format!("import_obs:{id}"));
+            Ok(serde_json::json!({ "id": id }))
+        }
+        async fn streamlabs_collections(&self) -> Result<Value, String> {
+            self.events.lock().unwrap().push("sl_collections".into());
+            Ok(serde_json::json!([{ "id": "sl_one", "name": "SL One" }]))
+        }
+        async fn import_streamlabs(&self, id: String) -> Result<Value, String> {
+            self.events.lock().unwrap().push(format!("import_streamlabs:{id}"));
+            Ok(serde_json::json!({ "id": id }))
+        }
+        async fn shelf(&self, kind: String, act: ShelfAct) -> Result<Value, String> {
+            match act {
+                ShelfAct::List => Ok(serde_json::json!({ "current": "untitled", "list": [] })),
+                ShelfAct::Export { id } => Ok(serde_json::json!({ "id": id })),
+                ShelfAct::Switch { id } => {
+                    self.events.lock().unwrap().push(format!("switch:enter:{kind}:{id}"));
+                    if kind == "collections" && self.hold_collection_switch.load(std::sync::atomic::Ordering::SeqCst) {
+                        self.switch_entered.notify_one();
+                        self.switch_release.notified().await;
+                    }
+                    self.events.lock().unwrap().push(format!("switch:exit:{kind}:{id}"));
+                    Ok(serde_json::json!({ "id": id }))
+                }
+                ShelfAct::New { name, .. } => {
+                    self.events.lock().unwrap().push(format!("new:{kind}:{name}"));
+                    Ok(serde_json::json!({ "id": name }))
+                }
+                ShelfAct::Rename { id, .. } => {
+                    self.events.lock().unwrap().push(format!("rename:{kind}:{id}"));
+                    Ok(Value::Null)
+                }
+                ShelfAct::Remove { id } => {
+                    self.events.lock().unwrap().push(format!("remove:{kind}:{id}"));
+                    Ok(Value::Null)
+                }
+                ShelfAct::Import { name, .. } => {
+                    self.events.lock().unwrap().push(format!("import:{kind}:{name}"));
+                    Ok(serde_json::json!({ "id": name, "name": name }))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn col03_shelf_mutations_serialize_with_switch_and_refuse_while_live_or_benchmarking() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let host = Arc::new(ColTestHost::default());
+        host.hold_collection_switch.store(true, std::sync::atomic::Ordering::SeqCst);
+        e.set_studio_host(host.clone());
+
+        // 1. Remove and Rename wait for an in-flight Switch rather than racing it.
+        let e_sw = e.clone();
+        let sw =
+            tokio::spawn(async move { e_sw.studio_shelf("collections", ShelfAct::Switch { id: "c2".into() }).await });
+        host.switch_entered.notified().await;
+
+        let e_rm = e.clone();
+        let rm =
+            tokio::spawn(async move { e_rm.studio_shelf("collections", ShelfAct::Remove { id: "c3".into() }).await });
+        let e_rn = e.clone();
+        let rn = tokio::spawn(async move {
+            e_rn.studio_shelf("collections", ShelfAct::Rename { id: "c3".into(), name: "Renamed".into() }).await
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        {
+            let ev = host.events.lock().unwrap();
+            assert!(!ev.iter().any(|s| s.starts_with("remove:")), "Remove ran concurrently with Switch: {ev:?}");
+            assert!(!ev.iter().any(|s| s.starts_with("rename:")), "Rename ran concurrently with Switch: {ev:?}");
+        }
+        host.switch_release.notify_one();
+        sw.await.unwrap().unwrap();
+        rm.await.unwrap().unwrap();
+        rn.await.unwrap().unwrap();
+        {
+            let ev = host.events.lock().unwrap();
+            let exit_pos = ev.iter().position(|s| s == "switch:exit:collections:c2").unwrap();
+            let rm_pos = ev.iter().position(|s| s == "remove:collections:c3").unwrap();
+            let rn_pos = ev.iter().position(|s| s == "rename:collections:c3").unwrap();
+            assert!(exit_pos < rm_pos && exit_pos < rn_pos, "expected sequential order: {ev:?}");
+        }
+
+        // 2. Remove and Rename are refused while live; List and Export remain allowed.
+        host.streaming.store(true, std::sync::atomic::Ordering::SeqCst);
+        for (kind, act) in [
+            ("collections", ShelfAct::Remove { id: "c3".into() }),
+            ("collections", ShelfAct::Rename { id: "c3".into(), name: "X".into() }),
+            ("profiles", ShelfAct::Remove { id: "p2".into() }),
+            ("profiles", ShelfAct::Rename { id: "p2".into(), name: "Y".into() }),
+        ] {
+            let err = e.studio_shelf(kind, act).await.unwrap_err();
+            assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "{err:?}");
+        }
+        assert!(e.studio_shelf("collections", ShelfAct::List).await.is_ok());
+        assert!(e.studio_shelf("collections", ShelfAct::Export { id: "c2".into() }).await.is_ok());
+        host.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // 3. OBS & Streamlabs imports acquire `output_gate` and are refused during live outputs.
+        let gate = e.studio().output_gate.lock().await;
+        let e_obs = e.clone();
+        let obs_task = tokio::spawn(async move { e_obs.studio_import_obs("obs_one").await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !host.obs_list_entered.load(std::sync::atomic::Ordering::SeqCst),
+            "studio_import_obs entered host before output_gate released"
+        );
+        drop(gate);
+        obs_task.await.unwrap().unwrap();
+        assert!(host.obs_list_entered.load(std::sync::atomic::Ordering::SeqCst));
+        e.studio_import_streamlabs("sl_one").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn col04_profile_switch_unconditionally_disarms_auto_config_and_clears_startup_restore() {
+        use crate::studio::encoder_bench::{
+            ApplyReq, AutoConfigStateKind, OutputSnapshot, PendingApply, pending_apply_path,
+        };
+        use ferrocast_golive::bench::AutoConfigMode;
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let host = Arc::new(ColTestHost::default());
+        {
+            let mut s = host.settings.lock().unwrap();
+            s.encoder = "software".into();
+            s.video_encoder = Some("obs_x264".into());
+            s.fps = 60;
+            s.video_kbps = 6000;
+        }
+        e.set_studio_host(host.clone());
+
+        // Apply Auto-Config on Profile A.
+        let applied = e
+            .auto_config_apply(ApplyReq {
+                encoder: Some("software".into()),
+                video_encoder: Some(Some("obs_x264".into())),
+                fps: Some(60),
+                video_kbps: Some(6000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(applied.state, AutoConfigStateKind::Applied);
+
+        // Also seed a pending startup restore on disk & in memory.
+        let pending = PendingApply {
+            version: 1,
+            snapshot: OutputSnapshot::from_settings(&StudioSettings::default()),
+            mode: AutoConfigMode::Stream,
+            applied_label: "test".into(),
+            saved_at_ms: 1,
+        };
+        ferrocast_store::durable::save_json_pretty(&pending_apply_path(e.data_dir()), &pending).unwrap();
+        *e.studio().pending_startup_restore.lock().unwrap() = Some(pending);
+
+        // Even when Profile B has IDENTICAL output fields to Profile A's applied settings,
+        // switching profiles must unconditionally disarm Auto-Config rollback/undo!
+        e.studio_shelf("profiles", ShelfAct::Switch { id: "alt".into() }).await.unwrap();
+        assert_eq!(
+            e.auto_config_status().state,
+            AutoConfigStateKind::Idle,
+            "profile switch must unconditionally disarm Auto-Config rollback"
+        );
+        assert!(e.auto_config_undo().await.is_err(), "Undo after profile switch must be rejected");
+        assert!(e.studio().pending_startup_restore.lock().unwrap().is_none());
+        assert!(!pending_apply_path(e.data_dir()).exists());
+    }
+
+    #[tokio::test]
+    async fn col08_and_col11_collection_clears_safe_mode_and_profile_switch_syncs_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let host = Arc::new(ColTestHost::default());
+        e.set_studio_host(host.clone());
+        let _ = e
+            .add_golive_destination("YouTube", "rtmp://127.0.0.1:19908/app", "k", ferrocast_golive::Canvas::Main)
+            .await
+            .unwrap();
+
+        // Switching profiles must NOT clear safe mode collection_pending.
+        e.set_safe_mode_for_test(true, false);
+        assert!(e.safe_mode_status().collection_pending);
+        *host.settings.lock().unwrap() = StudioSettings {
+            encoder: "software".into(),
+            video_encoder: Some("obs_x264".into()),
+            width: 1280,
+            height: 720,
+            fps: 30,
+            video_kbps: 2500,
+            ..StudioSettings::default()
+        };
+        e.studio_shelf("profiles", ShelfAct::Switch { id: "alt".into() }).await.unwrap();
+        assert!(e.safe_mode_status().collection_pending, "profile switch must keep collection_pending");
+        let view = e.golive_view().await;
+        assert_eq!(view.encode_groups[0].kbps, 2500);
+
+        // Collection Switch, New, Import each clear safe mode collection_pending & offer.
+        for act in [
+            ShelfAct::Switch { id: "c2".into() },
+            ShelfAct::New { name: "Fresh".into(), copy: false },
+            ShelfAct::Import { name: "Imp".into(), doc: serde_json::json!({ "sources": [] }) },
+        ] {
+            e.set_safe_mode_for_test(true, false);
+            e.studio_shelf("collections", act).await.unwrap();
+            let sm = e.safe_mode_status();
+            assert!(!sm.collection_pending, "collection action must clear collection_pending");
+            assert!(!sm.offer, "collection action must clear crash offer");
+        }
     }
 }
