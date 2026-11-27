@@ -215,6 +215,9 @@ async fn start_poll(
 ) -> Result<Response, ApiError> {
     let a = web_account(&st, &headers, &method, true)?;
     let spec = poll_spec(&body(&headers, &b)?)?;
+    if !spec.chat_fallback {
+        return Err(invalid("Cloud polls run in chat via !vote and require chat fallback to be enabled."));
+    }
     let bus = bus_of(&st, &a.account.id)?;
     let now = Millis(now_ms());
     let poll = {

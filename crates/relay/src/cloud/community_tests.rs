@@ -152,6 +152,20 @@ async fn an_untimed_cloud_poll_has_null_ends_at_and_closes_only_on_end() {
 }
 
 #[tokio::test]
+async fn cloud_polls_reject_chat_fallback_false_explicitly() {
+    let w = world().await;
+    let u = w.cloud_user("asha@example.com").await;
+    w.bind_channels(&u);
+    let spec = json!({ "question": "Native only?", "options": ["A", "B"], "chat_fallback": false });
+    let (s, v) = w.web(&u, Method::POST, "/c/api/v1/polls", Some(spec)).await;
+    assert_eq!(
+        (s, code(&v)),
+        (422, "invalid"),
+        "Cloud mode must reject chat_fallback: false instead of ignoring it: {v}"
+    );
+}
+
+#[tokio::test]
 async fn giveaways_take_keyword_entries_once_and_draw_without_repeats() {
     let w = world().await;
     let u = w.cloud_user("asha@example.com").await;

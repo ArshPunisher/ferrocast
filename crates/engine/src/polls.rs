@@ -62,26 +62,49 @@ fn limit_reason(spec: &PollSpec, limits: &PollLimits) -> Option<&'static str> {
     if spec.duration_s.is_none() && !limits.supports_no_timer {
         return Some("no_timer_unsupported_for_native");
     }
+    if let Some(d) = spec.duration_s {
+        if d < limits.min_duration_s {
+            return Some("duration_too_short_for_native");
+        }
+        if d > limits.max_duration_s {
+            return Some("duration_too_long_for_native");
+        }
+    }
     None
 }
 
 async fn watch_native_polls(engine: Engine, poll_id: String) {
     loop {
         tokio::time::sleep(NATIVE_POLL_REFRESH).await;
-        let targets: Vec<(Platform, String)> = {
+        let (closed_pending_end, targets): (bool, Vec<(Platform, String)>) = {
             let guard = engine.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
             let Some(p) = guard.poll.as_ref() else { return };
-            if p.id != poll_id || !p.is_open(now()) {
+            if p.id != poll_id {
                 return;
             }
-            p.platforms
-                .iter()
-                .filter(|s| s.mode == PlatformPollMode::Native && s.state == PlatformPollState::Active)
-                .filter_map(|s| s.external_id.clone().map(|id| (s.platform, id)))
-                .collect()
+            if p.closed {
+                if !p.has_pending_remote_end() {
+                    return;
+                }
+                (true, p.pending_remote_end_targets())
+            } else if !p.is_open(now()) {
+                return;
+            } else {
+                let active_targets = p
+                    .platforms
+                    .iter()
+                    .filter(|s| s.mode == PlatformPollMode::Native && s.state == PlatformPollState::Active)
+                    .filter_map(|s| s.external_id.clone().map(|id| (s.platform, id)))
+                    .collect();
+                (false, active_targets)
+            }
         };
         if targets.is_empty() {
             return;
+        }
+        if closed_pending_end {
+            let _ = engine.finish_poll(Some(&poll_id)).await;
+            continue;
         }
         for (platform, ext_id) in targets {
             let Some(c) = engine.connector(platform) else { continue };
@@ -119,13 +142,14 @@ impl Engine {
     pub async fn start_poll(&self, spec: PollSpec) -> Result<PollView, EngineError> {
         let spec = spec.cleaned().map_err(EngineError::Invalid)?;
         let _op = self.inner.poll_op.lock().await;
-        let at = now();
-        if self.inner.poll.lock().unwrap_or_else(|p| p.into_inner()).poll.as_ref().is_some_and(|p| p.is_open(at)) {
+        if self.inner.poll.lock().unwrap_or_else(|p| p.into_inner()).poll.as_ref().is_some_and(|p| p.is_open(now())) {
             return Err(EngineError::Conflict("A poll is already running. End it before starting another.".into()));
         }
 
         let mut statuses = Vec::new();
         let mut initial_tallies: Vec<(Platform, Vec<u64>)> = Vec::new();
+        let mut limit_reasons: Vec<(Platform, &'static str)> = Vec::new();
+        let mut create_errors: Vec<String> = Vec::new();
         let native_spec = NativePollSpec {
             question: spec.question.clone(),
             options: spec.options.clone(),
@@ -150,6 +174,8 @@ impl Engine {
                             state: PlatformPollState::FailedFallback,
                             note: Some(reason.into()),
                         });
+                    } else {
+                        limit_reasons.push((p, reason));
                     }
                     continue;
                 }
@@ -178,6 +204,8 @@ impl Engine {
                                 state: PlatformPollState::FailedFallback,
                                 note: Some(note),
                             });
+                        } else {
+                            create_errors.push(format!("{p}: {err}"));
                         }
                     }
                 }
@@ -193,18 +221,45 @@ impl Engine {
         }
 
         if !spec.chat_fallback && statuses.is_empty() {
+            if let Some((_, reason)) = limit_reasons.first() {
+                let msg = match *reason {
+                    "duration_too_short_for_native" => {
+                        "Duration is below a connected platform's minimum (Twitch native polls require at least 15 seconds). Increase the duration or enable chat (!vote) fallback."
+                    }
+                    "duration_too_long_for_native" => {
+                        "Duration exceeds a connected platform's native poll limit (30 minutes). Shorten it or enable chat (!vote) fallback."
+                    }
+                    "text_too_long_for_native" => {
+                        "Question or answer text exceeds a connected platform's native poll character limit. Shorten it or enable chat (!vote) fallback."
+                    }
+                    "options_count_unsupported_for_native" => {
+                        "Number of answers is outside a connected platform's native poll limit. Adjust answers or enable chat (!vote) fallback."
+                    }
+                    _ => {
+                        "A connected platform cannot run this poll natively with its current timer settings. Adjust settings or enable chat (!vote) fallback."
+                    }
+                };
+                return Err(EngineError::Invalid(msg.into()));
+            }
+            if !create_errors.is_empty() {
+                return Err(EngineError::Invalid(format!(
+                    "Native poll could not start ({}). Enable chat (!vote) fallback or fix the connection.",
+                    create_errors.join("; ")
+                )));
+            }
             return Err(EngineError::Invalid(
                 "No connected platform supports native polls right now. Enable chat (!vote) fallback or reconnect Twitch."
                     .into(),
             ));
         }
 
+        let started_at = now();
         let poll = {
             let mut slot = self.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
-            if slot.poll.as_ref().is_some_and(|p| p.is_open(at)) {
+            if slot.poll.as_ref().is_some_and(|p| p.is_open(started_at)) {
                 return Err(EngineError::Conflict("A poll is already running. End it before starting another.".into()));
             }
-            let mut p = Poll::start(ferrocast_store::new_id(), spec, at);
+            let mut p = Poll::start(ferrocast_store::new_id(), spec, started_at);
             p.set_platforms(statuses);
             for (platform, counts) in initial_tallies {
                 p.set_native_tally(platform, &counts);
@@ -247,37 +302,44 @@ impl Engine {
     /// Closes the poll (only `id`, when given) once: whoever gets here first terminates active
     /// native platform polls and posts the result on chat-fallback platforms.
     pub(crate) async fn finish_poll(&self, id: Option<&str>) -> Result<PollView, EngineError> {
-        let (poll_id, to_end) = {
+        let _op = self.inner.poll_op.lock().await;
+        let (poll_id, was_closed, to_end) = {
             let mut guard = self.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
             let PollSlot { poll, dirty } = &mut *guard;
             let Some(p) = poll.as_mut() else { return Err(NO_POLL) };
             if id.is_some_and(|id| id != p.id) {
                 return Err(NO_POLL);
             }
-            let to_end: Vec<(Platform, String)> = p
-                .platforms
-                .iter()
-                .filter(|s| s.mode == PlatformPollMode::Native && s.state == PlatformPollState::Active)
-                .filter_map(|s| s.external_id.clone().map(|ext| (s.platform, ext)))
-                .collect();
-            if !p.close() {
+            let was_closed = !p.close();
+            let to_end = p.pending_remote_end_targets();
+            if was_closed && to_end.is_empty() {
                 return Err(EngineError::Conflict("That poll already ended.".into()));
             }
             *dirty = false;
-            (p.id.clone(), to_end)
+            (p.id.clone(), was_closed, to_end)
         };
         for (platform, ext_id) in to_end {
-            let Some(c) = self.connector(platform) else { continue };
+            let Some(c) = self.connector(platform) else {
+                let mut guard = self.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(p) = guard.poll.as_mut()
+                    && p.id == poll_id
+                {
+                    p.mark_remote_ended(platform);
+                }
+                continue;
+            };
             match c.end_native_poll(&ext_id).await {
-                Ok(Some(tally)) => {
+                Ok(maybe_tally) => {
                     let mut guard = self.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(p) = guard.poll.as_mut()
                         && p.id == poll_id
                     {
-                        p.set_native_tally(platform, &tally.counts);
+                        if let Some(tally) = maybe_tally {
+                            p.set_native_tally(platform, &tally.counts);
+                        }
+                        p.mark_remote_ended(platform);
                     }
                 }
-                Ok(None) => {}
                 Err(err) => tracing::warn!(%platform, error = %err, "couldn't end native poll on platform"),
             }
         }
@@ -290,39 +352,34 @@ impl Engine {
         };
         let view = poll.view();
         self.broadcast_poll(Some(view.clone()));
-        if poll.platforms.is_empty() {
-            self.announce(&poll.result(), "post the poll result");
-        } else if let Some(chat_set) = poll.chat_platforms()
-            && !chat_set.is_empty()
-        {
-            self.announce_to(&poll.result(), "post the poll result", &chat_set);
+        if !was_closed {
+            if poll.platforms.is_empty() {
+                self.announce(&poll.result(), "post the poll result");
+            } else if let Some(chat_set) = poll.chat_platforms()
+                && !chat_set.is_empty()
+            {
+                self.announce_to(&poll.result(), "post the poll result", &chat_set);
+            }
         }
         Ok(view)
     }
 
     /// Removes the poll without posting anything. 404 when there's none.
-    pub fn clear_poll(&self) -> Result<(), EngineError> {
-        let to_end: Vec<(Platform, String)> = {
+    pub async fn clear_poll(&self) -> Result<(), EngineError> {
+        let _op = self.inner.poll_op.lock().await;
+        let to_end = {
             let mut slot = self.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
             let Some(p) = slot.poll.take() else {
                 return Err(NO_POLL);
             };
             slot.dirty = false;
-            if p.closed {
-                Vec::new()
-            } else {
-                p.platforms
-                    .into_iter()
-                    .filter(|s| s.mode == PlatformPollMode::Native && s.state == PlatformPollState::Active)
-                    .filter_map(|s| s.external_id.map(|ext| (s.platform, ext)))
-                    .collect()
-            }
+            p.pending_remote_end_targets()
         };
         for (platform, ext_id) in to_end {
-            if let Some(c) = self.connector(platform) {
-                tokio::spawn(async move {
-                    let _ = c.end_native_poll(&ext_id).await;
-                });
+            if let Some(c) = self.connector(platform)
+                && let Err(err) = c.end_native_poll(&ext_id).await
+            {
+                tracing::warn!(%platform, error = %err, "couldn't end native poll on clear");
             }
         }
         self.broadcast_poll(None);
@@ -341,7 +398,7 @@ impl Engine {
             let mut guard = self.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
             let PollSlot { poll, dirty } = &mut *guard;
             let Some(p) = poll.as_mut() else { return };
-            if !p.is_open(now()) {
+            if p.closed {
                 return;
             }
             let matches_platform = p.platforms.iter().any(|s| {

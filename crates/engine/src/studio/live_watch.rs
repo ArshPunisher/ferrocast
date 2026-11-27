@@ -141,7 +141,7 @@ impl OutputLagWatch {
         if let Some(c) = step_cause {
             self.pending_cause = Some(pick_lag_cause(self.pending_cause, c));
         }
-        let cause = step_cause.or(self.pending_cause)?;
+        let cause = self.pending_cause?;
         if !self.last_warn_ms.is_none_or(|t| tick.at_ms - t >= OUTPUT_LAG_LOG_EVERY_MS) {
             return None;
         }
@@ -1230,5 +1230,66 @@ mod tests {
             .unwrap_or_else(|| panic!("expected retained drop burst to flush once cooldown elapsed"));
         assert_eq!(cause, "sender dropping packets");
         assert_eq!(burst, 10);
+    }
+
+    #[test]
+    fn output_lag_watch_flushes_highest_ranked_retained_cause() {
+        let dest = |dropped: u64| {
+            vec![ferrocast_core::auto_quality::Dest { id: "twitch".into(), dropped, live_ms: 30_000, live: true }]
+        };
+        let mut watch = OutputLagWatch::default();
+
+        assert_eq!(
+            watch.detect_trouble(&OutputLagTick {
+                at_ms: 0,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 500_000,
+                sender_dropped: 0,
+                dests: &dest(0),
+                paused: false,
+            }),
+            None
+        );
+        // Warn at 1s to open the 5s cooldown.
+        assert!(
+            watch
+                .detect_trouble(&OutputLagTick {
+                    at_ms: 1_000,
+                    sender_active: true,
+                    sender_reconnecting: false,
+                    sender_bytes: 500_000,
+                    sender_dropped: 0,
+                    dests: &dest(0),
+                    paused: false,
+                })
+                .is_some()
+        );
+        // At 3s inside cooldown: higher-priority full stall (0 bytes sent).
+        assert_eq!(
+            watch.detect_trouble(&OutputLagTick {
+                at_ms: 3_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 500_000,
+                sender_dropped: 0,
+                dests: &dest(0),
+                paused: false,
+            }),
+            None
+        );
+        // At 6s cooldown expiry: lower-priority destination drop arrives; retained stall must win.
+        let (cause, _, _) = watch
+            .detect_trouble(&OutputLagTick {
+                at_ms: 6_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 1_200_000,
+                sender_dropped: 0,
+                dests: &dest(3),
+                paused: false,
+            })
+            .unwrap();
+        assert_eq!(cause, "output stalled (0 bytes sent)");
     }
 }

@@ -224,6 +224,7 @@ impl Engine {
 
     /// Mutes or unmutes alert sound and speech (kept across restarts).
     pub async fn queue_set_muted(&self, muted: bool) -> QueueView {
+        let _tts_op = self.inner.tts_op.lock().await;
         let view = self
             .queue_op(move |q, _| {
                 q.set_muted(muted);

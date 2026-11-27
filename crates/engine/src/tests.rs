@@ -27,6 +27,9 @@ struct FakePlatform {
     poll_capability: Option<PlatformPollCapability>,
     fail_native_poll: bool,
     native_ended_tally: Option<Vec<u64>>,
+    native_start_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    native_end_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    fail_native_end_left: Mutex<u32>,
 }
 
 impl FakePlatform {
@@ -84,6 +87,10 @@ impl Connector for FakePlatform {
         self.poll_capability.clone()
     }
     async fn create_native_poll(&self, spec: &NativePollSpec) -> ferrocast_connector::Result<NativePollTally> {
+        if let Some((entered, release)) = &self.native_start_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         if self.fail_native_poll {
             let _ = self.push(format!("native_poll_fail {}", spec.question));
             return Err(ConnectorError::Refused { platform: self.platform(), message: "poll refused".into() });
@@ -101,6 +108,21 @@ impl Connector for FakePlatform {
         })
     }
     async fn end_native_poll(&self, external_id: &str) -> ferrocast_connector::Result<Option<NativePollTally>> {
+        if let Some((entered, release)) = &self.native_end_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
+        {
+            let mut left = self.fail_native_end_left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                let _ = self.push(format!("native_poll_end_fail {external_id}"));
+                return Err(ConnectorError::Network {
+                    platform: self.platform(),
+                    message: "transient network error".into(),
+                });
+            }
+        }
         self.push(format!("native_poll_end {external_id}"))?;
         Ok(self.native_ended_tally.clone().map(|counts| NativePollTally {
             external_id: external_id.to_string(),
@@ -1302,9 +1324,9 @@ async fn polls_count_one_vote_per_person_and_post_the_result_once() {
         saw_poll_frame |= f.text.contains("\"type\":\"poll\"");
     }
     assert!(saw_poll_frame, "dashboards get live results");
-    e.clear_poll().unwrap();
+    e.clear_poll().await.unwrap();
     assert!(e.poll().is_none());
-    assert!(matches!(e.clear_poll(), Err(EngineError::Missing { code: "poll_not_found", .. })));
+    assert!(matches!(e.clear_poll().await, Err(EngineError::Missing { code: "poll_not_found", .. })));
     assert!(matches!(e.end_poll().await, Err(EngineError::Missing { code: "poll_not_found", .. })));
     assert!(e.start_poll(poll_spec(&["only one"])).await.is_err());
 }
@@ -1512,7 +1534,7 @@ async fn untimed_poll_lives_until_end_or_external_native_end_and_clear_cancels_n
     assert!(tw.log().iter().any(|l| l == "native_poll_start Wait for boss? opts=2 dur=None"));
 
     // Clearing an active native poll ends it on the platform cleanly.
-    e.clear_poll().unwrap();
+    e.clear_poll().await.unwrap();
     eventually(|| tw.log().iter().any(|l| l == "native_poll_end ext-twitch")).await;
 
     // External native poll end auto-closes a native-only poll without needing clicking End.
@@ -1535,6 +1557,175 @@ async fn untimed_poll_lives_until_end_or_external_native_end_and_clear_cancels_n
     let final_view = e.poll().unwrap();
     assert_eq!(final_view.options.iter().map(|o| o.votes).collect::<Vec<_>>(), vec![2, 5]);
     assert_eq!(final_view.leaders, vec![1]);
+}
+
+#[tokio::test]
+async fn native_poll_serializes_finish_vs_start_retries_failed_end_starts_clock_after_setup_and_accepts_boundary_end() {
+    use tokio::sync::Notify;
+
+    // 1. started_at is captured after native creation completes, and boundary late NativePoll updates apply.
+    let (e, _d) = engine().await;
+    let start_entered = Arc::new(Notify::new());
+    let start_release = Arc::new(Notify::new());
+    let end_entered = Arc::new(Notify::new());
+    let end_release = Arc::new(Notify::new());
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        native_ended_tally: Some(vec![9, 1]),
+        native_start_gate: Some((start_entered.clone(), start_release.clone())),
+        native_end_gate: None,
+        ..Default::default()
+    });
+    e.register_connector(tw.clone());
+
+    let e_start = e.clone();
+    let p_task = tokio::spawn(async move { e_start.start_poll(poll_spec(&["A", "B"])).await });
+    start_entered.notified().await;
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    let unblocked_at = now();
+    start_release.notify_one();
+    let started = p_task.await.unwrap().unwrap();
+    assert!(
+        started.started_at.0 >= unblocked_at.0,
+        "local poll clock must start after native creation (started_at={} < unblocked={})",
+        started.started_at.0,
+        unblocked_at.0
+    );
+
+    // Late final EventSub arrival right past ends_at before timer finish_poll must apply final counts.
+    {
+        let mut guard = e.inner.poll.lock().unwrap_or_else(|p| p.into_inner());
+        guard.poll.as_mut().unwrap().ends_at = Some(Millis(now().0 - 5));
+    }
+    e.on_native_poll_event(Platform::Twitch, "ext-twitch", &[4, 6], true).await;
+    let boundary_view = e.poll().unwrap();
+    assert!(boundary_view.closed);
+    assert_eq!(boundary_view.total, 10, "boundary final tally past ends_at must not be dropped");
+
+    // 2. Limit error with chat_fallback=false names the limit reason (duration / text length).
+    {
+        let err = e
+            .start_poll(ferrocast_core::poll::PollSpec {
+                question: "Short duration?".into(),
+                options: vec!["Y".into(), "N".into()],
+                duration_s: Some(10),
+                chat_fallback: false,
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("second") || msg.contains("15") || msg.contains("duration"), "unexpected error: {err}");
+    }
+
+    // 3. Failed end_native_poll stays retryable without reopening voting or double-announcing.
+    let (e2, _d2) = engine().await;
+    let tw2 = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        native_ended_tally: Some(vec![3, 2]),
+        fail_native_end_left: Mutex::new(1),
+        ..Default::default()
+    });
+    let kick2 = FakePlatform::new(Platform::Kick);
+    e2.register_connector(tw2.clone());
+    e2.register_connector(kick2.clone());
+    let mut mixed_spec = poll_spec(&["X", "Y"]);
+    mixed_spec.chat_fallback = true;
+    e2.start_poll(mixed_spec).await.unwrap();
+    let after_fail = e2.end_poll().await.unwrap();
+    assert!(after_fail.closed, "poll closes locally even if native end failed");
+    eventually(|| kick2.log().iter().any(|l| l.starts_with("say Poll closed:"))).await;
+    // Retry end_poll succeeds remotely and announces result on Kick only once.
+    let retried = e2.end_poll().await.unwrap();
+    assert!(retried.closed);
+    assert!(tw2.log().iter().any(|l| l == "native_poll_end ext-twitch"));
+    assert_eq!(kick2.log().iter().filter(|l| l.starts_with("say Poll closed:")).count(), 1);
+    assert!(matches!(e2.end_poll().await, Err(EngineError::Conflict(_))));
+
+    // 4. finish_poll serializes against concurrent start_poll so Poll A's result is never lost.
+    let (e3, _d3) = engine().await;
+    let tw3 = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        native_ended_tally: Some(vec![9, 1]),
+        native_end_gate: Some((end_entered.clone(), end_release.clone())),
+        ..Default::default()
+    });
+    e3.register_connector(tw3.clone());
+    e3.start_poll(poll_spec(&["Alpha", "Beta"])).await.unwrap();
+    let e3_end = e3.clone();
+    let end_task = tokio::spawn(async move { e3_end.end_poll().await });
+    end_entered.notified().await;
+
+    let e3_start = e3.clone();
+    let start_b = tokio::spawn(async move { e3_start.start_poll(poll_spec(&["One", "Two"])).await });
+    for _ in 0..5 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !tw3.log().iter().any(|l| l.contains("native_poll_start One")),
+        "new poll start must wait until previous poll finishes ending"
+    );
+    end_release.notify_one();
+    let ended_a = end_task.await.unwrap().expect("Poll A end_poll must succeed with final tallies");
+    assert_eq!(ended_a.total, 10);
+    assert!(start_b.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn moderation_ban_surfaces_pending_tts_cleanup_failure_and_blocks_approval_until_cleaned() {
+    let (e, _d) = engine().await;
+    let tw = FakePlatform::new(Platform::Twitch);
+    e.register_connector(tw);
+    let mut tts = e.state().tts.clone();
+    tts.enabled = true;
+    tts.voice = Some("missing-local-voice-falls-back-fast".into());
+    tts.chat.enabled = true;
+    tts.chat.mode = ferrocast_core::tts::ChatTtsMode::Everyone;
+    tts.hold_for_approval = true;
+    e.save_tts(tts).await.unwrap();
+
+    e.ingest(chat(Platform::Twitch, "bad-1", "troll", "spam line")).await;
+    let pending = e.tts_pending().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let pid = pending[0]["id"].as_str().unwrap().to_string();
+
+    // Force SQLite DELETE on tts_pending to fail while platform ban succeeds.
+    e.db(|s| {
+        s.write(|tx| {
+            tx.execute_batch(
+                "CREATE TRIGGER test_fail_tts_del BEFORE DELETE ON tts_pending BEGIN
+                    SELECT RAISE(ABORT, 'simulated cleanup error');
+                 END;",
+            )?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+
+    let mut live_rx = e.subscribe_live();
+    let out = e.ban(Platform::Twitch, "troll-id", "troll", Some("troll"), None, false).await.unwrap();
+    assert_eq!(out.ok, vec![Platform::Twitch]);
+
+    // Failure notice must be surfaced instead of silently dropped as 0, and approval must be refused.
+    let mut saw_notice = false;
+    while let Ok(f) = live_rx.try_recv() {
+        if f.text.contains("\"type\":\"notice\"") && f.text.to_ascii_lowercase().contains("pending") {
+            saw_notice = true;
+        }
+    }
+    assert!(saw_notice, "must surface failed pending-TTS cleanup notice");
+    assert!(
+        e.decide_tts(&pid, true).await.is_err(),
+        "banned user's pending row must not be approvable while cleanup failed"
+    );
+
+    // Once DB recovers, retry drops the row cleanly.
+    e.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TRIGGER test_fail_tts_del;")?))).await.unwrap();
+    assert!(e.decide_tts(&pid, true).await.is_err());
+    assert!(e.tts_pending().await.unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------- giveaways

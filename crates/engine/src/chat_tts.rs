@@ -18,7 +18,9 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 const MAX_TRACKED_USERS: usize = 2_000;
-const RECENT_MEDIA_KEEP: usize = 10;
+const RECENT_MEDIA_KEEP: usize = 24;
+const MAX_DISPATCHED_KEEP: usize = 24;
+const DISPATCHED_TTL_MS: i64 = 120_000;
 
 /// One approved chat message waiting to be spoken.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +36,8 @@ pub(crate) struct ChatTtsItem {
 #[derive(Debug, Clone)]
 struct ActiveChatTts {
     generation: u64,
+    is_auto: bool,
+    id: String,
     event_id: String,
     source_id: Option<String>,
     platform: Platform,
@@ -43,10 +47,12 @@ struct ActiveChatTts {
 
 #[derive(Debug, Clone)]
 struct DispatchedChatTts {
+    id: String,
     event_id: String,
     source_id: Option<String>,
     platform: Platform,
     actor_id: Option<String>,
+    dispatched_at_ms: i64,
 }
 
 /// Result of attempting to add a chat line to the in-memory queue.
@@ -77,8 +83,9 @@ pub(crate) struct ChatTtsState {
     queue: VecDeque<ChatTtsItem>,
     per_user_last: HashMap<String, i64>,
     last_spoken_at: Option<i64>,
-    active: Option<ActiveChatTts>,
-    last_dispatched: Option<DispatchedChatTts>,
+    last_spoken_duration_ms: u64,
+    in_flight: Vec<ActiveChatTts>,
+    recent_dispatched: VecDeque<DispatchedChatTts>,
     recent_media: VecDeque<String>,
     next_generation: u64,
 }
@@ -118,10 +125,12 @@ impl ChatTtsState {
     }
 
     pub(crate) fn take_ready(&mut self, now_ms: i64, global_cooldown_s: u32) -> ReadyState {
-        if self.active.is_some() || self.queue.is_empty() {
+        if self.in_flight.iter().any(|a| a.is_auto) || self.queue.is_empty() {
             return ReadyState::Empty;
         }
-        let gap_ms = i64::from(global_cooldown_s).saturating_mul(1_000);
+        let gap_ms = i64::from(global_cooldown_s)
+            .saturating_mul(1_000)
+            .max(i64::try_from(self.last_spoken_duration_ms).unwrap_or(0));
         if gap_ms > 0
             && let Some(last) = self.last_spoken_at
         {
@@ -136,8 +145,10 @@ impl ChatTtsState {
         };
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let generation = self.next_generation;
-        self.active = Some(ActiveChatTts {
+        self.in_flight.push(ActiveChatTts {
             generation,
+            is_auto: true,
+            id: item.id.clone(),
             event_id: item.event_id.clone(),
             source_id: item.source_id.clone(),
             platform: item.platform,
@@ -147,6 +158,23 @@ impl ChatTtsState {
         ReadyState::Ready { item, generation }
     }
 
+    pub(crate) fn start_approved(&mut self, item: &ChatTtsItem) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        self.in_flight.push(ActiveChatTts {
+            generation,
+            is_auto: false,
+            id: item.id.clone(),
+            event_id: item.event_id.clone(),
+            source_id: item.source_id.clone(),
+            platform: item.platform,
+            actor_id: item.actor_id.clone(),
+            cancelled: false,
+        });
+        generation
+    }
+
+    #[cfg(test)]
     pub(crate) fn finish_active(
         &mut self,
         generation: u64,
@@ -154,21 +182,52 @@ impl ChatTtsState {
         commit: bool,
         now_ms: i64,
     ) -> FinishOutcome {
-        let Some(active) = self.active.take() else {
+        self.finish_active_with_duration(generation, media_id, commit, now_ms, 0)
+    }
+
+    pub(crate) fn finish_active_with_duration(
+        &mut self,
+        generation: u64,
+        media_id: Option<String>,
+        commit: bool,
+        now_ms: i64,
+        duration_ms: u64,
+    ) -> FinishOutcome {
+        let Some(idx) = self.in_flight.iter().position(|a| a.generation == generation) else {
             return FinishOutcome { cancelled: true, retired_media_id: None };
         };
-        if !commit || active.generation != generation || active.cancelled {
+        let active = self.in_flight.remove(idx);
+        if !commit || active.cancelled {
             return FinishOutcome { cancelled: true, retired_media_id: None };
         }
-        self.last_spoken_at = Some(now_ms);
-        self.last_dispatched = Some(DispatchedChatTts {
+        if active.is_auto {
+            self.last_spoken_at = Some(now_ms);
+            self.last_spoken_duration_ms = duration_ms;
+        }
+        self.prune_dispatched(now_ms);
+        self.recent_dispatched.push_back(DispatchedChatTts {
+            id: active.id,
             event_id: active.event_id,
             source_id: active.source_id,
             platform: active.platform,
             actor_id: active.actor_id,
+            dispatched_at_ms: now_ms,
         });
+        while self.recent_dispatched.len() > MAX_DISPATCHED_KEEP {
+            self.recent_dispatched.pop_front();
+        }
         let retired_media_id = media_id.and_then(|id| self.remember_media(id));
         FinishOutcome { cancelled: false, retired_media_id }
+    }
+
+    fn prune_dispatched(&mut self, now_ms: i64) {
+        while self
+            .recent_dispatched
+            .front()
+            .is_some_and(|d| now_ms.saturating_sub(d.dispatched_at_ms) > DISPATCHED_TTL_MS)
+        {
+            self.recent_dispatched.pop_front();
+        }
     }
 
     pub(crate) fn remember_media(&mut self, media_id: String) -> Option<String> {
@@ -176,55 +235,86 @@ impl ChatTtsState {
         if self.recent_media.len() > RECENT_MEDIA_KEEP { self.recent_media.pop_front() } else { None }
     }
 
-    pub(crate) fn purge_message(&mut self, platform: Platform, message_id: &str, event_id: Option<&str>) -> bool {
+    pub(crate) fn purge_message_stop(
+        &mut self,
+        platform: Platform,
+        message_id: &str,
+        event_id: Option<&str>,
+        now_ms: i64,
+    ) -> Option<Vec<String>> {
         let matches = |ev_id: &str, src_id: Option<&str>, plat: Platform| {
             plat == platform
                 && (src_id == Some(message_id) || ev_id == message_id || event_id.is_some_and(|e| ev_id == e))
         };
         self.queue.retain(|item| !matches(&item.event_id, item.source_id.as_deref(), item.platform));
-        let mut stop = false;
-        if let Some(active) = self.active.as_mut()
-            && matches(&active.event_id, active.source_id.as_deref(), active.platform)
-            && !active.cancelled
-        {
-            active.cancelled = true;
-            stop = true;
+        let mut stop_ids = Vec::new();
+        let mut stopped = false;
+        for active in &mut self.in_flight {
+            if matches(&active.event_id, active.source_id.as_deref(), active.platform) && !active.cancelled {
+                active.cancelled = true;
+                stop_ids.push(active.id.clone());
+                stopped = true;
+            }
         }
-        if self.last_dispatched.as_ref().is_some_and(|d| matches(&d.event_id, d.source_id.as_deref(), d.platform)) {
-            self.last_dispatched = None;
-            stop = true;
-        }
-        stop
+        self.prune_dispatched(now_ms);
+        self.recent_dispatched.retain(|d| {
+            if matches(&d.event_id, d.source_id.as_deref(), d.platform) {
+                stop_ids.push(d.id.clone());
+                stopped = true;
+                false
+            } else {
+                true
+            }
+        });
+        stopped.then_some(stop_ids)
     }
 
-    pub(crate) fn purge_user(&mut self, platform: Platform, actor_id: &str) -> bool {
+    pub(crate) fn purge_user_stop(&mut self, platform: Platform, actor_id: &str, now_ms: i64) -> Option<Vec<String>> {
         if actor_id.is_empty() {
-            return false;
+            return None;
         }
         let matches = |aid: Option<&str>, plat: Platform| plat == platform && aid == Some(actor_id);
         self.queue.retain(|item| !matches(item.actor_id.as_deref(), item.platform));
-        let mut stop = false;
-        if let Some(active) = self.active.as_mut()
-            && matches(active.actor_id.as_deref(), active.platform)
-            && !active.cancelled
-        {
-            active.cancelled = true;
-            stop = true;
+        let mut stop_ids = Vec::new();
+        let mut stopped = false;
+        for active in &mut self.in_flight {
+            if matches(active.actor_id.as_deref(), active.platform) && !active.cancelled {
+                active.cancelled = true;
+                stop_ids.push(active.id.clone());
+                stopped = true;
+            }
         }
-        if self.last_dispatched.as_ref().is_some_and(|d| matches(d.actor_id.as_deref(), d.platform)) {
-            self.last_dispatched = None;
-            stop = true;
-        }
-        stop
+        self.prune_dispatched(now_ms);
+        self.recent_dispatched.retain(|d| {
+            if matches(d.actor_id.as_deref(), d.platform) {
+                stop_ids.push(d.id.clone());
+                stopped = true;
+                false
+            } else {
+                true
+            }
+        });
+        stopped.then_some(stop_ids)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn purge_message(&mut self, platform: Platform, message_id: &str, event_id: Option<&str>) -> bool {
+        self.purge_message_stop(platform, message_id, event_id, i64::MIN / 4).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn purge_user(&mut self, platform: Platform, actor_id: &str) -> bool {
+        self.purge_user_stop(platform, actor_id, i64::MIN / 4).is_some()
     }
 
     pub(crate) fn stop_all(&mut self) -> usize {
         let dropped = self.queue.len();
         self.queue.clear();
-        if let Some(active) = self.active.as_mut() {
+        for active in &mut self.in_flight {
             active.cancelled = true;
         }
-        self.last_dispatched = None;
+        self.recent_dispatched.clear();
+        self.last_spoken_duration_ms = 0;
         dropped
     }
 
@@ -253,11 +343,15 @@ impl Engine {
         let EventKind::ChatMessage { actor, .. } = &e.kind else {
             return;
         };
+        let _op = self.inner.tts_op.lock().await;
+        if self.inner.queue.lock().await.is_muted() {
+            return;
+        }
         let (decision, cfg_chat, paused_tts) = {
             let st = self.state();
             (decide_chat(&st.tts, &st.filter, e), st.tts.chat.clone(), st.tts_paused)
         };
-        if paused_tts || self.inner.queue.lock().await.is_muted() {
+        if paused_tts {
             return;
         }
         let at_ms = now().0;
@@ -276,6 +370,17 @@ impl Engine {
             Decision::Hold { text } => {
                 let pending_count = self.db(repo::events::pending_chat_tts_count).await.unwrap_or(0);
                 if pending_count >= cfg_chat.queue_limit.max(1) {
+                    return;
+                }
+                // Revalidate live policy under tts_op + queue lock right before committing Hold insert.
+                if self.inner.queue.lock().await.is_muted() {
+                    return;
+                }
+                let still_ok = {
+                    let st = self.state();
+                    !st.tts_paused && st.tts.enabled && st.tts.chat.enabled && st.tts.hold_for_approval
+                };
+                if !still_ok {
                     return;
                 }
                 let allowed =
@@ -319,30 +424,68 @@ impl Engine {
         }
     }
 
+    pub(crate) fn start_approved_chat_tts(&self, item: &ChatTtsItem) -> u64 {
+        self.inner.chat_tts.lock().start_approved(item)
+    }
+
+    pub(crate) async fn publish_chat_tts_after_synth(
+        &self,
+        generation: u64,
+        item: &ChatTtsItem,
+        media_id: Option<String>,
+        duration_ms: u64,
+    ) {
+        let finish = {
+            let q = self.inner.queue.lock().await;
+            let st = self.state();
+            let still_allowed = !q.is_muted() && !st.tts_paused && st.tts.enabled && st.tts.chat.enabled;
+            let mut guard = self.inner.chat_tts.lock();
+            let finish = guard.finish_active_with_duration(
+                generation,
+                if still_allowed { media_id.clone() } else { None },
+                still_allowed,
+                now().0,
+                duration_ms,
+            );
+            if !finish.cancelled && still_allowed {
+                crate::studio::voice_commands::reading_aloud(&item.text, now().0);
+                self.send_overlay(OverlayFrame::new(
+                    Audience::Alerts,
+                    self.next_seq(),
+                    "tts",
+                    &json!({ "id": item.id, "text": item.text, "audio": media_id }),
+                ));
+            }
+            finish
+        };
+        if let Some(retired) = finish.retired_media_id {
+            let _ = self.db(move |s| repo::media::delete(s, &retired)).await;
+        }
+        if finish.cancelled
+            && let Some(unused_id) = media_id
+        {
+            let _ = self.db(move |s| repo::media::delete(s, &unused_id)).await;
+        }
+    }
+
     /// Clears all waiting chat TTS lines, cancels any in-flight utterance, and tells alert
     /// overlays to stop speech right away (`tts_stop`).
     pub(crate) fn stop_chat_tts(&self) {
         self.inner.chat_tts.lock().stop_all();
         self.inner.chat_tts.wake.notify_one();
-        self.emit_tts_stop();
+        self.emit_tts_stop(None);
     }
 
     pub(crate) fn purge_chat_tts_message(&self, platform: Platform, message_id: &str, event_id: Option<&str>) {
-        let stop = self.inner.chat_tts.lock().purge_message(platform, message_id, event_id);
-        if stop {
-            self.emit_tts_stop();
+        if let Some(ids) = self.inner.chat_tts.lock().purge_message_stop(platform, message_id, event_id, now().0) {
+            self.emit_tts_stop(Some(ids));
         }
     }
 
     pub(crate) fn purge_chat_tts_user(&self, platform: Platform, actor_id: &str) {
-        let stop = self.inner.chat_tts.lock().purge_user(platform, actor_id);
-        if stop {
-            self.emit_tts_stop();
+        if let Some(ids) = self.inner.chat_tts.lock().purge_user_stop(platform, actor_id, now().0) {
+            self.emit_tts_stop(Some(ids));
         }
-    }
-
-    pub(crate) fn remember_chat_tts_media(&self, media_id: String) -> Option<String> {
-        self.inner.chat_tts.lock().remember_media(media_id)
     }
 
     pub(crate) fn chat_tts_media_ids(&self) -> Vec<String> {
@@ -353,8 +496,12 @@ impl Engine {
         self.inner.chat_tts.wake.notify_one();
     }
 
-    fn emit_tts_stop(&self) {
-        self.send_overlay(OverlayFrame::new(Audience::Alerts, self.next_seq(), "tts_stop", &json!({})));
+    fn emit_tts_stop(&self, ids: Option<Vec<String>>) {
+        let payload = match ids {
+            Some(ids) if !ids.is_empty() => json!({ "ids": ids }),
+            _ => json!({}),
+        };
+        self.send_overlay(OverlayFrame::new(Audience::Alerts, self.next_seq(), "tts_stop", &payload));
     }
 }
 
@@ -382,36 +529,8 @@ pub(crate) async fn run(engine: Engine) {
             }
             ReadyState::Ready { item, generation } => {
                 // Local system voice only so live chat never spends Pro Cloud TTS characters.
-                let media_id = engine.speak_local_to_media(&item.text).await;
-                let still_allowed = {
-                    let st = engine.state();
-                    !st.tts_paused && st.tts.enabled && st.tts.chat.enabled
-                } && !engine.inner.queue.lock().await.is_muted();
-
-                let finish = engine.inner.chat_tts.lock().finish_active(
-                    generation,
-                    if still_allowed { media_id.clone() } else { None },
-                    still_allowed,
-                    now().0,
-                );
-
-                if let Some(retired) = finish.retired_media_id {
-                    let _ = engine.db(move |s| repo::media::delete(s, &retired)).await;
-                }
-                if finish.cancelled || !still_allowed {
-                    if let Some(unused_id) = media_id {
-                        let _ = engine.db(move |s| repo::media::delete(s, &unused_id)).await;
-                    }
-                    continue;
-                }
-
-                crate::studio::voice_commands::reading_aloud(&item.text, now().0);
-                engine.send_overlay(OverlayFrame::new(
-                    Audience::Alerts,
-                    engine.next_seq(),
-                    "tts",
-                    &json!({ "id": item.id, "text": item.text, "audio": media_id }),
-                ));
+                let (media_id, duration_ms) = engine.speak_local_to_media(&item.text).await;
+                engine.publish_chat_tts_after_synth(generation, &item, media_id, duration_ms).await;
             }
         }
     }
@@ -506,7 +625,7 @@ mod tests {
         assert_eq!(st.take_ready(2_500, 3), ReadyState::Wait(Duration::from_millis(1_700)));
         assert!(matches!(st.take_ready(4_200, 3), ReadyState::Ready { .. }));
 
-        for i in 2..=12 {
+        for i in 2..=(RECENT_MEDIA_KEEP + 2) {
             let retired = st.remember_media(format!("m{i}"));
             if i <= RECENT_MEDIA_KEEP {
                 assert!(retired.is_none());
@@ -569,8 +688,12 @@ mod tests {
     }
 
     async fn next_overlay_of(rx: &mut tokio::sync::broadcast::Receiver<OverlayFrame>, kind: &str) -> serde_json::Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let f = rx.recv().await.unwrap();
+            let f = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for overlay frame `{kind}`"))
+                .expect("overlay channel closed");
             let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
             if v["type"] == kind {
                 return v;
@@ -742,5 +865,58 @@ mod tests {
         let mut tts = engine.state().tts.clone();
         tts.hold_for_approval = false;
         engine.save_tts(tts).await.unwrap();
+    }
+
+    #[test]
+    fn recent_dispatched_ring_tracks_earlier_speaking_messages_and_media_ring_retains_queue() {
+        let mut st = ChatTtsState::default();
+        const { assert!(RECENT_MEDIA_KEEP >= 24, "media retention ring must outlast max queued overlay playback") };
+
+        st.try_enqueue(item("1", "u1", "src-1", "long abusive message"), "twitch:u1".into(), 5, 0, 1_000);
+        let ReadyState::Ready { generation: g1, .. } = st.take_ready(1_000, 3) else {
+            panic!("first ready");
+        };
+        assert!(!st.finish_active(g1, Some("m1".into()), true, 1_200).cancelled);
+
+        // 4 s later, a second message is synthesized and dispatched while msg 1 is still reading aloud.
+        st.try_enqueue(item("2", "u2", "src-2", "gg"), "twitch:u2".into(), 5, 0, 5_000);
+        let ReadyState::Ready { generation: g2, .. } = st.take_ready(5_000, 3) else {
+            panic!("second ready");
+        };
+        assert!(!st.finish_active(g2, Some("m2".into()), true, 5_200).cancelled);
+
+        // Deleting msg 1 (or banning u1) must still match msg 1 and emit stop.
+        assert!(st.purge_message(Platform::Twitch, "src-1", None), "earlier active msg 1 must still purge");
+    }
+
+    #[tokio::test]
+    async fn approved_chat_honors_playback_controls_and_preserves_pending_item() {
+        let (engine, _dir) = test_engine().await;
+        let mut tts = engine.state().tts.clone();
+        tts.hold_for_approval = true;
+        engine.save_tts(tts).await.unwrap();
+
+        engine.ingest(chat_event("src-hold-ctrl", "u-ctrl", Roles::empty(), Origin::Live, None, "held line")).await;
+        let pending = engine.tts_pending().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        let pid = pending[0]["id"].as_str().unwrap().to_string();
+
+        // While alert queue is muted, approving a held chat line must fail without consuming it or emitting tts.
+        let mut rx = engine.subscribe_overlays();
+        engine.queue_set_muted(true).await;
+        let _ = next_overlay_of(&mut rx, "tts_stop").await;
+        assert!(engine.decide_tts(&pid, true).await.is_err(), "muted queue must refuse chat approval");
+        assert_eq!(engine.tts_pending().await.unwrap().len(), 1, "refused approval must leave pending item");
+        assert!(rx.try_recv().is_err(), "refused approval must not emit tts");
+
+        // Same when Panic pauses TTS.
+        engine.queue_set_muted(false).await;
+        let mut panic_cfg = engine.panic_state().1;
+        panic_cfg.pause_tts = true;
+        engine.save_panic(panic_cfg).await.unwrap();
+        engine.panic(true).await.unwrap();
+        let _ = next_overlay_of(&mut rx, "tts_stop").await;
+        assert!(engine.decide_tts(&pid, true).await.is_err(), "paused TTS must refuse chat approval");
+        assert_eq!(engine.tts_pending().await.unwrap().len(), 1);
     }
 }

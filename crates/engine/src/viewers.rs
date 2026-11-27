@@ -101,6 +101,13 @@ impl PollSchedule {
         }
     }
 
+    pub(crate) fn note_rate_limit(&mut self, idx: usize, retry_after: Duration, now: Instant) {
+        let wait = retry_after.max(backoff_delay(PLATFORMS[idx], self.slots[idx].failures.max(1)));
+        let until = now + wait;
+        self.slots[idx].rate_limited_until =
+            Some(self.slots[idx].rate_limited_until.map_or(until, |prev| prev.max(until)));
+    }
+
     pub(crate) fn reset_after_stale_poll(&mut self, idx: usize, now: Instant) {
         let rate_limited_until = self.slots[idx].rate_limited_until.filter(|rl| *rl > now);
         let default_due = now + INITIAL_DELAY;
@@ -190,6 +197,8 @@ impl PollSchedule {
 }
 
 const GOLIVE_STARTUP_RECHECK: Duration = Duration::from_secs(2);
+const GOLIVE_STARTUP_WINDOW: Duration = Duration::from_secs(60);
+const GOLIVE_RETRY_RECHECK: Duration = Duration::from_secs(30);
 
 fn service_platform(kind: ferrocast_golive::Service) -> Option<Platform> {
     match kind {
@@ -236,6 +245,7 @@ fn has_pending_golive_destination(
         .any(|p| platform_index(p).is_some_and(|i| has_conn[i] && !active[i]))
 }
 
+#[cfg(test)]
 pub(crate) fn effective_next_deadline(
     scheduled: Option<Instant>,
     golive_running: bool,
@@ -244,8 +254,24 @@ pub(crate) fn effective_next_deadline(
     destinations: &[crate::golive::DestinationConfig],
     now: Instant,
 ) -> Option<Instant> {
+    effective_next_deadline_since(scheduled, golive_running, has_conn, active, destinations, None, now)
+}
+
+pub(crate) fn effective_next_deadline_since(
+    scheduled: Option<Instant>,
+    golive_running: bool,
+    has_conn: [bool; 3],
+    active: [bool; 3],
+    destinations: &[crate::golive::DestinationConfig],
+    pending_since: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
     if golive_running && (scheduled.is_none() || has_pending_golive_destination(has_conn, active, destinations)) {
-        let recheck = now + GOLIVE_STARTUP_RECHECK;
+        let interval = match pending_since {
+            Some(since) if now.saturating_duration_since(since) >= GOLIVE_STARTUP_WINDOW => GOLIVE_RETRY_RECHECK,
+            _ => GOLIVE_STARTUP_RECHECK,
+        };
+        let recheck = now + interval;
         Some(scheduled.map_or(recheck, |dl| dl.min(recheck)))
     } else {
         scheduled
@@ -285,9 +311,10 @@ pub(crate) fn clear_stopped_golive_viewers(engine: &Engine, prev_active: [bool; 
                 "state",
                 &serde_json::json!({ "viewers": viewers }),
             ));
+            let connectors = engine.state().connectors.clone();
             engine.send_live(crate::frames::LiveFrame::new(
-                "event",
-                &Event::live(p, None, now(), EventKind::StreamOffline),
+                "status",
+                &serde_json::json!({ "connectors": connectors, "viewers": viewers }),
             ));
         }
     }
@@ -305,6 +332,7 @@ pub(crate) async fn run(engine: Engine) {
 pub(crate) async fn run_with_clock<C: Clock>(engine: Engine, clock: Arc<C>, stop: Arc<Notify>) {
     let mut schedule = PollSchedule::default();
     let mut prev_active = [false; 3];
+    let mut golive_pending_since: Option<Instant> = None;
     let mut wake_rx = engine.inner.viewer_wake.subscribe();
     let _ = wake_rx.borrow_and_update();
     loop {
@@ -341,6 +369,9 @@ pub(crate) async fn run_with_clock<C: Clock>(engine: Engine, clock: Arc<C>, stop
                     _ => false,
                 };
                 if post_epochs[idx] != pre_epochs[idx] || !same_conn {
+                    if same_conn && let Err(ConnectorError::RateLimited { retry_after, .. }) = &res {
+                        schedule.note_rate_limit(idx, *retry_after, poll_end);
+                    }
                     schedule.reset_after_stale_poll(idx, poll_end);
                     continue;
                 }
@@ -353,13 +384,22 @@ pub(crate) async fn run_with_clock<C: Clock>(engine: Engine, clock: Arc<C>, stop
             }
         }
 
-        let next = effective_next_deadline(
+        let now_t = clock.now();
+        let destinations = &engine.golive_config().destinations;
+        let golive_running = engine.golive_stream_running();
+        if golive_running && has_pending_golive_destination(has_conn, active, destinations) {
+            golive_pending_since.get_or_insert(now_t);
+        } else {
+            golive_pending_since = None;
+        }
+        let next = effective_next_deadline_since(
             schedule.next_deadline(),
-            engine.golive_stream_running(),
+            golive_running,
             has_conn,
             active,
-            &engine.golive_config().destinations,
-            clock.now(),
+            destinations,
+            golive_pending_since,
+            now_t,
         );
         tokio::select! {
             _ = stop.notified() => return,
@@ -859,6 +899,21 @@ mod tests {
         );
         // Once YouTube is active (Kick is disabled), keep the normal 30s deadline.
         assert_eq!(effective_next_deadline(next, true, [true, true, true], [true, true, false], &dests, t0), next);
+        // After startup grace window expires for a permanently failing destination, back off to 30s.
+        let past_startup = t0 + Duration::from_secs(90);
+        let far_next = Some(past_startup + Duration::from_secs(60));
+        assert_eq!(
+            effective_next_deadline_since(
+                far_next,
+                true,
+                [true, true, true],
+                [true, false, false],
+                &dests,
+                Some(t0),
+                past_startup
+            ),
+            Some(past_startup + GOLIVE_RETRY_RECHECK)
+        );
     }
 
     #[tokio::test]
@@ -882,8 +937,50 @@ mod tests {
         assert_eq!(ov["data"]["viewers"]["twitch"], 100);
 
         let lf: Value = serde_json::from_str(&live_rx.try_recv().unwrap().text).unwrap();
-        let ev: Event = serde_json::from_value(lf["data"].clone()).unwrap();
-        assert_eq!(ev.platform, Platform::Youtube);
-        assert!(matches!(ev.kind, EventKind::StreamOffline));
+        assert_eq!(lf["type"], "status", "expected status frame on viewer clear, got: {lf}");
+        assert!(lf["data"]["viewers"]["youtube"].is_null());
+        assert_eq!(lf["data"]["viewers"]["twitch"], 100);
+    }
+
+    #[tokio::test]
+    async fn stale_poll_on_same_connector_preserves_rate_limit_deadline() {
+        let (eng, _dir) = test_engine().await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let conn = Arc::new(BlockingViewerConnector {
+            platform: Platform::Youtube,
+            result: Err(ConnectorError::RateLimited {
+                platform: Platform::Youtube,
+                retry_after: Duration::from_secs(3600),
+            }),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        eng.register_connector(conn);
+
+        let clock = FakeClock::new();
+        let stop = Arc::new(Notify::new());
+        let handle = tokio::spawn(run_with_clock(eng.clone(), clock.clone(), stop.clone()));
+
+        let (g0, _) = clock.wait_sleep_after(0).await;
+        eng.ingest(Event::live(Platform::Youtube, None, Millis(1000), EventKind::StreamOnline { title: None })).await;
+        let (g1, _) = clock.wait_sleep_after(g0).await;
+        clock.advance(INITIAL_DELAY);
+        tokio::time::timeout(Duration::from_secs(2), entered.notified()).await.unwrap();
+
+        // Stream briefly restarts on the SAME connector while viewer_count() is in flight.
+        eng.ingest(Event::live(Platform::Youtube, None, Millis(2000), EventKind::StreamOffline)).await;
+        eng.ingest(Event::live(Platform::Youtube, None, Millis(2100), EventKind::StreamOnline { title: None })).await;
+        release.notify_one();
+
+        let (_g2, dl2) = clock.wait_sleep_after(g1).await;
+        assert!(
+            dl2.is_some_and(|d| d >= clock.now() + Duration::from_secs(3590)),
+            "same connector RateLimited deadline must survive stale session reset: got {dl2:?} vs now {:?}",
+            clock.now()
+        );
+
+        stop.notify_one();
+        handle.await.unwrap();
     }
 }

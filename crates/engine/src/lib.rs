@@ -241,6 +241,10 @@ struct Inner {
     /// Last `next_stream_at` timestamp broadcast to overlays, so schedule ticks detect pass-through.
     last_pushed_next_stream_at: Mutex<Option<Option<i64>>>,
     chat_tts: chat_tts::ChatTtsSlot,
+    /// Serializes chat TTS policy/pause/mute transitions with admission and approval dispatch.
+    tts_op: tokio::sync::Mutex<()>,
+    /// Moderated `(platform, user_id)` pairs whose pending TTS cleanup failed and awaits retry.
+    blocked_pending_tts_users: Mutex<HashSet<(Platform, String)>>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -408,6 +412,8 @@ impl Engine {
                 youtube_handle_checked: AtomicBool::new(false),
                 last_pushed_next_stream_at: Mutex::new(None),
                 chat_tts: Default::default(),
+                tts_op: tokio::sync::Mutex::new(()),
+                blocked_pending_tts_users: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));

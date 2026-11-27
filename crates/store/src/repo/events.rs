@@ -285,6 +285,14 @@ pub fn pending_tts(store: &Store) -> Result<Vec<PendingTts>> {
     })
 }
 
+/// Reads a pending TTS item without removing it.
+pub fn get_pending_tts(store: &Store, id: &str) -> Result<Option<PendingTts>> {
+    store.read(|c| {
+        Ok(c.query_row(&format!("SELECT {PENDING_COLS} FROM tts_pending WHERE id = ?1"), [id], pending_row)
+            .optional()?)
+    })
+}
+
 /// Removes and returns a pending item (approve or reject both take it off the list).
 pub fn take_pending_tts(store: &Store, id: &str) -> Result<Option<PendingTts>> {
     store.write(|tx| {

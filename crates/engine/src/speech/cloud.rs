@@ -360,13 +360,22 @@ impl Engine {
     }
 
     /// Synthesizes `text` with the local computer voice only (never Pro Cloud TTS) and saves
-    /// it to the media library. Used by free Chat TTS so busy chat never spends cloud quota.
-    pub(crate) async fn speak_local_to_media(&self, text: &str) -> Option<String> {
+    /// it to the media library. Returns `(media_id, estimated_duration_ms)`.
+    pub(crate) async fn speak_local_to_media(&self, text: &str) -> (Option<String>, u64) {
         let system_voice = self.state().tts.voice.clone();
-        self.speak_local(text, system_voice, None).await.map(|s| s.media_id)
+        self.speak_local_measured(text, system_voice, None).await.map_or((None, 0), |(s, ms)| (Some(s.media_id), ms))
     }
 
     async fn speak_local(&self, text: &str, system_voice: Option<String>, notice: Option<String>) -> Option<Spoken> {
+        self.speak_local_measured(text, system_voice, notice).await.map(|(s, _)| s)
+    }
+
+    async fn speak_local_measured(
+        &self,
+        text: &str,
+        system_voice: Option<String>,
+        notice: Option<String>,
+    ) -> Option<(Spoken, u64)> {
         let work = self.store().dir().join("tmp");
         let out = work.join(format!("tts-{}.wav", ferrocast_store::new_id()));
         if let Err(e) = super::synthesize(text, system_voice.as_deref(), &work, &out).await {
@@ -375,15 +384,19 @@ impl Engine {
         }
         let bytes = tokio::fs::read(&out).await.ok()?;
         let _ = tokio::fs::remove_file(&out).await;
+        let duration_ms = wav_duration_ms(&bytes);
         let saved =
             self.db(move |s| Ok(repo::media::save_speech(s, "speech.wav", &bytes).ok())).await.ok().flatten()?;
-        Some(Spoken {
-            url: format!("/api/v1/media/{}", saved.id),
-            media_id: saved.id,
-            voice: system_voice,
-            cloud: false,
-            notice,
-        })
+        Some((
+            Spoken {
+                url: format!("/api/v1/media/{}", saved.id),
+                media_id: saved.id,
+                voice: system_voice,
+                cloud: false,
+                notice,
+            },
+            duration_ms,
+        ))
     }
 
     /// `POST /api/v1/tts/preview {voice?}`: a short sample line in `voice` (default: what
@@ -448,4 +461,36 @@ impl Engine {
         }
         Ok(spoken)
     }
+}
+
+pub(crate) fn wav_duration_ms(bytes: &[u8]) -> u64 {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return 0;
+    }
+    let mut pos = 12usize;
+    let mut byte_rate = 0u32;
+    let mut data_bytes = 0u32;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]);
+        let payload_start = pos + 8;
+        let payload_end = payload_start.saturating_add(size as usize).min(bytes.len());
+        if id == b"fmt " && payload_end.saturating_sub(payload_start) >= 12 {
+            byte_rate = u32::from_le_bytes([
+                bytes[payload_start + 8],
+                bytes[payload_start + 9],
+                bytes[payload_start + 10],
+                bytes[payload_start + 11],
+            ]);
+        } else if id == b"data" {
+            data_bytes = size;
+            break;
+        }
+        let padded = (size as usize).saturating_add((size as usize) & 1);
+        pos = payload_start.saturating_add(padded);
+    }
+    if byte_rate == 0 || data_bytes == 0 {
+        return 0;
+    }
+    u64::from(data_bytes).saturating_mul(1_000).saturating_div(u64::from(byte_rate)).min(60_000)
 }
