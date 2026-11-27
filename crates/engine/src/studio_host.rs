@@ -2637,12 +2637,13 @@ impl Engine {
     /// The desktop app registers itself once its window exists.
     pub fn set_studio_host(&self, host: Arc<dyn StudioHost>) {
         *self.inner.studio_host.host.write().unwrap_or_else(|p| p.into_inner()) = Some(host);
-        if self.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).is_some()
-            && let Ok(rt) = tokio::runtime::Handle::try_current()
-        {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
             let e = self.clone();
             rt.spawn(async move {
-                e.flush_pending_startup_restore_to_host().await;
+                let _ = e.refresh_pc_budget().await;
+                if e.studio().pending_startup_restore.lock().unwrap_or_else(|p| p.into_inner()).is_some() {
+                    e.flush_pending_startup_restore_to_host().await;
+                }
             });
         }
     }
@@ -3342,17 +3343,94 @@ impl Engine {
     }
 
     pub async fn studio_encode_budget(&self, draft: Option<Value>) -> Result<Value, EngineError> {
-        // Settings that couldn't be saved get the field's error, not a budget (CodeRabbit).
-        if let Some(d) = &draft {
-            let s: StudioSettings =
-                serde_json::from_value(d.clone()).map_err(|e| EngineError::Invalid(format!("settings: {e}")))?;
-            s.check()?;
-        }
+        let draft_settings: Option<StudioSettings> = match &draft {
+            Some(d) => {
+                let s: StudioSettings =
+                    serde_json::from_value(d.clone()).map_err(|e| EngineError::Invalid(format!("settings: {e}")))?;
+                s.check()?;
+                Some(s)
+            }
+            None => None,
+        };
         let config = self.golive_config();
         let on = || config.destinations.iter().filter(|d| d.enabled);
         let enhanced = on().any(|d| d.enhanced);
         let light = on().any(crate::golive::DestinationConfig::wants_light);
-        self.studio_host()?.encode_budget(draft, enhanced, light).await.map_err(failed)
+        let host = self.studio_host()?;
+        let host_info = host.host_budget_info().await;
+        if let Some(info) = &host_info {
+            self.note_host_budget_info(info.clone());
+        }
+        let mut out = host.encode_budget(draft, enhanced, light).await.map_err(failed)?;
+        let shared_by_host = out.get("shared").and_then(Value::as_bool);
+        let replay_by_host = out.get("replay").and_then(Value::as_bool);
+        let bench = self.studio().studio_bench.read().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(mut info) = host_info {
+            if let Some(s) = &draft_settings {
+                let enc_id = s.video_encoder.clone().unwrap_or_else(|| {
+                    if s.encoder == "software" { "obs_x264".into() } else { info.encoder_id.clone() }
+                });
+                info.encoder_id = enc_id;
+                let draft_is_sw = crate::golive_plan::encoder_is_software(&info.encoder_id);
+                let mpx_canvas = f64::from(s.width) * f64::from(s.height) * f64::from(s.fps) / 1e6;
+                let rec_sw = s.record_quality == "lossless" || draft_is_sw;
+                let shared = shared_by_host.unwrap_or(false);
+                let mut extra_mpx = 0.0;
+                let mut extra_sessions = 0u32;
+                let counts_rec = !draft_is_sw || s.encoder == "software" || rec_sw;
+                if counts_rec && s.record_when_streaming && !shared && !draft_is_sw && !rec_sw {
+                    extra_mpx += mpx_canvas;
+                    extra_sessions += 1;
+                }
+                if replay_by_host.unwrap_or(s.replay_when_streaming) && !rec_sw {
+                    extra_mpx += mpx_canvas;
+                    extra_sessions += 1;
+                }
+                info.record_shares_main = s.record_when_streaming && shared && !draft_is_sw;
+                info.record_extra_mpx_s = extra_mpx;
+                info.record_extra_sessions = extra_sessions;
+            }
+            let budget = crate::golive_plan::PcBudget::from_host_info(&info, bench.as_ref(), config.auto_quality);
+            let mut input = self.golive_planner_input(budget);
+            if let Some(s) = &draft_settings {
+                self.override_planner_input_with_settings(&mut input, s, info.vertical_size);
+            }
+            let plan = crate::golive_plan::plan_encodes(&input);
+            let vert_mpx: f64 = plan
+                .groups
+                .iter()
+                .filter(|g| g.key.canvas == ferrocast_golive::probe::Canvas::Vertical)
+                .map(|g| f64::from(g.key.width) * f64::from(g.key.height) * f64::from(g.key.fps) / 1e6)
+                .sum();
+            if let Some(obj) = out.as_object_mut() {
+                let status_str = match plan.budget.status {
+                    crate::golive_plan::BudgetStatus::Ok => "ok",
+                    crate::golive_plan::BudgetStatus::Limit => "limit",
+                    crate::golive_plan::BudgetStatus::Over => "over",
+                    crate::golive_plan::BudgetStatus::Unknown => "unknown",
+                };
+                if plan.budget.source != crate::golive_plan::BudgetSource::Unknown {
+                    obj.insert("level".into(), Value::String(status_str.into()));
+                    obj.insert(
+                        "budget_mpx".into(),
+                        plan.budget.limit_mpx_s.map_or(Value::Null, |l| Value::from(l.round())),
+                    );
+                }
+                obj.insert("vertical_mpx".into(), Value::from(vert_mpx.round()));
+                obj.insert("used_mpx_s".into(), Value::from(plan.budget.used_mpx_s));
+                obj.insert("limit_mpx_s".into(), plan.budget.limit_mpx_s.map_or(Value::Null, Value::from));
+                obj.insert("used_sessions".into(), Value::from(plan.budget.used_sessions));
+                obj.insert("max_sessions".into(), plan.budget.max_sessions.map_or(Value::Null, Value::from));
+                obj.insert("budget_source".into(), serde_json::to_value(plan.budget.source).unwrap_or(Value::Null));
+                obj.insert("budget_status".into(), Value::String(status_str.into()));
+                obj.insert(
+                    "budget_note".into(),
+                    plan.budget.note.as_ref().map_or(Value::Null, |n| Value::String(n.clone())),
+                );
+                obj.insert("group_count".into(), Value::from(plan.groups.len()));
+            }
+        }
+        Ok(out)
     }
 
     pub async fn studio_screen_access(&self) -> Result<Value, EngineError> {

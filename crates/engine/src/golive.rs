@@ -588,6 +588,8 @@ pub(crate) struct GoLive {
     pub(crate) enhanced: Mutex<Option<ferrocast_golive::twitch_eb::Plan>>,
     /// Cached Studio encode settings so `view_with` can build the C-2 cap badge synchronously.
     studio_video: Mutex<Option<StudioCapConfig>>,
+    /// Cached hardware/driver/recording budget telemetry reported by [`StudioHost::host_budget_info`].
+    cached_host_budget: RwLock<Option<crate::studio_host::HostBudgetInfo>>,
     /// Whether Ferrocast Studio itself started the live main stream (vs external OBS ingest).
     studio_live: std::sync::atomic::AtomicBool,
     /// The Studio couldn't put the platform's cap on the stream on air (its encoder is shared with
@@ -698,6 +700,28 @@ impl StudioCapConfig {
             audio_kbps: self.audio_kbps,
         }
     }
+
+    fn as_vertical_encode(&self, width: u32, height: u32) -> MainEncode {
+        let vw = (width & !1).max(2);
+        let vh = (height & !1).max(2);
+        MainEncode {
+            canvas: Canvas::Vertical,
+            canvas_width: vw,
+            canvas_height: vh,
+            canvas_fps: self.fps,
+            width: vw,
+            height: vh,
+            fps: self.fps,
+            fps_ntsc: self.fps_ntsc,
+            kbps: self.video_kbps,
+            codec: self.codec,
+            keyframe_s: if self.keyframe_s == 0 { 2 } else { self.keyframe_s },
+            vbr: self.vbr,
+            strict_cbr: false,
+            no_bframes: !self.bframes,
+            audio_kbps: self.audio_kbps,
+        }
+    }
 }
 
 impl From<&crate::studio_host::StudioSettings> for StudioCapConfig {
@@ -788,6 +812,7 @@ impl Default for GoLive {
             tested: Mutex::new(HashMap::new()),
             enhanced: Mutex::new(None),
             studio_video: Mutex::new(None),
+            cached_host_budget: RwLock::new(None),
             studio_live: std::sync::atomic::AtomicBool::new(false),
             cap_failed: std::sync::atomic::AtomicBool::new(false),
             applied_cap: Mutex::new(None),
@@ -1195,6 +1220,11 @@ impl Engine {
         let g = self.golive();
         let cfg = self.golive_config();
         let studio = (*lock(&g.studio_video)).unwrap_or_default();
+        self.planner_input_for(&cfg, &studio, budget)
+    }
+
+    fn planner_input_for(&self, cfg: &GoLiveConfig, studio: &StudioCapConfig, budget: PcBudget) -> PlannerInput {
+        let g = self.golive();
         let main = studio.as_main_encode();
         let blocked = lock(&g.blocked).clone();
         let failing = lock(&g.backup).failing.clone();
@@ -1202,7 +1232,7 @@ impl Engine {
         let enhanced_plan = lock(&g.enhanced).clone();
 
         let whip_simulcast = cfg.destinations.iter().any(|d| {
-            destination_sends(&cfg, &failing, d) && self.can_start_destination(d, &blocked) && self.simulcast(d)
+            destination_sends(cfg, &failing, d) && self.can_start_destination(d, &blocked) && self.simulcast(d)
         });
         let destinations = cfg
             .destinations
@@ -1214,7 +1244,7 @@ impl Engine {
                     Some("whip") => Some(ferrocast_golive::direct::Kind::Whip),
                     _ => None,
                 });
-                let standby = backs_up(&cfg, &d.id).is_some_and(|p| p.enabled && !failing.contains(&p.id));
+                let standby = backs_up(cfg, &d.id).is_some_and(|p| p.enabled && !failing.contains(&p.id));
                 PlannerDestination {
                     id: d.id.clone(),
                     name: dest_name(d),
@@ -1234,16 +1264,71 @@ impl Engine {
             })
             .collect();
         let twitch_eb = enhanced_plan.as_ref().and_then(|p| TwitchEbSpec::from_plan(p, &main));
+        let host_info = g.cached_host_budget.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let vertical_wanted = host_info.as_ref().is_some_and(|i| i.vertical_on)
+            || (cfg.vertical_source == VerticalSource::Canvas
+                && cfg.destinations.iter().any(|d| d.enabled && d.canvas == Canvas::Vertical));
+        let vertical = vertical_wanted.then(|| {
+            let (vw, vh) = host_info.as_ref().and_then(|i| i.vertical_size).unwrap_or((1080, 1920));
+            studio.as_vertical_encode(vw, vh)
+        });
         PlannerInput {
             main,
-            vertical: None,
-            vertical_cut: cfg_cut_source(&cfg),
+            vertical,
+            vertical_cut: cfg_cut_source(cfg),
             destinations,
             ignore_service_limits: cfg.advanced.ignore_service_limits,
             twitch_eb,
             whip_simulcast,
             budget,
         }
+    }
+
+    pub(crate) fn override_planner_input_with_settings(
+        &self,
+        input: &mut PlannerInput,
+        s: &crate::studio_host::StudioSettings,
+        vertical_size: Option<(u32, u32)>,
+    ) {
+        let cap = StudioCapConfig::from(s);
+        input.main = cap.as_main_encode();
+        if input.vertical.is_some() {
+            let (vw, vh) = vertical_size.unwrap_or((1080, 1920));
+            input.vertical = Some(cap.as_vertical_encode(vw, vh));
+        }
+        for d in &mut input.destinations {
+            if d.kind == Service::Twitch {
+                d.vod_track = cap.vod_track;
+            }
+        }
+    }
+
+    pub(crate) fn cached_host_budget_info(&self) -> Option<crate::studio_host::HostBudgetInfo> {
+        self.golive().cached_host_budget.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn note_host_budget_info(&self, info: crate::studio_host::HostBudgetInfo) {
+        *self.golive().cached_host_budget.write().unwrap_or_else(|p| p.into_inner()) = Some(info);
+    }
+
+    /// Computes effective [`PcBudget`] from cached host telemetry and persisted `studio_bench`.
+    pub fn cached_pc_budget(&self) -> PcBudget {
+        let Some(info) = self.cached_host_budget_info() else {
+            return PcBudget::unknown();
+        };
+        let bench = self.studio().studio_bench.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let auto_q = self.golive_config().auto_quality;
+        PcBudget::from_host_info(&info, bench.as_ref(), auto_q)
+    }
+
+    /// Refreshes cached host hardware telemetry from the attached [`StudioHost`] and returns [`PcBudget`].
+    pub async fn refresh_pc_budget(&self) -> PcBudget {
+        if let Ok(host) = self.studio_host()
+            && let Some(info) = host.host_budget_info().await
+        {
+            self.note_host_budget_info(info);
+        }
+        self.cached_pc_budget()
     }
 
     /// Runs the pure multi-encode planner against `budget`.
@@ -1680,21 +1765,17 @@ impl Engine {
                     backup_for: backs_up(&cfg, &d.id).filter(|p| failing.contains(&p.id)).map(dest_name),
                     standby_for: backs_up(&cfg, &d.id).filter(|p| p.enabled && !failing.contains(&p.id)).map(dest_name),
                     key_note: key_notes.get(&d.id).cloned(),
-                    quality_note: plan
-                        .destinations
-                        .get(&d.id)
-                        .and_then(|p| p.note.clone())
-                        .or_else(|| {
-                            (!cfg.advanced.ignore_service_limits)
-                                .then(|| probe::ceiling(d.kind, d.enhanced))
-                                .flatten()
-                                .and_then(|lim| match &d.quality {
-                                    DestinationQuality::Custom(q) => lim.recommendation_note(q.width, q.height, q.fps),
-                                    DestinationQuality::SameAsMain => studio_cfg.and_then(|sv| {
-                                        lim.recommendation_note(sv.width, sv.height, sv.fps)
-                                    }),
-                                })
-                        }),
+                    quality_note: plan.destinations.get(&d.id).and_then(|p| p.note.clone()).or_else(|| {
+                        (!cfg.advanced.ignore_service_limits)
+                            .then(|| probe::ceiling(d.kind, d.enhanced))
+                            .flatten()
+                            .and_then(|lim| match &d.quality {
+                                DestinationQuality::Custom(q) => lim.recommendation_note(q.width, q.height, q.fps),
+                                DestinationQuality::SameAsMain => {
+                                    studio_cfg.and_then(|sv| lim.recommendation_note(sv.width, sv.height, sv.fps))
+                                }
+                            })
+                    }),
                 }
             })
             .collect();

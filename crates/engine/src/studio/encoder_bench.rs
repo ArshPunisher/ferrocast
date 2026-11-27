@@ -1441,6 +1441,45 @@ struct WorkerDone {
     picked: BenchRecommendation,
 }
 
+/// Derives a persisted encode throughput ceiling (`PersistedStudioBench`) from passing candidates.
+pub(crate) fn persisted_bench_from_run(
+    candidates: &[BenchCandidate],
+    picked: &BenchRecommendation,
+    host_sig: &str,
+    measured_at: i64,
+) -> crate::golive_plan::PersistedStudioBench {
+    let want_sw = crate::golive_plan::encoder_is_software(&picked.studio_encoder_id);
+    let estimate_mpx = |c: &BenchCandidate| -> f64 {
+        let mpx = f64::from(c.width) * f64::from(c.height) * f64::from(c.fps) / 1e6;
+        let budget_ms = 1000.0 / f64::from(c.fps.max(1));
+        let avg_ms = c.encode_ms_avg.max(0.25);
+        ((mpx * (budget_ms / avg_ms) * 0.80).max(mpx)).min(2_500.0)
+    };
+    let mut best_exact: Option<f64> = None;
+    let mut best_class: Option<f64> = None;
+    for c in candidates {
+        if !c.passed || c.encode_ms_avg <= 0.0 {
+            continue;
+        }
+        let est = estimate_mpx(c);
+        if c.studio_encoder_id == picked.studio_encoder_id {
+            best_exact = Some(best_exact.map_or(est, |cur| cur.max(est)));
+        } else if crate::golive_plan::encoder_is_software(&c.studio_encoder_id) == want_sw {
+            best_class = Some(best_class.map_or(est, |cur| cur.max(est)));
+        }
+    }
+    let picked_mpx = f64::from(picked.width) * f64::from(picked.height) * f64::from(picked.fps) / 1e6;
+    let max_mpx_s = best_exact.or(best_class).unwrap_or(picked_mpx).max(picked_mpx);
+    crate::golive_plan::PersistedStudioBench {
+        encoder_id: picked.studio_encoder_id.clone(),
+        is_software: want_sw,
+        max_mpx_s: (max_mpx_s * 10.0).round() / 10.0,
+        max_sessions_ok: None,
+        measured_at,
+        host_sig: if host_sig.is_empty() { "default".into() } else { host_sig.to_string() },
+    }
+}
+
 impl Engine {
     /// Current state of the auto-config encoder benchmark and rollback watchdog.
     pub fn auto_config_status(&self) -> AutoConfigView {
@@ -1600,6 +1639,22 @@ impl Engine {
                 self.finish_bench_failed(&job_id, mode, error, candidates);
             }
             WorkerOutcome::Done(done) => {
+                let host_sig = if let Ok(h) = self.studio_host() {
+                    h.host_budget_info()
+                        .await
+                        .map(|i| {
+                            self.note_host_budget_info(i.clone());
+                            i.host_sig
+                        })
+                        .unwrap_or_default()
+                } else {
+                    self.golive_cached_host_sig().unwrap_or_default()
+                };
+                let bench = persisted_bench_from_run(&done.candidates, &done.picked, &host_sig, now().0);
+                *self.studio().studio_bench.write().unwrap_or_else(|p| p.into_inner()) = Some(bench.clone());
+                if let Err(e) = crate::studio::save_setting(&self, crate::golive_plan::STUDIO_BENCH_KEY, &bench).await {
+                    tracing::warn!(error = %e, "couldn't persist studio_bench measurement");
+                }
                 let mut slot = self.studio().auto_config.lock().unwrap_or_else(|p| p.into_inner());
                 let elapsed_ms = if let MachineState::Running(r) = &slot.state
                     && r.job_id == job_id
@@ -1932,6 +1987,10 @@ impl Engine {
         };
 
         WorkerOutcome::Done(Box::new(WorkerDone { mode, candidates, upload_check, upload_error, picked }))
+    }
+
+    fn golive_cached_host_sig(&self) -> Option<String> {
+        self.cached_host_budget_info().map(|i| i.host_sig)
     }
 
     fn finish_bench_cancelled(&self, job_id: &str) {
@@ -4016,5 +4075,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok_view.applied.unwrap().label, "VideoToolbox 1080p60");
+    }
+
+    #[tokio::test]
+    async fn studio_bench_persists_reloads_and_invalidates_on_host_sig_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::start(dir.path()).await.unwrap();
+        let cand = BenchCandidate {
+            encoder_backend: "nvenc".into(),
+            studio_encoder_id: "ffmpeg_nvenc".into(),
+            label: "NVENC 1080p60".into(),
+            family: EncoderFamily::Nvenc,
+            hardware: true,
+            preset: None,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 8_000,
+            frames_tested: 120,
+            encode_ms_avg: 3.2,
+            encode_ms_p95: 4.1,
+            encode_ms_max: 5.0,
+            budget_ms: 16.67,
+            fps_achieved: 60.0,
+            headroom_pct: 80.8,
+            skipped_frames: 0,
+            lagged_frames: 0,
+            cpu_pct: None,
+            gpu_pct: None,
+            elapsed_ms: 200,
+            passed: true,
+            reason: "ok".into(),
+        };
+        let picked = BenchRecommendation {
+            encoder: "hardware".into(),
+            video_encoder: Some("ffmpeg_nvenc".into()),
+            studio_encoder_id: "ffmpeg_nvenc".into(),
+            encoder_settings: serde_json::Map::new(),
+            label: "NVENC".into(),
+            preset: None,
+            scale: None,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            video_kbps: 8_000,
+            headroom_pct: 80.8,
+            limited_by: ferrocast_golive::bench::LimitedBy::Upload,
+            why: "test".into(),
+        };
+        let bench = super::persisted_bench_from_run(&[cand], &picked, "windows|nv=551.23", 1_700_000_000_000);
+        assert!(bench.max_mpx_s > 400.0, "NVENC 3.2ms@1080p60 headroom should estimate >400 Mpx/s: {bench:?}");
+        crate::studio::save_setting(&engine, crate::golive_plan::STUDIO_BENCH_KEY, &bench).await.unwrap();
+        drop(engine);
+
+        let reloaded = Engine::start(dir.path()).await.unwrap();
+        let saved = reloaded.studio().studio_bench.read().unwrap().clone().expect("studio_bench loaded");
+        assert_eq!(saved, bench);
+
+        let info_same = crate::studio_host::HostBudgetInfo {
+            os: "windows".into(),
+            encoder_id: "ffmpeg_nvenc".into(),
+            cpu_cores: 8,
+            nvidia_driver_major: Some(551),
+            nvidia_driver_minor: Some(23),
+            host_sig: "windows|nv=551.23".into(),
+            ..Default::default()
+        };
+        let b_same = crate::golive_plan::PcBudget::from_host_info(&info_same, Some(&saved), true);
+        assert_eq!(b_same.source, crate::golive_plan::BudgetSource::Bench);
+
+        let mut info_upgraded = info_same;
+        info_upgraded.host_sig = "windows|nv=560.70".into();
+        let b_stale = crate::golive_plan::PcBudget::from_host_info(&info_upgraded, Some(&saved), true);
+        assert_eq!(b_stale.source, crate::golive_plan::BudgetSource::NvencDefault);
     }
 }

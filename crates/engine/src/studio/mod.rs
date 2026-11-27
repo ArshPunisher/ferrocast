@@ -147,6 +147,8 @@ pub(crate) struct Studio {
     pub clips: crate::clips::ClipsState,
     /// Encoder stress benchmark and setting rollback state machine.
     pub auto_config: Mutex<encoder_bench::AutoConfigSlot>,
+    /// Persisted hardware/software encoder throughput ceiling (`settings["studio_bench"]`).
+    pub studio_bench: RwLock<Option<crate::golive_plan::PersistedStudioBench>>,
     /// Pre-apply encoder settings queued on startup after an unclean exit, applied when `StudioHost` attaches.
     pub pending_startup_restore: Mutex<Option<encoder_bench::PendingApply>>,
 }
@@ -192,6 +194,7 @@ impl Default for Studio {
             clipboard: Mutex::default(),
             clips: crate::clips::ClipsState::default(),
             auto_config: Mutex::default(),
+            studio_bench: RwLock::default(),
             pending_startup_restore: Mutex::default(),
         }
     }
@@ -219,13 +222,22 @@ impl Engine {
                     get_or_default::<ScenesConfig>(s, SCENES_KEY),
                     get_or_default::<MomentsConfig>(s, MOMENTS_KEY),
                     get_or_default::<ShowConfig>(s, SHOW_KEY),
+                    repo::settings::get::<crate::golive_plan::PersistedStudioBench>(
+                        s,
+                        crate::golive_plan::STUDIO_BENCH_KEY,
+                    ),
                     repo::studio::counter_values(s),
                 ))
             })
             .await;
-        let Ok((defs, modules, scenes, moments, show, values)) = loaded else { return };
+        let Ok((defs, modules, scenes, moments, show, bench, values)) = loaded else { return };
         let st = self.studio();
         let ok = |what: &str, e: &ferrocast_store::StoreError| tracing::error!(error = %e, what, "a Studio setting couldn't be read");
+        if let Ok(b) = bench {
+            *st.studio_bench.write().unwrap_or_else(|p| p.into_inner()) = b;
+        } else if let Err(e) = bench {
+            ok("studio_bench", &e);
+        }
         match defs {
             Ok(v) => *st.counter_defs.write().unwrap_or_else(|p| p.into_inner()) = v,
             Err(e) => ok("counters", &e),

@@ -42,6 +42,74 @@ pub enum BudgetSource {
     Unknown,
 }
 
+/// Settings DB key under which measured encoder throughput is persisted.
+pub const STUDIO_BENCH_KEY: &str = "studio_bench";
+
+/// Persisted benchmark capacity stored under `settings["studio_bench"]`, invalidated when
+/// hardware/driver signature (`host_sig`) or encoder family (`hw` vs `x264`) changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersistedStudioBench {
+    pub encoder_id: String,
+    #[serde(default)]
+    pub is_software: bool,
+    pub max_mpx_s: f64,
+    #[serde(default)]
+    pub max_sessions_ok: Option<u32>,
+    pub measured_at: i64,
+    pub host_sig: String,
+}
+
+impl PersistedStudioBench {
+    /// Returns true if this benchmark measurement applies to `host_sig` and the active encoder class.
+    pub fn is_valid_for(&self, host_sig: &str, stream_is_software: bool) -> bool {
+        !self.host_sig.is_empty()
+            && self.host_sig == host_sig
+            && self.is_software == stream_is_software
+            && self.max_mpx_s.is_finite()
+            && self.max_mpx_s > 0.0
+    }
+}
+
+/// Returns true if `encoder_id` runs software CPU encoding (`libx264` / `obs_x264`) rather than GPU hardware.
+pub fn encoder_is_software(encoder_id: &str) -> bool {
+    let low = encoder_id.to_ascii_lowercase();
+    low.contains("x264") || low.contains("software") || low.contains("svt")
+}
+
+/// Conservative concurrent NVENC session cap from the NVIDIA driver branch (`551.23+ -> 8`, `531+ -> 5`, else `3`).
+pub fn nvenc_session_cap(major: Option<u32>, minor: Option<u32>) -> u32 {
+    match major {
+        Some(maj) if maj > 551 || (maj == 551 && minor.unwrap_or(0) >= 23) => 8,
+        Some(maj) if maj >= 531 => 5,
+        _ => 3,
+    }
+}
+
+fn cpu_default_mpx_s(cpu_cores: u32) -> f64 {
+    if cpu_cores < 8 {
+        125.0
+    } else if cpu_cores < 12 {
+        180.0
+    } else {
+        250.0
+    }
+}
+
+fn cpu_default_sessions(cpu_cores: u32) -> u32 {
+    if cpu_cores < 8 {
+        1
+    } else if cpu_cores < 16 {
+        2
+    } else {
+        3
+    }
+}
+
+fn encoder_is_nvenc(info: &crate::studio_host::HostBudgetInfo) -> bool {
+    let enc = info.encoder_id.to_ascii_lowercase();
+    enc.contains("nvenc") || info.hw_backend.as_deref() == Some("nvenc") || info.nvidia_driver_major.is_some()
+}
+
 /// Overall encode budget status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,6 +178,89 @@ impl PcBudget {
 
     pub fn with_limits(source: BudgetSource, limit_mpx_s: Option<f64>, max_sessions: Option<u32>) -> Self {
         Self { source, limit_mpx_s, max_sessions, ..Self::unknown() }
+    }
+
+    /// Computes cross-OS encode budget from host hardware telemetry and optional persisted `studio_bench`.
+    /// Reserves one spare hardware session on `ffenc` backends when `auto_quality` is active because
+    /// mid-stream bitrate handover spawns a second FFmpeg encoder until the next IDR frame.
+    pub fn from_host_info(
+        info: &crate::studio_host::HostBudgetInfo,
+        bench: Option<&PersistedStudioBench>,
+        auto_quality: bool,
+    ) -> Self {
+        let stream_is_software = encoder_is_software(&info.encoder_id);
+        let valid_bench = bench.filter(|b| b.is_valid_for(&info.host_sig, stream_is_software));
+
+        let base = if stream_is_software {
+            let cores = info.cpu_cores.max(1);
+            let default_sessions = cpu_default_sessions(cores);
+            let sessions = valid_bench
+                .and_then(|b| b.max_sessions_ok)
+                .map_or(default_sessions, |m| m.min(default_sessions).max(1));
+            Self {
+                source: if valid_bench.is_some() { BudgetSource::Bench } else { BudgetSource::CpuDefault },
+                limit_mpx_s: Some(valid_bench.map_or_else(|| cpu_default_mpx_s(cores), |b| b.max_mpx_s)),
+                max_sessions: Some(sessions),
+                reserve_spare_session: false,
+                stream_is_software: true,
+                note: valid_bench.is_none().then(|| {
+                    "Estimated CPU encode budget (run Auto-Config benchmark to measure exact x264 headroom).".into()
+                }),
+                ..Self::unknown()
+            }
+        } else if info.os == "macos" {
+            if let Some(engines) = info.engines.filter(|&e| e > 0) {
+                Self::apple_silicon(engines)
+            } else {
+                Self {
+                    source: if valid_bench.is_some() { BudgetSource::Bench } else { BudgetSource::HwDefault },
+                    limit_mpx_s: Some(valid_bench.map_or(125.0, |b| b.max_mpx_s)),
+                    max_sessions: Some(valid_bench.and_then(|b| b.max_sessions_ok).map_or(2, |m| m.min(2).max(1))),
+                    reserve_spare_session: false,
+                    stream_is_software: false,
+                    note: valid_bench.is_none().then(|| {
+                        "Estimated Intel Mac hardware budget (run Auto-Config benchmark to measure capacity).".into()
+                    }),
+                    ..Self::unknown()
+                }
+            }
+        } else if matches!(info.os.as_str(), "windows" | "linux") {
+            let is_nvenc = encoder_is_nvenc(info);
+            let max_sess =
+                if is_nvenc { nvenc_session_cap(info.nvidia_driver_major, info.nvidia_driver_minor) } else { 3 };
+            let bench_or_default = valid_bench.map_or(if is_nvenc { 250.0 } else { 125.0 }, |b| b.max_mpx_s);
+            let sessions = valid_bench.and_then(|b| b.max_sessions_ok).map_or(max_sess, |m| m.min(max_sess).max(1));
+            Self {
+                source: if valid_bench.is_some() {
+                    BudgetSource::Bench
+                } else if is_nvenc {
+                    BudgetSource::NvencDefault
+                } else {
+                    BudgetSource::HwDefault
+                },
+                limit_mpx_s: Some(bench_or_default),
+                max_sessions: Some(sessions),
+                reserve_spare_session: auto_quality,
+                stream_is_software: false,
+                note: valid_bench.is_none().then(|| {
+                    if is_nvenc {
+                        "Estimated NVENC budget; run Auto-Config benchmark for exact card capacity.".into()
+                    } else {
+                        "Estimated hardware encoder budget; run Auto-Config benchmark for exact capacity.".into()
+                    }
+                }),
+                ..Self::unknown()
+            }
+        } else {
+            Self::unknown()
+        };
+
+        Self {
+            extra_mpx_s: info.record_extra_mpx_s,
+            extra_sessions: info.record_extra_sessions,
+            record_shares_main: info.record_shares_main,
+            ..base
+        }
     }
 
     /// Maximum concurrent stream/recording encoder sessions after reserving a handover spare if requested.
@@ -443,7 +594,10 @@ fn resolve_normal_fit(
     ignore_service_limits: bool,
 ) -> (FittedEncode, Option<PlatformLimit>) {
     if d.canvas == Canvas::Vertical && vertical_cut {
-        return (FittedEncode { key: base.as_key(), separate_encode: false, auto_fitted: false, capped: None, note: None }, None);
+        return (
+            FittedEncode { key: base.as_key(), separate_encode: false, auto_fitted: false, capped: None, note: None },
+            None,
+        );
     }
     let limit = destination_limit(d);
     let ignore = effective_ignore_limits(d, ignore_service_limits);
@@ -466,9 +620,13 @@ fn resolve_normal_fit(
                     note: None,
                 })
             }
-            DestinationQuality::SameAsMain => {
-                FittedEncode { key: base.as_key(), separate_encode: false, auto_fitted: false, capped: None, note: None }
-            }
+            DestinationQuality::SameAsMain => FittedEncode {
+                key: base.as_key(),
+                separate_encode: false,
+                auto_fitted: false,
+                capped: None,
+                note: None,
+            },
         },
     };
     (fitted, limit)
@@ -510,7 +668,8 @@ fn mpx_s(w: u32, h: u32, fps: u32) -> f64 {
 fn evaluate_budget(groups: &[WorkingGroup], main: &MainEncode, budget: &PcBudget) -> BudgetCheck {
     let mut used_mpx_s = budget.extra_mpx_s;
     let mut used_sessions = budget.extra_sessions;
-    let stream_counted = !(budget.stream_is_software && budget.source != BudgetSource::CpuDefault);
+    let stream_counted =
+        !(budget.stream_is_software && !matches!(budget.source, BudgetSource::CpuDefault | BudgetSource::Bench));
     if stream_counted {
         for g in groups {
             used_mpx_s += mpx_s(g.key.width, g.key.height, g.key.fps);
@@ -675,13 +834,22 @@ fn coalesce_pass(
                     continue;
                 }
                 let res_changed = (merged.width, merged.height, merged.fps)
-                    != (donor.key.width.max(target.key.width), donor.key.height.max(target.key.height), donor.key.fps.max(target.key.fps));
+                    != (
+                        donor.key.width.max(target.key.width),
+                        donor.key.height.max(target.key.height),
+                        donor.key.fps.max(target.key.fps),
+                    );
                 let kbps_loss = donor.key.kbps.max(target.key.kbps).saturating_sub(merged.kbps);
                 let replace = match &best {
                     None => true,
                     Some((best_res_changed, best_loss, best_di, best_ti, _)) => {
                         (res_changed, kbps_loss, donor.id.as_str(), target.id.as_str())
-                            < (*best_res_changed, *best_loss, groups[*best_di].id.as_str(), groups[*best_ti].id.as_str())
+                            < (
+                                *best_res_changed,
+                                *best_loss,
+                                groups[*best_di].id.as_str(),
+                                groups[*best_ti].id.as_str(),
+                            )
                     }
                 };
                 if replace {
@@ -1586,5 +1754,164 @@ mod tests {
         });
         assert!(!p_skip_light.groups.iter().any(|g| g.id == GROUP_LIGHT), "budget full must skip light");
         assert_eq!(p_skip_light.destinations["kick"].group_id, GROUP_MAIN);
+    }
+
+    fn base_host(os: &str, encoder_id: &str) -> crate::studio_host::HostBudgetInfo {
+        crate::studio_host::HostBudgetInfo {
+            os: os.to_string(),
+            encoder_id: encoder_id.to_string(),
+            cpu_cores: 8,
+            host_sig: format!("{os}|cores=8"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pc_budget_from_host_info_covers_cross_os_and_nvenc_spare_session() {
+        // Apple Silicon: 1 and 2 engines, no FFmpeg handover spare session reserved.
+        let mut m1 = base_host("macos", "com.apple.videotoolbox.videoencoder.ave.avc");
+        m1.engines = Some(1);
+        m1.hw_backend = Some("apple".into());
+        let b_m1 = PcBudget::from_host_info(&m1, None, true);
+        assert_eq!(b_m1.source, BudgetSource::AppleSilicon);
+        assert_eq!(b_m1.max_sessions, Some(4));
+        assert!(!b_m1.reserve_spare_session);
+        assert_eq!(b_m1.effective_max_sessions(), Some(4));
+
+        // Intel Mac HW fallback (125 Mpx/s, 2 sessions) and valid bench override.
+        let intel = base_host("macos", "com.apple.videotoolbox.videoencoder.ave.avc");
+        let b_intel = PcBudget::from_host_info(&intel, None, true);
+        assert_eq!(b_intel.source, BudgetSource::HwDefault);
+        assert_eq!(b_intel.limit_mpx_s, Some(125.0));
+        assert_eq!(b_intel.effective_max_sessions(), Some(2));
+
+        // Windows NVENC driver matrix: <531 -> 3, 531..551 -> 5, >=551.23 -> 8, minus 1 spare when auto_quality.
+        let mut nv_old = base_host("windows", "ffmpeg_nvenc");
+        nv_old.nvidia_driver_major = Some(525);
+        assert_eq!(PcBudget::from_host_info(&nv_old, None, false).effective_max_sessions(), Some(3));
+        assert_eq!(PcBudget::from_host_info(&nv_old, None, true).effective_max_sessions(), Some(2));
+
+        let mut nv_mid = base_host("windows", "ffmpeg_nvenc");
+        nv_mid.nvidia_driver_major = Some(531);
+        nv_mid.nvidia_driver_minor = Some(18);
+        assert_eq!(PcBudget::from_host_info(&nv_mid, None, false).effective_max_sessions(), Some(5));
+        assert_eq!(PcBudget::from_host_info(&nv_mid, None, true).effective_max_sessions(), Some(4));
+
+        let mut nv_551_22 = base_host("windows", "ffmpeg_nvenc");
+        nv_551_22.nvidia_driver_major = Some(551);
+        nv_551_22.nvidia_driver_minor = Some(22);
+        assert_eq!(PcBudget::from_host_info(&nv_551_22, None, false).effective_max_sessions(), Some(5));
+
+        let mut nv_new = base_host("windows", "ffmpeg_nvenc");
+        nv_new.nvidia_driver_major = Some(551);
+        nv_new.nvidia_driver_minor = Some(23);
+        let b_nv_new = PcBudget::from_host_info(&nv_new, None, true);
+        assert_eq!(b_nv_new.source, BudgetSource::NvencDefault);
+        assert_eq!(b_nv_new.limit_mpx_s, Some(250.0));
+        assert_eq!(b_nv_new.max_sessions, Some(8));
+        assert_eq!(b_nv_new.effective_max_sessions(), Some(7));
+
+        // Windows QSV / AMF fallback: 3 sessions minus 1 spare when auto_quality = true.
+        let mut qsv = base_host("windows", "ffmpeg_hardware");
+        qsv.hw_backend = Some("qsv".into());
+        let b_qsv = PcBudget::from_host_info(&qsv, None, true);
+        assert_eq!(b_qsv.source, BudgetSource::HwDefault);
+        assert_eq!(b_qsv.limit_mpx_s, Some(125.0));
+        assert_eq!(b_qsv.effective_max_sessions(), Some(2));
+
+        // Software x264 core tiers (<8 -> 125/1, 8-11 -> 180/2, 12-15 -> 250/2, 16+ -> 250/3).
+        let mut sw4 = base_host("linux", "obs_x264");
+        sw4.cpu_cores = 4;
+        let b_sw4 = PcBudget::from_host_info(&sw4, None, true);
+        assert_eq!(
+            (b_sw4.source, b_sw4.limit_mpx_s, b_sw4.effective_max_sessions()),
+            (BudgetSource::CpuDefault, Some(125.0), Some(1))
+        );
+        let mut sw8 = base_host("linux", "obs_x264");
+        sw8.cpu_cores = 8;
+        assert_eq!(
+            (
+                PcBudget::from_host_info(&sw8, None, true).limit_mpx_s,
+                PcBudget::from_host_info(&sw8, None, true).effective_max_sessions()
+            ),
+            (Some(180.0), Some(2))
+        );
+        let mut sw16 = base_host("linux", "obs_x264");
+        sw16.cpu_cores = 16;
+        assert_eq!(
+            (
+                PcBudget::from_host_info(&sw16, None, true).limit_mpx_s,
+                PcBudget::from_host_info(&sw16, None, true).effective_max_sessions()
+            ),
+            (Some(250.0), Some(3))
+        );
+    }
+
+    #[test]
+    fn persisted_studio_bench_validates_host_sig_and_encoder_class() {
+        let mut info = base_host("windows", "ffmpeg_nvenc");
+        info.nvidia_driver_major = Some(551);
+        info.nvidia_driver_minor = Some(23);
+        info.host_sig = "windows|nv=551.23".into();
+
+        let bench = PersistedStudioBench {
+            encoder_id: "ffmpeg_nvenc".into(),
+            is_software: false,
+            max_mpx_s: 612.0,
+            max_sessions_ok: Some(6),
+            measured_at: 1_700_000_000_000,
+            host_sig: "windows|nv=551.23".into(),
+        };
+        let b_valid = PcBudget::from_host_info(&info, Some(&bench), true);
+        assert_eq!(b_valid.source, BudgetSource::Bench);
+        assert_eq!(b_valid.limit_mpx_s, Some(612.0));
+        assert_eq!(b_valid.max_sessions, Some(6));
+        assert_eq!(b_valid.effective_max_sessions(), Some(5));
+
+        // Driver update invalidates host_sig -> falls back to NvencDefault.
+        let mut upgraded = info.clone();
+        upgraded.host_sig = "windows|nv=560.70".into();
+        let b_stale = PcBudget::from_host_info(&upgraded, Some(&bench), true);
+        assert_eq!(b_stale.source, BudgetSource::NvencDefault);
+        assert_eq!(b_stale.limit_mpx_s, Some(250.0));
+
+        // Switching to x264 invalidates HW bench -> CpuDefault, AND when a software bench IS valid,
+        // `evaluate_budget` must count software stream encodes against it.
+        let sw_info = crate::studio_host::HostBudgetInfo {
+            encoder_id: "obs_x264".into(),
+            host_sig: "windows|nv=551.23".into(),
+            cpu_cores: 8,
+            ..info
+        };
+        assert_eq!(PcBudget::from_host_info(&sw_info, Some(&bench), true).source, BudgetSource::CpuDefault);
+
+        let sw_bench = PersistedStudioBench {
+            encoder_id: "obs_x264".into(),
+            is_software: true,
+            max_mpx_s: 150.0,
+            max_sessions_ok: Some(2),
+            measured_at: 1_700_000_000_000,
+            host_sig: sw_info.host_sig.clone(),
+        };
+        let sw_budget = PcBudget::from_host_info(&sw_info, Some(&sw_bench), true);
+        assert_eq!(sw_budget.source, BudgetSource::Bench);
+        assert_eq!(sw_budget.limit_mpx_s, Some(150.0));
+
+        let plan = plan_encodes(&PlannerInput {
+            main: base_1440p60(),
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![dest("yt", "YouTube", Service::Youtube, Canvas::Main)],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: sw_budget,
+        });
+        assert_eq!(
+            plan.budget.status,
+            BudgetStatus::Over,
+            "software Bench limit must still count software stream encodes"
+        );
+        assert!(plan.budget.used_mpx_s > 200.0);
     }
 }

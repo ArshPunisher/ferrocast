@@ -9,8 +9,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use ferrocast_engine::studio_host::{
-    CaptionsSet, FilePick, FilterEdit, FollowSet, ItemEdit as Edit, Monitor as Hear, PreviewRect, ProjectorReq,
-    STOPPED, ShelfAct, StreamCap, StudioAct, StudioHost, StudioSettings, StudioStatus,
+    CaptionsSet, FilePick, FilterEdit, FollowSet, HostBudgetInfo, ItemEdit as Edit, Monitor as Hear, PreviewRect,
+    ProjectorReq, STOPPED, ShelfAct, StreamCap, StudioAct, StudioHost, StudioSettings, StudioStatus,
 };
 // The Studio's scenes kept by Ferrocast's own engine (ENGINE.md step 3): no libobs.
 use ferrocast_studio::stage::Stage as Collection;
@@ -461,13 +461,10 @@ struct Also {
     /// Some source is shown only on the stream or only in the recording, so the recording can't
     /// share the stream's encode.
     selective: bool,
+    /// Vertical picture (`width`, `height`) when active and included in budget estimates.
+    vertical: Option<(u32, u32)>,
 }
 
-/// What streaming and recording at once ask of the Mac's video encoder (its engines × about one
-/// 4K60 each), from the settings: the stream (at its output size), and the recording unless
-/// "Same as stream" shares the stream's encode (`can_share`, whose reason is given when it
-/// can't). `level`: ok under 90%, limit up to 100% (4K30 × 2 held its 30, 19 Nov), over past
-/// it (frames drop: 4K60 × 2 made 31 of 60).
 /// The lighter stream's size: 720 high at the canvas's shape (even sizes); None: the canvas
 /// itself, when it's no taller.
 fn light_size(width: u32, height: u32) -> Option<(u32, u32)> {
@@ -477,10 +474,50 @@ fn light_size(width: u32, height: u32) -> Option<(u32, u32)> {
     })
 }
 
+/// Cross-OS capacity estimate when Apple Silicon engine count alone isn't used.
+fn default_budget_mpx(
+    os: &str,
+    engines: Option<u32>,
+    hw_backend: Option<&str>,
+    cpu_cores: u32,
+    encoder_id: &str,
+) -> Option<f64> {
+    let low = encoder_id.to_ascii_lowercase();
+    let is_sw = low.contains("x264") || low.contains("software");
+    if is_sw {
+        let cores = cpu_cores.max(1);
+        return Some(if cores < 8 {
+            125.0
+        } else if cores < 12 {
+            180.0
+        } else {
+            250.0
+        });
+    }
+    if os == "macos" {
+        return Some(engines.map_or(125.0, |n| f64::from(n) * ferrocast_studio::system::MPX_PER_ENGINE));
+    }
+    if matches!(os, "windows" | "linux") {
+        let is_nvenc = low.contains("nvenc") || hw_backend == Some("nvenc");
+        return Some(if is_nvenc { 250.0 } else { 125.0 });
+    }
+    engines.map(|n| f64::from(n) * ferrocast_studio::system::MPX_PER_ENGINE)
+}
+
 fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32>, also: Also) -> Value {
+    encode_budget_with_host(s, cap, engines, None, also)
+}
+
+fn encode_budget_with_host(
+    s: &StudioSettings,
+    cap: Option<StreamCap>,
+    engines: Option<u32>,
+    telem: Option<&ferrocast_studio::system::HardwareTelemetry>,
+    also: Also,
+) -> Value {
     let mpx = |w: u32, h: u32| f64::from(w) * f64::from(h) * f64::from(s.fps) / 1e6;
     let canvas = mpx(s.width, s.height);
-    // Only the video encoder's own encodes count: x264 (software, Lossless) runs on the CPU.
+    // Only the video encoder's own encodes count against HW unless stream uses software x264.
     let hardware = |id: &str| !id.to_ascii_lowercase().contains("x264");
     let mut stream = stream_settings(s, cap);
     // Twitch Enhanced Broadcasting's qualities: Twitch's plan sets them when the stream starts;
@@ -488,13 +525,17 @@ fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32
     if also.enhanced {
         stream.video_tracks = vec![(1280, 720, 3000), (852, 480, 1500)];
     }
+    let stream_sw = !hardware(&stream.encode.video_encoder);
     let mut stream_mpx = stream.encode.scale.map_or(canvas, |(w, h)| mpx(w, h));
     stream_mpx += stream.video_tracks.iter().map(|&(w, h, _)| mpx(w, h)).sum::<f64>();
+    if let Some((vw, vh)) = also.vertical {
+        stream_mpx += mpx(vw, vh);
+    }
     if also.light {
         let (w, h) = light_size(s.width, s.height).unwrap_or((s.width, s.height));
         stream_mpx += mpx(w, h);
     }
-    if !hardware(&stream.encode.video_encoder) {
+    if stream_sw && telem.is_none() {
         stream_mpx = 0.0;
     }
     let plan = ferrocast_studio::RecordPlan {
@@ -514,12 +555,17 @@ fn encode_budget(s: &StudioSettings, cap: Option<StreamCap>, engines: Option<u32
                 }
             });
     let record_hw = hardware(&plan.encode.video_encoder);
-    let mut record_mpx = if shares.is_ok() || !record_hw { 0.0 } else { canvas };
+    let mut record_mpx = if shares.is_ok() || (!record_hw && !(telem.is_some() && stream_sw)) { 0.0 } else { canvas };
     // The replay buffer is always an encode of its own (the recording's settings).
-    if also.replay && record_hw {
+    if also.replay && (record_hw || (telem.is_some() && stream_sw)) {
         record_mpx += canvas;
     }
-    let budget = engines.map(|n| f64::from(n) * ferrocast_studio::system::MPX_PER_ENGINE);
+    let budget = match telem {
+        Some(t) => {
+            default_budget_mpx(&t.os, t.engines, t.hw_backend.as_deref(), t.cpu_cores, &stream.encode.video_encoder)
+        }
+        None => engines.map(|n| f64::from(n) * ferrocast_studio::system::MPX_PER_ENGINE),
+    };
     let level = match budget {
         None => "unknown",
         Some(b) if stream_mpx + record_mpx > b * 1.0 => "over",
@@ -4197,21 +4243,84 @@ impl StudioHost for DesktopStudio {
 
     async fn encode_budget(&self, draft: Option<Value>, enhanced: bool, light: bool) -> Result<Value, String> {
         let data = self.data.clone();
+        let telem = ferrocast_studio::system::hardware_telemetry();
         // The saved profile (loaded if nothing asked for it yet), and a replay buffer that runs
         // (one that failed isn't an encode; CodeRabbit).
-        let (saved, replay, cap, selective) = self
+        let (saved, replay, cap, selective, vertical_on) = self
             .on_main(move |h| {
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
                 let selective = h.collection.as_ref().is_some_and(|c| c.has_selective_items());
-                (s, h.replay.as_ref().is_some_and(|r| r.active()), h.stream_cap, selective)
+                let vertical_on = h.collection.as_ref().is_some_and(|c| c.vertical().is_some());
+                (s, h.replay.as_ref().is_some_and(|r| r.active()), h.stream_cap, selective, vertical_on)
             })
             .await?;
         let s = match draft {
             Some(d) => serde_json::from_value::<StudioSettings>(d).map_err(|e| format!("settings: {e}"))?,
             None => saved,
         };
-        let also = Also { enhanced, light, replay: replay || s.replay_when_streaming, selective };
-        Ok(encode_budget(&s, cap, ferrocast_studio::system::video_engines(), also))
+        let also = Also {
+            enhanced,
+            light,
+            replay: replay || s.replay_when_streaming,
+            selective,
+            vertical: vertical_on.then_some(ferrocast_studio::VERTICAL_SIZE),
+        };
+        Ok(encode_budget_with_host(&s, cap, telem.engines, Some(telem), also))
+    }
+
+    async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+        let data = self.data.clone();
+        let telem = ferrocast_studio::system::hardware_telemetry();
+        let (s, replay_active, record_active, cap, selective, vertical_on) = self
+            .on_main(move |h| {
+                let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+                let replay_active = h.replay.as_ref().is_some_and(|r| r.active());
+                let record_active = h.record.as_ref().is_some_and(|r| r.0.stats().active);
+                let selective = h.collection.as_ref().is_some_and(|c| c.has_selective_items());
+                let vertical_on = h.collection.as_ref().is_some_and(|c| c.vertical().is_some());
+                (s, replay_active, record_active, h.stream_cap, selective, vertical_on)
+            })
+            .await
+            .ok()?;
+        let stream = stream_settings(&s, cap);
+        let plan = ferrocast_studio::RecordPlan {
+            tracks: s.record_tracks.clone(),
+            encode: record_encode_capped(&s, cap),
+            ..Default::default()
+        };
+        let shares =
+            ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps, selective)
+                .is_ok();
+        let mpx_canvas = f64::from(s.width) * f64::from(s.height) * f64::from(s.fps) / 1e6;
+        let stream_sw = stream.encode.video_encoder.to_ascii_lowercase().contains("x264");
+        let rec_sw = plan.encode.video_encoder.to_ascii_lowercase().contains("x264");
+        let mut extra_mpx = 0.0;
+        let mut extra_sessions = 0u32;
+        let record_needed = record_active || s.record_when_streaming;
+        let rec_shares_main = record_needed && shares;
+        if record_needed && !shares && (!rec_sw || stream_sw) {
+            extra_mpx += mpx_canvas;
+            extra_sessions += 1;
+        }
+        if (replay_active || s.replay_when_streaming) && (!rec_sw || stream_sw) {
+            extra_mpx += mpx_canvas;
+            extra_sessions += 1;
+        }
+        Some(HostBudgetInfo {
+            os: telem.os.clone(),
+            encoder_id: stream.encode.video_encoder,
+            engines: telem.engines,
+            cpu_cores: telem.cpu_cores,
+            nvidia_driver_major: telem.nvidia_driver.map(|d| d.0),
+            nvidia_driver_minor: telem.nvidia_driver.map(|d| d.1),
+            hw_backend: telem.hw_backend.clone(),
+            record_extra_mpx_s: extra_mpx,
+            record_extra_sessions: extra_sessions,
+            record_shares_main: rec_shares_main,
+            vertical_on,
+            vertical_size: vertical_on.then_some(ferrocast_studio::VERTICAL_SIZE),
+            host_sig: telem.host_sig.clone(),
+        })
     }
 
     async fn screen_access(&self) -> Result<Value, String> {
@@ -5279,6 +5388,66 @@ mod budget_tests {
             (Some(0.0), Some("limit")),
             "{lossless}"
         );
+    }
+
+    #[test]
+    fn cross_os_encode_budget_accounts_for_vertical_nvenc_intel_and_cpu() {
+        let at = |width, height, fps, rec: &str| StudioSettings {
+            width,
+            height,
+            fps,
+            record_quality: rec.into(),
+            ..StudioSettings::default()
+        };
+        let win_nv = ferrocast_studio::system::HardwareTelemetry {
+            os: "windows".into(),
+            cpu_cores: 8,
+            engines: None,
+            hw_backend: Some("nvenc".into()),
+            gpu_name: "NVIDIA RTX 4070".into(),
+            nvidia_driver: Some((551, 23)),
+            host_sig: "windows|nv=551.23".into(),
+        };
+        let mut s_1080 = at(1920, 1080, 60, "stream");
+        s_1080.video_encoder = Some("ffmpeg_nvenc".into());
+        // Main 1080p60 (124.4) + Vertical 1080x1920@60 (124.4) = ~249 against 250 Mpx/s -> limit.
+        let v_limit = encode_budget_with_host(
+            &s_1080,
+            None,
+            None,
+            Some(&win_nv),
+            Also { vertical: Some((1080, 1920)), ..Also::default() },
+        );
+        assert_eq!(v_limit["budget_mpx"], 250.0);
+        assert_eq!(v_limit["level"], "limit", "{v_limit}");
+
+        let intel_mac = ferrocast_studio::system::HardwareTelemetry {
+            os: "macos".into(),
+            cpu_cores: 8,
+            engines: None,
+            hw_backend: None,
+            gpu_name: String::new(),
+            nvidia_driver: None,
+            host_sig: "macos|intel".into(),
+        };
+        let s_4k = at(3840, 2160, 30, "stream");
+        let over = encode_budget_with_host(&s_4k, None, None, Some(&intel_mac), Also::default());
+        assert_eq!((over["budget_mpx"].as_f64(), over["level"].as_str()), (Some(125.0), Some("over")), "{over}");
+
+        let mut s_sw = at(1920, 1080, 60, "stream");
+        s_sw.encoder = "software".into();
+        s_sw.video_encoder = Some("obs_x264".into());
+        let cpu8 = ferrocast_studio::system::HardwareTelemetry {
+            os: "linux".into(),
+            cpu_cores: 8,
+            engines: None,
+            hw_backend: None,
+            gpu_name: String::new(),
+            nvidia_driver: None,
+            host_sig: "linux|cores=8".into(),
+        };
+        let sw_b = encode_budget_with_host(&s_sw, None, None, Some(&cpu8), Also::default());
+        assert_eq!((sw_b["budget_mpx"].as_f64(), sw_b["level"].as_str()), (Some(180.0), Some("ok")), "{sw_b}");
     }
 
     /// A save that changes what only a restart can (the sound rate, broadcast timing) says so; a
