@@ -697,10 +697,16 @@ fn evaluate_budget(groups: &[WorkingGroup], main: &MainEncode, budget: &PcBudget
                 used_sessions = used_sessions.saturating_add(1);
             }
         }
-        let main_shares_with_record =
-            groups.iter().any(|g| g.id == GROUP_MAIN && g.extra_tracks.is_empty() && !g.vod_track);
+        let main_shares_with_record = groups.iter().any(|g| {
+            g.id == GROUP_MAIN
+                && g.extra_tracks.is_empty()
+                && !g.vod_track
+                && g.key.width == main.canvas_width
+                && g.key.height == main.canvas_height
+                && g.key.fps == main.canvas_fps
+        });
         if budget.record_shares_main && !main_shares_with_record {
-            used_mpx_s += mpx_s(main.width, main.height, main.fps);
+            used_mpx_s += mpx_s(main.canvas_width, main.canvas_height, main.canvas_fps);
             used_sessions = used_sessions.saturating_add(1);
         }
     }
@@ -843,9 +849,31 @@ fn coalesce_pass(
                 let Some(merged) = merged_compatible_key(&donor.key, &target.key) else {
                     continue;
                 };
+                let res_changed = (merged.width, merged.height, merged.fps)
+                    != (
+                        donor.key.width.max(target.key.width),
+                        donor.key.height.max(target.key.height),
+                        donor.key.fps.max(target.key.fps),
+                    );
                 let target_auto_only = group_is_auto_fitted_only(target, dests);
-                if !target_auto_only && merged != target.key {
-                    // Never silently alter an uncapped main or explicit Custom group in Pass 1.
+                let same_as_main_groups_on_canvas = groups
+                    .iter()
+                    .filter(|g| {
+                        g.key.canvas == donor.key.canvas
+                            && !g.is_twitch_eb
+                            && !g.is_light
+                            && g.members.iter().any(|&i| dests[i].is_same_as_main)
+                    })
+                    .count();
+                if !target_auto_only
+                    && (!merged.same_shape(&target.key)
+                        || (res_changed
+                            && merged.strict_cbr != target.key.strict_cbr
+                            && same_as_main_groups_on_canvas >= 2))
+                {
+                    // Never silently alter an uncapped main or explicit Custom shape in Pass 1,
+                    // and prefer Pass 2 shared-cap collapsing among SameAsMain peers over forcing
+                    // strict CBR onto a lower-resolution Custom group.
                     continue;
                 }
                 let ok_all = donor
@@ -856,12 +884,6 @@ fn coalesce_pass(
                 if !ok_all {
                     continue;
                 }
-                let res_changed = (merged.width, merged.height, merged.fps)
-                    != (
-                        donor.key.width.max(target.key.width),
-                        donor.key.height.max(target.key.height),
-                        donor.key.fps.max(target.key.fps),
-                    );
                 let kbps_loss = donor.key.kbps.max(target.key.kbps).saturating_sub(merged.kbps);
                 let replace = match &best {
                     None => true,
@@ -1240,6 +1262,8 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
     let mut main_eff = input.main;
     if any_whip {
         main_eff.no_bframes = true;
+        main_eff.keyframe_s = main_eff.keyframe_s.clamp(1, probe::WHIP_LIMIT.max_keyframe_secs);
+        main_eff.codec = probe::WHIP_LIMIT.fallback_codec(main_eff.codec);
     }
     let light_key = light_encode_key(&main_eff, any_whip);
 
@@ -2138,5 +2162,108 @@ mod tests {
         let main = MainEncode::from_canvas(Canvas::Main, 1920, 1080, 60, 6_000, VideoCodec::H264);
         let spec = TwitchEbSpec::from_plan(&eb_plan, &main).unwrap();
         assert!(spec.extra_tracks.is_empty(), "equal-height encode must not duplicate top track");
+    }
+
+    #[test]
+    fn pass2_scaled_main_does_not_share_with_recording_and_bills_extra_session() {
+        let mut budget = PcBudget::with_limits(BudgetSource::HwDefault, Some(300.0), Some(2));
+        budget.record_shares_main = true;
+        let plan = plan_encodes(&PlannerInput {
+            main: base_1440p60(),
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![
+                dest("youtube", "YouTube", Service::Youtube, Canvas::Main),
+                dest("kick", "Kick", Service::Kick, Canvas::Main),
+            ],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget,
+        });
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].id, GROUP_MAIN);
+        assert_eq!((plan.groups[0].key.width, plan.groups[0].key.height), (1920, 1080));
+        assert_eq!(plan.budget.used_sessions, 2, "scaled main cannot share unscaled canvas recording");
+        assert!(
+            (plan.budget.used_mpx_s - 345.6).abs() < 0.2,
+            "expected scaled 1080p60 stream + 1440p60 recording mpx/s (~345.6), got {}",
+            plan.budget.used_mpx_s
+        );
+        assert_eq!(plan.budget.status, BudgetStatus::Over);
+    }
+
+    #[test]
+    fn coalesce_pass_merges_auto_fitted_strict_cbr_into_custom_non_strict_cbr() {
+        let mut yt = dest("youtube", "YouTube", Service::Youtube, Canvas::Main);
+        yt.quality = DestinationQuality::Custom(CustomQuality {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            kbps: 5_000,
+            codec: Some(VideoCodec::H264),
+        });
+        let twitch = dest("twitch", "Twitch", Service::Twitch, Canvas::Main);
+        let vert = dest("vert", "Vertical", Service::Youtube, Canvas::Vertical);
+        let vertical = MainEncode::from_canvas(Canvas::Vertical, 1080, 1920, 60, 6_000, VideoCodec::H264);
+        let mut main = base_1440p60();
+        main.strict_cbr = false;
+        main.vbr = false;
+        let plan = plan_encodes(&PlannerInput {
+            main,
+            vertical: Some(vertical),
+            vertical_cut: false,
+            destinations: vec![yt, twitch, vert],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: PcBudget::with_limits(BudgetSource::NvencDefault, Some(500.0), Some(2)),
+        });
+        assert!(plan.destinations["twitch"].coalesced, "Twitch auto-fit must coalesce into matching Custom shape");
+        assert_eq!(plan.destinations["twitch"].group_id, plan.destinations["youtube"].group_id);
+        assert!(plan.groups.iter().find(|g| g.id == plan.destinations["youtube"].group_id).unwrap().key.strict_cbr);
+        assert_eq!(plan.groups.len(), 2);
+        assert!(!plan.destinations["vert"].shared_cap_fallback);
+    }
+
+    #[test]
+    fn whip_folds_keyframe_and_codec_constraints_into_main_without_orphan_group() {
+        let yt = dest("youtube", "YouTube", Service::Youtube, Canvas::Main);
+        let mut whip = dest("whip", "WebRTC", Service::Custom, Canvas::Main);
+        whip.direct = Some(DirectKind::Whip);
+
+        let mut main_kf4 = base_1440p60();
+        main_kf4.keyframe_s = 4;
+        main_kf4.no_bframes = true;
+        let p_kf = plan_encodes(&PlannerInput {
+            main: main_kf4,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![yt.clone(), whip.clone()],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: PcBudget::apple_silicon(2),
+        });
+        assert_eq!(p_kf.groups.len(), 1, "4s main + WHIP must share single main group: {:?}", p_kf.groups);
+        assert_eq!(p_kf.groups[0].key.keyframe_s, 2);
+        assert_eq!(p_kf.destinations["whip"].group_id, GROUP_MAIN);
+
+        let mut main_av1 = base_1440p60();
+        main_av1.codec = VideoCodec::Av1;
+        main_av1.no_bframes = true;
+        let p_av1 = plan_encodes(&PlannerInput {
+            main: main_av1,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![yt, whip],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: PcBudget::apple_silicon(2),
+        });
+        assert_eq!(p_av1.groups.len(), 1, "AV1 main + WHIP must share single H.264 main group: {:?}", p_av1.groups);
+        assert_eq!(p_av1.groups[0].key.codec, VideoCodec::H264);
+        assert_eq!(p_av1.destinations["whip"].group_id, GROUP_MAIN);
     }
 }
