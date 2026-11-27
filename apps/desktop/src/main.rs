@@ -1032,13 +1032,13 @@ struct MacRelaunchSpec {
     args: Vec<std::ffi::OsString>,
 }
 
-/// Filters raw `env.args_os` (skipping argv[0] and LaunchServices `-psn_*` serial tokens) and
-/// appends `--safe-mode` once when restarting into Safe Mode.
+/// Filters raw `env.args_os` down to persistent flags (`--minimized`, plus `--safe-mode` only
+/// when relaunching into Safe Mode), stripping LaunchServices `-psn_*` serial tokens and
+/// one-shot `ferrocast://` deep links.
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn relaunch_forward_args(env_args: &[std::ffi::OsString], safe_mode: bool) -> Vec<std::ffi::OsString> {
-    let mut out: Vec<std::ffi::OsString> =
-        env_args.iter().skip(1).filter(|a| !a.to_str().is_some_and(|s| s.starts_with("-psn_"))).cloned().collect();
-    if safe_mode && !out.iter().any(|a| a == SAFE_MODE_ARG) {
+    let mut out: Vec<std::ffi::OsString> = env_args.iter().skip(1).filter(|a| *a == MINIMIZED_ARG).cloned().collect();
+    if safe_mode {
         out.push(SAFE_MODE_ARG.into());
     }
     out
@@ -1054,7 +1054,7 @@ fn mac_relaunch_spec(
     env_args: &[std::ffi::OsString],
     safe_mode: bool,
 ) -> MacRelaunchSpec {
-    let script = "pid=\"$1\"; shift; n=0; while /bin/kill -0 \"$pid\" 2>/dev/null && [ \"$n\" -lt 400 ]; do /bin/sleep 0.05; n=$((n + 1)); done; exec /usr/bin/open \"$@\"";
+    let script = "pid=\"$1\"; shift; n=0; while /bin/kill -0 \"$pid\" 2>/dev/null && [ \"$n\" -lt 1200 ]; do /bin/sleep 0.05; n=$((n + 1)); done; if /bin/kill -0 \"$pid\" 2>/dev/null; then exit 1; fi; /bin/sleep 0.2; exec /usr/bin/open \"$@\"";
     let mut args: Vec<std::ffi::OsString> =
         vec!["-c".into(), script.into(), "ferrocast-relaunch".into(), pid.to_string().into()];
     match bundle {
@@ -2209,7 +2209,7 @@ mod update_tests {
         );
         let script = spec.args[1].to_string_lossy();
         assert!(
-            script.contains("kill -0") && script.contains("exec /usr/bin/open") && script.contains("-lt 400"),
+            script.contains("kill -0") && script.contains("exec /usr/bin/open") && script.contains("-lt 1200"),
             "{script}"
         );
 
@@ -2219,6 +2219,29 @@ mod update_tests {
         assert_eq!(
             fallback.args[2..],
             [std::ffi::OsString::from("ferrocast-relaunch"), "99".into(), "-b".into(), BUNDLE_ID.into(),]
+        );
+    }
+
+    #[test]
+    fn mac_relaunch_strips_safe_mode_and_deeplinks_and_guards_dying_pid_handoff() {
+        let forwarded = relaunch_forward_args(
+            &[
+                "/Applications/Ferrocast.app/Contents/MacOS/ferrocast".into(),
+                "-psn_0_999".into(),
+                "--safe-mode".into(),
+                "--minimized".into(),
+                "ferrocast://auth/callback?code=abc".into(),
+            ],
+            false,
+        );
+        assert_eq!(forwarded, [std::ffi::OsString::from("--minimized")]);
+
+        let spec = mac_relaunch_spec(4242, Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &[], false);
+        let script = spec.args[1].to_string_lossy();
+        assert!(script.contains("sleep 0.2"), "expected LaunchServices settle sleep in script: {script}");
+        assert!(
+            script.contains("if /bin/kill -0 \"$pid\""),
+            "script must guard against calling plain `open` while old PID still lives: {script}"
         );
     }
 }
