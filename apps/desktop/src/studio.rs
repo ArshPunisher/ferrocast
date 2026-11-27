@@ -18,12 +18,259 @@ use ferrocast_engine::studio_host::{
 use ferrocast_studio::stage::Stage as Collection;
 use ferrocast_studio::stage::StageOutput as Streaming;
 use ferrocast_studio::stage::StageOutput as Recording;
+#[cfg(not(test))]
 use ferrocast_studio::stage::StageView as Preview;
 /// A projector window (Ferrocore draws them on a Mac and on Windows; none elsewhere yet).
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(all(not(test), any(target_os = "macos", target_os = "windows")))]
 type ProjectorWin = ferrocast_studio::stage::StageProjector;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 type ProjectorWin = ();
+
+#[derive(Clone, Copy)]
+enum ViewCtx<'a> {
+    #[cfg_attr(test, allow(dead_code))]
+    App(&'a AppHandle),
+    #[cfg(test)]
+    Test,
+}
+
+#[cfg(test)]
+type Holes = Vec<(f64, f64, f64, f64, f64)>;
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestView {
+    engine: ferrocast_studio::stage::EngineRef,
+    rect: Rect,
+    scale: f64,
+    area: std::cell::RefCell<Option<(f64, f64, f64, f64)>>,
+    vertical: bool,
+    scene: std::cell::RefCell<Option<String>>,
+    picked: std::cell::RefCell<Option<(String, Vec<i64>)>>,
+    frames: std::cell::RefCell<Option<String>>,
+    bg: std::cell::Cell<Option<u32>>,
+    stripe: std::cell::Cell<Option<u32>>,
+    holes: std::cell::RefCell<Holes>,
+    opacity: std::cell::Cell<f64>,
+    shade: std::cell::Cell<f64>,
+    paused: std::cell::Cell<bool>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum Preview {
+    #[allow(dead_code)]
+    Real(ferrocast_studio::stage::StageView),
+    Test(TestView),
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl Preview {
+    fn set_rect(&mut self, rect: Rect, scale: f64) {
+        match self {
+            Preview::Real(p) => p.set_rect(rect, scale),
+            Preview::Test(p) => {
+                p.rect = rect;
+                p.scale = scale;
+                *p.area.borrow_mut() = None;
+            }
+        }
+    }
+
+    fn set_area(&mut self, area: Rect, canvas: (f64, f64, f64, f64), scale: f64) {
+        match self {
+            Preview::Real(p) => p.set_area(area, canvas, scale),
+            Preview::Test(p) => {
+                p.rect = area;
+                p.scale = scale;
+                *p.area.borrow_mut() = Some(canvas);
+            }
+        }
+    }
+
+    fn show_scene(&self, scene: Option<&str>) {
+        match self {
+            Preview::Real(p) => p.show_scene(scene),
+            Preview::Test(p) => *p.scene.borrow_mut() = scene.map(String::from),
+        }
+    }
+
+    fn shown_scene(&self) -> Option<String> {
+        match self {
+            Preview::Real(p) => p.shown_scene(),
+            Preview::Test(p) => p.scene.borrow().clone(),
+        }
+    }
+
+    fn select(&self, pick: Option<(&str, &[i64])>) {
+        match self {
+            Preview::Real(p) => p.select(pick),
+            Preview::Test(p) => *p.picked.borrow_mut() = pick.map(|(s, i)| (s.to_string(), i.to_vec())),
+        }
+    }
+
+    fn frames(&self, scene: Option<&str>) {
+        match self {
+            Preview::Real(p) => p.frames(scene),
+            Preview::Test(p) => *p.frames.borrow_mut() = scene.map(String::from),
+        }
+    }
+
+    fn guides(&self, on: bool) {
+        if let Preview::Real(p) = self {
+            p.guides(on);
+        }
+    }
+
+    fn background(&self, abgr: u32) {
+        match self {
+            Preview::Real(p) => p.background(abgr),
+            Preview::Test(p) => p.bg.set(Some(abgr)),
+        }
+    }
+
+    fn overflow_stripes(&self, abgr: Option<u32>) {
+        match self {
+            Preview::Real(p) => p.overflow_stripes(abgr),
+            Preview::Test(p) => p.stripe.set(abgr),
+        }
+    }
+
+    fn set_shade(&self, shade: f64) {
+        match self {
+            Preview::Real(p) => p.set_shade(shade),
+            Preview::Test(p) => p.shade.set(shade),
+        }
+    }
+
+    fn set_holes(&self, holes: &[(f64, f64, f64, f64, f64)]) {
+        match self {
+            Preview::Real(p) => p.set_holes(holes),
+            Preview::Test(p) => *p.holes.borrow_mut() = holes.to_vec(),
+        }
+    }
+
+    fn set_opacity(&self, opacity: f64) {
+        match self {
+            Preview::Real(p) => p.set_opacity(opacity),
+            Preview::Test(p) => p.opacity.set(opacity),
+        }
+    }
+
+    fn set_paused(&self, paused: bool) {
+        match self {
+            Preview::Real(p) => p.set_paused(paused),
+            Preview::Test(p) => p.paused.set(paused),
+        }
+    }
+
+    fn set_input(&self, cb: Box<dyn Fn(ferrocast_studio::PreviewInput)>) {
+        if let Preview::Real(p) = self {
+            p.set_input(cb);
+        }
+    }
+
+    fn set_cursor(&self, css: &str) {
+        if let Preview::Real(p) = self {
+            p.set_cursor(css);
+        }
+    }
+
+    fn follow(&self, stage: &Collection) {
+        match self {
+            Preview::Real(p) => p.follow(stage),
+            Preview::Test(p) => {
+                if !p.paused.get() && p.vertical {
+                    *p.scene.borrow_mut() = stage.vertical().map(|v| v.current);
+                }
+            }
+        }
+    }
+
+    fn engine_ref(&self) -> Option<ferrocast_studio::stage::EngineRef> {
+        match self {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Preview::Real(p) => Some(p.engine_ref()),
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            Preview::Real(_) => None,
+            Preview::Test(p) => Some(p.engine.clone()),
+        }
+    }
+
+    fn test_view(&self) -> Option<&TestView> {
+        match self {
+            Preview::Real(_) => None,
+            Preview::Test(p) => Some(p),
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+#[derive(Debug)]
+struct TestProjector {
+    engine: ferrocast_studio::stage::EngineRef,
+    what: String,
+    name: Option<String>,
+    names: std::cell::RefCell<Vec<String>>,
+    preview: std::cell::RefCell<Option<String>>,
+    look: std::cell::RefCell<ferrocast_studio::MultiviewLook>,
+    on_top: std::cell::Cell<bool>,
+    hide_cursor: std::cell::Cell<bool>,
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+#[derive(Debug)]
+enum ProjectorWin {
+    #[allow(dead_code)]
+    Real(ferrocast_studio::stage::StageProjector),
+    Test(TestProjector),
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
+#[allow(dead_code)]
+impl ProjectorWin {
+    fn update(&self, stage: &Collection, look: ferrocast_studio::MultiviewLook) {
+        match self {
+            ProjectorWin::Real(p) => p.update(stage, look),
+            ProjectorWin::Test(p) => {
+                if p.what == "multiview" {
+                    *p.names.borrow_mut() = stage.scenes().into_iter().map(|s| s.name).collect();
+                    *p.preview.borrow_mut() = stage.preview_scene();
+                    *p.look.borrow_mut() = look;
+                }
+            }
+        }
+    }
+
+    fn set_on_top(&self, on: bool) {
+        match self {
+            ProjectorWin::Real(p) => p.set_on_top(on),
+            ProjectorWin::Test(p) => p.on_top.set(on),
+        }
+    }
+
+    fn set_hide_cursor(&self, on: bool) {
+        match self {
+            ProjectorWin::Real(p) => p.set_hide_cursor(on),
+            ProjectorWin::Test(p) => p.hide_cursor.set(on),
+        }
+    }
+
+    fn engine_ref(&self) -> ferrocast_studio::stage::EngineRef {
+        match self {
+            ProjectorWin::Real(p) => p.engine_ref(),
+            ProjectorWin::Test(p) => p.engine.clone(),
+        }
+    }
+
+    fn test_proj(&self) -> Option<&TestProjector> {
+        match self {
+            ProjectorWin::Real(_) => None,
+            ProjectorWin::Test(p) => Some(p),
+        }
+    }
+}
 use ferrocast_studio::{
     Canvas, EncodeSettings, ItemEdit, Monitor, Rect, StreamSettings, StudioOptions, TransitionInfo,
 };
@@ -241,20 +488,70 @@ struct VerticalView {
     shade: f64,
 }
 
+fn create_stage_view(
+    ctx: ViewCtx<'_>,
+    c: &Collection,
+    rect: Rect,
+    scale: f64,
+    vertical: bool,
+) -> Result<Preview, String> {
+    match ctx {
+        ViewCtx::App(app) => {
+            let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
+            let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
+            let p = if vertical {
+                c.vertical_preview_drawn(handle.as_raw(), rect, scale)
+            } else {
+                c.preview_drawn(handle.as_raw(), rect, scale)
+            }
+            .map_err(|e| e.to_string())?;
+            #[cfg(not(test))]
+            let view = p;
+            #[cfg(test)]
+            let view = Preview::Real(p);
+            pass_input(&window, &view);
+            Ok(view)
+        }
+        #[cfg(test)]
+        ViewCtx::Test => {
+            let scene = if vertical {
+                let v = c.vertical().ok_or_else(|| "The vertical picture is off.".to_string())?;
+                Some(v.current)
+            } else {
+                None
+            };
+            let engine = c.engine_ref().map_err(|e| e.to_string())?;
+            Ok(Preview::Test(TestView {
+                engine,
+                rect,
+                scale,
+                area: std::cell::RefCell::new(None),
+                vertical,
+                scene: std::cell::RefCell::new(scene),
+                picked: std::cell::RefCell::new(None),
+                frames: std::cell::RefCell::new(None),
+                bg: std::cell::Cell::new(None),
+                stripe: std::cell::Cell::new(None),
+                holes: std::cell::RefCell::new(Vec::new()),
+                opacity: std::cell::Cell::new(1.0),
+                shade: std::cell::Cell::new(0.0),
+                paused: std::cell::Cell::new(false),
+            }))
+        }
+    }
+}
+
 /// Makes the vertical picture's preview at its last place, when the picture is on and the page
 /// has a box for it (main thread).
-fn make_vertical_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
+fn make_vertical_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.vertical.at else { return Ok(()) };
     let Some(c) = h.collection.as_ref() else { return Ok(()) };
     if c.vertical().is_none() {
         h.vertical.view = None;
         return Ok(());
     }
-    let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
-    let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
     // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
-    let mut p = c.vertical_preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
-    pass_input(&window, &p);
+    let mut p = create_stage_view(ctx, c, rect, scale, true)?;
     let v = &h.vertical;
     if let Some(area) = v.canvas {
         p.set_area(rect, area, scale);
@@ -291,13 +588,16 @@ fn multiview_look(s: &StudioSettings) -> ferrocast_studio::MultiviewLook {
 }
 
 /// Multiviews follow the scenes, Studio Mode's preview and their settings (other projectors
-/// follow by themselves).
+/// follow by themselves; all open projectors take updated top-most and cursor settings).
 fn refresh_projectors(h: &Held) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Some(c) = &h.collection {
-        let look = multiview_look(&h.settings.clone().unwrap_or_default());
-        for (_, p, _) in &h.projectors {
+        let settings = h.settings.clone().unwrap_or_default();
+        let look = multiview_look(&settings);
+        for (_, p, req) in &h.projectors {
             p.update(c, look);
+            p.set_on_top(req.on_top || settings.projector_on_top);
+            p.set_hide_cursor(settings.projector_hide_cursor);
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -405,32 +705,115 @@ fn encode_of(s: &StudioSettings) -> EncodeSettings {
     }
 }
 
-/// The canvas to `canvas` (its size or frame rate), the previews made again for it.
-fn apply_canvas(app: &tauri::AppHandle, h: &mut Held, canvas: Canvas) -> Result<(), String> {
-    // Refused while live or recording: nothing is saved then. The previews
-    // must let go of the old engine first: each holds it, so with one still
-    // alive the change was refused as "streaming or recording" when nothing
-    // was. They're dropped here, and made again below either way.
-    let had = (h.preview.is_some(), h.program_view.is_some(), h.vertical.view.is_some());
+/// Whether any live output or capture prevents replacing the collection or reopening the canvas.
+fn outputs_busy_for_switch(h: &Held) -> bool {
+    any_stream_group_active(h)
+        || h.record.as_ref().is_some_and(|r| r.0.stats().active)
+        || h.source_records.iter().any(|(_, r, _)| r.stats().active)
+        || h.replay.as_ref().is_some_and(|r| r.active())
+        || h.virtualcam.is_some()
+        || h.ndi.is_some()
+}
+
+/// Drops finished or errored output slots so no stale output keeps the previous engine alive
+/// across a collection switch or canvas reopen.
+fn drop_inactive_outputs(h: &mut Held) {
+    if h.stream.as_ref().is_some_and(|s| !s.stats().active) {
+        h.stream = None;
+    }
+    if h.vstream.as_ref().is_some_and(|s| !s.stats().active) {
+        h.vstream = None;
+    }
+    if h.lstream.as_ref().is_some_and(|s| !s.stats().active) {
+        h.lstream = None;
+        h.lstream_no_bframes = false;
+    }
+    h.groups.retain(|_, g| g.output.stats().active);
+    if h.stream.is_none() && h.groups.is_empty() {
+        h.stream_started = None;
+        h.stream_with = None;
+        h.live_pct = None;
+    }
+    if h.record.as_ref().is_some_and(|r| !r.0.stats().active) {
+        h.record = None;
+        h.record_with = None;
+    }
+    h.source_records.retain(|(_, r, _)| r.stats().active);
+    if h.replay.as_ref().is_some_and(|r| !r.active()) {
+        h.replay = None;
+        h.replay_shown = None;
+        h.replay_back = None;
+        h.replay_wait = None;
+    }
+}
+
+fn take_projector_reqs(h: &mut Held) -> Vec<ProjectorReq> {
+    h.projectors.drain(..).map(|(_, _, req)| req).collect()
+}
+
+/// Rebuilds cached preview, program, and vertical views plus open projector windows onto the
+/// current collection and engine using their cached rects and look properties.
+fn rebuild_views(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, prev_projectors: Vec<ProjectorReq>) {
+    if h.preview_at.is_some()
+        && let Err(e) = make_preview(ctx, h)
+    {
+        tracing::warn!(error = %e, "the preview didn't rebuild");
+    }
+    if h.program_at.is_some()
+        && let Err(e) = make_program_view(ctx, h)
+    {
+        tracing::warn!(error = %e, "the program view didn't rebuild");
+    }
+    if h.vertical.at.is_some()
+        && let Err(e) = make_vertical_view(ctx, h)
+    {
+        tracing::warn!(error = %e, "the vertical preview didn't rebuild");
+    }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if !prev_projectors.is_empty() {
+        for req in prev_projectors {
+            if let Err(e) = open_projector(ctx, h, &req, data) {
+                tracing::warn!(error = %e, what = %req.what, "a projector didn't reopen");
+            }
+        }
+        save_projectors(h, data);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let _ = (data, prev_projectors);
+}
+
+/// Reopens the engine for `canvas` (or the current audio/NTSC format) after releasing all old
+/// views and projectors, then rebuilds every cached view and open projector on the new engine.
+fn apply_canvas(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, canvas: Canvas) -> Result<(), String> {
+    let (old_canvas, had_engine) = {
+        let c = h.collection.as_ref().ok_or(STOPPED)?;
+        (c.canvas(), c.has_engine())
+    };
+    drop_inactive_outputs(h);
+    let prev_projectors = take_projector_reqs(h);
     h.preview = None;
     h.program_view = None;
     h.vertical.view = None;
-    h.projectors.clear();
     // They send the old engine's picture: stopped (turned on again by hand).
     h.ndi = None;
     h.virtualcam = None;
-    let c = h.collection.as_mut().ok_or(STOPPED)?;
-    let changed = c.set_canvas(canvas);
-    // Made again (at the new size when it changed).
-    if had.0 {
-        let _ = make_preview(app, h);
+    let changed = h.collection.as_mut().ok_or(STOPPED)?.set_canvas(canvas);
+    if changed.is_ok()
+        && (u64::from(old_canvas.width) * u64::from(canvas.height)
+            != u64::from(canvas.width) * u64::from(old_canvas.height))
+    {
+        // A different aspect ratio invalidates the cached preview canvas rect until the UI resizes.
+        h.preview_canvas = None;
     }
-    if had.1 {
-        let _ = make_program_view(app, h);
+    rebuild_views(ctx, h, data, prev_projectors);
+    if let Some(c) = &h.collection
+        && had_engine
+        && !c.has_engine()
+        && let Err(e) = c.engine_ref()
+    {
+        tracing::warn!(error = %e, "the engine didn't reopen after a canvas change");
     }
-    if had.2 {
-        let _ = make_vertical_view(app, h);
-    }
+    sync_views(h);
     changed.map_err(|e| e.to_string())
 }
 
@@ -438,22 +821,16 @@ fn apply_canvas(app: &tauri::AppHandle, h: &mut Held, canvas: Canvas) -> Result<
 /// nothing that draws from it runs (called when a stream, recording or replay buffer stops, and
 /// before a stream starts). The virtual camera and NDI would be stopped by it, so while one is
 /// on it waits longer (the next stream still goes out at the chosen rate, see `stream_start`).
-fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held) {
+fn apply_waiting_canvas(app: &tauri::AppHandle, h: &mut Held, data: &std::path::Path) {
     let Some(s) = h.settings.clone() else { return };
     let want = Canvas { width: s.width, height: s.height, fps: s.fps };
     if h.collection.as_ref().is_none_or(|c| c.canvas() == want) {
         return;
     }
-    let busy = h.stream.as_ref().is_some_and(|st| st.stats().active)
-        || h.groups.values().any(|g| g.output.stats().active)
-        || h.record.as_ref().is_some_and(|r| r.0.stats().active)
-        || h.replay.as_ref().is_some_and(|r| r.active())
-        || h.ndi.is_some()
-        || h.virtualcam.is_some();
-    if busy {
+    if outputs_busy_for_switch(h) {
         return;
     }
-    if let Err(e) = apply_canvas(app, h, want) {
+    if let Err(e) = apply_canvas(ViewCtx::App(app), h, data, want) {
         tracing::warn!(error = %e, "the frame rate chosen while live couldn't be applied after the stream");
     }
 }
@@ -996,62 +1373,64 @@ fn load_collection_doc(canvas: Canvas, file: &std::path::Path) -> Result<Collect
 }
 
 /// Saves the scenes in use to `from` and puts `to`'s in their place (a missing file is a new
-/// set with one empty scene). If `to` won't load, the old ones come back.
-fn swap_collection(h: &mut Held, from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
+/// set with one empty scene). If `to` won't load, the old collection and all views remain intact.
+fn swap_collection(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    data: &std::path::Path,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<(), String> {
     let Some(canvas) = h.collection.as_ref().map(Collection::canvas) else {
         // Not running: the next Start loads it.
         return Ok(());
     };
-    // libobs keeps one collection's sources at a time: the old ones go first, with the undo
-    // steps that hold them and the projectors that show them.
-    // The vertical preview and stream use the old collection's canvas: they go before it does.
-    h.vertical.view = None;
-    h.vstream = None;
-    h.groups.retain(|_, g| g.spec.key.canvas != EncodeCanvas::Vertical);
-    h.captions = None;
-    // NDI and the virtual camera send the old collection's picture: they stop with it.
-    h.ndi = None;
-    h.virtualcam = None;
+    if outputs_busy_for_switch(h) {
+        return Err("Stop streaming and recording before changing scene collections.".into());
+    }
+    // Validate and load the incoming collection before tearing down the current collection or its
+    // views, so a load failure leaves the active engine, history, selection, and views intact.
+    let made = load_collection_doc(canvas, to).map_err(|e| format!("That scene collection didn't load: {e}"))?;
     // Put the following item back first, so neither collection is saved slid sideways.
     if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
         c.stop_follow(&f);
     }
-    let old = h.collection.take().map(|c| {
-        save_confirmed(h.collection_deferred, &c, from);
-        c.save(COLLECTION)
-    });
-    let was_deferred = h.collection_deferred;
+    // Release every view, projector, and stopped output holding the old engine before dropping it.
+    let prev_projectors = take_projector_reqs(h);
+    h.preview = None;
+    h.program_view = None;
+    h.vertical.view = None;
+    drop_inactive_outputs(h);
+    h.captions = None;
+    // NDI and the virtual camera send the old collection's picture: they stop with it.
+    h.ndi = None;
+    h.virtualcam = None;
     h.history.clear();
     h.selected = None;
     h.frames = None;
-    // The old scenes are going: the preview lets go of the one it shows (a scene of the same
-    // name in the new set is another source).
-    if let Some(p) = &h.preview {
-        p.show_scene(None);
+    if let Some(old_c) = h.collection.take() {
+        save_confirmed(h.collection_deferred, &old_c, from);
+        drop(old_c);
     }
-    // Only a missing file (or corrupt JSON without a working `.bak`) starts fresh; valid JSON that
-    // fails collection loading restores the old collection.
-    let made = load_collection_doc(canvas, to);
-    match made {
-        Ok(c) => {
-            h.collection_deferred = false;
-            save_confirmed(false, &c, to);
-            c.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
-            c.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
-            h.collection = Some(c);
-            refresh_projectors(h);
-            sync_views(h);
-            Ok(())
-        }
-        Err(e) => {
-            h.collection_deferred = was_deferred;
-            if let Some(old) = old {
-                h.collection = Collection::load(canvas, &old, FIRST_SCENE).ok();
-            }
-            sync_views(h);
-            Err(format!("That scene collection didn't load: {e}"))
-        }
+    h.collection_deferred = false;
+    save_confirmed(false, &made, to);
+    let settings = h.settings.clone().unwrap_or_default();
+    made.set_true_peak(settings.true_peak);
+    made.set_low_latency(settings.low_latency_audio);
+    let (mon_name, mon_id) = settings.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
+    if let Err(e) = made.set_monitoring_device(&mon_name, &mon_id) {
+        tracing::warn!(error = %e, "the listening device is gone; using the system's");
     }
+    h.collection = Some(made);
+    rebuild_views(ctx, h, data, prev_projectors);
+    if let Some(c) = &h.collection
+        && !c.has_engine()
+        && let Err(e) = c.engine_ref()
+    {
+        tracing::warn!(error = %e, "the engine couldn't open after switching scene collections");
+    }
+    sync_views(h);
+    Ok(())
 }
 
 /// The saved settings, falling back to `.bak` when unreadable, or the defaults.
@@ -1067,6 +1446,13 @@ fn load_settings(data: &std::path::Path) -> StudioSettings {
     let s = read_settings(data);
     apply_audio_format(&s);
     s
+}
+
+/// Reads the profile settings file `to` with `.bak` and queued-save fallback when switching profiles.
+fn load_profile_settings(to: &std::path::Path) -> StudioSettings {
+    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(to, |s| s.check().is_ok())
+        .map(|l| l.value)
+        .unwrap_or_default()
 }
 
 /// What the running engine can't take until Ferrocast restarts: its sound rate and its broadcast
@@ -2077,14 +2463,11 @@ fn sync_views(h: &Held) {
 }
 
 /// Makes Studio Mode's picture of what's on air at its last place (main thread).
-fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
+fn make_program_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.program_at else { return Ok(()) };
-    let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
-    let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
     // What's on air, drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
     let c = h.collection.as_ref().ok_or(STOPPED)?;
-    let p = c.preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
-    pass_input(&window, &p);
+    let p = create_stage_view(ctx, c, rect, scale, false)?;
     // Made again (a new canvas size): the stage keeps the page's colour.
     if let Some(c) = h.program_bg {
         p.background(c);
@@ -2099,14 +2482,11 @@ fn make_program_view(app: &AppHandle, h: &mut Held) -> Result<(), String> {
 }
 
 /// Makes the preview at its last place (main thread).
-fn make_preview(app: &AppHandle, h: &mut Held) -> Result<(), String> {
+fn make_preview(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.preview_at else { return Ok(()) };
-    let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
-    let handle = raw_window_handle::HasWindowHandle::window_handle(&window).map_err(|e| e.to_string())?;
     // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
     let c = h.collection.as_ref().ok_or(STOPPED)?;
-    let mut p = c.preview_drawn(handle.as_raw(), rect, scale).map_err(|e| e.to_string())?;
-    pass_input(&window, &p);
+    let mut p = create_stage_view(ctx, c, rect, scale, false)?;
     if let Some(c) = h.preview_canvas {
         p.set_area(rect, c, scale);
     }
@@ -2286,16 +2666,7 @@ impl DesktopStudio {
         if lib.shelf(kind).current == id {
             return Ok(());
         }
-        let busy = self
-            .on_main(|h| {
-                any_stream_group_active(h)
-                    || h.record.is_some()
-                    || !h.source_records.is_empty()
-                    || h.replay.is_some()
-                    || h.virtualcam.is_some()
-                    || h.ndi.is_some()
-            })
-            .await?;
+        let busy = self.on_main(|h| outputs_busy_for_switch(h)).await?;
         if busy {
             let noun = match kind {
                 Kind::Collections => "scene collections",
@@ -2310,7 +2681,10 @@ impl DesktopStudio {
         match kind {
             Kind::Collections => {
                 library::save(&data, &lib);
-                let swapped = self.on_main(move |h| swap_collection(h, &from, &to)).await?;
+                let app = self.app.clone();
+                let data_main = data.clone();
+                let swapped =
+                    self.on_main(move |h| swap_collection(ViewCtx::App(&app), h, &data_main, &from, &to)).await?;
                 if let Err(e) = swapped {
                     lib.collections.current = before;
                     library::save(&data, &lib);
@@ -2319,11 +2693,7 @@ impl DesktopStudio {
                 Ok(())
             }
             Kind::Profiles => {
-                let next = std::fs::read(&to)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<StudioSettings>(&b).ok())
-                    .filter(|s| s.check().is_ok())
-                    .unwrap_or_default();
+                let next = load_profile_settings(&to);
                 library::save(&data, &lib);
                 if let Err(e) = self.set_settings(next).await {
                     lib.profiles.current = before;
@@ -2433,10 +2803,63 @@ fn projectors_file(data: &std::path::Path) -> PathBuf {
     data.join("studio").join("projectors.json")
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn create_projector_win(
+    ctx: ViewCtx<'_>,
+    c: &Collection,
+    p: &ProjectorReq,
+    of: &ferrocast_studio::ProjectorOf,
+    look: ferrocast_studio::MultiviewLook,
+    on_close: Box<dyn Fn()>,
+    on_pick: Box<dyn Fn(String)>,
+) -> Result<ProjectorWin, String> {
+    match ctx {
+        ViewCtx::App(_) => {
+            let made =
+                c.projector(of, p.screen.map(|s| s as usize), look, on_close, on_pick).map_err(|e| e.to_string())?;
+            #[cfg(not(test))]
+            {
+                Ok(made)
+            }
+            #[cfg(test)]
+            {
+                Ok(ProjectorWin::Real(made))
+            }
+        }
+        #[cfg(test)]
+        ViewCtx::Test => {
+            use ferrocast_studio::ProjectorOf as P;
+            let engine = c.engine_ref().map_err(|e| e.to_string())?;
+            if let P::Source(name) = of {
+                let has_source = c.sources().iter().any(|s| s.name == *name);
+                let has_scene = c.scene_index(name).is_ok();
+                if !has_source && !has_scene {
+                    return Err(format!("There's no source called \"{name}\"."));
+                }
+            }
+            let (names, preview) = if matches!(of, P::Multiview) {
+                (c.scenes().into_iter().map(|s| s.name).collect(), c.preview_scene())
+            } else {
+                (Vec::new(), None)
+            };
+            Ok(ProjectorWin::Test(TestProjector {
+                engine,
+                what: p.what.clone(),
+                name: p.name.clone(),
+                names: std::cell::RefCell::new(names),
+                preview: std::cell::RefCell::new(preview),
+                look: std::cell::RefCell::new(look),
+                on_top: std::cell::Cell::new(false),
+                hide_cursor: std::cell::Cell::new(false),
+            }))
+        }
+    }
+}
+
 /// Opens a projector: one per screen when the setting says so, above other windows when it says
 /// so. → its id. The caller saves the list.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn open_projector(h: &mut Held, p: &ProjectorReq, data: &std::path::Path) -> Result<u64, String> {
+fn open_projector(ctx: ViewCtx<'_>, h: &mut Held, p: &ProjectorReq, data: &std::path::Path) -> Result<u64, String> {
     let settings = h.settings.clone().unwrap_or_default();
     let c = h.collection.as_ref().ok_or(STOPPED)?;
     let of = match p.what.as_str() {
@@ -2475,7 +2898,7 @@ fn open_projector(h: &mut Held, p: &ProjectorReq, data: &std::path::Path) -> Res
         });
     });
     let look = multiview_look(&settings);
-    let made = c.projector(&of, p.screen.map(|s| s as usize), look, on_close, on_pick).map_err(|e| e.to_string())?;
+    let made = create_projector_win(ctx, c, p, &of, look, on_close, on_pick)?;
     if p.on_top || settings.projector_on_top {
         made.set_on_top(true);
     }
@@ -2502,7 +2925,7 @@ fn save_projectors(h: &Held, data: &std::path::Path) {
 /// The projectors kept from last time, opened again (a source that is gone or a display that is
 /// not there is skipped, with a note in the log).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn restore_projectors(h: &mut Held, data: &std::path::Path) {
+fn restore_projectors(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path) {
     if !h.settings.as_ref().is_some_and(|s| s.projector_restore) {
         return;
     }
@@ -2513,10 +2936,150 @@ fn restore_projectors(h: &mut Held, data: &std::path::Path) {
         .map(|l| l.value)
         .unwrap_or_default();
     for p in list {
-        if let Err(e) = open_projector(h, &p, data) {
+        if let Err(e) = open_projector(ctx, h, &p, data) {
             tracing::warn!(error = %e, what = %p.what, "a saved projector didn't open");
         }
     }
+}
+
+fn apply_settings_on_main(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    data: &std::path::Path,
+    s: StudioSettings,
+) -> Result<Vec<String>, String> {
+    let mut notes: Vec<String> = Vec::new();
+    let prev_settings = h.settings.clone();
+    // The sound rate and broadcast timing are read when the engine opens (a new canvas or format
+    // reopens it just below): set first, so reopening takes them, and store the incoming settings
+    // so any rebuilt multiview/projector reads them immediately (rolled back if reopening fails).
+    apply_audio_format(&s);
+    h.settings = Some(s.clone());
+    // Streaming now: what Optimize changes (frame rate, size, encoder) goes to the
+    // stream on air at once (owner, 15 Nov: "I have to end and stream again").
+    let live = any_main_stream_active(h);
+    let any_live = any_stream_group_active(h);
+    if let Some(c) = h.collection.as_ref() {
+        let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
+        let now = c.canvas();
+        // Only the frame rate, while live: the stream takes it below; the canvas
+        // follows when the stream ends (`apply_waiting_canvas`).
+        let rate_only = live && (canvas.width, canvas.height) == (now.width, now.height);
+        // Changing sample rate or broadcast timing on an idle engine takes effect immediately by
+        // reopening the canvas/engine once no active output holds it.
+        let format_changed = c.engine_format().is_some_and(|running| restart_note(running, &s).is_some());
+        let busy = outputs_busy_for_switch(h);
+        if (canvas != now && !rate_only) || (!busy && format_changed) {
+            if busy {
+                notes.push(
+                    "The new size and frame rate apply once streaming, recording, replay, NDI and the virtual camera are off."
+                        .into(),
+                );
+            } else if let Err(e) = apply_canvas(ctx, h, data, canvas) {
+                h.settings = prev_settings.clone();
+                apply_audio_format(prev_settings.as_ref().unwrap_or(&StudioSettings::default()));
+                return Err(e);
+            }
+        } else if rate_only && canvas.fps > now.fps {
+            notes.push(format!("The stream goes up to {} fps once it ends.", canvas.fps));
+        }
+        if !busy {
+            drop_inactive_outputs(h);
+        }
+        let c = h.collection.as_ref().ok_or(STOPPED)?;
+        let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
+        if c.set_monitoring_device(&name, &id).is_err() {
+            notes.push(format!("{name} can't play sound; the system's device is used."));
+        }
+        c.set_true_peak(s.true_peak);
+        c.set_low_latency(s.low_latency_audio);
+    }
+    if let Some(running) = h.collection.as_ref().and_then(|c| c.engine_format())
+        && let Some(note) = restart_note(running, &s)
+    {
+        notes.push(note);
+    }
+    // The stream on air takes a new encoder, size or frame rate at once, without
+    // stopping; a new bitrate alone just changes the bitrate.
+    let was = prev_settings;
+    let was_encode = was.as_ref().map(|o| effective_stream_encode(o, h.stream_cap, h.live_pct));
+    let encode = effective_stream_encode(&s, h.stream_cap, h.live_pct);
+    // What changed besides the bitrate: the encoder, its options, the size, the rate.
+    let shape_changed =
+        was.as_ref().is_some_and(|o| was_encode.as_ref().is_some_and(|a| shape_differs(a, &encode)) || o.fps != s.fps);
+    let kbps = encode.video_kbps;
+    let reshaped = if let Some(st) = h.stream.as_ref().filter(|_| live && shape_changed) {
+        match st.reshape(&encode, s.fps) {
+            Ok(()) => {
+                // What it runs with now: a recording "Same as stream" started
+                // next compares with this (a 1080p stream reshaped to 720p was
+                // still taken as unscaled).
+                if let Some(w) = h.stream_with.as_mut() {
+                    w.encode = encode;
+                }
+                true
+            }
+            Err(e) => {
+                notes.push(format!("{e} The next stream uses the new settings."));
+                false
+            }
+        }
+    } else if live
+        && shape_changed
+        && let Some(slot) = h.groups.get_mut(GROUP_MAIN).filter(|g| g.output.stats().active)
+    {
+        let inferred_cap = main_slot_cap_kbps(&slot.spec, slot.cap_kbps, was.as_ref().map(|o| o.video_kbps));
+        let next_spec = next_main_spec_for_settings(&slot.spec, &s, inferred_cap, was.as_ref());
+        let mut next_group_settings = stream_settings_for_group(&s, &next_spec);
+        let live_kbps = at_pct(next_spec.key.kbps, slot.live_pct);
+        next_group_settings.encode.video_kbps = live_kbps;
+        match slot.output.reshape(&next_group_settings.encode, s.fps) {
+            Ok(()) => {
+                if slot.cap_kbps.is_none() {
+                    slot.cap_kbps = inferred_cap;
+                }
+                slot.spec = next_spec;
+                slot.with = next_group_settings;
+                true
+            }
+            Err(e) => {
+                notes.push(format!("{e} The next stream uses the new settings."));
+                false
+            }
+        }
+    } else if any_live && shape_changed {
+        notes.push("The next stream uses the new settings.".into());
+        false
+    } else {
+        false
+    };
+    if live && was.as_ref().is_some_and(|o| o.audio_kbps != s.audio_kbps) {
+        notes.push("The new sound bitrate starts with the next stream.".into());
+    }
+    let was_kbps = was.as_ref().map(|o| o.video_kbps);
+    if was_kbps.is_some_and(|k| k != s.video_kbps) {
+        if !reshaped && let Some(st) = h.stream.as_mut() {
+            st.set_video_kbps(kbps);
+        }
+        if let Some(st) = h.vstream.as_mut() {
+            st.set_video_kbps(at_pct(s.video_kbps, h.live_pct));
+        }
+        if !reshaped && let Some(slot) = h.groups.get_mut(GROUP_MAIN) {
+            let cap = main_slot_cap_kbps(&slot.spec, slot.cap_kbps, was.as_ref().map(|o| o.video_kbps));
+            if slot.cap_kbps.is_none() {
+                slot.cap_kbps = cap;
+            }
+            let k = apply_main_slot_bitrate_on_spec(&mut slot.spec, cap, slot.live_pct, s.video_kbps);
+            slot.output.set_video_kbps(k);
+            slot.with.encode.video_kbps = k;
+        }
+    }
+    save_json(&settings_file(data), &serde_json::to_value(&s).unwrap_or(Value::Null));
+    // Open multiviews and projectors take updated layout, on-top, and cursor visibility at once.
+    refresh_projectors(h);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    save_projectors(h, data);
+    Ok(notes)
 }
 
 #[async_trait::async_trait]
@@ -2534,6 +3097,7 @@ impl StudioHost for DesktopStudio {
         fetch_matte(self.data.clone());
         let config = self.data.join("studio");
         let data = self.data.clone();
+        let app = self.app.clone();
         self.on_main(move |h| {
             // Read here, on the main thread, so a switch can't slip in between (CodeRabbit).
             let file = scenes_file(&data);
@@ -2563,7 +3127,9 @@ impl StudioHost for DesktopStudio {
             collection.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(collection);
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            restore_projectors(h, &data);
+            restore_projectors(ViewCtx::App(&app), h, &data);
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            let _ = &app;
             write_session(session_now(h).as_ref());
             // The first Start after a crash says what was on, for the engine to put back.
             let recovered = CRASHED.lock().ok().and_then(|mut c| c.take());
@@ -2574,10 +3140,11 @@ impl StudioHost for DesktopStudio {
 
     async fn confirm_collection(&self) -> Result<StudioStatus, String> {
         let data = self.data.clone();
+        let app = self.app.clone();
         self.on_main(move |h| {
             let file = scenes_file(&data);
             if h.collection.is_some() {
-                swap_collection(h, &file, &file)?;
+                swap_collection(ViewCtx::App(&app), h, &data, &file, &file)?;
                 write_session(session_now(h).as_ref());
             }
             Ok(Self::status_of(h))
@@ -2661,7 +3228,7 @@ impl StudioHost for DesktopStudio {
             if let Some(p) = h.program_view.as_mut() {
                 p.set_rect(rect, scale);
             } else {
-                make_program_view(&app, h)?;
+                make_program_view(ViewCtx::App(&app), h)?;
             }
             h.program_holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
             h.program_opacity = r.opacity;
@@ -2713,7 +3280,7 @@ impl StudioHost for DesktopStudio {
             v.holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
             v.opacity = r.opacity;
             v.shade = r.shade.unwrap_or(0.0);
-            let Some(p) = v.view.as_mut() else { return make_vertical_view(&app, h) };
+            let Some(p) = v.view.as_mut() else { return make_vertical_view(ViewCtx::App(&app), h) };
             if let Some(bg) = v.bg {
                 p.background(bg);
             }
@@ -2762,7 +3329,7 @@ impl StudioHost for DesktopStudio {
                 p.set_shade(h.preview_shade);
                 return Ok(());
             }
-            make_preview(&app, h)
+            make_preview(ViewCtx::App(&app), h)
         })
         .await?
     }
@@ -3145,7 +3712,7 @@ impl StudioHost for DesktopStudio {
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             let out = run(c, act).map_err(|e| e.to_string());
             if turns_vertical {
-                let _ = make_vertical_view(&app, h);
+                let _ = make_vertical_view(ViewCtx::App(&app), h);
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
             if let Some(b) = before {
@@ -3175,141 +3742,7 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         let app = self.app.clone();
         let keys = s.hotkeys.clone();
-        let note = self
-            .on_main(move |h| {
-                let mut notes: Vec<String> = Vec::new();
-                // The sound rate and broadcast timing are read when the engine opens (a new canvas opens
-                // it again just below): set first, so that reopening takes them.
-                apply_audio_format(&s);
-                // Streaming now: what Optimize changes (frame rate, size, encoder) goes to the
-                // stream on air at once (owner, 15 Nov: "I have to end and stream again").
-                let live = any_main_stream_active(h);
-                let any_live = any_stream_group_active(h);
-                if let Some(c) = h.collection.as_mut() {
-                    let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-                    let now = c.canvas();
-                    // Only the frame rate, while live: the stream takes it below; the canvas
-                    // follows when the stream ends (`apply_waiting_canvas`).
-                    let rate_only = live && (canvas.width, canvas.height) == (now.width, now.height);
-                    // Something draws from the picture (a recording, the replay buffer, NDI, the
-                    // virtual camera, a stream at another size): the new size waits for it to
-                    // stop, and the rest of the settings are saved now. Before, the virtual
-                    // camera and NDI were turned off first and then the change was refused, and
-                    // the whole save with it (peer, 18 Nov).
-                    let busy = any_live
-                        || h.record.as_ref().is_some_and(|r| r.0.stats().active)
-                        || h.replay.as_ref().is_some_and(|r| r.active())
-                        || h.ndi.is_some()
-                        || h.virtualcam.is_some();
-                    if canvas != now && !rate_only {
-                        if busy {
-                            notes.push(
-                                "The new size and frame rate apply once streaming, recording, replay, NDI and the virtual camera are off."
-                                    .into(),
-                            );
-                        } else {
-                            apply_canvas(&app, h, canvas)?;
-                        }
-                    } else if rate_only && canvas.fps > now.fps {
-                        notes.push(format!("The stream goes up to {} fps once it ends.", canvas.fps));
-                    }
-                    let c = h.collection.as_ref().ok_or(STOPPED)?;
-                    let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
-                    if c.set_monitoring_device(&name, &id).is_err() {
-                        notes.push(format!("{name} can't play sound; the system's device is used."));
-                    }
-                    c.set_true_peak(s.true_peak);
-                    c.set_low_latency(s.low_latency_audio);
-                }
-                if let Some(running) = h.collection.as_ref().and_then(|c| c.engine_format())
-                    && let Some(note) = restart_note(running, &s)
-                {
-                    notes.push(note);
-                }
-                // The stream on air takes a new encoder, size or frame rate at once, without
-                // stopping; a new bitrate alone just changes the bitrate.
-                let was = h.settings.clone();
-                let was_encode = was.as_ref().map(|o| effective_stream_encode(o, h.stream_cap, h.live_pct));
-                let encode = effective_stream_encode(&s, h.stream_cap, h.live_pct);
-                // What changed besides the bitrate: the encoder, its options, the size, the rate.
-                let shape_changed = was.as_ref().is_some_and(|o| {
-                    was_encode.as_ref().is_some_and(|a| shape_differs(a, &encode)) || o.fps != s.fps
-                });
-                let kbps = encode.video_kbps;
-                let reshaped = if let Some(st) = h.stream.as_ref().filter(|_| live && shape_changed) {
-                    match st.reshape(&encode, s.fps) {
-                        Ok(()) => {
-                            // What it runs with now: a recording "Same as stream" started
-                            // next compares with this (a 1080p stream reshaped to 720p was
-                            // still taken as unscaled).
-                            if let Some(w) = h.stream_with.as_mut() {
-                                w.encode = encode;
-                            }
-                            true
-                        }
-                        Err(e) => {
-                            notes.push(format!("{e} The next stream uses the new settings."));
-                            false
-                        }
-                    }
-                } else if live
-                    && shape_changed
-                    && let Some(slot) = h.groups.get_mut(GROUP_MAIN).filter(|g| g.output.stats().active)
-                {
-                    let inferred_cap = main_slot_cap_kbps(&slot.spec, slot.cap_kbps, was.as_ref().map(|o| o.video_kbps));
-                    let next_spec = next_main_spec_for_settings(&slot.spec, &s, inferred_cap, was.as_ref());
-                    let mut next_group_settings = stream_settings_for_group(&s, &next_spec);
-                    let live_kbps = at_pct(next_spec.key.kbps, slot.live_pct);
-                    next_group_settings.encode.video_kbps = live_kbps;
-                    match slot.output.reshape(&next_group_settings.encode, s.fps) {
-                        Ok(()) => {
-                            if slot.cap_kbps.is_none() {
-                                slot.cap_kbps = inferred_cap;
-                            }
-                            slot.spec = next_spec;
-                            slot.with = next_group_settings;
-                            true
-                        }
-                        Err(e) => {
-                            notes.push(format!("{e} The next stream uses the new settings."));
-                            false
-                        }
-                    }
-                } else if any_live && shape_changed {
-                    notes.push("The next stream uses the new settings.".into());
-                    false
-                } else {
-                    false
-                };
-                if live && was.as_ref().is_some_and(|o| o.audio_kbps != s.audio_kbps) {
-                    notes.push("The new sound bitrate starts with the next stream.".into());
-                }
-                let was_kbps = was.as_ref().map(|o| o.video_kbps);
-                if was_kbps.is_some_and(|k| k != s.video_kbps) {
-                    if !reshaped && let Some(st) = h.stream.as_mut() {
-                        st.set_video_kbps(kbps);
-                    }
-                    if let Some(st) = h.vstream.as_mut() {
-                        st.set_video_kbps(at_pct(s.video_kbps, h.live_pct));
-                    }
-                    if !reshaped && let Some(slot) = h.groups.get_mut(GROUP_MAIN) {
-                        let cap = main_slot_cap_kbps(&slot.spec, slot.cap_kbps, was.as_ref().map(|o| o.video_kbps));
-                        if slot.cap_kbps.is_none() {
-                            slot.cap_kbps = cap;
-                        }
-                        let k = apply_main_slot_bitrate_on_spec(&mut slot.spec, cap, slot.live_pct, s.video_kbps);
-                        slot.output.set_video_kbps(k);
-                        slot.with.encode.video_kbps = k;
-                    }
-                }
-                save_json(&settings_file(&data), &serde_json::to_value(&s).unwrap_or(Value::Null));
-                apply_audio_format(&s);
-                h.settings = Some(s);
-                // Open multiviews take a new layout at once.
-                refresh_projectors(h);
-                Ok::<_, String>(notes)
-            })
-            .await??;
+        let note = self.on_main(move |h| apply_settings_on_main(ViewCtx::App(&app), h, &data, s)).await??;
         let failed = crate::studio_keys::apply(&self.app, &keys);
         let mut all = note;
         if !failed.is_empty() {
@@ -3482,6 +3915,7 @@ impl StudioHost for DesktopStudio {
 
     async fn record(&self, on: bool) -> Result<Value, String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         tracing::info!(on, "the recording is asked to {}", if on { "start" } else { "stop" });
         self.on_main(move |h| {
             if !on {
@@ -3505,7 +3939,7 @@ impl StudioHost for DesktopStudio {
                         }
                     }
                 }
-                apply_waiting_canvas(&app, h);
+                apply_waiting_canvas(&app, h, &data);
                 return Ok(Value::Null);
             }
             if let Some(r) = h.record.as_ref().filter(|r| r.0.stats().active) {
@@ -3709,10 +4143,11 @@ impl StudioHost for DesktopStudio {
 
     async fn replay(&self, on: bool) -> Result<Value, String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         self.on_main(move |h| {
             if !on {
                 h.replay = None;
-                apply_waiting_canvas(&app, h);
+                apply_waiting_canvas(&app, h, &data);
                 return Ok(json!({ "active": false }));
             }
             if h.replay.as_ref().is_some_and(|r| r.active()) {
@@ -3756,11 +4191,12 @@ impl StudioHost for DesktopStudio {
 
     async fn virtual_camera(&self, on: bool, source: Option<String>) -> Result<Value, String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         self.on_main(move |h| {
             h.virtualcam = None;
             if !on {
                 // A frame rate chosen while it ran can be applied now (review).
-                apply_waiting_canvas(&app, h);
+                apply_waiting_canvas(&app, h, &data);
                 return Ok(json!({ "active": false }));
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
@@ -3823,11 +4259,12 @@ impl StudioHost for DesktopStudio {
 
     async fn ndi_output(&self, on: bool, name: Option<String>) -> Result<Value, String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         self.on_main(move |h| {
             h.ndi = None;
             if !on {
                 // A frame rate chosen while it ran can be applied now (review).
-                apply_waiting_canvas(&app, h);
+                apply_waiting_canvas(&app, h, &data);
                 return Ok(json!({ "active": false, "name": null }));
             }
             let c = h.collection.as_ref().ok_or(STOPPED)?;
@@ -4592,8 +5029,9 @@ impl StudioHost for DesktopStudio {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             let data = self.data.clone();
+            let app = self.app.clone();
             self.on_main(move |h| {
-                let id = open_projector(h, &p, &data)?;
+                let id = open_projector(ViewCtx::App(&app), h, &p, &data)?;
                 save_projectors(h, &data);
                 Ok(json!({ "id": id }))
             })
@@ -4657,6 +5095,7 @@ impl StudioHost for DesktopStudio {
 
     async fn stream_start(&self, server: String, key: String, tracks: Vec<(u32, u32, u32)>) -> Result<Value, String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         self.on_main(move |h| {
             h.collection.as_ref().ok_or(STOPPED)?;
             if let Some(s) = h.stream.as_ref().filter(|s| s.stats().active) {
@@ -4667,7 +5106,7 @@ impl StudioHost for DesktopStudio {
             h.stream_started = None;
             h.live_pct = None;
             // A frame rate chosen during the last stream, still waiting.
-            apply_waiting_canvas(&app, h);
+            apply_waiting_canvas(&app, h, &data);
             let s = h.settings.clone().unwrap_or_default();
             if s.bframes && h.stream_cap.is_some_and(|c| c.no_bframes) {
                 tracing::info!("B-frames turned off for this stream: a WebRTC (WHIP) destination can't carry them");
@@ -4729,6 +5168,7 @@ impl StudioHost for DesktopStudio {
 
     async fn stream_stop(&self) -> Result<(), String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         self.on_main(move |h| {
             h.groups.clear();
             h.vstream = None;
@@ -4737,7 +5177,7 @@ impl StudioHost for DesktopStudio {
             h.stream = None;
             h.stream_started = None;
             h.stream_with = None;
-            apply_waiting_canvas(&app, h);
+            apply_waiting_canvas(&app, h, &data);
         })
         .await
     }
@@ -4748,6 +5188,7 @@ impl StudioHost for DesktopStudio {
 
     async fn start_encode_group(&self, spec: EncodeGroupSpec, hub: std::sync::Arc<Hub>) -> Result<bool, String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         self.on_main(move |h| -> Result<bool, String> {
             h.collection.as_ref().ok_or(STOPPED)?;
             if let Some(existing) = h.groups.get(&spec.id)
@@ -4757,7 +5198,7 @@ impl StudioHost for DesktopStudio {
                 return Ok(true);
             }
             if !any_stream_group_active(h) {
-                apply_waiting_canvas(&app, h);
+                apply_waiting_canvas(&app, h, &data);
             }
             h.groups.remove(&spec.id);
             let s = h.settings.clone().unwrap_or_default();
@@ -4821,13 +5262,14 @@ impl StudioHost for DesktopStudio {
 
     async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         let group_id = id.to_string();
         self.on_main(move |h| {
             h.groups.remove(&group_id);
             if !any_stream_group_active(h) {
                 h.stream_started = None;
                 h.stream_with = None;
-                apply_waiting_canvas(&app, h);
+                apply_waiting_canvas(&app, h, &data);
             }
         })
         .await
@@ -4835,6 +5277,7 @@ impl StudioHost for DesktopStudio {
 
     async fn abort_encode_group(&self, id: &str) -> Result<(), String> {
         let app = self.app.clone();
+        let data = self.data.clone();
         let group_id = id.to_string();
         self.on_main(move |h| {
             if let Some(slot) = h.groups.remove(&group_id) {
@@ -4843,7 +5286,7 @@ impl StudioHost for DesktopStudio {
             if !any_stream_group_active(h) {
                 h.stream_started = None;
                 h.stream_with = None;
-                apply_waiting_canvas(&app, h);
+                apply_waiting_canvas(&app, h, &data);
             }
         })
         .await
@@ -7516,5 +7959,484 @@ mod import_tests {
     fn desktop_machine_load_reports_valid_cpu_percentage() {
         let cpu = ferrocast_studio::system::machine_cpu_pct();
         assert!((0.0..=100.0).contains(&cpu) && cpu > 0.0, "unexpected machine CPU pct: {cpu}");
+    }
+}
+
+#[cfg(test)]
+mod collection_profile_tests {
+    use super::*;
+
+    static ENGINE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_engine() -> std::sync::MutexGuard<'static, ()> {
+        ENGINE_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct ResetAudioFormat;
+    impl Drop for ResetAudioFormat {
+        fn drop(&mut self) {
+            apply_audio_format(&StudioSettings::default());
+        }
+    }
+
+    fn wait_for_frames(engine: &ferrocast_studio::stage::EngineRef) -> u64 {
+        for _ in 0..400 {
+            let n = engine.frames();
+            if n > 0 {
+                return n;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        engine.frames()
+    }
+
+    fn make_collection_doc(
+        canvas: Canvas,
+        main_scene: &str,
+        preview_scene: &str,
+        vertical_scene: Option<&str>,
+        extra_source: &str,
+    ) -> Value {
+        let c = Collection::new(canvas, main_scene).unwrap_or_else(|e| panic!("new collection: {e}"));
+        c.add_scene(preview_scene).unwrap_or_else(|e| panic!("add preview scene: {e}"));
+        c.add_source(main_scene, "color_source_v3", extra_source, &json!({}), false)
+            .unwrap_or_else(|e| panic!("add extra source: {e}"));
+        c.add_source(preview_scene, "color_source_v3", &format!("{extra_source}_p"), &json!({}), false)
+            .unwrap_or_else(|e| panic!("add preview source: {e}"));
+        c.set_studio_mode(true);
+        c.set_preview(preview_scene).unwrap_or_else(|e| panic!("set_preview: {e}"));
+        if let Some(vs) = vertical_scene {
+            c.start_vertical(vs).unwrap_or_else(|e| panic!("start_vertical: {e}"));
+            c.add_source(vs, "color_source_v3", &format!("{extra_source}_v"), &json!({}), false)
+                .unwrap_or_else(|e| panic!("add vertical source: {e}"));
+        }
+        c.save(COLLECTION)
+    }
+
+    fn write_json_sync(path: &std::path::Path, value: &Value) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(value).unwrap_or_else(|e| panic!("json: {e}")))
+            .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+
+    fn populate_cached_views(h: &mut Held, data: &std::path::Path, paused: bool) {
+        h.preview_at = Some((Rect { x: 10.0, y: 20.0, w: 640.0, h: 360.0, vh: 800.0 }, 2.0));
+        h.preview_canvas = Some((12.0, 22.0, 636.0, 356.0));
+        h.preview_bg = Some(0xFF112233);
+        h.preview_stripe = Some(0xFF445566);
+        h.preview_holes = vec![(1.0, 2.0, 30.0, 40.0, 6.0)];
+        h.preview_opacity = Some(0.85);
+        h.preview_shade = 0.25;
+        h.preview_paused = paused;
+        h.selected = Some(("MainA".into(), vec![1]));
+        h.frames = Some("MainA".into());
+
+        h.program_at = Some((Rect { x: 660.0, y: 20.0, w: 320.0, h: 180.0, vh: 800.0 }, 2.0));
+        h.program_bg = Some(0xFF778899);
+        h.program_stripe = Some(0xFF121314);
+        h.program_holes = vec![(5.0, 6.0, 20.0, 20.0, 4.0)];
+        h.program_opacity = Some(0.9);
+        h.program_shade = 0.15;
+
+        h.vertical.at = Some((Rect { x: 990.0, y: 20.0, w: 180.0, h: 320.0, vh: 800.0 }, 1.5));
+        h.vertical.canvas = Some((992.0, 24.0, 176.0, 312.0));
+        h.vertical.bg = Some(0xFFAABBCC);
+        h.vertical.stripe = Some(0xFFDDEEFF);
+        h.vertical.holes = vec![(9.0, 10.0, 12.0, 14.0, 2.0)];
+        h.vertical.opacity = Some(0.75);
+        h.vertical.shade = 0.4;
+
+        make_preview(ViewCtx::Test, h).unwrap_or_else(|e| panic!("make_preview: {e}"));
+        make_program_view(ViewCtx::Test, h).unwrap_or_else(|e| panic!("make_program_view: {e}"));
+        make_vertical_view(ViewCtx::Test, h).unwrap_or_else(|e| panic!("make_vertical_view: {e}"));
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            for req in [
+                ProjectorReq { what: "multiview".into(), name: None, screen: None, on_top: false },
+                ProjectorReq { what: "program".into(), name: None, screen: None, on_top: true },
+                ProjectorReq { what: "source".into(), name: Some("SharedColor".into()), screen: None, on_top: false },
+            ] {
+                open_projector(ViewCtx::Test, h, &req, data).unwrap_or_else(|e| panic!("open_projector: {e}"));
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let _ = data;
+    }
+
+    fn assert_preview_look(p: &Preview, h: &Held) {
+        let tv = p.test_view().expect("test view");
+        let (rect, scale) = h.preview_at.expect("preview_at");
+        assert_eq!(
+            (tv.rect.x, tv.rect.y, tv.rect.w, tv.rect.h, tv.rect.vh, tv.scale),
+            (rect.x, rect.y, rect.w, rect.h, rect.vh, scale)
+        );
+        assert_eq!(*tv.area.borrow(), h.preview_canvas);
+        assert_eq!(tv.bg.get(), h.preview_bg);
+        assert_eq!(tv.stripe.get(), h.preview_stripe);
+        assert_eq!(*tv.holes.borrow(), h.preview_holes);
+        assert!((tv.opacity.get() - h.preview_opacity.unwrap_or(1.0)).abs() < 1e-6);
+        assert!((tv.shade.get() - h.preview_shade).abs() < 1e-6);
+        assert_eq!(tv.paused.get(), h.preview_paused);
+    }
+
+    fn assert_program_look(p: &Preview, h: &Held) {
+        let tv = p.test_view().expect("test program view");
+        let (rect, scale) = h.program_at.expect("program_at");
+        assert_eq!(
+            (tv.rect.x, tv.rect.y, tv.rect.w, tv.rect.h, tv.rect.vh, tv.scale),
+            (rect.x, rect.y, rect.w, rect.h, rect.vh, scale)
+        );
+        assert_eq!(tv.bg.get(), h.program_bg);
+        assert_eq!(tv.stripe.get(), h.program_stripe);
+        assert_eq!(*tv.holes.borrow(), h.program_holes);
+        assert!((tv.opacity.get() - h.program_opacity.unwrap_or(1.0)).abs() < 1e-6);
+        assert!((tv.shade.get() - h.program_shade).abs() < 1e-6);
+        assert_eq!(tv.paused.get(), h.preview_paused);
+    }
+
+    fn assert_vertical_look(p: &Preview, h: &Held) {
+        let tv = p.test_view().expect("test vertical view");
+        let (rect, scale) = h.vertical.at.expect("vertical.at");
+        assert_eq!(
+            (tv.rect.x, tv.rect.y, tv.rect.w, tv.rect.h, tv.rect.vh, tv.scale),
+            (rect.x, rect.y, rect.w, rect.h, rect.vh, scale)
+        );
+        assert_eq!(*tv.area.borrow(), h.vertical.canvas);
+        assert_eq!(tv.bg.get(), h.vertical.bg);
+        assert_eq!(tv.stripe.get(), h.vertical.stripe);
+        assert_eq!(*tv.holes.borrow(), h.vertical.holes);
+        assert!((tv.opacity.get() - h.vertical.opacity.unwrap_or(1.0)).abs() < 1e-6);
+        assert!((tv.shade.get() - h.vertical.shade).abs() < 1e-6);
+        assert_eq!(tv.paused.get(), h.preview_paused);
+    }
+
+    #[test]
+    fn swap_collection_releases_old_engine_rebuilds_views_and_opens_new_engine_with_fps() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_b = dir.path().join("collections").join("b.json");
+
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", Some("VertA"), "SharedColor");
+        let doc_b = make_collection_doc(canvas, "GameB", "PreviewB", Some("VertB"), "SharedColor");
+        write_json_sync(&scenes_a, &doc_a);
+        write_json_sync(&scenes_b, &doc_b);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap_or_else(|e| panic!("load A: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let settings = StudioSettings {
+            multiview_layout: "bottom".into(),
+            multiview_labels: false,
+            multiview_safe_areas: true,
+            projector_on_top: false,
+            projector_hide_cursor: true,
+            ..StudioSettings::default()
+        };
+        let mut h = Held { settings: Some(settings), collection: Some(col_a), ..Held::default() };
+        populate_cached_views(&mut h, dir.path(), false);
+
+        let old_engine = h.collection.as_ref().expect("col A").engine_ref().expect("engine A");
+        let old_weak = old_engine.downgrade();
+        assert!(h.preview.as_ref().expect("preview").engine_ref().expect("ref").same(&old_engine));
+        assert!(h.program_view.as_ref().expect("program").engine_ref().expect("ref").same(&old_engine));
+        assert!(h.vertical.view.as_ref().expect("vertical").engine_ref().expect("ref").same(&old_engine));
+        assert!(ferrocast_studio::stage::levels_now(&["SharedColor".into()], false).is_some());
+        drop(old_engine);
+
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_a, &scenes_b)
+            .unwrap_or_else(|e| panic!("swap A->B: {e}"));
+
+        assert!(!old_weak.is_alive(), "old Stage own::Shared must be completely released after swap");
+        let col_b = h.collection.as_ref().expect("col B");
+        assert!(col_b.has_engine(), "new collection must open its engine immediately during swap");
+        let eng_b = col_b.engine_ref().expect("engine B");
+        assert!(wait_for_frames(&eng_b) > 0, "new engine must produce frames after swap");
+        assert!(col_b.stats().fps > 0.0, "new engine stats().fps must be > 0 after swap");
+        assert!(
+            ferrocast_studio::stage::levels_now(&["SharedColor".into()], false).is_some(),
+            "LIVE_ENGINE must track the new engine after swap"
+        );
+        assert!(h.selected.is_none());
+        assert!(h.frames.is_none());
+
+        let preview = h.preview.as_ref().expect("rebuilt preview");
+        assert!(preview.engine_ref().expect("preview engine").same(&eng_b), "preview must hold new engine");
+        assert_eq!(preview.shown_scene().as_deref(), Some("PreviewB"));
+        assert_preview_look(preview, &h);
+        assert!(preview.test_view().expect("tv").picked.borrow().is_none());
+        assert!(preview.test_view().expect("tv").frames.borrow().is_none());
+
+        let program = h.program_view.as_ref().expect("rebuilt program view");
+        assert!(program.engine_ref().expect("program engine").same(&eng_b), "program view must hold new engine");
+        assert_program_look(program, &h);
+
+        let vertical = h.vertical.view.as_ref().expect("rebuilt vertical view");
+        assert!(vertical.engine_ref().expect("vertical engine").same(&eng_b), "vertical view must hold new engine");
+        assert_eq!(vertical.shown_scene().as_deref(), Some("VertB"));
+        assert_vertical_look(vertical, &h);
+
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(h.projectors.len(), 3, "all three projectors must rebuild onto new collection");
+            for (_, p, req) in &h.projectors {
+                assert!(p.engine_ref().same(&eng_b), "projector {} must hold new engine", req.what);
+                let tp = p.test_proj().expect("test projector");
+                assert_eq!(tp.on_top.get(), req.on_top);
+                assert!(tp.hide_cursor.get());
+                if req.what == "source" {
+                    assert_eq!(tp.name.as_deref(), Some("SharedColor"));
+                }
+                if req.what == "multiview" {
+                    let names = tp.names.borrow().clone();
+                    assert!(
+                        names.contains(&"GameB".to_string()) && names.contains(&"PreviewB".to_string()),
+                        "{names:?}"
+                    );
+                    assert!(!names.contains(&"MainA".to_string()), "{names:?}");
+                    assert_eq!(*tp.preview.borrow(), Some("PreviewB".to_string()));
+                    assert!(matches!(tp.look.borrow().layout, ferrocast_studio::MultiviewLayout::Bottom));
+                    assert!(!tp.look.borrow().labels);
+                    assert!(tp.look.borrow().safe_areas);
+                }
+            }
+        }
+
+        // Swapping back B -> A must release B's engine and open A's cleanly as well.
+        let weak_b = eng_b.downgrade();
+        drop(eng_b);
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_b, &scenes_a)
+            .unwrap_or_else(|e| panic!("swap B->A: {e}"));
+        assert!(!weak_b.is_alive(), "collection B engine must be released on switch back");
+        let col_a2 = h.collection.as_ref().expect("col A restored");
+        let eng_a2 = col_a2.engine_ref().expect("engine A2");
+        assert!(wait_for_frames(&eng_a2) > 0);
+        assert!(col_a2.stats().fps > 0.0);
+        assert_eq!(h.preview.as_ref().expect("preview").shown_scene().as_deref(), Some("PreviewA"));
+        assert_eq!(h.vertical.view.as_ref().expect("vertical").shown_scene().as_deref(), Some("VertA"));
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn swap_collection_failed_load_restores_old_collection_and_all_views() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_bad = dir.path().join("collections").join("bad.json");
+
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", Some("VertA"), "SharedColor");
+        // Valid JSON referencing `"Main"` in sources while having no scenes triggers add_scene("Main") failure.
+        let bad_doc = json!({
+            "ferrocast": { "program_copy": { "scene": "X", "items": [{ "name": "Main" }] } },
+            "sources": [{ "id": "color_source_v3", "name": "Main" }],
+            "scene_order": []
+        });
+        write_json_sync(&scenes_a, &doc_a);
+        write_json_sync(&scenes_bad, &bad_doc);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap_or_else(|e| panic!("load A: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held {
+            settings: Some(StudioSettings::default()),
+            collection: Some(col_a),
+            collection_deferred: true,
+            ..Held::default()
+        };
+        populate_cached_views(&mut h, dir.path(), false);
+
+        let old_engine = h.collection.as_ref().expect("col A").engine_ref().expect("engine A");
+        let old_weak = old_engine.downgrade();
+
+        let err = swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_a, &scenes_bad)
+            .expect_err("invalid collection must fail");
+        assert!(err.contains("didn't load"), "unexpected error: {err}");
+
+        assert!(old_weak.is_alive(), "failed load must keep the old engine alive");
+        let kept = h.collection.as_ref().expect("old collection restored");
+        assert!(kept.engine_ref().expect("kept engine").same(&old_engine));
+        assert!(h.collection_deferred, "deferred flag must remain untouched on failed swap");
+        assert_eq!(h.selected, Some(("MainA".into(), vec![1])));
+        assert_eq!(h.frames.as_deref(), Some("MainA"));
+
+        let preview = h.preview.as_ref().expect("preview preserved");
+        assert!(preview.engine_ref().expect("ref").same(&old_engine));
+        assert_eq!(preview.shown_scene().as_deref(), Some("PreviewA"));
+        assert!(h.program_view.as_ref().expect("program preserved").engine_ref().expect("ref").same(&old_engine));
+        let vert = h.vertical.view.as_ref().expect("vertical preserved on failed swap");
+        assert!(vert.engine_ref().expect("ref").same(&old_engine));
+        assert_eq!(vert.shown_scene().as_deref(), Some("VertA"));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(h.projectors.len(), 3, "all projectors must stay attached to old engine on failed swap");
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn swap_collection_paused_vertical_off_and_missing_source_projector() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_b = dir.path().join("collections").join("b.json");
+
+        // Collection B has NO vertical enabled and NO `"SharedColor"` source.
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", Some("VertA"), "SharedColor");
+        let doc_b = make_collection_doc(canvas, "GameB", "PreviewB", None, "OnlyB");
+        write_json_sync(&scenes_a, &doc_a);
+        write_json_sync(&scenes_b, &doc_b);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap_or_else(|e| panic!("load A: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held { settings: Some(StudioSettings::default()), collection: Some(col_a), ..Held::default() };
+        populate_cached_views(&mut h, dir.path(), true);
+
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_a, &scenes_b)
+            .unwrap_or_else(|e| panic!("swap A->B: {e}"));
+
+        assert!(h.preview.as_ref().expect("preview").test_view().expect("tv").paused.get());
+        assert!(h.program_view.as_ref().expect("program").test_view().expect("tv").paused.get());
+        assert!(h.vertical.view.is_none(), "vertical off in new collection must clear vertical view");
+        assert!(h.vertical.at.is_some(), "cached vertical rect must be kept when vertical is off");
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(
+                h.projectors.len(),
+                2,
+                "missing source projector skips cleanly while multiview & program rebuild"
+            );
+            assert!(h.projectors.iter().all(|(_, _, r)| r.what != "source"));
+        }
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn profile_switch_canvas_audio_format_projectors_and_durable_read() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let s0 = StudioSettings { width: 1920, height: 1080, fps: 60, ..StudioSettings::default() };
+        let canvas = Canvas { width: s0.width, height: s0.height, fps: s0.fps };
+        let doc = make_collection_doc(canvas, "Main", "Preview", Some("Vert"), "SharedColor");
+        let col = Collection::load(canvas, &doc, FIRST_SCENE).unwrap_or_else(|e| panic!("load: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held { settings: Some(s0.clone()), collection: Some(col), ..Held::default() };
+        populate_cached_views(&mut h, dir.path(), false);
+
+        // 1. Same-aspect resolution/fps change (1920x1080@60 -> 1280x720@30): releases old engine,
+        // rebuilds ALL views INCLUDING open projectors, and keeps preview_canvas.
+        let eng0 = h.collection.as_ref().expect("col").engine_ref().expect("eng0");
+        let weak0 = eng0.downgrade();
+        drop(eng0);
+
+        let s1 = StudioSettings { width: 1280, height: 720, fps: 30, ..s0.clone() };
+        let notes1 =
+            apply_settings_on_main(ViewCtx::Test, &mut h, dir.path(), s1.clone()).unwrap_or_else(|e| panic!("s1: {e}"));
+        assert!(notes1.is_empty(), "idle canvas switch should have no restart note: {notes1:?}");
+        assert!(!weak0.is_alive(), "old engine must be released after canvas change");
+        assert!(h.preview_canvas.is_some(), "same aspect ratio keeps cached preview_canvas");
+        let eng1 = h.collection.as_ref().expect("col").engine_ref().expect("eng1");
+        assert!(wait_for_frames(&eng1) > 0);
+        assert!(h.collection.as_ref().expect("col").stats().fps > 0.0);
+        assert!(h.preview.as_ref().expect("preview").engine_ref().expect("ref").same(&eng1));
+        assert!(h.program_view.as_ref().expect("program").engine_ref().expect("ref").same(&eng1));
+        assert!(h.vertical.view.as_ref().expect("vertical").engine_ref().expect("ref").same(&eng1));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(h.projectors.len(), 3, "open projectors must be rebuilt on canvas change");
+            for (_, p, _) in &h.projectors {
+                assert!(p.engine_ref().same(&eng1), "rebuilt projector must hold new engine");
+            }
+        }
+
+        // 2. Sample rate & broadcast timing change while idle at SAME canvas reopens engine immediately!
+        let weak1 = eng1.downgrade();
+        drop(eng1);
+        let s2 = StudioSettings {
+            sample_rate: 44_100,
+            fps_ntsc: true,
+            multiview_layout: "left".into(),
+            projector_on_top: true,
+            projector_hide_cursor: true,
+            ..s1
+        };
+        let notes2 =
+            apply_settings_on_main(ViewCtx::Test, &mut h, dir.path(), s2.clone()).unwrap_or_else(|e| panic!("s2: {e}"));
+        assert!(
+            notes2.is_empty(),
+            "idle audio/ntsc switch must reopen engine cleanly instead of warning restart: {notes2:?}"
+        );
+        assert!(!weak1.is_alive(), "old engine must be released when audio rate / NTSC changes while idle");
+        let eng2 = h.collection.as_ref().expect("col").engine_ref().expect("eng2");
+        assert_eq!(h.collection.as_ref().expect("col").engine_format(), Some((44_100, true)));
+        assert!(h.preview.as_ref().expect("preview").engine_ref().expect("ref").same(&eng2));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            assert_eq!(h.projectors.len(), 3);
+            for (_, p, _) in &h.projectors {
+                let tp = p.test_proj().expect("tp");
+                assert!(tp.on_top.get(), "projector_on_top from profile must apply");
+                assert!(tp.hide_cursor.get(), "projector_hide_cursor from profile must apply");
+                if tp.what == "multiview" {
+                    assert!(matches!(tp.look.borrow().layout, ferrocast_studio::MultiviewLayout::Left));
+                }
+            }
+        }
+
+        // 3. Aspect ratio change (1280x720 -> 1080x1920) clears stale preview_canvas.
+        let weak2 = eng2.downgrade();
+        drop(eng2);
+        let s3 = StudioSettings { width: 1080, height: 1920, fps: 60, fps_ntsc: false, ..s2 };
+        let _ =
+            apply_settings_on_main(ViewCtx::Test, &mut h, dir.path(), s3.clone()).unwrap_or_else(|e| panic!("s3: {e}"));
+        assert!(!weak2.is_alive());
+        assert!(h.preview_canvas.is_none(), "aspect-ratio change must clear stale preview_canvas");
+
+        // 4. Failed canvas change (engine held externally) rolls back settings and restores all views.
+        let pin = h.collection.as_ref().expect("col").engine_ref().expect("pin");
+        let s_bad = StudioSettings { width: 1920, height: 1080, fps: 30, sample_rate: 44_100, ..s3.clone() };
+        assert!(apply_settings_on_main(ViewCtx::Test, &mut h, dir.path(), s_bad).is_err());
+        assert_eq!(h.settings.as_ref().map(|s| (s.width, s.height)), Some((1080, 1920)));
+        assert!(h.preview.as_ref().expect("preview restored").engine_ref().expect("ref").same(&pin));
+        assert!(h.program_view.as_ref().expect("program restored").engine_ref().expect("ref").same(&pin));
+        assert!(h.vertical.view.as_ref().expect("vertical restored").engine_ref().expect("ref").same(&pin));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(h.projectors.len(), 3, "projectors must restore on failed canvas change");
+        drop(pin);
+
+        // 5. load_profile_settings uses durable read (.bak fallback when main file is missing/corrupt).
+        let profile_path = dir.path().join("profiles").join("p2.json");
+        let profile_bak = ferrocast_store::durable::backup_path(&profile_path);
+        let custom =
+            StudioSettings { width: 1600, height: 900, fps: 50, video_kbps: 4200, ..StudioSettings::default() };
+        write_json_sync(&profile_bak, &serde_json::to_value(&custom).unwrap_or(Value::Null));
+        let loaded = load_profile_settings(&profile_path);
+        assert_eq!((loaded.width, loaded.height, loaded.fps, loaded.video_kbps), (1600, 900, 50, 4200));
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
     }
 }
