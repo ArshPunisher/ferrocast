@@ -6408,6 +6408,39 @@ mod budget_tests {
         assert_eq!(reshaped.key.kbps, 6_000, "reshaping after equal-bitrate start must keep cap_kbps");
         assert_eq!(reshaped.cap_kbps, Some(6_000));
     }
+
+    #[test]
+    fn synthesized_main_group_without_cap_kbps_allows_bitrate_raise() {
+        let was =
+            StudioSettings { width: 2560, height: 1440, fps: 60, video_kbps: 18_000, ..StudioSettings::default() };
+        let updated = StudioSettings { video_kbps: 15_000, ..was.clone() };
+        let raised = StudioSettings { video_kbps: 22_000, ..was.clone() };
+        let mut spec = EncodeGroupSpec {
+            id: GROUP_MAIN.into(),
+            key: ferrocast_engine::studio_host::EncodeKey {
+                canvas: EncodeCanvas::Main,
+                width: 2560,
+                height: 1440,
+                fps: 60,
+                fps_ntsc: false,
+                kbps: 18_000,
+                codec: EncodeCodec::H264,
+                keyframe_s: 2,
+                strict_cbr: false,
+                no_bframes: false,
+                audio_kbps: 160,
+            },
+            extra_tracks: Vec::new(),
+            vod_track: false,
+            is_light: false,
+            is_twitch_eb: false,
+            cap_kbps: None,
+        };
+        let cap = main_slot_cap_kbps(&spec, None, Some(was.video_kbps));
+        assert_eq!(cap, None);
+        assert_eq!(apply_main_slot_bitrate_on_spec(&mut spec, cap, None, updated.video_kbps), 15_000);
+        assert_eq!(next_main_spec_for_settings(&spec, &raised, cap, Some(&updated)).key.kbps, 22_000);
+    }
 }
 
 #[cfg(test)]
