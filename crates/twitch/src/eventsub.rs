@@ -187,7 +187,13 @@ async fn subscribe_all(helix: &Helix, broadcaster: &str, session: &str, sink: &E
     for sub in SUBSCRIPTIONS {
         match helix.subscribe(session, sub.kind, sub.version, sub.condition_json(broadcaster)).await {
             Ok(()) => {}
-            Err(TwitchError::MissingScope(_)) => missing.push(sub.kind.to_string()),
+            Err(TwitchError::MissingScope(m)) => {
+                if sub.optional {
+                    tracing::debug!(kind = sub.kind, %m, "skipping optional EventSub topic without scope");
+                } else {
+                    missing.push(sub.kind.to_string());
+                }
+            }
             // A revoked or not-yet-allowed type is a per-subscription problem, not fatal.
             Err(TwitchError::Refused(m)) => {
                 tracing::warn!(kind = sub.kind, %m, "subscription refused")

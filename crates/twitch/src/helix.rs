@@ -4,11 +4,27 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ferrocast_connector::NativePollTally;
+use ferrocast_core::poll::PollLimits;
 use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{Auth, TwitchError};
+
+pub const TWITCH_POLL_LIMITS: PollLimits = PollLimits {
+    min_options: 2,
+    max_options: 5,
+    min_duration_s: 15,
+    max_duration_s: 1800,
+    supports_no_timer: true,
+    question_chars: 60,
+    option_chars: 25,
+};
+
+pub fn is_affiliate_or_partner(broadcaster_type: &str) -> bool {
+    matches!(broadcaster_type, "affiliate" | "partner")
+}
 
 #[derive(Debug, Clone)]
 pub struct Helix {
@@ -17,6 +33,8 @@ pub struct Helix {
     pub(crate) ingest: Arc<Mutex<Option<(Instant, String)>>>,
     /// How long a picked server is reused before the list is read again.
     pub(crate) ingest_keep: Duration,
+    /// Cached `GET /users` `broadcaster_type` (`"affiliate"`, `"partner"`, or `""`).
+    pub(crate) broadcaster_type: Arc<Mutex<Option<String>>>,
 }
 
 /// A 429 that asks for this long or less is waited out and tried again; a longer one is told.
@@ -31,11 +49,44 @@ pub struct User {
     pub display_name: String,
     #[serde(default)]
     pub profile_image_url: String,
+    #[serde(default)]
+    pub broadcaster_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TwitchPoll {
+    pub id: String,
+    pub status: String,
+    #[serde(default)]
+    pub choices: Vec<TwitchPollChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TwitchPollChoice {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub votes: u64,
+}
+
+impl TwitchPoll {
+    pub fn into_tally(self) -> NativePollTally {
+        NativePollTally {
+            external_id: self.id,
+            counts: self.choices.into_iter().map(|c| c.votes).collect(),
+            ended: !self.status.eq_ignore_ascii_case("ACTIVE"),
+        }
+    }
 }
 
 impl Helix {
     pub fn new(auth: Arc<Auth>) -> Self {
-        Helix { auth, ingest: Arc::new(Mutex::new(None)), ingest_keep: crate::ingest::INGEST_KEEP }
+        Helix {
+            auth,
+            ingest: Arc::new(Mutex::new(None)),
+            ingest_keep: crate::ingest::INGEST_KEEP,
+            broadcaster_type: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// How long a picked ingest server is reused (the default is an hour; zero reads the list each time).
@@ -128,7 +179,79 @@ impl Helix {
             .and_then(|d| d.get(0))
             .cloned()
             .ok_or_else(|| TwitchError::Protocol("no user returned".into()))?;
-        serde_json::from_value(first).map_err(|e| TwitchError::Protocol(e.to_string()))
+        let user: User = serde_json::from_value(first).map_err(|e| TwitchError::Protocol(e.to_string()))?;
+        *self.broadcaster_type.lock().unwrap_or_else(|p| p.into_inner()) = Some(user.broadcaster_type.clone());
+        Ok(user)
+    }
+
+    /// Returns cached `broadcaster_type` (`"affiliate"`, `"partner"`, or `""`), fetching `/users` once if unset.
+    pub async fn broadcaster_type(&self) -> Result<String, TwitchError> {
+        if let Some(bt) = self.broadcaster_type.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Ok(bt);
+        }
+        Ok(self.me().await?.broadcaster_type)
+    }
+
+    pub fn mark_non_affiliate(&self) {
+        *self.broadcaster_type.lock().unwrap_or_else(|p| p.into_inner()) = Some(String::new());
+    }
+
+    /// Starts a Twitch Helix poll (`duration` clamped to 15..=1800s; No-timer uses 1800s and ends early).
+    pub async fn create_poll(
+        &self,
+        broadcaster: &str,
+        title: &str,
+        choices: &[String],
+        duration_s: u32,
+    ) -> Result<TwitchPoll, TwitchError> {
+        let choice_objs: Vec<Value> = choices.iter().map(|c| json!({ "title": c })).collect();
+        let body = json!({
+            "broadcaster_id": broadcaster,
+            "title": title,
+            "choices": choice_objs,
+            "duration": duration_s.clamp(15, 1800),
+        });
+        match self.call(Method::POST, "/polls", &[], Some(body)).await {
+            Ok(v) => parse_poll_first(v),
+            Err(TwitchError::Refused(m)) => {
+                let lower = m.to_lowercase();
+                if lower.contains("affiliate") || lower.contains("partner") {
+                    self.mark_non_affiliate();
+                }
+                Err(TwitchError::Refused(m))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reads the current state of one Helix poll by id.
+    pub async fn get_poll(&self, broadcaster: &str, id: &str) -> Result<Option<TwitchPoll>, TwitchError> {
+        let v = self.call(Method::GET, "/polls", &[("broadcaster_id", broadcaster), ("id", id)], None).await?;
+        let Some(first) = v.get("data").and_then(|d| d.get(0)).cloned() else {
+            return Ok(None);
+        };
+        serde_json::from_value(first).map(Some).map_err(|e| TwitchError::Protocol(e.to_string()))
+    }
+
+    /// Ends an active Twitch Helix poll (`status: "TERMINATED"`) and returns its final counts.
+    pub async fn end_poll(&self, broadcaster: &str, id: &str) -> Result<Option<TwitchPoll>, TwitchError> {
+        let body = json!({
+            "broadcaster_id": broadcaster,
+            "id": id,
+            "status": "TERMINATED",
+        });
+        match self.call(Method::PATCH, "/polls", &[], Some(body)).await {
+            Ok(v) => parse_poll_first(v).map(Some),
+            Err(TwitchError::Refused(m)) => {
+                if let Ok(Some(existing)) = self.get_poll(broadcaster, id).await
+                    && !existing.status.eq_ignore_ascii_case("ACTIVE")
+                {
+                    return Ok(Some(existing));
+                }
+                Err(TwitchError::Refused(m))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The game a channel last streamed (`game_name` of Get Channel Information), by login.
@@ -239,6 +362,15 @@ impl Helix {
         let v = self.call(Method::GET, "/streams", &[("user_id", broadcaster)], None).await?;
         Ok(parse_stream_viewers(&v))
     }
+}
+
+fn parse_poll_first(v: Value) -> Result<TwitchPoll, TwitchError> {
+    let first = v
+        .get("data")
+        .and_then(|d| d.get(0))
+        .cloned()
+        .ok_or_else(|| TwitchError::Protocol("no poll returned".into()))?;
+    serde_json::from_value(first).map_err(|e| TwitchError::Protocol(e.to_string()))
 }
 
 /// Extracts `viewer_count` from a Helix `GET /streams` response when a stream is `"live"`.

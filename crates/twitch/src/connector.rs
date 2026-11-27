@@ -1,12 +1,14 @@
 //! Twitch actions for the engine (send chat, moderate, chat modes).
 
 use async_trait::async_trait;
-use ferrocast_connector::{CategoryHit, Connector, Ingest, Result, StreamInfo};
+use ferrocast_connector::{CategoryHit, Connector, Ingest, NativePollSpec, NativePollTally, Result, StreamInfo};
 use ferrocast_core::event::{ChatMode, Platform};
 use ferrocast_core::moderation::{Capabilities, ModeChange};
+use ferrocast_core::poll::{PlatformPollCapability, PollCapabilityMode};
 use serde_json::json;
 
-use crate::helix::Helix;
+use crate::auth::POLL_MANAGE_SCOPE;
+use crate::helix::{Helix, TWITCH_POLL_LIMITS, is_affiliate_or_partner};
 
 /// The signed-in channel. The streamer is broadcaster, moderator and bot sender.
 #[derive(Debug, Clone)]
@@ -91,6 +93,68 @@ impl Connector for TwitchConnector {
 
     async fn viewer_count(&self) -> Result<Option<u64>> {
         Ok(self.helix.stream_viewers(&self.user_id).await?)
+    }
+
+    async fn poll_capability(&self) -> Option<PlatformPollCapability> {
+        if let Ok(bt) = self.helix.broadcaster_type().await
+            && !is_affiliate_or_partner(&bt)
+        {
+            return Some(PlatformPollCapability {
+                platform: Platform::Twitch,
+                mode: PollCapabilityMode::ChatFallback,
+                reason: Some("requires_affiliate".into()),
+                limits: TWITCH_POLL_LIMITS,
+            });
+        }
+        let have = self.helix.auth.scopes().await;
+        if !have.is_empty() && !have.iter().any(|s| s == POLL_MANAGE_SCOPE) {
+            return Some(PlatformPollCapability {
+                platform: Platform::Twitch,
+                mode: PollCapabilityMode::ReconnectNeeded,
+                reason: Some("needs_scope".into()),
+                limits: TWITCH_POLL_LIMITS,
+            });
+        }
+        Some(PlatformPollCapability {
+            platform: Platform::Twitch,
+            mode: PollCapabilityMode::Native,
+            reason: None,
+            limits: TWITCH_POLL_LIMITS,
+        })
+    }
+
+    async fn create_native_poll(&self, spec: &NativePollSpec) -> Result<NativePollTally> {
+        self.need_scope(POLL_MANAGE_SCOPE).await?;
+        if spec.question.chars().count() > TWITCH_POLL_LIMITS.question_chars {
+            return Err(ferrocast_connector::ConnectorError::Refused {
+                platform: Platform::Twitch,
+                message: format!("Question exceeds Twitch {} character limit.", TWITCH_POLL_LIMITS.question_chars),
+            });
+        }
+        if spec.options.len() < TWITCH_POLL_LIMITS.min_options
+            || spec.options.len() > TWITCH_POLL_LIMITS.max_options
+            || spec.options.iter().any(|o| o.chars().count() > TWITCH_POLL_LIMITS.option_chars)
+        {
+            return Err(ferrocast_connector::ConnectorError::Refused {
+                platform: Platform::Twitch,
+                message: format!(
+                    "Options must be 2 to 5 answers of at most {} characters for Twitch.",
+                    TWITCH_POLL_LIMITS.option_chars
+                ),
+            });
+        }
+        let duration_s = spec.duration_s.unwrap_or(TWITCH_POLL_LIMITS.max_duration_s).clamp(15, 1800);
+        let poll = self.helix.create_poll(&self.user_id, &spec.question, &spec.options, duration_s).await?;
+        Ok(poll.into_tally())
+    }
+
+    async fn get_native_poll(&self, external_id: &str) -> Result<Option<NativePollTally>> {
+        Ok(self.helix.get_poll(&self.user_id, external_id).await?.map(|p| p.into_tally()))
+    }
+
+    async fn end_native_poll(&self, external_id: &str) -> Result<Option<NativePollTally>> {
+        self.need_scope(POLL_MANAGE_SCOPE).await?;
+        Ok(self.helix.end_poll(&self.user_id, external_id).await?.map(|p| p.into_tally()))
     }
 }
 
