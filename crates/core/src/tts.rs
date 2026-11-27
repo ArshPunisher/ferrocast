@@ -118,6 +118,9 @@ pub enum Decision {
     Speak { text: String },
 }
 
+/// Maximum characters sent to local OS speech synthesis in a single utterance.
+pub const MAX_SYNTH_CHARS: usize = 500;
+
 /// Decides what to say for `event`'s message.
 pub fn decide(policy: &TtsPolicy, filter_cfg: &FilterConfig, event: &Event) -> Decision {
     let skip = |r: &str| Decision::Skip { reason: r.into() };
@@ -148,6 +151,9 @@ pub fn decide(policy: &TtsPolicy, filter_cfg: &FilterConfig, event: &Event) -> D
     let body = clean(&message, policy.max_chars);
     if body.is_empty() {
         return skip("nothing readable left");
+    }
+    if filter::check(filter_cfg, actor, &body, 0).action != filter::Action::Allow {
+        return Decision::Hold { text: body };
     }
     let text = if policy.read_names && !actor.anonymous {
         format!("{} says: {}", clean(&actor.display_name, 40), body)
@@ -190,58 +196,92 @@ pub fn decide_chat(policy: &TtsPolicy, filter_cfg: &FilterConfig, event: &Event)
     }
 
     let (extracted, emote_count, has_link_fragment) = extract_chat_content(content);
-    let candidate = match policy.chat.mode {
+    let norm_raw = filter::normalize_invisible_nfkc(&content.text);
+    let norm_extracted = filter::normalize_invisible_nfkc(&extracted);
+    let norm_name = filter::normalize_invisible_nfkc(&actor.display_name);
+
+    let norm_candidate = match policy.chat.mode {
         ChatTtsMode::Everyone | ChatTtsMode::SubsMods => {
-            if content.text.trim_start().starts_with('!') || extracted.trim_start().starts_with('!') {
+            if norm_raw.trim_start().starts_with('!') || norm_extracted.trim_start().starts_with('!') {
                 return skip("bot commands aren't read aloud");
             }
-            extracted
+            norm_extracted
         }
         ChatTtsMode::Command => {
-            if strip_command(&content.text, &policy.chat.command).is_none() {
+            if strip_command(&norm_raw, &policy.chat.command).is_none() {
                 return skip("missing TTS command");
             }
-            match strip_command(&extracted, &policy.chat.command) {
+            match strip_command(&norm_extracted, &policy.chat.command) {
                 Some(rest) => rest.to_string(),
                 None => return skip("missing TTS command"),
             }
         }
     };
 
-    if policy.chat.skip_links && (has_link_fragment || has_any_link(&content.text) || has_any_link(&candidate)) {
+    let name_for_speech = policy.read_names && !actor.anonymous;
+    if policy.chat.skip_links
+        && (has_link_fragment
+            || has_any_link(&norm_raw)
+            || has_any_link(&norm_candidate)
+            || (name_for_speech && has_any_link(&norm_name)))
+    {
         return skip("links aren't read aloud");
     }
 
-    if contains_severe_slur(&content.text)
-        || contains_severe_slur(&candidate)
-        || contains_severe_slur(&actor.display_name)
-    {
+    if contains_severe_slur(&norm_raw) || contains_severe_slur(&norm_candidate) || contains_severe_slur(&norm_name) {
         return skip("blocked content");
     }
 
-    if filter::blocked_word(filter_cfg, &content.text).is_some()
-        || filter::blocked_word(filter_cfg, &candidate).is_some()
-        || filter::blocked_word(filter_cfg, &actor.display_name).is_some()
-    {
+    let has_blocked = |s: &str| {
+        filter::blocked_word(filter_cfg, s).is_some()
+            || (filter_cfg.words.lookalikes
+                && filter::blocked_word(filter_cfg, &collapse_intra_word_separators(s)).is_some())
+    };
+    if has_blocked(&norm_raw) || has_blocked(&norm_candidate) || has_blocked(&norm_name) {
         return skip("blocked word");
     }
 
-    if policy.chat.skip_emote_spam && is_emote_or_repeat_spam(&candidate, emote_count) {
+    if policy.chat.skip_emote_spam && is_emote_or_repeat_spam(&norm_candidate, emote_count) {
         return skip("emote or repeat spam");
     }
 
-    let body = clean(&candidate, policy.chat.max_chars);
+    let body = clean(&norm_candidate, policy.chat.max_chars);
     if body.is_empty() {
         return skip("nothing readable left");
     }
 
-    let text = if policy.read_names && !actor.anonymous {
-        let name = clean(&actor.display_name, 40);
-        if name.is_empty() { body } else { format!("{name} says: {body}") }
-    } else {
-        body
+    let clean_name = if name_for_speech { Some(clean(&norm_name, 40)).filter(|n| !n.is_empty()) } else { None };
+    let text = match &clean_name {
+        Some(name) => format!("{name} says: {body}"),
+        None => body.clone(),
     };
+
+    // Re-check post-clean output so stripping email/link tokens or brackets cannot assemble a slur,
+    // blocked phrase, or link.
+    if policy.chat.skip_links
+        && (has_any_link(&body) || clean_name.as_deref().is_some_and(has_any_link) || has_any_link(&text))
+    {
+        return skip("links aren't read aloud");
+    }
+    if contains_severe_slur(&body)
+        || clean_name.as_deref().is_some_and(contains_severe_slur)
+        || contains_severe_slur(&text)
+    {
+        return skip("blocked content");
+    }
+    if has_blocked(&body) || clean_name.as_deref().is_some_and(has_blocked) || has_blocked(&text) {
+        return skip("blocked word");
+    }
+
     if policy.hold_for_approval { Decision::Hold { text } } else { Decision::Speak { text } }
+}
+
+fn collapse_intra_word_separators(text: &str) -> String {
+    text.split_whitespace()
+        .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn extract_chat_content(content: &Content) -> (String, usize, bool) {
@@ -313,11 +353,12 @@ fn is_email_token(w: &str) -> bool {
 }
 
 fn has_any_link(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
+    let norm = filter::normalize_invisible_nfkc(text);
+    let lower = norm.to_lowercase();
     if lower.contains("://") || lower.contains("www.") {
         return true;
     }
-    let without_emails: String = text.split_whitespace().filter(|w| !is_email_token(w)).collect::<Vec<_>>().join(" ");
+    let without_emails: String = norm.split_whitespace().filter(|w| !is_email_token(w)).collect::<Vec<_>>().join(" ");
     !filter::links(&without_emails).is_empty()
 }
 
@@ -369,32 +410,114 @@ fn is_emote_or_repeat_spam(text: &str, emote_count: usize) -> bool {
     false
 }
 
-fn contains_severe_slur_in(
-    folded: &str,
+fn squeeze_policy(word: &str, keep_double: impl Fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut last = None;
+    let mut run = 0usize;
+    for c in word.chars() {
+        run = if Some(c) == last { run + 1 } else { 1 };
+        last = Some(c);
+        let max = if keep_double(c) { 2 } else { 1 };
+        if run <= max {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn matches_slur_token(
+    token: &str,
     whole_word: &[[u8; 16]],
     substring: &[[u8; 16]],
     min_len: usize,
     max_len: usize,
 ) -> bool {
-    let tokens: Vec<&str> = folded.split(' ').filter(|t| !t.is_empty()).collect();
-    for token in &tokens {
-        let h = sha256_prefix16(token.as_bytes());
-        if whole_word.contains(&h) {
-            return true;
-        }
-        if contains_subtoken_hash(token, substring, min_len, max_len) {
+    if whole_word.contains(&sha256_prefix16(token.as_bytes())) {
+        return true;
+    }
+    if let Some(stem) = token.strip_suffix('s')
+        && stem.chars().count() >= 4
+        && whole_word.contains(&sha256_prefix16(stem.as_bytes()))
+    {
+        return true;
+    }
+    contains_subtoken_hash(token, substring, min_len, max_len)
+}
+
+fn contains_severe_slur_with_policy(
+    norm: &str,
+    keep_double: impl Fn(char) -> bool,
+    whole_word: &[[u8; 16]],
+    substring: &[[u8; 16]],
+    min_len: usize,
+    max_len: usize,
+) -> bool {
+    // Collapse separators within each whitespace-delimited chunk first so contractions like
+    // `"let's pic"` or `"we're tardy"` remain distinct space-separated words while `"ret-tard"`,
+    // `"nigg-ger"`, and `"xfa-ggoty"` become a single re-squeezed token.
+    let chunks: Vec<String> = norm
+        .split_whitespace()
+        .map(|raw| {
+            let folded: String = raw
+                .chars()
+                .flat_map(char::to_lowercase)
+                .map(filter::lookalike)
+                .filter(|c| c.is_alphanumeric())
+                .collect();
+            squeeze_policy(&folded, &keep_double)
+        })
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    for chunk in &chunks {
+        if matches_slur_token(chunk, whole_word, substring, min_len, max_len) {
             return true;
         }
     }
-    // Check adjacent 2..=4 token concatenations against stem/substring hashes (catches `"nig ger"` /
-    // `"re t ard"` / `"ni-gga"` splits without causing cross-boundary short-word false positives).
+
+    // Collapse runs of single-character space-separated tokens (e.g. `"n i g g e r"`).
+    let mut tokens: Vec<String> = Vec::with_capacity(chunks.len());
+    let mut run = String::new();
+    for c in chunks {
+        if c.chars().count() == 1 {
+            run.push_str(&c);
+        } else {
+            if !run.is_empty() {
+                tokens.push(squeeze_policy(&std::mem::take(&mut run), &keep_double));
+            }
+            tokens.push(c);
+        }
+    }
+    if !run.is_empty() {
+        tokens.push(squeeze_policy(&run, &keep_double));
+    }
+
+    for token in &tokens {
+        if matches_slur_token(token, whole_word, substring, min_len, max_len) {
+            return true;
+        }
+    }
+
+    // Check adjacent 2..=4 space-separated tokens (re-squeezed after concatenation) for exact
+    // whole-word or stem matches without running substring scanning across ordinary word pairs.
     for span in 2..=4usize {
         if tokens.len() < span {
             break;
         }
         for i in 0..=tokens.len() - span {
-            let joined = tokens[i..i + span].concat();
+            let joined = squeeze_policy(&tokens[i..i + span].concat(), &keep_double);
             let len = joined.chars().count();
+            if len >= 4 && len <= max_len + 2 {
+                if whole_word.contains(&sha256_prefix16(joined.as_bytes())) {
+                    return true;
+                }
+                if let Some(stem) = joined.strip_suffix('s')
+                    && stem.chars().count() >= 4
+                    && whole_word.contains(&sha256_prefix16(stem.as_bytes()))
+                {
+                    return true;
+                }
+            }
             if len >= min_len && len <= max_len + 1 {
                 if substring.contains(&sha256_prefix16(joined.as_bytes())) {
                     return true;
@@ -413,12 +536,11 @@ fn contains_severe_slur_in(
 
 /// Checks folded tokens against SHA-256 prefixes of severe slurs (none stored in plaintext).
 fn contains_severe_slur(text: &str) -> bool {
-    let folded_1 = filter::fold(text);
-    if contains_severe_slur_in(&folded_1, WHOLE_WORD_FOLDED_1, SUBSTRING_FOLDED_1, 5, 12) {
+    let norm = filter::normalize_invisible_nfkc(text);
+    if contains_severe_slur_with_policy(&norm, |_| false, WHOLE_WORD_FOLDED_1, SUBSTRING_FOLDED_1, 5, 12) {
         return true;
     }
-    let folded_go = filter::fold_with(text, |c| c == 'g' || c == 'o');
-    contains_severe_slur_in(&folded_go, WHOLE_WORD_FOLDED_GO, SUBSTRING_FOLDED_GO, 5, 8)
+    contains_severe_slur_with_policy(&norm, |c| c == 'g' || c == 'o', WHOLE_WORD_FOLDED_GO, SUBSTRING_FOLDED_GO, 5, 8)
 }
 
 fn contains_subtoken_hash(token: &str, hashes: &[[u8; 16]], min_len: usize, max_len: usize) -> bool {
@@ -566,10 +688,41 @@ fn meets(mins: &[Money], money: &Money) -> bool {
     mins.iter().any(|m| m.currency.eq_ignore_ascii_case(&money.currency) && money.minor >= m.minor)
 }
 
-/// Removes links, emails, long digit runs (phones, addresses, card numbers), repeated
-/// characters and control characters, then caps the length at a word boundary.
+fn strip_synth_brackets(text: &str) -> String {
+    filter::normalize_invisible_nfkc(text)
+        .chars()
+        .map(|c| if matches!(c, '[' | ']' | '<' | '>') { ' ' } else { c })
+        .collect()
+}
+
+/// Normalizes text and removes OS synth embedded command brackets, SSML/espeak markup,
+/// invisible/control characters, and caps length before writing a synthesizer input file.
+pub fn sanitize_synth_text(text: &str) -> String {
+    let stripped = strip_synth_brackets(text);
+    let mut out = String::new();
+    for w in stripped.split_whitespace() {
+        let w_len = w.chars().count();
+        let sep = usize::from(!out.is_empty());
+        if out.chars().count() + w_len + sep > MAX_SYNTH_CHARS {
+            if out.is_empty() {
+                out = w.chars().take(MAX_SYNTH_CHARS).collect();
+            }
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
+    out
+}
+
+/// Removes links, emails, long digit runs (phones, addresses, card numbers), embedded synth
+/// markup, repeated characters and invisible/control characters, then caps the length at a word
+/// boundary.
 pub fn clean(text: &str, max_chars: usize) -> String {
-    let words: Vec<String> = text
+    let normalized = strip_synth_brackets(text);
+    let words: Vec<String> = normalized
         .split_whitespace()
         .filter(|w| !looks_like_link(w) && !w.contains('@'))
         .map(|w| {
@@ -580,7 +733,6 @@ pub fn clean(text: &str, max_chars: usize) -> String {
         .collect();
     let mut out = String::new();
     for w in words {
-        let w: String = w.chars().filter(|c| !c.is_control()).collect();
         let sep = usize::from(!out.is_empty());
         if out.chars().count() + w.chars().count() + sep > max_chars {
             break;
@@ -1009,5 +1161,87 @@ mod tests {
             decide_chat(&p, &f, &chat_ev(Roles::empty(), Origin::Live, false, Content::plain("hello world"))),
             Decision::Hold { text: "hello world".into() }
         );
+    }
+
+    #[test]
+    fn chat_tts_blocks_adversarial_bypasses_and_strips_synth_commands() {
+        let mut f = FilterConfig::default();
+        f.words.list.push("scam".into());
+        f.words.list.push("bad phrase".into());
+        let p = chat_on(ChatTtsMode::Everyone);
+
+        // Post-clean token removal (email/link between halves) and split-repeat/subtoken slurs.
+        let split_repeat_1 = format!("{}t-{}ard", "re", "t");
+        let split_repeat_2 = format!("{}g-{}er", "nig", "g");
+        let split_repeat_3 = format!("{}g-{}ot", "fag", "g");
+        let wrapped_split = format!("x{}-{}y", "fa", "ggot");
+        let bidi_slur = format!("{}g\u{2066}{}er", "nig", "g");
+        let whole_split = format!("{}-{}", "sp", "ic");
+        let email_split_slur = format!("{} ab@cd.ef {}", "nig", "ger");
+        for hostile in [
+            "bad ab@cd.ef phrase",
+            "sc\u{2066}am",
+            "sc\u{202e}am",
+            "sc\u{fe0f}am",
+            &split_repeat_1,
+            &split_repeat_2,
+            &split_repeat_3,
+            &wrapped_split,
+            &bidi_slur,
+            &whole_split,
+            &email_split_slur,
+            "check https:\u{200b}//evil.\u{200b}com",
+            "visit evil.\u{2066}com",
+            "visit evil .com",
+            "visit evil. com",
+            "visit \u{ff45}\u{ff56}\u{ff49}\u{ff4c}.\u{ff43}\u{ff4f}\u{ff4d}",
+        ] {
+            assert!(
+                matches!(
+                    decide_chat(&p, &f, &chat_ev(Roles::VIP, Origin::Live, false, Content::plain(hostile))),
+                    Decision::Skip { .. }
+                ),
+                "adversarial chat message must be skipped: {hostile:?}"
+            );
+        }
+
+        // With skip_links off, link-token removal between halves still cannot bypass blocklist.
+        let mut p_links = p.clone();
+        p_links.chat.skip_links = false;
+        assert!(matches!(
+            decide_chat(
+                &p_links,
+                &f,
+                &chat_ev(Roles::VIP, Origin::Live, false, Content::plain("bad example.com phrase"))
+            ),
+            Decision::Skip { .. }
+        ));
+
+        // Display name checks must cover normalized slurs, blocked words, and links.
+        for bad_name in ["scam.\u{200b}com", "evil .com", "evil. com", &bidi_slur, "bad ab@cd.ef phrase"] {
+            let mut ev = chat_ev(Roles::VIP, Origin::Live, false, Content::plain("hello chat"));
+            if let EventKind::ChatMessage { actor, .. } = &mut ev.kind {
+                actor.display_name = bad_name.into();
+            }
+            assert!(
+                matches!(decide_chat(&p, &f, &ev), Decision::Skip { .. }),
+                "adversarial display_name must be skipped: {bad_name:?}"
+            );
+        }
+
+        // Embedded synth commands (`say` [[...]] and SSML/espeak markup) must be neutralised.
+        for markup in [
+            "[[inpt PHON]] hEHlOW [[inpt TEXT]]",
+            "[[slnc 99999]] hi",
+            "\u{ff3b}\u{ff3b}inpt PHON\u{ff3d}\u{ff3d} hi",
+            "<speak><break time=\"60s\"/></speak> hello",
+        ] {
+            let cleaned = clean(markup, 200);
+            assert!(
+                !cleaned.contains('[') && !cleaned.contains(']') && !cleaned.contains('<') && !cleaned.contains('>'),
+                "cleaned output retained markup brackets from {markup:?}: {cleaned:?}"
+            );
+        }
+        assert_eq!(clean("[[slnc 99999]] hi", 200), "slnc number hi");
     }
 }
