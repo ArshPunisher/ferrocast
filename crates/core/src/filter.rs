@@ -242,6 +242,38 @@ const SOLICITATION: &[&str] = &[
     "remove the space",
 ];
 
+/// Checks whether `text` matches any custom blocked word in `cfg.words`, ignoring
+/// `cfg.exempt_roles`.
+pub fn blocked_word(cfg: &FilterConfig, text: &str) -> Option<String> {
+    if !cfg.words.enabled || cfg.words.list.is_empty() {
+        return None;
+    }
+    let folded = cfg.words.lookalikes.then(|| fold(text));
+    blocked_word_in(cfg, text, folded.as_deref())
+}
+
+fn blocked_word_in(cfg: &FilterConfig, text: &str, folded: Option<&str>) -> Option<String> {
+    if !cfg.words.enabled || cfg.words.list.is_empty() {
+        return None;
+    }
+    let plain = (!cfg.words.lookalikes).then(|| text.to_lowercase());
+    for term in &cfg.words.list {
+        let hit = if let Some(folded) = folded {
+            let needle = fold(term);
+            !needle.is_empty() && contains_term(folded, &needle)
+        } else if let Some(plain) = &plain {
+            let needle = term.trim().to_lowercase();
+            !needle.is_empty() && contains_plain(plain, &needle)
+        } else {
+            false
+        };
+        if hit {
+            return Some(term.clone());
+        }
+    }
+    None
+}
+
 /// Checks one message. `emotes` is the number of emote fragments.
 pub fn check(cfg: &FilterConfig, actor: &Actor, text: &str, emotes: usize) -> Verdict {
     if actor.roles.0 & cfg.exempt_roles.0 != 0 {
@@ -249,23 +281,8 @@ pub fn check(cfg: &FilterConfig, actor: &Actor, text: &str, emotes: usize) -> Ve
     }
     let mut v = Verdict::allow();
     let folded = fold(text);
-    if cfg.words.enabled {
-        let plain = text.to_lowercase();
-        for term in &cfg.words.list {
-            let hit = if cfg.words.lookalikes {
-                let needle = fold(term);
-                !needle.is_empty() && contains_term(&folded, &needle)
-            } else {
-                let needle = term.trim().to_lowercase();
-                !needle.is_empty() && contains_plain(&plain, &needle)
-            };
-            if hit {
-                v = v.worse(Verdict {
-                    action: cfg.action(cfg.words.action),
-                    reason: format!("blocked term \"{term}\""),
-                });
-            }
-        }
+    if let Some(term) = blocked_word_in(cfg, text, cfg.words.lookalikes.then_some(folded.as_str())) {
+        v = v.worse(Verdict { action: cfg.action(cfg.words.action), reason: format!("blocked term \"{term}\"") });
     }
     if cfg.solicitation.enabled {
         // Whole words only: "hi do emotes work" must not read as "i do emotes". A phrase
@@ -343,6 +360,12 @@ fn contains_plain(text: &str, needle: &str) -> bool {
 /// Folds text for matching (see module docs). Output is lowercase ASCII-ish words
 /// separated by single spaces.
 pub fn fold(text: &str) -> String {
+    fold_with(text, |_| false)
+}
+
+/// Folds text like [`fold`] while preserving double occurrences of characters where
+/// `keep_double` returns true.
+pub(crate) fn fold_with(text: &str, keep_double: impl Fn(char) -> bool) -> String {
     let mapped: String =
         text.nfkc().flat_map(char::to_lowercase).filter(|c| !is_invisible(*c)).map(lookalike).collect();
     // Collapse "b.a.d" / "b a d" / "b-a-d": separators between single characters.
@@ -362,7 +385,7 @@ pub fn fold(text: &str) -> String {
     if !run.is_empty() {
         words.push(run);
     }
-    words.iter().map(|w| squeeze(w)).collect::<Vec<_>>().join(" ")
+    words.iter().map(|w| squeeze_with(w, &keep_double)).collect::<Vec<_>>().join(" ")
 }
 
 /// Whole-word match for single words, substring match inside words for longer terms so
@@ -375,14 +398,17 @@ fn contains_term(folded: &str, needle: &str) -> bool {
     folded.split(' ').any(|w| w == needle)
 }
 
-fn squeeze(word: &str) -> String {
+fn squeeze_with(word: &str, keep_double: impl Fn(char) -> bool) -> String {
     let mut out = String::with_capacity(word.len());
     let mut last = None;
+    let mut run = 0usize;
     for c in word.chars() {
-        if Some(c) != last {
+        run = if Some(c) == last { run + 1 } else { 1 };
+        last = Some(c);
+        let max = if keep_double(c) { 2 } else { 1 };
+        if run <= max {
             out.push(c);
         }
-        last = Some(c);
     }
     out
 }

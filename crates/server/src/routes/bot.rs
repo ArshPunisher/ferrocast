@@ -153,6 +153,7 @@ pub async fn save_tts(State(app): State<AppState>, Body(b): Body<TtsBody>) -> Ap
         max_chars: b.max_chars.unwrap_or(current.max_chars),
         read_names: b.read_names.unwrap_or(current.read_names),
         hold_for_approval: b.hold_for_approval.unwrap_or(current.hold_for_approval),
+        chat: current.chat,
     };
     Ok(Json(tts_view(&app.engine.save_tts(p).await?, &main)))
 }
