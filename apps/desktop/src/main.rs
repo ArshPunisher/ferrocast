@@ -58,7 +58,7 @@ const SAFE_MODE_ARG: &str = "--safe-mode";
 const BUNDLE_ID: &str = "com.clearcraftlabs.ferrocast";
 /// Set before `app.exit(0)` on macOS so `RunEvent::Exit` schedules LaunchServices relaunch after exit.
 #[cfg(target_os = "macos")]
-static RELAUNCH_AFTER_EXIT: AtomicBool = AtomicBool::new(false);
+pub(crate) static RELAUNCH_AFTER_EXIT: AtomicBool = AtomicBool::new(false);
 /// How often the shell picks up settings changed in the dashboard.
 const SETTINGS_EVERY: Duration = Duration::from_secs(2);
 

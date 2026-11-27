@@ -4642,6 +4642,14 @@ impl StudioHost for DesktopStudio {
         // A moment for the answer to reach the page first.
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(400));
+            // On macOS reopen through LaunchServices after exit (as the update restart does), so
+            // the pinned Dock icon is reused instead of a second, unpinned one appearing.
+            #[cfg(target_os = "macos")]
+            {
+                crate::RELAUNCH_AFTER_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                app.exit(0);
+            }
+            #[cfg(not(target_os = "macos"))]
             app.restart();
         });
         Ok(())
