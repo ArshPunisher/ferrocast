@@ -3114,55 +3114,54 @@ impl Engine {
         self.studio_host()?.preview_streamlabs(id.to_string()).await.map_err(failed)
     }
 
+    async fn studio_import_from(&self, id: &str, streamlabs: bool) -> Result<Value, EngineError> {
+        if !collection_id_ok(id) {
+            let app = if streamlabs { "Streamlabs'" } else { "OBS's" };
+            return Err(EngineError::Invalid(format!("id: one of {app} scene collections, as listed.")));
+        }
+        // Run inside a detached task so a dropped HTTP caller never cuts off an in-flight import
+        // between saving the collection file, swapping scenes, and updating `library.json`.
+        let engine = self.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let _lib = engine.studio().library_lock.lock().await;
+            let _gate = engine.prepare_shelf_mutation("collections", true).await?;
+            let host = engine.studio_host()?;
+            let list = if streamlabs { host.streamlabs_collections().await } else { host.obs_collections().await }
+                .map_err(failed)?;
+            if !list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id)) {
+                let message = if streamlabs {
+                    "Streamlabs has no such scene collection.".into()
+                } else {
+                    format!("OBS has no scene collection \"{id}\".")
+                };
+                return Err(EngineError::Refused {
+                    status: 404,
+                    code: "studio_no_obs_collection",
+                    message,
+                    hint: "Pick one from the list.".into(),
+                    retry_after: None,
+                });
+            }
+            let out = if streamlabs { host.import_streamlabs(id).await } else { host.import_obs(id).await }
+                .map_err(failed)?;
+            drop(_gate);
+            drop(_lib);
+            engine.finish_collection_switch(true, true).await;
+            Ok(out)
+        })
+        .await
+        .map_err(|e| EngineError::Internal(format!("Collection import failed: {e}")))?
+    }
+
     /// Brings in Streamlabs' scene collection `id` as a new scene collection.
     pub async fn studio_import_streamlabs(&self, id: &str) -> Result<Value, EngineError> {
-        if !collection_id_ok(id) {
-            return Err(EngineError::Invalid("id: one of Streamlabs' scene collections, as listed.".into()));
-        }
-        let _lib = self.studio().library_lock.lock().await;
-        let _gate = self.prepare_shelf_mutation("collections", true).await?;
-        let host = self.studio_host()?;
-        let list = host.streamlabs_collections().await.map_err(failed)?;
-        if !list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id)) {
-            return Err(EngineError::Refused {
-                status: 404,
-                code: "studio_no_obs_collection",
-                message: "Streamlabs has no such scene collection.".into(),
-                hint: "Pick one from the list.".into(),
-                retry_after: None,
-            });
-        }
-        let out = host.import_streamlabs(id.to_string()).await.map_err(failed)?;
-        drop(_gate);
-        drop(_lib);
-        self.finish_collection_switch(true, true).await;
-        Ok(out)
+        self.studio_import_from(id, true).await
     }
 
     /// Brings in OBS's scene collection `id` in place of the Studio's scenes.
     pub async fn studio_import_obs(&self, id: &str) -> Result<Value, EngineError> {
-        if !collection_id_ok(id) {
-            return Err(EngineError::Invalid("id: one of OBS's scene collections, as listed.".into()));
-        }
-        let _lib = self.studio().library_lock.lock().await;
-        let _gate = self.prepare_shelf_mutation("collections", true).await?;
-        let host = self.studio_host()?;
-        let list = host.obs_collections().await.map_err(failed)?;
-        let known = list.as_array().is_some_and(|l| l.iter().any(|c| c["id"] == id));
-        if !known {
-            return Err(EngineError::Refused {
-                status: 404,
-                code: "studio_no_obs_collection",
-                message: format!("OBS has no scene collection \"{id}\"."),
-                hint: "Pick one from the list.".into(),
-                retry_after: None,
-            });
-        }
-        let out = host.import_obs(id.to_string()).await.map_err(failed)?;
-        drop(_gate);
-        drop(_lib);
-        self.finish_collection_switch(true, true).await;
-        Ok(out)
+        self.studio_import_from(id, false).await
     }
 
     pub async fn studio_monitoring(&self) -> Result<Value, EngineError> {
@@ -3779,12 +3778,39 @@ impl Engine {
         list.get("current").and_then(Value::as_str).map(String::from)
     }
 
-    /// Scene collections or profiles: one act on that list. Falls back to file-backed storage on
-    /// disk when no desktop [`StudioHost`] is attached (such as in `ferrocast-headless`).
-    pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
-        act.check(kind)?;
+    async fn run_shelf_act(
+        &self,
+        host: Option<&Arc<dyn StudioHost>>,
+        kind: &str,
+        act: ShelfAct,
+    ) -> Result<Value, EngineError> {
+        if let Some(host) = host {
+            return host.shelf(kind.to_string(), act).await.map_err(failed);
+        }
+        let data = self.store().dir().to_path_buf();
+        let kind_owned = kind.to_string();
+        let res = tokio::task::spawn_blocking(move || {
+            use ferrocast_store::studio_library as lib;
+            match act {
+                ShelfAct::List => lib::headless_shelf_list(&data, &kind_owned),
+                ShelfAct::New { name, copy } => lib::headless_shelf_new(&data, &kind_owned, &name, copy),
+                ShelfAct::Switch { id } => lib::headless_shelf_switch(&data, &kind_owned, &id),
+                ShelfAct::Rename { id, name } => lib::headless_shelf_rename(&data, &kind_owned, &id, &name),
+                ShelfAct::Remove { id } => lib::headless_shelf_remove(&data, &kind_owned, &id),
+                ShelfAct::Export { id } => lib::headless_shelf_export(&data, &kind_owned, &id),
+                ShelfAct::Import { name, doc } => {
+                    let (id, prev, saved_name) = lib::import_collection_doc(&data, &name, doc)?;
+                    Ok(serde_json::json!({ "id": id, "previous_id": prev, "name": saved_name }))
+                }
+            }
+        })
+        .await
+        .map_err(|e| EngineError::Internal(e.to_string()))?;
+        res.map_err(failed)
+    }
+
+    async fn studio_shelf_mutating(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
         let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
-        let mutating = !matches!(act, ShelfAct::List | ShelfAct::Export { .. });
         let switched_shelf = matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. });
         // Swapping, renaming, or removing shelves is serialized with `library_lock`. Switches and
         // active-item renames/removals are refused while live, in a show, or benchmarking; inactive
@@ -3792,7 +3818,7 @@ impl Engine {
         // When changing profiles, `auto_config_op` is acquired outermost so rollback cannot race.
         let _auto_op =
             if kind == "profiles" && switched_shelf { Some(self.studio().auto_config_op.lock().await) } else { None };
-        let _lib = if mutating { Some(self.studio().library_lock.lock().await) } else { None };
+        let _lib = self.studio().library_lock.lock().await;
         let targets_active = match &act {
             ShelfAct::Rename { id, .. } | ShelfAct::Remove { id } => {
                 self.shelf_current_id(host.as_deref(), kind).await.is_none_or(|cur| cur == *id)
@@ -3804,30 +3830,7 @@ impl Engine {
         } else {
             None
         };
-        let out = if let Some(host) = &host {
-            host.shelf(kind.to_string(), act).await.map_err(failed)?
-        } else {
-            let data = self.store().dir().to_path_buf();
-            let kind_owned = kind.to_string();
-            let res = tokio::task::spawn_blocking(move || {
-                use ferrocast_store::studio_library as lib;
-                match act {
-                    ShelfAct::List => lib::headless_shelf_list(&data, &kind_owned),
-                    ShelfAct::New { name, copy } => lib::headless_shelf_new(&data, &kind_owned, &name, copy),
-                    ShelfAct::Switch { id } => lib::headless_shelf_switch(&data, &kind_owned, &id),
-                    ShelfAct::Rename { id, name } => lib::headless_shelf_rename(&data, &kind_owned, &id, &name),
-                    ShelfAct::Remove { id } => lib::headless_shelf_remove(&data, &kind_owned, &id),
-                    ShelfAct::Export { id } => lib::headless_shelf_export(&data, &kind_owned, &id),
-                    ShelfAct::Import { name, doc } => {
-                        let (id, prev, saved_name) = lib::import_collection_doc(&data, &name, doc)?;
-                        Ok(serde_json::json!({ "id": id, "previous_id": prev, "name": saved_name }))
-                    }
-                }
-            })
-            .await
-            .map_err(|e| EngineError::Internal(e.to_string()))?;
-            res.map_err(failed)?
-        };
+        let out = self.run_shelf_act(host.as_ref(), kind, act).await?;
         drop(_gate);
         drop(_lib);
         if switched_shelf && kind == "profiles" {
@@ -3842,11 +3845,28 @@ impl Engine {
             drop(_auto_op);
             if kind == "collections" && switched_shelf {
                 self.finish_collection_switch(true, host.is_some()).await;
-            } else if mutating {
+            } else {
                 self.notify_obsws_poll();
             }
         }
         Ok(out)
+    }
+
+    /// Scene collections or profiles: one act on that list. Falls back to file-backed storage on
+    /// disk when no desktop [`StudioHost`] is attached (such as in `ferrocast-headless`).
+    /// Mutating operations run in a detached task so dropping the caller's future mid-operation
+    /// cannot leave the loaded Studio collection/profile out of sync with `library.json`.
+    pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
+        act.check(kind)?;
+        if matches!(act, ShelfAct::List | ShelfAct::Export { .. }) {
+            let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
+            return self.run_shelf_act(host.as_ref(), kind, act).await;
+        }
+        let engine = self.clone();
+        let kind = kind.to_string();
+        tokio::spawn(async move { engine.studio_shelf_mutating(&kind, act).await })
+            .await
+            .map_err(|e| EngineError::Internal(format!("Shelf mutation failed: {e}")))?
     }
 
     pub async fn studio_screens(&self) -> Result<Value, EngineError> {
@@ -6231,5 +6251,306 @@ mod tests {
         drop(lib);
         assert!(!stop_task.await.unwrap().unwrap().running);
         assert!(host.events.lock().unwrap().iter().any(|ev| ev == "stop"));
+    }
+
+    #[derive(Debug)]
+    struct DropSwitchHost {
+        data: std::path::PathBuf,
+        streaming: std::sync::atomic::AtomicBool,
+        held_collection_id: std::sync::Mutex<String>,
+        held_profile_id: std::sync::Mutex<String>,
+        settings: std::sync::Mutex<StudioSettings>,
+        hold_next_save: std::sync::atomic::AtomicBool,
+        panic_on_shelf: std::sync::atomic::AtomicBool,
+        swapped: Arc<tokio::sync::Notify>,
+        release_save: Arc<tokio::sync::Notify>,
+        finished_or_aborted: Arc<tokio::sync::Notify>,
+        obs_imported: std::sync::Mutex<Vec<String>>,
+        sl_imported: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl DropSwitchHost {
+        fn new(data: &std::path::Path) -> Self {
+            Self {
+                data: data.to_path_buf(),
+                streaming: std::sync::atomic::AtomicBool::new(false),
+                held_collection_id: std::sync::Mutex::new("untitled".into()),
+                held_profile_id: std::sync::Mutex::new("untitled".into()),
+                settings: std::sync::Mutex::new(StudioSettings::default()),
+                hold_next_save: std::sync::atomic::AtomicBool::new(false),
+                panic_on_shelf: std::sync::atomic::AtomicBool::new(false),
+                swapped: Arc::new(tokio::sync::Notify::new()),
+                release_save: Arc::new(tokio::sync::Notify::new()),
+                finished_or_aborted: Arc::new(tokio::sync::Notify::new()),
+                obs_imported: std::sync::Mutex::new(Vec::new()),
+                sl_imported: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    struct ShelfOpGuard {
+        done: Arc<tokio::sync::Notify>,
+    }
+
+    impl Drop for ShelfOpGuard {
+        fn drop(&mut self) {
+            self.done.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StudioHost for DropSwitchHost {
+        async fn status(&self) -> StudioStatus {
+            StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn start(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<StudioStatus, String> {
+            Ok(Default::default())
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn options(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn act(&self, act: StudioAct) -> Result<Value, String> {
+            match act {
+                StudioAct::Scenes => Ok(serde_json::json!({
+                    "scenes": [{ "name": "Main" }],
+                    "current": "Main",
+                    "collection_id": self.held_collection_id.lock().unwrap().clone(),
+                })),
+                _ => Ok(Value::Null),
+            }
+        }
+        async fn settings(&self) -> StudioSettings {
+            self.settings.lock().unwrap().clone()
+        }
+        async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String> {
+            *self.settings.lock().unwrap() = s;
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({}))
+        }
+        async fn record(&self, _on: bool) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([]))
+        }
+        async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(serde_json::json!({ "active": self.streaming.load(std::sync::atomic::Ordering::SeqCst) }))
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([{ "id": "obs_one", "name": "OBS One" }]))
+        }
+        async fn import_obs(&self, id: String) -> Result<Value, String> {
+            self.obs_imported.lock().unwrap().push(id.clone());
+            self.shelf("collections".into(), ShelfAct::Import { name: id, doc: serde_json::json!({ "sources": [] }) })
+                .await
+        }
+        async fn streamlabs_collections(&self) -> Result<Value, String> {
+            Ok(serde_json::json!([{ "id": "sl_one", "name": "SL One" }]))
+        }
+        async fn import_streamlabs(&self, id: String) -> Result<Value, String> {
+            self.sl_imported.lock().unwrap().push(id.clone());
+            self.shelf("collections".into(), ShelfAct::Import { name: id, doc: serde_json::json!({ "sources": [] }) })
+                .await
+        }
+        async fn shelf(&self, kind: String, act: ShelfAct) -> Result<Value, String> {
+            use ferrocast_store::studio_library as lib;
+            match act {
+                ShelfAct::List => lib::headless_shelf_list(&self.data, &kind),
+                ShelfAct::Export { id } => lib::headless_shelf_export(&self.data, &kind, &id),
+                mutating => {
+                    let _guard = ShelfOpGuard { done: self.finished_or_aborted.clone() };
+                    if self.panic_on_shelf.load(std::sync::atomic::Ordering::SeqCst) {
+                        panic!("simulated panic in shelf mutation");
+                    }
+                    let hold = self.hold_next_save.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    match mutating {
+                        ShelfAct::Switch { id } => {
+                            if kind == "profiles" {
+                                *self.held_profile_id.lock().unwrap() = id.clone();
+                            } else {
+                                *self.held_collection_id.lock().unwrap() = id.clone();
+                            }
+                            if hold {
+                                self.swapped.notify_one();
+                                self.release_save.notified().await;
+                            }
+                            lib::headless_shelf_switch(&self.data, &kind, &id)
+                        }
+                        ShelfAct::New { name, copy } => {
+                            let loaded = lib::load(&self.data);
+                            let kind_enum = lib::Kind::parse(&kind).ok_or("bad kind")?;
+                            let id = loaded.shelf(kind_enum).new_id(&name);
+                            if kind == "profiles" {
+                                *self.held_profile_id.lock().unwrap() = id.clone();
+                            } else {
+                                *self.held_collection_id.lock().unwrap() = id.clone();
+                            }
+                            if hold {
+                                self.swapped.notify_one();
+                                self.release_save.notified().await;
+                            }
+                            lib::headless_shelf_new(&self.data, &kind, &name, copy)
+                        }
+                        ShelfAct::Import { name, doc } => {
+                            let loaded = lib::load(&self.data);
+                            let unique = loaded.collections.free_name(&name);
+                            let id = loaded.collections.new_id(&unique);
+                            *self.held_collection_id.lock().unwrap() = id;
+                            if hold {
+                                self.swapped.notify_one();
+                                self.release_save.notified().await;
+                            }
+                            let (saved_id, prev, saved_name) = lib::import_collection_doc(&self.data, &name, doc)?;
+                            Ok(serde_json::json!({ "id": saved_id, "previous_id": prev, "name": saved_name }))
+                        }
+                        ShelfAct::Rename { id, name } => {
+                            if hold {
+                                self.swapped.notify_one();
+                                self.release_save.notified().await;
+                            }
+                            lib::headless_shelf_rename(&self.data, &kind, &id, &name)
+                        }
+                        ShelfAct::Remove { id } => {
+                            if hold {
+                                self.swapped.notify_one();
+                                self.release_save.notified().await;
+                            }
+                            lib::headless_shelf_remove(&self.data, &kind, &id)
+                        }
+                        ShelfAct::List | ShelfAct::Export { .. } => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_and_drop_mid_shelf<F, Fut>(host: &DropSwitchHost, make_fut: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future,
+    {
+        host.hold_next_save.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut fut = Box::pin(make_fut());
+        tokio::select! {
+            biased;
+            _ = &mut fut => panic!("shelf operation finished before caller dropped"),
+            _ = host.swapped.notified() => {}
+        }
+        // Drop the caller future mid-operation, then unblock the save phase.
+        drop(fut);
+        host.release_save.notify_one();
+        host.finished_or_aborted.notified().await;
+    }
+
+    #[tokio::test]
+    async fn shelf_mutations_complete_when_caller_future_dropped() {
+        use ferrocast_store::studio_library as lib;
+
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let mut initial = lib::load(dir.path());
+        initial.collections.list.push(lib::Entry { id: "blue-b".into(), name: "Blue B".into() });
+        initial.profiles.list.push(lib::Entry { id: "pro-b".into(), name: "Pro B".into() });
+        lib::save(dir.path(), &initial);
+        assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(5)));
+
+        let host = Arc::new(DropSwitchHost::new(dir.path()));
+        e.set_studio_host(host.clone());
+
+        // 1. Collection switch dropped right after Held swapped, before library.json saved.
+        run_and_drop_mid_shelf(&host, || e.studio_shelf("collections", ShelfAct::Switch { id: "blue-b".into() })).await;
+        assert_eq!(lib::load(dir.path()).collections.current, "blue-b");
+        assert_eq!(e.studio_act(StudioAct::Scenes).await.unwrap()["collection_id"], "blue-b");
+
+        // 2. Alternating switch back to untitled dropped mid-switch keeps library and Held aligned.
+        run_and_drop_mid_shelf(&host, || e.studio_shelf("collections", ShelfAct::Switch { id: "untitled".into() }))
+            .await;
+        assert_eq!(lib::load(dir.path()).collections.current, "untitled");
+        assert_eq!(e.studio_act(StudioAct::Scenes).await.unwrap()["collection_id"], "untitled");
+
+        // 3. New and duplicate (copy = true) dropped mid-operation complete and sync current.
+        run_and_drop_mid_shelf(&host, || {
+            e.studio_shelf("collections", ShelfAct::New { name: "Fresh Show".into(), copy: false })
+        })
+        .await;
+        assert_eq!(lib::load(dir.path()).collections.current, "fresh-show");
+        assert_eq!(e.studio_act(StudioAct::Scenes).await.unwrap()["collection_id"], "fresh-show");
+
+        run_and_drop_mid_shelf(&host, || {
+            e.studio_shelf("collections", ShelfAct::New { name: "Dup Show".into(), copy: true })
+        })
+        .await;
+        assert_eq!(lib::load(dir.path()).collections.current, "dup-show");
+        assert_eq!(e.studio_act(StudioAct::Scenes).await.unwrap()["collection_id"], "dup-show");
+
+        // 4. Rename and Remove (inactive) dropped mid-operation still persist.
+        run_and_drop_mid_shelf(&host, || {
+            e.studio_shelf("collections", ShelfAct::Rename { id: "blue-b".into(), name: "Blue Renamed".into() })
+        })
+        .await;
+        assert_eq!(lib::load(dir.path()).collections.get("blue-b").unwrap().name, "Blue Renamed");
+
+        run_and_drop_mid_shelf(&host, || e.studio_shelf("collections", ShelfAct::Remove { id: "blue-b".into() })).await;
+        assert!(lib::load(dir.path()).collections.get("blue-b").is_none());
+
+        // 5. Direct, OBS, and Streamlabs collection imports dropped mid-operation complete.
+        run_and_drop_mid_shelf(&host, || {
+            e.studio_shelf(
+                "collections",
+                ShelfAct::Import { name: "Imported".into(), doc: serde_json::json!({ "sources": [] }) },
+            )
+        })
+        .await;
+        assert_eq!(lib::load(dir.path()).collections.current, "imported");
+        assert_eq!(e.studio_act(StudioAct::Scenes).await.unwrap()["collection_id"], "imported");
+
+        run_and_drop_mid_shelf(&host, || e.studio_import_obs("obs_one")).await;
+        assert_eq!(lib::load(dir.path()).collections.current, "obs-one");
+        assert_eq!(e.studio_act(StudioAct::Scenes).await.unwrap()["collection_id"], "obs-one");
+
+        run_and_drop_mid_shelf(&host, || e.studio_import_streamlabs("sl_one")).await;
+        assert_eq!(lib::load(dir.path()).collections.current, "sl-one");
+        assert_eq!(e.studio_act(StudioAct::Scenes).await.unwrap()["collection_id"], "sl-one");
+
+        // 6. Profile switch dropped mid-switch keeps library profile current and held profile aligned.
+        run_and_drop_mid_shelf(&host, || e.studio_shelf("profiles", ShelfAct::Switch { id: "pro-b".into() })).await;
+        assert_eq!(lib::load(dir.path()).profiles.current, "pro-b");
+        assert_eq!(*host.held_profile_id.lock().unwrap(), "pro-b");
+
+        // 7. Refuse while live check still blocks switch.
+        host.streaming.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = e.studio_shelf("collections", ShelfAct::Switch { id: "untitled".into() }).await.unwrap_err();
+        assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "{err:?}");
+        host.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // 8. A panicked shelf task maps JoinError to EngineError::Internal (HTTP 500).
+        host.panic_on_shelf.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = e.studio_shelf("collections", ShelfAct::Switch { id: "untitled".into() }).await.unwrap_err();
+        assert!(matches!(err, EngineError::Internal(_)), "expected Internal for JoinError, got {err:?}");
     }
 }

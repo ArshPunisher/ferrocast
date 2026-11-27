@@ -1603,6 +1603,21 @@ struct OverlayTestHost {
     released_holds: std::sync::Mutex<Vec<String>>,
     pushes: std::sync::Mutex<Vec<(String, i64, bool)>>,
     shelf_calls: std::sync::Mutex<Vec<String>>,
+    held_collection_id: std::sync::Mutex<String>,
+    hold_next_save: std::sync::atomic::AtomicBool,
+    swapped: Arc<tokio::sync::Notify>,
+    release_save: Arc<tokio::sync::Notify>,
+    finished_or_aborted: Arc<tokio::sync::Notify>,
+}
+
+struct OverlayOpGuard {
+    done: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for OverlayOpGuard {
+    fn drop(&mut self) {
+        self.done.notify_one();
+    }
 }
 
 impl OverlayTestHost {
@@ -1613,6 +1628,11 @@ impl OverlayTestHost {
             released_holds: std::sync::Mutex::new(Vec::new()),
             pushes: std::sync::Mutex::new(Vec::new()),
             shelf_calls: std::sync::Mutex::new(Vec::new()),
+            held_collection_id: std::sync::Mutex::new("untitled".into()),
+            hold_next_save: std::sync::atomic::AtomicBool::new(false),
+            swapped: Arc::new(tokio::sync::Notify::new()),
+            release_save: Arc::new(tokio::sync::Notify::new()),
+            finished_or_aborted: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -1652,6 +1672,11 @@ impl crate::studio_host::StudioHost for OverlayTestHost {
                 }
                 Ok(Value::Null)
             }
+            crate::studio_host::StudioAct::Scenes => Ok(json!({
+                "scenes": [{ "name": "Main" }],
+                "current": "Main",
+                "collection_id": self.held_collection_id.lock().unwrap().clone(),
+            })),
             _ => Ok(Value::Null),
         }
     }
@@ -1697,9 +1722,15 @@ impl crate::studio_host::StudioHost for OverlayTestHost {
                 studio_library::headless_shelf_new(&self.data, &kind, &name, copy)
             }
             ShelfAct::Switch { id } => {
+                let _guard = OverlayOpGuard { done: self.finished_or_aborted.clone() };
                 self.shelf_calls.lock().unwrap().push(format!("switch:{id}"));
                 if self.fail_switch.load(Ordering::SeqCst) {
                     return Err("switch failed intentionally".into());
+                }
+                *self.held_collection_id.lock().unwrap() = id.clone();
+                if self.hold_next_save.swap(false, Ordering::SeqCst) {
+                    self.swapped.notify_one();
+                    self.release_save.notified().await;
                 }
                 studio_library::headless_shelf_switch(&self.data, &kind, &id)
             }
@@ -1710,7 +1741,16 @@ impl crate::studio_host::StudioHost for OverlayTestHost {
             }
             ShelfAct::Export { id } => studio_library::headless_shelf_export(&self.data, &kind, &id),
             ShelfAct::Import { name, doc } => {
+                let _guard = OverlayOpGuard { done: self.finished_or_aborted.clone() };
                 self.shelf_calls.lock().unwrap().push(format!("import:{name}"));
+                let loaded = studio_library::load(&self.data);
+                let unique = loaded.collections.free_name(&name);
+                let planned_id = loaded.collections.new_id(&unique);
+                *self.held_collection_id.lock().unwrap() = planned_id;
+                if self.hold_next_save.swap(false, Ordering::SeqCst) {
+                    self.swapped.notify_one();
+                    self.release_save.notified().await;
+                }
                 let (id, _prev, saved_name) = studio_library::import_collection_doc(&self.data, &name, doc)?;
                 Ok(json!({ "id": id, "name": saved_name }))
             }
@@ -1782,4 +1822,68 @@ async fn col03_and_col12_overlay_import_and_undo_serialize_release_holds_fallbac
     assert_eq!(undone.restored_collection_id.as_deref(), Some("fallback-show"));
     assert_eq!(studio_library::load(dir.path()).collections.current, "fallback-show");
     assert!(!studio_library::file(dir.path(), studio_library::Kind::Collections, &report.id).exists());
+}
+
+#[tokio::test]
+async fn overlay_import_and_undo_complete_when_caller_future_dropped() {
+    let (e, dir) = engine().await;
+    let host = Arc::new(OverlayTestHost::new(dir.path()));
+    e.set_studio_host(host.clone());
+
+    let png = make_tiny_png();
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let zip = build_zip(vec![("config.json", &cfg, None), ("assets/frame.png", &png, None)]);
+    let prev = e.preview_overlay_pack(zip, "drop-pack.overlay".into()).await.unwrap();
+
+    // Drop import_overlay_pack mid-switch right after Held swapped, before library.json saves.
+    host.hold_next_save.store(true, Ordering::SeqCst);
+    let mut imp_fut = Box::pin(e.import_overlay_pack(OverlayPackImportReq {
+        preview_id: prev.preview_id,
+        name: Some("Drop Neon".into()),
+        ..Default::default()
+    }));
+    tokio::select! {
+        biased;
+        _ = &mut imp_fut => panic!("import_overlay_pack finished before drop"),
+        _ = host.swapped.notified() => {}
+    }
+    drop(imp_fut);
+    host.release_save.notify_one();
+    host.finished_or_aborted.notified().await;
+    // Wait until the detached import task releases `import_busy` after writing the undo record.
+    drop(e.inner.import_busy.lock().await);
+
+    let lib = studio_library::load(dir.path());
+    assert_eq!(lib.collections.current, "drop-neon");
+    assert_eq!(e.studio_act(crate::studio_host::StudioAct::Scenes).await.unwrap()["collection_id"], "drop-neon");
+
+    // Read the persisted undo token to confirm post-switch persistence also ran to completion.
+    let undo_dir_path = undo_dir(dir.path());
+    let undo_files: Vec<_> = std::fs::read_dir(&undo_dir_path)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    assert_eq!(undo_files.len(), 1, "undo record must be persisted: {undo_files:?}");
+    let rec: UndoRecord = durable::load_json_with_backup(&undo_files[0], |_| true).unwrap().value;
+
+    // Drop undo_overlay_pack mid-switch and confirm restore + cleanup finish cleanly.
+    host.hold_next_save.store(true, Ordering::SeqCst);
+    let mut undo_fut = Box::pin(e.undo_overlay_pack(&rec.token));
+    tokio::select! {
+        biased;
+        _ = &mut undo_fut => panic!("undo_overlay_pack finished before drop"),
+        _ = host.swapped.notified() => {}
+    }
+    drop(undo_fut);
+    host.release_save.notify_one();
+    host.finished_or_aborted.notified().await;
+    drop(e.inner.import_busy.lock().await);
+
+    let after = studio_library::load(dir.path());
+    assert_eq!(after.collections.current, "untitled");
+    assert_eq!(e.studio_act(crate::studio_host::StudioAct::Scenes).await.unwrap()["collection_id"], "untitled");
+    assert!(!studio_library::file(dir.path(), studio_library::Kind::Collections, "drop-neon").exists());
+    assert!(files_under(&dir.path().join("studio").join("packs")).is_empty());
 }

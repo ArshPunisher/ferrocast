@@ -318,10 +318,21 @@ impl Engine {
     /// Imports a previously previewed `.overlay` theme pack: resolves & caches missing Google Fonts,
     /// copies media files into `<data>/studio/packs/<pack_id>/`, creates Ferrocast overlays for mapped
     /// widgets, and switches the active Studio scene collection.
+    /// Runs inside a detached task so client disconnects cannot strand media, overlays, or `library.json`.
     pub async fn import_overlay_pack(&self, req: OverlayPackImportReq) -> Result<OverlayPackImportReport, EngineError> {
         if req.preview_id.trim().is_empty() {
             return Err(EngineError::Invalid("preview_id: preview the .overlay file first.".into()));
         }
+        let engine = self.clone();
+        tokio::spawn(async move { engine.import_overlay_pack_inner(req).await })
+            .await
+            .map_err(|e| EngineError::Internal(format!("Overlay pack import failed: {e}")))?
+    }
+
+    async fn import_overlay_pack_inner(
+        &self,
+        req: OverlayPackImportReq,
+    ) -> Result<OverlayPackImportReport, EngineError> {
         let _one_at_a_time = self.inner.import_busy.lock().await;
 
         // Refuse before copying files or switching when live streaming or recording is active.
@@ -533,13 +544,23 @@ impl Engine {
     /// Reverts a previous `.overlay` pack import: restores the previous scene collection, removes the
     /// imported collection, deletes any Ferrocast overlays created by the pack, and cleans up copied
     /// pack media files cleanly (cached Google Fonts remain reusable in `<data>/fonts/`).
+    /// Runs inside a detached task so client disconnects cannot abort mid-restore or skip cleanup.
     pub async fn undo_overlay_pack(&self, undo_token: &str) -> Result<OverlayPackUndoReport, EngineError> {
+        let token = undo_token.trim().to_string();
+        let _ = undo_file(self.store().dir(), &token)?;
+        let engine = self.clone();
+        tokio::spawn(async move { engine.undo_overlay_pack_inner(&token).await })
+            .await
+            .map_err(|e| EngineError::Internal(format!("Overlay pack undo failed: {e}")))?
+    }
+
+    async fn undo_overlay_pack_inner(&self, undo_token: &str) -> Result<OverlayPackUndoReport, EngineError> {
         let _one_at_a_time = self.inner.import_busy.lock().await;
         let _lib = self.studio().library_lock.lock().await;
         let _gate = self.prepare_shelf_mutation("collections", true).await?;
 
         let data = self.store().dir().to_path_buf();
-        let rec_path = undo_file(&data, undo_token.trim())?;
+        let rec_path = undo_file(&data, undo_token)?;
         let rec: UndoRecord =
             durable::load_json_with_backup(&rec_path, |_| true).map(|l| l.value).ok_or_else(|| {
                 EngineError::Refused {
