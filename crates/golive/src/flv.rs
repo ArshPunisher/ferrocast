@@ -248,7 +248,10 @@ fn skip_scaling_list(r: &mut BitReader<'_>, size: usize) -> Option<()> {
     for _ in 0..size {
         if next_scale != 0 {
             let delta = r.read_se()?;
-            next_scale = (last_scale + delta + 256).rem_euclid(256);
+            if !(-128..=127).contains(&delta) {
+                return None;
+            }
+            next_scale = (i64::from(last_scale) + i64::from(delta)).rem_euclid(256) as i32;
         }
         last_scale = if next_scale == 0 { last_scale } else { next_scale };
     }
@@ -576,5 +579,63 @@ mod tests {
         assert_eq!(avcc_sps_dimensions(&[0x17, 0x01, 0, 0, 0, 0xAA]), None);
         assert_eq!(avcc_sps_dimensions(b"\x90hvc1\x01\x01"), None);
         assert_eq!(avcc_sps_dimensions(&[]), None);
+    }
+
+    #[test]
+    fn avcc_sps_ignores_extreme_scaling_list_delta_without_overflow() {
+        // Build High-profile SPS (profile_idc = 100) with seq_scaling_matrix_present_flag = 1,
+        // seq_scaling_list_present_flag[0] = 1, and a 31-leading-zero Exp-Golomb delta_scale
+        // decoding to i32::MAX (code = u32::MAX - 2).
+        let mut bits = Vec::new();
+        let mut push_bits = |val: u64, n: u8| {
+            for i in (0..n).rev() {
+                bits.push(((val >> i) & 1) as u8);
+            }
+        };
+        push_bits(100, 8); // profile_idc
+        push_bits(0, 8); // constraints
+        push_bits(40, 8); // level_idc
+        push_bits(1, 1); // sps_id = ue(0)
+        push_bits(0b010, 3); // chroma_format_idc = ue(1)
+        push_bits(1, 1); // bit_depth_luma_minus8 = ue(0)
+        push_bits(1, 1); // bit_depth_chroma_minus8 = ue(0)
+        push_bits(0, 1); // qpprime_y_zero_transform
+        push_bits(1, 1); // seq_scaling_matrix_present_flag = 1
+        push_bits(1, 1); // seq_scaling_list_present_flag[0] = 1
+        push_bits(0, 31); // 31 zeros (followed by 1 and 31-bit suffix)
+        push_bits(1, 1);
+        push_bits(0x7FFF_FFFE, 31); // code = 0xFFFF_FFFD -> read_se() = i32::MAX
+
+        while !bits.len().is_multiple_of(8) {
+            bits.push(0);
+        }
+        let mut sps = vec![0x67u8];
+        let (chunks, _) = bits.as_chunks::<8>();
+        for chunk in chunks {
+            let mut byte = 0u8;
+            for &b in chunk {
+                byte = (byte << 1) | b;
+            }
+            sps.push(byte);
+        }
+        // Escape any accidental 0x00 0x00 0x00..=0x03 sequences in NAL payload? Our bit pattern has
+        // 31 consecutive zero bits -> bytes around it could contain 0x00 0x00, so wrap RBSP safely:
+        let mut nal = Vec::with_capacity(sps.len() + 8);
+        nal.push(sps[0]);
+        let mut zeros = 0u8;
+        for &b in &sps[1..] {
+            if zeros == 2 && b <= 3 {
+                nal.push(0x03);
+                zeros = 0;
+            }
+            nal.push(b);
+            zeros = if b == 0 { zeros.saturating_add(1).min(2) } else { 0 };
+        }
+        let mut pkt = vec![0x17, 0x00, 0, 0, 0, 1, 100, 0, 40, 0xFF, 0xE1];
+        pkt.extend_from_slice(&(nal.len() as u16).to_be_bytes());
+        pkt.extend_from_slice(&nal);
+        pkt.extend_from_slice(&[1, 0, 4, 0x68, 0xEE, 0x3C, 0x80]);
+
+        assert_eq!(avcc_sps_dimensions(&pkt), None);
     }
 }

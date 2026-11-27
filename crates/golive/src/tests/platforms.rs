@@ -834,6 +834,67 @@ async fn platform_that_rejects_above_drops_over_bitrate() {
 }
 
 #[tokio::test]
+async fn platform_that_rejects_above_drops_over_coded_bitrate_without_metadata() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let mut got = platform_that_rejects_above(l, "k", 1920, 1080, 8000).await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: Retry { first: Duration::from_millis(10), max: Duration::from_millis(20), max_attempts: 2 },
+        ..destination(dport, "k")
+    };
+    let mut health = start(&w, dest);
+    let mut obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+    // Metadata omits video_bitrate_kbps so only the coded-frame timestamp window detects > 8,000 kbps.
+    let mut m = StreamMetadata::new();
+    m.video_width = Some(1920);
+    m.video_height = Some(1080);
+    let r = obs.c.publish_metadata(&m).unwrap();
+    obs.send(vec![r]).await.unwrap();
+    let avc_1080p = Bytes::from(crate::flv::minimal_avc_header(1920, 1080));
+    let rv = obs.c.publish_video_data(avc_1080p, RtmpTimestamp::new(0), false).unwrap();
+    obs.send(vec![rv]).await.unwrap();
+    obs.video(0, KEY).await;
+
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    state_within(&mut health, WAIT, |s| *s == PushState::Live).await;
+
+    // Send ~10,000 kbps across coded RTMP timestamps continuously across retries so attempt 2
+    // also exceeds 8,000 kbps and transitions cleanly to PushState::Failed.
+    let mut frame = vec![0x17, 0x01, 0, 0, 0];
+    frame.resize(25_000, 0x5A);
+    let payload = Bytes::from(frame);
+    let feeder = tokio::spawn(async move {
+        let mut ts = 20u32;
+        loop {
+            let pkt = obs.c.publish_video_data(payload.clone(), RtmpTimestamp::new(ts), false).unwrap();
+            if obs.send(vec![pkt]).await.is_err() {
+                break;
+            }
+            ts = ts.saturating_add(20);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    loop {
+        if next(&mut got).await == Got::Closed {
+            break;
+        }
+    }
+    let failed = state_within(&mut health, WAIT, |s| matches!(s, PushState::Failed { .. })).await.state;
+    feeder.abort();
+    match failed {
+        PushState::Failed { reason, refused, .. } => {
+            assert!(refused);
+            assert!(reason.contains("8,000 kbps"), "{reason}");
+            assert!(!reason.contains("Allow multistreaming"), "{reason}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
 async fn platform_that_rejects_above_allows_within_limits_and_twitch_allows_1440p() {
     let w_kick = world().await;
     let lk = free_listener().await;
