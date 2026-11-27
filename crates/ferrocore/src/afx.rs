@@ -544,6 +544,14 @@ impl AudioFilter {
         }
     }
 
+    /// Whether this filter is a hard `NoiseGate` currently closed (`attenuation < 0.5`).
+    /// Downward expanders are excluded so an active VAD suppressor downstream/upstream of an
+    /// expander can still detect quiet speech for mic-level supervision.
+    #[must_use]
+    pub fn hard_gate_closed(&self) -> bool {
+        self.enabled && matches!(self.effect, AudioEffect::NoiseGate { .. }) && self.attenuation < 0.5
+    }
+
     /// Voice-activity probability (`0.0..=1.0`) when this filter is an enabled speech-aware
     /// noise suppressor (`Rnnoise` VAD or fallback `light_denoise` voice detector).
     #[must_use]
