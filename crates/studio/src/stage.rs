@@ -107,13 +107,16 @@ pub fn levels_now(
 }
 
 /// Handle to a [`Stage`]'s active engine, used by views and lifetime tests.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct EngineRef(Arc<own::Shared>);
 
 /// Weak reference to a [`Stage`]'s active engine.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct WeakEngineRef(std::sync::Weak<own::Shared>);
 
+#[cfg(any(test, feature = "test-support"))]
 impl EngineRef {
     pub fn downgrade(&self) -> WeakEngineRef {
         WeakEngineRef(Arc::downgrade(&self.0))
@@ -128,9 +131,76 @@ impl EngineRef {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl WeakEngineRef {
     pub fn is_alive(&self) -> bool {
         self.0.upgrade().is_some()
+    }
+}
+
+/// Collection validated and normalized off the main thread, ready to wrap in [`Stage`].
+#[derive(Debug)]
+pub struct PreparedStage {
+    canvas: Canvas,
+    doc: Value,
+}
+
+impl PreparedStage {
+    pub fn canvas(&self) -> Canvas {
+        self.canvas
+    }
+}
+
+/// Snapshot of what [`Stage::open_engine_off_main`] needs to open the engine on a worker thread.
+#[derive(Debug, Clone)]
+pub struct EngineOpenSpec {
+    canvas: Canvas,
+    doc: Value,
+    monitor_device: Option<String>,
+    true_peak: bool,
+    low_latency: bool,
+    snapshot_reloads: usize,
+}
+
+/// Newly opened [`own::Shared`] engine ready to install onto a [`Stage`] on the main thread.
+#[derive(Debug)]
+pub struct OpenedEngine {
+    shared: Arc<own::Shared>,
+    snapshot_reloads: usize,
+}
+
+/// Outgoing [`Stage`] media/engine handles moved off the main thread to close and drain safely.
+#[derive(Debug)]
+pub struct StageTeardown {
+    engine: Option<Arc<own::Shared>>,
+    weak: Option<std::sync::Weak<own::Shared>>,
+    nets: std::collections::HashMap<String, (Value, crate::netmedia::NetMedia)>,
+    ndis: std::collections::HashMap<String, (String, crate::ndi_io::NdiIn)>,
+}
+
+impl StageTeardown {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn weak_ref(&self) -> Option<WeakEngineRef> {
+        self.weak.clone().map(WeakEngineRef)
+    }
+
+    /// Drops network/NDI sources and the outgoing engine off the main thread, waiting until
+    /// every transient `Arc<own::Shared>` reader has finished so capture devices are fully closed
+    /// before another engine opens.
+    pub fn finish_off_main(self) {
+        let Self { engine, weak, nets, ndis } = self;
+        drop(nets);
+        drop(ndis);
+        drop(engine);
+        if let Some(weak) = weak {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while weak.strong_count() > 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            if weak.strong_count() > 0 {
+                tracing::warn!(holders = weak.strong_count(), "outgoing engine holders did not clear within 5 s");
+            }
+        }
     }
 }
 
@@ -161,6 +231,9 @@ pub struct Stage {
     low_latency: std::cell::Cell<bool>,
     /// Ferrocast's own engine with it open, once something asked for it.
     engine: RefCell<Option<Arc<own::Shared>>>,
+    /// True while a collection switch is draining the old engine and opening this stage's
+    /// engine off the main thread so no second engine can open concurrently.
+    engine_opening: std::cell::Cell<bool>,
     /// Web page sources, each a page rendered for our engine, with the settings it opened with.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pages: RefCell<std::collections::HashMap<String, (Value, crate::ffi::web::FedPage)>>,
@@ -669,6 +742,31 @@ impl Drop for Stage {
 }
 
 impl Stage {
+    fn from_doc(canvas: Canvas, doc: Value) -> Self {
+        Self {
+            canvas,
+            doc: RefCell::new(doc),
+            quiet: std::cell::Cell::new(false),
+            reloads: std::cell::Cell::new(0),
+            levels_retry_at: std::cell::Cell::new(None),
+            holds: RefCell::default(),
+            monitor_device: RefCell::new(None),
+            true_peak: std::cell::Cell::new(false),
+            low_latency: std::cell::Cell::new(false),
+            engine: RefCell::new(None),
+            engine_opening: std::cell::Cell::new(false),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            pages: RefCell::default(),
+            nets: RefCell::default(),
+            ndis: RefCell::default(),
+            ndi_failed: RefCell::default(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            cutouts: RefCell::default(),
+            fps_seen: std::cell::Cell::new(None),
+            dropped_base: ferrocore::video::dropped_frames(),
+        }
+    }
+
     /// A collection with one empty scene, on air.
     pub fn new(canvas: Canvas, first_scene: &str) -> Result<Self, StudioError> {
         check_name(first_scene)?;
@@ -685,33 +783,13 @@ impl Stage {
                 { "id": "cut_transition", "name": "Cut", "duration": 0, "settings": {} },
             ],
         });
-        let s = Self {
-            canvas,
-            doc: RefCell::new(doc),
-            quiet: std::cell::Cell::new(false),
-            reloads: std::cell::Cell::new(0),
-            levels_retry_at: std::cell::Cell::new(None),
-            holds: RefCell::default(),
-            monitor_device: RefCell::new(None),
-            true_peak: std::cell::Cell::new(false),
-            low_latency: std::cell::Cell::new(false),
-            engine: RefCell::new(None),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            pages: RefCell::default(),
-            nets: RefCell::default(),
-            ndis: RefCell::default(),
-            ndi_failed: RefCell::default(),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            cutouts: RefCell::default(),
-            fps_seen: std::cell::Cell::new(None),
-            dropped_base: ferrocore::video::dropped_frames(),
-        };
+        let s = Self::from_doc(canvas, doc);
         s.add_scene(first_scene)?;
         Ok(s)
     }
 
-    /// A collection OBS (or `save`) wrote. One with no scenes gets `first_scene`.
-    pub fn load(canvas: Canvas, doc: &Value, first_scene: &str) -> Result<Self, StudioError> {
+    /// Validates and normalizes a collection document off the main thread before creating [`Stage`].
+    pub fn prepare_load(canvas: Canvas, doc: &Value, first_scene: &str) -> Result<PreparedStage, StudioError> {
         let mut doc = doc.clone();
         if !doc.get("sources").is_some_and(Value::is_array) {
             doc["sources"] = json!([]);
@@ -719,27 +797,7 @@ impl Stage {
         // Sources an older Ferrocast kept after their last scene item went (they ran unseen).
         drop_unused(&mut doc);
         import_and_normalize_transitions(&mut doc);
-        let s = Self {
-            canvas,
-            doc: RefCell::new(doc),
-            quiet: std::cell::Cell::new(false),
-            reloads: std::cell::Cell::new(0),
-            levels_retry_at: std::cell::Cell::new(None),
-            holds: RefCell::default(),
-            monitor_device: RefCell::new(None),
-            true_peak: std::cell::Cell::new(false),
-            low_latency: std::cell::Cell::new(false),
-            engine: RefCell::new(None),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            pages: RefCell::default(),
-            nets: RefCell::default(),
-            ndis: RefCell::default(),
-            ndi_failed: RefCell::default(),
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            cutouts: RefCell::default(),
-            fps_seen: std::cell::Cell::new(None),
-            dropped_base: ferrocore::video::dropped_frames(),
-        };
+        let s = Self::from_doc(canvas, doc);
         if s.scenes().is_empty() {
             s.add_scene(first_scene)?;
         }
@@ -750,7 +808,17 @@ impl Stage {
                 d["current_program_scene"] = json!(first);
             });
         }
-        Ok(s)
+        Ok(PreparedStage { canvas, doc: std::mem::take(&mut *s.doc.borrow_mut()) })
+    }
+
+    /// Wraps a [`PreparedStage`] into a [`Stage`] on the main thread without opening its engine.
+    pub fn from_prepared(prep: PreparedStage) -> Self {
+        Self::from_doc(prep.canvas, prep.doc)
+    }
+
+    /// A collection OBS (or `save`) wrote. One with no scenes gets `first_scene`.
+    pub fn load(canvas: Canvas, doc: &Value, first_scene: &str) -> Result<Self, StudioError> {
+        Self::prepare_load(canvas, doc, first_scene).map(Self::from_prepared)
     }
 
     /// The collection as OBS writes a scene collection.
@@ -765,21 +833,60 @@ impl Stage {
         self.engine.borrow().is_some()
     }
 
+    /// Marks this stage as waiting on an off-main engine open so nothing opens a duplicate engine.
+    pub fn set_engine_opening(&self, opening: bool) {
+        self.engine_opening.set(opening);
+    }
+
+    /// Whether an off-main engine open is currently in flight for this stage.
+    pub fn is_engine_opening(&self) -> bool {
+        self.engine_opening.get()
+    }
+
+    /// Opens this stage's running engine if it is not already open.
+    pub fn ensure_engine(&self) -> Result<(), StudioError> {
+        self.engine().map(|_| ())
+    }
+
     /// Returns a handle to this stage's running engine, opening it if needed.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn engine_ref(&self) -> Result<EngineRef, StudioError> {
         self.engine().map(EngineRef)
     }
 
-    /// Ferrocast's own engine with this collection open: the one running, or a new one.
-    pub(crate) fn engine(&self) -> Result<Arc<own::Shared>, StudioError> {
-        if let Some(e) = self.engine.borrow().as_ref() {
-            return Ok(e.clone());
+    /// Captures the settings and document snapshot needed to open the engine off the main thread.
+    pub fn engine_open_spec(&self) -> EngineOpenSpec {
+        EngineOpenSpec {
+            canvas: self.canvas,
+            doc: self.live(|d| d.clone()),
+            monitor_device: self.monitor_device.borrow().clone(),
+            true_peak: self.true_peak.get(),
+            low_latency: self.low_latency.get(),
+            snapshot_reloads: self.reloads.get(),
         }
+    }
+
+    /// Opens a fresh engine for `spec` off the main thread.
+    pub fn open_engine_off_main(spec: &EngineOpenSpec) -> Result<OpenedEngine, StudioError> {
         crate::webfetch::install();
-        let shared = self.live(|d| own::Shared::open_at(self.canvas, d))?;
-        // Monitoring plays from the start, as libobs keeps its device open: opened only when
-        // Settings were saved, every new engine (each start, a new picture size) had none, and
-        // a source set to be heard here ("Monitor only", "Monitor and output") played nowhere.
+        let shared = own::Shared::open_at(spec.canvas, &spec.doc)?;
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if let Err(e) = shared.engine.set_monitoring(true, spec.monitor_device.as_deref()) {
+            tracing::warn!("monitoring couldn't start: {e}");
+        }
+        shared.engine.set_true_peak(spec.true_peak);
+        shared.engine.set_low_latency(spec.low_latency);
+        Ok(OpenedEngine { shared, snapshot_reloads: spec.snapshot_reloads })
+    }
+
+    /// Installs an [`OpenedEngine`] onto this stage on the main thread, syncing any doc edits and
+    /// audio preferences applied while it opened, plus browser/media/NDI pages.
+    pub fn install_opened_engine(&self, opened: OpenedEngine) {
+        self.engine_opening.set(false);
+        let shared = opened.shared;
+        if self.reloads.get() != opened.snapshot_reloads {
+            self.live(|d| shared.reopen_with(d, true));
+        }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let Err(e) = shared.engine.set_monitoring(true, self.monitor_device.borrow().as_deref()) {
             tracing::warn!("monitoring couldn't start: {e}");
@@ -789,6 +896,38 @@ impl Stage {
         *self.engine.borrow_mut() = Some(shared.clone());
         publish_engine(Some(&shared));
         self.sync_pages();
+    }
+
+    /// Drops UI/AppKit page handles on the main thread and extracts network, NDI, and engine
+    /// handles into [`StageTeardown`] so heavy close/wait runs off the main thread.
+    pub fn into_teardown(self) -> StageTeardown {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.pages.borrow_mut().clear();
+            self.cutouts.borrow_mut().clear();
+        }
+        let nets = std::mem::take(&mut *self.nets.borrow_mut());
+        let ndis = std::mem::take(&mut *self.ndis.borrow_mut());
+        let engine = self.engine.borrow_mut().take();
+        if let Some(ref shared) = engine {
+            clear_published_engine_if(shared);
+        }
+        let weak = engine.as_ref().map(Arc::downgrade);
+        StageTeardown { engine, weak, nets, ndis }
+    }
+
+    /// Ferrocast's own engine with this collection open: the one running, or a new one.
+    pub(crate) fn engine(&self) -> Result<Arc<own::Shared>, StudioError> {
+        if let Some(e) = self.engine.borrow().as_ref() {
+            return Ok(e.clone());
+        }
+        if self.engine_opening.get() {
+            return Err(fail("The scene collection is still opening; try again in a moment."));
+        }
+        let spec = self.engine_open_spec();
+        let opened = Self::open_engine_off_main(&spec)?;
+        let shared = opened.shared.clone();
+        self.install_opened_engine(opened);
         Ok(shared)
     }
 
@@ -7188,6 +7327,7 @@ impl Stage {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageView {
     /// Returns a handle to the engine backing this view.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn engine_ref(&self) -> EngineRef {
         EngineRef(self.shared.clone())
     }
@@ -7607,6 +7747,7 @@ impl Stage {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageProjector {
     /// Returns a handle to the engine backing this projector.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn engine_ref(&self) -> EngineRef {
         EngineRef(self.shared.clone())
     }
@@ -11487,5 +11628,63 @@ mod tests {
         );
         assert!(s.is_matching_camera_waiting(cam_kind, cam_key, &val));
         assert!(s.matching_device_picture_job(cam_kind, cam_key, &val, 160).is_none());
+    }
+
+    #[test]
+    fn stage_teardown_waits_for_transient_arc_holder_before_returning() {
+        let s = Stage::new(Canvas { width: 320, height: 180, fps: 30 }, "Main").unwrap_or_else(|e| panic!("{e}"));
+        let Ok(e) = s.engine() else { return };
+        let transient = e.clone();
+        let weak = Arc::downgrade(&e);
+        drop(e);
+
+        let td = s.into_teardown();
+        let saw_teardown_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = saw_teardown_drop.clone();
+        let w = weak.clone();
+        let holder = std::thread::spawn(move || {
+            while w.strong_count() > 1 {
+                std::thread::yield_now();
+            }
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            drop(transient);
+        });
+
+        td.finish_off_main();
+        holder.join().unwrap();
+        assert!(saw_teardown_drop.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(weak.strong_count(), 0, "transient Arc holder must be completely dropped before return");
+    }
+
+    #[test]
+    fn prepared_stage_and_off_main_engine_lifecycle_prevents_competing_engine_open() {
+        let canvas = Canvas { width: 640, height: 360, fps: 30 };
+        let doc = json!({
+            "name": "PrepTest",
+            "sources": [],
+            "scene_order": [{ "name": "Main" }],
+            "current_scene": "Main",
+            "current_program_scene": "Main",
+        });
+        let prep = Stage::prepare_load(canvas, &doc, "Main").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(prep.canvas(), canvas);
+        let stage = Stage::from_prepared(prep);
+        assert!(!stage.has_engine());
+
+        stage.set_engine_opening(true);
+        assert!(stage.is_engine_opening());
+        assert!(stage.ensure_engine().is_err(), "engine() must refuse competing opens while engine_opening is set");
+
+        let spec = stage.engine_open_spec();
+        let Ok(opened) = Stage::open_engine_off_main(&spec) else {
+            stage.set_engine_opening(false);
+            return;
+        };
+        // Simulate an edit arriving on the main thread while the engine opened off main.
+        ok(stage.add_scene("AddedDuringOpen"));
+        stage.install_opened_engine(opened);
+        assert!(!stage.is_engine_opening());
+        assert!(stage.has_engine());
+        assert!(stage.scenes().iter().any(|s| s.name == "AddedDuringOpen"));
     }
 }

@@ -380,6 +380,8 @@ struct Held {
     stream_cap: Option<StreamCap>,
     /// Kept LAST so Rust's implicit drop order always drops outputs before the collection.
     collection: Option<Collection>,
+    /// Active collection generation bumped on every commit/stop so stale async opens drop safely.
+    collection_gen: u64,
     /// True in Safe Mode when a temporary empty collection is running until the user confirms
     /// loading the saved collection; guards against overwriting the saved file on disk.
     collection_deferred: bool,
@@ -554,6 +556,9 @@ fn make_vertical_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     let Some(c) = h.collection.as_ref() else { return Ok(()) };
     if c.vertical().is_none() {
         h.vertical.view = None;
+        return Ok(());
+    }
+    if c.is_engine_opening() {
         return Ok(());
     }
     // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
@@ -799,7 +804,7 @@ fn finish_canvas_views(
     if let Some(c) = &h.collection
         && reopen_engine
         && !c.has_engine()
-        && let Err(e) = c.engine_ref()
+        && let Err(e) = c.ensure_engine()
     {
         tracing::warn!(error = %e, "the engine didn't reopen after a canvas change");
     }
@@ -1378,8 +1383,13 @@ fn forget(data: &std::path::Path, kind: Kind, id: &str) {
     ferrocast_store::durable::remove_with_backup(&library::file(data, kind, id));
 }
 
-fn load_collection_doc(canvas: Canvas, file: &std::path::Path) -> Result<Collection, ferrocast_studio::StudioError> {
-    let load_one = |path: &std::path::Path| -> Option<Result<Collection, Option<ferrocast_studio::StudioError>>> {
+fn load_prepared_collection(
+    canvas: Canvas,
+    file: &std::path::Path,
+) -> Result<ferrocast_studio::stage::PreparedStage, ferrocast_studio::StudioError> {
+    let load_one = |path: &std::path::Path| -> Option<
+        Result<ferrocast_studio::stage::PreparedStage, Option<ferrocast_studio::StudioError>>,
+    > {
         let bytes = match ferrocast_store::durable::read_patiently(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -1399,7 +1409,7 @@ fn load_collection_doc(canvas: Canvas, file: &std::path::Path) -> Result<Collect
                 return Some(Err(None));
             }
         };
-        Some(Collection::load(canvas, &doc, FIRST_SCENE).map_err(Some))
+        Some(Collection::prepare_load(canvas, &doc, FIRST_SCENE).map_err(Some))
     };
 
     if let Some(res) = load_one(file) {
@@ -1415,7 +1425,7 @@ fn load_collection_doc(canvas: Canvas, file: &std::path::Path) -> Result<Collect
                 if let Some(e) = schema_err {
                     return Err(e);
                 }
-                return Collection::new(canvas, FIRST_SCENE);
+                return Collection::prepare_load(canvas, &json!({ "sources": [] }), FIRST_SCENE);
             }
         }
     }
@@ -1425,7 +1435,7 @@ fn load_collection_doc(canvas: Canvas, file: &std::path::Path) -> Result<Collect
         tracing::warn!(file = %file.display(), "recovered scene collection from .bak");
         return Ok(c);
     }
-    Collection::new(canvas, FIRST_SCENE)
+    Collection::prepare_load(canvas, &json!({ "sources": [] }), FIRST_SCENE)
 }
 
 fn apply_collection_audio_prefs(c: &Collection, settings: Option<&StudioSettings>) {
@@ -1457,6 +1467,211 @@ fn release_push_keys_on(c: &Collection, release_keys: &[String]) {
     }
 }
 
+struct SwapPrecheck {
+    canvas: Canvas,
+    from: PathBuf,
+}
+
+struct PendingSwapPhase2 {
+    teardown: Option<ferrocast_studio::stage::StageTeardown>,
+    guests: Vec<(String, String, ferrocast_guest::Guest)>,
+    prev_projectors: Vec<ProjectorReq>,
+    open_spec: ferrocast_studio::stage::EngineOpenSpec,
+    epoch_gen: u64,
+}
+
+struct FinishedSwapPhase3 {
+    opened: Result<ferrocast_studio::stage::OpenedEngine, ferrocast_studio::StudioError>,
+    prev_projectors: Vec<ProjectorReq>,
+    epoch_gen: u64,
+}
+
+trait HeldBridge: Sync {
+    fn call_main<F, R>(&self, f: F) -> impl std::future::Future<Output = Result<R, String>> + Send
+    where
+        F: FnOnce(ViewCtx<'_>, &mut Held) -> R + Send + 'static,
+        R: Send + 'static;
+}
+
+impl HeldBridge for DesktopStudio {
+    async fn call_main<F, R>(&self, f: F) -> Result<R, String>
+    where
+        F: FnOnce(ViewCtx<'_>, &mut Held) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let app = self.app.clone();
+        self.on_main(move |h| f(ViewCtx::App(&app), h)).await
+    }
+}
+
+fn swap_phase0_precheck(
+    h: &mut Held,
+    to_id: Option<&str>,
+    from_fallback: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<Option<SwapPrecheck>, String> {
+    let Some(canvas) = h.collection.as_ref().map(Collection::canvas) else {
+        // Not running: the next Start loads it.
+        h.collection_file = Some(to.to_path_buf());
+        if let Some(id) = to_id {
+            h.collection_id = Some(id.to_string());
+        }
+        return Ok(None);
+    };
+    if outputs_busy_for_switch(h) {
+        return Err("Stop streaming and recording before changing scene collections.".into());
+    }
+    let from = h.collection_file.clone().unwrap_or_else(|| from_fallback.to_path_buf());
+    Ok(Some(SwapPrecheck { canvas, from }))
+}
+
+/// Commits the incoming collection onto `Held` and strips AppKit/Win32 UI views on the main
+/// thread while moving heavy engine teardown, guest `.sdp` cleanup, and new engine creation into
+/// `PendingSwapPhase2` so Phase 3 runs off the main thread.
+fn swap_phase2_on_main(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    to_id: Option<&str>,
+    from: &std::path::Path,
+    to: &std::path::Path,
+    prepared: ferrocast_studio::stage::PreparedStage,
+    release: impl FnOnce(ViewCtx<'_>) -> Vec<String>,
+) -> Result<Option<PendingSwapPhase2>, String> {
+    let Some(canvas_now) = h.collection.as_ref().map(Collection::canvas) else {
+        h.collection_file = Some(to.to_path_buf());
+        if let Some(id) = to_id {
+            h.collection_id = Some(id.to_string());
+        }
+        return Ok(None);
+    };
+    if outputs_busy_for_switch(h) {
+        return Err("Stop streaming and recording before changing scene collections.".into());
+    }
+    if canvas_now != prepared.canvas() {
+        return Err("The canvas size changed while loading the scene collection; try again.".into());
+    }
+    // Put the following item back first, so neither collection is saved slid sideways.
+    if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
+        c.stop_follow(&f);
+    }
+    h.follow_run = h.follow_run.saturating_add(1);
+    // Release every view, projector, and stopped output holding the old engine before teardown.
+    let mut prev_projectors = take_projector_reqs(h);
+    // Source projectors belong to the outgoing collection only (OBS closes them on switch).
+    prev_projectors.retain(|r| r.what != "source");
+    h.preview = None;
+    h.program_view = None;
+    h.vertical.view = None;
+    drop_inactive_outputs(h);
+    stop_captions(h);
+    h.replay_shown = None;
+    h.replay_back = None;
+    h.replay_wait = None;
+    let guests = std::mem::take(&mut h.guests);
+    // NDI and the virtual camera send the old collection's picture: they stop with it.
+    h.ndi = None;
+    h.virtualcam = None;
+    h.history.clear();
+    h.selected = None;
+    h.frames = None;
+    // Drain active shortcut holds only once the switch commits so a failed load leaves PTT/PTM
+    // keys intact and responsive on the surviving collection.
+    let release_keys = release(ctx);
+    let teardown = if let Some(old_c) = h.collection.take() {
+        release_push_keys_on(&old_c, &release_keys);
+        save_confirmed(h.collection_deferred, &old_c, from);
+        Some(old_c.into_teardown())
+    } else {
+        None
+    };
+    let made = Collection::from_prepared(prepared);
+    made.set_engine_opening(true);
+    h.collection_deferred = false;
+    save_confirmed(false, &made, to);
+    apply_collection_audio_prefs(&made, h.settings.as_ref());
+    let open_spec = made.engine_open_spec();
+    h.collection = Some(made);
+    h.collection_file = Some(to.to_path_buf());
+    if let Some(id) = to_id {
+        h.collection_id = Some(id.to_string());
+    }
+    h.collection_gen = h.collection_gen.wrapping_add(1);
+    Ok(Some(PendingSwapPhase2 { teardown, guests, prev_projectors, open_spec, epoch_gen: h.collection_gen }))
+}
+
+fn finish_phase3_off_main(p2: PendingSwapPhase2) -> FinishedSwapPhase3 {
+    // 1. Drop outgoing engine/network/NDI and wait until all transient holders release it so two
+    // engines never open an exclusive capture device at the same time.
+    if let Some(td) = p2.teardown {
+        td.finish_off_main();
+    }
+    // 2. Drop guest sources only after FFmpeg in the outgoing collection closed their .sdp files.
+    drop(p2.guests);
+    // 3. Open the incoming engine off the main thread.
+    let opened = Collection::open_engine_off_main(&p2.open_spec);
+    FinishedSwapPhase3 { opened, prev_projectors: p2.prev_projectors, epoch_gen: p2.epoch_gen }
+}
+
+fn swap_phase4_on_main(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, p3: FinishedSwapPhase3) {
+    if h.collection_gen != p3.epoch_gen || h.collection.is_none() {
+        drop(p3.opened);
+        return;
+    }
+    if let Some(c) = h.collection.as_ref() {
+        match p3.opened {
+            Ok(opened) => c.install_opened_engine(opened),
+            Err(e) => {
+                c.set_engine_opening(false);
+                tracing::warn!(error = %e, "the engine couldn't open after switching scene collections");
+            }
+        }
+    }
+    rebuild_views(ctx, h, data, p3.prev_projectors);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    save_projectors(h, data);
+    sync_views(h);
+}
+
+async fn swap_collection_off_main(
+    bridge: &impl HeldBridge,
+    data: PathBuf,
+    to_id: Option<String>,
+    from_fallback: PathBuf,
+    to: PathBuf,
+) -> Result<(), String> {
+    let pre_id = to_id.clone();
+    let pre_to = to.clone();
+    let Some(pre) =
+        bridge.call_main(move |_, h| swap_phase0_precheck(h, pre_id.as_deref(), &from_fallback, &pre_to)).await??
+    else {
+        return Ok(());
+    };
+    let canvas = pre.canvas;
+    let to_read = to.clone();
+    let prepared = tokio::task::spawn_blocking(move || load_prepared_collection(canvas, &to_read))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("That scene collection didn't load: {e}"))?;
+    let p2_id = to_id;
+    let p2_from = pre.from;
+    let p2_to = to;
+    let Some(p2) = bridge
+        .call_main(move |ctx, h| {
+            swap_phase2_on_main(ctx, h, p2_id.as_deref(), &p2_from, &p2_to, prepared, |c| match c {
+                ViewCtx::App(app) => crate::studio_keys::release_active(app),
+                #[cfg(test)]
+                ViewCtx::Test => Vec::new(),
+            })
+        })
+        .await??
+    else {
+        return Ok(());
+    };
+    let p3 = tokio::task::spawn_blocking(move || finish_phase3_off_main(p2)).await.map_err(|e| e.to_string())?;
+    bridge.call_main(move |ctx, h| swap_phase4_on_main(ctx, h, &data, p3)).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 fn swap_collection(
     ctx: ViewCtx<'_>,
@@ -1483,6 +1698,7 @@ fn swap_collection_to(
     swap_collection_releasing(ctx, h, data, to_id, from, to, || release_keys.to_vec())
 }
 
+#[cfg(test)]
 fn swap_collection_releasing(
     ctx: ViewCtx<'_>,
     h: &mut Held,
@@ -1492,73 +1708,16 @@ fn swap_collection_releasing(
     to: &std::path::Path,
     release: impl FnOnce() -> Vec<String>,
 ) -> Result<(), String> {
-    let Some(canvas) = h.collection.as_ref().map(Collection::canvas) else {
-        // Not running: the next Start loads it.
-        h.collection_file = Some(to.to_path_buf());
-        if let Some(id) = to_id {
-            h.collection_id = Some(id.to_string());
-        }
+    let Some(pre) = swap_phase0_precheck(h, to_id, from, to)? else {
         return Ok(());
     };
-    if outputs_busy_for_switch(h) {
-        return Err("Stop streaming and recording before changing scene collections.".into());
-    }
-    // Validate and load the incoming collection before tearing down the current collection or its
-    // views, so a load failure leaves the active engine, history, selection, and views intact.
-    let made = load_collection_doc(canvas, to).map_err(|e| format!("That scene collection didn't load: {e}"))?;
-    // Put the following item back first, so neither collection is saved slid sideways.
-    if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
-        c.stop_follow(&f);
-    }
-    h.follow_run = h.follow_run.saturating_add(1);
-    // Release every view, projector, and stopped output holding the old engine before dropping it.
-    let mut prev_projectors = take_projector_reqs(h);
-    // Source projectors belong to the outgoing collection only (OBS closes them on switch).
-    prev_projectors.retain(|r| r.what != "source");
-    h.preview = None;
-    h.program_view = None;
-    h.vertical.view = None;
-    drop_inactive_outputs(h);
-    stop_captions(h);
-    h.replay_shown = None;
-    h.replay_back = None;
-    h.replay_wait = None;
-    let guests = std::mem::take(&mut h.guests);
-    if !guests.is_empty() {
-        let _ = std::thread::Builder::new().name("ferrocast-guest-drain".into()).spawn(move || drop(guests));
-    }
-    // NDI and the virtual camera send the old collection's picture: they stop with it.
-    h.ndi = None;
-    h.virtualcam = None;
-    h.history.clear();
-    h.selected = None;
-    h.frames = None;
-    // Drain active shortcut holds only once the switch commits so a failed load leaves PTT/PTM
-    // keys intact and responsive on the surviving collection.
-    let release_keys = release();
-    if let Some(old_c) = h.collection.take() {
-        release_push_keys_on(&old_c, &release_keys);
-        save_confirmed(h.collection_deferred, &old_c, from);
-        drop(old_c);
-    }
-    h.collection_deferred = false;
-    save_confirmed(false, &made, to);
-    apply_collection_audio_prefs(&made, h.settings.as_ref());
-    h.collection = Some(made);
-    h.collection_file = Some(to.to_path_buf());
-    if let Some(id) = to_id {
-        h.collection_id = Some(id.to_string());
-    }
-    rebuild_views(ctx, h, data, prev_projectors);
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    save_projectors(h, data);
-    if let Some(c) = &h.collection
-        && !c.has_engine()
-        && let Err(e) = c.engine_ref()
-    {
-        tracing::warn!(error = %e, "the engine couldn't open after switching scene collections");
-    }
-    sync_views(h);
+    let prepared =
+        load_prepared_collection(pre.canvas, to).map_err(|e| format!("That scene collection didn't load: {e}"))?;
+    let Some(p2) = swap_phase2_on_main(ctx, h, to_id, &pre.from, to, prepared, |_| release())? else {
+        return Ok(());
+    };
+    let p3 = finish_phase3_off_main(p2);
+    swap_phase4_on_main(ctx, h, data, p3);
     Ok(())
 }
 
@@ -1761,7 +1920,6 @@ fn take_outputs_from_held(h: &mut Held) -> Vec<Box<dyn FnOnce() + Send>> {
     push_opt_drain(&mut jobs, &mut h.replay);
     push_opt_drain(&mut jobs, &mut h.virtualcam);
     push_opt_drain(&mut jobs, &mut h.ndi);
-    push_vec_drain(&mut jobs, &mut h.guests);
     sync_local_capture_flags(h);
     jobs
 }
@@ -1902,6 +2060,9 @@ pub fn close() -> bool {
     let jobs = take_outputs_from_held(&mut held);
     let clean = drain_outputs_bounded(jobs, quit_drain_for(cfg!(windows)));
     clear_non_output_held(&mut held);
+    let guests = std::mem::take(&mut held.guests);
+    drop(held.collection.take());
+    drop(guests);
     drop(held);
     // The queued scene saves land before the process goes (bounded).
     if !ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(6)) {
@@ -2648,6 +2809,9 @@ fn make_program_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
         h.program_view = None;
         return Ok(());
     }
+    if c.is_engine_opening() {
+        return Ok(());
+    }
     let p = create_stage_view(ctx, c, rect, scale, false)?;
     // Made again (a new canvas size): the stage keeps the page's colour.
     if let Some(c) = h.program_bg {
@@ -2667,6 +2831,9 @@ fn make_preview(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.preview_at else { return Ok(()) };
     // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
     let c = h.collection.as_ref().ok_or(STOPPED)?;
+    if c.is_engine_opening() {
+        return Ok(());
+    }
     let mut p = create_stage_view(ctx, c, rect, scale, false)?;
     if let Some(c) = h.preview_canvas {
         p.set_area(rect, c, scale);
@@ -2904,23 +3071,7 @@ impl DesktopStudio {
         let to = library::file(&data, kind, id);
         match kind {
             Kind::Collections => {
-                let app = self.app.clone();
-                let data_main = data.clone();
-                let id_main = id.to_string();
-                let to_main = to.clone();
-                self.on_main(move |h| {
-                    let from = h.collection_file.clone().unwrap_or(from_fallback);
-                    swap_collection_releasing(
-                        ViewCtx::App(&app),
-                        h,
-                        &data_main,
-                        Some(&id_main),
-                        &from,
-                        &to_main,
-                        || crate::studio_keys::release_active(&app),
-                    )
-                })
-                .await??;
+                swap_collection_off_main(self, data.clone(), Some(id.to_string()), from_fallback, to).await?;
                 let mut lib = library::load(&data);
                 lib.collections.current = id.to_string();
                 library::save(&data, &lib);
@@ -3171,19 +3322,25 @@ fn save_projectors(h: &Held, data: &std::path::Path) {
     save_json(&projectors_file(data), &serde_json::to_value(list).unwrap_or(Value::Null));
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn load_saved_projectors(data: &std::path::Path, settings: &StudioSettings) -> Vec<ProjectorReq> {
+    if !settings.projector_restore {
+        return Vec::new();
+    }
+    ferrocast_store::durable::load_json_with_backup::<Vec<ProjectorReq>>(&projectors_file(data), |l| {
+        l.len() <= 16 && l.iter().all(|p| p.validate().is_ok())
+    })
+    .map(|l| l.value.into_iter().filter(|p| p.what != "source").collect())
+    .unwrap_or_default()
+}
+
 /// The projectors kept from last time, opened again (a source that is gone or a display that is
 /// not there is skipped, with a note in the log).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn restore_projectors(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path) {
+fn restore_projectors_from_list(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path, list: Vec<ProjectorReq>) {
     if !h.settings.as_ref().is_some_and(|s| s.projector_restore) {
         return;
     }
-    let list: Vec<ProjectorReq> =
-        ferrocast_store::durable::load_json_with_backup::<Vec<ProjectorReq>>(&projectors_file(data), |l| {
-            l.len() <= 16 && l.iter().all(|p| p.validate().is_ok())
-        })
-        .map(|l| l.value)
-        .unwrap_or_default();
     for p in list {
         if p.what == "source" {
             continue;
@@ -3365,69 +3522,141 @@ impl StudioHost for DesktopStudio {
         let _shelf_lock = self.shelf_lock.lock().await;
         #[cfg(windows)]
         fetch_matte(self.data.clone());
+        if let Some(status) = self.on_main(|h| h.collection.as_ref().map(|_| Self::status_of(h))).await? {
+            return Ok(status);
+        }
         let config = self.data.join("studio");
         let data = self.data.clone();
-        let app = self.app.clone();
-        self.on_main(move |h| {
-            // Read here, on the main thread, so a switch can't slip in between (CodeRabbit).
-            if h.collection.is_some() {
-                return Ok(Self::status_of(h));
-            }
+        let prep = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let lib = library::load(&data);
             let col_id = lib.collections.current.clone();
             let file = lib.current_file(&data, Kind::Collections);
             let prof_id = lib.profiles.current.clone();
             let prof_file = lib.current_file(&data, Kind::Profiles);
-            h.collection_id = Some(col_id);
-            h.collection_file = Some(file.clone());
-            h.profile_id = Some(prof_id);
-            h.profile_file = Some(prof_file);
-            // Ferrocast's own engine: no libobs to load.
-            let s = ensure_held_settings(h, &data).clone();
-            let _ = &config;
-            h.renderer = "ferrocast";
+            let s = read_settings_from(&prof_file);
             let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
-            let collection = if load_collection {
-                h.collection_deferred = false;
-                load_collection_doc(canvas, &file).map_err(|e| e.to_string())?
+            let prepared = if load_collection {
+                Some(load_prepared_collection(canvas, &file).map_err(|e| e.to_string())?)
             } else {
-                // Safe Mode: start cleanly without loading the saved collection until confirmed.
-                h.collection_deferred = true;
-                Collection::new(canvas, FIRST_SCENE).map_err(|e| e.to_string())?
+                None
             };
-            apply_collection_audio_prefs(&collection, h.settings.as_ref());
-            save_confirmed(h.collection_deferred, &collection, &file);
-            h.collection = Some(collection);
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            restore_projectors(ViewCtx::App(&app), h, &data);
+            let projectors = load_saved_projectors(&data, &s);
             #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-            let _ = &app;
-            write_session(session_now(h).as_ref());
-            // The first Start after a crash says what was on, for the engine to put back.
-            let recovered = CRASHED.lock().ok().and_then(|mut c| c.take());
-            Ok(StudioStatus { recovered, ..Self::status_of(h) })
+            let projectors: Vec<ProjectorReq> = Vec::new();
+            Ok((col_id, file, prof_id, prof_file, s, canvas, prepared, projectors))
         })
-        .await?
+        .await
+        .map_err(|e| e.to_string())??;
+        let (col_id, file, prof_id, prof_file, s, canvas, prepared, projectors) = prep;
+        let need_projectors = !projectors.is_empty();
+        let _ = &config;
+        enum StartStep {
+            AlreadyRunning(StudioStatus),
+            Ready(StudioStatus),
+            OpenEngine(ferrocast_studio::stage::EngineOpenSpec, u64),
+        }
+        let step = self
+            .on_main(move |h| -> Result<StartStep, String> {
+                if h.collection.is_some() {
+                    return Ok(StartStep::AlreadyRunning(Self::status_of(h)));
+                }
+                apply_audio_format(&s);
+                h.collection_id = Some(col_id);
+                h.collection_file = Some(file.clone());
+                h.profile_id = Some(prof_id);
+                h.profile_file = Some(prof_file);
+                h.settings = Some(s);
+                h.renderer = "ferrocast";
+                let collection = match prepared {
+                    Some(p) => {
+                        h.collection_deferred = false;
+                        Collection::from_prepared(p)
+                    }
+                    None => {
+                        // Safe Mode: start cleanly without loading the saved collection until confirmed.
+                        h.collection_deferred = true;
+                        Collection::new(canvas, FIRST_SCENE).map_err(|e| e.to_string())?
+                    }
+                };
+                apply_collection_audio_prefs(&collection, h.settings.as_ref());
+                save_confirmed(h.collection_deferred, &collection, &file);
+                let open_spec = if need_projectors {
+                    collection.set_engine_opening(true);
+                    Some(collection.engine_open_spec())
+                } else {
+                    None
+                };
+                h.collection = Some(collection);
+                h.collection_gen = h.collection_gen.wrapping_add(1);
+                if let Some(spec) = open_spec {
+                    return Ok(StartStep::OpenEngine(spec, h.collection_gen));
+                }
+                write_session(session_now(h).as_ref());
+                let recovered = CRASHED.lock().ok().and_then(|mut c| c.take());
+                Ok(StartStep::Ready(StudioStatus { recovered, ..Self::status_of(h) }))
+            })
+            .await??;
+        match step {
+            StartStep::AlreadyRunning(status) | StartStep::Ready(status) => Ok(status),
+            StartStep::OpenEngine(spec, epoch_gen) => {
+                let opened = tokio::task::spawn_blocking(move || Collection::open_engine_off_main(&spec))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let app = self.app.clone();
+                let data = self.data.clone();
+                self.on_main(move |h| {
+                    if h.collection_gen != epoch_gen || h.collection.is_none() {
+                        drop(opened);
+                        return Self::status_of(h);
+                    }
+                    if let Some(c) = h.collection.as_ref() {
+                        match opened {
+                            Ok(eng) => c.install_opened_engine(eng),
+                            Err(e) => {
+                                c.set_engine_opening(false);
+                                tracing::warn!(error = %e, "the engine didn't open cleanly when starting Studio");
+                            }
+                        }
+                    }
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    restore_projectors_from_list(ViewCtx::App(&app), h, &data, projectors);
+                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                    let _ = (&app, &data, projectors);
+                    write_session(session_now(h).as_ref());
+                    let recovered = CRASHED.lock().ok().and_then(|mut c| c.take());
+                    StudioStatus { recovered, ..Self::status_of(h) }
+                })
+                .await
+            }
+        }
     }
 
     async fn confirm_collection(&self) -> Result<StudioStatus, String> {
         let _shelf_lock = self.shelf_lock.lock().await;
         let data = self.data.clone();
-        let app = self.app.clone();
-        self.on_main(move |h| {
-            let from = active_collection_file(h, &data);
-            let lib = library::load(&data);
-            let to_id = lib.collections.current.clone();
-            let to = lib.current_file(&data, Kind::Collections);
-            if h.collection.is_some() {
-                swap_collection_releasing(ViewCtx::App(&app), h, &data, Some(&to_id), &from, &to, || {
-                    crate::studio_keys::release_active(&app)
-                })?;
-                write_session(session_now(h).as_ref());
-            }
-            Ok(Self::status_of(h))
+        let (running, from) = self
+            .on_main({
+                let data = data.clone();
+                move |h| (h.collection.is_some(), active_collection_file(h, &data))
+            })
+            .await?;
+        if !running {
+            return self.on_main(|h| Self::status_of(h)).await;
+        }
+        let lib_data = data.clone();
+        let (to_id, to) = tokio::task::spawn_blocking(move || {
+            let lib = library::load(&lib_data);
+            (lib.collections.current.clone(), lib.current_file(&lib_data, Kind::Collections))
         })
-        .await?
+        .await
+        .map_err(|e| e.to_string())?;
+        swap_collection_off_main(self, data, Some(to_id), from.clone(), to).await?;
+        self.on_main(|h| {
+            write_session(session_now(h).as_ref());
+            Self::status_of(h)
+        })
+        .await
     }
 
     async fn stop(&self) -> Result<StudioStatus, String> {
@@ -3439,29 +3668,39 @@ impl StudioHost for DesktopStudio {
             let _ = tokio::task::spawn_blocking(move || drain_outputs_bounded(jobs, QUIT_DRAIN_TIMEOUT)).await;
         }
         let data = self.data.clone();
-        let status = self
+        let (status, teardown, guests) = self
             .on_main(move |h| {
                 let file = active_collection_file(h, &data);
                 let deferred = h.collection_deferred;
                 clear_non_output_held(h);
-                if let Some(c) = h.collection.take() {
+                let guests = std::mem::take(&mut h.guests);
+                h.collection_gen = h.collection_gen.wrapping_add(1);
+                let teardown = if let Some(c) = h.collection.take() {
                     save_confirmed(deferred, &c, &file);
-                }
+                    Some(c.into_teardown())
+                } else {
+                    None
+                };
                 h.collection_deferred = false;
                 h.collection_id = None;
                 h.collection_file = None;
                 h.profile_id = None;
                 h.profile_file = None;
                 write_session(None);
-                Self::status_of(h)
+                (Self::status_of(h), teardown, guests)
             })
             .await?;
-        // The scenes' save was queued: wait for it here, off the main thread, so Stop still means
-        // "saved" without the UI waiting on a locked file.
-        let landed =
-            tokio::task::spawn_blocking(|| ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)))
-                .await
-                .unwrap_or(false);
+        // Tear down the outgoing engine off the main thread, unlink guest .sdp files once
+        // FFmpeg closes, and flush queued scene saves before returning.
+        let landed = tokio::task::spawn_blocking(move || {
+            if let Some(td) = teardown {
+                td.finish_off_main();
+            }
+            drop(guests);
+            ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap_or(false);
         if !landed {
             tracing::warn!("the Studio's scenes were still saving when it stopped");
         }
@@ -9400,5 +9639,156 @@ mod collection_profile_tests {
         assert_eq!(act_shortcut_epoch(&pflt), Some(5));
         assert_eq!(act_shortcut_epoch(&paudio), Some(6));
         assert_eq!(act_shortcut_epoch(&StudioAct::Scenes), None);
+    }
+
+    #[test]
+    fn col20_take_outputs_defers_guests_until_collection_teardown() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let sdp = dir.path().join("guest-1.sdp");
+        let guest = ferrocast_guest::Guest::test_with_sdp(&sdp).unwrap_or_else(|e| panic!("guest: {e}"));
+        assert!(sdp.is_file());
+        let col = Collection::new(Canvas { width: 640, height: 360, fps: 30 }, FIRST_SCENE).unwrap();
+        let mut h =
+            Held { collection: Some(col), guests: vec![("Alex".into(), "Alex".into(), guest)], ..Held::default() };
+
+        let jobs = take_outputs_from_held(&mut h);
+        drain_outputs_bounded(jobs, std::time::Duration::from_secs(2));
+        assert_eq!(
+            h.guests.len(),
+            1,
+            "guests must remain intact while outputs drain so .sdp stays open until collection teardown"
+        );
+        assert!(sdp.is_file(), ".sdp must not be unlinked before outgoing collection drops");
+    }
+
+    #[test]
+    fn col21_swap_collection_off_main_waits_for_transient_holder_and_cleans_guests() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+            let scenes_a = dir.path().join("collections").join("a.json");
+            let scenes_b = dir.path().join("collections").join("b.json");
+            let bad = dir.path().join("collections").join("bad.json");
+            let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", Some("VertA"), "SharedColor");
+            let doc_b = make_collection_doc(canvas, "GameB", "PreviewB", Some("VertB"), "SharedColor");
+            let bad_doc = json!({
+                "ferrocast": { "program_copy": { "scene": "X", "items": [{ "name": "Main" }] } },
+                "sources": [{ "id": "color_source_v3", "name": "Main" }],
+                "scene_order": []
+            });
+            write_json_sync(&scenes_a, &doc_a);
+            write_json_sync(&scenes_b, &doc_b);
+            write_json_sync(&bad, &bad_doc);
+
+            let sdp = dir.path().join("guest-async.sdp");
+            let guest = ferrocast_guest::Guest::test_with_sdp(&sdp).unwrap_or_else(|e| panic!("guest: {e}"));
+
+            // Spawn a dedicated mock main thread owning `!Send` Held (just like the app UI thread).
+            type MainJob = Box<dyn FnOnce(ViewCtx<'_>, &mut Held) + Send>;
+            let (ui_tx, ui_rx) = std::sync::mpsc::channel::<MainJob>();
+            let (init_tx, init_rx) = std::sync::mpsc::channel::<Option<ferrocast_studio::stage::EngineRef>>();
+            let dir_ui = dir.path().to_path_buf();
+            let scenes_a_ui = scenes_a.clone();
+            let ui_handle = std::thread::spawn(move || {
+                let Ok(col_a) = Collection::load(canvas, &doc_a, FIRST_SCENE) else {
+                    let _ = init_tx.send(None);
+                    return;
+                };
+                if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+                    let _ = init_tx.send(None);
+                    return;
+                }
+                let mut held = Held {
+                    settings: Some(StudioSettings::default()),
+                    collection: Some(col_a),
+                    collection_id: Some("a".into()),
+                    collection_file: Some(scenes_a_ui),
+                    guests: vec![("Guest".into(), "Guest".into(), guest)],
+                    ..Held::default()
+                };
+                populate_cached_views(&mut held, &dir_ui, false);
+                let transient = held.collection.as_ref().unwrap().engine_ref().ok();
+                let _ = init_tx.send(transient);
+                while let Ok(job) = ui_rx.recv() {
+                    job(ViewCtx::Test, &mut held);
+                }
+                drop(held);
+            });
+            let Some(transient) = init_rx.recv().unwrap() else {
+                drop(ui_tx);
+                let _ = ui_handle.join();
+                return;
+            };
+            let weak_a = transient.downgrade();
+
+            struct UiBridge(std::sync::mpsc::Sender<MainJob>);
+            impl HeldBridge for UiBridge {
+                async fn call_main<F, R>(&self, f: F) -> Result<R, String>
+                where
+                    F: FnOnce(ViewCtx<'_>, &mut Held) -> R + Send + 'static,
+                    R: Send + 'static,
+                {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    self.0
+                        .send(Box::new(move |ctx, held| {
+                            let _ = tx.send(f(ctx, held));
+                        }))
+                        .map_err(|_| "mock UI thread exited".to_string())?;
+                    rx.await.map_err(|_| "mock UI task dropped".to_string())
+                }
+            }
+
+            // Background holder releases its EngineRef only once Phase 2 clears LIVE_ENGINE, ensuring
+            // Phase 3 finish_off_main genuinely waits for transient readers before opening B's engine.
+            let holder = std::thread::spawn(move || {
+                while ferrocast_studio::stage::levels_now(&["SharedColor".into()], false).is_some() {
+                    std::thread::yield_now();
+                }
+                drop(transient);
+            });
+
+            let bridge = UiBridge(ui_tx.clone());
+            swap_collection_off_main(
+                &bridge,
+                dir.path().to_path_buf(),
+                Some("b".into()),
+                scenes_a.clone(),
+                scenes_b.clone(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("async swap A->B: {e}"));
+            holder.join().unwrap();
+            assert!(!weak_a.is_alive(), "outgoing engine must be fully dropped before swap completes");
+            assert!(!sdp.exists(), "guest .sdp must be unlinked off-main after outgoing collection tears down");
+
+            let (eng_b_id, col_b_ok) = bridge
+                .call_main(|_, held| {
+                    let id = held.collection_id.clone();
+                    let ok = held.collection.as_ref().is_some_and(Collection::has_engine) && held.preview.is_some();
+                    (id, ok)
+                })
+                .await
+                .unwrap();
+            assert_eq!(eng_b_id.as_deref(), Some("b"));
+            assert!(col_b_ok);
+
+            // Failed Phase 1 load leaves collection B and views intact.
+            assert!(
+                swap_collection_off_main(&bridge, dir.path().to_path_buf(), Some("bad".into()), scenes_b, bad)
+                    .await
+                    .is_err()
+            );
+            let id_after_fail = bridge.call_main(|_, held| held.collection_id.clone()).await.unwrap();
+            assert_eq!(id_after_fail.as_deref(), Some("b"));
+
+            drop(bridge);
+            drop(ui_tx);
+            ui_handle.join().unwrap();
+            ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+        });
     }
 }
