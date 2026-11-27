@@ -156,17 +156,25 @@ impl Connector for YoutubeConnector {
             return Ok(None);
         }
         let count = self.api.concurrent_viewers(&ids).await.map_err(|e| self.map_err(e))?;
-        if count.is_none() && used_cache {
+        if count.is_some() {
+            self.api.clear_missing_viewers_recheck();
+            return Ok(count);
+        }
+        if used_cache && self.api.take_missing_viewers_recheck() {
             let active = self.api.active_broadcasts().await.map_err(|e| self.map_err(e))?;
             let fresh_ids: Vec<String> = active.into_iter().map(|b| b.id).collect();
             if fresh_ids.is_empty() {
                 return Ok(None);
             }
             if fresh_ids != ids {
-                return self.api.concurrent_viewers(&fresh_ids).await.map_err(|e| self.map_err(e));
+                let res = self.api.concurrent_viewers(&fresh_ids).await.map_err(|e| self.map_err(e))?;
+                if res.is_some() {
+                    self.api.clear_missing_viewers_recheck();
+                }
+                return Ok(res);
             }
         }
-        Ok(count)
+        Ok(None)
     }
 
     async fn poll_capability(&self) -> Option<PlatformPollCapability> {
@@ -180,6 +188,9 @@ impl Connector for YoutubeConnector {
     }
 
     async fn create_native_poll(&self, spec: &NativePollSpec) -> Result<NativePollTally> {
+        if let Some(retry_after) = self.api.quota_retry_after() {
+            return Err(ConnectorError::RateLimited { platform: Platform::Youtube, retry_after });
+        }
         if spec.question.chars().count() > YOUTUBE_POLL_LIMITS.question_chars {
             return Err(ConnectorError::Refused {
                 platform: Platform::Youtube,
@@ -207,6 +218,9 @@ impl Connector for YoutubeConnector {
     }
 
     async fn end_native_poll(&self, external_id: &str) -> Result<Option<NativePollTally>> {
+        if let Some(retry_after) = self.api.quota_retry_after() {
+            return Err(ConnectorError::RateLimited { platform: Platform::Youtube, retry_after });
+        }
         self.api.close_poll(external_id).await.map_err(|e| self.map_err(e))
     }
 }

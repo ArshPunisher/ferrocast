@@ -128,18 +128,23 @@ pub struct Api {
 struct ActiveBroadcastCache {
     ids: Vec<String>,
     cached_at: Option<std::time::Instant>,
+    no_viewers_rechecked_at: Option<std::time::Instant>,
     ttl: std::time::Duration,
 }
 
 impl Default for ActiveBroadcastCache {
     fn default() -> Self {
-        Self { ids: Vec::new(), cached_at: None, ttl: ACTIVE_BROADCAST_TTL }
+        Self { ids: Vec::new(), cached_at: None, no_viewers_rechecked_at: None, ttl: ACTIVE_BROADCAST_TTL }
     }
 }
 
 impl ActiveBroadcastCache {
     fn is_fresh(&self, now: std::time::Instant) -> bool {
         !self.ids.is_empty() && self.cached_at.is_some_and(|t| now.saturating_duration_since(t) < self.ttl)
+    }
+
+    fn can_recheck_no_viewers(&self, now: std::time::Instant) -> bool {
+        self.no_viewers_rechecked_at.is_none_or(|t| now.saturating_duration_since(t) >= self.ttl)
     }
 }
 
@@ -458,8 +463,31 @@ impl Api {
             .filter(|id| !id.is_empty() && seen.insert(id.clone()))
             .collect();
         let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        let same_nonempty = !deduped.is_empty() && guard.ids == deduped && guard.cached_at.is_some();
         guard.cached_at = (!deduped.is_empty()).then(std::time::Instant::now);
+        if !same_nonempty {
+            guard.no_viewers_rechecked_at = None;
+        }
         guard.ids = deduped;
+    }
+
+    /// Returns whether a cached missing-viewers poll may perform its once-per-TTL `active_broadcasts` recheck,
+    /// recording the recheck timestamp when allowed.
+    pub fn take_missing_viewers_recheck(&self) -> bool {
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        if guard.can_recheck_no_viewers(now) {
+            guard.no_viewers_rechecked_at = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clears the once-per-TTL missing-viewers recheck marker when live viewers are observed again.
+    pub fn clear_missing_viewers_recheck(&self) {
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        guard.no_viewers_rechecked_at = None;
     }
 
     /// Clears cached active broadcast ids when a stream goes offline.
@@ -467,6 +495,7 @@ impl Api {
         let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
         guard.ids.clear();
         guard.cached_at = None;
+        guard.no_viewers_rechecked_at = None;
     }
 
     #[cfg(test)]
@@ -529,8 +558,19 @@ impl Api {
     }
 
     /// Stores the most recent native poll tally observed from REST or `streamList`.
-    pub fn record_poll(&self, tally: &ferrocast_connector::NativePollTally) {
-        *self.latest_poll.lock().unwrap_or_else(|p| p.into_inner()) = Some(tally.clone());
+    /// Returns `false` and ignores the update when an already-ended poll would be overwritten by a
+    /// stale non-ended snapshot for the same poll id.
+    pub fn record_poll(&self, tally: &ferrocast_connector::NativePollTally) -> bool {
+        let mut guard = self.latest_poll.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(prev) = guard.as_ref()
+            && prev.external_id == tally.external_id
+            && prev.ended
+            && !tally.ended
+        {
+            return false;
+        }
+        *guard = Some(tally.clone());
+        true
     }
 
     /// Returns the latest cached snapshot for `external_id`, if any.
@@ -584,7 +624,13 @@ impl Api {
             .await
         {
             Ok(v) => {
-                let tally = parse_youtube_poll(&v, 0, true)?;
+                let mut tally = parse_youtube_poll(&v, 0, true)?;
+                if tally.counts.is_empty()
+                    && let Some(prev) = self.latest_poll(message_id)
+                    && !prev.counts.is_empty()
+                {
+                    tally.counts = prev.counts;
+                }
                 self.record_poll(&tally);
                 Ok(Some(tally))
             }
