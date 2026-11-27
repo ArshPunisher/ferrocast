@@ -611,4 +611,39 @@ fn golive_quality_routes_and_additive_views_are_documented_in_openapi_and_asynca
     for shared in ["DestinationView", "EncodeGroupView", "EncodeBudgetCheck", "ResolvedQuality", "DestinationQuality"] {
         assert!(a["components"]["schemas"].get(shared).is_some(), "AsyncAPI missing shared schema {shared}");
     }
+
+    let get_eb = op(o, "/studio/engine/encode-budget", "get");
+    assert_eq!(
+        get_eb["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EncodeBudgetResponse"
+    );
+    let post_eb = op(o, "/studio/engine/encode-budget", "post");
+    assert_eq!(
+        post_eb["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EncodeBudgetRequest"
+    );
+    assert_eq!(
+        post_eb["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/EncodeBudgetResponse"
+    );
+    for f in [
+        "replay",
+        "budget_mpx",
+        "stream_mpx",
+        "record_mpx",
+        "shared",
+        "why_not_shared",
+        "level",
+        "vertical_mpx",
+        "used_mpx_s",
+        "limit_mpx_s",
+        "used_sessions",
+        "max_sessions",
+        "budget_source",
+        "budget_status",
+        "budget_note",
+        "group_count",
+    ] {
+        assert!(schemas["EncodeBudgetResponse"]["properties"].get(f).is_some(), "EncodeBudgetResponse missing {f}");
+    }
 }

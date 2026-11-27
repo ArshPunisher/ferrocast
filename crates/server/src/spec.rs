@@ -973,15 +973,15 @@ const STUDIO_ENGINE_ROUTES: &[RouteDoc] = &[
         "Studio Engine",
         "Read hardware encoder headroom telemetry.",
         None,
-        None,
+        Some("EncodeBudgetResponse"),
     ),
     doc(
         "POST",
         "/studio/engine/encode-budget",
         "Studio Engine",
         "Estimate encode budget for proposed output settings.",
-        None,
-        None,
+        Some("EncodeBudgetRequest"),
+        Some("EncodeBudgetResponse"),
     ),
     doc(
         "POST",
@@ -2330,14 +2330,14 @@ fn build_openapi() -> Value {
             for (code, desc) in [
                 (
                     "400",
-                    "Invalid JSON, unknown field, invalid resolution/fps/bitrate/codec, over platform limit, or custom quality disallowed for Direct/Twitch EB/Cut.",
+                    "Invalid JSON, unknown field, invalid resolution/fps/bitrate, upscale above canvas, or VP9 codec.",
                 ),
                 ("404", "Unknown destination id."),
                 ("409", "A live quality switch is already in progress for this destination."),
                 ("415", "Missing or non-JSON Content-Type header."),
                 (
                     "422",
-                    "Exceeds PC encode budget, OBS streaming mode requires restart, or live keyframe handover failed/cancelled.",
+                    "Over platform limit, custom quality locked (Direct/Twitch EB/Vertical Cut/host codec), exceeds PC encode budget, OBS streaming mode requires restart, or live keyframe handover failed/cancelled.",
                 ),
             ] {
                 responses.insert(
@@ -2952,6 +2952,46 @@ fn golive_quality_schemas() -> Map<String, Value> {
                     "type": "object",
                     "additionalProperties": { "$ref": "#/components/schemas/DestinationQualityOptions" }
                 }
+            }
+        }),
+    );
+    m.insert(
+        "EncodeBudgetRequest".into(),
+        json!({
+            "type": "object",
+            "required": ["settings"],
+            "properties": {
+                "settings": { "type": "object", "additionalProperties": true }
+            }
+        }),
+    );
+    m.insert(
+        "EncodeBudgetResponse".into(),
+        json!({
+            "type": "object",
+            "required": [
+                "replay", "budget_mpx", "stream_mpx", "record_mpx", "shared", "why_not_shared", "level"
+            ],
+            "properties": {
+                "replay": { "type": "boolean" },
+                "budget_mpx": { "type": ["number", "null"] },
+                "stream_mpx": { "type": "number" },
+                "record_mpx": { "type": "number" },
+                "shared": { "type": "boolean" },
+                "why_not_shared": { "type": ["string", "null"] },
+                "level": { "type": "string", "enum": ["ok", "limit", "over", "unknown"] },
+                "vertical_mpx": { "type": "number" },
+                "used_mpx_s": { "type": "number" },
+                "limit_mpx_s": { "type": ["number", "null"] },
+                "used_sessions": { "type": "integer" },
+                "max_sessions": { "type": ["integer", "null"] },
+                "budget_source": {
+                    "type": "string",
+                    "enum": ["apple_silicon", "bench", "nvenc_default", "hw_default", "cpu_default", "unknown"]
+                },
+                "budget_status": { "type": "string", "enum": ["ok", "limit", "over", "unknown"] },
+                "budget_note": { "type": ["string", "null"] },
+                "group_count": { "type": "integer" }
             }
         }),
     );

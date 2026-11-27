@@ -1350,6 +1350,115 @@
         ],
         "type": "object"
       },
+      "EncodeBudgetRequest": {
+        "properties": {
+          "settings": {
+            "additionalProperties": true,
+            "type": "object"
+          }
+        },
+        "required": [
+          "settings"
+        ],
+        "type": "object"
+      },
+      "EncodeBudgetResponse": {
+        "properties": {
+          "budget_mpx": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "budget_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "budget_source": {
+            "enum": [
+              "apple_silicon",
+              "bench",
+              "nvenc_default",
+              "hw_default",
+              "cpu_default",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "budget_status": {
+            "enum": [
+              "ok",
+              "limit",
+              "over",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "group_count": {
+            "type": "integer"
+          },
+          "level": {
+            "enum": [
+              "ok",
+              "limit",
+              "over",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "limit_mpx_s": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_sessions": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "record_mpx": {
+            "type": "number"
+          },
+          "replay": {
+            "type": "boolean"
+          },
+          "shared": {
+            "type": "boolean"
+          },
+          "stream_mpx": {
+            "type": "number"
+          },
+          "used_mpx_s": {
+            "type": "number"
+          },
+          "used_sessions": {
+            "type": "integer"
+          },
+          "vertical_mpx": {
+            "type": "number"
+          },
+          "why_not_shared": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "replay",
+          "budget_mpx",
+          "stream_mpx",
+          "record_mpx",
+          "shared",
+          "why_not_shared",
+          "level"
+        ],
+        "type": "object"
+      },
       "EncodeGroupView": {
         "properties": {
           "canvas": {
@@ -10656,7 +10765,7 @@
                 }
               }
             },
-            "description": "Invalid JSON, unknown field, invalid resolution/fps/bitrate/codec, over platform limit, or custom quality disallowed for Direct/Twitch EB/Cut."
+            "description": "Invalid JSON, unknown field, invalid resolution/fps/bitrate, upscale above canvas, or VP9 codec."
           },
           "401": {
             "content": {
@@ -10716,7 +10825,7 @@
                 }
               }
             },
-            "description": "Exceeds PC encode budget, OBS streaming mode requires restart, or live keyframe handover failed/cancelled."
+            "description": "Over platform limit, custom quality locked (Direct/Twitch EB/Vertical Cut/host codec), exceeds PC encode budget, OBS streaming mode requires restart, or live keyframe handover failed/cancelled."
           },
           "429": {
             "content": {
@@ -26474,10 +26583,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/EncodeBudgetResponse"
                 }
               }
             },
@@ -26532,20 +26638,18 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object"
+                "$ref": "#/components/schemas/EncodeBudgetRequest"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/EncodeBudgetResponse"
                 }
               }
             },
