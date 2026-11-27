@@ -1851,3 +1851,355 @@ async fn live_alert_silence_accepts_quiet_and_muted_mic_alerts_and_rejects_other
         StatusCode::BAD_REQUEST
     );
 }
+
+#[derive(Debug)]
+struct DropRouteHost {
+    data: std::path::PathBuf,
+    streaming: std::sync::atomic::AtomicBool,
+    held_collection_id: Mutex<String>,
+    held_profile_id: Mutex<String>,
+    hold_next_save: std::sync::atomic::AtomicBool,
+    panic_on_shelf: std::sync::atomic::AtomicBool,
+    swapped: Arc<tokio::sync::Notify>,
+    release_save: Arc<tokio::sync::Notify>,
+    finished_or_aborted: Arc<tokio::sync::Notify>,
+}
+
+struct RouteOpGuard {
+    done: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for RouteOpGuard {
+    fn drop(&mut self) {
+        self.done.notify_one();
+    }
+}
+
+impl DropRouteHost {
+    fn new(data: &std::path::Path) -> Self {
+        Self {
+            data: data.to_path_buf(),
+            streaming: std::sync::atomic::AtomicBool::new(false),
+            held_collection_id: Mutex::new("untitled".into()),
+            held_profile_id: Mutex::new("untitled".into()),
+            hold_next_save: std::sync::atomic::AtomicBool::new(false),
+            panic_on_shelf: std::sync::atomic::AtomicBool::new(false),
+            swapped: Arc::new(tokio::sync::Notify::new()),
+            release_save: Arc::new(tokio::sync::Notify::new()),
+            finished_or_aborted: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ferrocast_engine::studio_host::StudioHost for DropRouteHost {
+    async fn status(&self) -> ferrocast_engine::studio_host::StudioStatus {
+        ferrocast_engine::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+    }
+    async fn start(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<ferrocast_engine::studio_host::StudioStatus, String> {
+        Ok(Default::default())
+    }
+    async fn kinds(&self) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn options(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn preview(&self, _rect: Option<ferrocast_engine::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn defaults(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn act(&self, act: ferrocast_engine::studio_host::StudioAct) -> Result<Value, String> {
+        match act {
+            ferrocast_engine::studio_host::StudioAct::Scenes => Ok(json!({
+                "scenes": [{ "name": "Main" }],
+                "current": "Main",
+                "collection_id": self.held_collection_id.lock().unwrap().clone(),
+            })),
+            _ => Ok(Value::Null),
+        }
+    }
+    async fn settings(&self) -> ferrocast_engine::studio_host::StudioSettings {
+        Default::default()
+    }
+    async fn set_settings(&self, _s: ferrocast_engine::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn record(&self, _on: bool) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<Value, String> {
+        Ok(json!({ "active": self.streaming.load(std::sync::atomic::Ordering::SeqCst) }))
+    }
+    async fn obs_collections(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<Value, String> {
+        Err("n/a".into())
+    }
+    async fn shelf(&self, kind: String, act: ferrocast_engine::studio_host::ShelfAct) -> Result<Value, String> {
+        use ferrocast_engine::studio_host::ShelfAct;
+        use ferrocast_store::studio_library as lib;
+        match act {
+            ShelfAct::List => lib::headless_shelf_list(&self.data, &kind),
+            ShelfAct::Export { id } => lib::headless_shelf_export(&self.data, &kind, &id),
+            mutating => {
+                let _guard = RouteOpGuard { done: self.finished_or_aborted.clone() };
+                if self.panic_on_shelf.load(std::sync::atomic::Ordering::SeqCst) {
+                    panic!("simulated panic in shelf route");
+                }
+                let hold = self.hold_next_save.swap(false, std::sync::atomic::Ordering::SeqCst);
+                match mutating {
+                    ShelfAct::Switch { id } => {
+                        if kind == "profiles" {
+                            *self.held_profile_id.lock().unwrap() = id.clone();
+                        } else {
+                            *self.held_collection_id.lock().unwrap() = id.clone();
+                        }
+                        if hold {
+                            self.swapped.notify_one();
+                            self.release_save.notified().await;
+                        }
+                        lib::headless_shelf_switch(&self.data, &kind, &id)
+                    }
+                    ShelfAct::New { name, copy } => {
+                        let loaded = lib::load(&self.data);
+                        let kind_enum = lib::Kind::parse(&kind).ok_or("bad kind")?;
+                        let id = loaded.shelf(kind_enum).new_id(&name);
+                        if kind == "profiles" {
+                            *self.held_profile_id.lock().unwrap() = id.clone();
+                        } else {
+                            *self.held_collection_id.lock().unwrap() = id.clone();
+                        }
+                        if hold {
+                            self.swapped.notify_one();
+                            self.release_save.notified().await;
+                        }
+                        lib::headless_shelf_new(&self.data, &kind, &name, copy)
+                    }
+                    ShelfAct::Rename { id, name } => {
+                        if hold {
+                            self.swapped.notify_one();
+                            self.release_save.notified().await;
+                        }
+                        lib::headless_shelf_rename(&self.data, &kind, &id, &name)
+                    }
+                    ShelfAct::Remove { id } => {
+                        if hold {
+                            self.swapped.notify_one();
+                            self.release_save.notified().await;
+                        }
+                        lib::headless_shelf_remove(&self.data, &kind, &id)
+                    }
+                    ShelfAct::Import { name, doc } => {
+                        let loaded = lib::load(&self.data);
+                        let unique = loaded.collections.free_name(&name);
+                        let id = loaded.collections.new_id(&unique);
+                        *self.held_collection_id.lock().unwrap() = id;
+                        if hold {
+                            self.swapped.notify_one();
+                            self.release_save.notified().await;
+                        }
+                        let (saved_id, prev, saved_name) = lib::import_collection_doc(&self.data, &name, doc)?;
+                        Ok(json!({ "id": saved_id, "previous_id": prev, "name": saved_name }))
+                    }
+                    ShelfAct::List | ShelfAct::Export { .. } => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+fn shelf_http_req(
+    method: axum::http::Method,
+    path: &str,
+    token: &str,
+    body: Option<Value>,
+) -> axum::http::Request<axum::body::Body> {
+    let builder = axum::http::Request::builder()
+        .method(method)
+        .uri(format!("/api/v1{path}"))
+        .header(axum::http::header::HOST, "127.0.0.1:47820")
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+    match body {
+        Some(v) => builder
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(v.to_string()))
+            .unwrap(),
+        None => builder.body(axum::body::Body::empty()).unwrap(),
+    }
+}
+
+async fn read_router_json(router: &axum::Router, token: &str, path: &str) -> (StatusCode, Value) {
+    use tower::ServiceExt;
+    let res = router.clone().oneshot(shelf_http_req(axum::http::Method::GET, path, token, None)).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn http_shelf_mutations_complete_when_request_dropped_and_panic_maps_to_500() {
+    use ferrocast_store::studio_library as lib;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine =
+        Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default())).await.unwrap();
+    let mut initial = lib::load(dir.path());
+    initial.collections.list.push(lib::Entry { id: "blue-b".into(), name: "Blue B".into() });
+    initial.profiles.list.push(lib::Entry { id: "pro-b".into(), name: "Pro B".into() });
+    lib::save(dir.path(), &initial);
+    assert!(ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(5)));
+
+    let host = Arc::new(DropRouteHost::new(dir.path()));
+    engine.set_studio_host(host.clone());
+
+    let sessions = Arc::new(crate::Sessions::new());
+    let token = sessions.desktop_token().to_string();
+    let state = crate::AppState {
+        engine: engine.clone(),
+        sessions,
+        guard: crate::auth::Guard { port: 47820, lan: false, dev_origins: vec![] },
+        api_limiter: crate::rate_limit::ApiKeyRateLimiter::default(),
+    };
+    let router = crate::router(state);
+
+    let drop_mid_request = |method: axum::http::Method, path: &str, body: Option<Value>| {
+        let router = router.clone();
+        let host = host.clone();
+        let token = token.clone();
+        let path = path.to_string();
+        async move {
+            host.hold_next_save.store(true, std::sync::atomic::Ordering::SeqCst);
+            let req = shelf_http_req(method, &path, &token, body);
+            let mut fut = Box::pin(router.oneshot(req));
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("HTTP handler returned before drop barrier"),
+                _ = host.swapped.notified() => {}
+            }
+            drop(fut);
+            host.release_save.notify_one();
+            host.finished_or_aborted.notified().await;
+        }
+    };
+
+    // 1. PUT /library/collections/current dropped mid-switch keeps library current == scenes collection_id.
+    drop_mid_request(
+        axum::http::Method::PUT,
+        "/studio/engine/library/collections/current",
+        Some(json!({ "id": "blue-b" })),
+    )
+    .await;
+    let (_, cols) = read_router_json(&router, &token, "/studio/engine/library/collections").await;
+    let (_, scenes) = read_router_json(&router, &token, "/studio/engine/scenes").await;
+    assert_eq!(cols["current"], "blue-b");
+    assert_eq!(scenes["collection_id"], "blue-b");
+
+    // 2. Alternating back to untitled dropped mid-switch also agrees.
+    drop_mid_request(
+        axum::http::Method::PUT,
+        "/studio/engine/library/collections/current",
+        Some(json!({ "id": "untitled" })),
+    )
+    .await;
+    let (_, cols) = read_router_json(&router, &token, "/studio/engine/library/collections").await;
+    let (_, scenes) = read_router_json(&router, &token, "/studio/engine/scenes").await;
+    assert_eq!(cols["current"], "untitled");
+    assert_eq!(scenes["collection_id"], "untitled");
+
+    // 3. Profile switch, New, Duplicate, Rename, Remove, and Import dropped mid-request.
+    drop_mid_request(
+        axum::http::Method::PUT,
+        "/studio/engine/library/profiles/current",
+        Some(json!({ "id": "pro-b" })),
+    )
+    .await;
+    let (_, profs) = read_router_json(&router, &token, "/studio/engine/library/profiles").await;
+    assert_eq!(profs["current"], "pro-b");
+    assert_eq!(*host.held_profile_id.lock().unwrap(), "pro-b");
+
+    drop_mid_request(
+        axum::http::Method::POST,
+        "/studio/engine/library/collections",
+        Some(json!({ "name": "Created", "copy": false })),
+    )
+    .await;
+    drop_mid_request(
+        axum::http::Method::POST,
+        "/studio/engine/library/collections",
+        Some(json!({ "name": "Duplicated", "copy": true })),
+    )
+    .await;
+    drop_mid_request(
+        axum::http::Method::POST,
+        "/studio/engine/library/collections/blue-b/rename",
+        Some(json!({ "name": "Blue Renamed" })),
+    )
+    .await;
+    drop_mid_request(axum::http::Method::DELETE, "/studio/engine/library/collections/blue-b", None).await;
+    drop_mid_request(
+        axum::http::Method::POST,
+        "/studio/engine/library/collections/import",
+        Some(json!({ "name": "Imported", "doc": { "sources": [] } })),
+    )
+    .await;
+    let (_, cols) = read_router_json(&router, &token, "/studio/engine/library/collections").await;
+    let (_, scenes) = read_router_json(&router, &token, "/studio/engine/scenes").await;
+    assert_eq!(cols["current"], "imported");
+    assert_eq!(scenes["collection_id"], "imported");
+    assert!(cols["list"].as_array().unwrap().iter().all(|e| e["id"] != "blue-b"));
+
+    // 4. Refuse while live still returns 409 studio_busy.
+    host.streaming.store(true, std::sync::atomic::Ordering::SeqCst);
+    let busy_res = router
+        .clone()
+        .oneshot(shelf_http_req(
+            axum::http::Method::PUT,
+            "/studio/engine/library/collections/current",
+            &token,
+            Some(json!({ "id": "untitled" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(busy_res.status(), StatusCode::CONFLICT);
+    host.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // 5. JoinError from a panicked shelf task returns a clear HTTP 500.
+    host.panic_on_shelf.store(true, std::sync::atomic::Ordering::SeqCst);
+    let err_res = router
+        .clone()
+        .oneshot(shelf_http_req(
+            axum::http::Method::PUT,
+            "/studio/engine/library/collections/current",
+            &token,
+            Some(json!({ "id": "untitled" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(err_res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let err_bytes = axum::body::to_bytes(err_res.into_body(), 1024 * 1024).await.unwrap();
+    let err_json: Value = serde_json::from_slice(&err_bytes).unwrap();
+    assert_eq!(err_json["error"]["code"], "internal");
+}
