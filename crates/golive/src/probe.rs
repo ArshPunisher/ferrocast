@@ -629,6 +629,35 @@ pub struct EncodeKey {
     pub audio_kbps: u32,
 }
 
+impl EncodeKey {
+    /// Returns true when `other` matches every encoding property except `strict_cbr`.
+    pub fn same_shape(&self, other: &Self) -> bool {
+        (
+            self.canvas,
+            self.width,
+            self.height,
+            self.fps,
+            self.fps_ntsc,
+            self.kbps,
+            self.codec,
+            self.keyframe_s,
+            self.no_bframes,
+            self.audio_kbps,
+        ) == (
+            other.canvas,
+            other.width,
+            other.height,
+            other.fps,
+            other.fps_ntsc,
+            other.kbps,
+            other.codec,
+            other.keyframe_s,
+            other.no_bframes,
+            other.audio_kbps,
+        )
+    }
+}
+
 /// Main canvas and stream encode inputs passed to [`fit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MainEncode {
@@ -729,7 +758,7 @@ pub fn fit(
                 Some(lim) if !ignore_service_limits => (
                     q.codec.unwrap_or_else(|| lim.fallback_codec(main.codec)),
                     fitted_keyframe(main.keyframe_s, lim),
-                    main.strict_cbr || lim.strict_cbr,
+                    main.strict_cbr || (lim.strict_cbr && main.vbr),
                     main.no_bframes || lim.force_no_bframes,
                     main.audio_kbps.min(lim.max_audio_kbps),
                 ),
@@ -1682,5 +1711,22 @@ mod tests {
         let kick_same = fit(&main_1440_hevc, Some(&kick_lim), &DestinationQuality::SameAsMain, false).unwrap();
         assert_eq!((kick_same.key.width, kick_same.key.height, kick_same.key.kbps), (1920, 1080, 8_000));
         assert_eq!(kick_same.note, None);
+    }
+
+    #[test]
+    fn custom_matching_main_cbr_shares_main_without_strict_cbr_split() {
+        let main_cbr = MainEncode::from_canvas(Canvas::Main, 1920, 1080, 60, 6_000, VideoCodec::H264);
+        assert!(!main_cbr.vbr);
+        let kick_lim = platform_limit(Service::Kick, None, Canvas::Main).unwrap();
+        let q = DestinationQuality::Custom(CustomQuality {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            kbps: 6_000,
+            codec: Some(VideoCodec::H264),
+        });
+        let fitted = fit(&main_cbr, Some(&kick_lim), &q, false).unwrap();
+        assert!(!fitted.separate_encode, "matching CBR Custom must share main instead of splitting strict_cbr");
+        assert_eq!(fitted.key, main_cbr.as_key());
     }
 }

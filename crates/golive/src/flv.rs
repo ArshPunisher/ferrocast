@@ -62,6 +62,11 @@ pub fn video_is_header(data: &[u8]) -> bool {
     }
 }
 
+/// Whether this video tag body is a coded main-track keyframe (not a sequence header or extra track).
+pub fn video_is_coded_keyframe(data: &[u8]) -> bool {
+    !video_is_header(data) && video_extra_track(data).is_none() && video_is_keyframe(data)
+}
+
 /// Whether this audio tag body is the codec's sequence header (AAC's AudioSpecificConfig, or
 /// Enhanced RTMP's SequenceStart).
 pub fn audio_is_header(data: &[u8]) -> bool {
@@ -174,8 +179,10 @@ mod tests {
         // 0x17 = keyframe + AVC; packet type 0 = header, 1 = NALUs.
         assert!(video_is_keyframe(&[0x17, 0x00]));
         assert!(video_is_header(&[0x17, 0x00, 0, 0, 0]));
+        assert!(!video_is_coded_keyframe(&[0x17, 0x00, 0, 0, 0]));
         assert!(video_is_keyframe(&[0x17, 0x01]));
         assert!(!video_is_header(&[0x17, 0x01]));
+        assert!(video_is_coded_keyframe(&[0x17, 0x01]));
         // 0x27 = inter frame.
         assert!(!video_is_keyframe(&[0x27, 0x01]));
         assert!(!video_is_header(&[0x27, 0x01]));

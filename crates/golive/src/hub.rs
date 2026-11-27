@@ -85,6 +85,9 @@ pub struct Hub {
     prev_key_ts: AtomicU64,
     /// Newest main-track keyframe timestamp (ms), or `NO_TS` before the first keyframe.
     newest_key_ts: AtomicU64,
+    /// Monotonic counter bumped whenever the source encoder emits a main-track coded IDR frame,
+    /// including while a stream delay holds packets before [`Self::start`].
+    encoded_idr: watch::Sender<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +123,7 @@ impl Hub {
     pub fn new() -> Arc<Self> {
         let (tx, _) = broadcast::channel(BACKLOG);
         let (live, _) = watch::channel(Live::default());
+        let (encoded_idr, _) = watch::channel(0u64);
         Arc::new(Self {
             tx,
             state: Mutex::new(State::default()),
@@ -127,7 +131,24 @@ impl Hub {
             newest_video_ts: AtomicU64::new(NO_TS),
             prev_key_ts: AtomicU64::new(NO_TS),
             newest_key_ts: AtomicU64::new(NO_TS),
+            encoded_idr,
         })
+    }
+
+    /// Notes that the upstream encoder emitted a coded main-track IDR keyframe (even before
+    /// a stream delay releases packets onto this hub).
+    pub fn note_encoded_idr(&self) {
+        self.encoded_idr.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Monotonic count of main-track coded IDR frames emitted for this hub.
+    pub fn encoded_idr_count(&self) -> u64 {
+        *self.encoded_idr.borrow()
+    }
+
+    /// Watch receiver notified whenever a coded main-track IDR is encoded for this hub.
+    pub fn encoded_idr_rx(&self) -> watch::Receiver<u64> {
+        self.encoded_idr.subscribe()
     }
 
     /// The newest main-track video frame's timestamp (ms) in the current stream, if any has
@@ -224,8 +245,8 @@ impl Hub {
     pub fn video(&self, ts: u32, data: Bytes) {
         let mut st = self.lock();
         let extra = flv::video_extra_track(&data);
-        // Only the main track's keyframes are where a joining destination may start.
-        let key = extra.is_none() && flv::video_is_keyframe(&data);
+        // Only the main track's coded keyframes are where a joining destination may start.
+        let key = flv::video_is_coded_keyframe(&data);
         if let Some((track, header)) = extra {
             if header {
                 st.headers.extra_video.retain(|(t, _)| *t != track);
@@ -242,6 +263,7 @@ impl Hub {
                 }
                 st.last_key = Some(ts);
                 self.newest_key_ts.store(u64::from(ts), Ordering::Release);
+                self.note_encoded_idr();
             }
             self.newest_video_ts.store(u64::from(ts), Ordering::Release);
         }
@@ -387,5 +409,23 @@ mod tests {
 
         hub.start();
         assert_eq!((hub.prev_key_ts(), hub.newest_key_ts()), (None, None));
+    }
+
+    #[test]
+    fn encoded_idr_counts_only_coded_keyframes_and_survives_deferred_start() {
+        let hub = Hub::new();
+        assert_eq!(hub.encoded_idr_count(), 0);
+        // Sequence headers never trigger encoded_idr (even though frame type nibble is 1).
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        assert_eq!(hub.encoded_idr_count(), 0);
+        // Pre-delay coded IDR can be signalled before `hub.start()` and survives `hub.start()`.
+        hub.note_encoded_idr();
+        assert_eq!(hub.encoded_idr_count(), 1);
+        hub.start();
+        assert_eq!(hub.encoded_idr_count(), 1);
+        hub.video(0, Bytes::from_static(&[0x17, 0x00, 1, 2]));
+        assert_eq!(hub.encoded_idr_count(), 1);
+        hub.video(0, Bytes::from_static(&[0x17, 0x01, 0, 0, 0]));
+        assert_eq!(hub.encoded_idr_count(), 2);
     }
 }

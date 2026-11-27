@@ -296,7 +296,18 @@ pub fn sender_runtime_workers() -> usize {
 }
 
 /// Runs one destination until `stop` turns true. Health is sent on `health`.
-pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>, mut stop: watch::Receiver<bool>) {
+pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>, stop: watch::Receiver<bool>) {
+    run_with_siblings(dest, hub, health, stop, None).await;
+}
+
+/// Runs one destination with sibling liveness context until `stop` turns true.
+pub async fn run_with_siblings(
+    dest: Destination,
+    hub: Arc<Hub>,
+    health: watch::Sender<Health>,
+    mut stop: watch::Receiver<bool>,
+    other_destinations_live: Option<watch::Receiver<bool>>,
+) {
     let mut live = hub.live();
     health.send_replace(Health::new(PushState::Waiting));
     // The last stream this destination finished with; it waits for a newer one.
@@ -451,7 +462,13 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                         limit > 0 && attempt >= limit
                     };
                     if give_up {
-                        let (short_reason, detail) = failure_text(&dest, &err, kick_refused, &sent_info, None);
+                        let (short_reason, detail) = failure_text(
+                            &dest,
+                            &err,
+                            kick_refused,
+                            &sent_info,
+                            other_destinations_live.as_ref().map(|rx| *rx.borrow()),
+                        );
                         tracing::warn!(
                             dest = %dest.id,
                             attempts = attempt.max(net_tries),
@@ -535,7 +552,11 @@ pub async fn run(dest: Destination, hub: Arc<Hub>, health: watch::Sender<Health>
                             if on_backup { "its backup server" } else { "its main server again" }
                         )
                     } else if kick_refused {
-                        kick_reconnecting_detail(&err, &sent_info, None)
+                        kick_reconnecting_detail(
+                            &err,
+                            &sent_info,
+                            other_destinations_live.as_ref().map(|rx| *rx.borrow()),
+                        )
                     } else {
                         err.to_string()
                     };
@@ -1019,30 +1040,48 @@ async fn session(
     sent_info.merge_hub_stats(hub.stats());
     // The stream may have ended (or a new one begun) while this connection was being set up.
     if !live.on || live.stream != stream {
+        p.finish().await;
         return Ok(Ended::StreamEnded);
     }
+    let progress = p.progress.clone();
+    let mut window = (Instant::now(), progress.load(Ordering::Relaxed));
     if let Some(m) = &headers.metadata {
         let r = p.client.publish_metadata(m);
-        p.send(r).await?;
+        if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+            p.finish().await;
+            return Ok(Ended::Stopped);
+        }
     }
     if let Some(v) = headers.video {
         let r = p.client.publish_video_data(v, RtmpTimestamp::new(0), false);
-        p.send(r).await?;
+        if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+            p.finish().await;
+            return Ok(Ended::Stopped);
+        }
     }
     if let Some(a) = headers.audio {
         let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
-        p.send(r).await?;
+        if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+            p.finish().await;
+            return Ok(Ended::Stopped);
+        }
     }
     if dest.extra_video {
         for (_, v) in headers.extra_video {
             let r = p.client.publish_video_data(v, RtmpTimestamp::new(0), false);
-            p.send(r).await?;
+            if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+                p.finish().await;
+                return Ok(Ended::Stopped);
+            }
         }
     }
     if dest.extra_audio {
         for (_, a) in headers.extra_audio {
             let r = p.client.publish_audio_data(a, RtmpTimestamp::new(0), false);
-            p.send(r).await?;
+            if send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await? {
+                p.finish().await;
+                return Ok(Ended::Stopped);
+            }
         }
     }
     set_state(health, PushState::Live);
@@ -1051,8 +1090,6 @@ async fn session(
     let mut base: Option<u32> = None;
     let mut started = false;
     let mut video_drop = VideoDrop::default();
-    let progress = p.progress.clone();
-    let mut window = (Instant::now(), progress.load(Ordering::Relaxed));
     loop {
         tokio::select! {
             // Stopped (a destination unticked): the connection is closed properly, as at the
@@ -1138,19 +1175,11 @@ async fn session(
                         send.then(|| p.client.publish_audio_data(data, stamp(&mut base, ts), false))
                     }
                 };
-                if let Some(r) = outbound {
-                    // While the write goes on (a destination that stopped reading blocks it for
-                    // up to the write deadline) the rate is still reported each second: 0 when
-                    // the kernel takes nothing, so upload protection sees it at once.
-                    let send = p.send(r);
-                    tokio::pin!(send);
-                    loop {
-                        let left = HEALTH_EVERY.saturating_sub(window.0.elapsed()).max(Duration::from_millis(50));
-                        tokio::select! {
-                            done = &mut send => { done?; break; }
-                            _ = tokio::time::sleep(left) => report_rate(health, &mut window, progress.load(Ordering::Relaxed)),
-                        }
-                    }
+                if let Some(r) = outbound
+                    && send_result_with_stop(&mut p, r, &mut stop, health, &mut window, &progress).await?
+                {
+                    p.finish().await;
+                    return Ok(Ended::Stopped);
                 }
             }
             // Only the read races the next packet (a read can be dropped safely); the answer
@@ -1161,6 +1190,34 @@ async fn session(
             }
         }
         report_rate(health, &mut window, progress.load(Ordering::Relaxed));
+    }
+}
+
+/// Sends one RTMP session result while updating health bitrate each second and aborting promptly
+/// if `stop` is triggered during an in-flight stalled TCP/TLS write.
+async fn send_result_with_stop(
+    p: &mut Publisher,
+    r: Result<ClientSessionResult, ClientSessionError>,
+    stop: &mut watch::Receiver<bool>,
+    health: &watch::Sender<Health>,
+    window: &mut (Instant, u64),
+    progress: &Arc<AtomicU64>,
+) -> Result<bool, PushError> {
+    if *stop.borrow() {
+        return Ok(true);
+    }
+    let send = p.send(r);
+    tokio::pin!(send);
+    loop {
+        let left = HEALTH_EVERY.saturating_sub(window.0.elapsed()).max(Duration::from_millis(50));
+        tokio::select! {
+            done = &mut send => {
+                done?;
+                return Ok(false);
+            }
+            _ = stop.wait_for(|s| *s) => return Ok(true),
+            _ = tokio::time::sleep(left) => report_rate(health, window, progress.load(Ordering::Relaxed)),
+        }
     }
 }
 

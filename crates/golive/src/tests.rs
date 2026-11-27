@@ -1930,4 +1930,81 @@ async fn a_link_slower_than_keyframes_alone_skips_to_newest_keyframe() {
         }
     }
 }
+
+#[tokio::test]
+async fn kick_single_dest_compliant_rapid_close_does_not_blame_multistreaming() {
+    let w = world().await;
+    let l = free_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let _got = platform_that_drops(l, "k", Duration::from_millis(50)).await;
+    let dest = Destination {
+        id: "kick".into(),
+        retry: push::Retry { first: Duration::from_millis(20), max: Duration::from_millis(40), max_attempts: 3 },
+        ..destination(dport, "k")
+    };
+    let (htx, mut health) = watch::channel(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        link: None,
+        via: None,
+        since_ms: 0,
+    });
+    let (_other_tx, other_rx) = watch::channel(false);
+    tokio::spawn(push::run_with_siblings(dest, w.hub.clone(), htx, w.stop.subscribe(), Some(other_rx)));
+    let _obs = Obs::publish(w.port, "live", OBS_KEY).await.unwrap();
+
+    match state_is(&mut health, |s| matches!(s, PushState::Failed { .. })).await {
+        PushState::Failed { reason, detail, refused, .. } => {
+            assert!(refused, "Kick rapid drops remain refused");
+            assert!(!reason.contains("multistreaming"), "{reason}");
+            let detail = detail.expect("Kick refusal detail");
+            assert!(!detail.contains("Allow multistreaming"), "must not blame multistreaming alone: {detail}");
+        }
+        s => panic!("expected Failed, got {s:?}"),
+    }
+}
+
+#[tokio::test]
+async fn stop_cancels_in_flight_blocked_send_promptly() {
+    let w = world().await;
+    let l = small_buf_listener().await;
+    let dport = l.local_addr().unwrap().port();
+    let (open_tx, open_rx) = watch::channel(true);
+    let mut got = controlled_platform(l, "k", open_rx, None).await;
+    let (htx, mut health) = watch::channel(Health {
+        state: PushState::Waiting,
+        kbps: 0,
+        dropped: 0,
+        sent: 0,
+        link: None,
+        via: None,
+        since_ms: 0,
+    });
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let handle = tokio::spawn(push::run(destination(dport, "k"), w.hub.clone(), htx, stop_rx));
+
+    w.hub.start();
+    w.hub.video(0, Bytes::from_static(AVC_HEADER));
+    w.hub.audio(0, Bytes::from_static(AAC_HEADER));
+    w.hub.video(0, Bytes::from_static(KEY));
+    assert_eq!(next(&mut got).await, Got::Publish("k".into()));
+    state_is(&mut health, |s| *s == PushState::Live).await;
+
+    // Pause server reads and pump large video packets so TCP write blocks inside `p.send`.
+    let _ = open_tx.send(false);
+    for i in 1..=64u32 {
+        let ts = i * 33;
+        w.hub.video(ts, sized_video(i.is_multiple_of(15), i as u8, 256 * 1024));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let _ = stop_tx.send(true);
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("stop must cancel an in-flight blocked send well before WRITE_DEADLINE")
+        .expect("push task must join cleanly");
+    assert_eq!(health.borrow().state, PushState::Stopped);
+}
 mod platforms;
