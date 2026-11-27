@@ -1,6 +1,7 @@
 //! Helix requests: one place that adds auth, retries once after a 401 with a refreshed
 //! token, and turns 403/429 into errors the dashboard can explain (R-19).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,8 @@ pub struct Helix {
     pub(crate) ingest_keep: Duration,
     /// Cached `GET /users` `broadcaster_type` (`"affiliate"`, `"partner"`, or `""`).
     pub(crate) broadcaster_type: Arc<Mutex<Option<String>>>,
+    /// Set if a live Helix poll request returned `MissingScope`.
+    pub(crate) poll_scope_missing: Arc<AtomicBool>,
 }
 
 /// A 429 that asks for this long or less is waited out and tried again; a longer one is told.
@@ -86,7 +89,14 @@ impl Helix {
             ingest: Arc::new(Mutex::new(None)),
             ingest_keep: crate::ingest::INGEST_KEEP,
             broadcaster_type: Arc::new(Mutex::new(None)),
+            poll_scope_missing: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether a live poll call previously hit `MissingScope` on this connection.
+    #[must_use]
+    pub fn is_poll_scope_missing(&self) -> bool {
+        self.poll_scope_missing.load(Ordering::Relaxed)
     }
 
     /// How long a picked ingest server is reused (the default is an hour; zero reads the list each time).
@@ -212,7 +222,14 @@ impl Helix {
             "duration": duration_s.clamp(15, 1800),
         });
         match self.call(Method::POST, "/polls", &[], Some(body)).await {
-            Ok(v) => parse_poll_first(v),
+            Ok(v) => {
+                self.poll_scope_missing.store(false, Ordering::Relaxed);
+                parse_poll_first(v)
+            }
+            Err(TwitchError::MissingScope(m)) => {
+                self.poll_scope_missing.store(true, Ordering::Relaxed);
+                Err(TwitchError::MissingScope(m))
+            }
             Err(TwitchError::Refused(m)) => {
                 let lower = m.to_lowercase();
                 if lower.contains("affiliate") || lower.contains("partner") {
@@ -241,7 +258,14 @@ impl Helix {
             "status": "TERMINATED",
         });
         match self.call(Method::PATCH, "/polls", &[], Some(body)).await {
-            Ok(v) => parse_poll_first(v).map(Some),
+            Ok(v) => {
+                self.poll_scope_missing.store(false, Ordering::Relaxed);
+                parse_poll_first(v).map(Some)
+            }
+            Err(TwitchError::MissingScope(m)) => {
+                self.poll_scope_missing.store(true, Ordering::Relaxed);
+                Err(TwitchError::MissingScope(m))
+            }
             Err(TwitchError::Refused(m)) => {
                 if let Ok(Some(existing)) = self.get_poll(broadcaster, id).await
                     && !existing.status.eq_ignore_ascii_case("ACTIVE")

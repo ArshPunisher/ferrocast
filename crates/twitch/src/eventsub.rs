@@ -196,7 +196,11 @@ async fn subscribe_all(helix: &Helix, broadcaster: &str, session: &str, sink: &E
             }
             // A revoked or not-yet-allowed type is a per-subscription problem, not fatal.
             Err(TwitchError::Refused(m)) => {
-                tracing::warn!(kind = sub.kind, %m, "subscription refused")
+                if sub.optional {
+                    tracing::debug!(kind = sub.kind, %m, "optional subscription refused");
+                } else {
+                    tracing::warn!(kind = sub.kind, %m, "subscription refused");
+                }
             }
             Err(e) => return Err(e),
         }

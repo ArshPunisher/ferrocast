@@ -757,6 +757,9 @@ async fn native_poll_lifecycle_create_poll_get_end_and_failures() {
     st.lock().unwrap().refuse_poll_scope = true;
     let unknown_scopes = connector_for(&ep, vec![]);
     assert!(matches!(unknown_scopes.create_native_poll(&spec).await, Err(ConnectorError::MissingScope { .. })));
+    let after_missing = unknown_scopes.poll_capability().await.unwrap();
+    assert_eq!(after_missing.mode, ferrocast_core::poll::PollCapabilityMode::ReconnectNeeded);
+    assert_eq!(after_missing.reason.as_deref(), Some("needs_scope"));
 
     // 403 non-affiliate caches non-affiliate so capability stops advertising Native.
     let (st2, ep2) = fake().await;
@@ -817,4 +820,29 @@ async fn optional_eventsub_poll_topics_map_events_and_skip_missing_scope() {
         &ended.kind,
         EventKind::NativePoll { poll_id, counts, ended: true } if poll_id == "tw-poll-9" && counts == &[5, 10]
     ));
+}
+
+#[tokio::test]
+async fn eventsub_403_missing_proper_authorization_is_classified_as_missing_scope() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = l.accept().await {
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"error":"Forbidden","status":403,"message":"subscription missing proper authorization"}"#;
+            let resp = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    let res = http_client().get(format!("http://{addr}/403")).send().await.unwrap();
+    let err = TwitchError::from_response(res).await;
+    assert!(matches!(err, TwitchError::MissingScope(_)), "expected MissingScope, got {err:?}");
 }

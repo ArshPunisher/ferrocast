@@ -107,7 +107,8 @@ impl Connector for TwitchConnector {
             });
         }
         let have = self.helix.auth.scopes().await;
-        if !have.is_empty() && !have.iter().any(|s| s == POLL_MANAGE_SCOPE) {
+        let missing_recorded = !have.is_empty() && !have.iter().any(|s| s == POLL_MANAGE_SCOPE);
+        if missing_recorded || self.helix.is_poll_scope_missing() {
             return Some(PlatformPollCapability {
                 platform: Platform::Twitch,
                 mode: PollCapabilityMode::ReconnectNeeded,

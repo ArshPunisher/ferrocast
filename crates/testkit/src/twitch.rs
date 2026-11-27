@@ -278,10 +278,7 @@ async fn subscribe(State(st): State<St>, axum::Json(body): axum::Json<Value>) ->
     let session = body.pointer("/transport/session_id").and_then(Value::as_str).unwrap_or("").to_string();
     let kind = body["type"].as_str().unwrap_or("").to_string();
     if kind == "channel.ad_break.begin" || (st.lock().unwrap().refuse_poll_subs && kind.starts_with("channel.poll.")) {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(json!({ "message": "subscription missing proper authorization: missing scope" })),
-        )
+        return (StatusCode::FORBIDDEN, axum::Json(json!({ "message": "subscription missing proper authorization" })))
             .into_response();
     }
     st.lock().unwrap().subs.push((session, kind));
