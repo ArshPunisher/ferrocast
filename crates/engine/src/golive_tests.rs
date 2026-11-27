@@ -9459,11 +9459,15 @@ async fn ticks_skip_when_group_ops_held_and_protect_pause_reconciles_cleanly() {
 
     // While another lifecycle operation holds `group_ops`, background ticks and `pause`
     // must skip via `try_lock` without deadlocking or mutating paused state.
+    let b_health = e.replace_running_health_for_test(&b.id, crate::golive::GROUP_MAIN, 500, 60_000);
     let hold = e.golive().group_ops.lock().await;
     e.backup_tick().await;
+    e.quality_tick().await;
+    assert!(!e.quality_tick_try_at(std::time::Instant::now()).await, "quality_tick must skip when group_ops is held");
     e.protect_tick().await;
     e.pause(b.id.clone(), "A".into());
     assert!(e.golive_running().contains(&b.id), "pause while group_ops held must skip without mutating");
+    drop(b_health);
     assert!(
         !matches!(
             e.golive_view()
@@ -9497,4 +9501,709 @@ async fn ticks_skip_when_group_ops_held_and_protect_pause_reconciles_cleanly() {
     wait_got(&mut got_b, |g| matches!(g, Got::Publish(k) if k == "tick-b")).await;
 
     e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn save_golive_failure_after_drain_restores_destination_on_old_group() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 2);
+    e.set_studio_host(host.clone());
+
+    let (p_yt, mut got_yt) = platform("sg-yt").await;
+    let (p_d, mut got_d) = platform("sg-d").await;
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "sg-yt".into(),
+    )));
+    let d =
+        e.add_golive_destination("DestD", &format!("rtmp://127.0.0.1:{p_d}/app"), "sg-d", Canvas::Main).await.unwrap();
+    let only_yt_d: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|x| (x.id.clone(), x.id == "youtube" || x.id == d.id)).collect();
+    e.set_golive_destinations(only_yt_d).await.unwrap();
+
+    let q1080 = CustomQuality { width: 1920, height: 1080, fps: 60, kbps: 7_000, codec: Some(VideoCodec::H264) };
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&d.id, DestinationQuality::Custom(q1080.clone())).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_yt, "sg-yt"), (&mut got_d, "sg-d")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+    while got_d.try_recv().is_ok() {}
+    let old_gid = e.golive_running_group(&d.id).unwrap();
+    let mut p_in = e.golive_planner_input(e.cached_pc_budget());
+    p_in.destinations.iter_mut().find(|x| x.id == d.id).unwrap().quality = DestinationQuality::Custom(q720.clone());
+    let target_gid = crate::golive::plan_encodes(&p_in).destinations[&d.id].group_id.clone();
+    assert_ne!(old_gid, target_gid);
+
+    // Block saving `golive` in SQLite so persistence fails AFTER draining the old forwarder.
+    e.db(|s| {
+        s.write(|tx| {
+            Ok(tx.execute_batch(
+                "CREATE TRIGGER block_golive_save BEFORE UPDATE ON settings WHEN NEW.key = 'golive'
+                 BEGIN SELECT RAISE(ABORT, 'disk error'); END;",
+            )?)
+        })
+    })
+    .await
+    .unwrap();
+
+    let err = e.set_golive_quality(&d.id, DestinationQuality::Custom(q720)).await.unwrap_err();
+    assert!(!matches!(err, EngineError::Refused { code: "golive_switch_cancelled", .. }), "{err:?}");
+
+    // Destination D must be restored on `old_gid` instead of silently dropped off air.
+    assert!(e.golive_running().contains(&d.id), "enabled destination D must stay live after save_golive failure");
+    assert_eq!(e.golive_running_group(&d.id).as_deref(), Some(old_gid.as_str()));
+    assert!(!host.started.lock().unwrap().contains_key(&target_gid), "target group must be aborted on save failure");
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_d.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "sg-d")
+        {
+            break;
+        }
+    }
+    let view = e.golive_view().await;
+    assert!(!view.destinations.iter().find(|x| x.id == d.id).unwrap().switching_quality);
+    assert_eq!(
+        e.golive_config().destinations.into_iter().find(|x| x.id == d.id).unwrap().quality,
+        DestinationQuality::Custom(q1080)
+    );
+
+    e.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TRIGGER block_golive_save")?))).await.unwrap();
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_cancel_recovery_and_future_abort_preserve_live_destination_and_groups() {
+    use crate::golive::{Canvas, CustomQuality, DestinationConfirm, DestinationQuality, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 2);
+    e.set_studio_host(host.clone());
+
+    let (p_yt, mut got_yt) = platform("pcr-yt").await;
+    let (p_d, mut got_d) = platform("pcr-d").await;
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "pcr-yt".into(),
+    )));
+    let d =
+        e.add_golive_destination("DestD", &format!("rtmp://127.0.0.1:{p_d}/app"), "pcr-d", Canvas::Main).await.unwrap();
+
+    let q1080 = CustomQuality { width: 1920, height: 1080, fps: 60, kbps: 7_000, codec: Some(VideoCodec::H264) };
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let q480 = CustomQuality { width: 852, height: 480, fps: 30, kbps: 1_500, codec: Some(VideoCodec::H264) };
+
+    // Part A: Single-destination stream (only g_d active, no GROUP_MAIN) cancelled mid-drain by an untick
+    // that then fails post-lock in `save_golive` -> `reconcile_locked` must restore g_d and D on air.
+    let only_d: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|x| (x.id.clone(), x.id == d.id)).collect();
+    e.set_golive_destinations(only_d.clone()).await.unwrap();
+    e.set_golive_quality(&d.id, DestinationQuality::Custom(q1080.clone())).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_d.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "pcr-d")
+        {
+            break;
+        }
+    }
+    let single_gid = e.golive_running_group(&d.id).unwrap();
+
+    let entered_a = Arc::new(tokio::sync::Notify::new());
+    let release_a = Arc::new(tokio::sync::Notify::new());
+    e.arm_slow_drain_for_test(&d.id, entered_a.clone(), release_a.clone());
+    let e_sw_a = e.clone();
+    let d_id_a = d.id.clone();
+    let q720_a = q720.clone();
+    let sw_a =
+        tokio::spawn(async move { e_sw_a.set_golive_quality(&d_id_a, DestinationQuality::Custom(q720_a)).await });
+    timeout(Duration::from_secs(3), entered_a.notified()).await.expect("Part A entered drain");
+
+    e.db(|s| {
+        s.write(|tx| {
+            Ok(tx.execute_batch(
+                "CREATE TRIGGER block_golive_pcr BEFORE UPDATE ON settings WHEN NEW.key = 'golive'
+                 BEGIN SELECT RAISE(ABORT, 'disk error'); END;",
+            )?)
+        })
+    })
+    .await
+    .unwrap();
+    let all_off: Vec<(String, bool)> = e.golive_config().destinations.into_iter().map(|x| (x.id, false)).collect();
+    let untick_err =
+        e.set_golive_destinations_checked(all_off, DestinationConfirm { upload: true, last: true }).await.unwrap_err();
+    assert!(!matches!(untick_err, EngineError::Refused { code: "golive_last_destination", .. }), "{untick_err:?}");
+    release_a.notify_waiters();
+    let sw_a_err = sw_a.await.unwrap().unwrap_err();
+    assert!(matches!(sw_a_err, EngineError::Refused { code: "golive_switch_cancelled", .. }), "{sw_a_err:?}");
+    assert!(
+        e.golive_running().contains(&d.id),
+        "single-destination post-cancel recovery must restore D and {single_gid} on air"
+    );
+    assert!(host.started.lock().unwrap().contains_key(&single_gid));
+
+    e.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TRIGGER block_golive_pcr")?))).await.unwrap();
+    e.studio_stream(false).await.unwrap();
+
+    // Part B: Multi-thread stress of post-cancel recovery across both `set_golive_destinations`
+    // and `remove_golive_destination` failing post-lock after cancelling an in-flight switch.
+    let only_yt_d: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|x| (x.id.clone(), x.id == "youtube" || x.id == d.id)).collect();
+    e.set_golive_destinations(only_yt_d).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_yt, "pcr-yt"), (&mut got_d, "pcr-d")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+
+    for iter in 0..8 {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        e.arm_slow_drain_for_test(&d.id, entered.clone(), release.clone());
+        let e_sw = e.clone();
+        let d_id = d.id.clone();
+        let q720_b = q720.clone();
+        let sw = tokio::spawn(async move { e_sw.set_golive_quality(&d_id, DestinationQuality::Custom(q720_b)).await });
+        timeout(Duration::from_secs(3), entered.notified()).await.expect("entered slow drain");
+
+        e.db(|s| {
+            s.write(|tx| {
+                Ok(tx.execute_batch(
+                    "CREATE TRIGGER block_golive_iter BEFORE UPDATE ON settings WHEN NEW.key = 'golive'
+                     BEGIN SELECT RAISE(ABORT, 'disk error'); END;",
+                )?)
+            })
+        })
+        .await
+        .unwrap();
+
+        let err = if iter % 2 == 0 {
+            let untick: Vec<(String, bool)> =
+                e.golive_config().destinations.into_iter().map(|x| (x.id.clone(), x.id == "youtube")).collect();
+            e.set_golive_destinations(untick).await.unwrap_err()
+        } else {
+            e.remove_golive_destination(&d.id).await.unwrap_err()
+        };
+        assert!(!matches!(err, EngineError::Refused { code: "golive_last_destination", .. }), "iter {iter}: {err:?}");
+        release.notify_waiters();
+        let sw_err = sw.await.unwrap().unwrap_err();
+        assert!(matches!(sw_err, EngineError::Refused { code: "golive_switch_cancelled", .. }));
+        e.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TRIGGER block_golive_iter")?))).await.unwrap();
+
+        assert!(
+            e.golive_running().contains(&d.id),
+            "iter {iter}: D must be restored live immediately after post-cancel recovery"
+        );
+        assert!(
+            !e.golive_view().await.destinations.iter().find(|x| x.id == d.id).unwrap().switching_quality,
+            "iter {iter}: switching_quality must clear before group_ops unlocks"
+        );
+    }
+
+    // Part C: Dropping the switch future mid-IDR wait must record and drain `orphaned_groups` and clear
+    // `g.switching` before `group_ops` unlocks, so a waiting retry never sees 409 or leaked host groups.
+    let mut p_in = e.golive_planner_input(e.cached_pc_budget());
+    p_in.destinations.iter_mut().find(|x| x.id == d.id).unwrap().quality = DestinationQuality::Custom(q720.clone());
+    let gid_720 = crate::golive::plan_encodes(&p_in).destinations[&d.id].group_id.clone();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    host.idr_gate.lock().unwrap().insert(gid_720.clone(), gate.clone());
+
+    let abort_now = Arc::new(tokio::sync::Notify::new());
+    let e_drop = e.clone();
+    let d_drop = d.id.clone();
+    let abort_wait = abort_now.clone();
+    tokio::select! {
+        res = e_drop.set_golive_quality(&d_drop, DestinationQuality::Custom(q720.clone())) => {
+            panic!("IDR-gated switch finished unexpectedly before abort: {res:?}");
+        }
+        _ = async {
+            while !(host.started.lock().unwrap().contains_key(&gid_720)
+                && e.golive().active_switching_ids().contains(&d.id))
+            {
+                tokio::task::yield_now().await;
+            }
+            abort_wait.notify_one();
+            abort_wait.notified().await;
+        } => {}
+    }
+
+    // Immediately after future drop, `reconcile` and a retry switch on `d.id` must succeed cleanly.
+    e.reconcile().await;
+    assert!(!host.started.lock().unwrap().contains_key(&gid_720), "aborted IDR group must be drained");
+    assert!(!e.active_encode_groups().iter().any(|g| g.id == gid_720));
+    e.set_golive_quality(&d.id, DestinationQuality::Custom(q480))
+        .await
+        .expect("retry after aborted future must not hit 409 Conflict");
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn stop_stream_later_and_start_show_with_race_never_poisons_stream_cancel() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use crate::studio::show::ShowStartOpts;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    #[derive(Debug)]
+    struct RunningStudioHost {
+        inner: Arc<MultiGroupHost>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::studio_host::StudioHost for RunningStudioHost {
+        async fn status(&self) -> crate::studio_host::StudioStatus {
+            crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            self.inner.start().await
+        }
+        async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+            self.inner.stop().await
+        }
+        async fn kinds(&self) -> Result<serde_json::Value, String> {
+            self.inner.kinds().await
+        }
+        async fn options(&self, kind: String) -> Result<serde_json::Value, String> {
+            self.inner.options(kind).await
+        }
+        async fn preview(&self, rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+            self.inner.preview(rect).await
+        }
+        async fn defaults(&self, kind: String) -> Result<serde_json::Value, String> {
+            self.inner.defaults(kind).await
+        }
+        async fn act(&self, act: crate::studio_host::StudioAct) -> Result<serde_json::Value, String> {
+            match act {
+                crate::studio_host::StudioAct::Scenes => Ok(serde_json::json!({ "current": "Main", "scenes": [] })),
+                other => self.inner.act(other).await,
+            }
+        }
+        async fn settings(&self) -> crate::studio_host::StudioSettings {
+            self.inner.settings().await
+        }
+        async fn set_settings(&self, s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+            self.inner.set_settings(s).await
+        }
+        async fn stats(&self) -> Result<serde_json::Value, String> {
+            self.inner.stats().await
+        }
+        async fn record(&self, on: bool) -> Result<serde_json::Value, String> {
+            self.inner.record(on).await
+        }
+        async fn record_pause(&self, on: bool) -> Result<(), String> {
+            self.inner.record_pause(on).await
+        }
+        async fn monitoring(&self) -> Result<serde_json::Value, String> {
+            self.inner.monitoring().await
+        }
+        async fn stream_start(
+            &self,
+            server: String,
+            key: String,
+            t: Vec<(u32, u32, u32)>,
+        ) -> Result<serde_json::Value, String> {
+            self.inner.stream_start(server, key, t).await
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            self.inner.stream_stop().await
+        }
+        async fn stream_stats(&self) -> Result<serde_json::Value, String> {
+            self.inner.stream_stats().await
+        }
+        async fn obs_collections(&self) -> Result<serde_json::Value, String> {
+            self.inner.obs_collections().await
+        }
+        async fn import_obs(&self, id: String) -> Result<serde_json::Value, String> {
+            self.inner.import_obs(id).await
+        }
+        fn supports_encode_groups(&self) -> bool {
+            true
+        }
+        async fn start_encode_group(
+            &self,
+            spec: crate::studio_host::EncodeGroupSpec,
+            hub: Arc<ferrocast_golive::Hub>,
+        ) -> Result<bool, String> {
+            self.inner.start_encode_group(spec, hub).await
+        }
+        async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
+            self.inner.stop_encode_group(id).await
+        }
+        async fn abort_encode_group(&self, id: &str) -> Result<(), String> {
+            self.inner.abort_encode_group(id).await
+        }
+        async fn live_group_key(&self, id: &str) -> Option<crate::studio_host::EncodeKey> {
+            self.inner.live_group_key(id).await
+        }
+        async fn group_stats(&self) -> Result<Option<serde_json::Value>, String> {
+            self.inner.group_stats().await
+        }
+        async fn host_budget_info(&self) -> Option<crate::studio_host::HostBudgetInfo> {
+            self.inner.host_budget_info().await
+        }
+    }
+
+    let (e, _dir) = engine().await;
+    let inner = ivs_budget_host(1920, 1080, 60, 9_000, 2);
+    let host = Arc::new(RunningStudioHost { inner: inner.clone() });
+    e.set_studio_host(host);
+
+    let (pa, mut got_a) = platform("ds-a").await;
+    let a = e.add_golive_destination("A", &format!("rtmp://127.0.0.1:{pa}/app"), "ds-a", Canvas::Main).await.unwrap();
+    let only_a: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == a.id)).collect();
+    e.set_golive_destinations(only_a).await.unwrap();
+
+    e.patch_show_config(
+        serde_json::json!({
+            "start_stream": true,
+            "stop_stream": true,
+            "stop_delay_s": 60,
+            "discord": false,
+            "recap_message": null
+        })
+        .as_object()
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Part A: While `stop_stream_later` already passed `rig()` and cancelled `stream_cancel` and awaits
+    // `group_ops`, `start_show_with` (`stream: Some(false)`) must not hijack `stop_waiting` / bump `epoch`
+    // and abandon a live stream with a poisoned `stream_cancel`.
+    e.start_show(true).await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while !matches!(got_a.recv().await, Some(Got::Publish(k)) if k == "ds-a") {}
+    })
+    .await
+    .unwrap();
+    e.end_show().await.unwrap();
+
+    let hold = e.golive().group_ops.lock().await;
+    let cancel_tok = e.current_golive_switch_cancel();
+    let e_late = e.clone();
+    let stop_task = tokio::spawn(async move { e_late.trigger_delayed_stop_later_for_test().await });
+    timeout(Duration::from_secs(3), cancel_tok.cancelled())
+        .await
+        .expect("stop_stream_later cancelled stream_cancel before acquiring group_ops");
+
+    let start_err = e
+        .start_show_with(ShowStartOpts { force: false, stream: Some(false) })
+        .await
+        .expect_err("start_show_with must be rejected once delayed stop is in flight");
+    assert!(matches!(start_err, EngineError::Conflict(_)), "{start_err:?}");
+
+    drop(hold);
+    stop_task.await.unwrap();
+    assert!(!e.golive_stream_running(), "delayed stop must finish stopping the stream");
+
+    // Part B: Even if `stop_stream_later` exits via `!still_ours` after acquiring `group_ops` while the
+    // Studio stream stays live, `stream_cancel` must be healed so subsequent quality switches succeed.
+    e.start_show(true).await.unwrap();
+    timeout(Duration::from_secs(3), async {
+        while !matches!(got_a.recv().await, Some(Got::Publish(k)) if k == "ds-a") {}
+    })
+    .await
+    .unwrap();
+    e.end_show().await.unwrap();
+
+    let hold2 = e.golive().group_ops.lock().await;
+    let cancel_tok2 = e.current_golive_switch_cancel();
+    let e_late2 = e.clone();
+    let stop_task2 = tokio::spawn(async move { e_late2.trigger_delayed_stop_later_for_test().await });
+    timeout(Duration::from_secs(3), cancel_tok2.cancelled()).await.unwrap();
+
+    {
+        let mut m = e.studio().machine.lock().unwrap();
+        m.epoch += 1;
+        m.stop_waiting = false;
+    }
+    drop(hold2);
+    stop_task2.await.unwrap();
+
+    assert!(e.golive_stream_running(), "stream must remain live when delayed stop exits on !still_ours");
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&a.id, DestinationQuality::Custom(q720.clone()))
+        .await
+        .expect("live switch must succeed instead of failing with golive_switch_cancelled");
+
+    // Part C: Rejected `remove_golive_destination` (409 last destination / 400 built-in) while `a` awaits IDR
+    // must not cancel `a`'s in-flight live switch.
+    let mut p_in = e.golive_planner_input(e.cached_pc_budget());
+    let q480 = CustomQuality { width: 852, height: 480, fps: 30, kbps: 1_500, codec: Some(VideoCodec::H264) };
+    p_in.destinations.iter_mut().find(|x| x.id == a.id).unwrap().quality = DestinationQuality::Custom(q480.clone());
+    let gid_480 = crate::golive::plan_encodes(&p_in).destinations[&a.id].group_id.clone();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    inner.idr_gate.lock().unwrap().insert(gid_480.clone(), gate.clone());
+
+    let e_sw = e.clone();
+    let a_id = a.id.clone();
+    let sw = tokio::spawn(async move { e_sw.set_golive_quality(&a_id, DestinationQuality::Custom(q480)).await });
+    timeout(Duration::from_secs(3), async {
+        while !inner.started.lock().unwrap().contains_key(&gid_480) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let err_last = e.remove_golive_destination(&a.id).await.unwrap_err();
+    assert!(matches!(err_last, EngineError::Refused { status: 409, code: "golive_last_destination", .. }));
+    let err_builtin = e.remove_golive_destination("youtube").await.unwrap_err();
+    assert!(matches!(err_builtin, EngineError::Invalid(_)));
+
+    gate.notify_waiters();
+    sw.await.unwrap().expect("rejected remove_golive_destination must not cancel in-flight switch");
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn reconcile_studio_groups_cancels_route_light_when_session_cap_reached() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_LIGHT, GROUP_MAIN, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(1920, 1080, 60, 10_000, 2);
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        cpu_cores: 12,
+        nvidia_driver_major: Some(555),
+        hw_backend: Some("nvenc".into()),
+        host_sig: "win|nv=555".into(),
+        ..Default::default()
+    });
+    *e.studio().studio_bench.write().unwrap() = Some(crate::golive_plan::PersistedStudioBench {
+        encoder_id: "ffmpeg_nvenc".into(),
+        is_software: false,
+        max_mpx_s: 600.0,
+        max_sessions_ok: Some(3),
+        measured_at: 1,
+        host_sig: "win|nv=555".into(),
+    });
+    e.set_studio_host(host.clone());
+
+    let (p_yt, mut got_yt) = platform("rlc-yt").await;
+    let (p_b, mut got_b) = platform("rlc-b").await;
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "rlc-yt".into(),
+    )));
+    let b =
+        e.add_golive_destination("DestB", &format!("rtmp://127.0.0.1:{p_b}/app"), "rlc-b", Canvas::Main).await.unwrap();
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&b.id, DestinationQuality::Custom(q720)).await.unwrap();
+    let order: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube" || d.id == b.id)).collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_yt, "rlc-yt"), (&mut got_b, "rlc-b")] {
+        loop {
+            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+                break;
+            }
+        }
+    }
+    let gid_b = e.golive_running_group(&b.id).unwrap();
+    assert_eq!(e.golive_running_group("youtube").as_deref(), Some(GROUP_MAIN));
+
+    // Marking YouTube `route_light` plans `[g_b, GROUP_LIGHT]` (2 sessions <= 2), while `keep_main` retains
+    // `GROUP_MAIN` in `active_groups`, forcing `reconcile_studio_groups_locked` to hit `overlap == Over` and
+    // cancel `route_light` + re-plan back to `GROUP_MAIN`.
+    e.mark_route_light_for_test("youtube");
+    e.reconcile().await;
+
+    assert_eq!(e.golive_running_group("youtube").as_deref(), Some(GROUP_MAIN));
+    assert_eq!(e.golive_running_group(&b.id).as_deref(), Some(gid_b.as_str()));
+    assert!(!host.started.lock().unwrap().contains_key(GROUP_LIGHT));
+    let view = e.golive_view().await;
+    let yt_v = view.destinations.iter().find(|d| d.id == "youtube").unwrap();
+    assert!(yt_v.blocked.is_none());
+    assert!(!yt_v.lighter_for_route);
+
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn viewers_stay_steady_during_quality_switch_drain_and_wake_on_midstream_toggle() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use crate::viewers::run_with_clock;
+    use crate::viewers::tests::{FakeClock, MockViewerConnector};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let dir = tempfile::tempdir().unwrap();
+    let e =
+        Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default())).await.unwrap();
+    e.stop_viewer_poller();
+    e.start_golive(0).await;
+
+    let host = ivs_budget_host(1920, 1080, 60, 9_000, 2);
+    e.set_studio_host(host);
+
+    let (p_tw, mut got_tw) = platform("vw-tw").await;
+    let (p_yt, mut got_yt) = platform("vw-yt").await;
+
+    #[derive(Debug)]
+    struct PolledPlatform {
+        inner: LocalPlatform,
+        mock: Arc<MockViewerConnector>,
+    }
+
+    #[async_trait::async_trait]
+    impl ferrocast_connector::Connector for PolledPlatform {
+        fn platform(&self) -> Platform {
+            self.inner.platform()
+        }
+        fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+            self.inner.capabilities()
+        }
+        async fn send_chat(&self, t: &str, r: Option<&str>) -> ferrocast_connector::Result<()> {
+            self.inner.send_chat(t, r).await
+        }
+        async fn delete_message(&self, id: &str) -> ferrocast_connector::Result<()> {
+            self.inner.delete_message(id).await
+        }
+        async fn timeout(&self, u: &str, s: u32, r: Option<&str>) -> ferrocast_connector::Result<()> {
+            self.inner.timeout(u, s, r).await
+        }
+        async fn ban(&self, u: &str, r: Option<&str>) -> ferrocast_connector::Result<()> {
+            self.inner.ban(u, r).await
+        }
+        async fn unban(&self, u: &str) -> ferrocast_connector::Result<()> {
+            self.inner.unban(u).await
+        }
+        async fn set_mode(&self, m: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+            self.inner.set_mode(m).await
+        }
+        async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+            self.inner.ingest().await
+        }
+        async fn viewer_count(&self) -> ferrocast_connector::Result<Option<u64>> {
+            self.mock.viewer_count().await
+        }
+    }
+
+    let tw_mock = MockViewerConnector::new(Platform::Twitch, Ok(Some(42)));
+    let yt_mock = MockViewerConnector::new(Platform::Youtube, Ok(Some(19)));
+    e.register_connector(Arc::new(PolledPlatform {
+        inner: LocalPlatform(Platform::Twitch, format!("rtmp://127.0.0.1:{p_tw}/app"), "vw-tw".into()),
+        mock: tw_mock.clone(),
+    }));
+    e.register_connector(Arc::new(PolledPlatform {
+        inner: LocalPlatform(Platform::Youtube, format!("rtmp://127.0.0.1:{p_yt}/app"), "vw-yt".into()),
+        mock: yt_mock.clone(),
+    }));
+
+    // Start with only YouTube enabled so Twitch starts inactive.
+    let only_yt: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
+    e.set_golive_destinations(only_yt).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "vw-yt")
+        {
+            break;
+        }
+    }
+
+    let clock = FakeClock::new();
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let poller = tokio::spawn(run_with_clock(e.clone(), clock.clone(), stop.clone()));
+
+    let (g0, dl0) = clock.wait_sleep_after(0).await;
+    assert_eq!(dl0, Some(clock.origin + Duration::from_secs(10)));
+    clock.advance(Duration::from_secs(10));
+    let (g1, dl1) = clock.wait_sleep_after(g0).await;
+    assert_eq!(yt_mock.calls(), 1);
+    assert_eq!(dl1, Some(clock.origin + Duration::from_secs(70)), "YouTube sleeps 60s before next poll");
+
+    // Tick Twitch mid-stream -> golive must wake the viewer poller immediately to schedule Twitch's 10s poll.
+    let yt_and_tw: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "twitch"))
+        .collect();
+    e.set_golive_destinations(yt_and_tw).await.unwrap();
+    loop {
+        if matches!(timeout(Duration::from_secs(3), got_tw.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "vw-tw")
+        {
+            break;
+        }
+    }
+    let (g2, dl2) = timeout(Duration::from_secs(2), clock.wait_sleep_after(g1))
+        .await
+        .expect("mid-stream destination start must wake viewer poller immediately");
+    assert_eq!(dl2, Some(clock.origin + Duration::from_secs(20)), "Twitch initial poll due in 10s");
+
+    clock.advance(Duration::from_secs(10));
+    let (g3, _) = clock.wait_sleep_after(g2).await;
+    assert_eq!(tw_mock.calls(), 1);
+    eventually_async(|| async { e.state().viewers.get(&Platform::Twitch).copied() == Some(42) }).await;
+
+    // During a live quality-switch drain on Twitch, viewer count must stay steady and never be cleared.
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    e.arm_slow_drain_for_test("twitch", entered.clone(), release.clone());
+    let mut overlays = e.subscribe_overlays();
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let e_sw = e.clone();
+    let sw = tokio::spawn(async move { e_sw.set_golive_quality("twitch", DestinationQuality::Custom(q720)).await });
+    timeout(Duration::from_secs(3), entered.notified()).await.expect("twitch switch entered drain");
+
+    e.wake_viewer_poller();
+    let (g4, _) = timeout(Duration::from_secs(2), clock.wait_sleep_after(g3)).await.unwrap();
+    assert_eq!(
+        e.state().viewers.get(&Platform::Twitch).copied(),
+        Some(42),
+        "viewers must not flicker to None during live quality-switch drain"
+    );
+    while let Ok(f) = overlays.try_recv() {
+        let v: serde_json::Value = serde_json::from_str(&f.text).unwrap();
+        if let Some(viewers_obj) = v["data"]["viewers"].as_object()
+            && viewers_obj.contains_key("twitch")
+        {
+            assert!(!viewers_obj["twitch"].is_null(), "unexpected viewer clear frame during drain: {v}");
+        }
+    }
+
+    release.notify_waiters();
+    sw.await.unwrap().unwrap();
+    let (g_post_sw, _) = timeout(Duration::from_secs(2), clock.wait_sleep_after(g4)).await.unwrap();
+
+    // Unticking Twitch mid-stream must wake the viewer poller immediately and clear its viewers.
+    let only_yt2: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
+    e.set_golive_destinations(only_yt2).await.unwrap();
+    let (_g5, _) = timeout(Duration::from_secs(2), clock.wait_sleep_after(g_post_sw))
+        .await
+        .expect("mid-stream destination stop must wake viewer poller immediately");
+    assert_eq!(e.state().viewers.get(&Platform::Twitch).copied(), None);
+
+    stop.notify_one();
+    poller.await.unwrap();
+    e.studio_stream(false).await.unwrap();
+    let _ = Canvas::Main;
 }
