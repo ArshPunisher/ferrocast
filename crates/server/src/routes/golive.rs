@@ -12,12 +12,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::extract::Body;
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/golive", get(view))
+        .route("/golive/quality-options", get(quality_options))
         .route("/golive/ingest", get(ingest))
         .route("/golive/destinations", put(order).post(add))
         .route("/golive/destinations/{id}", delete(remove))
@@ -26,6 +27,7 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/golive/networks", get(networks))
         .route("/golive/destinations/{id}/light", put(light))
         .route("/golive/destinations/{id}/enhanced", put(enhanced))
+        .route("/golive/destinations/{id}/quality", put(quality))
         .route("/golive/obs/setup", post(point_obs))
         .route("/golive/obs/restore", post(restore_obs))
         .route("/golive/upload-check", post(upload_check))
@@ -45,6 +47,11 @@ pub(crate) fn routes() -> Router<AppState> {
 
 async fn view(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.golive_view().await))
+}
+
+/// `GET /golive/quality-options`: per-destination quality rungs, limits, sharing hints, and PC budget.
+async fn quality_options(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.golive_quality_options().await))
 }
 
 /// The local server and key, to type into OBS by hand. Never sent to a paired phone
@@ -141,6 +148,60 @@ async fn enhanced(
     Body(b): Body<OnBody>,
 ) -> ApiResult<Json<Value>> {
     Ok(Json(json!(app.engine.set_golive_enhanced(&id, b.on).await?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QualityModeBody {
+    SameAsMain,
+    Custom,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QualityBody {
+    mode: QualityModeBody,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<u32>,
+    kbps: Option<u32>,
+    codec: Option<ferrocast_engine::golive::VideoCodec>,
+}
+
+impl TryFrom<QualityBody> for ferrocast_engine::golive::DestinationQuality {
+    type Error = ApiError;
+
+    fn try_from(b: QualityBody) -> Result<Self, Self::Error> {
+        match b.mode {
+            QualityModeBody::SameAsMain => {
+                if b.width.is_some() || b.height.is_some() || b.fps.is_some() || b.kbps.is_some() || b.codec.is_some() {
+                    return Err(ApiError::invalid(
+                        "\"same_as_main\" mode does not accept width, height, fps, kbps, or codec.",
+                    ));
+                }
+                Ok(Self::SameAsMain)
+            }
+            QualityModeBody::Custom => {
+                let (Some(width), Some(height), Some(fps), Some(kbps)) = (b.width, b.height, b.fps, b.kbps) else {
+                    return Err(ApiError::invalid(
+                        "Custom quality requires integer width, height, fps, and kbps fields.",
+                    ));
+                };
+                Ok(Self::Custom(ferrocast_engine::golive::CustomQuality { width, height, fps, kbps, codec: b.codec }))
+            }
+        }
+    }
+}
+
+/// `PUT /golive/destinations/{id}/quality`: set per-destination quality (`same_as_main` or `custom`).
+async fn quality(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    Body(b): Body<QualityBody>,
+) -> ApiResult<Json<Value>> {
+    let quality = ferrocast_engine::golive::DestinationQuality::try_from(b)?;
+    app.engine.set_golive_quality(&id, quality).await?;
+    Ok(Json(json!(app.engine.golive_view().await)))
 }
 
 async fn remove(State(app): State<AppState>, Path(id): Path<String>) -> ApiResult<StatusCode> {

@@ -2948,3 +2948,409 @@ async fn put_links_refuses_to_overwrite_corrupt_creator_links_row() {
     // Best-effort GET /api/v1/links display path still returns 200 with empty fallback.
     assert_eq!(r.get("/api/v1/links").await.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn golive_quality_options_and_put_quality_cover_every_status_code() {
+    use async_trait::async_trait;
+    use ferrocast_engine::studio_host::{
+        EncodeGroupSpec, FilePick, HostBudgetInfo, Hub, PreviewRect, StudioAct, StudioHost, StudioSettings,
+        StudioStatus,
+    };
+    use ferrocast_testkit::rtmp::{Obs, platform};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    #[derive(Debug, Default)]
+    struct HttpMockStudioHost {
+        settings: Mutex<StudioSettings>,
+        budget: Mutex<Option<HostBudgetInfo>>,
+        supports_groups: AtomicBool,
+        streaming: AtomicBool,
+        started: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+        started_notify: Notify,
+        idr_gates: Mutex<HashMap<String, Arc<Notify>>>,
+    }
+
+    #[async_trait]
+    impl StudioHost for HttpMockStudioHost {
+        async fn status(&self) -> StudioStatus {
+            StudioStatus { available: true, running: true, ..Default::default() }
+        }
+        async fn start(&self) -> Result<StudioStatus, String> {
+            Ok(self.status().await)
+        }
+        async fn stop(&self) -> Result<StudioStatus, String> {
+            Ok(StudioStatus::default())
+        }
+        async fn kinds(&self) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn options(&self, _kind: String) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
+            Ok(())
+        }
+        async fn defaults(&self, _kind: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn act(&self, _act: StudioAct) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn settings(&self) -> StudioSettings {
+            self.settings.lock().unwrap().clone()
+        }
+        async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String> {
+            *self.settings.lock().unwrap() = s;
+            Ok(None)
+        }
+        async fn stats(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn record(&self, _on: bool) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        async fn record_pause(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        async fn monitoring(&self) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+            self.streaming.store(true, Ordering::Release);
+            Ok(json!({ "active": true }))
+        }
+        async fn stream_stop(&self) -> Result<(), String> {
+            self.streaming.store(false, Ordering::Release);
+            let mut started = self.started.lock().unwrap();
+            for (_, t) in started.drain() {
+                t.abort();
+            }
+            Ok(())
+        }
+        async fn stream_stats(&self) -> Result<Value, String> {
+            Ok(if self.streaming.load(Ordering::Acquire) { json!({ "active": true }) } else { Value::Null })
+        }
+        async fn obs_collections(&self) -> Result<Value, String> {
+            Ok(json!([]))
+        }
+        async fn import_obs(&self, _id: String) -> Result<Value, String> {
+            Ok(json!({}))
+        }
+        async fn pick_file(&self, _p: FilePick) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        fn supports_encode_groups(&self) -> bool {
+            self.supports_groups.load(Ordering::Acquire)
+        }
+        async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
+            self.budget.lock().unwrap().clone()
+        }
+        async fn start_encode_group(&self, spec: EncodeGroupSpec, hub: Arc<Hub>) -> Result<bool, String> {
+            if !self.supports_encode_groups() {
+                return Ok(false);
+            }
+            self.streaming.store(true, Ordering::Release);
+            hub.start();
+            hub.video(0, vec![0x17u8, 0x00, 0x00, 0x00, 0x00].into());
+            hub.audio(0, vec![0xAFu8, 0x00, 0x12, 0x10].into());
+            let gate = self.idr_gates.lock().unwrap().get(&spec.id).cloned();
+            let id = spec.id.clone();
+            let pump = tokio::spawn(async move {
+                if let Some(g) = gate {
+                    g.notified().await;
+                }
+                hub.note_encoded_idr();
+                hub.video(33, vec![0x17u8, 0x01, 0x00, 0x00, 0x01].into());
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            });
+            self.started.lock().unwrap().insert(id, pump);
+            self.started_notify.notify_waiters();
+            Ok(true)
+        }
+        async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
+            if let Some(t) = self.started.lock().unwrap().remove(id) {
+                t.abort();
+            }
+            Ok(())
+        }
+    }
+
+    let r = start().await;
+
+    // 401 unauthorized without session bearer token on both GET & PUT.
+    assert_eq!(
+        error_code(r.anonymous(reqwest::Method::GET, "/api/v1/golive/quality-options").await).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        error_code(r.anonymous(reqwest::Method::PUT, "/api/v1/golive/destinations/kick/quality").await).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 403 forbidden when Origin header violates CSRF rules on PUT.
+    let bad_origin = r
+        .client
+        .put(format!("{}/api/v1/golive/destinations/kick/quality", r.base))
+        .bearer_auth(&r.token)
+        .header("Origin", "https://evil.example")
+        .json(&json!({ "mode": "same_as_main" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+
+    // 415 unsupported media type without application/json content-type.
+    let wrong_ct = r
+        .client
+        .put(format!("{}/api/v1/golive/destinations/kick/quality", r.base))
+        .bearer_auth(&r.token)
+        .header("Content-Type", "text/plain")
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error_code(wrong_ct).await, (StatusCode::UNSUPPORTED_MEDIA_TYPE, "wrong_content_type".into()));
+
+    // Attach Studio host (1440p60 H264, Apple Silicon 2 engines so multi-encode works).
+    let host = Arc::new(HttpMockStudioHost::default());
+    *host.settings.lock().unwrap() =
+        StudioSettings { width: 2560, height: 1440, fps: 60, video_kbps: 16_000, ..Default::default() };
+    *host.budget.lock().unwrap() = Some(HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        vertical_on: true,
+        vertical_size: Some((1080, 1920)),
+        host_sig: "mac-m2-http".into(),
+        ..Default::default()
+    });
+    host.supports_groups.store(true, Ordering::Release);
+    r.engine.set_studio_host(host.clone());
+
+    // 200 GET /golive/quality-options returns full options tree, hard Kick cap, soft Twitch note.
+    let opts_res = r.get("/api/v1/golive/quality-options").await;
+    assert_eq!(opts_res.status(), StatusCode::OK);
+    let opts: Value = opts_res.json().await.unwrap();
+    assert_eq!(opts["source"], "studio");
+    assert_eq!(opts["main"]["width"], 2560);
+    assert_eq!(opts["vertical"]["width"], 1080);
+    assert_eq!(opts["destinations"]["kick"]["custom_limits"]["max_height"], 1080);
+    assert!(
+        opts["destinations"]["twitch"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["id"] == "1440p60_6000" && o["note"].as_str().unwrap().contains("recommended 1080p"))
+    );
+
+    // 404 unknown destination id.
+    let res_404 = r.put("/api/v1/golive/destinations/does_not_exist/quality", json!({ "mode": "same_as_main" })).await;
+    assert_eq!(error_code(res_404).await, (StatusCode::NOT_FOUND, "not_found".into()));
+
+    // 400 malformed JSON, unknown fields (deny_unknown_fields), missing/invalid custom dims/fps/kbps/limits.
+    assert_eq!(
+        error_code(r.raw(reqwest::Method::PUT, "/api/v1/golive/destinations/kick/quality", "{bad").await).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    for bad_body in [
+        json!({ "mode": "same_as_main", "extra": 1 }),
+        json!({ "mode": "same_as_main", "kbps": 3000 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "extra": true }),
+        json!({ "mode": "custom", "width": 1281, "height": 720, "fps": 30, "kbps": 3000 }),
+        json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 45, "kbps": 3000 }),
+        json!({ "mode": "custom", "width": 2560, "height": 1440, "fps": 60, "kbps": 8000 }),
+    ] {
+        let res = r.put("/api/v1/golive/destinations/kick/quality", bad_body.clone()).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "expected 400 for {bad_body}");
+    }
+
+    // 200 PUT custom quality offline + additive GoLiveView fields.
+    let put_ok = r
+        .put(
+            "/api/v1/golive/destinations/kick/quality",
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3500, "codec": "h264" }),
+        )
+        .await;
+    assert_eq!(put_ok.status(), StatusCode::OK);
+    let view: Value = put_ok.json().await.unwrap();
+    let kick_v = view["destinations"].as_array().unwrap().iter().find(|d| d["id"] == "kick").unwrap();
+    assert_eq!(kick_v["quality"]["mode"], "custom");
+    assert_eq!(kick_v["resolved_quality"]["width"], 1280);
+    assert_eq!(kick_v["resolved_quality"]["kbps"], 3500);
+    assert_eq!(kick_v["switching_quality"], false);
+    assert!(view["encode_budget"]["status"].is_string());
+    assert!(view["encode_groups"].is_array());
+
+    // 200 reset back to same_as_main.
+    let reset_ok = r.put("/api/v1/golive/destinations/kick/quality", json!({ "mode": "same_as_main" })).await;
+    assert_eq!(reset_ok.status(), StatusCode::OK);
+
+    // Set up enabled custom RTMP destination to verify HTTP 422 budget exceeded, 200 live switch, & 409 concurrent switch.
+    let (p1, mut got1) = platform("http-q1").await;
+    let custom1: Value = r
+        .post(
+            "/api/v1/golive/destinations",
+            json!({ "name": "C1", "url": format!("rtmp://127.0.0.1:{p1}/app"), "key": "http-q1" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let c1_id = custom1["id"].as_str().unwrap().to_string();
+
+    // 422 offline encode_budget_exceeded: tighten host to Windows NVENC pre-550 (2 effective sessions), add 2nd custom.
+    let (p2, _got2) = platform("http-q2").await;
+    let custom2: Value = r
+        .post(
+            "/api/v1/golive/destinations",
+            json!({ "name": "C2", "url": format!("rtmp://127.0.0.1:{p2}/app"), "key": "http-q2" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let c2_id = custom2["id"].as_str().unwrap().to_string();
+    let (p3, _got3) = platform("http-q3").await;
+    let custom3: Value = r
+        .post(
+            "/api/v1/golive/destinations",
+            json!({ "name": "C3", "url": format!("rtmp://127.0.0.1:{p3}/app"), "key": "http-q3" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let c3_id = custom3["id"].as_str().unwrap().to_string();
+    let order: Vec<Value> = r.get("/api/v1/golive").await.json::<Value>().await.unwrap()["destinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            let id = d["id"].as_str().unwrap();
+            json!({ "id": id, "enabled": id == c1_id || id == c2_id || id == c3_id })
+        })
+        .collect();
+    assert_eq!(r.put("/api/v1/golive/destinations", json!({ "destinations": order })).await.status(), StatusCode::OK);
+
+    // Pin c2 to 720p60, shrink NVENC to 2 effective sessions (driver <531 -> 3 max, 1 spare = 2),
+    // then pushing c3 to a 3rd group (480p30) -> 422.
+    *host.settings.lock().unwrap() =
+        StudioSettings { width: 1920, height: 1080, fps: 60, video_kbps: 8_000, ..Default::default() };
+    *host.budget.lock().unwrap() = Some(HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        nvidia_driver_major: Some(525),
+        cpu_cores: 8,
+        host_sig: "win-525".into(),
+        ..Default::default()
+    });
+    assert_eq!(
+        r.put(
+            &format!("/api/v1/golive/destinations/{c2_id}/quality"),
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 60, "kbps": 4500, "codec": "h264" }),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let over_budget_res = r
+        .put(
+            &format!("/api/v1/golive/destinations/{c3_id}/quality"),
+            json!({ "mode": "custom", "width": 852, "height": 480, "fps": 30, "kbps": 1500, "codec": "h264" }),
+        )
+        .await;
+    assert_eq!(error_code(over_budget_res).await, (StatusCode::UNPROCESSABLE_ENTITY, "encode_budget_exceeded".into()));
+
+    // Restore Apple Silicon 4-engine headroom and go live with c1, then verify HTTP 200 live switch & HTTP 409 concurrent switch.
+    *host.budget.lock().unwrap() = Some(HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2-live".into(),
+        ..Default::default()
+    });
+    let only_c1: Vec<Value> = r.get("/api/v1/golive").await.json::<Value>().await.unwrap()["destinations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| json!({ "id": d["id"], "enabled": d["id"] == c1_id }))
+        .collect();
+    assert_eq!(r.put("/api/v1/golive/destinations", json!({ "destinations": only_c1 })).await.status(), StatusCode::OK);
+
+    r.engine.studio_stream(true).await.unwrap();
+    let live_put = r
+        .put(
+            &format!("/api/v1/golive/destinations/{c1_id}/quality"),
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "codec": "h264" }),
+        )
+        .await;
+    assert_eq!(live_put.status(), StatusCode::OK);
+    let live_view: Value = live_put.json().await.unwrap();
+    let live_c1 = live_view["destinations"].as_array().unwrap().iter().find(|d| d["id"] == c1_id).unwrap();
+    assert_eq!(live_c1["resolved_quality"]["width"], 1280);
+
+    // 409 conflict while a live switch for the same destination is awaiting its keyframe.
+    let target_480 = json!({ "mode": "custom", "width": 852, "height": 480, "fps": 30, "kbps": 1500, "codec": "h264" });
+    let gate_inserted;
+    {
+        let mut p_in = r.engine.golive_planner_input(r.engine.cached_pc_budget());
+        if let Some(pd) = p_in.destinations.iter_mut().find(|d| d.id == c1_id) {
+            pd.quality =
+                ferrocast_engine::golive::DestinationQuality::Custom(ferrocast_engine::golive::CustomQuality {
+                    width: 852,
+                    height: 480,
+                    fps: 30,
+                    kbps: 1500,
+                    codec: Some(ferrocast_engine::golive::VideoCodec::H264),
+                });
+        }
+        let gid = ferrocast_engine::golive::plan_encodes(&p_in).destinations[&c1_id].group_id.clone();
+        let notify = Arc::new(Notify::new());
+        host.idr_gates.lock().unwrap().insert(gid.clone(), notify.clone());
+        gate_inserted = Some((gid, notify));
+    }
+    let (gated_gid, gate_notify) = gate_inserted.unwrap();
+
+    let url = format!("{}/api/v1/golive/destinations/{c1_id}/quality", r.base);
+    let fut1 = r.client.put(&url).bearer_auth(&r.token).json(&target_480).send();
+    let client2 = r.client.clone();
+    let tok2 = r.token.clone();
+    let h1 = tokio::spawn(fut1);
+    loop {
+        let notified = host.started_notify.notified();
+        if host.started.lock().unwrap().contains_key(&gated_gid) || h1.is_finished() {
+            break;
+        }
+        notified.await;
+    }
+    let res_409 = client2.put(&url).bearer_auth(&tok2).json(&json!({ "mode": "same_as_main" })).send().await.unwrap();
+    assert_eq!(error_code(res_409).await, (StatusCode::CONFLICT, "conflict".into()));
+
+    // Release IDR gate so first switch finishes 200 cleanly, then stop Studio.
+    gate_notify.notify_waiters();
+    assert_eq!(h1.await.unwrap().unwrap().status(), StatusCode::OK);
+    r.engine.studio_stream(false).await.unwrap();
+
+    // 422 OBS live mode refusal (`golive_needs_new_encode`).
+    r.engine.start_golive(0).await;
+    let ing: Value = r.get("/api/v1/golive/ingest").await.json().await.unwrap();
+    let key = ing["key"].as_str().unwrap();
+    let ingest_port: u16 =
+        ing["server"].as_str().unwrap().rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let mut obs = Obs::publish(ingest_port, "live", key).await.unwrap();
+    let _ = obs.keyframes_until_seen(&mut got1).await;
+    let obs_opts: Value = r.get("/api/v1/golive/quality-options").await.json().await.unwrap();
+    assert_eq!(obs_opts["source"], "obs");
+    assert!(obs_opts["destinations"][&c1_id]["locked_reason"].is_string());
+    let obs_422 =
+        r.put(&format!("/api/v1/golive/destinations/{c1_id}/quality"), json!({ "mode": "same_as_main" })).await;
+    assert_eq!(error_code(obs_422).await, (StatusCode::UNPROCESSABLE_ENTITY, "golive_needs_new_encode".into()));
+}
