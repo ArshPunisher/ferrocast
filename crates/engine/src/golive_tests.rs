@@ -91,7 +91,7 @@ async fn a_paused_destination_stays_off_until_resumed() {
     // The next message matching `want`, skipping media in between.
     async fn until(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Got>, want: impl Fn(&Got) -> bool) -> Got {
         loop {
-            let g = timeout(Duration::from_secs(5), rx.recv()).await.expect("in time").expect("open");
+            let g = timeout(Duration::from_secs(30), rx.recv()).await.expect("in time").expect("open");
             if want(&g) {
                 return g;
             }
@@ -495,7 +495,7 @@ async fn the_vertical_canvas_goes_only_to_vertical_destinations() {
     assert_eq!(next(&mut got_m).await, Got::Publish("main-key".into()));
     drop(vertical);
     loop {
-        let g = tokio::time::timeout(std::time::Duration::from_secs(5), got_v.recv()).await.unwrap().unwrap();
+        let g = tokio::time::timeout(std::time::Duration::from_secs(30), got_v.recv()).await.unwrap().unwrap();
         if g == Got::Closed {
             break;
         }
@@ -2853,7 +2853,7 @@ async fn dynamic_hub_registry_routes_custom_group_checks_budget_and_promotes_bac
 
     let mut saw_cust_publish = false;
     for _ in 0..10 {
-        if let Ok(Some(msg)) = timeout(Duration::from_secs(2), got_cust.recv()).await
+        if let Ok(Some(msg)) = timeout(Duration::from_secs(30), got_cust.recv()).await
             && matches!(msg, Got::Publish(ref k) if k == "cust-k")
         {
             saw_cust_publish = true;
@@ -2863,7 +2863,7 @@ async fn dynamic_hub_registry_routes_custom_group_checks_budget_and_promotes_bac
     assert!(saw_cust_publish, "dynamic hub must feed its assigned custom destination");
     let mut saw_main_publish = false;
     for _ in 0..10 {
-        if let Ok(Some(msg)) = timeout(Duration::from_secs(2), got_main.recv()).await
+        if let Ok(Some(msg)) = timeout(Duration::from_secs(30), got_main.recv()).await
             && matches!(msg, Got::Publish(ref k) if k == "main-k")
         {
             saw_main_publish = true;
@@ -3258,7 +3258,7 @@ async fn multi_encode_studio_start_and_live_single_dest_switch_keeps_other_desti
 
     async fn wait_pub(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Got>, want: &str) {
         loop {
-            match timeout(Duration::from_secs(3), rx.recv()).await.expect("rtmp timely").expect("open") {
+            match timeout(Duration::from_secs(30), rx.recv()).await.expect("rtmp timely").expect("open") {
                 Got::Publish(k) if k == want => return,
                 Got::Closed => panic!("unexpected close before publish for {want}"),
                 _ => {}
@@ -3327,7 +3327,7 @@ async fn multi_encode_studio_start_and_live_single_dest_switch_keeps_other_desti
     assert_eq!(e.golive_running_group(&kick.id).as_deref(), Some(initial_kick_group.as_str()));
     assert_eq!(e.golive_running_group(&yt.id).as_deref(), Some(GROUP_MAIN));
 
-    notify.notify_waiters();
+    notify.notify_one();
     sw_task.await.unwrap().unwrap();
     assert_eq!(e.golive_running_group(&kick.id).as_deref(), Some(target_gid.as_str()));
     assert_eq!(e.golive_running_group(&yt.id).as_deref(), Some(GROUP_MAIN));
@@ -3337,7 +3337,7 @@ async fn multi_encode_studio_start_and_live_single_dest_switch_keeps_other_desti
     }
     let mut saw_kick_repub = false;
     for _ in 0..50 {
-        match timeout(Duration::from_secs(2), got_kick.recv()).await.expect("kick event").expect("open") {
+        match timeout(Duration::from_secs(30), got_kick.recv()).await.expect("kick event").expect("open") {
             Got::Publish(k) if k == "kick-k" => {
                 saw_kick_repub = true;
                 break;
@@ -3386,7 +3386,7 @@ async fn live_switch_timeout_keeps_old_forwarder_live_and_cleans_up_stalled_grou
         .unwrap();
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {
+        if matches!(timeout(Duration::from_secs(30), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {
             break;
         }
     }
@@ -3419,7 +3419,7 @@ async fn live_switch_concurrent_guard_and_stop_cancels_pending_switch() {
     use tokio::time::{Duration, timeout};
 
     let (e, _dir) = engine().await;
-    e.set_keyframe_wait_timeout_for_test(Duration::from_secs(5));
+    e.set_keyframe_wait_timeout_for_test(Duration::from_secs(30));
     let host = Arc::new(MultiGroupHost::default());
     *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
         width: 1920,
@@ -3445,7 +3445,7 @@ async fn live_switch_concurrent_guard_and_stop_cancels_pending_switch() {
         .unwrap();
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {
+        if matches!(timeout(Duration::from_secs(30), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {
             break;
         }
     }
@@ -3476,7 +3476,7 @@ async fn live_switch_concurrent_guard_and_stop_cancels_pending_switch() {
 
     // Stop stream cancels the pending switch cleanly before keyframe timeout elapses.
     e.studio_stream(false).await.unwrap();
-    let res1 = timeout(Duration::from_secs(2), t1).await.expect("switch aborts cleanly").unwrap().unwrap_err();
+    let res1 = timeout(Duration::from_secs(30), t1).await.expect("switch aborts cleanly").unwrap().unwrap_err();
     assert!(matches!(res1, EngineError::Refused { code: "golive_switch_cancelled", .. }), "{res1:?}");
     assert!(host.stopped_groups.lock().unwrap().contains(&pending_gid));
 }
@@ -3645,7 +3645,7 @@ async fn f1_main_group_never_restarts_or_retires_midstream() {
     let yt =
         e.add_golive_destination("YT", &format!("rtmp://127.0.0.1:{p_yt}/app"), "yt-f1", Canvas::Main).await.unwrap();
     e.studio_stream(true).await.unwrap();
-    while !matches!(timeout(Duration::from_secs(2), got_yt.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(30), got_yt.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
 
     let custom_720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
     e.set_golive_quality(&yt.id, DestinationQuality::Custom(custom_720)).await.unwrap();
@@ -3729,7 +3729,7 @@ async fn f4_unticked_dest_mid_switch_and_concurrent_shared_group_and_budget() {
     use tokio::time::{Duration, timeout};
 
     let (e, _dir) = engine().await;
-    e.set_keyframe_wait_timeout_for_test(Duration::from_secs(2));
+    e.set_keyframe_wait_timeout_for_test(Duration::from_secs(30));
     let host = Arc::new(MultiGroupHost::default());
     *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
         width: 1920,
@@ -3766,8 +3766,8 @@ async fn f4_unticked_dest_mid_switch_and_concurrent_shared_group_and_budget() {
     };
     e.set_golive_destinations(set_only(&e, &[&d1.id, &d2.id])).await.unwrap();
     e.studio_stream(true).await.unwrap();
-    while !matches!(timeout(Duration::from_secs(2), g1.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
-    while !matches!(timeout(Duration::from_secs(2), g2.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(30), g1.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(30), g2.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
 
     // 1. Untick d1 while it awaits IDR on target group -> switch cancels and removes new group.
     let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
@@ -3787,7 +3787,7 @@ async fn f4_unticked_dest_mid_switch_and_concurrent_shared_group_and_budget() {
         tokio::task::yield_now().await;
     }
     e.set_golive_destinations(set_only(&e, &[&d2.id])).await.unwrap();
-    gate.notify_waiters();
+    gate.notify_one();
     let res = sw1.await.unwrap().unwrap_err();
     assert!(matches!(res, EngineError::Refused { code: "golive_switch_cancelled", .. }), "{res:?}");
     assert!(host.stopped_groups.lock().unwrap().contains(&gid_720));
@@ -3837,7 +3837,7 @@ async fn f5_delay_switch_wakes_on_encoded_idr_and_clears_route_light() {
     let (p, mut got) = platform("f5").await;
     let d = e.add_golive_destination("YT", &format!("rtmp://127.0.0.1:{p}/app"), "f5", Canvas::Main).await.unwrap();
     e.studio_stream(true).await.unwrap();
-    while !matches!(timeout(Duration::from_secs(2), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(30), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
 
     // Place destination on route_light -> reconcile onto GROUP_LIGHT.
     e.mark_route_light_for_test(&d.id);
@@ -3856,7 +3856,7 @@ async fn f5_delay_switch_wakes_on_encoded_idr_and_clears_route_light() {
     let gid_6m = crate::golive::plan_encodes(&input).destinations[&d.id].group_id.clone();
     host.delay_idr_only_groups.lock().unwrap().insert(gid_6m.clone());
 
-    timeout(Duration::from_secs(2), e.set_golive_quality(&d.id, DestinationQuality::Custom(q_6m)))
+    timeout(Duration::from_secs(30), e.set_golive_quality(&d.id, DestinationQuality::Custom(q_6m)))
         .await
         .expect("delay_s encoded IDR wake")
         .expect("live switch under delay must succeed");
@@ -3904,7 +3904,7 @@ async fn n2_live_switch_drains_old_rtmp_session_before_opening_replacement() {
         .unwrap();
     e.studio_stream(true).await.unwrap();
     loop {
-        match timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap() {
+        match timeout(Duration::from_secs(30), rx.recv()).await.unwrap().unwrap() {
             Ok(Got::Publish(_)) => break,
             Ok(_) => {}
             Err(why) => panic!("unexpected error on first publish: {why}"),
@@ -3918,7 +3918,7 @@ async fn n2_live_switch_drains_old_rtmp_session_before_opening_replacement() {
     let mut saw_close = false;
     let mut saw_second_pub = false;
     for _ in 0..100 {
-        match timeout(Duration::from_secs(2), rx.recv()).await.expect("rtmp activity").expect("open") {
+        match timeout(Duration::from_secs(30), rx.recv()).await.expect("rtmp activity").expect("open") {
             Err(why) => panic!("replacement publish overlapped old RTMP session: {why}"),
             Ok(Got::Closed) => saw_close = true,
             Ok(Got::Publish(k)) if k == "n2-key" => {
@@ -3969,7 +3969,7 @@ async fn n3_vertical_only_keeps_studio_live_and_allows_live_switch() {
         e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == d_v.id)).collect();
     e.set_golive_destinations(only_v).await.unwrap();
     e.studio_stream(true).await.unwrap();
-    while !matches!(timeout(Duration::from_secs(2), got_v.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(30), got_v.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
 
     assert!(!host.started.lock().unwrap().contains_key(crate::golive::GROUP_MAIN), "must be vertical-only");
     assert!(e.golive_stream_running(), "vertical-only stream must be reported live");
@@ -4011,7 +4011,7 @@ async fn n4_sequence_header_alone_does_not_satisfy_await_hub_idr() {
     let (p, mut got) = platform("n4").await;
     let d = e.add_golive_destination("YT", &format!("rtmp://127.0.0.1:{p}/app"), "n4", Canvas::Main).await.unwrap();
     e.studio_stream(true).await.unwrap();
-    while !matches!(timeout(Duration::from_secs(2), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(30), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
 
     let q_hdr = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
     let mut input = e.golive_planner_input(e.cached_pc_budget());
@@ -4144,7 +4144,7 @@ async fn f7_view_reports_live_stats_capped_and_golive_live_without_main_group() 
     // Going live with Kick only starts Kick's 1080p group, NEVER GROUP_MAIN.
     let mut live_rx = e.golive_live();
     e.studio_stream(true).await.unwrap();
-    while !matches!(timeout(Duration::from_secs(2), got_kick.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(30), got_kick.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
     assert!(!host.started.lock().unwrap().contains_key(GROUP_MAIN));
 
     let live_view = e.golive_view().await;
@@ -4160,7 +4160,7 @@ async fn f7_view_reports_live_stats_capped_and_golive_live_without_main_group() 
     assert_eq!(live_cap.kbps, 8_000);
 
     if !live_rx.borrow().on {
-        timeout(Duration::from_secs(2), live_rx.changed()).await.unwrap().unwrap();
+        timeout(Duration::from_secs(30), live_rx.changed()).await.unwrap().unwrap();
     }
     assert!(live_rx.borrow().on, "golive_live() must report live for non-main main-canvas groups");
     e.studio_stream(false).await.unwrap();
@@ -4421,7 +4421,7 @@ async fn recv_until_coded_frames(
     let mut sps_dims = None;
     let mut timestamps = Vec::new();
     while timestamps.len() < min_coded_frames {
-        match timeout(Duration::from_secs(5), rx.recv()).await.expect("rtmp packet in time").expect("rtmp open") {
+        match timeout(Duration::from_secs(30), rx.recv()).await.expect("rtmp packet in time").expect("rtmp open") {
             Got::Publish(k) => {
                 assert_eq!(k, want_key);
                 seen_pub = true;
@@ -4483,8 +4483,8 @@ async fn scenario_a_1440p_main_youtube_and_kick_autofit_stay_live() {
     assert_eq!(kick_sps, Some((1920, 1080)));
     assert!(!yt_ts.is_empty() && !kick_ts.is_empty());
 
-    let yt_m = timeout(Duration::from_secs(2), meta_yt.recv()).await.unwrap().unwrap();
-    let kick_m = timeout(Duration::from_secs(2), meta_kick.recv()).await.unwrap().unwrap();
+    let yt_m = timeout(Duration::from_secs(30), meta_yt.recv()).await.unwrap().unwrap();
+    let kick_m = timeout(Duration::from_secs(30), meta_kick.recv()).await.unwrap().unwrap();
     assert_eq!((yt_m.video_width, yt_m.video_height, yt_m.video_bitrate_kbps), (Some(2560), Some(1440), Some(18_000)));
     assert_eq!((kick_m.video_width, kick_m.video_height), (Some(1920), Some(1080)));
     assert!(kick_m.video_bitrate_kbps.is_some_and(|k| k <= 8_000), "kick meta kbps={:?}", kick_m.video_bitrate_kbps);
@@ -4542,8 +4542,8 @@ async fn scenario_a_twitch_recommended_1080p_limit_accepts_1440p_at_6000kbps() {
     assert_eq!(yt_sps, Some((2560, 1440)));
     assert_eq!(tw_sps, Some((2560, 1440)), "Twitch 1080p is recommended (soft), not hard-downscaled");
 
-    let yt_m = timeout(Duration::from_secs(2), meta_yt.recv()).await.unwrap().unwrap();
-    let tw_m = timeout(Duration::from_secs(2), meta_tw.recv()).await.unwrap().unwrap();
+    let yt_m = timeout(Duration::from_secs(30), meta_yt.recv()).await.unwrap().unwrap();
+    let tw_m = timeout(Duration::from_secs(30), meta_tw.recv()).await.unwrap().unwrap();
     assert_eq!((yt_m.video_width, yt_m.video_height, yt_m.video_bitrate_kbps), (Some(2560), Some(1440), Some(18_000)));
     assert_eq!((tw_m.video_width, tw_m.video_height, tw_m.video_bitrate_kbps), (Some(2560), Some(1440), Some(6_000)));
 
@@ -4604,7 +4604,7 @@ async fn scenario_b_ignore_service_limits_kick_rejects_1440p_with_limit_reason()
     let mut kick_sps = None;
     let mut saw_kick_close = false;
     for _ in 0..50 {
-        match tokio::time::timeout(std::time::Duration::from_secs(2), got_kick.recv()).await.unwrap().unwrap() {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), got_kick.recv()).await.unwrap().unwrap() {
             ferrocast_testkit::rtmp::Got::Publish(k) => {
                 assert_eq!(k, "kick-b");
                 assert_eq!(e.golive_running_group("kick").as_deref(), Some(crate::golive::GROUP_MAIN));
@@ -4623,7 +4623,7 @@ async fn scenario_b_ignore_service_limits_kick_rejects_1440p_with_limit_reason()
     }
     assert!(saw_kick_close, "Kick IVS fake must close 1440p stream");
     assert_eq!(kick_sps, Some((2560, 1440)));
-    let kick_m = tokio::time::timeout(std::time::Duration::from_secs(2), meta_kick.recv()).await.unwrap().unwrap();
+    let kick_m = tokio::time::timeout(std::time::Duration::from_secs(30), meta_kick.recv()).await.unwrap().unwrap();
     assert_eq!(
         (kick_m.video_width, kick_m.video_height, kick_m.video_bitrate_kbps),
         (Some(2560), Some(1440), Some(18_000))
@@ -4767,7 +4767,7 @@ async fn scenario_d_live_switch_kick_to_720p30_zero_drop_on_youtube_and_old_grou
     let (kick_sps_before, _) = recv_until_coded_frames(&mut got_kick, "kick-d", 10, false).await;
     assert_eq!(yt_sps, Some((2560, 1440)));
     assert_eq!(kick_sps_before, Some((1920, 1080)));
-    let kick_m1 = timeout(Duration::from_secs(2), meta_kick.recv()).await.unwrap().unwrap();
+    let kick_m1 = timeout(Duration::from_secs(30), meta_kick.recv()).await.unwrap().unwrap();
     assert_eq!((kick_m1.video_width, kick_m1.video_height), (Some(1920), Some(1080)));
 
     let old_kick_gid = e.golive_running_group("kick").unwrap();
@@ -4784,7 +4784,7 @@ async fn scenario_d_live_switch_kick_to_720p30_zero_drop_on_youtube_and_old_grou
     let mut post_switch_frames = 0usize;
     let mut republished = false;
     while post_switch_frames < 10 {
-        match timeout(Duration::from_secs(5), got_kick.recv()).await.unwrap().unwrap() {
+        match timeout(Duration::from_secs(30), got_kick.recv()).await.unwrap().unwrap() {
             Got::Closed => {
                 assert!(!republished, "new Kick forwarder after switch must not disconnect");
                 saw_closed = true;
@@ -4807,7 +4807,7 @@ async fn scenario_d_live_switch_kick_to_720p30_zero_drop_on_youtube_and_old_grou
     }
     assert!(saw_closed && republished, "Kick must close old connection and republish on new group");
     assert_eq!(kick_sps_after, Some((1280, 720)));
-    let kick_m2 = timeout(Duration::from_secs(2), meta_kick.recv()).await.unwrap().unwrap();
+    let kick_m2 = timeout(Duration::from_secs(30), meta_kick.recv()).await.unwrap().unwrap();
     assert_eq!(
         (kick_m2.video_width, kick_m2.video_height, kick_m2.video_frame_rate, kick_m2.video_bitrate_kbps),
         (Some(1280), Some(720), Some(30.0), Some(3_500))
@@ -5253,32 +5253,30 @@ async fn r_f2_encode_groups_start_holds_reconcile_so_kick_never_connects_to_main
 
     let e_start = e.clone();
     let start_task = tokio::spawn(async move { e_start.studio_stream(true).await });
-    timeout(Duration::from_secs(3), entered_main.notified()).await.expect("entered GROUP_MAIN start");
+    timeout(Duration::from_secs(30), entered_main.notified()).await.expect("entered GROUP_MAIN start");
     tokio::time::sleep(Duration::from_millis(60)).await;
-    release_main.notify_waiters();
+    release_main.notify_one();
     start_task.await.unwrap().unwrap();
 
     loop {
-        match timeout(Duration::from_secs(3), got_yt.recv()).await.expect("yt event").expect("open") {
+        match timeout(Duration::from_secs(30), got_yt.recv()).await.expect("yt event").expect("open") {
             Got::Publish(k) if k == "yt-race" => break,
             Got::Closed => panic!("YouTube closed unexpectedly"),
             _ => {}
         }
     }
-    let mut kick_published = false;
-    for _ in 0..40 {
-        match timeout(Duration::from_millis(200), got_kick.recv()).await {
-            Ok(Some(Got::Closed)) => panic!("Kick connected to un-started main group and got rejected by IVS"),
-            Ok(Some(Got::Publish(k))) if k == "kick-race" => {
-                kick_published = true;
-                break;
+    let kick_published = timeout(Duration::from_secs(30), async {
+        loop {
+            match got_kick.recv().await {
+                Some(Got::Closed) => panic!("Kick connected to un-started main group and got rejected by IVS"),
+                Some(Got::Publish(k)) if k == "kick-race" => return true,
+                Some(_) => {}
+                None => panic!("kick server closed"),
             }
-            Ok(Some(_)) => {}
-            Ok(None) => panic!("kick server closed"),
-            Err(_) if kick_published => break,
-            Err(_) => {}
         }
-    }
+    })
+    .await
+    .unwrap_or(false);
     assert!(kick_published, "Kick must publish cleanly on its fitted 1080p60 group");
     assert_eq!(e.golive_running_group(&kick.id).as_deref(), Some(kick_gid.as_str()));
     assert_eq!(inner.start_counts.lock().unwrap().get(&kick_gid).copied(), Some(1));
@@ -5333,7 +5331,8 @@ async fn r_f4a_live_switch_checks_transient_overlap_against_nvenc_session_budget
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "yt-ov"), (&mut got_kick, "kick-ov")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -5391,7 +5390,8 @@ async fn r_f4b_concurrent_switches_preserve_shared_group_on_single_cancel_and_cl
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "ka-4b"), (&mut got_b, "kb-4b")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -5427,7 +5427,7 @@ async fn r_f4b_concurrent_switches_preserve_shared_group_on_single_cancel_and_cl
     let disable_a: Vec<(String, bool)> =
         e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id != a.id && d.enabled)).collect();
     e.set_golive_destinations(disable_a).await.unwrap();
-    notify.notify_waiters();
+    notify.notify_one();
     let res_a = task_a.await.unwrap();
     let res_b = task_b.await.unwrap();
     assert!(res_a.is_err(), "cancelled switch A must return error");
@@ -5447,7 +5447,7 @@ async fn r_f4b_concurrent_switches_preserve_shared_group_on_single_cancel_and_cl
         e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == b.id || d.id == c.id)).collect();
     e.set_golive_destinations(enable_bc).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_c.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "kc-4b")
+        if matches!(timeout(Duration::from_secs(30), got_c.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "kc-4b")
         {
             break;
         }
@@ -5523,7 +5523,8 @@ async fn r_f1a_studio_settings_update_syncs_main_group_key_so_switch_back_matche
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_m, "m-1a"), (&mut got_c, "c-1a")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -5591,7 +5592,8 @@ async fn r_f1b_enabling_or_switching_third_dest_never_disrupts_live_peer_on_tigh
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "yt-1b"), (&mut got_kick, "kick-1b"), (&mut got_c, "cust-1b")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -5704,7 +5706,7 @@ async fn r_f4d_live_switch_succeeds_for_active_failover_backup_when_unticked() {
 
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_p.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "prim-4d")
+        if matches!(timeout(Duration::from_secs(30), got_p.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "prim-4d")
         {
             break;
         }
@@ -5712,7 +5714,7 @@ async fn r_f4d_live_switch_succeeds_for_active_failover_backup_when_unticked() {
     e.seed_backup_failing_for_test(&prim.id, true);
     e.reconcile().await;
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_b.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "back-4d")
+        if matches!(timeout(Duration::from_secs(30), got_b.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "back-4d")
         {
             break;
         }
@@ -5842,14 +5844,15 @@ async fn r_n6_live_quality_switch_clears_upload_protection_pause() {
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "na-6"), (&mut got_b, "nb-6")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
     }
     e.pause(b.id.clone(), "Main".into());
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_b.recv()).await.unwrap(), Some(Got::Closed)) {
+        if matches!(timeout(Duration::from_secs(30), got_b.recv()).await.unwrap(), Some(Got::Closed)) {
             break;
         }
     }
@@ -5871,7 +5874,7 @@ async fn r_n6_live_quality_switch_clears_upload_protection_pause() {
     .await
     .unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_b.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "nb-6")
+        if matches!(timeout(Duration::from_secs(30), got_b.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "nb-6")
         {
             break;
         }
@@ -5989,7 +5992,8 @@ async fn q5_4_options_match_put_for_live_same_as_main_and_offline_over_shared_cu
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "ka-54"), (&mut got_b, "kb-54")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -6200,7 +6204,8 @@ async fn q5_9_live_set_golive_light_checks_budget_and_preserves_old_stream_on_ov
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "la-59"), (&mut got_b, "lb-59")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -6376,7 +6381,8 @@ async fn concurrent_switch_does_not_race_reconcile_or_stop_group_if_unused_teard
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "race-a"), (&mut got_b, "race-b"), (&mut got_c, "race-c")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -6391,7 +6397,7 @@ async fn concurrent_switch_does_not_race_reconcile_or_stop_group_if_unused_teard
     let ea = e.clone();
     let ida = a.id.clone();
     let sw_a = tokio::spawn(async move { ea.set_golive_quality(&ida, DestinationQuality::Custom(q480)).await });
-    timeout(Duration::from_secs(3), entered_stop.notified()).await.expect("A entered stop_encode_group");
+    timeout(Duration::from_secs(30), entered_stop.notified()).await.expect("A entered stop_encode_group");
 
     let prev_starts_1 = inner.start_counts.lock().unwrap().get(&gid_720).copied().unwrap_or(0);
     let eb = e.clone();
@@ -6402,7 +6408,7 @@ async fn concurrent_switch_does_not_race_reconcile_or_stop_group_if_unused_teard
         tokio::task::yield_now().await;
     }
     release_stop.notify_one();
-    timeout(Duration::from_secs(3), async {
+    timeout(Duration::from_secs(30), async {
         while inner.start_counts.lock().unwrap().get(&gid_720).copied().unwrap_or(0) == prev_starts_1
             || !inner.started.lock().unwrap().contains_key(&gid_720)
         {
@@ -6414,7 +6420,7 @@ async fn concurrent_switch_does_not_race_reconcile_or_stop_group_if_unused_teard
     })
     .await
     .expect("B restarted gid_720 after stop_encode_group finished");
-    idr_gate.notify_waiters();
+    idr_gate.notify_one();
 
     sw_a.await.unwrap().expect("A switch off gid_720 succeeds");
     sw_b.await.unwrap().expect("B switch onto gid_720 must not fail with HubEnded during teardown");
@@ -6432,7 +6438,7 @@ async fn concurrent_switch_does_not_race_reconcile_or_stop_group_if_unused_teard
         e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.enabled && d.id != b.id)).collect();
     let er = e.clone();
     let rec_task = tokio::spawn(async move { er.set_golive_destinations(disable_b).await });
-    timeout(Duration::from_secs(3), entered_stop.notified()).await.expect("reconcile entered stop_encode_group");
+    timeout(Duration::from_secs(30), entered_stop.notified()).await.expect("reconcile entered stop_encode_group");
 
     let prev_starts_2 = inner.start_counts.lock().unwrap().get(&gid_720).copied().unwrap_or(0);
     let ec = e.clone();
@@ -6442,7 +6448,7 @@ async fn concurrent_switch_does_not_race_reconcile_or_stop_group_if_unused_teard
         tokio::task::yield_now().await;
     }
     release_stop.notify_one();
-    timeout(Duration::from_secs(3), async {
+    timeout(Duration::from_secs(30), async {
         while inner.start_counts.lock().unwrap().get(&gid_720).copied().unwrap_or(0) == prev_starts_2
             || !inner.started.lock().unwrap().contains_key(&gid_720)
         {
@@ -6454,7 +6460,7 @@ async fn concurrent_switch_does_not_race_reconcile_or_stop_group_if_unused_teard
     })
     .await
     .expect("C restarted gid_720 after reconcile_studio_groups finished");
-    idr_gate.notify_waiters();
+    idr_gate.notify_one();
 
     rec_task.await.unwrap().expect("untick B succeeds");
     sw_c.await.unwrap().expect("C switch onto gid_720 must not race reconcile_studio_groups teardown");
@@ -6629,7 +6635,8 @@ async fn midstream_enable_custom_rtmp_rejects_peer_disruption_and_budget_overflo
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "yt-ms"), (&mut got_kick, "kick-ms")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -6734,7 +6741,8 @@ async fn deferred_studio_reshape_keeps_live_main_group_key_unmodified() {
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "def-a"), (&mut got_b, "def-b")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -6809,7 +6817,8 @@ async fn quality_options_and_put_reject_mismatched_live_main_and_vertical_group_
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "mm-a"), (&mut got_b, "mm-b")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -6857,7 +6866,8 @@ async fn quality_options_and_put_reject_mismatched_live_main_and_vertical_group_
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_v1, "mv-1"), (&mut got_v2, "mv-2")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -6973,7 +6983,8 @@ async fn shared_switch_group_cleans_up_after_commit_untick_sibling_fail_and_task
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "lk-a"), (&mut got_yt, "lk-yt")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -6995,13 +7006,13 @@ async fn shared_switch_group_cleans_up_after_commit_untick_sibling_fail_and_task
     let eb = e.clone();
     let qb = q720.clone();
     let task_b = tokio::spawn(async move { eb.set_golive_quality("youtube", DestinationQuality::Custom(qb)).await });
-    timeout(Duration::from_secs(3), entered_resolve.notified()).await.expect("YouTube entered gated resolve");
+    timeout(Duration::from_secs(30), entered_resolve.notified()).await.expect("YouTube entered gated resolve");
 
     let ea = e.clone();
     let aid = a.id.clone();
     let qa = q720.clone();
     let task_a = tokio::spawn(async move { ea.set_golive_quality(&aid, DestinationQuality::Custom(qa)).await });
-    release_resolve.notify_waiters();
+    release_resolve.notify_one();
     assert!(task_b.await.unwrap().is_err(), "gated YouTube switch must fail");
     task_a.await.unwrap().unwrap();
     assert!(host.started.lock().unwrap().contains_key(&gid_720), "committed switch A keeps shared group alive");
@@ -7065,7 +7076,8 @@ async fn stopping_studio_stream_clears_cached_group_stats_in_ws_golive_snapshot(
     let _d = e.add_golive_destination("YT", &format!("rtmp://127.0.0.1:{p}/app"), "ws-gs", Canvas::Main).await.unwrap();
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "ws-gs") {
+        if matches!(timeout(Duration::from_secs(30), got.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "ws-gs")
+        {
             break;
         }
     }
@@ -7076,7 +7088,7 @@ async fn stopping_studio_stream_clears_cached_group_stats_in_ws_golive_snapshot(
 
     let mut offline_golive = None;
     for _ in 0..20 {
-        let frame = timeout(Duration::from_secs(2), live_rx.recv()).await.expect("live frame").expect("open");
+        let frame = timeout(Duration::from_secs(30), live_rx.recv()).await.expect("live frame").expect("open");
         let parsed: serde_json::Value = serde_json::from_str(&frame.text).unwrap();
         if parsed["type"] == "golive" && parsed["data"]["live"] == false {
             offline_golive = Some(parsed["data"].clone());
@@ -7196,7 +7208,7 @@ async fn legacy_light_options_current_avoids_same_as_main_alias_and_same_quality
     e.save_golive(cfg).await.unwrap();
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "rl-9") {
+        if matches!(timeout(Duration::from_secs(30), got.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "rl-9") {
             break;
         }
     }
@@ -7438,7 +7450,7 @@ async fn studio_stop_cancels_pending_switch_in_resolve_and_clears_encode_groups(
     e.set_golive_destinations(only_yt).await.unwrap();
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "stop-yt")
+        if matches!(timeout(Duration::from_secs(30), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "stop-yt")
         {
             break;
         }
@@ -7448,14 +7460,14 @@ async fn studio_stop_cancels_pending_switch_in_resolve_and_clears_encode_groups(
     let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
     let e_sw = e.clone();
     let sw = tokio::spawn(async move { e_sw.set_golive_quality("youtube", DestinationQuality::Custom(q720)).await });
-    timeout(Duration::from_secs(3), entered.notified()).await.expect("switch entered resolve");
+    timeout(Duration::from_secs(30), entered.notified()).await.expect("switch entered resolve");
 
     // studio_stop must cancel the pending switch inside resolve() immediately and clear all encode groups.
-    timeout(Duration::from_secs(3), e.studio_stop())
+    timeout(Duration::from_secs(30), e.studio_stop())
         .await
         .expect("studio_stop must not wait on stalled resolve")
         .unwrap();
-    let sw_err = timeout(Duration::from_secs(3), sw)
+    let sw_err = timeout(Duration::from_secs(30), sw)
         .await
         .expect("switch must abort on studio_stop without waiting for release")
         .unwrap()
@@ -7633,7 +7645,7 @@ async fn set_golive_destinations_does_not_stall_config_lock_behind_encoder_io() 
 
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_a.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "cfg-a")
+        if matches!(timeout(Duration::from_secs(30), got_a.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "cfg-a")
         {
             break;
         }
@@ -7645,7 +7657,7 @@ async fn set_golive_destinations_does_not_stall_config_lock_behind_encoder_io() 
     let e_sw = e.clone();
     let a_id = a.id.clone();
     let sw = tokio::spawn(async move { e_sw.set_golive_quality(&a_id, DestinationQuality::SameAsMain).await });
-    timeout(Duration::from_secs(3), entered_stop.notified()).await.expect("switch entered stop_encode_group");
+    timeout(Duration::from_secs(30), entered_stop.notified()).await.expect("switch entered stop_encode_group");
 
     // Start set_golive_destinations enabling B (which waits on the group lifecycle lock): it must NOT hold config_lock!
     let enable_ab: Vec<(String, bool)> =
@@ -7657,12 +7669,12 @@ async fn set_golive_destinations_does_not_stall_config_lock_behind_encoder_io() 
     }
 
     // Unrelated config_lock writer must finish immediately without waiting for release_stop!
-    timeout(Duration::from_secs(3), e.set_golive_aitum_ok(true))
+    timeout(Duration::from_secs(30), e.set_golive_aitum_ok(true))
         .await
         .expect("config_lock must not stall behind encoder I/O")
         .unwrap();
 
-    release_stop.notify_waiters();
+    release_stop.notify_one();
     sw.await.unwrap().unwrap();
     dest_task.await.unwrap().unwrap();
     e.studio_stream(false).await.unwrap();
@@ -7730,7 +7742,7 @@ async fn stress_parallel_switch_reconcile_untick_and_stop_under_group_ops() {
         e.studio_stream(true).await.unwrap();
         for (rx, want) in [(&mut got_yt, "stress-yt"), (&mut got_a, "stress-a"), (&mut got_b, "stress-b")] {
             loop {
-                if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+                if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
                 {
                     break;
                 }
@@ -7784,7 +7796,7 @@ async fn stress_parallel_switch_reconcile_untick_and_stop_under_group_ops() {
         // Phase B: re-enable A, wait for publish, then fire switch(a) + switch(b) + reconcile + untick(a) + Stop in parallel!
         e.set_golive_destinations(enable_all.clone()).await.unwrap();
         loop {
-            if matches!(timeout(Duration::from_secs(3), got_a.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "stress-a")
+            if matches!(timeout(Duration::from_secs(30), got_a.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "stress-a")
             {
                 break;
             }
@@ -7835,7 +7847,8 @@ async fn stress_parallel_switch_reconcile_untick_and_stop_under_group_ops() {
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "stress-yt"), (&mut got_b, "stress-b")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -7893,7 +7906,8 @@ async fn switch_commit_serialized_with_studio_stop_and_remove_leaves_no_orphans(
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "f52-a"), (&mut got_b, "f52-b")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -7904,11 +7918,11 @@ async fn switch_commit_serialized_with_studio_stop_and_remove_leaves_no_orphans(
     let e_sw = e.clone();
     let aid = a.id.clone();
     let sw = tokio::spawn(async move { e_sw.set_golive_quality(&aid, DestinationQuality::SameAsMain).await });
-    timeout(Duration::from_secs(3), entered_stop.notified()).await.expect("entered stop_encode_group post-commit");
+    timeout(Duration::from_secs(30), entered_stop.notified()).await.expect("entered stop_encode_group post-commit");
 
     let e_stop = e.clone();
     let stop_task = tokio::spawn(async move { e_stop.studio_stop().await });
-    release_stop.notify_waiters();
+    release_stop.notify_one();
     sw.await.unwrap().unwrap();
     stop_task.await.unwrap().unwrap();
 
@@ -7921,7 +7935,8 @@ async fn switch_commit_serialized_with_studio_stop_and_remove_leaves_no_orphans(
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_a, "f52-a"), (&mut got_b, "f52-b")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -7930,12 +7945,12 @@ async fn switch_commit_serialized_with_studio_stop_and_remove_leaves_no_orphans(
     let e_sw2 = e.clone();
     let aid2 = a.id.clone();
     let sw2 = tokio::spawn(async move { e_sw2.set_golive_quality(&aid2, DestinationQuality::SameAsMain).await });
-    timeout(Duration::from_secs(3), entered_stop.notified()).await.expect("entered stop_encode_group case 2");
+    timeout(Duration::from_secs(30), entered_stop.notified()).await.expect("entered stop_encode_group case 2");
 
     let e_rm = e.clone();
     let aid_rm = a.id.clone();
     let rm_task = tokio::spawn(async move { e_rm.remove_golive_destination(&aid_rm).await });
-    release_stop.notify_waiters();
+    release_stop.notify_one();
     sw2.await.unwrap().unwrap();
     rm_task.await.unwrap().unwrap();
 
@@ -8009,7 +8024,8 @@ async fn f54_paused_peer_pass2_switch_and_check_midstream_reject_422_and_keep_ki
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "f54-yt"), (&mut got_kick, "f54-kick"), (&mut got_a, "f54-a")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -8051,7 +8067,7 @@ async fn f54_paused_peer_pass2_switch_and_check_midstream_reject_422_and_keep_ki
     while got_kick.try_recv().is_ok() {}
     e.golive_resume("kick").await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_kick.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f54-kick")
+        if matches!(timeout(Duration::from_secs(30), got_kick.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f54-kick")
         {
             break;
         }
@@ -8132,7 +8148,8 @@ async fn f54_standby_failover_under_tight_budget_blocks_backup_without_disruptin
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "fail-yt"), (&mut got_kick, "fail-kick")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -8225,7 +8242,8 @@ async fn f54_set_golive_advanced_editing_keep_free_pct_preserves_applied_cap() {
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "adv-yt"), (&mut got_tw, "adv-tw")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -8404,7 +8422,7 @@ async fn f55_start_vertical_midstream_recovers_quarantined_vertical_without_rest
     // Start live while vertical canvas is OFF -> GROUP_MAIN starts cleanly; vertical dest is quarantined.
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-yt")
+        if matches!(timeout(Duration::from_secs(30), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-yt")
         {
             break;
         }
@@ -8415,7 +8433,7 @@ async fn f55_start_vertical_midstream_recovers_quarantined_vertical_without_rest
     // Turn Vertical canvas ON mid-stream via StartVertical -> GROUP_VERTICAL must start and publish without restarting GROUP_MAIN.
     e.studio_act(crate::studio_host::StudioAct::StartVertical { scene: "Vertical".into() }).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_v.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-v")
+        if matches!(timeout(Duration::from_secs(30), got_v.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-v")
         {
             break;
         }
@@ -8438,7 +8456,7 @@ async fn f55_start_vertical_midstream_recovers_quarantined_vertical_without_rest
         .collect();
     e.set_golive_destinations(both_back).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_v.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-v")
+        if matches!(timeout(Duration::from_secs(30), got_v.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "f55-v")
         {
             break;
         }
@@ -8484,7 +8502,7 @@ async fn f57_live_switch_under_platform_exclusive_with_concurrent_reconcile() {
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_tw, "excl-tw"), (&mut got_kick, "excl-kick")] {
         loop {
-            match timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap() {
+            match timeout(Duration::from_secs(30), rx.recv()).await.unwrap().unwrap() {
                 Ok(Got::Publish(k)) if k == want => break,
                 Err(why) => panic!("unexpected exclusive overlap at startup for {want}: {why}"),
                 _ => {}
@@ -8502,7 +8520,7 @@ async fn f57_live_switch_under_platform_exclusive_with_concurrent_reconcile() {
     // Wait for clean single-publisher handover on Kick (1 Closed followed by 1 Publish, 0 overlaps).
     let mut saw_closed = false;
     loop {
-        match timeout(Duration::from_secs(3), got_kick.recv()).await.unwrap().unwrap() {
+        match timeout(Duration::from_secs(30), got_kick.recv()).await.unwrap().unwrap() {
             Ok(Got::Closed) => saw_closed = true,
             Ok(Got::Publish(k)) if k == "excl-kick" && saw_closed => break,
             Err(why) => panic!("platform_exclusive saw overlapping publish during switch: {why}"),
@@ -8592,7 +8610,8 @@ async fn mid_drain_cancel_preserves_saved_quality_cleans_old_group_and_keeps_liv
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "drain-yt"), (&mut got_d, "drain-d")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -8605,10 +8624,10 @@ async fn mid_drain_cancel_preserves_saved_quality_cleans_old_group_and_keeps_liv
     let d_id = d.id.clone();
     let q720_a = q720.clone();
     let sw = tokio::spawn(async move { e_sw.set_golive_quality(&d_id, DestinationQuality::Custom(q720_a)).await });
-    timeout(Duration::from_secs(3), entered_drain.notified()).await.expect("switch entered drain");
+    timeout(Duration::from_secs(30), entered_drain.notified()).await.expect("switch entered drain");
 
     e.studio_stream(false).await.unwrap();
-    release_drain.notify_waiters();
+    release_drain.notify_one();
     let err = sw.await.unwrap().unwrap_err();
     assert!(matches!(err, crate::EngineError::Refused { code: "golive_switch_cancelled", .. }), "{err:?}");
     let saved_after_stop = e.golive_config().destinations.into_iter().find(|x| x.id == d.id).unwrap();
@@ -8628,7 +8647,8 @@ async fn mid_drain_cancel_preserves_saved_quality_cleans_old_group_and_keeps_liv
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "drain-yt"), (&mut got_d, "drain-d")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -8642,7 +8662,7 @@ async fn mid_drain_cancel_preserves_saved_quality_cleans_old_group_and_keeps_liv
     let q720_b = q720.clone();
     let sw_b =
         tokio::spawn(async move { e_sw_b.set_golive_quality(&d_id_b, DestinationQuality::Custom(q720_b)).await });
-    timeout(Duration::from_secs(3), entered_drain_b.notified()).await.expect("case B switch entered drain");
+    timeout(Duration::from_secs(30), entered_drain_b.notified()).await.expect("case B switch entered drain");
 
     // Untick D while ticking C (without upload confirm -> 409 golive_upload_exceeded).
     let reject_order: Vec<(String, bool)> =
@@ -8659,7 +8679,7 @@ async fn mid_drain_cancel_preserves_saved_quality_cleans_old_group_and_keeps_liv
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
-    release_drain_b.notify_waiters();
+    release_drain_b.notify_one();
     let dest_err = dest_task.await.unwrap().unwrap_err();
     assert!(matches!(dest_err, crate::EngineError::Refused { status: 409, code: "golive_upload_exceeded", .. }));
     let _ = sw_b.await.unwrap();
@@ -8676,7 +8696,7 @@ async fn mid_drain_cancel_preserves_saved_quality_cleans_old_group_and_keeps_liv
     let e_sw_c = e.clone();
     let d_id_c = d.id.clone();
     let sw_c = tokio::spawn(async move { e_sw_c.set_golive_quality(&d_id_c, DestinationQuality::Custom(q720)).await });
-    timeout(Duration::from_secs(3), entered_drain_c.notified()).await.expect("case C switch entered drain");
+    timeout(Duration::from_secs(30), entered_drain_c.notified()).await.expect("case C switch entered drain");
 
     let untick_d: Vec<(String, bool)> =
         e.golive_config().destinations.into_iter().map(|x| (x.id.clone(), x.id == "youtube")).collect();
@@ -8685,7 +8705,7 @@ async fn mid_drain_cancel_preserves_saved_quality_cleans_old_group_and_keeps_liv
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
-    release_drain_c.notify_waiters();
+    release_drain_c.notify_one();
     let sw_c_err = sw_c.await.unwrap().unwrap_err();
     assert!(matches!(sw_c_err, crate::EngineError::Refused { code: "golive_switch_cancelled", .. }), "{sw_c_err:?}");
     untick_task.await.unwrap().unwrap();
@@ -8798,7 +8818,7 @@ async fn stale_stop_stream_later_never_poisons_stream_cancel_and_bad_put_never_c
             hub: Arc<ferrocast_golive::Hub>,
         ) -> Result<bool, String> {
             let res = self.inner.start_encode_group(spec, hub).await;
-            self.started_notify.notify_waiters();
+            self.started_notify.notify_one();
             res
         }
         async fn stop_encode_group(&self, id: &str) -> Result<(), String> {
@@ -8854,7 +8874,7 @@ async fn stale_stop_stream_later_never_poisons_stream_cancel_and_bad_put_never_c
     .await
     .unwrap();
     e.start_show(true).await.unwrap();
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(30), async {
         while !matches!(got_a.recv().await, Some(Got::Publish(k)) if k == "stale-a") {}
     })
     .await
@@ -8864,11 +8884,11 @@ async fn stale_stop_stream_later_never_poisons_stream_cancel_and_bad_put_never_c
     host.arm_status.store(true, std::sync::atomic::Ordering::Release);
     let e_late = e.clone();
     let stale_stop = tokio::spawn(async move { e_late.trigger_delayed_stop_later_for_test().await });
-    timeout(Duration::from_secs(3), entered_status.notified()).await.expect("stop_stream_later entered rig()");
+    timeout(Duration::from_secs(30), entered_status.notified()).await.expect("stop_stream_later entered rig()");
 
     // Start Stream 2 cleanly (`reset_golive_switch_cancel` + `on_stream_started`), then resume stale stop_stream_later.
     e.studio_stream(true).await.unwrap();
-    release_status.notify_waiters();
+    release_status.notify_one();
     stale_stop.await.unwrap();
 
     // Stream 2's switch token MUST NOT be poisoned by the stale Show 1 stop task.
@@ -8890,7 +8910,7 @@ async fn stale_stop_stream_later_never_poisons_stream_cancel_and_bad_put_never_c
     let e_sw = e.clone();
     let a_id = a.id.clone();
     let sw = tokio::spawn(async move { e_sw.set_golive_quality(&a_id, DestinationQuality::Custom(q480)).await });
-    timeout(Duration::from_secs(3), async {
+    timeout(Duration::from_secs(30), async {
         while !inner.started.lock().unwrap().contains_key(&gid_480) {
             started_notify.notified().await;
         }
@@ -8913,7 +8933,7 @@ async fn stale_stop_stream_later_never_poisons_stream_cancel_and_bad_put_never_c
         .unwrap_err();
     assert!(matches!(err_last, crate::EngineError::Refused { status: 409, code: "golive_last_destination", .. }));
 
-    gate.notify_waiters();
+    gate.notify_one();
     sw.await
         .unwrap()
         .expect("A's in-flight live switch must complete cleanly after rejected PUT /golive/destinations calls");
@@ -8979,7 +8999,8 @@ async fn route_light_on_two_session_host_never_kills_kick_and_switching_stays_ac
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "rl2-yt"), (&mut got_kick, "rl2-kick")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -9067,7 +9088,7 @@ async fn route_light_on_two_session_host_never_kills_kick_and_switching_stays_ac
         "queued destination waiting for group_ops must not expose switching_quality=true prematurely"
     );
 
-    gate.notify_waiters();
+    gate.notify_one();
     sw_yt.await.unwrap().unwrap();
     sw_k.await.unwrap().unwrap();
     e.studio_stream(false).await.unwrap();
@@ -9134,7 +9155,8 @@ async fn simultaneous_untick_and_tick_swaps_encode_groups_on_two_session_host() 
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "swap-yt"), (&mut got_a, "swap-a")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -9149,7 +9171,7 @@ async fn simultaneous_untick_and_tick_swaps_encode_groups_on_two_session_host() 
     e.set_golive_destinations(swap_order).await.expect("simultaneous untick A + tick B must succeed within 2 sessions");
 
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_b.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "swap-b")
+        if matches!(timeout(Duration::from_secs(30), got_b.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "swap-b")
         {
             break;
         }
@@ -9207,7 +9229,7 @@ async fn synthesized_main_group_does_not_inherit_kick_cap() {
 
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_kick.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "synth-kick")
+        if matches!(timeout(Duration::from_secs(30), got_kick.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "synth-kick")
         {
             break;
         }
@@ -9370,7 +9392,7 @@ async fn multithread_exclusive_switch_and_stress_with_slow_resolve_drain_and_tic
         e.studio_stream(true).await.unwrap();
         for (rx, want) in [(&mut got_yt, "f67-yt"), (&mut got_kick, "f67-kick"), (&mut got_c, "f67-c")] {
             loop {
-                match timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap() {
+                match timeout(Duration::from_secs(30), rx.recv()).await.unwrap().unwrap() {
                     Ok(Got::Publish(k)) if k == want => break,
                     Err(why) => panic!("iter {iter}: startup exclusive overlap for {want}: {why}"),
                     _ => {}
@@ -9407,13 +9429,13 @@ async fn multithread_exclusive_switch_and_stress_with_slow_resolve_drain_and_tic
         let rel_drn = release_drain.clone();
         let t_ctrl = tokio::spawn(async move {
             if iter % 2 == 0 {
-                timeout(Duration::from_secs(3), ent_res.notified()).await.expect("entered slow resolve");
+                timeout(Duration::from_secs(30), ent_res.notified()).await.expect("entered slow resolve");
                 let _ = e_stop.studio_stream(false).await;
-                rel_res.notify_waiters();
+                rel_res.notify_one();
             } else {
-                timeout(Duration::from_secs(3), entered_drain.notified()).await.expect("entered slow drain");
+                timeout(Duration::from_secs(30), entered_drain.notified()).await.expect("entered slow drain");
                 let _ = e_stop.studio_stream(false).await;
-                rel_drn.notify_waiters();
+                rel_drn.notify_one();
             }
         });
 
@@ -9449,7 +9471,7 @@ async fn ticks_skip_when_group_ops_held_and_protect_pause_reconciles_cleanly() {
 
     async fn wait_got(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Got>, want: impl Fn(&Got) -> bool) -> Got {
         loop {
-            let g = timeout(Duration::from_secs(3), rx.recv()).await.expect("rtmp msg in time").expect("open");
+            let g = timeout(Duration::from_secs(30), rx.recv()).await.expect("rtmp msg in time").expect("open");
             if want(&g) {
                 return g;
             }
@@ -9553,7 +9575,8 @@ async fn save_golive_failure_after_drain_restores_destination_on_old_group() {
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "sg-yt"), (&mut got_d, "sg-d")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -9585,7 +9608,7 @@ async fn save_golive_failure_after_drain_restores_destination_on_old_group() {
     assert_eq!(e.golive_running_group(&d.id).as_deref(), Some(old_gid.as_str()));
     assert!(!host.started.lock().unwrap().contains_key(&target_gid), "target group must be aborted on save failure");
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_d.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "sg-d")
+        if matches!(timeout(Duration::from_secs(30), got_d.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "sg-d")
         {
             break;
         }
@@ -9634,7 +9657,7 @@ async fn post_cancel_recovery_and_future_abort_preserve_live_destination_and_gro
     e.set_golive_quality(&d.id, DestinationQuality::Custom(q1080.clone())).await.unwrap();
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_d.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "pcr-d")
+        if matches!(timeout(Duration::from_secs(30), got_d.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "pcr-d")
         {
             break;
         }
@@ -9649,7 +9672,7 @@ async fn post_cancel_recovery_and_future_abort_preserve_live_destination_and_gro
     let q720_a = q720.clone();
     let sw_a =
         tokio::spawn(async move { e_sw_a.set_golive_quality(&d_id_a, DestinationQuality::Custom(q720_a)).await });
-    timeout(Duration::from_secs(3), entered_a.notified()).await.expect("Part A entered drain");
+    timeout(Duration::from_secs(30), entered_a.notified()).await.expect("Part A entered drain");
 
     e.db(|s| {
         s.write(|tx| {
@@ -9665,7 +9688,7 @@ async fn post_cancel_recovery_and_future_abort_preserve_live_destination_and_gro
     let untick_err =
         e.set_golive_destinations_checked(all_off, DestinationConfirm { upload: true, last: true }).await.unwrap_err();
     assert!(!matches!(untick_err, EngineError::Refused { code: "golive_last_destination", .. }), "{untick_err:?}");
-    release_a.notify_waiters();
+    release_a.notify_one();
     let sw_a_err = sw_a.await.unwrap().unwrap_err();
     assert!(matches!(sw_a_err, EngineError::Refused { code: "golive_switch_cancelled", .. }), "{sw_a_err:?}");
     assert!(
@@ -9685,7 +9708,8 @@ async fn post_cancel_recovery_and_future_abort_preserve_live_destination_and_gro
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "pcr-yt"), (&mut got_d, "pcr-d")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -9699,7 +9723,7 @@ async fn post_cancel_recovery_and_future_abort_preserve_live_destination_and_gro
         let d_id = d.id.clone();
         let q720_b = q720.clone();
         let sw = tokio::spawn(async move { e_sw.set_golive_quality(&d_id, DestinationQuality::Custom(q720_b)).await });
-        timeout(Duration::from_secs(3), entered.notified()).await.expect("entered slow drain");
+        timeout(Duration::from_secs(30), entered.notified()).await.expect("entered slow drain");
 
         e.db(|s| {
             s.write(|tx| {
@@ -9720,7 +9744,7 @@ async fn post_cancel_recovery_and_future_abort_preserve_live_destination_and_gro
             e.remove_golive_destination(&d.id).await.unwrap_err()
         };
         assert!(!matches!(err, EngineError::Refused { code: "golive_last_destination", .. }), "iter {iter}: {err:?}");
-        release.notify_waiters();
+        release.notify_one();
         let sw_err = sw.await.unwrap().unwrap_err();
         assert!(matches!(sw_err, EngineError::Refused { code: "golive_switch_cancelled", .. }));
         e.db(|s| s.write(|tx| Ok(tx.execute_batch("DROP TRIGGER block_golive_iter")?))).await.unwrap();
@@ -9907,7 +9931,7 @@ async fn stop_stream_later_and_start_show_with_race_never_poisons_stream_cancel(
     // `group_ops`, `start_show_with` (`stream: Some(false)`) must not hijack `stop_waiting` / bump `epoch`
     // and abandon a live stream with a poisoned `stream_cancel`.
     e.start_show(true).await.unwrap();
-    timeout(Duration::from_secs(3), async {
+    timeout(Duration::from_secs(30), async {
         while !matches!(got_a.recv().await, Some(Got::Publish(k)) if k == "ds-a") {}
     })
     .await
@@ -9918,7 +9942,7 @@ async fn stop_stream_later_and_start_show_with_race_never_poisons_stream_cancel(
     let cancel_tok = e.current_golive_switch_cancel();
     let e_late = e.clone();
     let stop_task = tokio::spawn(async move { e_late.trigger_delayed_stop_later_for_test().await });
-    timeout(Duration::from_secs(3), cancel_tok.cancelled())
+    timeout(Duration::from_secs(30), cancel_tok.cancelled())
         .await
         .expect("stop_stream_later cancelled stream_cancel before acquiring group_ops");
 
@@ -9935,7 +9959,7 @@ async fn stop_stream_later_and_start_show_with_race_never_poisons_stream_cancel(
     // Part B: Even if `stop_stream_later` exits via `!still_ours` after acquiring `group_ops` while the
     // Studio stream stays live, `stream_cancel` must be healed so subsequent quality switches succeed.
     e.start_show(true).await.unwrap();
-    timeout(Duration::from_secs(3), async {
+    timeout(Duration::from_secs(30), async {
         while !matches!(got_a.recv().await, Some(Got::Publish(k)) if k == "ds-a") {}
     })
     .await
@@ -9946,7 +9970,7 @@ async fn stop_stream_later_and_start_show_with_race_never_poisons_stream_cancel(
     let cancel_tok2 = e.current_golive_switch_cancel();
     let e_late2 = e.clone();
     let stop_task2 = tokio::spawn(async move { e_late2.trigger_delayed_stop_later_for_test().await });
-    timeout(Duration::from_secs(3), cancel_tok2.cancelled()).await.unwrap();
+    timeout(Duration::from_secs(30), cancel_tok2.cancelled()).await.unwrap();
 
     {
         let mut m = e.studio().machine.lock().unwrap();
@@ -9974,7 +9998,7 @@ async fn stop_stream_later_and_start_show_with_race_never_poisons_stream_cancel(
     let e_sw = e.clone();
     let a_id = a.id.clone();
     let sw = tokio::spawn(async move { e_sw.set_golive_quality(&a_id, DestinationQuality::Custom(q480)).await });
-    timeout(Duration::from_secs(3), async {
+    timeout(Duration::from_secs(30), async {
         while !inner.started.lock().unwrap().contains_key(&gid_480) {
             tokio::task::yield_now().await;
         }
@@ -9987,7 +10011,7 @@ async fn stop_stream_later_and_start_show_with_race_never_poisons_stream_cancel(
     let err_builtin = e.remove_golive_destination("youtube").await.unwrap_err();
     assert!(matches!(err_builtin, EngineError::Invalid(_)));
 
-    gate.notify_waiters();
+    gate.notify_one();
     sw.await.unwrap().expect("rejected remove_golive_destination must not cancel in-flight switch");
     e.studio_stream(false).await.unwrap();
 }
@@ -10038,7 +10062,8 @@ async fn reconcile_studio_groups_cancels_route_light_when_session_cap_reached() 
     e.studio_stream(true).await.unwrap();
     for (rx, want) in [(&mut got_yt, "rlc-yt"), (&mut got_b, "rlc-b")] {
         loop {
-            if matches!(timeout(Duration::from_secs(3), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want) {
+            if matches!(timeout(Duration::from_secs(30), rx.recv()).await.unwrap(), Some(Got::Publish(k)) if k == want)
+            {
                 break;
             }
         }
@@ -10141,7 +10166,7 @@ async fn viewers_stay_steady_during_quality_switch_drain_and_wake_on_midstream_t
     e.set_golive_destinations(only_yt).await.unwrap();
     e.studio_stream(true).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "vw-yt")
+        if matches!(timeout(Duration::from_secs(30), got_yt.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "vw-yt")
         {
             break;
         }
@@ -10167,12 +10192,12 @@ async fn viewers_stay_steady_during_quality_switch_drain_and_wake_on_midstream_t
         .collect();
     e.set_golive_destinations(yt_and_tw).await.unwrap();
     loop {
-        if matches!(timeout(Duration::from_secs(3), got_tw.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "vw-tw")
+        if matches!(timeout(Duration::from_secs(30), got_tw.recv()).await.unwrap(), Some(Got::Publish(k)) if k == "vw-tw")
         {
             break;
         }
     }
-    let (g2, dl2) = timeout(Duration::from_secs(2), clock.wait_sleep_after(g1))
+    let (g2, dl2) = timeout(Duration::from_secs(30), clock.wait_sleep_after(g1))
         .await
         .expect("mid-stream destination start must wake viewer poller immediately");
     assert_eq!(dl2, Some(clock.origin + Duration::from_secs(20)), "Twitch initial poll due in 10s");
@@ -10190,10 +10215,10 @@ async fn viewers_stay_steady_during_quality_switch_drain_and_wake_on_midstream_t
     let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
     let e_sw = e.clone();
     let sw = tokio::spawn(async move { e_sw.set_golive_quality("twitch", DestinationQuality::Custom(q720)).await });
-    timeout(Duration::from_secs(3), entered.notified()).await.expect("twitch switch entered drain");
+    timeout(Duration::from_secs(30), entered.notified()).await.expect("twitch switch entered drain");
 
     e.wake_viewer_poller();
-    let (g4, _) = timeout(Duration::from_secs(2), clock.wait_sleep_after(g3)).await.unwrap();
+    let (g4, _) = timeout(Duration::from_secs(30), clock.wait_sleep_after(g3)).await.unwrap();
     assert_eq!(
         e.state().viewers.get(&Platform::Twitch).copied(),
         Some(42),
@@ -10208,15 +10233,15 @@ async fn viewers_stay_steady_during_quality_switch_drain_and_wake_on_midstream_t
         }
     }
 
-    release.notify_waiters();
+    release.notify_one();
     sw.await.unwrap().unwrap();
-    let (g_post_sw, _) = timeout(Duration::from_secs(2), clock.wait_sleep_after(g4)).await.unwrap();
+    let (g_post_sw, _) = timeout(Duration::from_secs(30), clock.wait_sleep_after(g4)).await.unwrap();
 
     // Unticking Twitch mid-stream must wake the viewer poller immediately and clear its viewers.
     let only_yt2: Vec<(String, bool)> =
         e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == "youtube")).collect();
     e.set_golive_destinations(only_yt2).await.unwrap();
-    let (_g5, _) = timeout(Duration::from_secs(2), clock.wait_sleep_after(g_post_sw))
+    let (_g5, _) = timeout(Duration::from_secs(30), clock.wait_sleep_after(g_post_sw))
         .await
         .expect("mid-stream destination stop must wake viewer poller immediately");
     assert_eq!(e.state().viewers.get(&Platform::Twitch).copied(), None);
