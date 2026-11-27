@@ -3240,8 +3240,8 @@ impl StudioHost for DesktopStudio {
                     match st.reshape(&encode, s.fps) {
                         Ok(()) => {
                             // What it runs with now: a recording "Same as stream" started
-                            // next compares with this (CodeRabbit: 1080p reshaped to 720p
-                            // was still taken as unscaled).
+                            // next compares with this (a 1080p stream reshaped to 720p was
+                            // still taken as unscaled).
                             if let Some(w) = h.stream_with.as_mut() {
                                 w.encode = encode;
                             }
