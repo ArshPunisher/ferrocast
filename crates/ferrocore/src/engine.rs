@@ -583,6 +583,8 @@ struct Shown {
     errors: Vec<(u64, String)>,
     /// Each output's recording and encoder.
     outputs: Vec<(u64, RecordState, String)>,
+    /// Approximate per-frame encode time (ms) for each active output.
+    output_encode_ms: Vec<(u64, f32)>,
     /// Each opened source's load (`Engine::source_load`).
     loads: Vec<SourceLoad>,
     /// Captures shown with no picture, not opening: name, whether it's the screen, and since
@@ -602,6 +604,7 @@ impl Shown {
             stats: st.stats,
             errors: st.errors.iter().map(|(id, e)| (*id, e.clone())).collect(),
             outputs: st.outputs.iter().map(|(id, pipe, ..)| (*id, record_state(pipe), pipe.encoder())).collect(),
+            output_encode_ms: st.encode_ms.iter().map(|(&id, &ms)| (id, ms)).collect(),
             loads: loads_of(st),
             quiet: quiet_of(st),
             waiting_cameras: waiting_cameras_of(st),
@@ -1391,6 +1394,8 @@ struct State {
     errors: HashMap<u64, String>,
     /// Outputs whose encoder failed and are being made again (see `heal_outputs`).
     heal: HashMap<u64, Heal>,
+    /// Smoothed per-frame encode duration in milliseconds per output (`deliver`).
+    encode_ms: HashMap<u64, f32>,
     /// Things captures want said (see `Engine::take_notices`).
     notices: crate::notices::Notices,
     /// The previews windows show, by id.
@@ -1833,6 +1838,7 @@ impl Engine {
             stats: Stats::default(),
             errors: HashMap::new(),
             heal: HashMap::new(),
+            encode_ms: HashMap::new(),
             notices: Default::default(),
             previews: HashMap::new(),
             in_flight: std::collections::VecDeque::new(),
@@ -3670,6 +3676,7 @@ impl Engine {
             let taken = st.outputs.iter().position(|(i, ..)| *i == id).map(|at| st.outputs.remove(at));
             st.errors.remove(&id);
             st.heal.remove(&id);
+            st.encode_ms.remove(&id);
             sync_heard(&mut st, &self.audio.cmd_sender());
             self.show(&st);
             let ticket = st.sleep_ticket();
@@ -3770,6 +3777,14 @@ impl Engine {
             build(&st, self.config.width, self.config.height, Some(name), now_ns(), Audience::Everyone)
         };
         self.gpu.render(&scene)
+    }
+
+    /// Approximate per-frame encode time in milliseconds for an active output, or `None` once stopped.
+    pub fn output_encode_ms(&self, id: u64) -> Option<f32> {
+        self.now_or_last(
+            |st| st.encode_ms.get(&id).copied(),
+            |s| s.output_encode_ms.iter().find(|(i, _)| *i == id).map(|(_, ms)| *ms),
+        )
     }
 
     /// A scene drawn on a canvas of `canvas` size and scaled down whole to `size` (bicubic),
@@ -6173,6 +6188,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             .chain(st.heal.iter().filter(|(_, h)| h.retry_at.is_some()).map(|(id, _)| *id))
             .collect();
         let mut encoding = Duration::ZERO;
+        let mut per_out_encoding: Vec<(u64, Duration)> = Vec::new();
         for (id, pipe, kind, canvas) in st.outputs.iter_mut() {
             if !outputs.contains(id) {
                 continue;
@@ -6189,6 +6205,7 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
             if dead.contains(id) {
                 continue;
             }
+            let mut out_encoding = Duration::ZERO;
             let mut tags = Vec::new();
             if let Some((_, frame)) = drawn.iter().find(|(c, _)| *c == view(canvas, sides_of(*id))) {
                 match frame {
@@ -6199,7 +6216,9 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                             Ok(t) => tags = t,
                             Err(e) => failed = Some(e.to_string()),
                         }
-                        encoding += t0.elapsed();
+                        let dt = t0.elapsed();
+                        out_encoding += dt;
+                        encoding += dt;
                     }
                     Err(e) => failed = Some(e.clone()),
                 }
@@ -6212,9 +6231,14 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
                             Ok(t) => tags.extend(t),
                             Err(e) => failed = Some(e.to_string()),
                         }
-                        encoding += t0.elapsed();
+                        let dt = t0.elapsed();
+                        out_encoding += dt;
+                        encoding += dt;
                     }
                 }
+            }
+            if out_encoding > Duration::ZERO {
+                per_out_encoding.push((*id, out_encoding));
             }
             for b in &blocks {
                 match pipe.audio(&b.tracks[canvas.track], b.ts_ns) {
@@ -6241,6 +6265,10 @@ fn deliver(st: &mut State, gpu: &Compositor, flush: bool, recycle_tx: &mpsc::Syn
         // recording aren't marked dead by a vertical stream's or the replay buffer's.
         for (id, why) in failures {
             note_failure(st, id, &why);
+        }
+        for (id, dt) in per_out_encoding {
+            let ms = dt.as_secs_f32() * 1000.0;
+            st.encode_ms.entry(id).and_modify(|prev| *prev = *prev * 0.9 + ms * 0.1).or_insert(ms);
         }
         // Only frames that went through an encoder count (a canvas drawn every other frame, or
         // one that failed to draw, would pull the average down by half).
@@ -12063,5 +12091,30 @@ mod tests {
             "mid-stream B-frame A/V start skewed: video_pts={first_v_pts}ms audio={first_a}ms"
         );
         assert!(video_dts.windows(2).all(|w| w[1] >= w[0]), "non-monotonic mid-stream video DTS: {video_dts:?}");
+    }
+
+    #[test]
+    fn output_encode_ms_tracks_per_output_encoding_time() {
+        if !encodes_here() {
+            return;
+        }
+        let Some(e) = engine() else { return };
+        e.set_source(1, SourceKind::Color { width: 640, height: 360, rgba: [20, 40, 60, 255] })
+            .unwrap_or_else(|x| panic!("{x}"));
+        e.set_scene("Main", vec![SceneItem::new(1, Placement::default())]);
+        e.go("Main").unwrap_or_else(|x| panic!("{x}"));
+        let (pkt_tx, pkt_rx) = std::sync::mpsc::channel::<()>();
+        let out = e
+            .start_output(OutputKind::Stream(Box::new(move |_| {
+                let _ = pkt_tx.send(());
+            })))
+            .unwrap_or_else(|x| panic!("{x}"));
+        for _ in 0..5 {
+            pkt_rx.recv().unwrap();
+        }
+        let ms = e.output_encode_ms(out);
+        assert!(ms.is_some_and(|v| v > 0.0 && v.is_finite()), "expected positive encode_ms, got {ms:?}");
+        e.stop_output(out).unwrap_or_else(|x| panic!("{x}"));
+        assert_eq!(e.output_encode_ms(out), None);
     }
 }
