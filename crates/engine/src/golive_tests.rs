@@ -2917,6 +2917,40 @@ async fn save_golive_and_view_with_backup_do_not_deadlock() {
 }
 
 #[derive(Debug)]
+struct LocalPlatform(ferrocast_core::event::Platform, String, String);
+
+#[async_trait::async_trait]
+impl ferrocast_connector::Connector for LocalPlatform {
+    fn platform(&self) -> ferrocast_core::event::Platform {
+        self.0
+    }
+    fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+        Default::default()
+    }
+    async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+        Ok(ferrocast_connector::Ingest { url: self.1.clone(), key: self.2.clone(), backup: None, note: None })
+    }
+}
+
+#[derive(Debug)]
 struct LocalKick(String, String);
 
 #[async_trait::async_trait]
@@ -3082,7 +3116,20 @@ impl crate::studio_host::StudioHost for MultiGroupHost {
         let header_only = self.header_only_groups.lock().unwrap().contains(&spec.id);
         if !delay_only {
             hub.start();
-            hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
+            let mut meta = ferrocast_golive::hub::StreamMetadata::new();
+            meta.video_width = Some(spec.key.width);
+            meta.video_height = Some(spec.key.height);
+            meta.video_frame_rate = Some(spec.key.fps as f32);
+            meta.video_bitrate_kbps = Some(spec.key.kbps);
+            meta.video_codec_id = Some(if spec.key.codec == crate::golive::VideoCodec::Hevc { 12 } else { 7 });
+            meta.audio_codec_id = Some(10);
+            hub.metadata(meta);
+            let hdr: Vec<u8> = if spec.key.codec == crate::golive::VideoCodec::Hevc {
+                vec![0x1Cu8, 0x00, 0, 0, 0]
+            } else {
+                ferrocast_golive::flv::minimal_avc_header(spec.key.width, spec.key.height)
+            };
+            hub.video(0, hdr.into());
             hub.audio(0, (&[0xAFu8, 0x00, 0x12, 0x10][..]).into());
         }
 
@@ -3105,8 +3152,9 @@ impl crate::studio_host::StudioHost for MultiGroupHost {
                 }
             }
             let mut ts = 0u32;
+            let mut frame = 0u32;
             loop {
-                let tag = if ts.is_multiple_of(500) {
+                let tag = if frame.is_multiple_of(10) {
                     vec![0x17u8, 0x01, 0x00, 0x00, 0x01]
                 } else {
                     vec![0x27u8, 0x01, 0x00, 0x00, 0x01]
@@ -3114,6 +3162,7 @@ impl crate::studio_host::StudioHost for MultiGroupHost {
                 hub_clone.video(ts, tag.into());
                 hub_clone.audio(ts, (&[0xAFu8, 0x01, 0x22][..]).into());
                 ts = ts.saturating_add(33);
+                frame = frame.wrapping_add(1);
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         });
@@ -4276,4 +4325,509 @@ async fn f13_vertical_only_without_vertical_canvas_fails_cleanly_without_main_fa
         "must clearly report missing vertical picture: {err}"
     );
     assert!(host.started.lock().unwrap().is_empty(), "must never start a 16:9 main fallback encode");
+}
+
+fn ivs_budget_host(width: u32, height: u32, fps: u32, video_kbps: u32, engines: u32) -> Arc<MultiGroupHost> {
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() =
+        crate::studio_host::StudioSettings { width, height, fps, video_kbps, ..Default::default() };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(engines),
+        cpu_cores: 10,
+        host_sig: "mac-m2-max".into(),
+        ..Default::default()
+    });
+    host
+}
+
+async fn recv_until_coded_frames(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ferrocast_testkit::rtmp::Got>,
+    want_key: &str,
+    min_coded_frames: usize,
+    already_published: bool,
+) -> (Option<(u32, u32)>, Vec<u32>) {
+    use ferrocast_testkit::rtmp::Got;
+    use tokio::time::{Duration, timeout};
+
+    let mut seen_pub = already_published;
+    let mut sps_dims = None;
+    let mut timestamps = Vec::new();
+    while timestamps.len() < min_coded_frames {
+        match timeout(Duration::from_secs(5), rx.recv()).await.expect("rtmp packet in time").expect("rtmp open") {
+            Got::Publish(k) => {
+                assert_eq!(k, want_key);
+                seen_pub = true;
+            }
+            Got::Video(ts, data) => {
+                if let Some(d) = ferrocast_golive::flv::avcc_sps_dimensions(&data) {
+                    sps_dims = Some(d);
+                } else if !ferrocast_golive::flv::video_is_header(&data) && seen_pub {
+                    timestamps.push(ts);
+                }
+            }
+            Got::Audio(..) => {}
+            Got::Closed => panic!("unexpected Got::Closed for {want_key}"),
+        }
+    }
+    (sps_dims, timestamps)
+}
+
+#[tokio::test]
+async fn scenario_a_1440p_main_youtube_and_kick_autofit_stay_live() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_golive::push::PushState;
+    use ferrocast_testkit::rtmp::{platform_rejecting_above, platform_with_meta};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 2);
+    let s = host.settings.lock().unwrap().clone();
+    e.set_studio_host(host.clone());
+    e.note_studio_settings(&s);
+
+    let (p_yt, mut got_yt, mut meta_yt) = platform_with_meta("yt-a").await;
+    let (p_kick, mut got_kick, mut meta_kick) =
+        platform_rejecting_above("kick-a", 1920, 1080, 8000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "yt-a".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Kick,
+        format!("rtmp://127.0.0.1:{p_kick}/app"),
+        "kick-a".into(),
+    )));
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "kick"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+
+    let (yt_sps, yt_ts) = recv_until_coded_frames(&mut got_yt, "yt-a", 15, false).await;
+    let (kick_sps, kick_ts) = recv_until_coded_frames(&mut got_kick, "kick-a", 15, false).await;
+    assert_eq!(yt_sps, Some((2560, 1440)));
+    assert_eq!(kick_sps, Some((1920, 1080)));
+    assert!(!yt_ts.is_empty() && !kick_ts.is_empty());
+
+    let yt_m = timeout(Duration::from_secs(2), meta_yt.recv()).await.unwrap().unwrap();
+    let kick_m = timeout(Duration::from_secs(2), meta_kick.recv()).await.unwrap().unwrap();
+    assert_eq!((yt_m.video_width, yt_m.video_height, yt_m.video_bitrate_kbps), (Some(2560), Some(1440), Some(18_000)));
+    assert_eq!((kick_m.video_width, kick_m.video_height), (Some(1920), Some(1080)));
+    assert!(kick_m.video_bitrate_kbps.is_some_and(|k| k <= 8_000), "kick meta kbps={:?}", kick_m.video_bitrate_kbps);
+
+    let view = e.golive_view().await;
+    for id in ["youtube", "kick"] {
+        let state = view.destinations.iter().find(|d| d.id == id).and_then(|d| d.health.as_ref()).map(|h| &h.state);
+        assert_eq!(state, Some(&PushState::Live), "{id} must stay Live, got {state:?}");
+    }
+    assert_eq!(e.golive_running_group("youtube").as_deref(), Some(crate::golive::GROUP_MAIN));
+    assert_ne!(e.golive_running_group("kick").as_deref(), Some(crate::golive::GROUP_MAIN));
+
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn scenario_a_twitch_recommended_1080p_limit_accepts_1440p_at_6000kbps() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_golive::push::PushState;
+    use ferrocast_testkit::rtmp::{platform_rejecting_above, platform_with_meta};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 4);
+    let s = host.settings.lock().unwrap().clone();
+    e.set_studio_host(host.clone());
+    e.note_studio_settings(&s);
+
+    let (p_yt, mut got_yt, mut meta_yt) = platform_with_meta("yt-tw").await;
+    let (p_tw, mut got_tw, mut meta_tw) =
+        platform_rejecting_above("tw-a", 2560, 1440, 6000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "yt-tw".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Twitch,
+        format!("rtmp://127.0.0.1:{p_tw}/app"),
+        "tw-a".into(),
+    )));
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "twitch"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+
+    let (yt_sps, _) = recv_until_coded_frames(&mut got_yt, "yt-tw", 10, false).await;
+    let (tw_sps, _) = recv_until_coded_frames(&mut got_tw, "tw-a", 10, false).await;
+    assert_eq!(yt_sps, Some((2560, 1440)));
+    assert_eq!(tw_sps, Some((2560, 1440)), "Twitch 1080p is recommended (soft), not hard-downscaled");
+
+    let yt_m = timeout(Duration::from_secs(2), meta_yt.recv()).await.unwrap().unwrap();
+    let tw_m = timeout(Duration::from_secs(2), meta_tw.recv()).await.unwrap().unwrap();
+    assert_eq!((yt_m.video_width, yt_m.video_height, yt_m.video_bitrate_kbps), (Some(2560), Some(1440), Some(18_000)));
+    assert_eq!((tw_m.video_width, tw_m.video_height, tw_m.video_bitrate_kbps), (Some(2560), Some(1440), Some(6_000)));
+
+    let view = e.golive_view().await;
+    let tw_state =
+        view.destinations.iter().find(|d| d.id == "twitch").and_then(|d| d.health.as_ref()).map(|h| &h.state);
+    assert_eq!(tw_state, Some(&PushState::Live), "Twitch must accept 1440p@6000 and stay Live");
+
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn scenario_b_ignore_service_limits_kick_rejects_1440p_with_limit_reason() {
+    use ferrocast_core::event::Platform;
+    use ferrocast_golive::push::PushState;
+    use ferrocast_testkit::rtmp::{platform_rejecting_above, platform_with_meta};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 2);
+    let s = host.settings.lock().unwrap().clone();
+    e.set_studio_host(host.clone());
+    e.note_studio_settings(&s);
+
+    let (p_yt, mut got_yt, _meta_yt) = platform_with_meta("yt-b").await;
+    let (p_kick, mut got_kick, mut meta_kick) =
+        platform_rejecting_above("kick-b", 1920, 1080, 8000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "yt-b".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Kick,
+        format!("rtmp://127.0.0.1:{p_kick}/app"),
+        "kick-b".into(),
+    )));
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "kick"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    let mut adv = e.golive_config().advanced;
+    adv.ignore_service_limits = true;
+    adv.per
+        .insert("kick".into(), crate::golive::DestAdvanced { first_retry_s: 1, max_retry_s: 1, ..Default::default() });
+    e.set_golive_advanced(adv).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+
+    let (yt_sps, _) = recv_until_coded_frames(&mut got_yt, "yt-b", 10, false).await;
+    assert_eq!(yt_sps, Some((2560, 1440)));
+
+    // Wait for Kick to publish on GROUP_MAIN (1440p), send 1440p SPS/metadata, and be closed by fake IVS (~200 ms).
+    let mut kick_sps = None;
+    let mut saw_kick_close = false;
+    for _ in 0..50 {
+        match tokio::time::timeout(std::time::Duration::from_secs(2), got_kick.recv()).await.unwrap().unwrap() {
+            ferrocast_testkit::rtmp::Got::Publish(k) => {
+                assert_eq!(k, "kick-b");
+                assert_eq!(e.golive_running_group("kick").as_deref(), Some(crate::golive::GROUP_MAIN));
+            }
+            ferrocast_testkit::rtmp::Got::Video(_, data) => {
+                if let Some(d) = ferrocast_golive::flv::avcc_sps_dimensions(&data) {
+                    kick_sps = Some(d);
+                }
+            }
+            ferrocast_testkit::rtmp::Got::Closed => {
+                saw_kick_close = true;
+                break;
+            }
+            ferrocast_testkit::rtmp::Got::Audio(..) => {}
+        }
+    }
+    assert!(saw_kick_close, "Kick IVS fake must close 1440p stream");
+    assert_eq!(kick_sps, Some((2560, 1440)));
+    let kick_m = tokio::time::timeout(std::time::Duration::from_secs(2), meta_kick.recv()).await.unwrap().unwrap();
+    assert_eq!(
+        (kick_m.video_width, kick_m.video_height, kick_m.video_bitrate_kbps),
+        (Some(2560), Some(1440), Some(18_000))
+    );
+
+    let mut failed_state = None;
+    for _ in 0..120 {
+        let v = e.golive_view().await;
+        if let Some(st) = v.destinations.into_iter().find(|d| d.id == "kick").and_then(|d| d.health).map(|h| h.state) {
+            if let PushState::Reconnecting { ref reason, .. } = st {
+                assert!(!reason.contains("Allow multistreaming"), "misdiagnosed Reconnecting: {reason}");
+                assert!(reason.contains("1080p") || reason.contains("8,000 kbps"), "{reason}");
+            }
+            if matches!(st, PushState::Failed { .. }) {
+                failed_state = Some(st);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    match failed_state {
+        Some(PushState::Failed { reason, detail, refused, .. }) => {
+            assert!(refused);
+            assert!(!reason.contains("Allow multistreaming"), "{reason}");
+            assert!(reason.contains("1080p") || reason.contains("8,000 kbps"), "{reason}");
+            let detail = detail.expect("Kick failure detail");
+            assert!(!detail.contains("Allow multistreaming"), "misdiagnosed detail: {detail}");
+            assert!(detail.contains("2560") && detail.contains("18,000 kbps"), "{detail}");
+        }
+        other => panic!("expected Kick PushState::Failed with limit reason, got {other:?}"),
+    }
+
+    while let Ok(msg) = got_yt.try_recv() {
+        assert!(!matches!(msg, ferrocast_testkit::rtmp::Got::Closed), "YouTube must stay Live while Kick fails");
+    }
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn scenario_c_identical_custom_encodes_share_one_encoder_group() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{platform_rejecting_above, platform_with_meta};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 2);
+    let s = host.settings.lock().unwrap().clone();
+    e.set_studio_host(host.clone());
+    e.note_studio_settings(&s);
+
+    let (p_yt, mut got_yt, _) = platform_with_meta("yt-c").await;
+    let (p_tw, mut got_tw, _) =
+        platform_rejecting_above("tw-c", 1920, 1080, 6000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+    let (p_cust, mut got_cust, _) =
+        platform_rejecting_above("cust-c", 1920, 1080, 6000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "yt-c".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Twitch,
+        format!("rtmp://127.0.0.1:{p_tw}/app"),
+        "tw-c".into(),
+    )));
+    let cust = e
+        .add_golive_destination("Custom", &format!("rtmp://127.0.0.1:{p_cust}/app"), "cust-c", Canvas::Main)
+        .await
+        .unwrap();
+
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "twitch" || d.id == cust.id))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    let shared_1080 = CustomQuality { width: 1920, height: 1080, fps: 60, kbps: 6_000, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality("twitch", DestinationQuality::Custom(shared_1080.clone())).await.unwrap();
+    e.set_golive_quality(&cust.id, DestinationQuality::Custom(shared_1080)).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+
+    let (yt_sps, _) = recv_until_coded_frames(&mut got_yt, "yt-c", 8, false).await;
+    let (tw_sps, _) = recv_until_coded_frames(&mut got_tw, "tw-c", 8, false).await;
+    let (cust_sps, _) = recv_until_coded_frames(&mut got_cust, "cust-c", 8, false).await;
+    assert_eq!(yt_sps, Some((2560, 1440)));
+    assert_eq!(tw_sps, Some((1920, 1080)));
+    assert_eq!(cust_sps, Some((1920, 1080)));
+
+    let active_non_main: Vec<_> = e.active_encode_groups().into_iter().filter(|g| g.id != GROUP_MAIN).collect();
+    assert_eq!(active_non_main.len(), 1, "identical 1080p60 encodes must share one group: {active_non_main:?}");
+    let tw_gid = e.golive_running_group("twitch");
+    let cust_gid = e.golive_running_group(&cust.id);
+    assert_eq!(tw_gid, cust_gid);
+    assert_ne!(tw_gid.as_deref(), Some(GROUP_MAIN));
+
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn scenario_d_live_switch_kick_to_720p30_zero_drop_on_youtube_and_old_group_stops() {
+    use crate::golive::{CustomQuality, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform_rejecting_above, platform_with_meta};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 3);
+    let s = host.settings.lock().unwrap().clone();
+    e.set_studio_host(host.clone());
+    e.note_studio_settings(&s);
+
+    let (p_yt, mut got_yt, _) = platform_with_meta("yt-d").await;
+    let (p_kick, mut got_kick, mut meta_kick) =
+        platform_rejecting_above("kick-d", 1920, 1080, 8000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "yt-d".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Kick,
+        format!("rtmp://127.0.0.1:{p_kick}/app"),
+        "kick-d".into(),
+    )));
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "kick"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+
+    let (yt_sps, mut yt_ts) = recv_until_coded_frames(&mut got_yt, "yt-d", 10, false).await;
+    let (kick_sps_before, _) = recv_until_coded_frames(&mut got_kick, "kick-d", 10, false).await;
+    assert_eq!(yt_sps, Some((2560, 1440)));
+    assert_eq!(kick_sps_before, Some((1920, 1080)));
+    let kick_m1 = timeout(Duration::from_secs(2), meta_kick.recv()).await.unwrap().unwrap();
+    assert_eq!((kick_m1.video_width, kick_m1.video_height), (Some(1920), Some(1080)));
+
+    let old_kick_gid = e.golive_running_group("kick").unwrap();
+    assert_ne!(old_kick_gid, GROUP_MAIN);
+
+    let q_720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality("kick", DestinationQuality::Custom(q_720)).await.unwrap();
+    let new_kick_gid = e.golive_running_group("kick").unwrap();
+    assert_ne!(new_kick_gid, old_kick_gid);
+
+    // Kick disconnects once cleanly from the old group and reconnects with 1280x720 metadata + SPS.
+    let mut saw_closed = false;
+    let mut kick_sps_after = None;
+    let mut post_switch_frames = 0usize;
+    let mut republished = false;
+    while post_switch_frames < 10 {
+        match timeout(Duration::from_secs(5), got_kick.recv()).await.unwrap().unwrap() {
+            Got::Closed => {
+                assert!(!republished, "new Kick forwarder after switch must not disconnect");
+                saw_closed = true;
+            }
+            Got::Publish(k) => {
+                assert_eq!(k, "kick-d");
+                republished = true;
+            }
+            Got::Video(_, data) => {
+                if let Some(d) = ferrocast_golive::flv::avcc_sps_dimensions(&data) {
+                    if republished {
+                        kick_sps_after = Some(d);
+                    }
+                } else if republished && !ferrocast_golive::flv::video_is_header(&data) {
+                    post_switch_frames += 1;
+                }
+            }
+            Got::Audio(..) => {}
+        }
+    }
+    assert!(saw_closed && republished, "Kick must close old connection and republish on new group");
+    assert_eq!(kick_sps_after, Some((1280, 720)));
+    let kick_m2 = timeout(Duration::from_secs(2), meta_kick.recv()).await.unwrap().unwrap();
+    assert_eq!(
+        (kick_m2.video_width, kick_m2.video_height, kick_m2.video_frame_rate, kick_m2.video_bitrate_kbps),
+        (Some(1280), Some(720), Some(30.0), Some(3_500))
+    );
+
+    // YouTube stays completely uninterrupted across the entire switch with continuous timestamps.
+    while let Ok(msg) = got_yt.try_recv() {
+        match msg {
+            Got::Closed => panic!("unexpected Got::Closed for yt-d during Kick switch"),
+            Got::Video(ts, data) if !ferrocast_golive::flv::video_is_header(&data) => yt_ts.push(ts),
+            _ => {}
+        }
+    }
+    let (_, more_yt_ts) = recv_until_coded_frames(&mut got_yt, "yt-d", 10, true).await;
+    yt_ts.extend(more_yt_ts);
+    assert!(yt_ts.windows(2).all(|w| w[1] > w[0]), "YouTube timestamps must keep advancing: {yt_ts:?}");
+
+    assert!(host.stopped_groups.lock().unwrap().contains(&old_kick_gid), "old Kick group must stop at 0 refcount");
+    assert!(!e.active_encode_groups().iter().any(|g| g.id == old_kick_gid));
+
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn scenario_e_live_switch_timeout_aborts_and_keeps_kick_old_stream() {
+    use crate::golive::{CustomQuality, DestinationQuality, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{platform_rejecting_above, platform_with_meta};
+    use tokio::time::Duration;
+
+    let (e, _dir) = engine().await;
+    e.set_keyframe_wait_timeout_for_test(Duration::from_millis(25));
+    let host = ivs_budget_host(2560, 1440, 60, 18_000, 3);
+    let s = host.settings.lock().unwrap().clone();
+    e.set_studio_host(host.clone());
+    e.note_studio_settings(&s);
+
+    let (p_yt, mut got_yt, _) = platform_with_meta("yt-e").await;
+    let (p_kick, mut got_kick, _) =
+        platform_rejecting_above("kick-e", 1920, 1080, 8000, ferrocast_golive::flv::avcc_sps_dimensions).await;
+
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Youtube,
+        format!("rtmp://127.0.0.1:{p_yt}/app"),
+        "yt-e".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Kick,
+        format!("rtmp://127.0.0.1:{p_kick}/app"),
+        "kick-e".into(),
+    )));
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "youtube" || d.id == "kick"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    let _ = recv_until_coded_frames(&mut got_yt, "yt-e", 6, false).await;
+    let (kick_sps_before, _) = recv_until_coded_frames(&mut got_kick, "kick-e", 6, false).await;
+    assert_eq!(kick_sps_before, Some((1920, 1080)));
+    let old_kick_gid = e.golive_running_group("kick").unwrap();
+
+    let q_720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let mut input = e.golive_planner_input(e.cached_pc_budget());
+    input.destinations.iter_mut().find(|x| x.id == "kick").unwrap().quality = DestinationQuality::Custom(q_720.clone());
+    let stalled_gid = crate::golive::plan_encodes(&input).destinations["kick"].group_id.clone();
+    host.blocked_idr_groups.lock().unwrap().insert(stalled_gid.clone());
+
+    let err = e.set_golive_quality("kick", DestinationQuality::Custom(q_720)).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { code: "golive_switch_timeout", .. }), "{err:?}");
+
+    assert_eq!(e.golive_running_group("kick").as_deref(), Some(old_kick_gid.as_str()));
+    assert!(host.stopped_groups.lock().unwrap().contains(&stalled_gid));
+    assert!(!e.active_encode_groups().iter().any(|g| g.id == stalled_gid));
+
+    // Both Kick's previous 1080p stream and YouTube remain connected and keep delivering frames.
+    while let Ok(msg) = got_yt.try_recv() {
+        assert!(!matches!(msg, ferrocast_testkit::rtmp::Got::Closed));
+    }
+    while let Ok(msg) = got_kick.try_recv() {
+        assert!(!matches!(msg, ferrocast_testkit::rtmp::Got::Closed));
+    }
+    let _ = recv_until_coded_frames(&mut got_kick, "kick-e", 5, true).await;
+
+    e.studio_stream(false).await.unwrap();
 }

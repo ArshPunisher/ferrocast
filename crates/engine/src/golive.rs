@@ -1521,6 +1521,11 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn active_encode_groups(&self) -> Vec<crate::studio_host::EncodeGroupSpec> {
+        lock(&self.golive().active_groups).values().cloned().collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn replace_running_health_for_test(
         &self,
         id: &str,
