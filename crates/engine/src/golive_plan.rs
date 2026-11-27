@@ -1102,12 +1102,13 @@ fn apply_on_demand_light(
     dests: &mut [WorkingDest],
     groups: &mut Vec<WorkingGroup>,
     main: &MainEncode,
-    whip_simulcast: bool,
     any_whip: bool,
     eb_extra: &[(u32, u32, u32)],
-    ignore_service_limits: bool,
-    budget: &PcBudget,
+    input: &PlannerInput,
 ) {
+    let whip_simulcast = input.whip_simulcast && any_whip;
+    let ignore_service_limits = input.ignore_service_limits;
+    let budget = &input.budget;
     let light_key = light_encode_key(main, any_whip);
     let member_light_key = |d: &WorkingDest| {
         let mut k = light_key.clone();
@@ -1338,17 +1339,7 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
         eff_input.main = main_eff;
         shared_cap_pass(&mut working, &mut groups, &eff_input, &vertical_base, &eb_extra);
     }
-    let has_whip_simulcast = input.whip_simulcast && any_whip;
-    apply_on_demand_light(
-        &mut working,
-        &mut groups,
-        &main_eff,
-        has_whip_simulcast,
-        any_whip,
-        &eb_extra,
-        input.ignore_service_limits,
-        &input.budget,
-    );
+    apply_on_demand_light(&mut working, &mut groups, &main_eff, any_whip, &eb_extra, input);
     sort_groups(&mut groups);
 
     let budget = evaluate_budget(&groups, &main_eff, &input.budget);

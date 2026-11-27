@@ -1306,7 +1306,6 @@ async fn youtube_test_preflight_and_upload_check_make_zero_writes_and_403_blocks
 /// destination the Studio stops showing LIVE while keeping the failed state visible.
 #[tokio::test]
 async fn destination_give_up_marks_failed_and_stops_studio_live() {
-    use ferrocast_core::event::Platform;
     use ferrocast_golive::push::PushState;
     use ferrocast_testkit::rtmp::{Obs, platform, platform_dropping};
 
@@ -1387,47 +1386,14 @@ async fn destination_give_up_marks_failed_and_stops_studio_live() {
         }
     }
 
-    #[derive(Debug)]
-    struct LocalKick(String);
-    #[async_trait::async_trait]
-    impl ferrocast_connector::Connector for LocalKick {
-        fn platform(&self) -> Platform {
-            Platform::Kick
-        }
-        fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
-            Default::default()
-        }
-        async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
-            Ok(())
-        }
-        async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
-            Ok(())
-        }
-        async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
-            Ok(())
-        }
-        async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
-            Ok(())
-        }
-        async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
-            Ok(())
-        }
-        async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
-            Ok(())
-        }
-        async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
-            Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: "kick-k".into(), backup: None, note: None })
-        }
-    }
-
     let (e, _dir) = engine().await;
     let host = Arc::new(LiveHost::default());
     e.set_studio_host(host.clone());
 
-    // 1. Kick alone, refusing multistreaming (accept then close after 40 ms): gives up and
-    //    stops the Studio stream so the Studio stops showing LIVE.
+    // 1. Kick alone closing a compliant stream after 40 ms: gives up without misdiagnosing
+    //    multistreaming, and stops the Studio stream so the Studio stops showing LIVE.
     let (kport, _kgot) = platform_dropping("kick-k", std::time::Duration::from_millis(40)).await;
-    e.register_connector(Arc::new(LocalKick(format!("rtmp://127.0.0.1:{kport}/app"))));
+    e.register_connector(Arc::new(LocalKick(format!("rtmp://127.0.0.1:{kport}/app"), "kick-k".into())));
     let order: Vec<(String, bool)> =
         GoLiveConfig::default().destinations.into_iter().map(|d| (d.id.clone(), d.id == "kick")).collect();
     e.set_golive_destinations(order).await.unwrap();
@@ -1458,8 +1424,10 @@ async fn destination_give_up_marks_failed_and_stops_studio_live() {
         Some(PushState::Failed { attempts, reason, detail, refused }) => {
             assert_eq!(attempts, ferrocast_golive::push::DEFAULT_MAX_ATTEMPTS);
             assert!(refused);
-            assert!(reason.contains("Kick refused"), "{reason}");
-            assert!(detail.as_deref().is_some_and(|d| d.contains("Allow multistreaming")), "{detail:?}");
+            assert_eq!(reason, "Kick closed the stream.");
+            let d = detail.as_deref().unwrap_or("");
+            assert!(!d.contains("Allow multistreaming"), "{d}");
+            assert!(d.contains("stream key"), "{d}");
         }
         other => panic!("Kick should have reached Failed and stopped Studio stream: {other:?}"),
     }
@@ -2948,6 +2916,40 @@ async fn save_golive_and_view_with_backup_do_not_deadlock() {
     );
 }
 
+#[derive(Debug)]
+struct LocalKick(String, String);
+
+#[async_trait::async_trait]
+impl ferrocast_connector::Connector for LocalKick {
+    fn platform(&self) -> ferrocast_core::event::Platform {
+        ferrocast_core::event::Platform::Kick
+    }
+    fn capabilities(&self) -> ferrocast_core::moderation::Capabilities {
+        Default::default()
+    }
+    async fn send_chat(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn delete_message(&self, _: &str) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn timeout(&self, _: &str, _: u32, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn ban(&self, _: &str, _: Option<&str>) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn unban(&self, _: &str) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn set_mode(&self, _: ferrocast_core::moderation::ModeChange) -> ferrocast_connector::Result<()> {
+        Ok(())
+    }
+    async fn ingest(&self) -> ferrocast_connector::Result<ferrocast_connector::Ingest> {
+        Ok(ferrocast_connector::Ingest { url: self.0.clone(), key: self.1.clone(), backup: None, note: None })
+    }
+}
+
 type StartedGroupEntry = (crate::studio_host::EncodeGroupSpec, Arc<ferrocast_golive::Hub>, tokio::task::JoinHandle<()>);
 
 #[derive(Debug)]
@@ -2955,9 +2957,14 @@ struct MultiGroupHost {
     settings: std::sync::Mutex<crate::studio_host::StudioSettings>,
     budget_info: std::sync::Mutex<Option<crate::studio_host::HostBudgetInfo>>,
     started: std::sync::Mutex<std::collections::HashMap<String, StartedGroupEntry>>,
+    start_counts: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     stopped_groups: std::sync::Mutex<Vec<String>>,
+    aborted_groups: std::sync::Mutex<Vec<String>>,
     legacy_stream_starts: std::sync::atomic::AtomicUsize,
     blocked_idr_groups: std::sync::Mutex<std::collections::HashSet<String>>,
+    header_only_groups: std::sync::Mutex<std::collections::HashSet<String>>,
+    delay_idr_only_groups: std::sync::Mutex<std::collections::HashSet<String>>,
+    fail_groups: std::sync::Mutex<std::collections::HashSet<String>>,
     idr_gate: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
@@ -2967,9 +2974,14 @@ impl Default for MultiGroupHost {
             settings: std::sync::Mutex::new(Default::default()),
             budget_info: std::sync::Mutex::new(None),
             started: std::sync::Mutex::new(Default::default()),
+            start_counts: std::sync::Mutex::new(Default::default()),
             stopped_groups: std::sync::Mutex::new(Vec::new()),
+            aborted_groups: std::sync::Mutex::new(Vec::new()),
             legacy_stream_starts: std::sync::atomic::AtomicUsize::new(0),
             blocked_idr_groups: std::sync::Mutex::new(Default::default()),
+            header_only_groups: std::sync::Mutex::new(Default::default()),
+            delay_idr_only_groups: std::sync::Mutex::new(Default::default()),
+            fail_groups: std::sync::Mutex::new(Default::default()),
             idr_gate: std::sync::Mutex::new(Default::default()),
         }
     }
@@ -3046,17 +3058,28 @@ impl crate::studio_host::StudioHost for MultiGroupHost {
     async fn import_obs(&self, _id: String) -> Result<serde_json::Value, String> {
         Err("n/a".into())
     }
+    fn supports_encode_groups(&self) -> bool {
+        true
+    }
     async fn start_encode_group(
         &self,
         spec: crate::studio_host::EncodeGroupSpec,
         hub: Arc<ferrocast_golive::Hub>,
     ) -> Result<bool, String> {
+        if self.fail_groups.lock().unwrap().contains(&spec.id) {
+            return Err(format!("forced failure starting {}", spec.id));
+        }
+        *self.start_counts.lock().unwrap().entry(spec.id.clone()).or_insert(0) += 1;
         if let Some((_, _, old_pump)) = self.started.lock().unwrap().remove(&spec.id) {
             old_pump.abort();
         }
-        hub.start();
-        hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
-        hub.audio(0, (&[0xAFu8, 0x00, 0x12, 0x10][..]).into());
+        let delay_only = self.delay_idr_only_groups.lock().unwrap().contains(&spec.id);
+        let header_only = self.header_only_groups.lock().unwrap().contains(&spec.id);
+        if !delay_only {
+            hub.start();
+            hub.video(0, (&[0x17u8, 0x00, 1, 2][..]).into());
+            hub.audio(0, (&[0xAFu8, 0x00, 0x12, 0x10][..]).into());
+        }
 
         let emit_idr_now = !self.blocked_idr_groups.lock().unwrap().contains(&spec.id);
         let gate = self.idr_gate.lock().unwrap().get(&spec.id).cloned();
@@ -3065,7 +3088,13 @@ impl crate::studio_host::StudioHost for MultiGroupHost {
             if let Some(notify) = gate {
                 notify.notified().await;
             }
-            if !emit_idr_now {
+            if !emit_idr_now || header_only {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            }
+            if delay_only {
+                hub_clone.note_encoded_idr();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 }
@@ -3093,6 +3122,10 @@ impl crate::studio_host::StudioHost for MultiGroupHost {
         }
         self.stopped_groups.lock().unwrap().push(id.to_string());
         Ok(())
+    }
+    async fn abort_encode_group(&self, id: &str) -> Result<(), String> {
+        self.aborted_groups.lock().unwrap().push(id.to_string());
+        self.stop_encode_group(id).await
     }
     async fn group_stats(&self) -> Result<Option<serde_json::Value>, String> {
         let map: serde_json::Map<String, serde_json::Value> = self
@@ -3472,4 +3505,484 @@ async fn v37_legacy_host_falls_back_to_single_stream_start() {
     assert_eq!(cpu_host.started.lock().unwrap().len(), 1, "1-session host must run exactly 1 encode group");
     assert!(cpu_host.started.lock().unwrap().contains_key(crate::golive::GROUP_MAIN));
     e2.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f1_main_group_never_restarts_or_retires_midstream() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 2560,
+        height: 1440,
+        fps: 60,
+        video_kbps: 18_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host.clone());
+
+    let (p_yt, mut got_yt) = platform("yt-f1").await;
+    let yt =
+        e.add_golive_destination("YT", &format!("rtmp://127.0.0.1:{p_yt}/app"), "yt-f1", Canvas::Main).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    while !matches!(timeout(Duration::from_secs(2), got_yt.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+
+    let custom_720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&yt.id, DestinationQuality::Custom(custom_720)).await.unwrap();
+
+    // Even when zero destinations remain subscribed to `GROUP_MAIN`, `GROUP_MAIN` must stay live!
+    assert!(
+        !host.stopped_groups.lock().unwrap().contains(&GROUP_MAIN.to_string()),
+        "GROUP_MAIN must never retire mid-stream"
+    );
+    assert!(host.started.lock().unwrap().contains_key(GROUP_MAIN));
+
+    // Switching back to SameAsMain reuses the untouched `GROUP_MAIN` (start_count == 1).
+    e.set_golive_quality(&yt.id, DestinationQuality::SameAsMain).await.unwrap();
+    assert_eq!(host.start_counts.lock().unwrap().get(GROUP_MAIN).copied(), Some(1), "main encode must never restart");
+
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f2_failed_secondary_group_never_leaks_main_onto_kick() {
+    use crate::golive::{Canvas, DestinationQuality};
+    use ferrocast_testkit::rtmp::platform;
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    let s = crate::studio_host::StudioSettings {
+        width: 2560,
+        height: 1440,
+        fps: 30,
+        video_kbps: 12_000,
+        ..Default::default()
+    };
+    *host.settings.lock().unwrap() = s.clone();
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+
+    let (p_yt, _got_yt) = platform("yt-f2").await;
+    let (p_kick, mut got_kick) = platform("kick-f2").await;
+    e.set_studio_host(host.clone());
+    e.note_studio_settings(&s);
+    e.register_connector(Arc::new(LocalKick(format!("rtmp://127.0.0.1:{p_kick}/app"), "kick-f2".into())));
+    let yt =
+        e.add_golive_destination("YT", &format!("rtmp://127.0.0.1:{p_yt}/app"), "yt-f2", Canvas::Main).await.unwrap();
+    let order: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == yt.id || d.id == "kick")).collect();
+    e.set_golive_destinations(order).await.unwrap();
+    let kick_id = "kick".to_string();
+
+    // Force Kick's auto-fitted 1080p group to fail on startup.
+    let plan = e.plan_golive_encodes(
+        host.budget_info.lock().unwrap().as_ref().map_or_else(crate::golive_plan::PcBudget::unknown, |i| {
+            crate::golive_plan::PcBudget::from_host_info(i, None, true)
+        }),
+    );
+    let kick_gid = plan.destinations[&kick_id].group_id.clone();
+    assert_ne!(kick_gid, crate::golive::GROUP_MAIN);
+    host.fail_groups.lock().unwrap().insert(kick_gid.clone());
+
+    let _ = e.studio_stream(true).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert_ne!(
+        e.golive_running_group(&kick_id).as_deref(),
+        Some(crate::golive::GROUP_MAIN),
+        "failed secondary group must never fall back to GROUP_MAIN"
+    );
+    assert!(got_kick.try_recv().is_err(), "Kick must not receive unscaled main packets when its group failed");
+    let _ = DestinationQuality::SameAsMain;
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f4_unticked_dest_mid_switch_and_concurrent_shared_group_and_budget() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    e.set_keyframe_wait_timeout_for_test(Duration::from_secs(2));
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "windows".into(),
+        encoder_id: "ffmpeg_nvenc".into(),
+        nvidia_driver_major: Some(525),
+        cpu_cores: 8,
+        host_sig: "win|nv=525".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host.clone());
+
+    let (p1, mut g1) = platform("f4-1").await;
+    let (p2, mut g2) = platform("f4-2").await;
+    let d1 = e.add_golive_destination("D1", &format!("rtmp://127.0.0.1:{p1}/app"), "f4-1", Canvas::Main).await.unwrap();
+    let d2 = e.add_golive_destination("D2", &format!("rtmp://127.0.0.1:{p2}/app"), "f4-2", Canvas::Main).await.unwrap();
+    // Enable only d1 and d2 while preserving all existing destinations in `order`.
+    let set_only = |e_ref: &Engine, enabled_ids: &[&str]| {
+        e_ref
+            .golive_config()
+            .destinations
+            .into_iter()
+            .map(|d| {
+                let on = enabled_ids.contains(&d.id.as_str());
+                (d.id, on)
+            })
+            .collect::<Vec<_>>()
+    };
+    e.set_golive_destinations(set_only(&e, &[&d1.id, &d2.id])).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    while !matches!(timeout(Duration::from_secs(2), g1.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(2), g2.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+
+    // 1. Untick d1 while it awaits IDR on target group -> switch cancels and removes new group.
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let mut input = e.golive_planner_input(e.cached_pc_budget());
+    input.destinations.iter_mut().find(|x| x.id == d1.id).unwrap().quality = DestinationQuality::Custom(q720.clone());
+    let gid_720 = crate::golive::plan_encodes(&input).destinations[&d1.id].group_id.clone();
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    host.idr_gate.lock().unwrap().insert(gid_720.clone(), gate.clone());
+    let e1 = e.clone();
+    let d1_id = d1.id.clone();
+    let sw1 = tokio::spawn(async move { e1.set_golive_quality(&d1_id, DestinationQuality::Custom(q720)).await });
+    for _ in 0..100 {
+        if host.started.lock().unwrap().contains_key(&gid_720) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    e.set_golive_destinations(set_only(&e, &[&d2.id])).await.unwrap();
+    gate.notify_waiters();
+    let res = sw1.await.unwrap().unwrap_err();
+    assert!(matches!(res, EngineError::Refused { code: "golive_switch_cancelled", .. }), "{res:?}");
+    assert!(host.stopped_groups.lock().unwrap().contains(&gid_720));
+
+    // Re-enable d1 onto main for concurrent budget test: NVENC <531 + auto_quality => eff_cap=2 (1 main + 1 spare).
+    // Two concurrent switches to distinct new groups must serialize budget checks and refuse the 2nd!
+    e.set_golive_destinations(set_only(&e, &[&d1.id, &d2.id])).await.unwrap();
+    let q_a = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_000, codec: Some(VideoCodec::H264) };
+    let q_b = CustomQuality { width: 852, height: 480, fps: 30, kbps: 1_500, codec: Some(VideoCodec::H264) };
+    let (r_a, r_b) = tokio::join!(
+        e.set_golive_quality(&d1.id, DestinationQuality::Custom(q_a)),
+        e.set_golive_quality(&d2.id, DestinationQuality::Custom(q_b)),
+    );
+    let ok_count = usize::from(r_a.is_ok()) + usize::from(r_b.is_ok());
+    assert_eq!(ok_count, 1, "serialized budget must allow only 1 new group beyond main: {r_a:?} / {r_b:?}");
+    assert!(host.started.lock().unwrap().len() <= 2);
+    let _ = GROUP_MAIN;
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f5_delay_switch_wakes_on_encoded_idr_and_clears_route_light() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_LIGHT, GROUP_MAIN, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        delay_s: 30,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host.clone());
+
+    let (p, mut got) = platform("f5").await;
+    let d = e.add_golive_destination("YT", &format!("rtmp://127.0.0.1:{p}/app"), "f5", Canvas::Main).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    while !matches!(timeout(Duration::from_secs(2), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+
+    // Place destination on route_light -> reconcile onto GROUP_LIGHT.
+    e.mark_route_light_for_test(&d.id);
+    e.reconcile_midstream().await;
+    assert_eq!(e.golive_running_group(&d.id).as_deref(), Some(GROUP_LIGHT));
+
+    // Switch quality under delay (target Hub deferred `live.on = false`, emits only `note_encoded_idr`):
+    // switch must succeed quickly AND leave GROUP_LIGHT behind even after subsequent `reconcile`.
+    let q_6m = CustomQuality { width: 1920, height: 1080, fps: 60, kbps: 6_000, codec: Some(VideoCodec::H264) };
+    let mut input = e.golive_planner_input(e.cached_pc_budget());
+    {
+        let pd = input.destinations.iter_mut().find(|x| x.id == d.id).unwrap();
+        pd.quality = DestinationQuality::Custom(q_6m.clone());
+        pd.route_light = false;
+    }
+    let gid_6m = crate::golive::plan_encodes(&input).destinations[&d.id].group_id.clone();
+    host.delay_idr_only_groups.lock().unwrap().insert(gid_6m.clone());
+
+    timeout(Duration::from_secs(2), e.set_golive_quality(&d.id, DestinationQuality::Custom(q_6m)))
+        .await
+        .expect("delay_s encoded IDR wake")
+        .expect("live switch under delay must succeed");
+    assert_eq!(e.golive_running_group(&d.id).as_deref(), Some(gid_6m.as_str()));
+
+    e.reconcile_midstream().await;
+    assert_eq!(
+        e.golive_running_group(&d.id).as_deref(),
+        Some(gid_6m.as_str()),
+        "reconcile must not pull switched destination back onto GROUP_LIGHT"
+    );
+    let _ = GROUP_MAIN;
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn n2_live_switch_drains_old_rtmp_session_before_opening_replacement() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform_exclusive};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host.clone());
+
+    let (port, mut rx) = platform_exclusive("n2-key").await;
+    let d = e
+        .add_golive_destination("Excl", &format!("rtmp://127.0.0.1:{port}/app"), "n2-key", Canvas::Main)
+        .await
+        .unwrap();
+    e.studio_stream(true).await.unwrap();
+    loop {
+        match timeout(Duration::from_secs(2), rx.recv()).await.unwrap().unwrap() {
+            Ok(Got::Publish(_)) => break,
+            Ok(_) => {}
+            Err(why) => panic!("unexpected error on first publish: {why}"),
+        }
+    }
+
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_000, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&d.id, DestinationQuality::Custom(q720)).await.unwrap();
+
+    // Expect old TCP session to close cleanly BEFORE replacement publish arrives with zero overlap!
+    let mut saw_close = false;
+    let mut saw_second_pub = false;
+    for _ in 0..100 {
+        match timeout(Duration::from_secs(2), rx.recv()).await.expect("rtmp activity").expect("open") {
+            Err(why) => panic!("replacement publish overlapped old RTMP session: {why}"),
+            Ok(Got::Closed) => saw_close = true,
+            Ok(Got::Publish(k)) if k == "n2-key" => {
+                assert!(saw_close, "replacement publish arrived before previous connection closed");
+                saw_second_pub = true;
+                break;
+            }
+            Ok(_) => {}
+        }
+    }
+    assert!(saw_second_pub, "replacement forwarder must publish cleanly after drain");
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn n3_vertical_only_keeps_studio_live_and_allows_live_switch() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, GROUP_VERTICAL, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        vertical_on: true,
+        vertical_size: Some((1080, 1920)),
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host.clone());
+
+    let (p_v, mut got_v) = platform("vert-n3").await;
+    let d_v = e
+        .add_golive_destination("Shorts", &format!("rtmp://127.0.0.1:{p_v}/app"), "vert-n3", Canvas::Vertical)
+        .await
+        .unwrap();
+    let only_v: Vec<(String, bool)> =
+        e.golive_config().destinations.into_iter().map(|d| (d.id.clone(), d.id == d_v.id)).collect();
+    e.set_golive_destinations(only_v).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    while !matches!(timeout(Duration::from_secs(2), got_v.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+
+    assert!(!host.started.lock().unwrap().contains_key(crate::golive::GROUP_MAIN), "must be vertical-only");
+    assert!(e.golive_stream_running(), "vertical-only stream must be reported live");
+    assert_eq!(e.golive_running_group(&d_v.id).as_deref(), Some(GROUP_VERTICAL));
+
+    let v_720 = CustomQuality { width: 720, height: 1280, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    e.set_golive_quality(&d_v.id, DestinationQuality::Custom(v_720))
+        .await
+        .expect("live switch on vertical-only stream must not treat stream as OBS");
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn n4_sequence_header_alone_does_not_satisfy_await_hub_idr() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    e.set_keyframe_wait_timeout_for_test(Duration::from_millis(40));
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host.clone());
+
+    let (p, mut got) = platform("n4").await;
+    let d = e.add_golive_destination("YT", &format!("rtmp://127.0.0.1:{p}/app"), "n4", Canvas::Main).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    while !matches!(timeout(Duration::from_secs(2), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+
+    let q_hdr = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let mut input = e.golive_planner_input(e.cached_pc_budget());
+    input.destinations.iter_mut().find(|x| x.id == d.id).unwrap().quality = DestinationQuality::Custom(q_hdr.clone());
+    let gid = crate::golive::plan_encodes(&input).destinations[&d.id].group_id.clone();
+    host.header_only_groups.lock().unwrap().insert(gid.clone());
+
+    let err = e.set_golive_quality(&d.id, DestinationQuality::Custom(q_hdr)).await.unwrap_err();
+    assert!(matches!(err, EngineError::Refused { code: "golive_switch_timeout", .. }), "{err:?}");
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn n6_pause_ignores_destination_actively_switching_quality() {
+    use crate::golive::{Canvas, CustomQuality, DestinationQuality, VideoCodec};
+    use ferrocast_testkit::rtmp::{Got, platform};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    e.set_keyframe_wait_timeout_for_test(Duration::from_secs(2));
+    let host = Arc::new(MultiGroupHost::default());
+    *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        video_kbps: 9_000,
+        ..Default::default()
+    };
+    *host.budget_info.lock().unwrap() = Some(crate::studio_host::HostBudgetInfo {
+        os: "macos".into(),
+        encoder_id: "com.apple.videotoolbox.videoencoder.ave.avc".into(),
+        engines: Some(2),
+        cpu_cores: 10,
+        host_sig: "mac-m2".into(),
+        ..Default::default()
+    });
+    e.set_studio_host(host.clone());
+
+    let (p, mut got) = platform("n6").await;
+    let d = e.add_golive_destination("Kick", &format!("rtmp://127.0.0.1:{p}/app"), "n6", Canvas::Main).await.unwrap();
+    e.studio_stream(true).await.unwrap();
+    while !matches!(timeout(Duration::from_secs(2), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let mut input = e.golive_planner_input(e.cached_pc_budget());
+    input.destinations.iter_mut().find(|x| x.id == d.id).unwrap().quality = DestinationQuality::Custom(q720.clone());
+    let gid = crate::golive::plan_encodes(&input).destinations[&d.id].group_id.clone();
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    host.idr_gate.lock().unwrap().insert(gid.clone(), gate.clone());
+    let e_clone = e.clone();
+    let d_id = d.id.clone();
+    let sw = tokio::spawn(async move { e_clone.set_golive_quality(&d_id, DestinationQuality::Custom(q720)).await });
+    for _ in 0..100 {
+        if host.started.lock().unwrap().contains_key(&gid) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    e.pause(d.id.clone(), "YT".into());
+    assert!(
+        e.golive_running_group(&d.id).is_some(),
+        "pause during in-flight switch must not evict active forwarder mid-switch"
+    );
+    let view_mid = e.golive_view().await;
+    assert!(!matches!(
+        view_mid.destinations.iter().find(|x| x.id == d.id).unwrap().health.as_ref().map(|h| &h.state),
+        Some(ferrocast_golive::PushState::Paused { .. })
+    ));
+    gate.notify_waiters();
+    sw.await.unwrap().unwrap();
+    assert!(
+        e.golive_running_group(&d.id).is_some(),
+        "pause during in-flight switch must not pause/evict switching destination"
+    );
+    let view_after = e.golive_view().await;
+    assert!(!matches!(
+        view_after.destinations.iter().find(|x| x.id == d.id).unwrap().health.as_ref().map(|h| &h.state),
+        Some(ferrocast_golive::PushState::Paused { .. })
+    ));
+    e.studio_stream(false).await.unwrap();
 }

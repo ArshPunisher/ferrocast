@@ -592,8 +592,10 @@ async fn platform_failing_during_start_gives_up_and_stops_studio_live() {
         Some(PushState::Failed { attempts, reason, detail, refused }) => {
             assert_eq!(attempts, DEFAULT_MAX_ATTEMPTS);
             assert!(refused);
-            assert!(reason.contains("Kick refused"), "{reason}");
-            assert!(detail.as_deref().is_some_and(|d| d.contains("Allow multistreaming")), "{detail:?}");
+            assert_eq!(reason, "Kick closed the stream.");
+            let d = detail.as_deref().unwrap_or("");
+            assert!(!d.contains("Allow multistreaming"), "{d}");
+            assert!(d.contains("stream key"), "{d}");
         }
         other => panic!("Kick should have given up, stopped Studio LIVE, and ended the Show: {other:?}"),
     }

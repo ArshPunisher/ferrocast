@@ -106,6 +106,101 @@ pub async fn platform_dropping(key: &'static str, after: Duration) -> (u16, mpsc
     (port, rx)
 }
 
+/// A fake platform on 127.0.0.1 that enforces single-publisher exclusivity on `key`:
+/// an overlapping `publish` before the previous TCP session closes is rejected with `BadName`
+/// and recorded as `Err("overlap")`.
+pub async fn platform_exclusive(key: &'static str) -> (u16, mpsc::UnboundedReceiver<Result<Got, &'static str>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let busy = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let tx = tx.clone();
+            let busy = busy.clone();
+            tokio::spawn(async move {
+                let _ = serve_exclusive(&mut sock, key, &busy, &tx).await;
+                let _ = tx.send(Ok(Got::Closed));
+            });
+        }
+    });
+    (port, rx)
+}
+
+async fn serve_exclusive(
+    sock: &mut TcpStream,
+    key: &str,
+    busy: &std::sync::atomic::AtomicBool,
+    tx: &mpsc::UnboundedSender<Result<Got, &'static str>>,
+) -> Option<()> {
+    use std::sync::atomic::Ordering;
+    struct Release<'a>(&'a std::sync::atomic::AtomicBool, bool);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            if self.1 {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+    }
+    let rest = handshake(sock, PeerType::Server).await?;
+    let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;
+    let mut queue = first;
+    queue.extend(s.handle_input(&rest).ok()?);
+    let mut buf = vec![0u8; 65536];
+    let mut guard = Release(busy, false);
+    loop {
+        while !queue.is_empty() {
+            for r in std::mem::take(&mut queue) {
+                match r {
+                    ServerSessionResult::OutboundResponse(p) => sock.write_all(&p.bytes).await.ok()?,
+                    ServerSessionResult::RaisedEvent(ev) => match ev {
+                        ServerSessionEvent::ConnectionRequested { request_id, .. } => {
+                            queue.extend(s.accept_request(request_id).ok()?)
+                        }
+                        ServerSessionEvent::PublishStreamRequested { request_id, stream_key, .. } => {
+                            if stream_key != key {
+                                for r in s.reject_request(request_id, "NetStream.Publish.BadName", "bad key").ok()? {
+                                    if let ServerSessionResult::OutboundResponse(p) = r {
+                                        sock.write_all(&p.bytes).await.ok()?;
+                                    }
+                                }
+                                return None;
+                            }
+                            if busy.swap(true, Ordering::AcqRel) {
+                                let _ = tx.send(Err("overlap"));
+                                for r in
+                                    s.reject_request(request_id, "NetStream.Publish.BadName", "already live").ok()?
+                                {
+                                    if let ServerSessionResult::OutboundResponse(p) = r {
+                                        sock.write_all(&p.bytes).await.ok()?;
+                                    }
+                                }
+                                return None;
+                            }
+                            guard.1 = true;
+                            let _ = tx.send(Ok(Got::Publish(stream_key)));
+                            queue.extend(s.accept_request(request_id).ok()?);
+                        }
+                        ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+                            let _ = tx.send(Ok(Got::Video(timestamp.value, data)));
+                        }
+                        ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
+                            let _ = tx.send(Ok(Got::Audio(timestamp.value, data)));
+                        }
+                        _ => {}
+                    },
+                    ServerSessionResult::UnhandleableMessageReceived(_) => {}
+                }
+            }
+        }
+        let n = sock.read(&mut buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        queue.extend(s.handle_input(&buf[..n]).ok()?);
+    }
+}
+
 async fn serve(sock: &mut TcpStream, key: &str, tx: &mpsc::UnboundedSender<Got>) -> Option<()> {
     let rest = handshake(sock, PeerType::Server).await?;
     let (mut s, first) = ServerSession::new(ServerSessionConfig::new()).ok()?;

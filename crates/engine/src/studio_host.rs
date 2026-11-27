@@ -3211,10 +3211,14 @@ impl Engine {
         let multi = if running && !self.golive_uses_encode_groups() {
             None
         } else {
+            if !running && host.supports_encode_groups() {
+                self.set_studio_live(true);
+            }
             match self.try_start_studio_encode_groups(&host, &budget).await {
                 Ok(m) => m,
                 Err(e) => {
                     if !running {
+                        self.stop_all_studio_encode_groups().await;
                         *crate::golive::lock_enhanced(self) = None;
                         self.set_studio_live(false);
                     }
