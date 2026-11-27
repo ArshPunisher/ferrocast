@@ -4031,7 +4031,8 @@ async fn n6_pause_ignores_destination_actively_switching_quality() {
     use tokio::time::{Duration, timeout};
 
     let (e, _dir) = engine().await;
-    e.set_keyframe_wait_timeout_for_test(Duration::from_secs(2));
+    // Hang guards only: slow CI runners need seconds to start and switch an encode.
+    e.set_keyframe_wait_timeout_for_test(Duration::from_secs(30));
     let host = Arc::new(MultiGroupHost::default());
     *host.settings.lock().unwrap() = crate::studio_host::StudioSettings {
         width: 1920,
@@ -4053,7 +4054,7 @@ async fn n6_pause_ignores_destination_actively_switching_quality() {
     let (p, mut got) = platform("n6").await;
     let d = e.add_golive_destination("Kick", &format!("rtmp://127.0.0.1:{p}/app"), "n6", Canvas::Main).await.unwrap();
     e.studio_stream(true).await.unwrap();
-    while !matches!(timeout(Duration::from_secs(2), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
+    while !matches!(timeout(Duration::from_secs(30), got.recv()).await.unwrap().unwrap(), Got::Publish(_)) {}
 
     let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
     let mut input = e.golive_planner_input(e.cached_pc_budget());
