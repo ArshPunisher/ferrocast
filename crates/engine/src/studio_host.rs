@@ -2857,7 +2857,7 @@ impl Engine {
         let saved = host.settings().await;
         drop(_lib);
         if !from_auto_config {
-            self.disarm_auto_config_if_output_changed(&saved);
+            self.disarm_auto_config_if_output_changed(&saved).await;
         }
         self.sync_studio_settings_live(&saved, restart.as_deref()).await;
         self.refresh_pc_budget().await;
@@ -3831,7 +3831,7 @@ impl Engine {
         drop(_gate);
         drop(_lib);
         if switched_shelf && kind == "profiles" {
-            self.disarm_auto_config();
+            self.disarm_auto_config().await;
             drop(_auto_op);
             if let Some(host) = &host {
                 let saved = host.settings().await;

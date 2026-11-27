@@ -1375,14 +1375,6 @@ fn active_profile_file(h: &Held, data: &std::path::Path) -> PathBuf {
     h.profile_file.clone().unwrap_or_else(|| settings_file(data))
 }
 
-/// Takes back an entry that was just made, with its file (its switch failed).
-fn forget(data: &std::path::Path, kind: Kind, id: &str) {
-    let mut lib = library::load(data);
-    lib.shelf_mut(kind).list.retain(|e| e.id != id);
-    library::save(data, &lib);
-    ferrocast_store::durable::remove_with_backup(&library::file(data, kind, id));
-}
-
 fn load_prepared_collection(
     canvas: Canvas,
     file: &std::path::Path,
@@ -2873,11 +2865,28 @@ fn shelf_action_result(id: &str, note: Option<String>) -> Value {
     out
 }
 
+fn obsws_snapshot_json(mut base: Value, lib: &library::Library, col_id: Option<&str>, prof_id: Option<&str>) -> Value {
+    let mut collections = lib.collections.clone();
+    if let Some(id) = col_id {
+        collections.current = id.to_string();
+    }
+    let mut profiles = lib.profiles.clone();
+    if let Some(id) = prof_id {
+        profiles.current = id.to_string();
+    }
+    if let Some(o) = base.as_object_mut() {
+        o.insert("collections".into(), json!(collections));
+        o.insert("profiles".into(), json!(profiles));
+    }
+    base
+}
+
 #[derive(Debug, Clone)]
 pub struct DesktopStudio {
     app: AppHandle,
     data: PathBuf,
     shelf_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    library_cache: std::sync::Arc<std::sync::Mutex<Option<library::Library>>>,
 }
 
 fn act_shortcut_epoch(act: &StudioAct) -> Option<u64> {
@@ -2918,7 +2927,12 @@ impl DesktopStudio {
         }
         ferrocast_store::durable::remove_with_backup(&file);
         let _ = SESSION.set(file);
-        let me = DesktopStudio { app, data, shelf_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())) };
+        let me = DesktopStudio {
+            app,
+            data,
+            shelf_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            library_cache: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        };
         let watcher = me.clone();
         tauri::async_runtime::spawn(async move { watcher.session_loop().await });
         let follower = me.clone();
@@ -3045,12 +3059,58 @@ impl DesktopStudio {
         rx.await.map_err(|_| "The window closed.".to_string())
     }
 
+    async fn cached_library(&self) -> library::Library {
+        if let Some(lib) = self.library_cache.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return lib;
+        }
+        let data = self.data.clone();
+        let lib = tokio::task::spawn_blocking(move || library::load(&data)).await.unwrap_or_else(|_| {
+            let mut slot = self.library_cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(cached) = slot.clone() {
+                return cached;
+            }
+            let loaded = library::load(&self.data);
+            *slot = Some(loaded.clone());
+            loaded
+        });
+        *self.library_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(lib.clone());
+        lib
+    }
+
+    async fn load_library_off_main(&self) -> Result<library::Library, String> {
+        let data = self.data.clone();
+        let lib = tokio::task::spawn_blocking(move || library::load(&data)).await.map_err(|e| e.to_string())?;
+        *self.library_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(lib.clone());
+        Ok(lib)
+    }
+
+    async fn save_library_off_main(&self, lib: library::Library) -> Result<(), String> {
+        *self.library_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(lib.clone());
+        let data = self.data.clone();
+        tokio::task::spawn_blocking(move || library::save(&data, &lib)).await.map_err(|e| e.to_string())
+    }
+
+    async fn forget_off_main(&self, kind: Kind, id: String) {
+        let data = self.data.clone();
+        if let Ok(lib) = tokio::task::spawn_blocking(move || {
+            let mut lib = library::load(&data);
+            lib.shelf_mut(kind).list.retain(|e| e.id != id);
+            library::save(&data, &lib);
+            ferrocast_store::durable::remove_with_backup(&library::file(&data, kind, &id));
+            lib
+        })
+        .await
+        {
+            *self.library_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(lib);
+        }
+    }
+
     /// Puts collection or profile `id` in use. Refused while any output is active (stream,
     /// recording, source record, replay, virtual camera, NDI) so switching never orphans or
     /// blacks out live outputs (M9-01). Callers must hold `self.shelf_lock`.
     async fn switch_locked(&self, kind: Kind, id: &str) -> Result<Option<String>, String> {
         let data = self.data.clone();
-        let lib = library::load(&data);
+        let lib = self.load_library_off_main().await?;
         if lib.shelf(kind).get(id).is_none() {
             return Err(format!("There's no {} with the id \"{id}\".", kind.noun()));
         }
@@ -3072,9 +3132,9 @@ impl DesktopStudio {
         match kind {
             Kind::Collections => {
                 swap_collection_off_main(self, data.clone(), Some(id.to_string()), from_fallback, to).await?;
-                let mut lib = library::load(&data);
+                let mut lib = self.load_library_off_main().await?;
                 lib.collections.current = id.to_string();
-                library::save(&data, &lib);
+                self.save_library_off_main(lib).await?;
                 Ok(None)
             }
             Kind::Profiles => {
@@ -3083,9 +3143,9 @@ impl DesktopStudio {
                     .await
                     .map_err(|e| e.to_string())??;
                 let note = self.set_settings_for(next, Some((id.to_string(), to))).await?;
-                let mut lib = library::load(&data);
+                let mut lib = self.load_library_off_main().await?;
                 lib.profiles.current = id.to_string();
-                library::save(&data, &lib);
+                self.save_library_off_main(lib).await?;
                 Ok(note)
             }
         }
@@ -3527,8 +3587,10 @@ impl StudioHost for DesktopStudio {
         }
         let config = self.data.join("studio");
         let data = self.data.clone();
+        let cache = self.library_cache.clone();
         let prep = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let lib = library::load(&data);
+            *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(lib.clone());
             let col_id = lib.collections.current.clone();
             let file = lib.current_file(&data, Kind::Collections);
             let prof_id = lib.profiles.current.clone();
@@ -3644,13 +3706,9 @@ impl StudioHost for DesktopStudio {
         if !running {
             return self.on_main(|h| Self::status_of(h)).await;
         }
-        let lib_data = data.clone();
-        let (to_id, to) = tokio::task::spawn_blocking(move || {
-            let lib = library::load(&lib_data);
-            (lib.collections.current.clone(), lib.current_file(&lib_data, Kind::Collections))
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+        let lib = self.load_library_off_main().await?;
+        let to_id = lib.collections.current.clone();
+        let to = lib.current_file(&data, Kind::Collections);
         swap_collection_off_main(self, data, Some(to_id), from.clone(), to).await?;
         self.on_main(|h| {
             write_session(session_now(h).as_ref());
@@ -4166,26 +4224,66 @@ impl StudioHost for DesktopStudio {
                 .await??;
             return finish_screenshot_job(folder, job).await;
         }
+        if act == StudioAct::Scenes {
+            let lib = self.cached_library().await;
+            let data = self.data.clone();
+            enum ScenesSource {
+                Live(Value),
+                Stopped(PathBuf, String),
+            }
+            match self
+                .on_main(move |h| match &h.collection {
+                    Some(c) => {
+                        let col_id = h.collection_id.clone().unwrap_or(lib.collections.current);
+                        let mut v = run(c, StudioAct::Scenes).map_err(|e| e.to_string())?;
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("collection_id".into(), json!(col_id));
+                        }
+                        Ok(ScenesSource::Live(v))
+                    }
+                    None => {
+                        let file =
+                            h.collection_file.clone().unwrap_or_else(|| lib.current_file(&data, Kind::Collections));
+                        let col_id = h.collection_id.clone().unwrap_or(lib.collections.current);
+                        Ok(ScenesSource::Stopped(file, col_id))
+                    }
+                })
+                .await?
+            {
+                Ok(ScenesSource::Live(v)) => return Ok(v),
+                Ok(ScenesSource::Stopped(file, col_id)) => {
+                    return tokio::task::spawn_blocking(move || {
+                        let saved =
+                            ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
+                        let mut v = saved_scenes(saved.as_ref());
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert("collection_id".into(), json!(col_id));
+                        }
+                        v
+                    })
+                    .await
+                    .map_err(|e| e.to_string());
+                }
+                Err(e) => return Err(e),
+            }
+        }
         let data = self.data.clone();
         let app = self.app.clone();
+        let cache = self.library_cache.clone();
         self.on_main(move |h| {
             if let Some(ep) = act_shortcut_epoch(&act)
                 && !crate::studio_keys::epoch_matches(&app, ep)
             {
                 return Ok(Value::Null);
             }
-            let file = active_collection_file(h, &data);
-            // The Studio off: its scenes from the saved file, so the show, BRB and the scene
-            // switcher can still be set up (owner, 30 Oct: "it's not showing my screens").
-            if act == StudioAct::Scenes && h.collection.is_none() {
-                let saved = ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
-                let mut v = saved_scenes(saved.as_ref());
-                let col_id = h.collection_id.clone().unwrap_or_else(|| library::load(&data).collections.current);
-                if let Some(o) = v.as_object_mut() {
-                    o.insert("collection_id".into(), json!(col_id));
-                }
-                return Ok(v);
-            }
+            let file = h.collection_file.clone().unwrap_or_else(|| {
+                cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                    .unwrap_or_else(|| library::load(&data))
+                    .current_file(&data, Kind::Collections)
+            });
             if let StudioAct::Select { scene, id, frames, also, guides } = &act {
                 h.selected = scene.clone().zip(*id).map(|(s, id)| {
                     let mut ids = vec![id];
@@ -4241,9 +4339,8 @@ impl StudioHost for DesktopStudio {
                     }
                 }
             }
-            let is_scenes = act == StudioAct::Scenes;
             let c = h.collection.as_ref().ok_or(STOPPED)?;
-            let mut out = run(c, act).map_err(|e| e.to_string());
+            let out = run(c, act).map_err(|e| e.to_string());
             if turns_vertical {
                 let _ = make_vertical_view(ViewCtx::App(&app), h);
             }
@@ -4255,13 +4352,6 @@ impl StudioHost for DesktopStudio {
             if changes && out.is_ok() {
                 save_confirmed(h.collection_deferred, c, &file);
                 refresh_projectors(h);
-            }
-            if is_scenes
-                && let Ok(ref mut v) = out
-                && let Some(o) = v.as_object_mut()
-            {
-                let col_id = h.collection_id.clone().unwrap_or_else(|| library::load(&data).collections.current);
-                o.insert("collection_id".into(), json!(col_id));
             }
             out
         })
@@ -4282,8 +4372,20 @@ impl StudioHost for DesktopStudio {
 
     async fn stats(&self) -> Result<Value, String> {
         let data = self.data.clone();
+        let cache = self.library_cache.clone();
         self.on_main(move |h| {
-            let collection_file = active_collection_file(h, &data);
+            let (collection_file, col_id, prof_id) = match (&h.collection_file, &h.collection_id, &h.profile_id) {
+                (Some(f), Some(c), Some(p)) => (f.clone(), c.clone(), p.clone()),
+                _ => {
+                    let lib =
+                        cache.lock().unwrap_or_else(|p| p.into_inner()).clone().unwrap_or_else(|| library::load(&data));
+                    (
+                        h.collection_file.clone().unwrap_or_else(|| lib.current_file(&data, Kind::Collections)),
+                        h.collection_id.clone().unwrap_or(lib.collections.current),
+                        h.profile_id.clone().unwrap_or(lib.profiles.current),
+                    )
+                }
+            };
             let studio = h.collection.as_ref().ok_or(STOPPED)?;
             // The page asks for stats every second, so scenes held for the grid's pictures
             // are let go soon after it closes.
@@ -4347,16 +4449,6 @@ impl StudioHost for DesktopStudio {
                 "remux": REMUX.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             });
             let cycles = h.collection.as_ref().map(|c| c.sidechain_cycles()).unwrap_or_default();
-            let (col_id, prof_id) = match (&h.collection_id, &h.profile_id) {
-                (Some(c), Some(p)) => (c.clone(), p.clone()),
-                _ => {
-                    let lib = library::load(&data);
-                    (
-                        h.collection_id.clone().unwrap_or(lib.collections.current),
-                        h.profile_id.clone().unwrap_or(lib.profiles.current),
-                    )
-                }
-            };
             if let Some(o) = out.as_object_mut() {
                 o.insert("collection_id".into(), json!(col_id));
                 o.insert("profile_id".into(), json!(prof_id));
@@ -4378,8 +4470,8 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn obsws_snapshot(&self) -> Option<Result<Value, String>> {
-        Some(
-            self.on_main(|h| {
+        let (base, col_id, prof_id) = match self
+            .on_main(|h| -> Result<_, String> {
                 let c = h.collection.as_ref().ok_or(STOPPED)?;
                 let program = c.current();
                 let preview = c.preview_scene();
@@ -4395,30 +4487,39 @@ impl StudioHost for DesktopStudio {
                 {
                     scene_items.push(json!({ "scene": p, "items": items }));
                 }
-                Ok(json!({
-                    "program": program,
-                    "preview": preview,
-                    "stream": any_stream_group_active(h),
-                    "record": h.record.as_ref().map(|r| {
-                        let st = r.0.record_stats();
-                        json!({
-                            "active": st.active,
-                            "paused": st.paused,
-                            "file": r.1.display().to_string(),
-                        })
+                Ok((
+                    json!({
+                        "program": program,
+                        "preview": preview,
+                        "stream": any_stream_group_active(h),
+                        "record": h.record.as_ref().map(|r| {
+                            let st = r.0.record_stats();
+                            json!({
+                                "active": st.active,
+                                "paused": st.paused,
+                                "file": r.1.display().to_string(),
+                            })
+                        }),
+                        "replay": h.replay.as_ref().map(|r| json!({
+                            "active": r.active(),
+                            "last": r.last_replay().map(|p| p.display().to_string()),
+                        })),
+                        "vcam": h.virtualcam.as_ref().is_some_and(|vc| vc.active()),
+                        "inputs": c.all_audio(),
+                        "scene_items": scene_items,
                     }),
-                    "replay": h.replay.as_ref().map(|r| json!({
-                        "active": r.active(),
-                        "last": r.last_replay().map(|p| p.display().to_string()),
-                    })),
-                    "vcam": h.virtualcam.as_ref().is_some_and(|vc| vc.active()),
-                    "inputs": c.all_audio(),
-                    "scene_items": scene_items,
-                }))
+                    h.collection_id.clone(),
+                    h.profile_id.clone(),
+                ))
             })
             .await
-            .and_then(|r| r),
-        )
+        {
+            Ok(Ok(parts)) => parts,
+            Ok(Err(e)) => return Some(Err(e)),
+            Err(e) => return Some(Err(e)),
+        };
+        let lib = self.cached_library().await;
+        Some(Ok(obsws_snapshot_json(base, &lib, col_id.as_deref(), prof_id.as_deref())))
     }
 
     async fn stalled_sources(&self) -> Vec<(String, bool)> {
@@ -5198,21 +5299,21 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         let missing = |id: &str| format!("There's no {} with the id \"{id}\".", kind.noun());
         match act {
-            ShelfAct::List => Ok(json!(library::load(&data).shelf(kind))),
+            ShelfAct::List => Ok(json!(self.load_library_off_main().await?.shelf(kind))),
             ShelfAct::Rename { id, name } => {
                 let name = library::check_name(&name)?;
-                let mut lib = library::load(&data);
+                let mut lib = self.load_library_off_main().await?;
                 let shelf = lib.shelf_mut(kind);
                 if shelf.list.iter().any(|e| e.id != id && e.name.eq_ignore_ascii_case(&name)) {
                     return Err(format!("There's already a {} called \"{name}\".", kind.noun()));
                 }
                 let entry = shelf.list.iter_mut().find(|e| e.id == id).ok_or_else(|| missing(&id))?;
                 entry.name = name;
-                library::save(&data, &lib);
+                self.save_library_off_main(lib).await?;
                 Ok(Value::Null)
             }
             ShelfAct::Remove { id } => {
-                let mut lib = library::load(&data);
+                let mut lib = self.load_library_off_main().await?;
                 let shelf = lib.shelf_mut(kind);
                 let entry = shelf.get(&id).ok_or_else(|| missing(&id))?.clone();
                 if shelf.current == id {
@@ -5233,11 +5334,11 @@ impl StudioHost for DesktopStudio {
                     let _ = ferrocast_store::durable::remove_patiently(&ferrocast_store::durable::backup_path(&file));
                 })
                 .await;
-                library::save(&data, &lib);
+                self.save_library_off_main(lib).await?;
                 Ok(Value::Null)
             }
             ShelfAct::Export { id } => {
-                let lib = library::load(&data);
+                let lib = self.load_library_off_main().await?;
                 let entry = lib.shelf(kind).get(&id).ok_or_else(|| missing(&id))?.clone();
                 let file = library::file(&data, kind, &id);
                 if kind == Kind::Collections && lib.collections.current == id {
@@ -5251,10 +5352,16 @@ impl StudioHost for DesktopStudio {
                     })
                     .await?;
                 }
-                let doc = ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
-                if doc.is_none() && (file.exists() || ferrocast_store::durable::backup_path(&file).exists()) {
-                    return Err(format!("Couldn't read the {} file cleanly.", kind.noun()));
-                }
+                let doc = tokio::task::spawn_blocking(move || -> Result<Option<Value>, String> {
+                    let doc =
+                        ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
+                    if doc.is_none() && (file.exists() || ferrocast_store::durable::backup_path(&file).exists()) {
+                        return Err(format!("Couldn't read the {} file cleanly.", kind.noun()));
+                    }
+                    Ok(doc)
+                })
+                .await
+                .map_err(|e| e.to_string())??;
                 Ok(match (kind, doc) {
                     (_, Some(mut d)) => {
                         if kind == Kind::Collections
@@ -5272,7 +5379,7 @@ impl StudioHost for DesktopStudio {
             }
             ShelfAct::New { name, copy } => {
                 let name = library::check_name(&name)?;
-                let mut lib = library::load(&data);
+                let mut lib = self.load_library_off_main().await?;
                 if lib.shelf(kind).list.iter().any(|e| e.name.eq_ignore_ascii_case(&name)) {
                     return Err(format!("There's already a {} called \"{name}\".", kind.noun()));
                 }
@@ -5290,26 +5397,31 @@ impl StudioHost for DesktopStudio {
                         .await?;
                     }
                     let to = library::file(&data, kind, &id);
-                    if let Some(loaded) = ferrocast_store::durable::load_json_with_backup::<Value>(&from, |_| true) {
-                        let bytes = serde_json::to_vec_pretty(&loaded.value).map_err(|e| e.to_string())?;
-                        // Off the async runtime (a locked file is waited out), and still
-                        // synchronous: the copy is switched to right after, and a failure is
-                        // this request's answer.
-                        tokio::task::spawn_blocking(move || ferrocast_store::durable::write_json_bytes(&to, &bytes))
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .map_err(|e| format!("The copy couldn't be made: {e}"))?;
-                    } else if from.exists() || ferrocast_store::durable::backup_path(&from).exists() {
-                        return Err(format!("Couldn't read the {} file cleanly.", kind.noun()));
-                    }
+                    let noun = kind.noun();
+                    tokio::task::spawn_blocking(move || -> Result<(), String> {
+                        if let Some(loaded) = ferrocast_store::durable::load_json_with_backup::<Value>(&from, |_| true)
+                        {
+                            let bytes = serde_json::to_vec_pretty(&loaded.value).map_err(|e| e.to_string())?;
+                            // Off the async runtime (a locked file is waited out), and still
+                            // synchronous: the copy is switched to right after, and a failure is
+                            // this request's answer.
+                            ferrocast_store::durable::write_json_bytes(&to, &bytes)
+                                .map_err(|e| format!("The copy couldn't be made: {e}"))?;
+                        } else if from.exists() || ferrocast_store::durable::backup_path(&from).exists() {
+                            return Err(format!("Couldn't read the {noun} file cleanly."));
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
                 }
                 lib.shelf_mut(kind).list.push(library::Entry { id: id.clone(), name });
-                library::save(&data, &lib);
+                self.save_library_off_main(lib).await?;
                 let note = match self.switch_locked(kind, &id).await {
                     Ok(note) => note,
                     Err(e) => {
                         // Not half made: a retry with the same name works.
-                        forget(&data, kind, &id);
+                        self.forget_off_main(kind, id).await;
                         return Err(e);
                     }
                 };
@@ -5321,24 +5433,30 @@ impl StudioHost for DesktopStudio {
             }
             ShelfAct::Import { name, mut doc } => {
                 let name = library::check_name(&name)?;
-                let mut lib = library::load(&data);
+                let mut lib = self.load_library_off_main().await?;
                 let previous_id = lib.collections.current.clone();
                 let name = lib.collections.free_name(&name);
                 let id = lib.collections.new_id(&name);
-                // OBS's Browser sources become Web page sources here; note kinds this OBS lacks.
-                let (known_inputs, _) = ferrocast_studio::import_preview::supported_kinds();
-                let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
-                let mut report = ferrocast_studio::import::convert(&mut doc, web, Some(&known_inputs));
-                report.name = name.clone();
-                if let Some(o) = doc.as_object_mut() {
-                    o.insert("name".into(), json!(name));
-                }
                 let file = library::file(&data, Kind::Collections, &id);
-                save_json(&file, &doc);
+                let import_name = name.clone();
+                let report = tokio::task::spawn_blocking(move || {
+                    // OBS's Browser sources become Web page sources here; note kinds this OBS lacks.
+                    let (known_inputs, _) = ferrocast_studio::import_preview::supported_kinds();
+                    let web = cfg!(target_os = "macos").then_some(ferrocast_studio::WEB_PAGE_KIND);
+                    let mut report = ferrocast_studio::import::convert(&mut doc, web, Some(&known_inputs));
+                    report.name = import_name.clone();
+                    if let Some(o) = doc.as_object_mut() {
+                        o.insert("name".into(), json!(import_name));
+                    }
+                    save_json(&file, &doc);
+                    report
+                })
+                .await
+                .map_err(|e| e.to_string())?;
                 lib.collections.list.push(library::Entry { id: id.clone(), name });
-                library::save(&data, &lib);
+                self.save_library_off_main(lib).await?;
                 if let Err(e) = self.switch_locked(Kind::Collections, &id).await {
-                    forget(&data, Kind::Collections, &id);
+                    self.forget_off_main(Kind::Collections, id).await;
                     return Err(e);
                 }
                 let mut v = serde_json::to_value(&report).map_err(|e| e.to_string())?;
@@ -9790,5 +9908,32 @@ mod collection_profile_tests {
             ui_handle.join().unwrap();
             ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
         });
+    }
+
+    #[test]
+    fn col22_obsws_snapshot_includes_collections_and_profiles_with_held_current() {
+        let lib = library::Library {
+            collections: library::Shelf {
+                current: "a".into(),
+                list: vec![
+                    library::Entry { id: "a".into(), name: "Alpha".into() },
+                    library::Entry { id: "b".into(), name: "Beta".into() },
+                ],
+            },
+            profiles: library::Shelf {
+                current: "p1".into(),
+                list: vec![
+                    library::Entry { id: "p1".into(), name: "MainProfile".into() },
+                    library::Entry { id: "p2".into(), name: "AltProfile".into() },
+                ],
+            },
+        };
+
+        let base = json!({ "program": "Main", "preview": null });
+        let out = obsws_snapshot_json(base, &lib, Some("b"), Some("p2"));
+        assert_eq!(out["collections"]["current"], json!("b"));
+        assert_eq!(out["collections"]["list"].as_array().unwrap().len(), 2);
+        assert_eq!(out["profiles"]["current"], json!("p2"));
+        assert_eq!(out["profiles"]["list"].as_array().unwrap().len(), 2);
     }
 }
