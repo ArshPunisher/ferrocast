@@ -3357,7 +3357,10 @@ async fn golive_quality_options_and_put_quality_cover_every_status_code() {
     assert_eq!(h1.await.unwrap().unwrap().status(), StatusCode::OK);
     r.engine.studio_stream(false).await.unwrap();
 
-    // 422 OBS live mode refusal (`golive_needs_new_encode`).
+    // 422 OBS live mode refusal (`golive_needs_new_encode`), even when Studio settings default to 30 fps
+    // and the request specifies a 60 fps Custom preset.
+    *host.settings.lock().unwrap() =
+        StudioSettings { width: 1920, height: 1080, fps: 30, video_kbps: 6_000, ..Default::default() };
     r.engine.start_golive(0).await;
     let ing: Value = r.get("/api/v1/golive/ingest").await.json().await.unwrap();
     let key = ing["key"].as_str().unwrap();
@@ -3371,4 +3374,11 @@ async fn golive_quality_options_and_put_quality_cover_every_status_code() {
     let obs_422 =
         r.put(&format!("/api/v1/golive/destinations/{c1_id}/quality"), json!({ "mode": "same_as_main" })).await;
     assert_eq!(error_code(obs_422).await, (StatusCode::UNPROCESSABLE_ENTITY, "golive_needs_new_encode".into()));
+    let obs_422_custom = r
+        .put(
+            &format!("/api/v1/golive/destinations/{c1_id}/quality"),
+            json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 60, "kbps": 4500, "codec": "h264" }),
+        )
+        .await;
+    assert_eq!(error_code(obs_422_custom).await, (StatusCode::UNPROCESSABLE_ENTITY, "golive_needs_new_encode".into()));
 }
