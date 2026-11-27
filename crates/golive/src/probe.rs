@@ -538,8 +538,25 @@ pub struct CustomQuality {
     pub codec: Option<VideoCodec>,
 }
 
+/// Categorized failure from [`CustomQuality::validate_typed`] distinguishing request-shape/field
+/// errors (`400`) from platform ceiling refusals (`422`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomQualityError {
+    Field(String),
+    PlatformLimit(String),
+}
+
+impl CustomQualityError {
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Field(m) | Self::PlatformLimit(m) => m,
+        }
+    }
+}
+
 impl CustomQuality {
-    /// Validates user-supplied quality against the canvas bounds and optional platform ceiling.
+    /// Validates user-supplied quality against the canvas bounds and optional platform ceiling,
+    /// returning a flat message.
     pub fn validate(
         &self,
         canvas: Canvas,
@@ -549,8 +566,23 @@ impl CustomQuality {
         limit: Option<&PlatformLimit>,
         ignore_service_limits: bool,
     ) -> Result<(), String> {
+        self.validate_typed(canvas, canvas_width, canvas_height, canvas_fps, limit, ignore_service_limits)
+            .map_err(CustomQualityError::into_message)
+    }
+
+    /// Validates user-supplied quality while distinguishing field/canvas bounds errors from
+    /// platform-limit violations.
+    pub fn validate_typed(
+        &self,
+        canvas: Canvas,
+        canvas_width: u32,
+        canvas_height: u32,
+        canvas_fps: u32,
+        limit: Option<&PlatformLimit>,
+        ignore_service_limits: bool,
+    ) -> Result<(), CustomQualityError> {
         if canvas_width < 2 || canvas_height < 2 || canvas_fps == 0 {
-            return Err("Canvas resolution and frame rate must be positive.".into());
+            return Err(CustomQualityError::Field("Canvas resolution and frame rate must be positive.".into()));
         }
         if self.width < 2
             || self.height < 2
@@ -559,54 +591,73 @@ impl CustomQuality {
             || self.width.min(self.height) < 72
             || self.width.max(self.height) < 128
         {
-            return Err("Resolution must use even dimensions of at least 128×72 (or 72×128).".into());
-        }
-        if self.width > canvas_width || self.height > canvas_height {
-            return Err(format!(
-                "Resolution {}×{} cannot exceed the {}×{} canvas.",
-                self.width, self.height, canvas_width, canvas_height
+            return Err(CustomQualityError::Field(
+                "Resolution must use even dimensions of at least 128×72 (or 72×128).".into(),
             ));
         }
+        if self.width > canvas_width || self.height > canvas_height {
+            return Err(CustomQualityError::Field(format!(
+                "Resolution {}×{} cannot exceed the {}×{} canvas.",
+                self.width, self.height, canvas_width, canvas_height
+            )));
+        }
         if canvas == Canvas::Vertical && self.height <= self.width {
-            return Err("Vertical destinations require portrait dimensions (height > width).".into());
+            return Err(CustomQualityError::Field(
+                "Vertical destinations require portrait dimensions (height > width).".into(),
+            ));
         }
         if self.fps == 0 || self.fps > canvas_fps {
-            return Err(format!("FPS ({}) cannot exceed canvas FPS ({canvas_fps}).", self.fps));
+            return Err(CustomQualityError::Field(format!(
+                "FPS ({}) cannot exceed canvas FPS ({canvas_fps}).",
+                self.fps
+            )));
         }
         if !canvas_fps.is_multiple_of(self.fps) {
-            return Err(format!("FPS ({}) must divide canvas FPS ({canvas_fps}) evenly.", self.fps));
+            return Err(CustomQualityError::Field(format!(
+                "FPS ({}) must divide canvas FPS ({canvas_fps}) evenly.",
+                self.fps
+            )));
         }
         if !(MIN_CUSTOM_KBPS..=MAX_CUSTOM_KBPS).contains(&self.kbps) {
-            return Err(format!("Bitrate must be between {MIN_CUSTOM_KBPS} and {MAX_CUSTOM_KBPS} kbps."));
+            return Err(CustomQualityError::Field(format!(
+                "Bitrate must be between {MIN_CUSTOM_KBPS} and {MAX_CUSTOM_KBPS} kbps."
+            )));
         }
         if self.codec == Some(VideoCodec::Vp9) {
-            return Err("VP9 is not supported for streaming output.".into());
+            return Err(CustomQualityError::Field("VP9 is not supported for streaming output.".into()));
         }
         if !ignore_service_limits && let Some(lim) = limit {
             if !lim.allows_resolution(self.width, self.height) {
-                return Err(format!(
+                return Err(CustomQualityError::PlatformLimit(format!(
                     "{} accepts at most {}×{} (or {}×{}).",
                     lim.name, lim.max_long_edge, lim.max_short_edge, lim.max_short_edge, lim.max_long_edge
-                ));
+                )));
             }
             if self.fps > lim.max_fps {
-                return Err(format!("{} accepts at most {} fps.", lim.name, lim.max_fps));
+                return Err(CustomQualityError::PlatformLimit(format!(
+                    "{} accepts at most {} fps.",
+                    lim.name, lim.max_fps
+                )));
             }
             let max_kbps = lim.max_kbps_for(self.width, self.height, self.fps);
             if self.kbps > max_kbps {
-                return Err(format!(
+                return Err(CustomQualityError::PlatformLimit(format!(
                     "{} accepts at most {} at {}×{}@{} fps.",
                     lim.name,
                     kbps_text(max_kbps),
                     self.width,
                     self.height,
                     self.fps
-                ));
+                )));
             }
             if let Some(c) = self.codec
                 && !lim.allows_codec(c)
             {
-                return Err(format!("{} does not support {}.", lim.name, codec_name(c)));
+                return Err(CustomQualityError::PlatformLimit(format!(
+                    "{} does not support {}.",
+                    lim.name,
+                    codec_name(c)
+                )));
             }
         }
         Ok(())
@@ -1638,6 +1689,18 @@ mod tests {
                 "expected rejection for {width}x{height}@{fps} {kbps} kbps {codec:?}"
             );
         }
+
+        // verify Field vs PlatformLimit distinction in validate_typed
+        let over_res = CustomQuality { width: 2560, height: 1440, fps: 60, kbps: 8_000, codec: None };
+        assert!(matches!(
+            over_res.validate_typed(Canvas::Main, 2560, 1440, 60, Some(&kick_lim), false),
+            Err(CustomQualityError::PlatformLimit(_))
+        ));
+        let bad_odd = CustomQuality { width: 1919, height: 1080, fps: 60, kbps: 6_000, codec: None };
+        assert!(matches!(
+            bad_odd.validate_typed(Canvas::Main, 2560, 1440, 60, Some(&kick_lim), false),
+            Err(CustomQualityError::Field(_))
+        ));
 
         // ignore_service_limits allows over-platform custom quality as long as canvas bounds hold.
         let over_kick = DestinationQuality::Custom(CustomQuality {
