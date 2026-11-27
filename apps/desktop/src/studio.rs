@@ -58,6 +58,8 @@ struct TestView {
 
 #[cfg(test)]
 #[derive(Debug)]
+// Off macOS and Windows the real view is an empty stub, so the test variant is the big one.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(clippy::large_enum_variant))]
 enum Preview {
     #[allow(dead_code)]
     Real(ferrocast_studio::stage::StageView),
