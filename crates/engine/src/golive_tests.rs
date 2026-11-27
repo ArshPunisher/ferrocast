@@ -4065,12 +4065,15 @@ async fn n6_pause_ignores_destination_actively_switching_quality() {
     let e_clone = e.clone();
     let d_id = d.id.clone();
     let sw = tokio::spawn(async move { e_clone.set_golive_quality(&d_id, DestinationQuality::Custom(q720)).await });
-    for _ in 0..100 {
-        if host.started.lock().unwrap().contains_key(&gid) {
-            break;
+    // Wait for the switch to start its group (only a hang guard bounds it: a slow CI machine
+    // needs more than a fixed number of yields).
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !host.started.lock().unwrap().contains_key(&gid) {
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("the switch never started its encode group");
 
     e.pause(d.id.clone(), "YT".into());
     assert!(
@@ -4082,7 +4085,8 @@ async fn n6_pause_ignores_destination_actively_switching_quality() {
         view_mid.destinations.iter().find(|x| x.id == d.id).unwrap().health.as_ref().map(|h| &h.state),
         Some(ferrocast_golive::PushState::Paused { .. })
     ));
-    gate.notify_waiters();
+    // A stored permit: the gated pump may not be waiting yet.
+    gate.notify_one();
     sw.await.unwrap().unwrap();
     assert!(
         e.golive_running_group(&d.id).is_some(),
