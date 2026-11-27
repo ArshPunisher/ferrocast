@@ -744,17 +744,60 @@ fn main_stream_stats(h: &Held) -> Option<(&Streaming, Option<std::time::Instant>
         .or_else(|| h.lstream.as_ref().filter(|s| s.stats().active).map(|s| (s, h.stream_started)))
 }
 
+fn record_encode_for_group_spec(
+    s: &StudioSettings,
+    cap: Option<StreamCap>,
+    main_spec: Option<&EncodeGroupSpec>,
+) -> EncodeSettings {
+    if s.record_quality == "stream"
+        && let Some(spec) = main_spec
+        && spec.extra_tracks.is_empty()
+        && !spec.vod_track
+        && spec.key.fps == s.fps
+        && spec.key.fps_ntsc == s.fps_ntsc
+    {
+        let enc = stream_settings_for_group(s, spec).encode;
+        if enc.scale.is_none() {
+            return enc;
+        }
+    }
+    record_encode_capped(s, cap)
+}
+
 fn record_encode_for_stream(
     s: &StudioSettings,
     cap: Option<StreamCap>,
     main_group: Option<&GroupSlot>,
 ) -> EncodeSettings {
-    if s.record_quality == "stream"
-        && let Some(g) = main_group.filter(|g| g.output.stats().active)
-    {
-        return EncodeSettings { scale: None, ..stream_settings_for_group(s, &g.spec).encode };
+    record_encode_for_group_spec(s, cap, main_group.filter(|g| g.output.stats().active).map(|g| &g.spec))
+}
+
+fn apply_main_slot_bitrate_on_spec(spec: &mut EncodeGroupSpec, live_pct: Option<u8>, video_kbps: u32) -> u32 {
+    let k = at_pct(video_kbps, live_pct);
+    spec.key.kbps = k;
+    k
+}
+
+fn next_main_spec_for_settings(
+    spec: &EncodeGroupSpec,
+    s: &StudioSettings,
+    live_pct: Option<u8>,
+    was: Option<&StudioSettings>,
+) -> EncodeGroupSpec {
+    let mut next = spec.clone();
+    if was.is_none_or(|o| spec.key.width == o.width && spec.key.height == o.height) {
+        next.key.width = s.width;
+        next.key.height = s.height;
     }
-    record_encode_capped(s, cap)
+    if was.is_none_or(|o| spec.key.fps == o.fps && spec.key.fps_ntsc == o.fps_ntsc) || s.fps < spec.key.fps {
+        next.key.fps = s.fps;
+        next.key.fps_ntsc = s.fps_ntsc;
+    }
+    next.key.kbps = match was {
+        Some(o) if spec.key.kbps < at_pct(o.video_kbps, live_pct) => spec.key.kbps.min(at_pct(s.video_kbps, live_pct)),
+        _ => at_pct(s.video_kbps, live_pct),
+    };
+    next
 }
 
 fn baseline_record_shares(s: &StudioSettings, cap: Option<StreamCap>, selective: bool) -> bool {
@@ -3200,9 +3243,11 @@ impl StudioHost for DesktopStudio {
                     && shape_changed
                     && let Some(slot) = h.groups.get_mut(GROUP_MAIN).filter(|g| g.output.stats().active)
                 {
-                    let next_group_settings = stream_settings_for_group(&s, &slot.spec);
+                    let next_spec = next_main_spec_for_settings(&slot.spec, &s, slot.live_pct, was.as_ref());
+                    let next_group_settings = stream_settings_for_group(&s, &next_spec);
                     match slot.output.reshape(&next_group_settings.encode, s.fps) {
                         Ok(()) => {
+                            slot.spec = next_spec;
                             slot.with = next_group_settings;
                             true
                         }
@@ -3229,7 +3274,7 @@ impl StudioHost for DesktopStudio {
                         st.set_video_kbps(at_pct(s.video_kbps, h.live_pct));
                     }
                     if let Some(slot) = h.groups.get_mut(GROUP_MAIN) {
-                        let k = at_pct(s.video_kbps, slot.live_pct);
+                        let k = apply_main_slot_bitrate_on_spec(&mut slot.spec, slot.live_pct, s.video_kbps);
                         slot.output.set_video_kbps(k);
                         slot.with.encode.video_kbps = k;
                     }
@@ -4421,7 +4466,9 @@ impl StudioHost for DesktopStudio {
 
     async fn encode_budget(&self, draft: Option<Value>, enhanced: bool, light: bool) -> Result<Value, String> {
         let data = self.data.clone();
-        let telem = ferrocast_studio::system::hardware_telemetry();
+        let telem = tokio::task::spawn_blocking(ferrocast_studio::system::hardware_telemetry)
+            .await
+            .map_err(|e| format!("hardware telemetry task failed: {e}"))?;
         // The saved profile (loaded if nothing asked for it yet), and a replay buffer that runs
         // (one that failed isn't an encode; CodeRabbit).
         let (saved, replay, cap, selective, vertical_on) = self
@@ -4789,15 +4836,24 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn group_stats(&self) -> Result<Option<Value>, String> {
+        fn with_encode_metrics(mut val: Value, st: &Streaming) -> Value {
+            if let Some(obj) = val.as_object_mut() {
+                if let Some(ms) = st.encode_ms() {
+                    obj.insert("encode_ms".into(), json!((ms * 10.0).round() / 10.0));
+                }
+                obj.insert("engine_skipped".into(), json!(st.engine_skipped()));
+            }
+            val
+        }
         self.on_main(|h| {
             let mut map = serde_json::Map::new();
             for (id, slot) in &h.groups {
-                map.insert(id.clone(), stats_of(&slot.output, Some(slot.started)));
+                map.insert(id.clone(), with_encode_metrics(stats_of(&slot.output, Some(slot.started)), &slot.output));
             }
             if !map.contains_key(GROUP_MAIN)
                 && let Some(st) = h.stream.as_ref()
             {
-                map.insert(GROUP_MAIN.to_string(), stats_of(st, h.stream_started));
+                map.insert(GROUP_MAIN.to_string(), with_encode_metrics(stats_of(st, h.stream_started), st));
             }
             if map.is_empty() { None } else { Some(Value::Object(map)) }
         })
@@ -6159,6 +6215,82 @@ mod budget_tests {
 
         // F10.1: `record_encode_for_stream` matches `GROUP_MAIN` encode shape when active, else falls back cleanly.
         assert_eq!(record_encode_for_stream(&vod_s, None, None), record_encode_capped(&vod_s, None));
+    }
+    #[test]
+    fn record_encode_skips_scaled_or_vod_main_group() {
+        let mut s = StudioSettings {
+            width: 2560,
+            height: 1440,
+            fps: 60,
+            video_kbps: 15_000,
+            record_quality: "stream".into(),
+            ..StudioSettings::default()
+        };
+        let expected_fallback = record_encode_capped(&s, None);
+        let scaled_spec = EncodeGroupSpec {
+            id: GROUP_MAIN.into(),
+            key: ferrocast_engine::studio_host::EncodeKey {
+                canvas: EncodeCanvas::Main,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                fps_ntsc: false,
+                kbps: 6_000,
+                codec: EncodeCodec::H264,
+                keyframe_s: 2,
+                strict_cbr: true,
+                no_bframes: false,
+                audio_kbps: 160,
+            },
+            extra_tracks: Vec::new(),
+            vod_track: false,
+            is_light: false,
+            is_twitch_eb: false,
+        };
+        assert_eq!(
+            record_encode_for_group_spec(&s, None, Some(&scaled_spec)),
+            expected_fallback,
+            "scaled GROUP_MAIN must not override unscaled recording with capped stream shape"
+        );
+        s.width = 1920;
+        s.height = 1080;
+        let vod_spec = EncodeGroupSpec { vod_track: true, ..scaled_spec };
+        assert_eq!(
+            record_encode_for_group_spec(&s, None, Some(&vod_spec)),
+            record_encode_capped(&s, None),
+            "vod_track GROUP_MAIN cannot share with plain recording"
+        );
+    }
+
+    #[test]
+    fn apply_main_slot_settings_updates_group_spec_key() {
+        let was = StudioSettings { width: 1920, height: 1080, fps: 60, video_kbps: 6_000, ..StudioSettings::default() };
+        let next = StudioSettings { width: 1280, height: 720, fps: 30, video_kbps: 4_500, ..was.clone() };
+        let mut spec = EncodeGroupSpec {
+            id: GROUP_MAIN.into(),
+            key: ferrocast_engine::studio_host::EncodeKey {
+                canvas: EncodeCanvas::Main,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                fps_ntsc: false,
+                kbps: 6_000,
+                codec: EncodeCodec::H264,
+                keyframe_s: 2,
+                strict_cbr: false,
+                no_bframes: false,
+                audio_kbps: 160,
+            },
+            extra_tracks: Vec::new(),
+            vod_track: false,
+            is_light: false,
+            is_twitch_eb: false,
+        };
+        let reshaped = next_main_spec_for_settings(&spec, &next, None, Some(&was));
+        assert_eq!((reshaped.key.width, reshaped.key.height, reshaped.key.fps), (1280, 720, 30));
+        let applied_kbps = apply_main_slot_bitrate_on_spec(&mut spec, None, 5_000);
+        assert_eq!(applied_kbps, 5_000);
+        assert_eq!(spec.key.kbps, 5_000);
     }
 }
 
