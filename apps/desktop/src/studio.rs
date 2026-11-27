@@ -383,6 +383,12 @@ struct Held {
     /// True in Safe Mode when a temporary empty collection is running until the user confirms
     /// loading the saved collection; guards against overwriting the saved file on disk.
     collection_deferred: bool,
+    /// Active collection ID & file path owned by the collection loaded in `Held`.
+    collection_id: Option<String>,
+    collection_file: Option<PathBuf>,
+    /// Active profile ID & file path owned by the settings loaded in `Held`.
+    profile_id: Option<String>,
+    profile_file: Option<PathBuf>,
 }
 
 struct GroupSlot {
@@ -1314,6 +1320,14 @@ fn settings_file(data: &std::path::Path) -> PathBuf {
     library::load(data).current_file(data, Kind::Profiles)
 }
 
+fn active_collection_file(h: &Held, data: &std::path::Path) -> PathBuf {
+    h.collection_file.clone().unwrap_or_else(|| scenes_file(data))
+}
+
+fn active_profile_file(h: &Held, data: &std::path::Path) -> PathBuf {
+    h.profile_file.clone().unwrap_or_else(|| settings_file(data))
+}
+
 /// Takes back an entry that was just made, with its file (its switch failed).
 fn forget(data: &std::path::Path, kind: Kind, id: &str) {
     let mut lib = library::load(data);
@@ -1372,8 +1386,36 @@ fn load_collection_doc(canvas: Canvas, file: &std::path::Path) -> Result<Collect
     Collection::new(canvas, FIRST_SCENE)
 }
 
-/// Saves the scenes in use to `from` and puts `to`'s in their place (a missing file is a new
-/// set with one empty scene). If `to` won't load, the old collection and all views remain intact.
+fn apply_collection_audio_prefs(c: &Collection, settings: Option<&StudioSettings>) {
+    let s = settings.cloned().unwrap_or_default();
+    c.set_true_peak(s.true_peak);
+    c.set_low_latency(s.low_latency_audio);
+    let (name, id) = s.monitoring.unwrap_or_else(|| ("Default".into(), "default".into()));
+    if let Err(e) = c.set_monitoring_device(&name, &id) {
+        tracing::warn!(error = %e, "the listening device is gone; using the system's");
+    }
+}
+
+fn release_push_keys_on(c: &Collection, release_keys: &[String]) {
+    for action in release_keys {
+        let (name, talk) = if let Some(n) = action.strip_prefix("push_to_talk:") {
+            (n, true)
+        } else if let Some(n) = action.strip_prefix("push_to_mute:") {
+            (n, false)
+        } else {
+            continue;
+        };
+        match c.push_key(name, talk, false) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = c.set_muted(name, talk);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
 fn swap_collection(
     ctx: ViewCtx<'_>,
     h: &mut Held,
@@ -1381,8 +1423,26 @@ fn swap_collection(
     from: &std::path::Path,
     to: &std::path::Path,
 ) -> Result<(), String> {
+    swap_collection_to(ctx, h, data, None, from, to, &[])
+}
+
+/// Saves the scenes in use to `from` and puts `to`'s in their place (a missing file is a new
+/// set with one empty scene). If `to` won't load, the old collection and all views remain intact.
+fn swap_collection_to(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    data: &std::path::Path,
+    to_id: Option<&str>,
+    from: &std::path::Path,
+    to: &std::path::Path,
+    release_keys: &[String],
+) -> Result<(), String> {
     let Some(canvas) = h.collection.as_ref().map(Collection::canvas) else {
         // Not running: the next Start loads it.
+        h.collection_file = Some(to.to_path_buf());
+        if let Some(id) = to_id {
+            h.collection_id = Some(id.to_string());
+        }
         return Ok(());
     };
     if outputs_busy_for_switch(h) {
@@ -1395,13 +1455,23 @@ fn swap_collection(
     if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
         c.stop_follow(&f);
     }
+    h.follow_run = h.follow_run.saturating_add(1);
     // Release every view, projector, and stopped output holding the old engine before dropping it.
-    let prev_projectors = take_projector_reqs(h);
+    let mut prev_projectors = take_projector_reqs(h);
+    // Source projectors belong to the outgoing collection only (OBS closes them on switch).
+    prev_projectors.retain(|r| r.what != "source");
     h.preview = None;
     h.program_view = None;
     h.vertical.view = None;
     drop_inactive_outputs(h);
-    h.captions = None;
+    stop_captions(h);
+    h.replay_shown = None;
+    h.replay_back = None;
+    h.replay_wait = None;
+    let guests = std::mem::take(&mut h.guests);
+    if !guests.is_empty() {
+        let _ = std::thread::Builder::new().name("ferrocast-guest-drain".into()).spawn(move || drop(guests));
+    }
     // NDI and the virtual camera send the old collection's picture: they stop with it.
     h.ndi = None;
     h.virtualcam = None;
@@ -1409,20 +1479,21 @@ fn swap_collection(
     h.selected = None;
     h.frames = None;
     if let Some(old_c) = h.collection.take() {
+        release_push_keys_on(&old_c, release_keys);
         save_confirmed(h.collection_deferred, &old_c, from);
         drop(old_c);
     }
     h.collection_deferred = false;
     save_confirmed(false, &made, to);
-    let settings = h.settings.clone().unwrap_or_default();
-    made.set_true_peak(settings.true_peak);
-    made.set_low_latency(settings.low_latency_audio);
-    let (mon_name, mon_id) = settings.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
-    if let Err(e) = made.set_monitoring_device(&mon_name, &mon_id) {
-        tracing::warn!(error = %e, "the listening device is gone; using the system's");
-    }
+    apply_collection_audio_prefs(&made, h.settings.as_ref());
     h.collection = Some(made);
+    h.collection_file = Some(to.to_path_buf());
+    if let Some(id) = to_id {
+        h.collection_id = Some(id.to_string());
+    }
     rebuild_views(ctx, h, data, prev_projectors);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    save_projectors(h, data);
     if let Some(c) = &h.collection
         && !c.has_engine()
         && let Err(e) = c.engine_ref()
@@ -1436,23 +1507,43 @@ fn swap_collection(
 /// The saved settings, falling back to `.bak` when unreadable, or the defaults.
 /// The saved profile, as is: nothing is applied to the engine (a support report can read it
 /// without changing the sound rate or broadcast timing of a running Studio).
-fn read_settings(data: &std::path::Path) -> StudioSettings {
-    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(&settings_file(data), |s| s.check().is_ok())
+fn read_settings_from(path: &std::path::Path) -> StudioSettings {
+    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(path, |s| s.check().is_ok())
         .map(|l| l.value)
         .unwrap_or_default()
 }
 
-fn load_settings(data: &std::path::Path) -> StudioSettings {
-    let s = read_settings(data);
+fn read_settings(data: &std::path::Path) -> StudioSettings {
+    read_settings_from(&settings_file(data))
+}
+
+fn load_settings_from(path: &std::path::Path) -> StudioSettings {
+    let s = read_settings_from(path);
     apply_audio_format(&s);
     s
 }
 
-/// Reads the profile settings file `to` with `.bak` and queued-save fallback when switching profiles.
-fn load_profile_settings(to: &std::path::Path) -> StudioSettings {
-    ferrocast_store::durable::load_json_with_backup::<StudioSettings>(to, |s| s.check().is_ok())
-        .map(|l| l.value)
-        .unwrap_or_default()
+#[cfg(test)]
+fn load_settings(data: &std::path::Path) -> StudioSettings {
+    load_settings_from(&settings_file(data))
+}
+
+fn ensure_held_settings<'a>(h: &'a mut Held, data: &std::path::Path) -> &'a mut StudioSettings {
+    let path = active_profile_file(h, data);
+    h.settings.get_or_insert_with(|| load_settings_from(&path))
+}
+
+/// Reads the profile settings file `to` with `.bak` and queued-save fallback when switching
+/// profiles. Returns factory defaults only when neither `to` nor `to.bak` exists yet; errors
+/// on corrupt or invalid files so switching never silently overwrites them with defaults.
+fn load_profile_settings(to: &std::path::Path) -> Result<StudioSettings, String> {
+    if let Some(loaded) = ferrocast_store::durable::load_json_with_backup::<StudioSettings>(to, |s| s.check().is_ok()) {
+        return Ok(loaded.value);
+    }
+    if to.exists() || ferrocast_store::durable::backup_path(to).exists() {
+        return Err("That profile's settings couldn't be read cleanly.".into());
+    }
+    Ok(StudioSettings::default())
 }
 
 /// What the running engine can't take until Ferrocast restarts: its sound rate and its broadcast
@@ -1685,6 +1776,34 @@ fn drain_outputs_bounded(jobs: Vec<Box<dyn FnOnce() + Send>>, timeout: std::time
     all_ok && finished == started
 }
 
+fn stop_captions(h: &mut Held) {
+    h.captions = None;
+    h.captions_run = h.captions_run.saturating_add(1);
+    CAPTION_SINK.with(|s| s.borrow_mut().take());
+    if let Ok(mut heard) = HEARD.lock() {
+        heard.clear();
+    }
+    if let Ok(mut s) = SENTENCE.lock() {
+        *s = (s.0.saturating_add(1), String::new());
+    }
+    if let Ok(mut d) = DONE.lock() {
+        d.clear();
+    }
+    if let Ok(mut e) = CAPTIONS_ERROR.lock() {
+        *e = None;
+    }
+}
+
+fn deliver_caption(run: u64, said: String, last: bool) {
+    CAPTION_SINK.with(|s| {
+        if let Some((r, f)) = s.borrow().as_ref()
+            && *r == run
+        {
+            f(said, last);
+        }
+    });
+}
+
 fn clear_non_output_held(h: &mut Held) {
     h.preview = None;
     h.preview_at = None;
@@ -1693,7 +1812,7 @@ fn clear_non_output_held(h: &mut Held) {
     h.vertical = VerticalView::default();
     h.projectors.clear();
     h.history.clear();
-    h.captions = None;
+    stop_captions(h);
     if let (Some(f), Some(c)) = (h.follow.take(), &h.collection) {
         c.stop_follow(&f);
     }
@@ -2505,10 +2624,31 @@ fn make_preview(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     Ok(())
 }
 
+fn format_settings_note(mut notes: Vec<String>, failed_shortcuts: &[String]) -> Option<String> {
+    if !failed_shortcuts.is_empty() {
+        notes.push(format!(
+            "These shortcuts are used by another app or aren't valid here: {}.",
+            failed_shortcuts.join(", ")
+        ));
+    }
+    (!notes.is_empty()).then(|| notes.join(" "))
+}
+
+fn shelf_action_result(id: &str, note: Option<String>) -> Value {
+    let mut out = json!({ "id": id });
+    if let Some(n) = note
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert("note".into(), json!(n));
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct DesktopStudio {
     app: AppHandle,
     data: PathBuf,
+    shelf_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl DesktopStudio {
@@ -2527,10 +2667,10 @@ impl DesktopStudio {
         }
         ferrocast_store::durable::remove_with_backup(&file);
         let _ = SESSION.set(file);
-        let me = DesktopStudio { app, data };
-        let watcher = DesktopStudio { app: me.app.clone(), data: me.data.clone() };
+        let me = DesktopStudio { app, data, shelf_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())) };
+        let watcher = me.clone();
         tauri::async_runtime::spawn(async move { watcher.session_loop().await });
-        let follower = DesktopStudio { app: me.app.clone(), data: me.data.clone() };
+        let follower = me.clone();
         tauri::async_runtime::spawn(async move { follower.own_engine_loop().await });
         me
     }
@@ -2656,15 +2796,15 @@ impl DesktopStudio {
 
     /// Puts collection or profile `id` in use. Refused while any output is active (stream,
     /// recording, source record, replay, virtual camera, NDI) so switching never orphans or
-    /// blacks out live outputs (M9-01).
-    async fn switch(&self, kind: Kind, id: &str) -> Result<(), String> {
+    /// blacks out live outputs (M9-01). Callers must hold `self.shelf_lock`.
+    async fn switch_locked(&self, kind: Kind, id: &str) -> Result<Option<String>, String> {
         let data = self.data.clone();
-        let mut lib = library::load(&data);
+        let lib = library::load(&data);
         if lib.shelf(kind).get(id).is_none() {
             return Err(format!("There's no {} with the id \"{id}\".", kind.noun()));
         }
         if lib.shelf(kind).current == id {
-            return Ok(());
+            return Ok(None);
         }
         let busy = self.on_main(|h| outputs_busy_for_switch(h)).await?;
         if busy {
@@ -2674,35 +2814,59 @@ impl DesktopStudio {
             };
             return Err(format!("Stop streaming and recording before changing {noun}."));
         }
-        let from = lib.current_file(&data, kind);
-        let before = lib.shelf(kind).current.clone();
-        lib.shelf_mut(kind).current = id.to_string();
-        let to = lib.current_file(&data, kind);
+        let from_fallback = lib.current_file(&data, kind);
+        let to = library::file(&data, kind, id);
         match kind {
             Kind::Collections => {
-                library::save(&data, &lib);
+                let release_keys = crate::studio_keys::release_active(&self.app);
                 let app = self.app.clone();
                 let data_main = data.clone();
-                let swapped =
-                    self.on_main(move |h| swap_collection(ViewCtx::App(&app), h, &data_main, &from, &to)).await?;
-                if let Err(e) = swapped {
-                    lib.collections.current = before;
-                    library::save(&data, &lib);
-                    return Err(e);
-                }
-                Ok(())
+                let id_main = id.to_string();
+                let to_main = to.clone();
+                self.on_main(move |h| {
+                    let from = h.collection_file.clone().unwrap_or(from_fallback);
+                    swap_collection_to(
+                        ViewCtx::App(&app),
+                        h,
+                        &data_main,
+                        Some(&id_main),
+                        &from,
+                        &to_main,
+                        &release_keys,
+                    )
+                })
+                .await??;
+                let mut lib = library::load(&data);
+                lib.collections.current = id.to_string();
+                library::save(&data, &lib);
+                Ok(None)
             }
             Kind::Profiles => {
-                let next = load_profile_settings(&to);
+                let to_read = to.clone();
+                let next = tokio::task::spawn_blocking(move || load_profile_settings(&to_read))
+                    .await
+                    .map_err(|e| e.to_string())??;
+                let note = self.set_settings_for(next, Some((id.to_string(), to))).await?;
+                let mut lib = library::load(&data);
+                lib.profiles.current = id.to_string();
                 library::save(&data, &lib);
-                if let Err(e) = self.set_settings(next).await {
-                    lib.profiles.current = before;
-                    library::save(&data, &lib);
-                    return Err(e);
-                }
-                Ok(())
+                Ok(note)
             }
         }
+    }
+
+    async fn set_settings_for(
+        &self,
+        s: StudioSettings,
+        target: Option<(String, PathBuf)>,
+    ) -> Result<Option<String>, String> {
+        let data = self.data.clone();
+        let app = self.app.clone();
+        let keys = s.hotkeys.clone();
+        let notes =
+            self.on_main(move |h| apply_settings_for_profile(ViewCtx::App(&app), h, &data, s, target)).await??;
+        let failed = crate::studio_keys::apply(&self.app, &keys);
+        Ok(format_settings_note(notes, &failed))
     }
 
     fn status_of(h: &Held) -> StudioStatus {
@@ -2918,7 +3082,7 @@ fn save_projectors(h: &Held, data: &std::path::Path) {
     if !h.settings.as_ref().is_some_and(|s| s.projector_restore) {
         return;
     }
-    let list: Vec<&ProjectorReq> = h.projectors.iter().map(|(_, _, r)| r).collect();
+    let list: Vec<&ProjectorReq> = h.projectors.iter().map(|(_, _, r)| r).filter(|r| r.what != "source").collect();
     save_json(&projectors_file(data), &serde_json::to_value(list).unwrap_or(Value::Null));
 }
 
@@ -2936,17 +3100,31 @@ fn restore_projectors(ctx: ViewCtx<'_>, h: &mut Held, data: &std::path::Path) {
         .map(|l| l.value)
         .unwrap_or_default();
     for p in list {
+        if p.what == "source" {
+            continue;
+        }
         if let Err(e) = open_projector(ctx, h, &p, data) {
             tracing::warn!(error = %e, what = %p.what, "a saved projector didn't open");
         }
     }
 }
 
+#[cfg(test)]
 fn apply_settings_on_main(
     ctx: ViewCtx<'_>,
     h: &mut Held,
     data: &std::path::Path,
     s: StudioSettings,
+) -> Result<Vec<String>, String> {
+    apply_settings_for_profile(ctx, h, data, s, None)
+}
+
+fn apply_settings_for_profile(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    data: &std::path::Path,
+    s: StudioSettings,
+    target: Option<(String, PathBuf)>,
 ) -> Result<Vec<String>, String> {
     let mut notes: Vec<String> = Vec::new();
     let prev_settings = h.settings.clone();
@@ -3074,7 +3252,12 @@ fn apply_settings_on_main(
             slot.with.encode.video_kbps = k;
         }
     }
-    save_json(&settings_file(data), &serde_json::to_value(&s).unwrap_or(Value::Null));
+    if let Some((id, file)) = target {
+        h.profile_id = Some(id);
+        h.profile_file = Some(file);
+    }
+    let profile_path = active_profile_file(h, data);
+    save_json(&profile_path, &serde_json::to_value(&s).unwrap_or(Value::Null));
     // Open multiviews and projectors take updated layout, on-top, and cursor visibility at once.
     refresh_projectors(h);
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3100,12 +3283,20 @@ impl StudioHost for DesktopStudio {
         let app = self.app.clone();
         self.on_main(move |h| {
             // Read here, on the main thread, so a switch can't slip in between (CodeRabbit).
-            let file = scenes_file(&data);
             if h.collection.is_some() {
                 return Ok(Self::status_of(h));
             }
+            let lib = library::load(&data);
+            let col_id = lib.collections.current.clone();
+            let file = lib.current_file(&data, Kind::Collections);
+            let prof_id = lib.profiles.current.clone();
+            let prof_file = lib.current_file(&data, Kind::Profiles);
+            h.collection_id = Some(col_id);
+            h.collection_file = Some(file.clone());
+            h.profile_id = Some(prof_id);
+            h.profile_file = Some(prof_file);
             // Ferrocast's own engine: no libobs to load.
-            let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+            let s = ensure_held_settings(h, &data).clone();
             let _ = &config;
             h.renderer = "ferrocast";
             let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
@@ -3117,14 +3308,8 @@ impl StudioHost for DesktopStudio {
                 h.collection_deferred = true;
                 Collection::new(canvas, FIRST_SCENE).map_err(|e| e.to_string())?
             };
-            if let Some((name, id)) = &s.monitoring
-                && let Err(e) = collection.set_monitoring_device(name, id)
-            {
-                tracing::warn!(error = %e, "the listening device is gone; using the system's");
-            }
+            apply_collection_audio_prefs(&collection, h.settings.as_ref());
             save_confirmed(h.collection_deferred, &collection, &file);
-            collection.set_true_peak(h.settings.as_ref().is_some_and(|s| s.true_peak));
-            collection.set_low_latency(h.settings.as_ref().is_some_and(|s| s.low_latency_audio));
             h.collection = Some(collection);
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             restore_projectors(ViewCtx::App(&app), h, &data);
@@ -3141,10 +3326,14 @@ impl StudioHost for DesktopStudio {
     async fn confirm_collection(&self) -> Result<StudioStatus, String> {
         let data = self.data.clone();
         let app = self.app.clone();
+        let release_keys = crate::studio_keys::release_active(&self.app);
         self.on_main(move |h| {
-            let file = scenes_file(&data);
+            let from = active_collection_file(h, &data);
+            let lib = library::load(&data);
+            let to_id = lib.collections.current.clone();
+            let to = lib.current_file(&data, Kind::Collections);
             if h.collection.is_some() {
-                swap_collection(ViewCtx::App(&app), h, &data, &file, &file)?;
+                swap_collection_to(ViewCtx::App(&app), h, &data, Some(&to_id), &from, &to, &release_keys)?;
                 write_session(session_now(h).as_ref());
             }
             Ok(Self::status_of(h))
@@ -3162,13 +3351,17 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         let status = self
             .on_main(move |h| {
-                let file = scenes_file(&data);
+                let file = active_collection_file(h, &data);
                 let deferred = h.collection_deferred;
                 clear_non_output_held(h);
                 if let Some(c) = h.collection.take() {
                     save_confirmed(deferred, &c, &file);
                 }
                 h.collection_deferred = false;
+                h.collection_id = None;
+                h.collection_file = None;
+                h.profile_id = None;
+                h.profile_file = None;
                 write_session(None);
                 Self::status_of(h)
             })
@@ -3551,7 +3744,7 @@ impl StudioHost for DesktopStudio {
                         let c = h.collection.as_ref().ok_or(STOPPED)?;
                         c.update_filter(&n, &f, &json!({ "state": state })).map_err(|e| e.to_string())?;
                         // Written now: a crash right after keeps what was saved (CodeRabbit).
-                        save_confirmed(h.collection_deferred, c, &scenes_file(&data));
+                        save_confirmed(h.collection_deferred, c, &active_collection_file(h, &data));
                         Ok(())
                     })
                     .await??;
@@ -3617,7 +3810,7 @@ impl StudioHost for DesktopStudio {
                 .on_main(move |h| -> Result<(PathBuf, ScreenshotJob), String> {
                     // Next to the recordings, as OBS does; only capture folder + job handle on
                     // the main thread so sleep, GPU render/readback, and file I/O run on a worker.
-                    let folder = record_folder(h.settings.get_or_insert_with(|| load_settings(&data)));
+                    let folder = record_folder(ensure_held_settings(h, &data));
                     let c = h.collection.as_ref().ok_or(STOPPED)?;
                     let job: ScreenshotJob = match &shot {
                         StudioAct::Screenshot { name, item: Some(target) } => {
@@ -3647,12 +3840,17 @@ impl StudioHost for DesktopStudio {
         let data = self.data.clone();
         let app = self.app.clone();
         self.on_main(move |h| {
-            let file = scenes_file(&data);
+            let file = active_collection_file(h, &data);
             // The Studio off: its scenes from the saved file, so the show, BRB and the scene
             // switcher can still be set up (owner, 30 Oct: "it's not showing my screens").
             if act == StudioAct::Scenes && h.collection.is_none() {
                 let saved = ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
-                return Ok(saved_scenes(saved.as_ref()));
+                let mut v = saved_scenes(saved.as_ref());
+                let col_id = h.collection_id.clone().unwrap_or_else(|| library::load(&data).collections.current);
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("collection_id".into(), json!(col_id));
+                }
+                return Ok(v);
             }
             if let StudioAct::Select { scene, id, frames, also, guides } = &act {
                 h.selected = scene.clone().zip(*id).map(|(s, id)| {
@@ -3709,8 +3907,9 @@ impl StudioHost for DesktopStudio {
                     }
                 }
             }
+            let is_scenes = act == StudioAct::Scenes;
             let c = h.collection.as_ref().ok_or(STOPPED)?;
-            let out = run(c, act).map_err(|e| e.to_string());
+            let mut out = run(c, act).map_err(|e| e.to_string());
             if turns_vertical {
                 let _ = make_vertical_view(ViewCtx::App(&app), h);
             }
@@ -3723,6 +3922,13 @@ impl StudioHost for DesktopStudio {
                 save_confirmed(h.collection_deferred, c, &file);
                 refresh_projectors(h);
             }
+            if is_scenes
+                && let Ok(ref mut v) = out
+                && let Some(o) = v.as_object_mut()
+            {
+                let col_id = h.collection_id.clone().unwrap_or_else(|| library::load(&data).collections.current);
+                o.insert("collection_id".into(), json!(col_id));
+            }
             out
         })
         .await?
@@ -3730,30 +3936,20 @@ impl StudioHost for DesktopStudio {
 
     async fn settings(&self) -> StudioSettings {
         let data = self.data.clone();
-        let mut s = self
-            .on_main(move |h| h.settings.get_or_insert_with(|| load_settings(&data)).clone())
-            .await
-            .unwrap_or_default();
+        let mut s = self.on_main(move |h| ensure_held_settings(h, &data).clone()).await.unwrap_or_default();
         s.record_folder_default = record_folder(&StudioSettings::default()).display().to_string();
         s
     }
 
     async fn set_settings(&self, s: StudioSettings) -> Result<Option<String>, String> {
-        let data = self.data.clone();
-        let app = self.app.clone();
-        let keys = s.hotkeys.clone();
-        let note = self.on_main(move |h| apply_settings_on_main(ViewCtx::App(&app), h, &data, s)).await??;
-        let failed = crate::studio_keys::apply(&self.app, &keys);
-        let mut all = note;
-        if !failed.is_empty() {
-            all.push(format!("These shortcuts are used by another app or aren't valid here: {}.", failed.join(", ")));
-        }
-        Ok((!all.is_empty()).then(|| all.join(" ")))
+        let _lock = self.shelf_lock.lock().await;
+        self.set_settings_for(s, None).await
     }
 
     async fn stats(&self) -> Result<Value, String> {
         let data = self.data.clone();
         self.on_main(move |h| {
+            let collection_file = active_collection_file(h, &data);
             let studio = h.collection.as_ref().ok_or(STOPPED)?;
             // The page asks for stats every second, so scenes held for the grid's pictures
             // are let go soon after it closes.
@@ -3764,7 +3960,7 @@ impl StudioHost for DesktopStudio {
                 // A captured window resized keeps its shape on the canvas (and stays so after
                 // a restart).
                 if c.follow_sizes() {
-                    save_confirmed(h.collection_deferred, c, &scenes_file(&data));
+                    save_confirmed(h.collection_deferred, c, &collection_file);
                 }
             }
             let disk_free = {
@@ -3817,18 +4013,30 @@ impl StudioHost for DesktopStudio {
                 "remux": REMUX.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             });
             let cycles = h.collection.as_ref().map(|c| c.sidechain_cycles()).unwrap_or_default();
-            if !cycles.is_empty()
-                && let Some(o) = out.as_object_mut()
-            {
-                o.insert(
-                    "sidechain_cycles".into(),
-                    json!(
-                        cycles
-                            .into_iter()
-                            .map(|(source, key)| json!({ "source": source, "key": key }))
-                            .collect::<Vec<_>>()
-                    ),
-                );
+            let (col_id, prof_id) = match (&h.collection_id, &h.profile_id) {
+                (Some(c), Some(p)) => (c.clone(), p.clone()),
+                _ => {
+                    let lib = library::load(&data);
+                    (
+                        h.collection_id.clone().unwrap_or(lib.collections.current),
+                        h.profile_id.clone().unwrap_or(lib.profiles.current),
+                    )
+                }
+            };
+            if let Some(o) = out.as_object_mut() {
+                o.insert("collection_id".into(), json!(col_id));
+                o.insert("profile_id".into(), json!(prof_id));
+                if !cycles.is_empty() {
+                    o.insert(
+                        "sidechain_cycles".into(),
+                        json!(
+                            cycles
+                                .into_iter()
+                                .map(|(source, key)| json!({ "source": source, "key": key }))
+                                .collect::<Vec<_>>()
+                        ),
+                    );
+                }
             }
             Ok(out)
         })
@@ -4049,7 +4257,7 @@ impl StudioHost for DesktopStudio {
                     c.add_source(&scene, "ffmpeg_source", &source, &settings, false).map_err(|e| e.to_string())?;
                 c.edit_item(&scene, item.id, ItemEdit::Hide).map_err(|e| e.to_string())?;
             }
-            save_confirmed(h.collection_deferred, c, &scenes_file(&data));
+            save_confirmed(h.collection_deferred, c, &active_collection_file(h, &data));
             // The connection whose source this was, if any, is over.
             h.guests.retain(|(_, s, _)| *s != source);
             h.guests.push((name, source, guest));
@@ -4287,34 +4495,26 @@ impl StudioHost for DesktopStudio {
             if let Some((l, _)) = &h.captions
                 && let Some(why) = l.stopped()
             {
+                stop_captions(h);
                 if let Ok(mut e) = CAPTIONS_ERROR.lock() {
                     *e = Some(why);
                 }
-                h.captions = None;
             }
             match set {
                 Some(CaptionsSet { ask: true, .. }) => ferrocast_studio::ask_captions_access(),
                 Some(CaptionsSet { on: false, .. }) => {
-                    h.captions = None;
-                    CAPTION_SINK.with(|s| s.borrow_mut().take());
-                    if let Ok(mut heard) = HEARD.lock() {
-                        heard.clear();
-                    }
+                    stop_captions(h);
                 }
                 Some(set @ CaptionsSet { on: true, .. }) => {
                     let source = set.source.clone().unwrap_or_default().trim().to_string();
-                    let c = h.collection.as_ref().ok_or(STOPPED)?;
                     // The old listener goes first: one at a time.
-                    h.captions = None;
-                    h.captions_run += 1;
+                    stop_captions(h);
+                    let c = h.collection.as_ref().ok_or(STOPPED)?;
                     let run = h.captions_run;
-                    if let Ok(mut e) = CAPTIONS_ERROR.lock() {
-                        *e = None;
-                    }
                     let listening = if set.engine.as_deref() == Some("whisper") {
                         let model = set.model_path.clone().ok_or("The speech model isn't downloaded yet.")?;
                         let tap = c.tap_sound(&source).map_err(|e| e.to_string())?;
-                        CAPTION_SINK.with(|s| *s.borrow_mut() = Some((run, Box::new(caption_sink()))));
+                        let app_cb = app.clone();
                         // Words come from the worker: they're shown on the main thread, and only
                         // while this run is the one listening.
                         let listener = crate::whisper::start(
@@ -4326,24 +4526,20 @@ impl StudioHost for DesktopStudio {
                                 translate: set.translate,
                             },
                             move |said, last| {
-                                let _ = app.run_on_main_thread(move || {
-                                    CAPTION_SINK.with(|s| {
-                                        if let Some((r, f)) = s.borrow().as_ref()
-                                            && *r == run
-                                        {
-                                            f(said, last);
-                                        }
-                                    });
-                                });
+                                let _ = app_cb.run_on_main_thread(move || deliver_caption(run, said, last));
                             },
                         );
                         Listening::Whisper { _tap: tap, listener }
                     } else {
-                        Listening::Apple(c.start_captions(&source, caption_sink()).map_err(|e| e.to_string())?)
+                        let app_cb = app.clone();
+                        Listening::Apple(
+                            c.start_captions(&source, move |said, last| {
+                                let _ = app_cb.run_on_main_thread(move || deliver_caption(run, said, last));
+                            })
+                            .map_err(|e| e.to_string())?,
+                        )
                     };
-                    if let Ok(mut heard) = HEARD.lock() {
-                        heard.clear();
-                    }
+                    CAPTION_SINK.with(|s| *s.borrow_mut() = Some((run, Box::new(caption_sink()))));
                     h.captions = Some((listening, source));
                 }
                 None => {}
@@ -4397,7 +4593,7 @@ impl StudioHost for DesktopStudio {
             })
             .await??;
         if let (Some(run), status) = started {
-            let me = DesktopStudio { app: self.app.clone(), data: self.data.clone() };
+            let me = self.clone();
             tauri::async_runtime::spawn(async move { me.follow_loop(run).await });
             return Ok(status);
         }
@@ -4665,6 +4861,7 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn shelf(&self, kind: String, act: ShelfAct) -> Result<Value, String> {
+        let _shelf_lock = self.shelf_lock.lock().await;
         let kind = Kind::parse(&kind).ok_or("kind: collections or profiles.")?;
         let data = self.data.clone();
         let missing = |id: &str| format!("There's no {} with the id \"{id}\".", kind.noun());
@@ -4713,15 +4910,19 @@ impl StudioHost for DesktopStudio {
                 let file = library::file(&data, kind, &id);
                 if kind == Kind::Collections && lib.collections.current == id {
                     // The one in use is saved as it is now.
-                    let f = file.clone();
+                    let fallback = file.clone();
                     self.on_main(move |h| {
                         if let Some(c) = &h.collection {
-                            save_confirmed(h.collection_deferred, c, &f);
+                            let target = h.collection_file.as_ref().unwrap_or(&fallback);
+                            save_confirmed(h.collection_deferred, c, target);
                         }
                     })
                     .await?;
                 }
                 let doc = ferrocast_store::durable::load_json_with_backup::<Value>(&file, |_| true).map(|l| l.value);
+                if doc.is_none() && (file.exists() || ferrocast_store::durable::backup_path(&file).exists()) {
+                    return Err(format!("Couldn't read the {} file cleanly.", kind.noun()));
+                }
                 Ok(match (kind, doc) {
                     (_, Some(mut d)) => {
                         if kind == Kind::Collections
@@ -4747,10 +4948,11 @@ impl StudioHost for DesktopStudio {
                 if copy {
                     let from = lib.current_file(&data, kind);
                     if kind == Kind::Collections {
-                        let f = from.clone();
+                        let fallback = from.clone();
                         self.on_main(move |h| {
                             if let Some(c) = &h.collection {
-                                save_confirmed(h.collection_deferred, c, &f);
+                                let target = h.collection_file.as_ref().unwrap_or(&fallback);
+                                save_confirmed(h.collection_deferred, c, target);
                             }
                         })
                         .await?;
@@ -4765,20 +4967,25 @@ impl StudioHost for DesktopStudio {
                             .await
                             .map_err(|e| e.to_string())?
                             .map_err(|e| format!("The copy couldn't be made: {e}"))?;
+                    } else if from.exists() || ferrocast_store::durable::backup_path(&from).exists() {
+                        return Err(format!("Couldn't read the {} file cleanly.", kind.noun()));
                     }
                 }
                 lib.shelf_mut(kind).list.push(library::Entry { id: id.clone(), name });
                 library::save(&data, &lib);
-                if let Err(e) = self.switch(kind, &id).await {
-                    // Not half made: a retry with the same name works.
-                    forget(&data, kind, &id);
-                    return Err(e);
-                }
-                Ok(json!({ "id": id }))
+                let note = match self.switch_locked(kind, &id).await {
+                    Ok(note) => note,
+                    Err(e) => {
+                        // Not half made: a retry with the same name works.
+                        forget(&data, kind, &id);
+                        return Err(e);
+                    }
+                };
+                Ok(shelf_action_result(&id, note))
             }
             ShelfAct::Switch { id } => {
-                self.switch(kind, &id).await?;
-                Ok(json!({ "id": id }))
+                let note = self.switch_locked(kind, &id).await?;
+                Ok(shelf_action_result(&id, note))
             }
             ShelfAct::Import { name, mut doc } => {
                 let name = library::check_name(&name)?;
@@ -4798,7 +5005,7 @@ impl StudioHost for DesktopStudio {
                 save_json(&file, &doc);
                 lib.collections.list.push(library::Entry { id: id.clone(), name });
                 library::save(&data, &lib);
-                if let Err(e) = self.switch(Kind::Collections, &id).await {
+                if let Err(e) = self.switch_locked(Kind::Collections, &id).await {
                     forget(&data, Kind::Collections, &id);
                     return Err(e);
                 }
@@ -4933,7 +5140,7 @@ impl StudioHost for DesktopStudio {
         // (one that failed isn't an encode; CodeRabbit).
         let (saved, replay, cap, selective, vertical_on) = self
             .on_main(move |h| {
-                let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+                let s = ensure_held_settings(h, &data).clone();
                 let selective = h.collection.as_ref().is_some_and(|c| c.has_selective_items());
                 let vertical_on = h.collection.as_ref().is_some_and(|c| c.vertical().is_some());
                 (s, h.replay.as_ref().is_some_and(|r| r.active()), h.stream_cap, selective, vertical_on)
@@ -4958,7 +5165,7 @@ impl StudioHost for DesktopStudio {
         let telem = tokio::task::spawn_blocking(ferrocast_studio::system::hardware_telemetry).await.ok()?;
         let (s, replay_active, record_active, cap, selective, vertical_on) = self
             .on_main(move |h| {
-                let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
+                let s = ensure_held_settings(h, &data).clone();
                 let replay_active = h.replay.as_ref().is_some_and(|r| r.active());
                 let record_active = h.record.as_ref().is_some_and(|r| r.0.stats().active);
                 let selective = h.collection.as_ref().is_some_and(|c| c.has_selective_items());
@@ -8186,15 +8393,17 @@ mod collection_profile_tests {
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            assert_eq!(h.projectors.len(), 3, "all three projectors must rebuild onto new collection");
+            assert_eq!(
+                h.projectors.len(),
+                2,
+                "source projectors close on collection switch; multiview & program rebuild"
+            );
             for (_, p, req) in &h.projectors {
+                assert_ne!(req.what, "source");
                 assert!(p.engine_ref().same(&eng_b), "projector {} must hold new engine", req.what);
                 let tp = p.test_proj().expect("test projector");
                 assert_eq!(tp.on_top.get(), req.on_top);
                 assert!(tp.hide_cursor.get());
-                if req.what == "source" {
-                    assert_eq!(tp.name.as_deref(), Some("SharedColor"));
-                }
                 if req.what == "multiview" {
                     let names = tp.names.borrow().clone();
                     assert!(
@@ -8401,6 +8610,9 @@ mod collection_profile_tests {
                 let tp = p.test_proj().expect("tp");
                 assert!(tp.on_top.get(), "projector_on_top from profile must apply");
                 assert!(tp.hide_cursor.get(), "projector_hide_cursor from profile must apply");
+                if tp.what == "source" {
+                    assert_eq!(tp.name.as_deref(), Some("SharedColor"));
+                }
                 if tp.what == "multiview" {
                     assert!(matches!(tp.look.borrow().layout, ferrocast_studio::MultiviewLayout::Left));
                 }
@@ -8434,8 +8646,368 @@ mod collection_profile_tests {
         let custom =
             StudioSettings { width: 1600, height: 900, fps: 50, video_kbps: 4200, ..StudioSettings::default() };
         write_json_sync(&profile_bak, &serde_json::to_value(&custom).unwrap_or(Value::Null));
-        let loaded = load_profile_settings(&profile_path);
+        let loaded = load_profile_settings(&profile_path).unwrap_or_else(|e| panic!("bak load: {e}"));
         assert_eq!((loaded.width, loaded.height, loaded.fps, loaded.video_kbps), (1600, 900, 50, 4200));
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn col05_swap_collection_clears_caption_state_and_rejects_stale_callbacks() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_b = dir.path().join("collections").join("b.json");
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", None, "A");
+        let doc_b = make_collection_doc(canvas, "GameB", "PreviewB", None, "B");
+        write_json_sync(&scenes_a, &doc_a);
+        write_json_sync(&scenes_b, &doc_b);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap_or_else(|e| panic!("load A: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held {
+            settings: Some(StudioSettings::default()),
+            collection: Some(col_a),
+            captions_run: 7,
+            ..Held::default()
+        };
+        let old_run = h.captions_run;
+        CAPTION_SINK.with(|s| *s.borrow_mut() = Some((old_run, Box::new(|said, _last| *HEARD.lock().unwrap() = said))));
+        *HEARD.lock().unwrap() = "stale caption".into();
+        let prev_sentence_id = {
+            let mut s = SENTENCE.lock().unwrap();
+            s.0 = s.0.max(10);
+            s.1 = "stale sentence".into();
+            s.0
+        };
+        DONE.lock().unwrap().push_back((10, 123, "stale done".into()));
+        *CAPTIONS_ERROR.lock().unwrap() = Some("stale error".into());
+
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_a, &scenes_b)
+            .unwrap_or_else(|e| panic!("swap A->B: {e}"));
+
+        assert!(h.captions_run > old_run, "captions_run must advance on collection swap");
+        assert!(CAPTION_SINK.with(|s| s.borrow().is_none()), "CAPTION_SINK must be cleared");
+        assert!(HEARD.lock().unwrap().is_empty(), "HEARD must clear on collection swap");
+        {
+            let s = SENTENCE.lock().unwrap();
+            assert!(s.0 > prev_sentence_id, "SENTENCE id must increment monotonically, never reset to 0");
+            assert!(s.1.is_empty(), "SENTENCE text must clear");
+        }
+        assert!(DONE.lock().unwrap().is_empty(), "DONE must clear on collection swap");
+        assert!(CAPTIONS_ERROR.lock().unwrap().is_none(), "CAPTIONS_ERROR must clear");
+
+        // Stale callback from pre-switch run must be ignored even if invoked after swap.
+        CAPTION_SINK.with(|s| {
+            if let Some((r, f)) = s.borrow().as_ref()
+                && *r == old_run
+            {
+                f("leaked after swap".into(), true);
+            }
+        });
+        assert!(HEARD.lock().unwrap().is_empty());
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn col06_swap_collection_clears_replay_timers() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_b = dir.path().join("collections").join("b.json");
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", None, "A");
+        let doc_b = make_collection_doc(canvas, "GameB", "PreviewB", None, "B");
+        write_json_sync(&scenes_a, &doc_a);
+        write_json_sync(&scenes_b, &doc_b);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap_or_else(|e| panic!("load A: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held {
+            settings: Some(StudioSettings::default()),
+            collection: Some(col_a),
+            replay_shown: Some(PathBuf::from("/tmp/replay.mp4")),
+            replay_back: Some(("MainA".into(), "ReplayScene".into(), "ReplaySrc".into(), std::time::Instant::now())),
+            replay_wait: Some(("ReplayScene".into(), "ReplaySrc".into(), std::time::Instant::now())),
+            ..Held::default()
+        };
+
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_a, &scenes_b)
+            .unwrap_or_else(|e| panic!("swap A->B: {e}"));
+
+        assert!(h.replay_shown.is_none(), "replay_shown must clear on collection switch");
+        assert!(h.replay_back.is_none(), "replay_back must clear on collection switch");
+        assert!(h.replay_wait.is_none(), "replay_wait must clear on collection switch");
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn col13_source_projectors_excluded_from_global_save_and_closed_on_collection_switch() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_b = dir.path().join("collections").join("b.json");
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", Some("VertA"), "SharedColor");
+        let doc_b = make_collection_doc(canvas, "GameB", "PreviewB", Some("VertB"), "SharedColor");
+        write_json_sync(&scenes_a, &doc_a);
+        write_json_sync(&scenes_b, &doc_b);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap_or_else(|e| panic!("load A: {e}"));
+        let mut h = Held {
+            settings: Some(StudioSettings { projector_restore: true, ..StudioSettings::default() }),
+            collection: Some(col_a),
+            ..Held::default()
+        };
+        populate_cached_views(&mut h, dir.path(), false);
+        assert_eq!(h.projectors.len(), 3);
+
+        // 1. Global projectors.json must not persist source-specific projectors.
+        save_projectors(&h, dir.path());
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+        let saved: Vec<ProjectorReq> =
+            ferrocast_store::durable::load_json_with_backup(&projectors_file(dir.path()), |_| true)
+                .map(|l| l.value)
+                .unwrap_or_default();
+        assert!(saved.iter().all(|r| r.what != "source"), "source projectors must not be saved globally: {saved:?}");
+
+        // 2. Switching collections closes source projectors even when B happens to have a same-named source.
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_a, &scenes_b)
+            .unwrap_or_else(|e| panic!("swap A->B: {e}"));
+        assert_eq!(h.projectors.len(), 2, "only program and multiview projectors carry over");
+        assert!(h.projectors.iter().all(|(_, _, r)| r.what != "source"));
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn col01_held_file_bindings_isolate_collection_and_profile_from_library() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let col_a = library::file(dir.path(), Kind::Collections, "a");
+        let col_b = library::file(dir.path(), Kind::Collections, "b");
+        let bad = library::file(dir.path(), Kind::Collections, "broken");
+        let prof_a = library::file(dir.path(), Kind::Profiles, "pa");
+        let prof_b = library::file(dir.path(), Kind::Profiles, "pb");
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        write_json_sync(&col_a, &make_collection_doc(canvas, "MainA", "PreviewA", None, "A"));
+        write_json_sync(&col_b, &make_collection_doc(canvas, "MainB", "PreviewB", None, "B"));
+        write_json_sync(
+            &bad,
+            &json!({
+                "ferrocast": { "program_copy": { "scene": "X", "items": [{ "name": "Main" }] } },
+                "sources": [{ "id": "color_source_v3", "name": "Main" }],
+                "scene_order": []
+            }),
+        );
+
+        let mut lib = library::load(dir.path());
+        lib.collections.list.push(library::Entry { id: "a".into(), name: "A".into() });
+        lib.collections.list.push(library::Entry { id: "b".into(), name: "B".into() });
+        lib.collections.current = "b".into();
+        lib.profiles.list.push(library::Entry { id: "pa".into(), name: "PA".into() });
+        lib.profiles.list.push(library::Entry { id: "pb".into(), name: "PB".into() });
+        lib.profiles.current = "pb".into();
+        library::save(dir.path(), &lib);
+
+        let col_doc_a = ferrocast_store::durable::load_json_with_backup::<Value>(&col_a, |_| true).unwrap().value;
+        let col = Collection::load(canvas, &col_doc_a, FIRST_SCENE).unwrap();
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held {
+            settings: Some(StudioSettings::default()),
+            collection: Some(col),
+            collection_id: Some("a".into()),
+            collection_file: Some(col_a.clone()),
+            profile_id: Some("pa".into()),
+            profile_file: Some(prof_a.clone()),
+            ..Held::default()
+        };
+
+        // Even when library.json points to "b"/"pb", active_* readers stick to Held's actual loaded paths.
+        assert_eq!(active_collection_file(&h, dir.path()), col_a);
+        assert_eq!(active_profile_file(&h, dir.path()), prof_a);
+
+        // Failed swap leaves Held's collection_id and collection_file pointing at "a".
+        assert!(swap_collection_to(ViewCtx::Test, &mut h, dir.path(), Some("broken"), &col_a, &bad, &[]).is_err());
+        assert_eq!(h.collection_id.as_deref(), Some("a"));
+        assert_eq!(active_collection_file(&h, dir.path()), col_a);
+
+        // Successful swap atomically updates Held's collection_id and collection_file to "b".
+        swap_collection_to(ViewCtx::Test, &mut h, dir.path(), Some("b"), &col_a, &col_b, &[])
+            .unwrap_or_else(|e| panic!("swap a->b: {e}"));
+        assert_eq!(h.collection_id.as_deref(), Some("b"));
+        assert_eq!(active_collection_file(&h, dir.path()), col_b);
+
+        // Profile apply updates Held's profile_id & profile_file and saves to pb (not pa).
+        let next = StudioSettings { video_kbps: 4500, ..StudioSettings::default() };
+        apply_settings_for_profile(ViewCtx::Test, &mut h, dir.path(), next, Some(("pb".into(), prof_b.clone())))
+            .unwrap_or_else(|e| panic!("apply pb: {e}"));
+        assert_eq!(h.profile_id.as_deref(), Some("pb"));
+        assert_eq!(active_profile_file(&h, dir.path()), prof_b);
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+        assert!(prof_b.exists(), "profile settings must save to the switched target path");
+    }
+
+    #[test]
+    fn col02_load_profile_settings_errors_when_corrupt_without_valid_bak() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let missing = dir.path().join("profiles").join("brand-new.json");
+        assert_eq!(
+            load_profile_settings(&missing).unwrap(),
+            StudioSettings::default(),
+            "brand new profile without file defaults cleanly"
+        );
+
+        let corrupt = dir.path().join("profiles").join("corrupt.json");
+        std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt, b"{not valid json").unwrap();
+        assert!(load_profile_settings(&corrupt).is_err(), "corrupt profile must fail instead of resetting to defaults");
+
+        let invalid = dir.path().join("profiles").join("invalid.json");
+        std::fs::write(&invalid, br#"{"width": 1}"#).unwrap();
+        assert!(load_profile_settings(&invalid).is_err(), "invalid profile must fail instead of resetting to defaults");
+    }
+
+    #[test]
+    fn col07_swap_collection_preserves_monitoring_device() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_b = dir.path().join("collections").join("b.json");
+        write_json_sync(&scenes_a, &make_collection_doc(canvas, "MainA", "PreviewA", None, "A"));
+        write_json_sync(&scenes_b, &make_collection_doc(canvas, "GameB", "PreviewB", None, "B"));
+
+        let doc_a = ferrocast_store::durable::load_json_with_backup::<Value>(&scenes_a, |_| true).unwrap().value;
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap();
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let s = StudioSettings {
+            monitoring: Some(("Headphones".into(), "Headphones-Dev-Id".into())),
+            true_peak: true,
+            low_latency_audio: true,
+            ..StudioSettings::default()
+        };
+        apply_collection_audio_prefs(&col_a, Some(&s));
+        let mut h = Held { settings: Some(s), collection: Some(col_a), ..Held::default() };
+
+        swap_collection(ViewCtx::Test, &mut h, dir.path(), &scenes_a, &scenes_b)
+            .unwrap_or_else(|e| panic!("swap A->B: {e}"));
+        let mon = h.collection.as_ref().unwrap().monitoring_device();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert_eq!(mon.as_deref(), Some("Headphones-Dev-Id"));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        assert!(mon.is_none());
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn col09_swap_collection_releases_push_keys_before_saving_outgoing_collection() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = dir.path().join("collections").join("a.json");
+        let scenes_b = dir.path().join("collections").join("b.json");
+        let doc_a = make_collection_doc(canvas, "MainA", "PreviewA", None, "A");
+        let doc_b = make_collection_doc(canvas, "GameB", "PreviewB", None, "B");
+        write_json_sync(&scenes_a, &doc_a);
+        write_json_sync(&scenes_b, &doc_b);
+
+        let col_a = Collection::load(canvas, &doc_a, FIRST_SCENE).unwrap();
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col_a.engine_ref().is_err() {
+            return;
+        }
+        let mic_kind = if cfg!(target_os = "macos") {
+            "coreaudio_input_capture"
+        } else if cfg!(windows) {
+            "wasapi_input_capture"
+        } else {
+            "pulse_input_capture"
+        };
+        col_a.add_source("MainA", mic_kind, "Mic", &json!({}), false).unwrap();
+        col_a.set_muted("Mic", false).unwrap();
+        let mut h = Held { settings: Some(StudioSettings::default()), collection: Some(col_a), ..Held::default() };
+
+        swap_collection_to(
+            ViewCtx::Test,
+            &mut h,
+            dir.path(),
+            Some("b"),
+            &scenes_a,
+            &scenes_b,
+            &["push_to_talk:Mic".into()],
+        )
+        .unwrap_or_else(|e| panic!("swap A->B: {e}"));
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+
+        let saved_a: Value = ferrocast_store::durable::load_json_with_backup(&scenes_a, |_| true).unwrap().value;
+        let mic = saved_a["sources"].as_array().unwrap().iter().find(|s| s["name"] == "Mic").unwrap();
+        assert_eq!(mic["muted"], json!(true), "held PTT mic must release to muted before saving outgoing collection");
+    }
+
+    #[test]
+    fn col10_apply_settings_for_profile_reopens_cleanly_and_returns_notes() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dflt = StudioSettings::default();
+        let canvas = Canvas { width: dflt.width, height: dflt.height, fps: dflt.fps };
+        let doc = make_collection_doc(canvas, "MainA", "PreviewA", Some("VertA"), "SharedColor");
+        let col = Collection::load(canvas, &doc, FIRST_SCENE).unwrap_or_else(|e| panic!("load: {e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && col.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held { settings: Some(dflt), collection: Some(col), ..Held::default() };
+        populate_cached_views(&mut h, dir.path(), false);
+
+        // Changing sample_rate while idle reopens the engine cleanly (no stale restart warning)
+        // and updates Held's active profile bindings.
+        let prof_b = library::file(dir.path(), Kind::Profiles, "b");
+        let s = StudioSettings { sample_rate: 44_100, ..StudioSettings::default() };
+        let notes =
+            apply_settings_for_profile(ViewCtx::Test, &mut h, dir.path(), s, Some(("b".into(), prof_b.clone())))
+                .unwrap_or_else(|e| panic!("apply: {e}"));
+        assert_eq!(h.profile_id.as_deref(), Some("b"));
+        assert_eq!(active_profile_file(&h, dir.path()), prof_b);
+        assert!(notes.is_empty(), "idle profile switch reopens engine cleanly: {notes:?}");
+        assert_eq!(h.collection.as_ref().and_then(|c| c.engine_format()), Some((44_100, false)));
+
+        let formatted = format_settings_note(vec!["Heads up.".into()], &["Ctrl+Shift+X".into()]);
+        let reply = shelf_action_result("b", formatted);
+        assert_eq!(reply["id"], "b");
+        assert!(reply["note"].as_str().is_some_and(|n| n.contains("Heads up.") && n.contains("Ctrl+Shift+X")));
 
         ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
     }
