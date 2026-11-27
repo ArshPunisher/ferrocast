@@ -11955,7 +11955,7 @@ mod tests {
     fn midstream_bframe_half_fps_output_keeps_av_sync_within_40ms() {
         #[derive(Default)]
         struct TagLog {
-            items: Vec<(bool, i64, i64, bool)>, // (is_video, dts_ms, pts_ms, is_header)
+            items: Vec<(bool, i64, i64, bool, i32)>, // (is_video, dts_ms, pts_ms, is_header, cts_ms)
         }
         fn collect(log: &Arc<(Mutex<TagLog>, std::sync::Condvar)>) -> Box<dyn FnMut(Tag) + Send> {
             let log = log.clone();
@@ -11968,9 +11968,11 @@ mod tests {
                         } else {
                             0
                         };
-                        (true, i64::from(ms), i64::from(ms) + i64::from(cts), is_hdr)
+                        (true, i64::from(ms), i64::from(ms) + i64::from(cts), is_hdr, cts)
                     }
-                    Tag::Audio { ms, body } => (false, i64::from(ms), i64::from(ms), body.get(1).copied() == Some(0)),
+                    Tag::Audio { ms, body } => {
+                        (false, i64::from(ms), i64::from(ms), body.get(1).copied() == Some(0), 0)
+                    }
                 };
                 let (lk, cv) = &*log;
                 lk.lock().unwrap_or_else(|p| p.into_inner()).items.push(item);
@@ -11981,7 +11983,7 @@ mod tests {
             log: &Arc<(Mutex<TagLog>, std::sync::Condvar)>,
             want_video: usize,
             want_audio: usize,
-        ) -> Vec<(bool, i64, i64, bool)> {
+        ) -> Vec<(bool, i64, i64, bool, i32)> {
             let (lk, cv) = &**log;
             let mut st = lk.lock().unwrap_or_else(|p| p.into_inner());
             let mut waited = 0u32;
@@ -12000,6 +12002,7 @@ mod tests {
 
         let Some(e) = engine() else { return };
         shared_scene(&e);
+        // Add a ticking text/changing source or toggle a small color shift so VideoToolbox exercises B-frame reordering.
         let main_log: Arc<(Mutex<TagLog>, std::sync::Condvar)> = Arc::default();
         let out1 = e.start_output(OutputKind::Stream(collect(&main_log))).unwrap_or_else(|x| panic!("{x}"));
         let _ = wait_until(&main_log, 3, 2);
@@ -12016,25 +12019,45 @@ mod tests {
             bitrate_kbps: 2000,
             rate: RateControl::Cbr,
             keyframe_secs: 1,
-            software: true,
+            software: false,
             profile: crate::video::H264Profile::High,
             bframes: true,
             preset: None,
             tune: None,
         };
         let acfg = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
-        let out2 = e
-            .start_output_with(OutputKind::Stream(collect(&mid_log)), half_canvas, vcfg, acfg)
-            .unwrap_or_else(|x| panic!("{x}"));
-        let _ = wait_until(&mid_log, 10, 6);
+        let out2 = match e.start_output_with(OutputKind::Stream(collect(&mid_log)), half_canvas, vcfg, acfg) {
+            Ok(o) => o,
+            Err(_) if !cfg!(target_os = "macos") => {
+                let _ = e.stop_output(out1);
+                return;
+            }
+            Err(x) => panic!("{x}"),
+        };
+        for step in 0..20u8 {
+            let _ = e.set_source(
+                1,
+                SourceKind::Color {
+                    width: 640,
+                    height: 360,
+                    rgba: [20u8.saturating_add(step * 9), 90, 60u8.saturating_add(step * 5), 255],
+                },
+            );
+            std::thread::sleep(Duration::from_millis(35));
+        }
+        let _ = wait_until(&mid_log, 12, 6);
 
         e.stop_output(out2).unwrap();
         e.stop_output(out1).unwrap();
 
         let collected = mid_log.0.lock().unwrap_or_else(|p| p.into_inner()).items.clone();
         let video_dts: Vec<i64> = collected.iter().filter(|x| x.0 && !x.3).map(|x| x.1).collect();
+        let max_cts = collected.iter().filter(|x| x.0 && !x.3).map(|x| x.4).max().unwrap_or(0);
         let first_v_pts = collected.iter().find_map(|x| (x.0 && !x.3).then_some(x.2)).expect("midstream video");
         let first_a = collected.iter().find_map(|x| (!x.0 && !x.3).then_some(x.1)).expect("midstream audio");
+        if cfg!(target_os = "macos") {
+            assert!(max_cts > 0, "expected real VideoToolbox B-frame reordering (max_cts={max_cts})");
+        }
         assert!(
             (first_v_pts - first_a).abs() < 40,
             "mid-stream B-frame A/V start skewed: video_pts={first_v_pts}ms audio={first_a}ms"

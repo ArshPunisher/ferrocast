@@ -2669,42 +2669,53 @@ mod bframe_tests {
 
     #[test]
     fn midstream_bframe_pipeline_with_audio_off_thread_keeps_av_sync_within_40ms() {
-        let vcfg = VideoConfig { software: true, ..video(true) };
+        let vcfg = video(true);
         let acfg = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         let Ok(mut pipe) = Pipeline::new(vcfg, acfg, None) else { return };
         if pipe.audio_off_thread().is_err() {
             return;
         }
         let start_ns: u64 = 310_000_000_000;
-
-        let y = vec![128u8; 320 * 180];
-        let uv = vec![128u8; 320 * 90];
-        let frame = Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 };
-
-        // Audio arriving before the first video frame must stay aligned once off-thread AAC starts.
-        let mut tags = Vec::new();
-        tags.extend(pipe.video(frame, start_ns).unwrap_or_else(|e| panic!("{e}")));
-
         let step_ns = 1_000_000_000 / 30;
         let block_ns = (1024u64 * 1_000_000_000) / 48_000;
         let pre_audio = vec![0.0f32; 1024 * 2];
-        tags.extend(pipe.audio(&pre_audio, start_ns - block_ns / 2).unwrap_or_else(|e| panic!("{e}")));
-        for i in 1..=30u64 {
+        let y_base = vec![128u8; 320 * 180];
+        let uv = vec![128u8; 320 * 90];
+
+        // Feed pre-start audio before the first video frame arrives (`start_ns == None`) and verify
+        // it is discarded without skewing subsequent audio alignment.
+        let mut tags = Vec::new();
+        tags.extend(pipe.audio(&pre_audio, start_ns - block_ns * 2).unwrap_or_else(|e| panic!("{e}")));
+
+        for i in 0..=45u64 {
+            let mut y = y_base.clone();
+            let stripe = ((i as usize * 17) % 170) * 320;
+            let end = (stripe + 320 * 8).min(y.len());
+            for b in &mut y[stripe..end] {
+                *b = ((i * 29) % 251) as u8;
+            }
+            let frame = Frame::Nv12 { y: &y, y_stride: 320, uv: &uv, uv_stride: 320 };
             tags.extend(pipe.video(frame, start_ns + i * step_ns).unwrap_or_else(|e| panic!("{e}")));
-            tags.extend(
-                pipe.audio(&pre_audio, start_ns - block_ns / 2 + i * block_ns).unwrap_or_else(|e| panic!("{e}")),
-            );
+            if i == 0 {
+                tags.extend(pipe.audio(&pre_audio, start_ns - block_ns / 2).unwrap_or_else(|e| panic!("{e}")));
+            } else {
+                tags.extend(
+                    pipe.audio(&pre_audio, start_ns - block_ns / 2 + i * block_ns).unwrap_or_else(|e| panic!("{e}")),
+                );
+            }
         }
         tags.extend(pipe.finish().unwrap_or_else(|e| panic!("{e}")));
 
         let mut dts_ms = Vec::new();
         let mut first_video_pts_ms = None;
+        let mut max_cts = 0i32;
         for t in &tags {
             if let Tag::Video { ms, body } = t
                 && body.len() > 5
                 && body[1] == 1
             {
                 let cts = ((body[2] as i32) << 16 | (body[3] as i32) << 8 | (body[4] as i32)) << 8 >> 8;
+                max_cts = max_cts.max(cts);
                 dts_ms.push(i64::from(*ms));
                 first_video_pts_ms.get_or_insert(i64::from(*ms) + i64::from(cts));
             }
@@ -2714,6 +2725,9 @@ mod bframe_tests {
             _ => None,
         });
         let (fv, fa) = (first_video_pts_ms.expect("video frame"), first_audio_ms.expect("audio frame"));
+        if cfg!(target_os = "macos") {
+            assert!(max_cts > 0, "expected real B-frame reordering (max_cts={max_cts})");
+        }
         assert!((fv - fa).abs() < 40, "mid-stream B-frame A/V start skewed: video_pts={fv}ms audio={fa}ms");
         assert!(dts_ms.windows(2).all(|w| w[1] >= w[0]), "non-monotonic video DTS: {dts_ms:?}");
     }

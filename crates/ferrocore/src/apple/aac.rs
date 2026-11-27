@@ -243,19 +243,34 @@ mod tests {
     use super::*;
 
     #[inline(never)]
-    fn encode_at_pad(pad: usize, blocks: &[Vec<f32>]) -> Vec<Vec<u8>> {
-        let mut s = [0u8; 64];
-        for i in 0..pad.min(s.len()) {
-            s[i] = i as u8;
+    fn encode_at_pad<const PAD: usize>(blocks: &[Vec<f32>]) -> (usize, Vec<Vec<u8>>) {
+        let mut s = [0u8; PAD];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = i as u8;
         }
-        std::hint::black_box(&s[..pad.min(s.len())]);
+        std::hint::black_box(&mut s);
+        let sp_mod_64 = (&raw const s as usize) % 64;
         let cfg = AudioConfig { sample_rate: 48_000, channels: 2, bitrate_kbps: 128 };
         let mut enc = Encoder::new(&cfg).unwrap_or_else(|e| panic!("{e}"));
         let mut out = Vec::new();
         for blk in blocks {
             out.extend(enc.encode(blk).unwrap_or_else(|e| panic!("{e}")));
         }
-        out
+        (sp_mod_64, out)
+    }
+
+    #[inline(never)]
+    fn at_stack_depth<F: FnOnce() -> R, R>(depth: usize, f: F) -> R {
+        let pad = std::hint::black_box([depth as u8; 16]);
+        if depth == 0 {
+            let r = f();
+            std::hint::black_box(pad);
+            r
+        } else {
+            let r = at_stack_depth(depth - 1, f);
+            std::hint::black_box(pad);
+            r
+        }
     }
 
     #[test]
@@ -263,10 +278,18 @@ mod tests {
         let blocks: Vec<Vec<f32>> = (0..16)
             .map(|k| (0..AAC_FRAME * 2).map(|i| ((k * AAC_FRAME * 2 + i) as f32 * 0.05).sin() * 0.35).collect())
             .collect();
-        let baseline = encode_at_pad(0, &blocks);
-        for pad in [16, 32, 48] {
-            let other = encode_at_pad(pad, &blocks);
-            assert_eq!(baseline, other, "AAC output differed for caller stack offset +{pad}");
+        let (_, baseline) = encode_at_pad::<1>(&blocks);
+        let mut observed_offsets = std::collections::HashSet::new();
+        let mut check = |depth: usize, (off, out): (usize, Vec<Vec<u8>>)| {
+            observed_offsets.insert(off);
+            assert_eq!(baseline, out, "AAC output differed at depth={depth}, SP%64={off}");
+        };
+        for depth in 0..4 {
+            check(depth, at_stack_depth(depth, || encode_at_pad::<1>(&blocks)));
+            check(depth, at_stack_depth(depth, || encode_at_pad::<17>(&blocks)));
+            check(depth, at_stack_depth(depth, || encode_at_pad::<33>(&blocks)));
+            check(depth, at_stack_depth(depth, || encode_at_pad::<49>(&blocks)));
         }
+        assert!(observed_offsets.len() >= 3, "expected distinct caller SP % 64 offsets, got {observed_offsets:?}");
     }
 }
