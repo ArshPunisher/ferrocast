@@ -127,6 +127,11 @@ impl AutoQuality {
         lowered
     }
 
+    /// Reverts `pct` to a prior share when an applied step had to be aborted before taking effect.
+    pub fn revert_to(&mut self, prev_pct: u8) {
+        self.pct = prev_pct.clamp(FLOOR, 100);
+    }
+
     /// One look at `at` (ms) → the new share when it changes.
     pub fn tick(&mut self, at: i64, s: Signals) -> Option<u8> {
         let started = *self.started.get_or_insert(at);
@@ -356,5 +361,15 @@ mod tests {
         assert_eq!(q.pct(), 100);
         // On again: still past the stream's first seconds, trouble counts at once.
         assert_eq!(q.tick(14_000, all([9, 9, 9])), Some(85));
+    }
+
+    #[test]
+    fn revert_to_restores_previous_share() {
+        let mut q = AutoQuality::default();
+        quiet(&mut q, 0, 12_000, &all([0, 0, 0]));
+        assert_eq!(q.tick(12_000, all([5, 5, 5])), Some(85));
+        assert_eq!(q.tick(25_000, all([10, 10, 10])), Some(70));
+        q.revert_to(85);
+        assert_eq!(q.pct(), 85);
     }
 }
