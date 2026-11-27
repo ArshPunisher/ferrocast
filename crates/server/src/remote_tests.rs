@@ -221,6 +221,9 @@ async fn a_phone_reaches_this_pc_through_the_relay() {
     // Refused on the relay before reaching the PC.
     for (token, method, path) in [
         (&moder, Method::GET, "/r/api/v1/settings"),
+        (&moder, Method::GET, "/r/api/v1/golive/quality-options"),
+        (&moder, Method::PUT, "/r/api/v1/golive/destinations/kick/quality"),
+        (&owner, Method::PUT, "/r/api/v1/golive/destinations/kick/quality"),
         (&owner, Method::GET, "/r/api/v1/accounts"),
         (&owner, Method::POST, "/r/api/v1/pro/remote/codes"),
         (&owner, Method::POST, "/r/api/v1/session/pair-code"),
@@ -228,6 +231,10 @@ async fn a_phone_reaches_this_pc_through_the_relay() {
         let (s, v) = w.phone(method, path, token, Some(json!({}))).await;
         assert_eq!((s, v["error"]["code"].as_str()), (403, Some("not_allowed_for_role")), "{path}: {v}");
     }
+    // Paired owner phone can read Go live quality options (PC-only PUT stayed refused above).
+    let (s, v) = w.phone(Method::GET, "/r/api/v1/golive/quality-options", &owner, None).await;
+    assert_eq!(s, 200, "{v}");
+    assert!(v["destinations"].is_object(), "{v}");
     // Unknown routes are this PC's own 404.
     let (s, v) = w.phone(Method::GET, "/r/api/v1/nothing-here", &owner, None).await;
     assert_eq!((s, v["error"]["code"].as_str()), (404, Some("no_route")), "{v}");

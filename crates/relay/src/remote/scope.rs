@@ -123,10 +123,11 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/golive/ingest"),
     ("POST", "/golive/destinations"),
     ("*", "/golive/destinations/*"),
-    // The Studio's lighter stream and Twitch Enhanced Broadcasting reshape the stream on air:
-    // the PC only (`*` is one segment, so the rule above does not reach these).
+    // The Studio's lighter stream, Twitch Enhanced Broadcasting, and per-destination quality
+    // changes reshape the encodes: PC only (`*` is one segment, so the rule above does not reach these).
     ("*", "/golive/destinations/*/light"),
     ("*", "/golive/destinations/*/enhanced"),
+    ("*", "/golive/destinations/*/quality"),
     ("*", "/golive/test"),
     ("*", "/golive/networks"),
     // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.

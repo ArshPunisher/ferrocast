@@ -124,10 +124,11 @@ pub const OWNER_DENIED: &[Rule] = &[
     ("*", "/golive/ingest"),
     ("POST", "/golive/destinations"),
     ("*", "/golive/destinations/*"),
-    // The Studio's lighter stream and Twitch Enhanced Broadcasting reshape the stream on air:
-    // the PC only (`*` is one segment, so the rule above does not reach these).
+    // The Studio's lighter stream, Twitch Enhanced Broadcasting, and per-destination quality
+    // changes reshape the encodes: PC only (`*` is one segment, so the rule above does not reach these).
     ("*", "/golive/destinations/*/light"),
     ("*", "/golive/destinations/*/enhanced"),
+    ("*", "/golive/destinations/*/quality"),
     ("*", "/golive/test"),
     ("*", "/golive/networks"),
     // Support diagnostics inspect local machine logs, hardware, and crash dumps: PC only.
@@ -276,6 +277,7 @@ pub const KEY_NEVER_ALLOWED: &[Rule] = &[
     ("*", "/golive/ingest"),
     ("POST", "/golive/destinations"),
     ("DELETE", "/golive/destinations/*"),
+    ("*", "/golive/destinations/*/quality"),
     ("*", "/golive/test"),
     ("*", "/golive/networks"),
     ("POST", "/golive/new-key"),
@@ -368,6 +370,7 @@ pub const READ_ONLY_ALLOWED: &[Rule] = &[
     ("GET", "/obs/stream"),
     ("GET", "/obs/health"),
     ("GET", "/golive"),
+    ("GET", "/golive/quality-options"),
     ("GET", "/golive/picture"),
     ("GET", "/studio/engine"),
     ("GET", "/studio/engine/scenes"),
@@ -580,6 +583,7 @@ pub const STUDIO_CONTROL_ALLOWED: &[Rule] = &[
 pub const GO_LIVE_ALLOWED: &[Rule] = &[
     ("GET", "/live"),
     ("GET", "/golive"),
+    ("GET", "/golive/quality-options"),
     ("PUT", "/golive/destinations"),
     ("POST", "/golive/destinations/*/test"),
     ("POST", "/golive/upload-check"),

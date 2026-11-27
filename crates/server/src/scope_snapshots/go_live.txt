@@ -2,6 +2,7 @@ DELETE /stream-info/presets/{id}
 GET /asyncapi.json
 GET /golive
 GET /golive/picture
+GET /golive/quality-options
 GET /obs/health
 GET /obs/stream
 GET /openapi.json

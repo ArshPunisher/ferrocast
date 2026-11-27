@@ -153,6 +153,7 @@ async fn scope_enforcement_matrix_across_all_route_groups() {
         Case { method: "GET", path: "/overlays", body: None, expected: [F, F, A, F, F, F, A] },
         Case { method: "GET", path: "/obs/scenes", body: None, expected: [A, F, F, A, F, F, A] },
         Case { method: "GET", path: "/golive", body: None, expected: [A, F, F, F, A, F, A] },
+        Case { method: "GET", path: "/golive/quality-options", body: None, expected: [A, F, F, F, A, F, A] },
         Case { method: "GET", path: "/settings", body: None, expected: [F, F, F, F, F, A, A] },
         // Chat writes
         Case {
@@ -247,6 +248,12 @@ async fn scope_enforcement_matrix_across_all_route_groups() {
         Case { method: "GET", path: "/golive/ingest", body: None, expected: [F, F, F, F, F, F, F] },
         Case { method: "POST", path: "/golive/destinations", body: Some(json!({})), expected: [F, F, F, F, F, F, F] },
         Case { method: "DELETE", path: "/golive/destinations/d1", body: None, expected: [F, F, F, F, F, F, F] },
+        Case {
+            method: "PUT",
+            path: "/golive/destinations/kick/quality",
+            body: Some(json!({ "mode": "same_as_main" })),
+            expected: [F, F, F, F, F, F, F],
+        },
         Case {
             method: "POST",
             path: "/golive/test",

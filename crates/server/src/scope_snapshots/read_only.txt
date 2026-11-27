@@ -17,6 +17,7 @@ GET /giveaways/current
 GET /goals
 GET /golive
 GET /golive/picture
+GET /golive/quality-options
 GET /insights/supporters
 GET /labels
 GET /links
