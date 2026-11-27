@@ -1409,6 +1409,34 @@
             "type": "object"
           },
           "summary": "Play synthesized TTS audio in overlay."
+        },
+        "tts_stop": {
+          "payload": {
+            "properties": {
+              "data": {
+                "type": "object"
+              },
+              "seq": {
+                "type": "integer"
+              },
+              "type": {
+                "const": "tts_stop",
+                "type": "string"
+              },
+              "v": {
+                "const": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "v",
+              "seq",
+              "type",
+              "data"
+            ],
+            "type": "object"
+          },
+          "summary": "Stop active overlay TTS playback and clear queued lines."
         }
       },
       "parameters": {

@@ -177,15 +177,17 @@ impl Engine {
                     .await
                     .ok()
                     .flatten();
-                // A queued alert for this message must not read it aloud either.
-                if let Some(ev) = deleted_event {
+                // A queued alert or chat TTS line for this message must not read it aloud either.
+                if let Some(ev) = &deleted_event {
+                    let ev_id = ev.clone();
                     self.queue_op(move |q, _| {
-                        q.strip_tts(&ev);
+                        q.strip_tts(&ev_id);
                         vec![]
                     })
                     .await;
                     self.push_tts_pending().await;
                 }
+                self.purge_chat_tts_message(e.platform, message_id, deleted_event.as_deref());
                 self.send_overlay(OverlayFrame::new(
                     Audience::Chat,
                     e.seq,
@@ -196,6 +198,12 @@ impl Engine {
             EventKind::UserMessagesCleared { target } | EventKind::Ban { target, .. } => {
                 if let Some(uid) = &target.id {
                     self.hide_user(e.platform, uid);
+                    self.purge_chat_tts_user(e.platform, uid);
+                    let p = e.platform;
+                    let aid = uid.clone();
+                    if self.db(move |s| repo::events::drop_pending_tts_for_user(s, p, &aid)).await.unwrap_or(0) > 0 {
+                        self.push_tts_pending().await;
+                    }
                 }
                 self.clear_highlight_if_user(e.platform, target);
                 self.send_overlay(OverlayFrame::new(
@@ -294,6 +302,9 @@ impl Engine {
 
         if e.kind.is_alertable() || matches!(e.kind, EventKind::Tip { .. }) {
             self.support_event(&e).await;
+        }
+        if show_in_overlays && matches!(e.kind, EventKind::ChatMessage { .. }) {
+            self.maybe_enqueue_chat_tts(&e).await;
         }
 
         // "When X, do Y" (hidden chat never sets a rule off).

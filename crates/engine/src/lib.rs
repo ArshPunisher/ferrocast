@@ -21,6 +21,7 @@ mod cloud_sync_tests;
 mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod automation;
+mod chat_tts;
 pub mod designs;
 pub mod diagnostics;
 mod discord;
@@ -238,6 +239,7 @@ struct Inner {
     youtube_handle_checked: AtomicBool,
     /// Last `next_stream_at` timestamp broadcast to overlays, so schedule ticks detect pass-through.
     last_pushed_next_stream_at: Mutex<Option<Option<i64>>>,
+    chat_tts: chat_tts::ChatTtsSlot,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -403,6 +405,7 @@ impl Engine {
                 hardware_probe_cache: Default::default(),
                 youtube_handle_checked: AtomicBool::new(false),
                 last_pushed_next_stream_at: Mutex::new(None),
+                chat_tts: Default::default(),
             }),
         };
         tokio::spawn(prune(engine.clone()));
@@ -411,6 +414,7 @@ impl Engine {
         let vh = tokio::spawn(viewers::run(engine.clone()));
         *engine.inner.viewer_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(vh.abort_handle());
         tokio::spawn(dispatcher::run(engine.clone()));
+        tokio::spawn(chat_tts::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
         tokio::spawn(schedule::run(engine.clone()));
         tokio::spawn(automation::run(engine.clone()));
@@ -764,6 +768,7 @@ async fn prune(engine: Engine) {
         // Clean up orphaned ephemeral TTS files older than 1 hour, preserving any alert still in
         // the queue and any cached voice previews.
         let mut keep_ids = engine.cloud_tts().preview_ids();
+        keep_ids.extend(engine.chat_tts_media_ids());
         {
             let q = engine.inner.queue.lock().await;
             if let Some(id) = q.playing().and_then(|p| p.alert.tts_audio.as_ref()) {

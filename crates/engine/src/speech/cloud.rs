@@ -356,6 +356,17 @@ impl Engine {
                 self.cloud_fell_back(why, system_voice.as_deref());
             }
         }
+        self.speak_local(text, system_voice, notice).await
+    }
+
+    /// Synthesizes `text` with the local computer voice only (never Pro Cloud TTS) and saves
+    /// it to the media library. Used by free Chat TTS so busy chat never spends cloud quota.
+    pub(crate) async fn speak_local_to_media(&self, text: &str) -> Option<String> {
+        let system_voice = self.state().tts.voice.clone();
+        self.speak_local(text, system_voice, None).await.map(|s| s.media_id)
+    }
+
+    async fn speak_local(&self, text: &str, system_voice: Option<String>, notice: Option<String>) -> Option<Spoken> {
         let work = self.store().dir().join("tmp");
         let out = work.join(format!("tts-{}.wav", ferrocast_store::new_id()));
         if let Err(e) = super::synthesize(text, system_voice.as_deref(), &work, &out).await {

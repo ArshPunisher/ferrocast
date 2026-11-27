@@ -525,6 +525,55 @@ async fn tts_goals_and_commands_speak_the_dashboards_language() {
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     assert!(r.get("/api/v1/tts/pending").await.json::<Value>().await.unwrap().as_array().unwrap().is_empty());
 
+    // Chat TTS defaults, partial merges, trimming, and validation bounds.
+    let initial: Value = r.get("/api/v1/tts").await.json().await.unwrap();
+    assert_eq!(initial["chat"]["enabled"], false);
+    assert_eq!(initial["chat"]["mode"], "subs_mods");
+    assert_eq!(initial["chat"]["command"], "!tts");
+    assert_eq!(initial["chat"]["cooldown_s"], 15);
+    assert_eq!(initial["chat"]["global_cooldown_s"], 3);
+    assert_eq!(initial["chat"]["queue_limit"], 5);
+    assert_eq!(initial["chat"]["max_chars"], 160);
+    assert_eq!(initial["chat"]["skip_links"], true);
+    assert_eq!(initial["chat"]["skip_emote_spam"], true);
+
+    let first_patch: Value = r
+        .put(
+            "/api/v1/tts",
+            json!({ "enabled": true, "chat": { "enabled": true, "mode": "command", "command": "  !voice  " } }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first_patch["chat"]["enabled"], true);
+    assert_eq!(first_patch["chat"]["mode"], "command");
+    assert_eq!(first_patch["chat"]["command"], "!voice");
+    assert_eq!(first_patch["chat"]["cooldown_s"], 15);
+
+    let partial: Value =
+        r.put("/api/v1/tts", json!({ "chat": { "cooldown_s": 45, "skip_links": false } })).await.json().await.unwrap();
+    assert_eq!(partial["chat"]["enabled"], true);
+    assert_eq!(partial["chat"]["mode"], "command");
+    assert_eq!(partial["chat"]["command"], "!voice");
+    assert_eq!(partial["chat"]["cooldown_s"], 45);
+    assert_eq!(partial["chat"]["skip_links"], false);
+
+    for (payload, expected_prefix) in [
+        (json!({ "chat": { "command": "voice" } }), "chat.command"),
+        (json!({ "chat": { "cooldown_s": 301 } }), "chat.cooldown_s"),
+        (json!({ "chat": { "global_cooldown_s": 61 } }), "chat.global_cooldown_s"),
+        (json!({ "chat": { "queue_limit": 0 } }), "chat.queue_limit"),
+        (json!({ "chat": { "queue_limit": 21 } }), "chat.queue_limit"),
+        (json!({ "chat": { "max_chars": 9 } }), "chat.max_chars"),
+        (json!({ "chat": { "max_chars": 301 } }), "chat.max_chars"),
+    ] {
+        let invalid = r.put("/api/v1/tts", payload).await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let body: Value = invalid.json().await.unwrap();
+        assert!(body["error"]["message"].as_str().unwrap_or("").starts_with(expected_prefix), "{body}");
+    }
+
     let g: Value = r
         .post("/api/v1/goals", json!({ "title": "Mic", "kind": "tips", "target": 5000, "currency": "INR" }))
         .await

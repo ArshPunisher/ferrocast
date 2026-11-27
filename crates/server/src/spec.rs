@@ -3482,6 +3482,7 @@ fn build_asyncapi() -> Value {
                     "alert": overlay_message("alert", "Show alert visual & sound frame.", json!({ "type": "object" })),
                     "alert_hide": overlay_message("alert_hide", "Dismiss active alert frame (`{ alert_id }`).", json!({ "type": "object" })),
                     "tts": overlay_message("tts", "Play synthesized TTS audio in overlay.", json!({ "type": "object" })),
+                    "tts_stop": overlay_message("tts_stop", "Stop active overlay TTS playback and clear queued lines.", json!({ "type": "object" })),
                     "music": overlay_message("music", "Visualizer spectrum levels & track info.", json!({ "type": "object" })),
                     "delete_message": overlay_message("delete_message", "Remove moderated chat message from overlay chatbox.", json!({ "type": "object" })),
                     "delete_user": overlay_message("delete_user", "Remove all messages from a timed-out/banned user.", json!({ "type": "object" })),

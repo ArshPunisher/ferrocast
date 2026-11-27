@@ -224,11 +224,18 @@ impl Engine {
 
     /// Mutes or unmutes alert sound and speech (kept across restarts).
     pub async fn queue_set_muted(&self, muted: bool) -> QueueView {
-        self.queue_op(move |q, _| {
-            q.set_muted(muted);
-            vec![]
-        })
-        .await
+        let view = self
+            .queue_op(move |q, _| {
+                q.set_muted(muted);
+                vec![]
+            })
+            .await;
+        if muted {
+            self.stop_chat_tts();
+        } else {
+            self.wake_chat_tts();
+        }
+        view
     }
 
     pub async fn queue_resume(&self) -> QueueView {

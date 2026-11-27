@@ -224,6 +224,11 @@ impl Engine {
         let c = self.connector(platform).ok_or(ConnectorError::NotConnected(platform))?;
         c.timeout(user_id, seconds, reason).await?;
         self.clear_highlight_if_user_id(platform, user_id);
+        self.purge_chat_tts_user(platform, user_id);
+        let uid = user_id.to_string();
+        if self.db(move |s| repo::events::drop_pending_tts_for_user(s, platform, &uid)).await.unwrap_or(0) > 0 {
+            self.push_tts_pending().await;
+        }
         self.count_timeout(platform, user_id).await;
         Ok(())
     }
@@ -325,6 +330,12 @@ impl Engine {
                 Some(c) => match c.ban(&uid, reason.as_deref()).await {
                     Ok(()) => {
                         self.clear_highlight_if_user_id(p, &uid);
+                        self.purge_chat_tts_user(p, &uid);
+                        let aid = uid.clone();
+                        if self.db(move |s| repo::events::drop_pending_tts_for_user(s, p, &aid)).await.unwrap_or(0) > 0
+                        {
+                            self.push_tts_pending().await;
+                        }
                         out.ok.push(p);
                     }
                     Err(e) => {
@@ -446,6 +457,11 @@ impl Engine {
             st.panic_on = on;
             st.tts_paused = plan.pause_tts;
         }
+        if plan.pause_tts {
+            self.stop_chat_tts();
+        } else {
+            self.wake_chat_tts();
+        }
         if on && plan.pause_alerts {
             self.queue_pause().await;
         } else if !on && cfg.pause_alerts {
@@ -499,14 +515,23 @@ impl Engine {
         self.state().tts.clone()
     }
 
-    pub async fn save_tts(&self, p: TtsPolicy) -> Result<TtsPolicy, EngineError> {
+    pub async fn save_tts(&self, mut p: TtsPolicy) -> Result<TtsPolicy, EngineError> {
         let _one_at_a_time = self.config_lock().await;
         if p.max_chars == 0 || p.max_chars > 500 {
             return Err(EngineError::Invalid("TTS can read 1 to 500 characters.".into()));
         }
+        p.chat.command = p.chat.command.trim().to_string();
+        if let Err(err) = p.chat.validate() {
+            return Err(EngineError::Invalid(err));
+        }
         let saved = p.clone();
         self.db(move |s| repo::settings::set(s, "tts", &saved)).await?;
         self.state_mut().tts = p.clone();
+        if !p.enabled || !p.chat.enabled {
+            self.stop_chat_tts();
+        } else {
+            self.wake_chat_tts();
+        }
         Ok(p)
     }
 
@@ -518,7 +543,22 @@ impl Engine {
             .await?
             .ok_or(EngineError::NotFound("TTS message"))?;
         if approve {
-            let audio = self.speak_to_media(&item.text).await;
+            let eid = item.event_id.clone();
+            let ev = self.db(move |s| repo::events::get(s, &eid)).await.ok().flatten();
+            let is_chat =
+                ev.as_ref().is_some_and(|e| matches!(e.kind, ferrocast_core::event::EventKind::ChatMessage { .. }));
+            crate::studio::voice_commands::reading_aloud(&item.text, now().0);
+            let audio = if is_chat {
+                self.speak_local_to_media(&item.text).await
+            } else {
+                self.speak_to_media(&item.text).await
+            };
+            if is_chat
+                && let Some(mid) = audio.clone()
+                && let Some(retired) = self.remember_chat_tts_media(mid)
+            {
+                let _ = self.db(move |s| repo::media::delete(s, &retired)).await;
+            }
             self.send_overlay(crate::frames::OverlayFrame::new(
                 crate::frames::Audience::Alerts,
                 self.next_seq(),
