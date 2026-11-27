@@ -107,13 +107,16 @@ pub fn levels_now(
 }
 
 /// Handle to a [`Stage`]'s active engine, used by views and lifetime tests.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct EngineRef(Arc<own::Shared>);
 
 /// Weak reference to a [`Stage`]'s active engine.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct WeakEngineRef(std::sync::Weak<own::Shared>);
 
+#[cfg(any(test, feature = "test-support"))]
 impl EngineRef {
     pub fn downgrade(&self) -> WeakEngineRef {
         WeakEngineRef(Arc::downgrade(&self.0))
@@ -128,6 +131,7 @@ impl EngineRef {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl WeakEngineRef {
     pub fn is_alive(&self) -> bool {
         self.0.upgrade().is_some()
@@ -765,7 +769,13 @@ impl Stage {
         self.engine.borrow().is_some()
     }
 
+    /// Opens this stage's running engine if it is not already open.
+    pub fn ensure_engine(&self) -> Result<(), StudioError> {
+        self.engine().map(|_| ())
+    }
+
     /// Returns a handle to this stage's running engine, opening it if needed.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn engine_ref(&self) -> Result<EngineRef, StudioError> {
         self.engine().map(EngineRef)
     }
@@ -7188,6 +7198,7 @@ impl Stage {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageView {
     /// Returns a handle to the engine backing this view.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn engine_ref(&self) -> EngineRef {
         EngineRef(self.shared.clone())
     }
@@ -7607,6 +7618,7 @@ impl Stage {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageProjector {
     /// Returns a handle to the engine backing this projector.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn engine_ref(&self) -> EngineRef {
         EngineRef(self.shared.clone())
     }

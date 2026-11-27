@@ -801,7 +801,7 @@ fn finish_canvas_views(
     if let Some(c) = &h.collection
         && reopen_engine
         && !c.has_engine()
-        && let Err(e) = c.engine_ref()
+        && let Err(e) = c.ensure_engine()
     {
         tracing::warn!(error = %e, "the engine didn't reopen after a canvas change");
     }
@@ -1526,9 +1526,6 @@ fn swap_collection_releasing(
     h.replay_back = None;
     h.replay_wait = None;
     let guests = std::mem::take(&mut h.guests);
-    if !guests.is_empty() {
-        let _ = std::thread::Builder::new().name("ferrocast-guest-drain".into()).spawn(move || drop(guests));
-    }
     // NDI and the virtual camera send the old collection's picture: they stop with it.
     h.ndi = None;
     h.virtualcam = None;
@@ -1543,6 +1540,10 @@ fn swap_collection_releasing(
         save_confirmed(h.collection_deferred, &old_c, from);
         drop(old_c);
     }
+    // Unlink guest .sdp files only after the outgoing collection has dropped and closed FFmpeg.
+    if !guests.is_empty() {
+        let _ = std::thread::Builder::new().name("ferrocast-guest-drain".into()).spawn(move || drop(guests));
+    }
     h.collection_deferred = false;
     save_confirmed(false, &made, to);
     apply_collection_audio_prefs(&made, h.settings.as_ref());
@@ -1556,7 +1557,7 @@ fn swap_collection_releasing(
     save_projectors(h, data);
     if let Some(c) = &h.collection
         && !c.has_engine()
-        && let Err(e) = c.engine_ref()
+        && let Err(e) = c.ensure_engine()
     {
         tracing::warn!(error = %e, "the engine couldn't open after switching scene collections");
     }
@@ -1763,7 +1764,6 @@ fn take_outputs_from_held(h: &mut Held) -> Vec<Box<dyn FnOnce() + Send>> {
     push_opt_drain(&mut jobs, &mut h.replay);
     push_opt_drain(&mut jobs, &mut h.virtualcam);
     push_opt_drain(&mut jobs, &mut h.ndi);
-    push_vec_drain(&mut jobs, &mut h.guests);
     sync_local_capture_flags(h);
     jobs
 }
@@ -1904,6 +1904,10 @@ pub fn close() -> bool {
     let jobs = take_outputs_from_held(&mut held);
     let clean = drain_outputs_bounded(jobs, quit_drain_for(cfg!(windows)));
     clear_non_output_held(&mut held);
+    // Drop the outgoing collection before guests so FFmpeg closes guest .sdp files first.
+    let guests = std::mem::take(&mut held.guests);
+    drop(held.collection.take());
+    drop(guests);
     drop(held);
     // The queued scene saves land before the process goes (bounded).
     if !ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(6)) {
@@ -3441,13 +3445,15 @@ impl StudioHost for DesktopStudio {
             let _ = tokio::task::spawn_blocking(move || drain_outputs_bounded(jobs, QUIT_DRAIN_TIMEOUT)).await;
         }
         let data = self.data.clone();
-        let status = self
+        let (status, guests) = self
             .on_main(move |h| {
                 let file = active_collection_file(h, &data);
                 let deferred = h.collection_deferred;
                 clear_non_output_held(h);
+                let guests = std::mem::take(&mut h.guests);
                 if let Some(c) = h.collection.take() {
                     save_confirmed(deferred, &c, &file);
+                    drop(c);
                 }
                 h.collection_deferred = false;
                 h.collection_id = None;
@@ -3455,15 +3461,17 @@ impl StudioHost for DesktopStudio {
                 h.profile_id = None;
                 h.profile_file = None;
                 write_session(None);
-                Self::status_of(h)
+                (Self::status_of(h), guests)
             })
             .await?;
-        // The scenes' save was queued: wait for it here, off the main thread, so Stop still means
-        // "saved" without the UI waiting on a locked file.
-        let landed =
-            tokio::task::spawn_blocking(|| ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10)))
-                .await
-                .unwrap_or(false);
+        // Unlink guest .sdp files off the main thread only after the outgoing collection dropped,
+        // and flush queued scene saves before returning.
+        let landed = tokio::task::spawn_blocking(move || {
+            drop(guests);
+            ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10))
+        })
+        .await
+        .unwrap_or(false);
         if !landed {
             tracing::warn!("the Studio's scenes were still saving when it stopped");
         }
@@ -9402,5 +9410,30 @@ mod collection_profile_tests {
         assert_eq!(act_shortcut_epoch(&pflt), Some(5));
         assert_eq!(act_shortcut_epoch(&paudio), Some(6));
         assert_eq!(act_shortcut_epoch(&StudioAct::Scenes), None);
+    }
+
+    #[test]
+    fn col20_take_outputs_defers_guests_until_collection_teardown() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let sdp = dir.path().join("guest-1.sdp");
+        let guest = ferrocast_guest::Guest::test_with_sdp(&sdp).unwrap_or_else(|e| panic!("guest: {e}"));
+        assert!(sdp.is_file());
+        let col = Collection::new(Canvas { width: 640, height: 360, fps: 30 }, FIRST_SCENE).unwrap();
+        let mut h =
+            Held { collection: Some(col), guests: vec![("Alex".into(), "Alex".into(), guest)], ..Held::default() };
+
+        let jobs = take_outputs_from_held(&mut h);
+        drain_outputs_bounded(jobs, std::time::Duration::from_secs(2));
+        assert_eq!(
+            h.guests.len(),
+            1,
+            "guests must remain intact while outputs drain so .sdp stays open until collection teardown"
+        );
+        assert!(sdp.is_file(), ".sdp must not be unlinked before outgoing collection drops");
+
+        let guests = std::mem::take(&mut h.guests);
+        drop(h.collection.take());
+        drop(guests);
+        assert!(!sdp.is_file(), ".sdp must be unlinked after collection and guests drop");
     }
 }
