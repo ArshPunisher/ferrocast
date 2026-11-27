@@ -195,12 +195,6 @@ impl Guest {
     pub fn sdp(&self) -> &Path {
         &self.sdp
     }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn test_with_sdp(sdp: &Path) -> Result<Self, GuestError> {
-        write_sdp(sdp, Video::Vp8, 50000, 50002)?;
-        Ok(Self { shared: Arc::new(Shared::default()), born: Instant::now(), sdp: sdp.to_path_buf(), thread: None })
-    }
 }
 
 impl Drop for Guest {

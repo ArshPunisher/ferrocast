@@ -45,7 +45,6 @@ tract-pulse-df = { package = "tract-pulse", version = "=0.21.4", optional = true
 tract-hir-df = { package = "tract-hir", version = "=0.21.4", optional = true }
 
 [features]
-test-support = []
 # Remove background with RVM on macOS too (to try it; Vision is the default there).
 onnx-matte = ["dep:tract-onnx"]
 # The Strong noise removal filter (DeepFilterNet). CI and releases build it; day-to-day builds

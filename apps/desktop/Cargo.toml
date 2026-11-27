@@ -89,8 +89,6 @@ windows = { version = "0.61", features = [
 tauri = { version = "2", features = ["tray-icon", "test"] }
 base64 = "0.22"
 tempfile = "3"
-ferrocast-guest = { workspace = true, features = ["test-support"] }
-ferrocast-studio = { workspace = true, features = ["test-support"] }
 
 # The workspace forbids unsafe code. Windows' crash reports (src/crash.rs) are Win32 calls, so
 # here it is denied instead and allowed in that file only, each block with its SAFETY reason.
