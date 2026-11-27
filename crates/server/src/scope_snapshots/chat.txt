@@ -24,6 +24,7 @@ GET /mod/panic
 GET /mod/panic/config
 GET /modules
 GET /openapi.json
+GET /polls/capabilities
 GET /polls/current
 GET /quotes
 GET /status

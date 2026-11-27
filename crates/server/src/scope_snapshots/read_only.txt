@@ -40,6 +40,7 @@ GET /obs/inputs
 GET /obs/scenes
 GET /obs/stream
 GET /openapi.json
+GET /polls/capabilities
 GET /polls/current
 GET /queue
 GET /quotes

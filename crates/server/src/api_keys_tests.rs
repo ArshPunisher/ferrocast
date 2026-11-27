@@ -154,6 +154,7 @@ async fn scope_enforcement_matrix_across_all_route_groups() {
         Case { method: "GET", path: "/obs/scenes", body: None, expected: [A, F, F, A, F, F, A] },
         Case { method: "GET", path: "/golive", body: None, expected: [A, F, F, F, A, F, A] },
         Case { method: "GET", path: "/golive/quality-options", body: None, expected: [A, F, F, F, A, F, A] },
+        Case { method: "GET", path: "/polls/capabilities", body: None, expected: [A, A, F, F, F, F, A] },
         Case { method: "GET", path: "/settings", body: None, expected: [F, F, F, F, F, A, A] },
         // Chat writes
         Case {

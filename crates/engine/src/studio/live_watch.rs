@@ -19,6 +19,307 @@ const EVERY: Duration = Duration::from_secs(2);
 /// A gap longer than this between 2-second ticks means the system slept or froze: reset
 /// pending silence/black/frozen durations so wake never fires false live alerts.
 const WAKE_JUMP_MS: i64 = 10_000;
+/// Rate limit for live missed-frame breakdown logs (ms).
+const MISS_LOG_EVERY_MS: i64 = 10_000;
+/// Rate limit for output falling-behind warnings (ms).
+const OUTPUT_LAG_LOG_EVERY_MS: i64 = 5_000;
+/// Upload check comparison threshold: warn when total stream bitrate exceeds 85% of measured upload.
+const TIGHT_UPLOAD_PCT: u64 = 85;
+
+fn lag_cause_rank(cause: &str) -> u8 {
+    match cause {
+        "output stalled (0 bytes sent)" => 4,
+        "sender dropping packets" => 3,
+        "destination falling behind" => 2,
+        _ => 1,
+    }
+}
+
+fn pick_lag_cause(existing: Option<&'static str>, next: &'static str) -> &'static str {
+    match existing {
+        Some(prev) if lag_cause_rank(prev) >= lag_cause_rank(next) => prev,
+        _ => next,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputLagReport {
+    pub cause: &'static str,
+    pub queue_mb: f64,
+    pub dropped_delta: u64,
+    pub dropped_total: u64,
+    pub sender_kbps: u32,
+    pub bitrate_kbps: u32,
+    pub measured_upload_kbps: Option<u32>,
+    pub measured_by: Option<String>,
+    pub upload_status: &'static str,
+    pub auto_quality_pct: u8,
+    pub slow_dests: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OutputLagWatch {
+    prev_at_ms: Option<i64>,
+    prev_sender_bytes: u64,
+    prev_sender_dropped: u64,
+    prev_dest_dropped: std::collections::HashMap<String, u64>,
+    prev_dest_live: std::collections::HashMap<String, bool>,
+    pending_dropped: u64,
+    pending_cause: Option<&'static str>,
+    last_warn_ms: Option<i64>,
+}
+
+pub(crate) struct OutputLagTick<'a> {
+    pub at_ms: i64,
+    pub sender_active: bool,
+    pub sender_reconnecting: bool,
+    pub sender_bytes: u64,
+    pub sender_dropped: u64,
+    pub dests: &'a [ferrocast_core::auto_quality::Dest],
+    pub paused: bool,
+}
+
+impl OutputLagWatch {
+    /// Checks sender and lightweight Go live destination counters every tick without calling `golive_view`
+    /// unless a stall, drop, or disconnect requires upload-check & bitrate comparison details.
+    pub(crate) fn detect_trouble(&mut self, tick: &OutputLagTick<'_>) -> Option<(&'static str, u32, u64)> {
+        let Some(prev_ms) = self.prev_at_ms else {
+            self.prev_at_ms = Some(tick.at_ms);
+            self.prev_sender_bytes = tick.sender_bytes;
+            self.prev_sender_dropped = tick.sender_dropped;
+            for d in tick.dests {
+                self.prev_dest_dropped.insert(d.id.clone(), d.dropped);
+                self.prev_dest_live.insert(d.id.clone(), d.live);
+            }
+            return None;
+        };
+        if tick.at_ms < prev_ms
+            || tick.sender_bytes < self.prev_sender_bytes
+            || tick.sender_dropped < self.prev_sender_dropped
+        {
+            *self = Self::default();
+            return self.detect_trouble(tick);
+        }
+        let dt_ms = (tick.at_ms - prev_ms).max(1) as u64;
+        let d_bytes = tick.sender_bytes - self.prev_sender_bytes;
+        let d_sender_dropped = tick.sender_dropped - self.prev_sender_dropped;
+        let sender_kbps = u32::try_from(d_bytes.saturating_mul(8) / dt_ms).unwrap_or(u32::MAX);
+
+        let mut d_dest_dropped = 0u64;
+        let mut hung_up = false;
+        for d in tick.dests {
+            let prev_d = self.prev_dest_dropped.get(&d.id).copied().unwrap_or(0);
+            if d.dropped >= prev_d {
+                d_dest_dropped += d.dropped - prev_d;
+            }
+            let was_live = self.prev_dest_live.get(&d.id).copied().unwrap_or(false);
+            if was_live && !d.live {
+                hung_up = true;
+            }
+            self.prev_dest_dropped.insert(d.id.clone(), d.dropped);
+            self.prev_dest_live.insert(d.id.clone(), d.live);
+        }
+        let stalled = tick.sender_active && !tick.sender_reconnecting && self.prev_sender_bytes > 0 && d_bytes == 0;
+        self.prev_at_ms = Some(tick.at_ms);
+        self.prev_sender_bytes = tick.sender_bytes;
+        self.prev_sender_dropped = tick.sender_dropped;
+
+        let step_drops = d_sender_dropped.saturating_add(d_dest_dropped);
+        self.pending_dropped = self.pending_dropped.saturating_add(step_drops);
+
+        let step_cause = if stalled {
+            Some("output stalled (0 bytes sent)")
+        } else if d_sender_dropped > 0 {
+            Some("sender dropping packets")
+        } else if d_dest_dropped > 0 {
+            Some("destination falling behind")
+        } else if hung_up || tick.paused {
+            Some("destination disconnected or paused")
+        } else {
+            None
+        };
+        if let Some(c) = step_cause {
+            self.pending_cause = Some(pick_lag_cause(self.pending_cause, c));
+        }
+        let cause = self.pending_cause?;
+        if !self.last_warn_ms.is_none_or(|t| tick.at_ms - t >= OUTPUT_LAG_LOG_EVERY_MS) {
+            return None;
+        }
+        let burst = std::mem::take(&mut self.pending_dropped);
+        self.pending_cause = None;
+        self.last_warn_ms = Some(tick.at_ms);
+        Some((cause, sender_kbps, burst))
+    }
+
+    pub(crate) fn build_report(input: OutputLagInput) -> OutputLagReport {
+        let dest_kbps_sum: u32 = input.dest_details.iter().map(|(_, _, k)| *k).fold(0u32, u32::saturating_add);
+        let dropped_total =
+            input.sender_dropped.saturating_add(input.dest_details.iter().map(|(_, d, _)| *d).sum::<u64>());
+        let bitrate_kbps = input.hub_kbps.max(dest_kbps_sum).max(input.sender_kbps);
+        let (measured_upload_kbps, measured_by, upload_status) = match input.upload {
+            Some((up, by)) if up > 0 => {
+                let status = if bitrate_kbps > up {
+                    "exceeds_upload"
+                } else if u64::from(bitrate_kbps).saturating_mul(100) >= u64::from(up).saturating_mul(TIGHT_UPLOAD_PCT)
+                {
+                    "tight_upload"
+                } else {
+                    "within_upload"
+                };
+                (Some(up), Some(by), status)
+            }
+            _ => (None, None, "no_upload_check"),
+        };
+        let slow_dests = if input.dest_details.is_empty() {
+            "none".into()
+        } else {
+            input
+                .dest_details
+                .into_iter()
+                .map(|(name, dropped, kbps)| format!("{name}:{kbps}kbps/drop={dropped}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        OutputLagReport {
+            cause: input.cause,
+            queue_mb: input.queue_mb,
+            dropped_delta: input.dropped_delta,
+            dropped_total,
+            sender_kbps: input.sender_kbps,
+            bitrate_kbps,
+            measured_upload_kbps,
+            measured_by,
+            upload_status,
+            auto_quality_pct: input.auto_quality_pct,
+            slow_dests,
+        }
+    }
+}
+
+pub(crate) struct OutputLagInput {
+    pub cause: &'static str,
+    pub queue_mb: f64,
+    pub dropped_delta: u64,
+    pub sender_dropped: u64,
+    pub sender_kbps: u32,
+    pub hub_kbps: u32,
+    pub upload: Option<(u32, String)>,
+    pub auto_quality_pct: u8,
+    pub dest_details: Vec<(String, u64, u32)>,
+}
+
+/// Cumulative counters observed at one live tick to split misses into render vs encode vs network.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MissSample {
+    pub at_ms: i64,
+    pub render_missed: u64,
+    pub encode_held: u64,
+    pub encode_skipped: u64,
+    pub stream_dropped: u64,
+    pub platform_dropped: u64,
+}
+
+impl MissSample {
+    pub(crate) fn from_stats(at_ms: i64, v: &Value, platform_dropped: u64) -> Self {
+        let (e, s) = (&v["engine"], &v["stream"]);
+        let n = |x: &Value| x.as_u64().unwrap_or(0);
+        let lagged = n(&e["lagged"]);
+        let encode_held = n(&e["missed_encode"]);
+        let render_missed = if e.get("missed_render").is_some() || e.get("missed_encode").is_some() {
+            n(&e["missed_render"])
+        } else {
+            lagged.saturating_sub(encode_held)
+        };
+        Self {
+            at_ms,
+            render_missed,
+            encode_held,
+            encode_skipped: n(&e["skipped"]),
+            stream_dropped: n(&s["dropped"]),
+            platform_dropped,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissSummary {
+    pub why: String,
+    pub render_missed: u64,
+    pub encode_missed: u64,
+    pub network_dropped: u64,
+    pub stream_dropped: u64,
+    pub platform_dropped: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MissWatch {
+    prev: Option<MissSample>,
+    pending_render: u64,
+    pending_encode: u64,
+    pending_stream: u64,
+    pending_platform: u64,
+    last_log_ms: Option<i64>,
+}
+
+impl MissWatch {
+    pub(crate) fn observe(&mut self, s: MissSample) -> Option<MissSummary> {
+        let Some(prev) = self.prev else {
+            self.prev = Some(s);
+            return None;
+        };
+        // Counters going backwards mean a new engine/stream session started.
+        if s.render_missed < prev.render_missed
+            || s.encode_held < prev.encode_held
+            || s.encode_skipped < prev.encode_skipped
+            || s.stream_dropped < prev.stream_dropped
+            || s.platform_dropped < prev.platform_dropped
+        {
+            *self = Self { prev: Some(s), ..Self::default() };
+            return None;
+        }
+        let d_render = s.render_missed - prev.render_missed;
+        let d_encode = (s.encode_held - prev.encode_held).saturating_add(s.encode_skipped - prev.encode_skipped);
+        let d_stream = s.stream_dropped - prev.stream_dropped;
+        let d_platform = s.platform_dropped - prev.platform_dropped;
+        self.prev = Some(s);
+
+        self.pending_render += d_render;
+        self.pending_encode += d_encode;
+        self.pending_stream += d_stream;
+        self.pending_platform += d_platform;
+
+        let network_dropped = self.pending_stream.saturating_add(self.pending_platform);
+        let has_misses = self.pending_render > 0 || self.pending_encode > 0 || network_dropped > 0;
+        if !has_misses || !self.last_log_ms.is_none_or(|t| s.at_ms - t >= MISS_LOG_EVERY_MS) {
+            return None;
+        }
+
+        let mut causes = Vec::new();
+        if self.pending_render > 0 {
+            causes.push("render");
+        }
+        if self.pending_encode > 0 {
+            causes.push("encode");
+        }
+        if network_dropped > 0 {
+            causes.push("network");
+        }
+        let out = MissSummary {
+            why: causes.join(" + "),
+            render_missed: self.pending_render,
+            encode_missed: self.pending_encode,
+            network_dropped,
+            stream_dropped: self.pending_stream,
+            platform_dropped: self.pending_platform,
+        };
+        self.pending_render = 0;
+        self.pending_encode = 0;
+        self.pending_stream = 0;
+        self.pending_platform = 0;
+        self.last_log_ms = Some(s.at_ms);
+        Some(out)
+    }
+}
 
 /// Whether a mixer row is judged as a microphone: the one the owner said ("This is a mic"), else
 /// by its kind (a mic input or a Mic/Aux channel that isn't a capture card; never the desktop's
@@ -73,13 +374,15 @@ pub(crate) struct WatchSnap {
 const HOLD_READS: usize = 6;
 const HOLD_GAP: Duration = if cfg!(test) { Duration::from_millis(1) } else { Duration::from_millis(300) };
 
-/// Several reads of the same sounds' levels as one: each peak the highest seen (the sound since
-/// the last tick, not the one 300 ms before it), `gated` if it was at any read, the rest as last read.
+/// Several reads of the same sounds' levels as one: each peak/magnitude the highest seen (the
+/// sound since the last tick, not the one 300 ms before it), `gated` if it was at any read,
+/// `speech` when at least 2 reads reported speech (rejects single-read transient spikes), the rest
+/// as last read.
 pub(crate) fn peak_hold(reads: &[Value]) -> Value {
     let mut out = reads.last().cloned().unwrap_or(Value::Null);
     let Some(obj) = out.as_object_mut() else { return out };
     for (name, level) in obj.iter_mut() {
-        for key in ["peak", "input_peak"] {
+        for key in ["peak", "magnitude", "input_peak"] {
             let best = reads
                 .iter()
                 .filter_map(|r| r[name.as_str()][key].as_array())
@@ -97,6 +400,8 @@ pub(crate) fn peak_hold(reads: &[Value]) -> Value {
         }
         let gated = reads.iter().any(|r| r[name.as_str()]["gated"].as_bool() == Some(true));
         level["gated"] = Value::Bool(gated);
+        let speech_reads = reads.iter().filter(|r| r[name.as_str()]["speech"].as_bool() == Some(true)).count();
+        level["speech"] = Value::Bool(speech_reads >= 2);
     }
     out
 }
@@ -115,13 +420,16 @@ pub(crate) fn mic_levels(mixer: &Value, levels: &Value, listed: &[String]) -> Ve
         let Some(name) = row["name"].as_str() else { continue };
         // A mic nobody has measured yet (just added) says nothing.
         let Some(peak) = loudest(&levels[name]["peak"]) else { continue };
+        let rms = loudest(&levels[name]["magnitude"]).unwrap_or(peak);
         let input = loudest(&levels[name]["input_peak"]).unwrap_or(peak);
         out.push(MicLevel {
             name: name.to_string(),
             peak_db: peak,
+            rms_db: rms,
             input_db: input,
             muted: row["muted"].as_bool() == Some(true),
             gated: levels[name]["gated"].as_bool() == Some(true),
+            speech: levels[name]["speech"].as_bool().unwrap_or(false),
             volume_db: row["volume_db"].as_f64().unwrap_or(0.0) as f32,
             listed: listed.iter().any(|l| l == name),
         });
@@ -188,6 +496,12 @@ impl Engine {
                     *engine.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
                     engine.studio().group_auto_quality.lock().unwrap_or_else(|p| p.into_inner()).clear();
                     *engine.studio().live_health.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+                    *engine.studio().miss_watch.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+                    *engine.studio().output_lag_watch.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+                    if live {
+                        engine.wake_youtube();
+                    }
+                    engine.wake_viewer_poller();
                     was_live = live;
                 }
                 // A recording stopping or running out of room matters live or not.
@@ -199,6 +513,7 @@ impl Engine {
                     let dropped = sender.as_ref().and_then(|v| v["dropped"].as_u64()).unwrap_or(0);
                     engine.auto_quality_tick_with(dropped).await;
                     engine.health_tick().await;
+                    engine.output_lag_tick(sender.as_ref()).await;
                     engine.live_watch_tick_with(&snap).await;
                 }
             }
@@ -403,8 +718,83 @@ impl Engine {
             at_ms: u64::try_from(now().0).unwrap_or(0),
         };
         let mut h = self.studio().live_health.lock().unwrap_or_else(|p| p.into_inner());
-        let now = h.0.push(sample);
-        h.1 = Some(now);
+        let health_now = h.0.push(sample);
+        h.1 = Some(health_now);
+        drop(h);
+        let miss_sample = MissSample::from_stats(now().0, &v, net_dropped);
+        let miss_summary = self.studio().miss_watch.lock().unwrap_or_else(|p| p.into_inner()).observe(miss_sample);
+        if let Some(m) = miss_summary {
+            tracing::warn!(
+                why = %m.why,
+                render_missed = m.render_missed,
+                encode_missed = m.encode_missed,
+                network_dropped = m.network_dropped,
+                stream_dropped = m.stream_dropped,
+                platform_dropped = m.platform_dropped,
+                "missed or dropped frames during stream ({})",
+                m.why
+            );
+        }
+    }
+
+    /// Diagnoses output freezes and falling-behind destinations with queue depth, dropped counts,
+    /// and bitrate vs measured upload capacity (rate-limited at warn).
+    pub(crate) async fn output_lag_tick(&self, sender: Option<&Value>) {
+        let Some(s) = sender else { return };
+        let active = s["active"].as_bool() == Some(true);
+        let reconnecting = s["reconnecting"].as_bool() == Some(true);
+        let sender_bytes = s["bytes"].as_u64().unwrap_or(0);
+        let sender_dropped = s["dropped"].as_u64().unwrap_or(0);
+        let queue_mb = s["delay_mb"].as_f64().unwrap_or(0.0);
+        let (_, paused) = self.golive_trouble();
+        let dests = self.golive_senders();
+
+        let hit =
+            self.studio().output_lag_watch.lock().unwrap_or_else(|p| p.into_inner()).detect_trouble(&OutputLagTick {
+                at_ms: now().0,
+                sender_active: active,
+                sender_reconnecting: reconnecting,
+                sender_bytes,
+                sender_dropped,
+                dests: &dests,
+                paused,
+            });
+        let Some((cause, sender_kbps, dropped_delta)) = hit else { return };
+
+        let gl = self.golive_view().await;
+        let upload = gl.upload.as_ref().map(|u| (u.verdict.upload_kbps, u.measured_by.clone()));
+        let dest_details = gl
+            .destinations
+            .iter()
+            .filter_map(|d| d.health.as_ref().map(|h| (d.name.clone(), h.dropped, h.kbps)))
+            .collect();
+        let aq_pct = self.studio().auto_quality.lock().unwrap_or_else(|p| p.into_inner()).pct();
+        let r = OutputLagWatch::build_report(OutputLagInput {
+            cause,
+            queue_mb,
+            dropped_delta,
+            sender_dropped,
+            sender_kbps,
+            hub_kbps: gl.stats.kbps,
+            upload,
+            auto_quality_pct: aq_pct,
+            dest_details,
+        });
+        tracing::warn!(
+            cause = r.cause,
+            queue_mb = r.queue_mb,
+            dropped_delta = r.dropped_delta,
+            dropped_total = r.dropped_total,
+            sender_kbps = r.sender_kbps,
+            bitrate_kbps = r.bitrate_kbps,
+            measured_upload_kbps = r.measured_upload_kbps,
+            measured_by = r.measured_by.as_deref(),
+            upload_status = r.upload_status,
+            auto_quality_pct = r.auto_quality_pct,
+            destinations = %r.slow_dests,
+            "output falling behind: {}",
+            r.cause
+        );
     }
 
     /// Auto quality turned off: lowered streams go back to full quality.
@@ -1007,5 +1397,290 @@ mod tests {
         assert!(host.group_calls.lock().unwrap().is_empty(), "EB extra tracks must exhaust session cap");
         let pct = e.studio().group_auto_quality.lock().unwrap().get(GROUP_MAIN).unwrap().pct();
         assert_eq!(pct, 85, "exhausted handover must revert to 85%, not jump back to 100%");
+    }
+
+    #[test]
+    fn peak_hold_aggregates_magnitude_and_requires_two_speech_reads() {
+        let read = |peak: f64, mag: f64, speech: bool| json!({ "KREO": { "peak": [peak, peak], "magnitude": [mag, mag], "input_peak": [peak, peak], "gated": false, "speech": speech } });
+        // Only 1 speech read out of 6 -> speech stays false (single-spike veto).
+        let one_spike = peak_hold(&[
+            read(-55.0, -60.0, false),
+            read(-30.0, -40.0, true),
+            read(-55.0, -60.0, false),
+            read(-55.0, -60.0, false),
+            read(-55.0, -60.0, false),
+            read(-55.0, -60.0, false),
+        ]);
+        assert_eq!(one_spike["KREO"]["speech"], json!(false));
+        assert_eq!(one_spike["KREO"]["magnitude"], json!([-40.0, -40.0]));
+
+        // 2 speech reads out of 6 -> speech is true even if the trailing read was a pause.
+        let two_reads = peak_hold(&[
+            read(-38.0, -45.0, true),
+            read(-36.0, -43.0, true),
+            read(-62.0, -66.0, false),
+            read(-62.0, -66.0, false),
+            read(-62.0, -66.0, false),
+            read(-62.0, -66.0, false),
+        ]);
+        assert_eq!(two_reads["KREO"]["speech"], json!(true));
+        assert_eq!(two_reads["KREO"]["peak"], json!([-36.0, -36.0]));
+        assert_eq!(two_reads["KREO"]["magnitude"], json!([-43.0, -43.0]));
+
+        let mixer = json!([row("KREO", json!({}))]);
+        let mics = mic_levels(&mixer, &two_reads, &[]);
+        assert_eq!(mics.len(), 1);
+        assert!(mics[0].speech);
+        assert_eq!(mics[0].rms_db, -43.0);
+
+        // Missing speech field (older engine) safely defaults to false.
+        let legacy = json!({ "KREO": { "peak": [-40.0, -40.0], "input_peak": [-40.0, -40.0] } });
+        let legacy_mics = mic_levels(&mixer, &legacy, &[]);
+        assert!(!legacy_mics[0].speech);
+    }
+
+    #[test]
+    fn miss_watch_separates_render_encode_network_and_rate_limits() {
+        let mut w = MissWatch::default();
+        let sample = |at_ms, r, eh, es, sd, pd| MissSample {
+            at_ms,
+            render_missed: r,
+            encode_held: eh,
+            encode_skipped: es,
+            stream_dropped: sd,
+            platform_dropped: pd,
+        };
+        assert_eq!(w.observe(sample(1_000, 0, 0, 0, 0, 0)), None);
+        let first = w.observe(sample(3_000, 4, 2, 1, 5, 3)).unwrap_or_else(|| panic!("first miss summary"));
+        assert_eq!(first.why, "render + encode + network");
+        assert_eq!((first.render_missed, first.encode_missed, first.network_dropped), (4, 3, 8));
+        assert_eq!((first.stream_dropped, first.platform_dropped), (5, 3));
+
+        // Within rate-limit window (< 10 s): accumulates without logging.
+        assert_eq!(w.observe(sample(5_000, 4, 2, 1, 5, 7)), None);
+        // Past 10 s: flushes accumulated network drops cleanly.
+        let second = w.observe(sample(13_000, 4, 2, 1, 5, 9)).unwrap_or_else(|| panic!("rate-limited flush"));
+        assert_eq!(second.why, "network");
+        assert_eq!((second.render_missed, second.encode_missed, second.network_dropped), (0, 0, 6));
+    }
+
+    #[test]
+    fn output_lag_watch_detects_stalls_drops_rate_limits_and_compares_upload() {
+        let mut w = OutputLagWatch::default();
+        let dest = |dropped, live| {
+            vec![ferrocast_core::auto_quality::Dest { id: "twitch".into(), dropped, live_ms: 30_000, live }]
+        };
+
+        // Warm baseline emits nothing.
+        assert_eq!(
+            w.detect_trouble(&OutputLagTick {
+                at_ms: 1_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 100_000,
+                sender_dropped: 0,
+                dests: &dest(0, true),
+                paused: false,
+            }),
+            None
+        );
+
+        // 2 s later with 0 additional bytes sent: 1-2 s output freeze triggers at once.
+        let (cause, kbps, _) = w
+            .detect_trouble(&OutputLagTick {
+                at_ms: 3_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 100_000,
+                sender_dropped: 0,
+                dests: &dest(0, true),
+                paused: false,
+            })
+            .unwrap_or_else(|| panic!("freeze detected"));
+        assert_eq!(cause, "output stalled (0 bytes sent)");
+        assert_eq!(kbps, 0);
+
+        // Drops within the 5 s cooldown accumulate silently without re-warning yet.
+        assert_eq!(
+            w.detect_trouble(&OutputLagTick {
+                at_ms: 5_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 200_000,
+                sender_dropped: 3,
+                dests: &dest(4, true),
+                paused: false,
+            }),
+            None
+        );
+
+        // Past the 5 s cooldown, accumulated drops flush together with measured bitrate vs upload.
+        let (cause2, _, burst) = w
+            .detect_trouble(&OutputLagTick {
+                at_ms: 9_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 1_200_000,
+                sender_dropped: 5,
+                dests: &dest(7, true),
+                paused: false,
+            })
+            .unwrap_or_else(|| panic!("drop summary after cooldown"));
+        assert_eq!(cause2, "sender dropping packets");
+        assert_eq!(burst, 12);
+
+        let over = OutputLagWatch::build_report(OutputLagInput {
+            cause: cause2,
+            queue_mb: 2.5,
+            dropped_delta: burst,
+            sender_dropped: 5,
+            sender_kbps: 2000,
+            hub_kbps: 7500,
+            upload: Some((6000, "twitch".into())),
+            auto_quality_pct: 85,
+            dest_details: vec![("Twitch".into(), 7, 7500)],
+        });
+        assert_eq!(over.upload_status, "exceeds_upload");
+        assert_eq!(over.measured_upload_kbps, Some(6000));
+        assert_eq!(over.queue_mb, 2.5);
+
+        let missing = OutputLagWatch::build_report(OutputLagInput {
+            cause,
+            queue_mb: 0.0,
+            dropped_delta: 0,
+            sender_dropped: 0,
+            sender_kbps: 0,
+            hub_kbps: 6000,
+            upload: None,
+            auto_quality_pct: 100,
+            dest_details: vec![],
+        });
+        assert_eq!(missing.upload_status, "no_upload_check");
+    }
+
+    #[test]
+    fn output_lag_watch_flushes_cooldown_masked_drops_on_calm_tick_after_cooldown() {
+        let dest = |dropped: u64| {
+            vec![ferrocast_core::auto_quality::Dest { id: "twitch".into(), dropped, live_ms: 30_000, live: true }]
+        };
+        let mut watch = OutputLagWatch::default();
+
+        assert_eq!(
+            watch.detect_trouble(&OutputLagTick {
+                at_ms: 0,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 500_000,
+                sender_dropped: 0,
+                dests: &dest(0),
+                paused: false,
+            }),
+            None
+        );
+
+        // Stall at 1s warns and starts the 5s cooldown.
+        let (first_cause, _, _) = watch
+            .detect_trouble(&OutputLagTick {
+                at_ms: 1_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 500_000,
+                sender_dropped: 0,
+                dests: &dest(0),
+                paused: false,
+            })
+            .unwrap_or_else(|| panic!("expected initial stall warning"));
+        assert_eq!(first_cause, "output stalled (0 bytes sent)");
+
+        // Drops occur at 3s inside cooldown (suppressed).
+        assert_eq!(
+            watch.detect_trouble(&OutputLagTick {
+                at_ms: 3_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 1_000_000,
+                sender_dropped: 6,
+                dests: &dest(4),
+                paused: false,
+            }),
+            None
+        );
+
+        // At 6s (cooldown expired), even if no new drop/stall happens on this calm tick,
+        // the pending burst from during cooldown must flush with its retained cause.
+        let (cause, _, burst) = watch
+            .detect_trouble(&OutputLagTick {
+                at_ms: 6_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 1_600_000,
+                sender_dropped: 6,
+                dests: &dest(4),
+                paused: false,
+            })
+            .unwrap_or_else(|| panic!("expected retained drop burst to flush once cooldown elapsed"));
+        assert_eq!(cause, "sender dropping packets");
+        assert_eq!(burst, 10);
+    }
+
+    #[test]
+    fn output_lag_watch_flushes_highest_ranked_retained_cause() {
+        let dest = |dropped: u64| {
+            vec![ferrocast_core::auto_quality::Dest { id: "twitch".into(), dropped, live_ms: 30_000, live: true }]
+        };
+        let mut watch = OutputLagWatch::default();
+
+        assert_eq!(
+            watch.detect_trouble(&OutputLagTick {
+                at_ms: 0,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 500_000,
+                sender_dropped: 0,
+                dests: &dest(0),
+                paused: false,
+            }),
+            None
+        );
+        // Warn at 1s to open the 5s cooldown.
+        assert!(
+            watch
+                .detect_trouble(&OutputLagTick {
+                    at_ms: 1_000,
+                    sender_active: true,
+                    sender_reconnecting: false,
+                    sender_bytes: 500_000,
+                    sender_dropped: 0,
+                    dests: &dest(0),
+                    paused: false,
+                })
+                .is_some()
+        );
+        // At 3s inside cooldown: higher-priority full stall (0 bytes sent).
+        assert_eq!(
+            watch.detect_trouble(&OutputLagTick {
+                at_ms: 3_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 500_000,
+                sender_dropped: 0,
+                dests: &dest(0),
+                paused: false,
+            }),
+            None
+        );
+        // At 6s cooldown expiry: lower-priority destination drop arrives; retained stall must win.
+        let (cause, _, _) = watch
+            .detect_trouble(&OutputLagTick {
+                at_ms: 6_000,
+                sender_active: true,
+                sender_reconnecting: false,
+                sender_bytes: 1_200_000,
+                sender_dropped: 0,
+                dests: &dest(3),
+                paused: false,
+            })
+            .unwrap();
+        assert_eq!(cause, "output stalled (0 bytes sent)");
     }
 }

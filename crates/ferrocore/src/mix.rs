@@ -127,6 +127,8 @@ pub struct Levels {
     pub input_peak: [f32; 2],
     /// Muted by a push-to-talk or push-to-mute key right now (the meter shows it dim).
     pub gated: bool,
+    /// Active speech detected on this source (RNNoise VAD / gate / sustained voice energy).
+    pub speech: bool,
 }
 
 impl Default for Levels {
@@ -136,6 +138,7 @@ impl Default for Levels {
             rms: [f32::NEG_INFINITY; 2],
             input_peak: [f32::NEG_INFINITY; 2],
             gated: false,
+            speech: false,
         }
     }
 }
@@ -149,12 +152,27 @@ pub const METER_BLOCKS: usize = 14;
 /// themselves, so the engine's 300 ms window no longer smears them.
 pub const METER_FAST_BLOCKS: usize = 2;
 
+/// RNNoise VAD probability threshold for marking a block as speech.
+const VAD_SPEECH_THRESHOLD: f32 = 0.65;
+/// Hang-time after active VAD speech (~200 ms) so brief inter-syllable gaps stay true.
+const SPEECH_HOLD_S: f32 = 0.2;
+/// Fallback speech check for raw mics (no RNNoise/Denoise): sustained RMS above -52 dBFS,
+/// at least 5.5 dB above the ambient noise floor, with crest factor under 22 dB for at least
+/// 3 consecutive blocks (~60 ms at 48 kHz).
+const RAW_SPEECH_MIN_RMS_DB: f32 = -52.0;
+const RAW_SPEECH_ABOVE_FLOOR_DB: f32 = 5.5;
+const RAW_SPEECH_MAX_CREST_DB: f32 = 22.0;
+const RAW_SPEECH_MIN_BLOCKS: u8 = 3;
+const RAW_FLOOR_DEFAULT_DB: f32 = -90.0;
+const RAW_FLOOR_SILENCE_DB: f32 = -58.0;
+
 /// One block's linear measures, kept for meters.
 #[derive(Debug, Clone, Copy, Default)]
 struct Measured {
     peak: [f32; 2],
     sq: [f32; 2],
     input: [f32; 2],
+    speech: bool,
 }
 
 /// One mixed block: its start time and each track's interleaved stereo frames.
@@ -508,6 +526,12 @@ struct Source {
     ptm_hold: u32,
     /// Muted by one of them as of the last block.
     gated: bool,
+    /// Remaining VAD speech hang-time samples (~200 ms) so inter-syllable gaps stay true.
+    speech_hold: u32,
+    /// Consecutive blocks passing the raw-mic voice energy + crest check (when no VAD filter).
+    raw_speech_blocks: u8,
+    /// Slow-tracking ambient noise floor (dBFS) used on raw mics to ignore steady fan/AC hum.
+    raw_floor_db: f32,
     levels: Levels,
     /// The last [`METER_BLOCKS`] blocks' measures, newest last.
     recent: VecDeque<Measured>,
@@ -1357,6 +1381,9 @@ impl Mixer {
             ptt_hold: 0,
             ptm_hold: 0,
             gated: false,
+            speech_hold: 0,
+            raw_speech_blocks: 0,
+            raw_floor_db: RAW_FLOOR_DEFAULT_DB,
             levels: Levels::default(),
             recent: VecDeque::with_capacity(METER_BLOCKS + 1),
             tp: [[0.0; TP_TAPS]; 2],
@@ -2020,11 +2047,23 @@ impl Mixer {
                 m.sq[c] += r.sq[c];
             }
         }
+        let has_vad = s.filters.iter().any(|f| f.voice_prob().is_some());
+        let gate_closed = if has_vad {
+            s.filters.iter().any(AudioFilter::hard_gate_closed)
+        } else {
+            s.filters.iter().any(AudioFilter::gate_closed)
+        };
+        let speech = !s.gated
+            && !s.settings.muted
+            && s.settings.volume > 1e-4
+            && !gate_closed
+            && s.recent.iter().rev().take(take).any(|r| r.speech);
         Some(Levels {
             peak: m.peak.map(db),
             rms: [db((m.sq[0] / n).sqrt()), db((m.sq[1] / n).sqrt())],
             input_peak: m.input.map(db),
             gated: s.gated,
+            speech,
         })
     }
 
@@ -2706,13 +2745,54 @@ impl Mixer {
                     }
                 }
             }
-            src.levels = Levels {
-                peak: [db(peak[0]), db(peak[1])],
-                rms: [db((sq[0] / BLOCK as f32).sqrt()), db((sq[1] / BLOCK as f32).sqrt())],
-                input_peak: input.map(db),
-                gated,
+            let peak_db = [db(peak[0]), db(peak[1])];
+            let rms_db = [db((sq[0] / BLOCK as f32).sqrt()), db((sq[1] / BLOCK as f32).sqrt())];
+            let vad_prob = src
+                .filters
+                .iter()
+                .filter_map(AudioFilter::voice_prob)
+                .fold(None, |acc: Option<f32>, p| Some(acc.map_or(p, |a| a.max(p))));
+            let gate_closed = if vad_prob.is_some() {
+                src.filters.iter().any(AudioFilter::hard_gate_closed)
+            } else {
+                src.filters.iter().any(AudioFilter::gate_closed)
             };
-            src.recent.push_back(Measured { peak: shown, sq, input });
+            let max_peak = peak_db[0].max(peak_db[1]);
+            let max_rms = rms_db[0].max(rms_db[1]);
+            let speech = if s.muted || gated || vol <= 1e-4 || gate_closed {
+                src.speech_hold = 0;
+                src.raw_speech_blocks = 0;
+                false
+            } else if let Some(p) = vad_prob {
+                src.raw_speech_blocks = 0;
+                if p >= VAD_SPEECH_THRESHOLD {
+                    src.speech_hold = ((rate as f32 * SPEECH_HOLD_S).round() as u32).max(1);
+                    true
+                } else {
+                    src.speech_hold = src.speech_hold.saturating_sub(BLOCK as u32);
+                    src.speech_hold > 0
+                }
+            } else {
+                src.speech_hold = 0;
+                let rms_clamped =
+                    if max_rms.is_finite() { max_rms.max(RAW_FLOOR_DEFAULT_DB) } else { RAW_FLOOR_DEFAULT_DB };
+                let rate_adapt =
+                    if rms_clamped < RAW_FLOOR_SILENCE_DB && rms_clamped < src.raw_floor_db { 0.20 } else { 0.08 };
+                let sustained = max_peak.is_finite()
+                    && max_rms.is_finite()
+                    && max_rms > RAW_SPEECH_MIN_RMS_DB
+                    && max_rms > src.raw_floor_db + RAW_SPEECH_ABOVE_FLOOR_DB
+                    && (max_peak - max_rms) < RAW_SPEECH_MAX_CREST_DB;
+                src.raw_floor_db += rate_adapt * (rms_clamped - src.raw_floor_db);
+                if sustained {
+                    src.raw_speech_blocks = src.raw_speech_blocks.saturating_add(1);
+                } else {
+                    src.raw_speech_blocks = 0;
+                }
+                src.raw_speech_blocks >= RAW_SPEECH_MIN_BLOCKS
+            };
+            src.levels = Levels { peak: peak_db, rms: rms_db, input_peak: input.map(db), gated, speech };
+            src.recent.push_back(Measured { peak: shown, sq, input, speech });
             if src.recent.len() > METER_BLOCKS {
                 src.recent.pop_front();
             }
@@ -5166,5 +5246,205 @@ mod steady_state_tests {
         // Music actually ducked under the 44.1 kHz resampled voice!
         let tail_music = produced.last().unwrap().tracks[0][BLOCK * 2 - 2].abs();
         assert!(tail_music < 0.15, "music should duck under 44.1 kHz key: {tail_music}");
+    }
+
+    #[test]
+    fn speech_signal_tracks_vad_gates_clicks_and_silence() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings::default());
+        let t0 = 1_000_000_000u64;
+        m.mix_until(t0);
+
+        // 1. Raw mic: quiet room tone (-60 dBFS) stays speech == false.
+        let room_amp = crate::afx::db_to_mul(-60.0);
+        let room = vec![room_amp; BLOCK * 6 * 2];
+        m.push(1, &room, 2, rate, t0);
+        m.mix_until(t0 + 6 * step);
+        assert!(!m.levels_over(1, 1).unwrap().speech, "quiet room must not be speech");
+
+        // 2. Raw mic: brief 5 ms click impulse keeps speech == false.
+        let t_click = t0 + 6 * step;
+        let mut click = vec![0.0f32; BLOCK * 2];
+        for i in 0..240 {
+            click[i * 2] = 0.25;
+            click[i * 2 + 1] = 0.25;
+        }
+        m.push(1, &click, 2, rate, t_click);
+        m.mix_until(t_click + step);
+        assert!(!m.levels_over(1, 1).unwrap().speech, "5 ms click must not be speech");
+
+        // Flush recent window with silence before sustained speech test.
+        let t_sil = t_click + step;
+        m.push(1, &vec![0.0f32; BLOCK * METER_BLOCKS * 2], 2, rate, t_sil);
+        m.mix_until(t_sil + METER_BLOCKS as u64 * step);
+
+        // 3. Raw mic: sustained speech-level audio (-35 dBFS) across >= 3 blocks sets speech == true.
+        let t_talk = t_sil + METER_BLOCKS as u64 * step;
+        let talk_amp = crate::afx::db_to_mul(-35.0);
+        let talk: Vec<f32> = (0..BLOCK * 5)
+            .flat_map(|i| {
+                let s = (i as f32 * 2.0 * std::f32::consts::PI * 180.0 / rate as f32).sin() * talk_amp;
+                [s, s]
+            })
+            .collect();
+        m.push(1, &talk, 2, rate, t_talk);
+        m.mix_until(t_talk + 5 * step);
+        assert!(m.levels(1).unwrap().speech, "sustained audio on raw mic sets speech == true");
+
+        // 4. Closed NoiseGate vetoes speech immediately.
+        m.set_effects(
+            1,
+            &[AudioEffect::NoiseGate {
+                open_db: -10.0,
+                close_db: -15.0,
+                attack_ms: 5.0,
+                hold_ms: 10.0,
+                release_ms: 10.0,
+            }],
+        );
+        let t_gate = t_talk + 5 * step;
+        m.push(1, &talk, 2, rate, t_gate);
+        m.mix_until(t_gate + 5 * step);
+        assert!(!m.levels(1).unwrap().speech, "closed NoiseGate must force speech == false");
+
+        // 5. Attenuating Expander vetoes speech immediately.
+        m.set_effects(
+            1,
+            &[AudioEffect::Expander {
+                ratio: 3.5,
+                threshold_db: -25.0,
+                attack_ms: 6.0,
+                release_ms: 180.0,
+                output_db: 0.0,
+                rms: true,
+            }],
+        );
+        let t_exp = t_gate + 5 * step;
+        m.push(1, &talk, 2, rate, t_exp);
+        m.mix_until(t_exp + 20 * step);
+        assert!(!m.levels(1).unwrap().speech, "attenuating Expander must force speech == false");
+
+        // 6. RNNoise on mixer: pink noise stays false, quiet speech sets speech == true.
+        m.set_effects(1, &[AudioEffect::Rnnoise { amount: 100 }]);
+        let mut seed = 7u32;
+        let mut b0 = 0.0f32;
+        let mut b1 = 0.0f32;
+        let mut b2 = 0.0f32;
+        let noise_scale = crate::afx::db_to_mul(-40.0);
+        let pink: Vec<f32> = (0..BLOCK * 40)
+            .flat_map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let w = ((seed >> 8) as f32 / 8_388_608.0) - 1.0;
+                b0 = 0.997 * b0 + w * 0.029;
+                b1 = 0.985 * b1 + w * 0.032;
+                b2 = 0.950 * b2 + w * 0.048;
+                let s = (b0 + b1 + b2 + w * 0.184) * noise_scale;
+                [s, s]
+            })
+            .collect();
+        let t_rnn = t_exp + 20 * step;
+        m.push(1, &pink, 2, rate, t_rnn);
+        m.mix_until(t_rnn + 40 * step);
+        assert!(!m.levels(1).unwrap().speech, "pink room noise through RNNoise stays speech == false");
+
+        let speech_amp = crate::afx::db_to_mul(-36.0) / 1.8;
+        let speech_pcm: Vec<f32> = (0..BLOCK * 40)
+            .flat_map(|i| {
+                let t = i as f32 / rate as f32;
+                let env = 0.35 + 0.65 * (2.0 * std::f32::consts::PI * 4.0 * t).sin().max(0.0);
+                let v: f32 =
+                    (1..=10).map(|h| (2.0 * std::f32::consts::PI * 145.0 * h as f32 * t).sin() / h as f32).sum();
+                let s = v * speech_amp * env;
+                [s, s]
+            })
+            .collect();
+        let t_sp = t_rnn + 40 * step;
+        m.push(1, &speech_pcm, 2, rate, t_sp);
+        m.mix_until(t_sp + 40 * step);
+        assert!(m.levels(1).unwrap().speech, "quiet speech through RNNoise sets speech == true");
+
+        // Muting forces speech == false immediately.
+        m.set(1, SourceSettings { muted: true, ..Default::default() });
+        assert!(!m.levels(1).unwrap().speech, "muted source must force speech == false");
+    }
+
+    #[test]
+    fn clean_up_expander_does_not_veto_quiet_speech_and_raw_fan_noise_stays_false() {
+        let rate = 48_000u32;
+        let step = block_ns(rate);
+        let mut m = Mixer::new(rate, 0);
+        m.set(1, SourceSettings::default());
+        m.set(2, SourceSettings::default());
+        let t0 = 1_000_000_000u64;
+        m.mix_until(t0);
+
+        // 1. Quiet speech (-45 dBFS RMS) through Clean-up chain (RNNoise -> Expander -40dB 3.5:1 -> Compressor +9dB):
+        // Expander attenuates (~-12.5 dB -> gain_db < -6), but upstream RNNoise VAD detects real speech.
+        m.set_effects(
+            1,
+            &[
+                AudioEffect::Rnnoise { amount: 100 },
+                AudioEffect::Expander {
+                    ratio: 3.5,
+                    threshold_db: -40.0,
+                    attack_ms: 6.0,
+                    release_ms: 180.0,
+                    output_db: 0.0,
+                    rms: true,
+                },
+                AudioEffect::Compressor {
+                    ratio: 3.0,
+                    threshold_db: -26.0,
+                    attack_ms: 8.0,
+                    release_ms: 150.0,
+                    output_db: 9.0,
+                    sidechain: None,
+                },
+            ],
+        );
+        // Feed quiet speech (~-45 dBFS RMS harmonic voice with 4 Hz syllables).
+        let quiet_amp = crate::afx::db_to_mul(-44.0) / 1.8;
+        let quiet_speech: Vec<f32> = (0..BLOCK * 60)
+            .flat_map(|i| {
+                let t = i as f32 / rate as f32;
+                let env = 0.35 + 0.65 * (2.0 * std::f32::consts::PI * 4.0 * t).sin().max(0.0);
+                let v: f32 =
+                    (1..=10).map(|h| (2.0 * std::f32::consts::PI * 145.0 * h as f32 * t).sin() / h as f32).sum();
+                let s = v * quiet_amp * env;
+                [s, s]
+            })
+            .collect();
+        m.push(1, &quiet_speech, 2, rate, t0);
+        m.mix_until(t0 + 60 * step);
+        assert!(
+            m.levels(1).unwrap().speech,
+            "quiet speech with Clean-up RNNoise + Expander must still report speech == true"
+        );
+
+        // 2. Raw mic (no RNNoise/Denoise) with continuous stationary fan/AC pink noise at -42 dBFS (~11 dB crest):
+        // after initial onset settles (> 1 s), stationary fan noise must report speech == false.
+        let mut seed = 13u32;
+        let (mut b0, mut b1, mut b2) = (0.0f32, 0.0f32, 0.0f32);
+        let fan_scale = crate::afx::db_to_mul(-39.0);
+        let fan: Vec<f32> = (0..BLOCK * 80)
+            .flat_map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let w = ((seed >> 8) as f32 / 8_388_608.0) - 1.0;
+                b0 = 0.997 * b0 + w * 0.029;
+                b1 = 0.985 * b1 + w * 0.032;
+                b2 = 0.950 * b2 + w * 0.048;
+                let s = (b0 + b1 + b2 + w * 0.184) * fan_scale;
+                [s, s]
+            })
+            .collect();
+        let t_fan = t0 + 60 * step;
+        m.push(2, &fan, 2, rate, t_fan);
+        m.mix_until(t_fan + 80 * step);
+        assert!(
+            !m.levels_over(2, 2).unwrap().speech,
+            "stationary fan/AC noise on raw mic must settle to speech == false"
+        );
     }
 }

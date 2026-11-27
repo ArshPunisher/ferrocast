@@ -378,6 +378,9 @@ pub struct Compositor {
     pub(crate) preview_pipelines: Mutex<HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>>,
     /// Held to submit and to configure a window surface (see `configure`).
     submitting: Mutex<()>,
+    /// Number of uncaptured GPU errors reported by `device` on this compositor.
+    #[cfg(test)]
+    pub(crate) uncaptured_errors: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// What an item draws: a picture, a texture made on the GPU (filtered), or other items.
@@ -509,6 +512,14 @@ impl Compositor {
         surface.configure(&self.device, config);
     }
 
+    /// Presents an acquired preview frame while holding `submitting`: `wgpu::Queue::present`
+    /// submits a transition to `PRESENT` on the queue, so holding the lock prevents it from racing
+    /// `configure`'s `maintain(Wait)` on another preview or resize (`GpuWaitTimeout`).
+    pub(crate) fn present_surface(&self, frame: wgpu::SurfaceTexture) {
+        let _turn = self.submitting.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.queue.present(frame);
+    }
+
     /// Opens the system's graphics card, headless (no window needed).
     pub fn new() -> Result<Self, AvError> {
         pollster::block_on(Self::open())
@@ -562,18 +573,22 @@ impl Compositor {
         // A graphics card error is logged, never the end of the app: the frame it hit is lost,
         // the engine draws the next (wgpu would otherwise panic on the thread it happened on).
         let gpu_error = std::sync::Arc::new(Mutex::new(None::<String>));
+        let error_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         {
             let gpu_error = gpu_error.clone();
+            let error_count = error_count.clone();
             device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
-                static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                // Count per Compositor so a Studio restart logs from error #1 again rather than
+                // inheriting an old power-of-two count from before the restart.
+                let n = error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let summary = format_wgpu_error(&e);
                 if n.is_power_of_two() {
-                    tracing::error!(times = n, "the graphics card refused something: {e}");
+                    tracing::error!(times = n, "the graphics card refused something: {summary}");
                 }
                 // Out of memory (or worse) is said where the Studio shows the engine's errors.
                 if let wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. } = e {
                     *gpu_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(format!(
-                        "The graphics card had a problem ({e}). Stop and start the Studio; if it keeps happening, \
+                        "The graphics card had a problem ({summary}). Stop and start the Studio; if it keeps happening, \
                          use fewer or smaller sources."
                     ));
                 }
@@ -752,6 +767,8 @@ impl Compositor {
             adapter,
             preview_pipelines: Mutex::new(HashMap::new()),
             submitting: Mutex::new(()),
+            #[cfg(test)]
+            uncaptured_errors: error_count,
             uploads: Mutex::new(HashMap::new()),
             staging: Mutex::new(HashMap::new()),
             rigs: Mutex::new(Vec::new()),
@@ -2872,6 +2889,16 @@ fn mask_mapping(source: (u32, u32), mask: (u32, u32), stretch: bool) -> [f32; 4]
     let fix = if sx / sy < mx / my { sx / mx } else { sy / my };
     let (mx, my) = (mx * fix, my * fix);
     [sx / mx, sy / my, -(sx / 2.0 - mx / 2.0) / mx, -(sy / 2.0 - my / 2.0) / my]
+}
+
+/// Collapses a multi-line `wgpu::Error` onto one log line so callers and log greps see the cause,
+/// not only `"Validation Error"`.
+pub(crate) fn format_wgpu_error(e: &wgpu::Error) -> String {
+    collapse_whitespace(&e.to_string())
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn view(texture: &wgpu::Texture, format: wgpu::TextureFormat) -> wgpu::TextureView {

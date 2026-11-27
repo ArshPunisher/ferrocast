@@ -180,6 +180,49 @@ pub trait Connector: Send + Sync + std::fmt::Debug {
     async fn vertical_ingest(&self) -> Result<Ingest> {
         Err(ConnectorError::NotSupported { platform: self.platform(), what: "take a second, vertical stream" })
     }
+
+    /// Current concurrent live viewers for this channel, when live and available.
+    /// Returns `Ok(None)` when offline or when the platform hides the count.
+    async fn viewer_count(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Reports whether this platform can host a native poll right now.
+    async fn poll_capability(&self) -> Option<ferrocast_core::poll::PlatformPollCapability> {
+        None
+    }
+
+    /// Starts a platform-native poll and returns its external id plus initial tallies.
+    async fn create_native_poll(&self, _spec: &NativePollSpec) -> Result<NativePollTally> {
+        Err(ConnectorError::NotSupported { platform: self.platform(), what: "run native polls" })
+    }
+
+    /// Reads the latest tallies/status for an active or recently closed native poll.
+    async fn get_native_poll(&self, _external_id: &str) -> Result<Option<NativePollTally>> {
+        Ok(None)
+    }
+
+    /// Ends a native poll early and returns final tallies when the platform supplies them.
+    async fn end_native_poll(&self, _external_id: &str) -> Result<Option<NativePollTally>> {
+        Ok(None)
+    }
+}
+
+/// Request sent to a platform's native poll API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePollSpec {
+    pub question: String,
+    pub options: Vec<String>,
+    /// `None` means "No timer" (Twitch uses 1800s max and terminates early on End).
+    pub duration_s: Option<u32>,
+}
+
+/// Snapshot returned by a platform's native poll API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePollTally {
+    pub external_id: String,
+    pub counts: Vec<u64>,
+    pub ended: bool,
 }
 
 /// A channel's ingest: the server address and the stream key. The key is a secret: it never

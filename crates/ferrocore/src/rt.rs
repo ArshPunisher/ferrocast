@@ -291,6 +291,8 @@ pub struct AtomicLevels {
     fast_rms: AtomicU64,
     fast_input_peak: AtomicU64,
     gated: std::sync::atomic::AtomicBool,
+    speech: std::sync::atomic::AtomicBool,
+    fast_speech: std::sync::atomic::AtomicBool,
 }
 
 fn pair(v: [f32; 2]) -> u64 {
@@ -312,6 +314,8 @@ impl Default for AtomicLevels {
             fast_rms: AtomicU64::new(pair(silent.rms)),
             fast_input_peak: AtomicU64::new(pair(silent.input_peak)),
             gated: std::sync::atomic::AtomicBool::new(false),
+            speech: std::sync::atomic::AtomicBool::new(false),
+            fast_speech: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -329,6 +333,7 @@ impl AtomicLevels {
         self.rms.store(pair(l.rms), Ordering::Relaxed);
         self.input_peak.store(pair(l.input_peak), Ordering::Relaxed);
         self.gated.store(l.gated, Ordering::Relaxed);
+        self.speech.store(l.speech, Ordering::Relaxed);
     }
 
     /// Publishes the fast (few-block) levels.
@@ -336,6 +341,7 @@ impl AtomicLevels {
         self.fast_peak.store(pair(l.peak), Ordering::Relaxed);
         self.fast_rms.store(pair(l.rms), Ordering::Relaxed);
         self.fast_input_peak.store(pair(l.input_peak), Ordering::Relaxed);
+        self.fast_speech.store(l.speech, Ordering::Relaxed);
     }
 
     /// The fast levels last published: three atomic loads.
@@ -346,6 +352,7 @@ impl AtomicLevels {
             rms: unpair(self.fast_rms.load(Ordering::Relaxed)),
             input_peak: unpair(self.fast_input_peak.load(Ordering::Relaxed)),
             gated: self.gated.load(Ordering::Relaxed),
+            speech: self.fast_speech.load(Ordering::Relaxed),
         }
     }
 
@@ -357,6 +364,7 @@ impl AtomicLevels {
             rms: unpair(self.rms.load(Ordering::Relaxed)),
             input_peak: unpair(self.input_peak.load(Ordering::Relaxed)),
             gated: self.gated.load(Ordering::Relaxed),
+            speech: self.speech.load(Ordering::Relaxed),
         }
     }
 }
@@ -602,9 +610,19 @@ mod tests {
     fn levels_come_back_as_they_went_in_silence_included() {
         let m = AtomicLevels::shared();
         assert_eq!(m.load(), Levels::default(), "silent to start");
-        let l = Levels { peak: [-3.5, -6.25], rms: [-20.0, f32::NEG_INFINITY], input_peak: [-0.1, -12.0], gated: true };
+        let l = Levels {
+            peak: [-3.5, -6.25],
+            rms: [-20.0, f32::NEG_INFINITY],
+            input_peak: [-0.1, -12.0],
+            gated: true,
+            speech: true,
+        };
         m.store(&l);
         assert_eq!(m.load(), l);
+        m.store_fast(&Levels { speech: false, ..l });
+        assert!(!m.load_fast().speech);
+        m.store_fast(&l);
+        assert!(m.load_fast().speech);
         // Written on one thread and read on another: always a whole pair, never a mix of two writes.
         let (a, b) = (Levels { peak: [-1.0, -1.0], ..l }, Levels { peak: [-9.0, -9.0], ..l });
         let writer = {

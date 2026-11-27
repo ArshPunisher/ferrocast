@@ -291,6 +291,13 @@ impl History {
                 };
                 Some(fresh(label, slide.then_some(key), false))
             }
+            StudioAct::SetChannel { channel, device } => match device {
+                Some(dev) => Some(fresh(format!("Set {}", dev.name), None, false)),
+                None => {
+                    let name = c.channels().into_iter().find(|a| a.channel == Some(*channel))?.name;
+                    Some(fresh(format!("Remove {name}"), None, false))
+                }
+            },
             StudioAct::AddFilter { filter, .. } => Some(fresh(format!("Add filter {}", filter.name), None, false)),
             StudioAct::RemoveFilter { filter, .. } => Some(fresh(format!("Remove filter {filter}"), None, false)),
             StudioAct::EditFilter { filter, .. } => Some(fresh(format!("Change filter {filter}"), None, false)),
@@ -1025,5 +1032,88 @@ mod tests {
             c.vertical().unwrap().scenes.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             ["Tall 2", "Tall"]
         );
+    }
+
+    #[test]
+    fn global_channel_set_and_remove_undo_and_redo_preserving_volume_and_filters() {
+        use ferrocast_engine::studio_host::{AudioChange, NewSource};
+
+        let c = stage();
+        let mut h = History::default();
+        let step = |h: &mut History, act: StudioAct, run: &dyn Fn() -> Result<(), String>| {
+            let b = h.before(&c, &act).unwrap_or_else(|| panic!("{act:?} must record an undo step"));
+            h.after(&c, b, &run().map(|_| Value::Null));
+        };
+
+        // Removing an already-empty channel must not push a spurious undo step.
+        assert!(h.before(&c, &StudioAct::SetChannel { channel: 3, device: None }).is_none());
+
+        // Set global Mic on channel 3, adjust volume, and add an audio filter.
+        let dev = NewSource {
+            kind: "coreaudio_input_capture".into(),
+            name: "Mic".into(),
+            settings: serde_json::json!({ "device_id": "default" }),
+        };
+        step(&mut h, StudioAct::SetChannel { channel: 3, device: Some(dev) }, &|| {
+            c.set_channel(3, Some(("coreaudio_input_capture", "Mic", &serde_json::json!({ "device_id": "default" }))))
+                .map_err(|e| e.to_string())
+        });
+        step(
+            &mut h,
+            StudioAct::SetAudio {
+                name: "Mic".into(),
+                change: AudioChange { volume_db: Some(-6.0), ..Default::default() },
+            },
+            &|| c.set_volume("Mic", -6.0).map_err(|e| e.to_string()),
+        );
+        step(
+            &mut h,
+            StudioAct::AddFilter {
+                name: "Mic".into(),
+                filter: NewSource {
+                    kind: "noise_suppress_filter_v2".into(),
+                    name: "Remove background noise".into(),
+                    settings: serde_json::json!({ "method": "rnnoise" }),
+                },
+                item: None,
+            },
+            &|| {
+                c.add_filter(
+                    "Mic",
+                    "noise_suppress_filter_v2",
+                    "Remove background noise",
+                    &serde_json::json!({ "method": "rnnoise" }),
+                )
+                .map_err(|e| e.to_string())
+            },
+        );
+
+        assert_eq!(c.channels().len(), 1);
+        assert_eq!(c.filters("Mic").unwrap().len(), 1);
+        assert!((c.audio_of("Mic").unwrap().volume_db - (-6.0)).abs() < 0.01);
+
+        // Remove the global Mic via SetChannel { channel: 3, device: None }.
+        step(&mut h, StudioAct::SetChannel { channel: 3, device: None }, &|| {
+            c.set_channel(3, None).map_err(|e| e.to_string())
+        });
+        assert!(c.channels().is_empty());
+        assert_eq!(h.labels().0, Some("Remove Mic"));
+
+        // Undo must bring back channel 3 with its exact volume and filters, not an earlier edit.
+        assert_eq!(h.undo(&c), Ok(Some("Remove Mic".into())));
+        let channels = c.channels();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].name, "Mic");
+        assert_eq!(channels[0].channel, Some(3));
+        assert!((channels[0].volume_db - (-6.0)).abs() < 0.01);
+        let filters = c.filters("Mic").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].name, "Remove background noise");
+
+        // Redo removes it again; undo brings it back again.
+        assert_eq!(h.redo(&c), Ok(Some("Remove Mic".into())));
+        assert!(c.channels().is_empty());
+        assert_eq!(h.undo(&c), Ok(Some("Remove Mic".into())));
+        assert_eq!(c.channels().len(), 1);
     }
 }

@@ -195,7 +195,8 @@ impl Engine {
             .map_err(|e| EngineError::Unavailable(e.to_string()))?;
         self.save_twitch_tokens(&tokens)?;
         let auth = self.twitch_auth(tokens)?;
-        let me = ferrocast_twitch::helix::Helix::new(auth.clone()).me().await.ok();
+        let helix = ferrocast_twitch::helix::Helix::new(auth.clone());
+        let me = helix.me().await.ok();
         let account = repo::settings::Account {
             platform: "twitch".into(),
             user_id: who.user_id.clone(),
@@ -207,7 +208,7 @@ impl Engine {
         };
         let saved = account.clone();
         self.db(move |s| repo::settings::save_account(s, &saved)).await?;
-        self.start_twitch(auth, account);
+        self.start_twitch_with_helix(auth, helix, account);
         self.push_overlay_links().await;
         self.notice("account:twitch", NoticeLevel::Info, "Twitch is connected.");
         Ok(())
@@ -237,16 +238,27 @@ impl Engine {
 
     /// Registers the connector, marks the account in the status strip, and runs EventSub.
     fn start_twitch(&self, auth: Arc<Auth>, account: repo::settings::Account) {
+        let helix = ferrocast_twitch::helix::Helix::new(auth.clone());
+        self.start_twitch_with_helix(auth, helix, account);
+    }
+
+    fn start_twitch_with_helix(
+        &self,
+        auth: Arc<Auth>,
+        helix: ferrocast_twitch::helix::Helix,
+        account: repo::settings::Account,
+    ) {
         // Its token proves the channel when connecting the cloud bot (cloud_bot.rs).
-        self.cloud_bot_set_twitch(Some(auth.clone()));
-        let helix = ferrocast_twitch::helix::Helix::new(auth);
+        self.cloud_bot_set_twitch(Some(auth));
         self.register_connector(Arc::new(TwitchConnector { helix: helix.clone(), user_id: account.user_id.clone() }));
-        {
+        let connectors = {
             let mut st = self.state_mut();
             let v = st.connectors.entry("twitch".into()).or_insert_with(crate::state::ConnectorView::off);
             v.account = Some(account_view(&account));
             v.state = "reconnecting".into();
-        }
+            st.connectors.clone()
+        };
+        self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": connectors })));
         let url = self.apps().twitch_endpoints.eventsub.clone();
         let handle = tokio::spawn(ferrocast_twitch::eventsub::run(helix, account.user_id, url, self.sink()));
         if let Some(old) =

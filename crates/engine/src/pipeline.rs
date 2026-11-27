@@ -54,7 +54,7 @@ impl Engine {
             e.source_id = Some(format!("{id}#{}", tip_status_key(*status)));
         }
 
-        if e.origin != Origin::Test {
+        if e.origin != Origin::Test && !matches!(e.kind, EventKind::ViewerCount { .. } | EventKind::NativePoll { .. }) {
             let first = self.inner.dedupe.lock().unwrap_or_else(|p| p.into_inner()).first_time(&e, at);
             if !first {
                 tracing::debug!(platform = %e.platform, source = ?e.source_id, "duplicate dropped");
@@ -95,6 +95,7 @@ impl Engine {
                 return;
             }
             EventKind::ViewerCount { count } => {
+                tracing::debug!(platform = %e.platform, count = *count, "viewer count");
                 let viewers = {
                     let mut st = self.state_mut();
                     st.viewers.insert(e.platform, *count);
@@ -106,8 +107,13 @@ impl Engine {
                         .collect::<std::collections::HashMap<_, _>>()
                 };
                 self.send_overlay(OverlayFrame::new(Audience::All, e.seq, "state", &json!({ "viewers": viewers })));
+                self.send_live(LiveFrame::new("event", &e));
                 self.history_saw(&e, None);
                 self.discord_saw(&e);
+                return;
+            }
+            EventKind::NativePoll { poll_id, counts, ended } => {
+                self.on_native_poll_event(e.platform, poll_id, counts, *ended).await;
                 return;
             }
             _ => {}
@@ -162,6 +168,8 @@ impl Engine {
             },
             EventKind::MessageDeleted { message_id } => {
                 self.hide_message(e.platform, message_id);
+                // Purge matching active/queued/recent chat TTS immediately before async DB/queue awaits.
+                self.purge_chat_tts_message(e.platform, message_id, None);
                 let id = message_id.clone();
                 let p = e.platform;
                 let deleted_event = self
@@ -175,14 +183,16 @@ impl Engine {
                     .await
                     .ok()
                     .flatten();
-                // A queued alert for this message must not read it aloud either.
-                if let Some(ev) = deleted_event {
+                // A queued alert or chat TTS line for this message must not read it aloud either.
+                if let Some(ev) = &deleted_event {
+                    let ev_id = ev.clone();
                     self.queue_op(move |q, _| {
-                        q.strip_tts(&ev);
+                        q.strip_tts(&ev_id);
                         vec![]
                     })
                     .await;
                     self.push_tts_pending().await;
+                    self.purge_chat_tts_message(e.platform, message_id, Some(ev));
                 }
                 self.send_overlay(OverlayFrame::new(
                     Audience::Chat,
@@ -194,6 +204,8 @@ impl Engine {
             EventKind::UserMessagesCleared { target } | EventKind::Ban { target, .. } => {
                 if let Some(uid) = &target.id {
                     self.hide_user(e.platform, uid);
+                    self.purge_chat_tts_user(e.platform, uid);
+                    self.cleanup_pending_tts_for_user(e.platform, uid).await;
                 }
                 self.clear_highlight_if_user(e.platform, target);
                 self.send_overlay(OverlayFrame::new(
@@ -215,6 +227,7 @@ impl Engine {
                     let was_live = st.live.values().any(|l| *l);
                     st.live.insert(e.platform, true);
                     if !was_live {
+                        st.viewers.clear();
                         st.session = crate::state::Session {
                             started_at: Some(at),
                             credits: ferrocast_core::credits::Credits::new(Some(at)),
@@ -223,6 +236,8 @@ impl Engine {
                     }
                     was_live
                 };
+                self.bump_live_epoch(e.platform);
+                self.wake_viewer_poller();
                 if !anyone_live {
                     self.clear_chat_highlight();
                     self.push_credits();
@@ -247,13 +262,24 @@ impl Engine {
                     let since = self.state().session.started_at.map_or(at.0 - 43_200_000, |m| m.0);
                     self.youtube_chapters_later(since);
                 }
-                let any_live = {
+                let (any_live, viewers) = {
                     let mut st = self.state_mut();
                     st.live.insert(e.platform, false);
                     // An ended stream's last count must not keep adding to the peak.
-                    st.viewers.remove(&e.platform);
-                    st.live.values().any(|l| *l)
+                    let removed = st.viewers.remove(&e.platform).is_some();
+                    let viewers = removed.then(|| crate::viewers::overlay_clear_payload(&st.viewers, e.platform));
+                    (st.live.values().any(|l| *l), viewers)
                 };
+                self.bump_live_epoch(e.platform);
+                if let Some(viewers) = viewers {
+                    self.send_overlay(OverlayFrame::new(
+                        Audience::All,
+                        self.next_seq(),
+                        "state",
+                        &json!({ "viewers": viewers }),
+                    ));
+                }
+                self.wake_viewer_poller();
                 if !any_live && e.origin == Origin::Live {
                     if self.golive_stream_running() {
                         // The stream is still on air (no platform gets it any more): the session
@@ -278,6 +304,9 @@ impl Engine {
 
         if e.kind.is_alertable() || matches!(e.kind, EventKind::Tip { .. }) {
             self.support_event(&e).await;
+        }
+        if show_in_overlays && matches!(e.kind, EventKind::ChatMessage { .. }) {
+            self.maybe_enqueue_chat_tts(&e).await;
         }
 
         // "When X, do Y" (hidden chat never sets a rule off).

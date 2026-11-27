@@ -65,6 +65,7 @@ fn read_levels(
                     magnitude: floor(l.rms),
                     input_peak: floor(l.input_peak),
                     gated: l.gated,
+                    speech: l.speech,
                 },
             ))
         })
@@ -4398,11 +4399,18 @@ impl Stage {
         let encoded = s.frames.min(u64::from(u32::MAX)) as u32;
         let skipped =
             ferrocore::video::dropped_frames().saturating_sub(self.dropped_base).min(u64::from(encoded)) as u32;
+        let lagged = s.skipped.min(u64::from(u32::MAX)) as u32;
+        let missed_encode = s.missed_encode.min(u64::from(lagged)) as u32;
+        let missed_render = s.missed_render.min(u64::from(lagged.saturating_sub(missed_encode))) as u32;
+        // If `missed_render + missed_encode` hasn't covered legacy lagged counts, count remainder as render.
+        let accounted = missed_render.saturating_add(missed_encode);
+        let missed_render = missed_render.saturating_add(lagged.saturating_sub(accounted));
+        let (missed_reason, missed_detail) = crate::describe_missed_frames(missed_render, missed_encode, skipped);
         crate::EngineStats {
             cpu,
             fps: self.fps_now(s.frames, s.skipped, std::time::Instant::now()),
             frame_ms: f64::from(s.frame_ms),
-            lagged: s.skipped.min(u64::from(u32::MAX)) as u32,
+            lagged,
             frames: s.frames.min(u64::from(u32::MAX)) as u32,
             memory_mb,
             skipped,
@@ -4411,6 +4419,10 @@ impl Stage {
             restarts: s.restarts.min(u64::from(u32::MAX)) as u32,
             encode_ms: f64::from(s.encode_ms),
             encoding_ms: s.encoding_us / 1000,
+            missed_render,
+            missed_encode,
+            missed_reason,
+            missed_detail,
         }
     }
 

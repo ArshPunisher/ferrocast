@@ -848,6 +848,8 @@ async fn health_turns_obs_numbers_into_warnings_and_the_watcher_runs() {
     let obs = with_obs(&e).await;
     let first = e.check_obs_health().await.unwrap();
     assert!(first.warnings.is_empty());
+    let mut viewer_wake = e.inner.viewer_wake.subscribe();
+    let _ = viewer_wake.borrow_and_update();
     {
         let mut s = obs.lock().unwrap();
         s.streaming = true;
@@ -856,6 +858,7 @@ async fn health_turns_obs_numbers_into_warnings_and_the_watcher_runs() {
         s.cpu = 95.0;
     }
     let h = e.check_obs_health().await.unwrap();
+    assert!(viewer_wake.has_changed().unwrap_or(false), "OBS streaming start must wake viewer poller");
     let ids: Vec<&str> = h.warnings.iter().map(|w| w.id.as_str()).collect();
     assert!(ids.contains(&"dropped") && ids.contains(&"cpu"), "{ids:?}");
     assert_eq!(e.obs_health().unwrap().dropped_pct, 10.0);

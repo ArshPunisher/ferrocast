@@ -359,6 +359,12 @@ pub enum EventKind {
     AdBreak {
         seconds: u32,
     },
+    /// Live tally update or closure pushed by a platform-native poll.
+    NativePoll {
+        poll_id: String,
+        counts: Vec<u64>,
+        ended: bool,
+    },
 
     // connection health
     Connector(ConnectorStatus),
@@ -393,6 +399,7 @@ impl EventKind {
             EventKind::StreamOnline { .. } => "stream_online",
             EventKind::StreamOffline => "stream_offline",
             EventKind::AdBreak { .. } => "ad_break",
+            EventKind::NativePoll { .. } => "native_poll",
             EventKind::Connector(_) => "connector",
             EventKind::Unknown { .. } => "unknown",
         }

@@ -15,7 +15,7 @@
 // window's thread).
 #![recursion_limit = "256"]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,6 +54,11 @@ const SHOW_SHORTCUT: &str = "CmdOrCtrl+Alt+Shift+F";
 const MINIMIZED_ARG: &str = "--minimized";
 /// Launch directly in Safe Mode (no third-party plugins, VSTs, auto-start, or auto-loaded collection).
 const SAFE_MODE_ARG: &str = "--safe-mode";
+/// Bundle identifier in `tauri.conf.json`, used for LaunchServices relaunch when bundle path is unavailable.
+const BUNDLE_ID: &str = "com.clearcraftlabs.ferrocast";
+/// Set before `app.exit(0)` on macOS so `RunEvent::Exit` schedules LaunchServices relaunch after exit.
+#[cfg(target_os = "macos")]
+static RELAUNCH_AFTER_EXIT: AtomicBool = AtomicBool::new(false);
 /// How often the shell picks up settings changed in the dashboard.
 const SETTINGS_EVERY: Duration = Duration::from_secs(2);
 
@@ -510,14 +515,15 @@ fn main() {
             if let Some(l) = LOG_FILE.get() {
                 l.flush(std::time::Duration::from_secs(2));
             }
-            // Help > Restart in Safe Mode: now that the quit is clean, start again with the flag.
+            // After updating or restarting in Safe Mode, relaunch via LaunchServices once this
+            // process has exited so macOS reuses the pinned Dock icon instead of opening a second one.
             #[cfg(target_os = "macos")]
-            if quit::RELAUNCH_SAFE.load(Ordering::SeqCst) {
-                let mut env = app.env();
-                if !env.args_os.iter().any(|a| a == SAFE_MODE_ARG) {
-                    env.args_os.push(SAFE_MODE_ARG.into());
+            {
+                let safe = quit::RELAUNCH_SAFE.load(Ordering::SeqCst);
+                let update_restart = RELAUNCH_AFTER_EXIT.load(Ordering::SeqCst);
+                if safe || update_restart {
+                    schedule_mac_relaunch(&app.env(), safe);
                 }
-                tauri::process::restart(&env);
             }
         }
         _ => {}
@@ -1007,7 +1013,102 @@ async fn restart_when_asked(app: AppHandle, engine: Engine, pending: Pending) {
             }
         }
         tracing::info!("restarting to finish the update");
+        #[cfg(target_os = "macos")]
+        {
+            RELAUNCH_AFTER_EXIT.store(true, Ordering::SeqCst);
+            app.exit(0);
+            break;
+        }
+        #[cfg(not(target_os = "macos"))]
         app.restart();
+    }
+}
+
+/// Command specification to wait for `pid` to exit and reopen the app via LaunchServices.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[derive(Debug, PartialEq, Eq)]
+struct MacRelaunchSpec {
+    program: &'static str,
+    args: Vec<std::ffi::OsString>,
+}
+
+/// Filters raw `env.args_os` down to persistent flags (`--minimized`, plus `--safe-mode` only
+/// when relaunching into Safe Mode), stripping LaunchServices `-psn_*` serial tokens and
+/// one-shot `ferrocast://` deep links.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn relaunch_forward_args(env_args: &[std::ffi::OsString], safe_mode: bool) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = env_args.iter().skip(1).filter(|a| *a == MINIMIZED_ARG).cloned().collect();
+    if safe_mode {
+        out.push(SAFE_MODE_ARG.into());
+    }
+    out
+}
+
+/// Shell snippet that blocks until the parent closes the inherited relaunch pipe at process exit.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+const MAC_RELAUNCH_WAIT_SH: &str = "while IFS= read -r _; do :; done";
+
+/// Builds a detached `/bin/sh` + `/usr/bin/open` invocation that waits for the parent's
+/// inherited pipe EOF (process exit) before asking LaunchServices to launch the `.app` bundle
+/// (or bundle ID fallback).
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn mac_relaunch_spec(
+    bundle: Option<&Path>,
+    bundle_id: &str,
+    env_args: &[std::ffi::OsString],
+    safe_mode: bool,
+) -> MacRelaunchSpec {
+    let script = format!("{MAC_RELAUNCH_WAIT_SH}; /bin/sleep 0.2; exec /usr/bin/open \"$@\"");
+    let mut args: Vec<std::ffi::OsString> = vec!["-c".into(), script.into(), "ferrocast-relaunch".into()];
+    match bundle {
+        Some(path) => args.push(path.as_os_str().to_os_string()),
+        None => {
+            args.push("-b".into());
+            args.push(bundle_id.into());
+        }
+    }
+    let forward = relaunch_forward_args(env_args, safe_mode);
+    if !forward.is_empty() {
+        args.push("--args".into());
+        args.extend(forward);
+    }
+    MacRelaunchSpec { program: "/bin/sh", args }
+}
+
+/// Write end of the anonymous pipe held open until process exit so the detached macOS relaunch
+/// watcher unblocks on kernel descriptor close rather than polling a numeric PID.
+#[cfg(target_os = "macos")]
+static RELAUNCH_PIPE_WRITE: Mutex<Option<std::io::PipeWriter>> = Mutex::new(None);
+
+/// Spawns a detached watcher that relaunches via LaunchServices only after this process exits.
+#[cfg(target_os = "macos")]
+fn schedule_mac_relaunch(env: &tauri::Env, safe_mode: bool) {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let (reader, writer) = match std::io::pipe() {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(error = %e, "couldn't create LaunchServices relaunch exit pipe");
+            return;
+        }
+    };
+    let bundle = std::env::current_exe().ok().and_then(|exe| mac_update::bundle_of(&exe));
+    let spec = mac_relaunch_spec(bundle.as_deref(), BUNDLE_ID, &env.args_os, safe_mode);
+    match Command::new(spec.program)
+        .args(&spec.args)
+        .stdin(Stdio::from(reader))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(_) => {
+            *RELAUNCH_PIPE_WRITE.lock().unwrap_or_else(|p| p.into_inner()) = Some(writer);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "couldn't schedule LaunchServices relaunch");
+        }
     }
 }
 
@@ -2096,5 +2197,107 @@ mod update_tests {
             store_deeplink_route("ferrocast://store/install/aurora-pulse"),
             "#/store?link=ferrocast%3A%2F%2Fstore%2Finstall%2Faurora-pulse"
         );
+    }
+
+    #[test]
+    fn bundle_id_matches_tauri_config() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(conf["identifier"].as_str(), Some(BUNDLE_ID));
+    }
+
+    #[test]
+    fn mac_relaunch_spec_uses_launchservices_after_exit_and_filters_psn_args() {
+        let env_args: Vec<std::ffi::OsString> = vec![
+            "/Applications/Ferrocast.app/Contents/MacOS/ferrocast".into(),
+            "-psn_0_123456".into(),
+            "--minimized".into(),
+        ];
+        let spec = mac_relaunch_spec(Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &env_args, true);
+        assert_eq!(spec.program, "/bin/sh");
+        assert!(!spec.args.iter().any(|a| a == "-n"), "open -n must not be passed: {:?}", spec.args);
+        assert_eq!(
+            spec.args[2..],
+            [
+                std::ffi::OsString::from("ferrocast-relaunch"),
+                "/Applications/Ferrocast.app".into(),
+                "--args".into(),
+                "--minimized".into(),
+                "--safe-mode".into(),
+            ]
+        );
+        let script = spec.args[1].to_string_lossy();
+        assert!(script.contains(MAC_RELAUNCH_WAIT_SH) && script.contains("exec /usr/bin/open"), "{script}");
+
+        // Without extra flags and without a bundle path, falls back to `-b <bundle_id>` with no `--args`.
+        let fallback =
+            mac_relaunch_spec(None, BUNDLE_ID, &["/usr/local/bin/ferrocast".into(), "-psn_0_777".into()], false);
+        assert_eq!(fallback.args[2..], [std::ffi::OsString::from("ferrocast-relaunch"), "-b".into(), BUNDLE_ID.into()]);
+    }
+
+    #[test]
+    fn mac_relaunch_strips_safe_mode_and_deeplinks_and_guards_dying_pid_handoff() {
+        let forwarded = relaunch_forward_args(
+            &[
+                "/Applications/Ferrocast.app/Contents/MacOS/ferrocast".into(),
+                "-psn_0_999".into(),
+                "--safe-mode".into(),
+                "--minimized".into(),
+                "ferrocast://auth/callback?code=abc".into(),
+            ],
+            false,
+        );
+        assert_eq!(forwarded, [std::ffi::OsString::from("--minimized")]);
+
+        let spec = mac_relaunch_spec(Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &[], false);
+        let script = spec.args[1].to_string_lossy();
+        assert!(script.contains("sleep 0.2"), "expected LaunchServices settle sleep in script: {script}");
+        assert!(
+            script.contains(MAC_RELAUNCH_WAIT_SH),
+            "script must block on inherited exit pipe EOF before calling open: {script}"
+        );
+    }
+
+    #[test]
+    fn mac_relaunch_does_not_poll_numeric_pid_with_kill_zero() {
+        let spec = mac_relaunch_spec(Some(Path::new("/Applications/Ferrocast.app")), BUNDLE_ID, &[], false);
+        let script = spec.args[1].to_string_lossy();
+        assert!(
+            !script.contains("kill -0"),
+            "relaunch script must not poll PID with kill -0 (vulnerable to PID reuse): {script}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::process::{Command, Stdio};
+
+            // Spawn an unrelated same-UID process to simulate a recycled PID staying alive.
+            let mut unrelated = Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            let (reader, writer) = std::io::pipe().unwrap();
+            let wait_script = format!("{MAC_RELAUNCH_WAIT_SH}; printf ready");
+            let mut watcher = Command::new("/bin/sh")
+                .args(["-c", &wait_script])
+                .stdin(Stdio::from(reader))
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+
+            assert!(watcher.try_wait().unwrap().is_none(), "watcher must wait while pipe write-end stays open");
+            drop(writer);
+            let out = watcher.wait_with_output().unwrap();
+            assert!(out.status.success(), "watcher failed: {:?}", out.status);
+            assert_eq!(out.stdout, b"ready");
+
+            let _ = unrelated.kill();
+            let _ = unrelated.wait();
+        }
     }
 }

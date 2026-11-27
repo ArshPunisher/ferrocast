@@ -21,6 +21,7 @@ mod cloud_sync_tests;
 mod golive_tests;
 pub use cloud_backup::KEY_FILE_NAME as CLOUD_BACKUP_KEY_FILE;
 pub mod automation;
+mod chat_tts;
 pub mod designs;
 pub mod diagnostics;
 mod discord;
@@ -77,6 +78,7 @@ pub use updates::{
 };
 mod tip_pro;
 pub use tip_pro::TIP_IMAGES;
+mod viewers;
 mod weekly_email;
 mod welcome;
 
@@ -151,6 +153,9 @@ struct Inner {
     apps: accounts::PlatformApps,
     adapters: Mutex<HashMap<Platform, tokio::task::JoinHandle<()>>>,
     youtube_wake: Mutex<Option<Arc<Notify>>>,
+    viewer_wake: tokio::sync::watch::Sender<u64>,
+    viewer_task: Mutex<Option<tokio::task::AbortHandle>>,
+    live_epoch: [AtomicU64; 3],
     /// The Ferrocast account sign-in in progress (or its last problem).
     account_flow: Mutex<ferro_account::Flow>,
     relay_link: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -158,6 +163,7 @@ struct Inner {
     activity: Mutex<ferrocast_core::loyalty::Activity>,
     points_cooldown: Mutex<loyalty::PointsCooldowns>,
     poll: Mutex<polls::PollSlot>,
+    poll_op: tokio::sync::Mutex<()>,
     giveaway: tokio::sync::Mutex<giveaways::GiveawaySlot>,
     highlight: Mutex<widgets::HighlightSlot>,
     /// When the last welcome went out (they're spaced out during raids).
@@ -235,6 +241,11 @@ struct Inner {
     youtube_handle_checked: AtomicBool,
     /// Last `next_stream_at` timestamp broadcast to overlays, so schedule ticks detect pass-through.
     last_pushed_next_stream_at: Mutex<Option<Option<i64>>>,
+    chat_tts: chat_tts::ChatTtsSlot,
+    /// Serializes chat TTS policy/pause/mute transitions with admission and approval dispatch.
+    tts_op: tokio::sync::Mutex<()>,
+    /// Moderated `(platform, user_id)` pairs whose pending TTS cleanup failed and awaits retry.
+    blocked_pending_tts_users: Mutex<HashSet<(Platform, String)>>,
 }
 
 /// Picks rustls' crypto provider for the whole process, once. The app links two backends
@@ -347,11 +358,15 @@ impl Engine {
                 apps,
                 adapters: Mutex::new(HashMap::new()),
                 youtube_wake: Mutex::new(None),
+                viewer_wake: tokio::sync::watch::Sender::new(0),
+                viewer_task: Mutex::new(None),
+                live_epoch: std::array::from_fn(|_| AtomicU64::new(0)),
                 account_flow: Mutex::new(Default::default()),
                 relay_link: Mutex::new(None),
                 activity: Mutex::new(Default::default()),
                 points_cooldown: Mutex::new(Default::default()),
                 poll: Mutex::new(Default::default()),
+                poll_op: tokio::sync::Mutex::new(()),
                 giveaway: tokio::sync::Mutex::new(Default::default()),
                 highlight: Mutex::new(Default::default()),
                 last_welcome: Mutex::new(None),
@@ -397,12 +412,18 @@ impl Engine {
                 hardware_probe_cache: Default::default(),
                 youtube_handle_checked: AtomicBool::new(false),
                 last_pushed_next_stream_at: Mutex::new(None),
+                chat_tts: Default::default(),
+                tts_op: tokio::sync::Mutex::new(()),
+                blocked_pending_tts_users: Mutex::new(Default::default()),
             }),
         };
         tokio::spawn(prune(engine.clone()));
         tokio::spawn(backups::run(engine.clone()));
         tokio::spawn(pipeline::run(engine.clone(), rx));
+        let vh = tokio::spawn(viewers::run(engine.clone()));
+        *engine.inner.viewer_task.lock().unwrap_or_else(|p| p.into_inner()) = Some(vh.abort_handle());
         tokio::spawn(dispatcher::run(engine.clone()));
+        tokio::spawn(chat_tts::run(engine.clone()));
         tokio::spawn(timers::run(engine.clone()));
         tokio::spawn(schedule::run(engine.clone()));
         tokio::spawn(automation::run(engine.clone()));
@@ -473,19 +494,60 @@ impl Engine {
     pub fn register_connector(&self, c: Arc<dyn Connector>) {
         let platform = c.platform();
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).insert(platform, c);
+        self.bump_live_epoch(platform);
+        self.wake_viewer_poller();
     }
 
     pub fn unregister_connector(&self, platform: Platform) {
         self.inner.connectors.write().unwrap_or_else(|p| p.into_inner()).remove(&platform);
-        let view = {
+        self.bump_live_epoch(platform);
+        let (view, cleared) = {
             let mut st = self.state_mut();
             st.connectors.insert(platform_key(platform).into(), ConnectorView::off());
             st.live.remove(&platform);
-            st.viewers.remove(&platform);
-            st.connectors.clone()
+            let cleared = st.viewers.remove(&platform).map(|_| viewers::overlay_clear_payload(&st.viewers, platform));
+            (st.connectors.clone(), cleared)
         };
+        if let Some(viewers) = cleared {
+            self.send_overlay(OverlayFrame::new(
+                frames::Audience::All,
+                self.next_seq(),
+                "state",
+                &serde_json::json!({ "viewers": viewers }),
+            ));
+        }
         // Open dashboards drop the account at once instead of after a reload.
         self.send_live(LiveFrame::new("status", &serde_json::json!({ "connectors": view })));
+        self.wake_viewer_poller();
+    }
+
+    pub(crate) fn wake_viewer_poller(&self) {
+        self.inner.viewer_wake.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    pub(crate) fn bump_live_epoch(&self, platform: Platform) {
+        let idx = match platform {
+            Platform::Twitch => 0,
+            Platform::Youtube => 1,
+            Platform::Kick => 2,
+            _ => return,
+        };
+        self.inner.live_epoch[idx].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn live_epochs(&self) -> [u64; 3] {
+        [
+            self.inner.live_epoch[0].load(Ordering::Relaxed),
+            self.inner.live_epoch[1].load(Ordering::Relaxed),
+            self.inner.live_epoch[2].load(Ordering::Relaxed),
+        ]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_viewer_poller(&self) {
+        if let Some(h) = self.inner.viewer_task.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            h.abort();
+        }
     }
 
     /// Held while saving any setting (see `Inner::config`).
@@ -715,6 +777,7 @@ async fn prune(engine: Engine) {
         // Clean up orphaned ephemeral TTS files older than 1 hour, preserving any alert still in
         // the queue and any cached voice previews.
         let mut keep_ids = engine.cloud_tts().preview_ids();
+        keep_ids.extend(engine.chat_tts_media_ids());
         {
             let q = engine.inner.queue.lock().await;
             if let Some(id) = q.playing().and_then(|p| p.alert.tts_audio.as_ref()) {

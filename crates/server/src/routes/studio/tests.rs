@@ -1834,3 +1834,20 @@ async fn screen_and_source_still_routes_forward_fresh_query_param() {
         ]
     );
 }
+
+#[tokio::test]
+async fn live_alert_silence_accepts_quiet_and_muted_mic_alerts_and_rejects_others() {
+    let r = start().await;
+    assert_eq!(
+        r.post("/studio/engine/live-alerts/silence", json!({ "id": "mic:quiet:KREO" })).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        r.post("/studio/engine/live-alerts/silence", json!({ "id": "mic:muted:KREO" })).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        r.post("/studio/engine/live-alerts/silence", json!({ "id": "camera:Cam:black" })).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+}

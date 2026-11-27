@@ -525,6 +525,55 @@ async fn tts_goals_and_commands_speak_the_dashboards_language() {
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     assert!(r.get("/api/v1/tts/pending").await.json::<Value>().await.unwrap().as_array().unwrap().is_empty());
 
+    // Chat TTS defaults, partial merges, trimming, and validation bounds.
+    let initial: Value = r.get("/api/v1/tts").await.json().await.unwrap();
+    assert_eq!(initial["chat"]["enabled"], false);
+    assert_eq!(initial["chat"]["mode"], "subs_mods");
+    assert_eq!(initial["chat"]["command"], "!tts");
+    assert_eq!(initial["chat"]["cooldown_s"], 15);
+    assert_eq!(initial["chat"]["global_cooldown_s"], 3);
+    assert_eq!(initial["chat"]["queue_limit"], 5);
+    assert_eq!(initial["chat"]["max_chars"], 160);
+    assert_eq!(initial["chat"]["skip_links"], true);
+    assert_eq!(initial["chat"]["skip_emote_spam"], true);
+
+    let first_patch: Value = r
+        .put(
+            "/api/v1/tts",
+            json!({ "enabled": true, "chat": { "enabled": true, "mode": "command", "command": "  !voice  " } }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first_patch["chat"]["enabled"], true);
+    assert_eq!(first_patch["chat"]["mode"], "command");
+    assert_eq!(first_patch["chat"]["command"], "!voice");
+    assert_eq!(first_patch["chat"]["cooldown_s"], 15);
+
+    let partial: Value =
+        r.put("/api/v1/tts", json!({ "chat": { "cooldown_s": 45, "skip_links": false } })).await.json().await.unwrap();
+    assert_eq!(partial["chat"]["enabled"], true);
+    assert_eq!(partial["chat"]["mode"], "command");
+    assert_eq!(partial["chat"]["command"], "!voice");
+    assert_eq!(partial["chat"]["cooldown_s"], 45);
+    assert_eq!(partial["chat"]["skip_links"], false);
+
+    for (payload, expected_prefix) in [
+        (json!({ "chat": { "command": "voice" } }), "chat.command"),
+        (json!({ "chat": { "cooldown_s": 301 } }), "chat.cooldown_s"),
+        (json!({ "chat": { "global_cooldown_s": 61 } }), "chat.global_cooldown_s"),
+        (json!({ "chat": { "queue_limit": 0 } }), "chat.queue_limit"),
+        (json!({ "chat": { "queue_limit": 21 } }), "chat.queue_limit"),
+        (json!({ "chat": { "max_chars": 9 } }), "chat.max_chars"),
+        (json!({ "chat": { "max_chars": 301 } }), "chat.max_chars"),
+    ] {
+        let invalid = r.put("/api/v1/tts", payload).await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let body: Value = invalid.json().await.unwrap();
+        assert!(body["error"]["message"].as_str().unwrap_or("").starts_with(expected_prefix), "{body}");
+    }
+
     let g: Value = r
         .post("/api/v1/goals", json!({ "title": "Mic", "kind": "tips", "target": 5000, "currency": "INR" }))
         .await
@@ -888,7 +937,11 @@ async fn poll_routes_validate_and_refuse_races() {
     use reqwest::Method;
     let r = start().await;
     assert_eq!(r.get("/api/v1/polls/current").await.json::<Value>().await.unwrap(), Value::Null);
+    let caps = r.get("/api/v1/polls/capabilities").await;
+    assert_eq!(caps.status(), StatusCode::OK);
+    assert_eq!(caps.json::<Value>().await.unwrap(), json!({ "platforms": [] }));
     for (m, path) in [
+        (Method::GET, "/api/v1/polls/capabilities"),
         (Method::GET, "/api/v1/polls/current"),
         (Method::POST, "/api/v1/polls"),
         (Method::POST, "/api/v1/polls/current/end"),
@@ -956,6 +1009,32 @@ async fn poll_routes_validate_and_refuse_races() {
     assert_eq!(error_code(gone).await, (StatusCode::NOT_FOUND, "poll_not_found".into()));
     let fresh = r.post("/api/v1/polls", ok).await;
     assert_eq!(fresh.status(), StatusCode::CREATED, "a new poll after the last one ended");
+    assert!(r.post("/api/v1/polls/current/end", json!({})).await.status().is_success());
+
+    // Omitted `duration_s` defaults to 60s; explicit JSON `null` creates a No-timer poll.
+    let defaulted = r.post("/api/v1/polls", json!({ "question": "Default?", "options": ["A", "B"] })).await;
+    assert_eq!(defaulted.status(), StatusCode::CREATED);
+    let dv: Value = defaulted.json().await.unwrap();
+    assert!(dv["ends_at"].is_i64(), "omitted duration_s defaults to timed: {dv}");
+    assert!(r.post("/api/v1/polls/current/end", json!({})).await.status().is_success());
+
+    let bad_fb =
+        r.post("/api/v1/polls", json!({ "question": "Bad?", "options": ["A", "B"], "chat_fallback": "yes" })).await;
+    assert_eq!(bad_fb.status(), StatusCode::BAD_REQUEST);
+
+    let untimed = r
+        .post("/api/v1/polls", json!({ "question": "No timer?", "options": ["Stay", "Go"], "duration_s": null }))
+        .await;
+    assert_eq!(untimed.status(), StatusCode::CREATED);
+    let uv: Value = untimed.json().await.unwrap();
+    assert_eq!(uv["ends_at"], Value::Null, "explicit null creates an untimed poll");
+    assert_eq!(r.post("/api/v1/polls/current/end", json!({})).await.status(), StatusCode::OK);
+
+    // Disabling chat fallback refuses to start when no connected platform supports native polls.
+    let no_fb = r
+        .post("/api/v1/polls", json!({ "question": "Native only?", "options": ["A", "B"], "chat_fallback": false }))
+        .await;
+    assert_eq!(error_code(no_fb).await.0, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -3383,4 +3462,23 @@ async fn golive_quality_options_and_put_quality_cover_every_status_code() {
         )
         .await;
     assert_eq!(error_code(obs_422_custom).await, (StatusCode::UNPROCESSABLE_ENTITY, "golive_needs_new_encode".into()));
+}
+
+#[test]
+fn poll_spec_max_length_and_asyncapi_status_tts_stop_match_runtime() {
+    let openapi = crate::spec::openapi();
+    assert_eq!(openapi["components"]["schemas"]["PollSpec"]["properties"]["question"]["maxLength"], 120);
+    let asyncapi = crate::spec::asyncapi();
+    assert!(
+        asyncapi["channels"]["live"]["messages"]["status"]["payload"]["properties"]["data"]["properties"]
+            .get("viewers")
+            .is_some(),
+        "AsyncAPI status payload must document viewers"
+    );
+    assert!(
+        asyncapi["channels"]["overlay"]["messages"]["tts_stop"]["payload"]["properties"]["data"]["properties"]
+            .get("ids")
+            .is_some(),
+        "AsyncAPI tts_stop payload must document ids"
+    );
 }

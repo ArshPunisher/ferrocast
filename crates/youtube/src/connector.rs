@@ -4,12 +4,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ferrocast_connector::{Connector, ConnectorError, Result};
+use ferrocast_connector::{Connector, ConnectorError, NativePollSpec, NativePollTally, Result};
 use ferrocast_core::event::Platform;
 use ferrocast_core::moderation::{Capabilities, ModeChange};
+use ferrocast_core::poll::{PlatformPollCapability, PollCapabilityMode};
 
-use crate::api::Api;
+use crate::api::{Api, YOUTUBE_POLL_LIMITS};
 use crate::stream::LiveChat;
+use crate::{YoutubeError, now_ms, quota_jitter_s, quota_resets_in};
 
 #[derive(Debug, Clone)]
 pub struct YoutubeConnector {
@@ -23,6 +25,15 @@ impl YoutubeConnector {
             platform: Platform::Youtube,
             message: "you aren't live on YouTube right now".into(),
         })
+    }
+
+    fn map_err(&self, err: YoutubeError) -> ConnectorError {
+        if matches!(err, YoutubeError::QuotaExceeded) {
+            let retry_after = quota_resets_in(now_ms(), quota_jitter_s());
+            self.api.note_quota_exceeded(retry_after);
+            return ConnectorError::RateLimited { platform: Platform::Youtube, retry_after };
+        }
+        ConnectorError::from(err)
     }
 }
 
@@ -129,5 +140,87 @@ impl Connector for YoutubeConnector {
 
     async fn vertical_ingest(&self) -> Result<ferrocast_connector::Ingest> {
         Ok(self.api.vertical_ingest().await?)
+    }
+
+    async fn viewer_count(&self) -> Result<Option<u64>> {
+        if let Some(retry_after) = self.api.quota_retry_after() {
+            return Err(ConnectorError::RateLimited { platform: Platform::Youtube, retry_after });
+        }
+        let mut ids = self.api.active_broadcast_ids();
+        let used_cache = !ids.is_empty();
+        if ids.is_empty() {
+            let active = self.api.active_broadcasts().await.map_err(|e| self.map_err(e))?;
+            ids = active.into_iter().map(|b| b.id).collect();
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let count = self.api.concurrent_viewers(&ids).await.map_err(|e| self.map_err(e))?;
+        if count.is_some() {
+            self.api.clear_missing_viewers_recheck();
+            return Ok(count);
+        }
+        if used_cache && self.api.take_missing_viewers_recheck() {
+            let active = self.api.active_broadcasts().await.map_err(|e| self.map_err(e))?;
+            let fresh_ids: Vec<String> = active.into_iter().map(|b| b.id).collect();
+            if fresh_ids.is_empty() {
+                return Ok(None);
+            }
+            if fresh_ids != ids {
+                let res = self.api.concurrent_viewers(&fresh_ids).await.map_err(|e| self.map_err(e))?;
+                if res.is_some() {
+                    self.api.clear_missing_viewers_recheck();
+                }
+                return Ok(res);
+            }
+        }
+        Ok(None)
+    }
+
+    async fn poll_capability(&self) -> Option<PlatformPollCapability> {
+        let is_live = self.live.read().unwrap_or_else(|p| p.into_inner()).is_some();
+        Some(PlatformPollCapability {
+            platform: Platform::Youtube,
+            mode: if is_live { PollCapabilityMode::Native } else { PollCapabilityMode::ChatFallback },
+            reason: if is_live { None } else { Some("not_live".into()) },
+            limits: YOUTUBE_POLL_LIMITS,
+        })
+    }
+
+    async fn create_native_poll(&self, spec: &NativePollSpec) -> Result<NativePollTally> {
+        if let Some(retry_after) = self.api.quota_retry_after() {
+            return Err(ConnectorError::RateLimited { platform: Platform::Youtube, retry_after });
+        }
+        if spec.question.chars().count() > YOUTUBE_POLL_LIMITS.question_chars {
+            return Err(ConnectorError::Refused {
+                platform: Platform::Youtube,
+                message: format!("Question exceeds YouTube {} character limit.", YOUTUBE_POLL_LIMITS.question_chars),
+            });
+        }
+        if spec.options.len() < YOUTUBE_POLL_LIMITS.min_options
+            || spec.options.len() > YOUTUBE_POLL_LIMITS.max_options
+            || spec.options.iter().any(|o| o.chars().count() > YOUTUBE_POLL_LIMITS.option_chars)
+        {
+            return Err(ConnectorError::Refused {
+                platform: Platform::Youtube,
+                message: format!(
+                    "YouTube polls allow {} to {} answers of at most {} characters.",
+                    YOUTUBE_POLL_LIMITS.min_options, YOUTUBE_POLL_LIMITS.max_options, YOUTUBE_POLL_LIMITS.option_chars
+                ),
+            });
+        }
+        let chat = self.chat()?;
+        self.api.create_poll(&chat, &spec.question, &spec.options).await.map_err(|e| self.map_err(e))
+    }
+
+    async fn get_native_poll(&self, external_id: &str) -> Result<Option<NativePollTally>> {
+        Ok(self.api.latest_poll(external_id))
+    }
+
+    async fn end_native_poll(&self, external_id: &str) -> Result<Option<NativePollTally>> {
+        if let Some(retry_after) = self.api.quota_retry_after() {
+            return Err(ConnectorError::RateLimited { platform: Platform::Youtube, retry_after });
+        }
+        self.api.close_poll(external_id).await.map_err(|e| self.map_err(e))
     }
 }

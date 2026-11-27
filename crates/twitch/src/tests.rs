@@ -628,3 +628,221 @@ async fn a_fresh_token_helix_refuses_names_the_scope_then_ends_in_a_sign_in() {
     }
     assert_eq!(helix.me().await.unwrap_err(), TwitchError::SignInNeeded);
 }
+
+#[test]
+fn parse_stream_viewers_handles_live_zero_non_live_and_offline() {
+    use crate::helix::parse_stream_viewers;
+    assert_eq!(parse_stream_viewers(&json!({ "data": [{ "type": "live", "viewer_count": 42 }] })), Some(42));
+    assert_eq!(parse_stream_viewers(&json!({ "data": [{ "type": "live", "viewer_count": 0 }] })), Some(0));
+    assert_eq!(parse_stream_viewers(&json!({ "data": [{ "type": "", "viewer_count": 99 }] })), None);
+    assert_eq!(parse_stream_viewers(&json!({ "data": [] })), None);
+}
+
+#[tokio::test]
+async fn connector_viewer_count_reads_helix_streams_handles_offline_401_and_429() {
+    use ferrocast_connector::{Connector, ConnectorError};
+    use ferrocast_core::event::Platform;
+
+    let (st, ep) = fake().await;
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let c = TwitchConnector { helix: Helix::new(auth_for(&ep, saved)), user_id: "111".into() };
+
+    assert_eq!(c.viewer_count().await.unwrap(), None, "empty data means offline");
+
+    st.lock().unwrap().streams_data =
+        Some(json!([{ "id": "s1", "user_id": "111", "type": "live", "viewer_count": 318 }]));
+    assert_eq!(c.viewer_count().await.unwrap(), Some(318));
+
+    st.lock().unwrap().streams_data =
+        Some(json!([{ "id": "s1", "user_id": "111", "type": "live", "viewer_count": 0 }]));
+    assert_eq!(c.viewer_count().await.unwrap(), Some(0), "0 viewers while live is still Some(0)");
+
+    st.lock().unwrap().fail_next_with_401 = true;
+    assert_eq!(c.viewer_count().await.unwrap(), Some(0), "401 refreshes token and retries");
+    assert_eq!(st.lock().unwrap().refreshes, 1);
+
+    st.lock().unwrap().fail_next_streams_429 = true;
+    let err = c.viewer_count().await.unwrap_err();
+    assert!(
+        matches!(err, ConnectorError::RateLimited { platform: Platform::Twitch, .. }),
+        "expected Twitch RateLimited, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn native_poll_capabilities_respect_broadcaster_type_before_scope() {
+    use ferrocast_connector::Connector;
+    use ferrocast_core::poll::PollCapabilityMode;
+
+    assert!(crate::auth::SCOPES.contains(&crate::auth::POLL_MANAGE_SCOPE));
+
+    // Non-affiliate missing poll scope still reports ChatFallback (never asks to reconnect).
+    let (st, ep) = fake().await;
+    let c_non_aff = connector_for(&ep, vec!["user:read:chat".into()]);
+    let cap = c_non_aff.poll_capability().await.unwrap();
+    assert_eq!(cap.mode, PollCapabilityMode::ChatFallback);
+    assert_eq!(cap.reason.as_deref(), Some("requires_affiliate"));
+
+    // Affiliate missing channel:manage:polls reports ReconnectNeeded.
+    let (st_aff, ep_aff) = fake().await;
+    st_aff.lock().unwrap().broadcaster_type = "affiliate".into();
+    let c_aff_old = connector_for(&ep_aff, vec!["user:read:chat".into()]);
+    let cap_old = c_aff_old.poll_capability().await.unwrap();
+    assert_eq!(cap_old.mode, PollCapabilityMode::ReconnectNeeded);
+    assert_eq!(cap_old.reason.as_deref(), Some("needs_scope"));
+
+    // Partner with channel:manage:polls reports Native with Twitch limits.
+    st.lock().unwrap().broadcaster_type = "partner".into();
+    let c_partner = connector_for(&ep, crate::auth::SCOPES.iter().map(|s| s.to_string()).collect());
+    let cap_ok = c_partner.poll_capability().await.unwrap();
+    assert_eq!(cap_ok.mode, PollCapabilityMode::Native);
+    assert_eq!(cap_ok.reason, None);
+    assert_eq!(cap_ok.limits.question_chars, 60);
+    assert_eq!(cap_ok.limits.option_chars, 25);
+    assert!(cap_ok.limits.supports_no_timer);
+}
+
+#[tokio::test]
+async fn native_poll_lifecycle_create_poll_get_end_and_failures() {
+    use ferrocast_connector::{Connector, ConnectorError, NativePollSpec};
+
+    let (st, ep) = fake().await;
+    st.lock().unwrap().broadcaster_type = "affiliate".into();
+    let scopes: Vec<String> = crate::auth::SCOPES.iter().map(|s| s.to_string()).collect();
+    let c = connector_for(&ep, scopes.clone());
+
+    // Pre-flight character limits fail locally without issuing a Helix call.
+    let too_long =
+        NativePollSpec { question: "x".repeat(61), options: vec!["A".into(), "B".into()], duration_s: Some(60) };
+    assert!(matches!(c.create_native_poll(&too_long).await, Err(ConnectorError::Refused { .. })));
+    let bad_opt =
+        NativePollSpec { question: "Map?".into(), options: vec!["A".into(), "y".repeat(26)], duration_s: Some(60) };
+    assert!(matches!(c.create_native_poll(&bad_opt).await, Err(ConnectorError::Refused { .. })));
+    assert!(st.lock().unwrap().poll_requests.is_empty());
+
+    // No-timer poll creates with Twitch's 1800s max and ends early with TERMINATED.
+    let spec = NativePollSpec {
+        question: "Which map?".into(),
+        options: vec!["Ascent".into(), "Bind".into()],
+        duration_s: None,
+    };
+    let created = c.create_native_poll(&spec).await.unwrap();
+    assert_eq!(created.external_id, "tw-poll-1");
+    assert_eq!(created.counts, vec![0, 0]);
+    assert!(!created.ended);
+    assert_eq!(st.lock().unwrap().poll_requests[0]["duration"], 1800);
+    assert_eq!(st.lock().unwrap().poll_requests[0]["title"], "Which map?");
+
+    // Simulate incoming votes in fake storage and verify get_native_poll reads them.
+    {
+        let mut guard = st.lock().unwrap();
+        guard.native_polls[0]["choices"][0]["votes"] = json!(7);
+        guard.native_polls[0]["choices"][1]["votes"] = json!(3);
+    }
+    let polled = c.get_native_poll(&created.external_id).await.unwrap().unwrap();
+    assert_eq!(polled.counts, vec![7, 3]);
+    assert!(!polled.ended);
+
+    let ended = c.end_native_poll(&created.external_id).await.unwrap().unwrap();
+    assert!(ended.ended);
+    assert_eq!(ended.counts, vec![7, 3]);
+    assert_eq!(st.lock().unwrap().poll_requests[1]["status"], "TERMINATED");
+
+    // Pre-3.8.0 scopes or Twitch 401 Missing scope returns MissingScope.
+    let old = connector_for(&ep, vec!["user:read:chat".into()]);
+    assert!(matches!(
+        old.create_native_poll(&spec).await,
+        Err(ConnectorError::MissingScope { scope, .. }) if scope == crate::auth::POLL_MANAGE_SCOPE
+    ));
+    st.lock().unwrap().refuse_poll_scope = true;
+    let unknown_scopes = connector_for(&ep, vec![]);
+    assert!(matches!(unknown_scopes.create_native_poll(&spec).await, Err(ConnectorError::MissingScope { .. })));
+    let after_missing = unknown_scopes.poll_capability().await.unwrap();
+    assert_eq!(after_missing.mode, ferrocast_core::poll::PollCapabilityMode::ReconnectNeeded);
+    assert_eq!(after_missing.reason.as_deref(), Some("needs_scope"));
+
+    // 403 non-affiliate caches non-affiliate so capability stops advertising Native.
+    let (st2, ep2) = fake().await;
+    let c2 = connector_for(&ep2, scopes);
+    assert!(matches!(c2.create_native_poll(&spec).await, Err(ConnectorError::Refused { .. })));
+    assert_eq!(c2.poll_capability().await.unwrap().reason.as_deref(), Some("requires_affiliate"));
+    drop(st2);
+}
+
+#[tokio::test]
+async fn optional_eventsub_poll_topics_map_events_and_skip_missing_scope() {
+    let (st, ep) = fake().await;
+    st.lock().unwrap().refuse_poll_subs = true;
+    let helix = Helix::new(auth_for(&ep, Arc::default()));
+    let (sink, mut rx) = mpsc::channel(64);
+    tokio::spawn(eventsub::run(helix, "111".into(), ep.eventsub.clone(), sink));
+
+    // Only channel.ad_break.begin triggers ScopesMissing; optional channel.poll.* skip silently.
+    let first = next_event(&mut rx).await;
+    assert!(
+        matches!(&first.kind, EventKind::Connector(ConnectorStatus::ScopesMissing { scopes }) if scopes == &["channel.ad_break.begin"]),
+        "{first:?}"
+    );
+    let connected = next_event(&mut rx).await;
+    assert!(matches!(connected.kind, EventKind::Connector(ConnectorStatus::Connected)));
+
+    // Map begin / progress / end notifications into EventKind::NativePoll.
+    let at = ferrocast_core::event::Millis(100);
+    let progress = map::map(
+        "channel.poll.progress",
+        "d-prog",
+        &json!({
+            "id": "tw-poll-9",
+            "status": "active",
+            "choices": [
+                { "id": "c1", "title": "A", "votes": 4, "channel_points_votes": 1 },
+                { "id": "c2", "title": "B", "votes": 9, "channel_points_votes": 0 }
+            ]
+        }),
+        at,
+    );
+    assert!(matches!(
+        &progress.kind,
+        EventKind::NativePoll { poll_id, counts, ended: false } if poll_id == "tw-poll-9" && counts == &[4, 9]
+    ));
+
+    let ended = map::map(
+        "channel.poll.end",
+        "d-end",
+        &json!({
+            "id": "tw-poll-9",
+            "status": "terminated",
+            "choices": [{ "votes": 5 }, { "votes": 10 }]
+        }),
+        at,
+    );
+    assert!(matches!(
+        &ended.kind,
+        EventKind::NativePoll { poll_id, counts, ended: true } if poll_id == "tw-poll-9" && counts == &[5, 10]
+    ));
+}
+
+#[tokio::test]
+async fn eventsub_403_missing_proper_authorization_is_classified_as_missing_scope() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = l.accept().await {
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf).await;
+            let body = r#"{"error":"Forbidden","status":403,"message":"subscription missing proper authorization"}"#;
+            let resp = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    let res = http_client().get(format!("http://{addr}/403")).send().await.unwrap();
+    let err = TwitchError::from_response(res).await;
+    assert!(matches!(err, TwitchError::MissingScope(_)), "expected MissingScope, got {err:?}");
+}

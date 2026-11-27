@@ -356,6 +356,26 @@ impl Engine {
                 self.cloud_fell_back(why, system_voice.as_deref());
             }
         }
+        self.speak_local(text, system_voice, notice).await
+    }
+
+    /// Synthesizes `text` with the local computer voice only (never Pro Cloud TTS) and saves
+    /// it to the media library. Returns `(media_id, estimated_duration_ms)`.
+    pub(crate) async fn speak_local_to_media(&self, text: &str) -> (Option<String>, u64) {
+        let system_voice = self.state().tts.voice.clone();
+        self.speak_local_measured(text, system_voice, None).await.map_or((None, 0), |(s, ms)| (Some(s.media_id), ms))
+    }
+
+    async fn speak_local(&self, text: &str, system_voice: Option<String>, notice: Option<String>) -> Option<Spoken> {
+        self.speak_local_measured(text, system_voice, notice).await.map(|(s, _)| s)
+    }
+
+    async fn speak_local_measured(
+        &self,
+        text: &str,
+        system_voice: Option<String>,
+        notice: Option<String>,
+    ) -> Option<(Spoken, u64)> {
         let work = self.store().dir().join("tmp");
         let out = work.join(format!("tts-{}.wav", ferrocast_store::new_id()));
         if let Err(e) = super::synthesize(text, system_voice.as_deref(), &work, &out).await {
@@ -364,15 +384,19 @@ impl Engine {
         }
         let bytes = tokio::fs::read(&out).await.ok()?;
         let _ = tokio::fs::remove_file(&out).await;
+        let duration_ms = wav_duration_ms(&bytes);
         let saved =
             self.db(move |s| Ok(repo::media::save_speech(s, "speech.wav", &bytes).ok())).await.ok().flatten()?;
-        Some(Spoken {
-            url: format!("/api/v1/media/{}", saved.id),
-            media_id: saved.id,
-            voice: system_voice,
-            cloud: false,
-            notice,
-        })
+        Some((
+            Spoken {
+                url: format!("/api/v1/media/{}", saved.id),
+                media_id: saved.id,
+                voice: system_voice,
+                cloud: false,
+                notice,
+            },
+            duration_ms,
+        ))
     }
 
     /// `POST /api/v1/tts/preview {voice?}`: a short sample line in `voice` (default: what
@@ -437,4 +461,8 @@ impl Engine {
         }
         Ok(spoken)
     }
+}
+
+pub(crate) fn wav_duration_ms(bytes: &[u8]) -> u64 {
+    super::parse_wav_duration_ms(bytes).unwrap_or(0).min(60_000)
 }

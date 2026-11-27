@@ -29,6 +29,7 @@ pub const SCOPES: &[&str] = &[
     "channel:moderate",
     "bits:read",
     "channel:manage:broadcast",
+    "channel:manage:polls",
     "channel:read:stream_key",
 ];
 
@@ -50,6 +51,20 @@ pub struct Fake {
     pub markers: Vec<Value>,
     /// Answer the next channel PATCH with 401 "Missing scope" (an old sign-in).
     pub refuse_channel_scope: bool,
+    /// Optional custom payload for `GET /helix/streams` (`data` array contents).
+    pub streams_data: Option<Value>,
+    /// Answer the next `GET /helix/streams` with 429 (`Ratelimit-Reset` far ahead so Helix returns RateLimited).
+    pub fail_next_streams_429: bool,
+    /// Broadcaster tier (`"affiliate"`, `"partner"`, or `""`).
+    pub broadcaster_type: String,
+    /// Refuse `POST /helix/polls` with 401 Missing scope: channel:manage:polls.
+    pub refuse_poll_scope: bool,
+    /// Refuse optional `channel.poll.*` EventSub subscriptions with 403 missing scope.
+    pub refuse_poll_subs: bool,
+    /// Active/created Helix polls in fake storage (`id`, `status`, `choices`, `title`, `duration`).
+    pub native_polls: Vec<Value>,
+    /// Recorded bodies of `POST /helix/polls` and `PATCH /helix/polls`.
+    pub poll_requests: Vec<Value>,
 }
 
 pub type St = Arc<Mutex<Fake>>;
@@ -64,11 +79,13 @@ pub async fn fake() -> (St, (String, String, String)) {
         .route("/helix/users", get(users))
         .route("/helix/channels", get(channels).patch(patch_channel))
         .route("/helix/search/categories", get(search_categories))
+        .route("/helix/streams", get(streams))
         .route("/helix/streams/markers", post(marker))
         .route("/helix/streams/key", get(stream_key))
         .route("/ingests", get(ingests))
         .route("/helix/channels/followers", get(followers))
         .route("/helix/chat/messages", post(chat))
+        .route("/helix/polls", post(create_poll).get(get_poll).patch(patch_poll))
         .route("/helix/eventsub/subscriptions", post(subscribe))
         .route("/helix/moderation/bans", any(ok))
         .route("/helix/chat/settings", any(ok))
@@ -84,6 +101,34 @@ pub async fn fake() -> (St, (String, String, String)) {
 
 async fn stream_key() -> Response {
     axum::Json(json!({ "data": [{ "stream_key": "live_123456_FakeKey" }] })).into_response()
+}
+
+async fn streams(
+    State(st): State<St>,
+    headers: axum::http::HeaderMap,
+    Query(_q): Query<HashMap<String, String>>,
+) -> Response {
+    if !check_auth(&st, &headers) {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "message": "Invalid OAuth token" }))).into_response();
+    }
+    let (fail_429, data) = {
+        let mut s = st.lock().unwrap();
+        let fail = std::mem::take(&mut s.fail_next_streams_429);
+        let data = s.streams_data.clone().unwrap_or_else(|| json!([]));
+        (fail, data)
+    };
+    if fail_429 {
+        let reset = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+            + 300)
+            .to_string();
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("Ratelimit-Reset", reset)],
+            axum::Json(json!({ "status": 429, "message": "Too Many Requests" })),
+        )
+            .into_response();
+    }
+    axum::Json(json!({ "data": data })).into_response()
 }
 
 /// Twitch's ingest list: nearest first; the first one is down, so the second is picked.
@@ -156,8 +201,17 @@ async fn users(
         };
         return axum::Json(json!({ "data": data })).into_response();
     }
-    axum::Json(json!({ "data": [{ "id": "111", "login": "streamer", "display_name": "Streamer", "profile_image_url": "https://x/p.png" }] }))
-        .into_response()
+    let bt = st.lock().unwrap().broadcaster_type.clone();
+    axum::Json(json!({
+        "data": [{
+            "id": "111",
+            "login": "streamer",
+            "display_name": "Streamer",
+            "profile_image_url": "https://x/p.png",
+            "broadcaster_type": bt,
+        }]
+    }))
+    .into_response()
 }
 
 async fn channels(Query(q): Query<HashMap<String, String>>) -> Response {
@@ -223,15 +277,72 @@ async fn chat(State(st): State<St>, axum::Json(body): axum::Json<Value>) -> Resp
 async fn subscribe(State(st): State<St>, axum::Json(body): axum::Json<Value>) -> Response {
     let session = body.pointer("/transport/session_id").and_then(Value::as_str).unwrap_or("").to_string();
     let kind = body["type"].as_str().unwrap_or("").to_string();
-    if kind == "channel.ad_break.begin" {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(json!({ "message": "subscription missing proper authorization: missing scope" })),
-        )
+    if kind == "channel.ad_break.begin" || (st.lock().unwrap().refuse_poll_subs && kind.starts_with("channel.poll.")) {
+        return (StatusCode::FORBIDDEN, axum::Json(json!({ "message": "subscription missing proper authorization" })))
             .into_response();
     }
     st.lock().unwrap().subs.push((session, kind));
     (StatusCode::ACCEPTED, axum::Json(json!({ "data": [] }))).into_response()
+}
+
+async fn create_poll(State(st): State<St>, axum::Json(body): axum::Json<Value>) -> Response {
+    let mut s = st.lock().unwrap();
+    s.poll_requests.push(body.clone());
+    if s.refuse_poll_scope {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "message": "Missing scope: channel:manage:polls" })))
+            .into_response();
+    }
+    if !matches!(s.broadcaster_type.as_str(), "affiliate" | "partner") {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "message": "User must be an affiliate or partner to create polls." })),
+        )
+            .into_response();
+    }
+    let id = format!("tw-poll-{}", s.native_polls.len() + 1);
+    let choices: Vec<Value> = body["choices"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| json!({ "id": format!("c-{}", i + 1), "title": c["title"], "votes": 0 }))
+        .collect();
+    let poll = json!({
+        "id": id,
+        "broadcaster_id": body["broadcaster_id"],
+        "title": body["title"],
+        "choices": choices,
+        "duration": body["duration"],
+        "status": "ACTIVE",
+    });
+    s.native_polls.push(poll.clone());
+    axum::Json(json!({ "data": [poll] })).into_response()
+}
+
+async fn get_poll(State(st): State<St>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let s = st.lock().unwrap();
+    let id = q.get("id").map(String::as_str);
+    let data: Vec<Value> =
+        s.native_polls.iter().filter(|p| id.is_none_or(|want| p["id"].as_str() == Some(want))).cloned().collect();
+    axum::Json(json!({ "data": data })).into_response()
+}
+
+async fn patch_poll(State(st): State<St>, axum::Json(body): axum::Json<Value>) -> Response {
+    let mut s = st.lock().unwrap();
+    s.poll_requests.push(body.clone());
+    if s.refuse_poll_scope {
+        return (StatusCode::UNAUTHORIZED, axum::Json(json!({ "message": "Missing scope: channel:manage:polls" })))
+            .into_response();
+    }
+    let id = body["id"].as_str().unwrap_or("");
+    let status = body["status"].as_str().unwrap_or("TERMINATED");
+    let Some(poll) = s.native_polls.iter_mut().find(|p| p["id"].as_str() == Some(id)) else {
+        return (StatusCode::NOT_FOUND, axum::Json(json!({ "message": "Poll not found" }))).into_response();
+    };
+    poll["status"] = json!(status);
+    let out = poll.clone();
+    axum::Json(json!({ "data": [out] })).into_response()
 }
 
 async fn ok() -> StatusCode {

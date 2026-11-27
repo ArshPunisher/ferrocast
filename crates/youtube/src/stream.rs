@@ -1,9 +1,10 @@
 //! Finding the live chat and holding the `streamList` stream open while live.
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use ferrocast_connector::EventSink;
+use ferrocast_connector::{EventSink, NativePollTally};
 use ferrocast_core::event::{ConnectorStatus, Event, EventKind, Millis, Origin, Platform};
 use tokio::sync::Notify;
 use tonic::Code;
@@ -70,59 +71,74 @@ pub async fn run_with(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: L
     // Connected is said when it starts and again only after a call worked following a failure:
     // never between failed attempts (it flashed green, then red, every time it woke up).
     let mut connected = true;
+    let mut tracked_poll: Option<(String, TrackedPoll)> = None;
     loop {
-        match api.active_live_chat().await {
-            Ok(Some(chat)) => {
-                attempt = 0;
-                if !connected {
-                    emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
-                    connected = true;
-                }
-                *live.write().unwrap_or_else(|p| p.into_inner()) = Some(chat.clone());
-                emit(&sink, EventKind::StreamOnline { title: None }).await;
-                let end = follow(&api, &chat, &sink).await;
-                *live.write().unwrap_or_else(|p| p.into_inner()) = None;
-                match end {
-                    End::ChatEnded => {
-                        emit(&sink, EventKind::StreamOffline).await;
+        match api.active_broadcasts().await {
+            Ok(broadcasts) => {
+                if let Some(chat) = broadcasts.iter().find_map(|b| b.live_chat_id.clone()) {
+                    attempt = 0;
+                    if !connected {
+                        emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
+                        connected = true;
                     }
-                    End::SignInNeeded => {
-                        emit(&sink, EventKind::Connector(ConnectorStatus::SignInNeeded)).await;
-                        return;
+                    if tracked_poll.as_ref().is_some_and(|(c, _)| c != &chat) {
+                        tracked_poll = None;
                     }
-                    End::Quota => {
-                        connected = false;
-                        quota_pause(&sink, waits).await;
+                    let mut session_poll = tracked_poll.take().map(|(_, p)| p);
+                    *live.write().unwrap_or_else(|p| p.into_inner()) = Some(chat.clone());
+                    emit(&sink, EventKind::StreamOnline { title: None }).await;
+                    let end = follow(&api, &chat, &sink, &mut session_poll).await;
+                    *live.write().unwrap_or_else(|p| p.into_inner()) = None;
+                    match end {
+                        End::ChatEnded => {
+                            tracked_poll = None;
+                            api.clear_active_broadcasts();
+                            emit(&sink, EventKind::StreamOffline).await;
+                        }
+                        _ => {
+                            tracked_poll = session_poll.map(|p| (chat, p));
+                            match end {
+                                End::ChatEnded => unreachable!(),
+                                End::SignInNeeded => {
+                                    emit(&sink, EventKind::Connector(ConnectorStatus::SignInNeeded)).await;
+                                    return;
+                                }
+                                End::Quota => {
+                                    connected = false;
+                                    quota_pause(&api, &sink, waits).await;
+                                }
+                                End::RateLimited(asked) => {
+                                    connected = false;
+                                    attempt += 1;
+                                    emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
+                                    tokio::time::sleep(waits.rate.unwrap_or_else(|| rate_backoff(attempt, asked)))
+                                        .await;
+                                }
+                                End::Lost(reason) => {
+                                    connected = false;
+                                    attempt += 1;
+                                    tracing::warn!(%reason, attempt, "YouTube chat stream lost");
+                                    emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
+                                    tokio::time::sleep(backoff(attempt)).await;
+                                }
+                            }
+                        }
                     }
-                    End::RateLimited(asked) => {
-                        connected = false;
-                        attempt += 1;
-                        emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
-                        tokio::time::sleep(waits.rate.unwrap_or_else(|| rate_backoff(attempt, asked))).await;
-                    }
-                    End::Lost(reason) => {
-                        connected = false;
-                        attempt += 1;
-                        tracing::warn!(%reason, attempt, "YouTube chat stream lost");
-                        emit(&sink, EventKind::Connector(ConnectorStatus::Reconnecting { attempt })).await;
-                        tokio::time::sleep(backoff(attempt)).await;
-                    }
-                }
-            }
-            Ok(None) => {
-                if !connected {
-                    emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
-                    connected = true;
-                }
-                let wait = if eager > 0 {
-                    eager -= 1;
-                    EAGER_EVERY
                 } else {
-                    LOOK_EVERY
-                };
-                tokio::select! {
-                    _ = wake.notified() => eager = EAGER_LOOKS,
-                    _ = tokio::time::sleep(wait) => {}
+                    if !connected {
+                        emit(&sink, EventKind::Connector(ConnectorStatus::Connected)).await;
+                        connected = true;
+                    }
+                    let wait = if eager > 0 {
+                        eager -= 1;
+                        EAGER_EVERY
+                    } else {
+                        LOOK_EVERY
+                    };
+                    tokio::select! {
+                        _ = wake.notified() => eager = EAGER_LOOKS,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
                 }
             }
             Err(YoutubeError::SignInNeeded) => {
@@ -131,7 +147,7 @@ pub async fn run_with(api: Arc<Api>, sink: EventSink, wake: Arc<Notify>, live: L
             }
             Err(YoutubeError::QuotaExceeded) => {
                 connected = false;
-                quota_pause(&sink, waits).await;
+                quota_pause(&api, &sink, waits).await;
             }
             Err(YoutubeError::RateLimited(asked)) => {
                 connected = false;
@@ -161,11 +177,13 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The day's units are used up: said, then nothing is asked until they are back (midnight in
 /// Pacific time, and a few minutes of spread), not every hour for nothing.
-async fn quota_pause(sink: &EventSink, waits: Waits) {
+async fn quota_pause(api: &Api, sink: &EventSink, waits: Waits) {
     emit(sink, EventKind::Connector(ConnectorStatus::Disconnected { reason: YoutubeError::QuotaExceeded.to_string() }))
         .await;
     let wait = waits.quota.unwrap_or_else(|| crate::quota_resets_in(now_ms(), crate::quota_jitter_s()));
+    api.note_quota_exceeded(wait);
     tokio::time::sleep(wait).await;
+    api.clear_quota_pause();
 }
 
 /// A gRPC "resource exhausted" is the day's quota when it says so, else a burst.
@@ -204,8 +222,15 @@ async fn channel_with(url: &str, every: Duration, timeout: Duration) -> Result<C
     ep.connect().await.map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone)]
+struct TrackedPoll {
+    id: String,
+    counts: Vec<u64>,
+    seen_in_active_item: bool,
+}
+
 /// Holds the stream, resuming from the last page token after drops, until the chat ends.
-async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
+async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink, active_poll: &mut Option<TrackedPoll>) -> End {
     let mut page_token: Option<String> = None;
     let mut first_batch = true;
     let mut drops = 0u32;
@@ -271,6 +296,7 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                     if let Some(next) = resp.next_page_token.clone().filter(|t| !t.is_empty()) {
                         page_token = Some(next);
                     }
+                    let mut closed_in_items = HashSet::new();
                     for item in &resp.items {
                         if let Some(mut e) = map::map(item, Millis(now_ms())) {
                             // The first answer replays recent chat; it's history, not new
@@ -283,13 +309,117 @@ async fn follow(api: &Arc<Api>, chat: &str, sink: &EventSink) -> End {
                             if first_batch && published.is_none_or(|p| p < opened_at - crate::feed::BACKFILL_SLACK_MS) {
                                 e.origin = Origin::Backfill;
                             }
+                            if let EventKind::NativePoll { poll_id, counts, ended } = &e.kind {
+                                if e.origin == Origin::Backfill {
+                                    let is_tracked = active_poll.as_ref().is_some_and(|p| p.id == *poll_id);
+                                    let is_open_latest = api.latest_poll(poll_id).is_some_and(|p| !p.ended);
+                                    if *ended && (is_tracked || is_open_latest) {
+                                        let recorded = api.record_poll(&NativePollTally {
+                                            external_id: poll_id.clone(),
+                                            counts: counts.clone(),
+                                            ended: true,
+                                        });
+                                        closed_in_items.insert(poll_id.clone());
+                                        if is_tracked {
+                                            *active_poll = None;
+                                        }
+                                        if recorded {
+                                            let mut ev = e.clone();
+                                            ev.origin = Origin::Live;
+                                            if sink.send(ev).await.is_err() {
+                                                return End::Lost("the engine stopped".into());
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                                if !api.record_poll(&NativePollTally {
+                                    external_id: poll_id.clone(),
+                                    counts: counts.clone(),
+                                    ended: *ended,
+                                }) {
+                                    continue;
+                                }
+                                if *ended {
+                                    closed_in_items.insert(poll_id.clone());
+                                    if active_poll.as_ref().is_some_and(|p| p.id == *poll_id) {
+                                        *active_poll = None;
+                                    }
+                                } else {
+                                    let seen_in_active_item =
+                                        active_poll.as_ref().is_some_and(|p| p.id == *poll_id && p.seen_in_active_item);
+                                    *active_poll = Some(TrackedPoll {
+                                        id: poll_id.clone(),
+                                        counts: counts.clone(),
+                                        seen_in_active_item,
+                                    });
+                                }
+                            }
                             if sink.send(e).await.is_err() {
                                 return End::Lost("the engine stopped".into());
                             }
                         }
                     }
+                    if let Some(poll_msg) = &resp.active_poll_item {
+                        if let Some(ev) = map::map(poll_msg, Millis(now_ms())) {
+                            let mut emit_ev = true;
+                            if let EventKind::NativePoll { poll_id, counts, ended } = &ev.kind {
+                                if !api.record_poll(&NativePollTally {
+                                    external_id: poll_id.clone(),
+                                    counts: counts.clone(),
+                                    ended: *ended,
+                                }) {
+                                    emit_ev = false;
+                                } else if *ended {
+                                    *active_poll = None;
+                                } else {
+                                    *active_poll = Some(TrackedPoll {
+                                        id: poll_id.clone(),
+                                        counts: counts.clone(),
+                                        seen_in_active_item: true,
+                                    });
+                                }
+                            }
+                            if emit_ev && sink.send(ev).await.is_err() {
+                                return End::Lost("the engine stopped".into());
+                            }
+                        }
+                    } else if let Some(prev) =
+                        active_poll.take_if(|p| p.seen_in_active_item && !closed_in_items.contains(&p.id))
+                        && api.record_poll(&NativePollTally {
+                            external_id: prev.id.clone(),
+                            counts: prev.counts.clone(),
+                            ended: true,
+                        })
+                    {
+                        let ev = Event::live(
+                            Platform::Youtube,
+                            Some(format!("{}#POLL_EVENT", prev.id)),
+                            Millis(now_ms()),
+                            EventKind::NativePoll { poll_id: prev.id, counts: prev.counts, ended: true },
+                        );
+                        if sink.send(ev).await.is_err() {
+                            return End::Lost("the engine stopped".into());
+                        }
+                    }
                     first_batch = false;
                     if resp.offline_at.as_deref().is_some_and(|s| !s.is_empty()) {
+                        if let Some(prev) = active_poll.take()
+                            && api.record_poll(&NativePollTally {
+                                external_id: prev.id.clone(),
+                                counts: prev.counts.clone(),
+                                ended: true,
+                            })
+                        {
+                            let _ = sink
+                                .send(Event::live(
+                                    Platform::Youtube,
+                                    Some(format!("{}#POLL_EVENT", prev.id)),
+                                    Millis(now_ms()),
+                                    EventKind::NativePoll { poll_id: prev.id, counts: prev.counts, ended: true },
+                                ))
+                                .await;
+                        }
                         return End::ChatEnded;
                     }
                 }

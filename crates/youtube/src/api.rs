@@ -117,6 +117,42 @@ pub struct Api {
     writes: AtomicU64,
     /// How long a read is kept (ms; 0: never, as before).
     read_ttl_ms: i64,
+    /// Broadcast ids reported active by the latest `active_broadcasts` check.
+    active_broadcasts: StdMutex<ActiveBroadcastCache>,
+    /// When daily quota ran out, stop polling viewer counts until this monotonic instant.
+    quota_paused_until: StdMutex<Option<std::time::Instant>>,
+    /// Latest live-chat poll snapshot seen from create, streamList, or transition.
+    latest_poll: StdMutex<Option<ferrocast_connector::NativePollTally>>,
+}
+
+struct ActiveBroadcastCache {
+    ids: Vec<String>,
+    cached_at: Option<std::time::Instant>,
+    no_viewers_rechecked_at: Option<std::time::Instant>,
+    ttl: std::time::Duration,
+}
+
+impl Default for ActiveBroadcastCache {
+    fn default() -> Self {
+        Self { ids: Vec::new(), cached_at: None, no_viewers_rechecked_at: None, ttl: ACTIVE_BROADCAST_TTL }
+    }
+}
+
+impl ActiveBroadcastCache {
+    fn is_fresh(&self, now: std::time::Instant) -> bool {
+        !self.ids.is_empty() && self.cached_at.is_some_and(|t| now.saturating_duration_since(t) < self.ttl)
+    }
+
+    fn can_recheck_no_viewers(&self, now: std::time::Instant) -> bool {
+        self.no_viewers_rechecked_at.is_none_or(|t| now.saturating_duration_since(t) >= self.ttl)
+    }
+}
+
+/// An active YouTube broadcast returned by `liveBroadcasts.list(broadcastStatus=active)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveBroadcast {
+    pub id: String,
+    pub live_chat_id: Option<String>,
 }
 
 /// How long to wait before asking the Keychain again to save a refreshed sign-in it refused.
@@ -137,6 +173,9 @@ const UPCOMING_PAST_MS: i64 = 12 * 3_600_000;
 
 /// Upper bound on pages followed when paginating `liveStreams` / `liveBroadcasts` (50/page).
 const MAX_LIST_PAGES: usize = 20;
+
+/// How long cached active broadcast ids remain trusted before re-querying `liveBroadcasts`.
+const ACTIVE_BROADCAST_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Standard YouTube RTMPS ingest server, used as read-only reachability fallback when the channel
 /// doesn't yet have a usable RTMP stream (e.g. vertical stream not created yet, or HLS-only key).
@@ -174,6 +213,9 @@ impl Api {
             reads: StdMutex::new(HashMap::new()),
             writes: AtomicU64::new(0),
             read_ttl_ms: READ_TTL_MS,
+            active_broadcasts: StdMutex::new(ActiveBroadcastCache::default()),
+            quota_paused_until: StdMutex::new(None),
+            latest_poll: StdMutex::new(None),
         }
     }
 
@@ -366,20 +408,242 @@ impl Api {
         .await
     }
 
+    /// Active broadcasts on the channel (`liveBroadcasts.list?broadcastStatus=active`, 1 unit/page),
+    /// updating the cached active broadcast ids for viewer-count polling.
+    pub async fn active_broadcasts(&self) -> Result<Vec<ActiveBroadcast>, YoutubeError> {
+        let v = self.list_broadcasts("snippet", "active", MAX_LIST_PAGES, true).await?;
+        let mut out = Vec::new();
+        for item in v.get("items").and_then(Value::as_array).into_iter().flatten() {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("")
+                .to_string();
+            let live_chat_id = item
+                .pointer("/snippet/liveChatId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            if id.is_empty() && live_chat_id.is_none() {
+                continue;
+            }
+            out.push(ActiveBroadcast { id, live_chat_id });
+        }
+        let ids: Vec<String> = out.iter().filter(|b| !b.id.is_empty()).map(|b| b.id.clone()).collect();
+        self.set_active_broadcasts(ids);
+        Ok(out)
+    }
+
     /// The live chat of the channel's active broadcast, if it's live now (1 unit/page).
     pub async fn active_live_chat(&self) -> Result<Option<String>, YoutubeError> {
-        let v = self.list_broadcasts("snippet", "active", MAX_LIST_PAGES, true).await?;
-        Ok(v.get("items")
-            .and_then(Value::as_array)
+        Ok(self.active_broadcasts().await?.into_iter().find_map(|b| b.live_chat_id))
+    }
+
+    /// Cached active broadcast ids from the most recent `active_broadcasts` check (empty once expired).
+    pub fn active_broadcast_ids(&self) -> Vec<String> {
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_fresh(std::time::Instant::now()) {
+            guard.ids.clone()
+        } else {
+            guard.ids.clear();
+            guard.cached_at = None;
+            Vec::new()
+        }
+    }
+
+    /// Stores the active broadcast ids (deduplicated, preserving order).
+    pub fn set_active_broadcasts(&self, ids: Vec<String>) {
+        let mut seen = HashSet::new();
+        let deduped: Vec<String> = ids
             .into_iter()
-            .flatten()
-            .find_map(|i| i.pointer("/snippet/liveChatId").and_then(Value::as_str).map(String::from)))
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+            .collect();
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        let same_nonempty = !deduped.is_empty() && guard.ids == deduped && guard.cached_at.is_some();
+        guard.cached_at = (!deduped.is_empty()).then(std::time::Instant::now);
+        if !same_nonempty {
+            guard.no_viewers_rechecked_at = None;
+        }
+        guard.ids = deduped;
+    }
+
+    /// Returns whether a cached missing-viewers poll may perform its once-per-TTL `active_broadcasts` recheck,
+    /// recording the recheck timestamp when allowed.
+    pub fn take_missing_viewers_recheck(&self) -> bool {
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        let now = std::time::Instant::now();
+        if guard.can_recheck_no_viewers(now) {
+            guard.no_viewers_rechecked_at = Some(now);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clears the once-per-TTL missing-viewers recheck marker when live viewers are observed again.
+    pub fn clear_missing_viewers_recheck(&self) {
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        guard.no_viewers_rechecked_at = None;
+    }
+
+    /// Clears cached active broadcast ids when a stream goes offline.
+    pub fn clear_active_broadcasts(&self) {
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        guard.ids.clear();
+        guard.cached_at = None;
+        guard.no_viewers_rechecked_at = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_active_broadcasts_for_test(&self) {
+        let mut guard = self.active_broadcasts.lock().unwrap_or_else(|p| p.into_inner());
+        guard.ttl = std::time::Duration::ZERO;
+    }
+
+    /// Records a daily-quota pause window so non-essential polling skips requests until reset.
+    pub fn note_quota_exceeded(&self, wait: std::time::Duration) {
+        *self.quota_paused_until.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::time::Instant::now() + wait);
+    }
+
+    /// Clears any recorded daily-quota pause after the pause finishes.
+    pub fn clear_quota_pause(&self) {
+        *self.quota_paused_until.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Remaining duration of the active daily-quota pause, if any.
+    pub fn quota_retry_after(&self) -> Option<std::time::Duration> {
+        let mut guard = self.quota_paused_until.lock().unwrap_or_else(|p| p.into_inner());
+        let until = (*guard)?;
+        let now = std::time::Instant::now();
+        if until > now {
+            Some(until.duration_since(now))
+        } else {
+            *guard = None;
+            None
+        }
+    }
+
+    /// Concurrent viewers summed across `broadcast_ids` via `videos.list(part=liveStreamingDetails)`
+    /// (1 quota unit per batch of up to 50 ids). Returns `None` when none of the videos report
+    /// an active `concurrentViewers`.
+    pub async fn concurrent_viewers(&self, broadcast_ids: &[String]) -> Result<Option<u64>, YoutubeError> {
+        let mut seen = HashSet::new();
+        let ids: Vec<&str> =
+            broadcast_ids.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && seen.insert(*s)).collect();
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let mut total: u64 = 0;
+        let mut any = false;
+        for chunk in ids.chunks(50) {
+            let joined = chunk.join(",");
+            let v =
+                self.call(Method::GET, "/videos", &[("part", "liveStreamingDetails"), ("id", &joined)], None).await?;
+            if let Some(count) = parse_concurrent_viewers(&v) {
+                total = total.saturating_add(count);
+                any = true;
+            }
+        }
+        Ok(any.then_some(total))
     }
 
     pub async fn send(&self, live_chat_id: &str, text: &str) -> Result<(), YoutubeError> {
         let body = json!({ "snippet": { "liveChatId": live_chat_id, "type": "textMessageEvent",
                                         "textMessageDetails": { "messageText": text } } });
         self.call(Method::POST, "/liveChat/messages", &[("part", "snippet")], Some(body)).await.map(|_| ())
+    }
+
+    /// Stores the most recent native poll tally observed from REST or `streamList`.
+    /// Returns `false` and ignores the update when an already-ended poll would be overwritten by a
+    /// stale non-ended snapshot for the same poll id.
+    pub fn record_poll(&self, tally: &ferrocast_connector::NativePollTally) -> bool {
+        let mut guard = self.latest_poll.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(prev) = guard.as_ref()
+            && prev.external_id == tally.external_id
+            && prev.ended
+            && !tally.ended
+        {
+            return false;
+        }
+        *guard = Some(tally.clone());
+        true
+    }
+
+    /// Returns the latest cached snapshot for `external_id`, if any.
+    pub fn latest_poll(&self, external_id: &str) -> Option<ferrocast_connector::NativePollTally> {
+        self.latest_poll
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|t| t.external_id == external_id)
+            .cloned()
+    }
+
+    /// Creates a native YouTube live chat poll (`liveChatMessages.insert` with `type: "pollEvent"`).
+    pub async fn create_poll(
+        &self,
+        live_chat_id: &str,
+        question: &str,
+        options: &[String],
+    ) -> Result<ferrocast_connector::NativePollTally, YoutubeError> {
+        let opts: Vec<Value> = options.iter().map(|o| json!({ "optionText": o })).collect();
+        let body = json!({
+            "snippet": {
+                "liveChatId": live_chat_id,
+                "type": "pollEvent",
+                "pollDetails": {
+                    "metadata": {
+                        "questionText": question,
+                        "options": opts,
+                    }
+                }
+            }
+        });
+        let v = self.call(Method::POST, "/liveChat/messages", &[("part", "snippet")], Some(body)).await?;
+        let tally = parse_youtube_poll(&v, options.len(), false)?;
+        self.record_poll(&tally);
+        Ok(tally)
+    }
+
+    /// Closes an active YouTube live chat poll (`liveChatMessages.transition` with `status=closed`).
+    pub async fn close_poll(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<ferrocast_connector::NativePollTally>, YoutubeError> {
+        match self
+            .call(
+                Method::POST,
+                "/liveChat/messages/transition",
+                &[("id", message_id), ("status", "closed"), ("part", "snippet")],
+                None,
+            )
+            .await
+        {
+            Ok(v) => {
+                let mut tally = parse_youtube_poll(&v, 0, true)?;
+                if tally.counts.is_empty()
+                    && let Some(prev) = self.latest_poll(message_id)
+                    && !prev.counts.is_empty()
+                {
+                    tally.counts = prev.counts;
+                }
+                self.record_poll(&tally);
+                Ok(Some(tally))
+            }
+            Err(YoutubeError::Refused(m)) => {
+                if let Some(existing) = self.latest_poll(message_id)
+                    && existing.ended
+                {
+                    return Ok(Some(existing));
+                }
+                Err(YoutubeError::Refused(m))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn delete(&self, message_id: &str) -> Result<(), YoutubeError> {
@@ -428,6 +692,47 @@ pub const VIDEO_CATEGORIES: &[(&str, &str)] = &[
 
 /// YouTube's title limit (Twitch allows 140).
 pub const MAX_TITLE_CHARS: usize = 100;
+
+/// Native YouTube live chat poll constraints (`liveChatMessages.insert` `pollEvent`).
+pub const YOUTUBE_POLL_LIMITS: ferrocast_core::poll::PollLimits = ferrocast_core::poll::PollLimits {
+    min_options: 2,
+    max_options: 4,
+    min_duration_s: 10,
+    max_duration_s: 1800,
+    supports_no_timer: true,
+    question_chars: 100,
+    option_chars: 35,
+};
+
+fn parse_youtube_poll(
+    v: &Value,
+    expected_options: usize,
+    force_ended: bool,
+) -> Result<ferrocast_connector::NativePollTally, YoutubeError> {
+    let external_id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| YoutubeError::Protocol("no poll id returned".into()))?
+        .to_string();
+    let counts = match v.pointer("/snippet/pollDetails/metadata/options").and_then(Value::as_array) {
+        Some(opts) => opts
+            .iter()
+            .map(|o| match o.get("tally") {
+                Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
+                Some(Value::String(s)) => s.trim().parse::<u64>().unwrap_or(0),
+                _ => 0,
+            })
+            .collect(),
+        None => vec![0; expected_options],
+    };
+    let ended = force_ended
+        || v.pointer("/snippet/pollDetails/status")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("closed"));
+    Ok(ferrocast_connector::NativePollTally { external_id, counts, ended })
+}
 
 impl Api {
     /// The channel's eligible normal broadcast (active first, else an upcoming one within the
@@ -1865,6 +2170,34 @@ fn usable(s: &Value) -> Option<ferrocast_connector::Ingest> {
         backup,
         note: None,
     })
+}
+
+/// Parses active `concurrentViewers` from a YouTube `videos.list(part=liveStreamingDetails)` response.
+/// Ignores items that already have a non-empty `actualEndTime` and sums active items so simultaneous
+/// horizontal + Shorts broadcasts count together.
+pub fn parse_concurrent_viewers(v: &Value) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut any = false;
+    for item in v.get("items").and_then(Value::as_array).into_iter().flatten() {
+        let ended = item
+            .pointer("/liveStreamingDetails/actualEndTime")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        if ended {
+            continue;
+        }
+        let raw = item.pointer("/liveStreamingDetails/concurrentViewers");
+        let parsed = match raw {
+            Some(Value::Number(n)) => n.as_u64(),
+            Some(Value::String(s)) => s.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        if let Some(n) = parsed {
+            total = total.saturating_add(n);
+            any = true;
+        }
+    }
+    any.then_some(total)
 }
 
 #[cfg(test)]

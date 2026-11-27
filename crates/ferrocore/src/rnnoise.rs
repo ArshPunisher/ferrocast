@@ -34,14 +34,15 @@ impl Chan {
         Self { state: DenoiseState::new(), collect: [0.0; FRAME_SIZE], out: [0.0; FRAME_SIZE] }
     }
 
-    /// The collected frame is full: clean it, mixed with itself by `a0` to `a1` (wet, 0 to 1).
-    fn run_frame(&mut self, a0: f32, a1: f32) {
+    /// The collected frame is full: clean it, mixed with itself by `a0` to `a1` (wet, 0 to 1),
+    /// returning `nnnoiseless`'s voice-activity probability (`0.0..=1.0`).
+    fn run_frame(&mut self, a0: f32, a1: f32) -> f32 {
         let mut inp = [0.0f32; FRAME_SIZE];
         let mut wet = [0.0f32; FRAME_SIZE];
         for (d, s) in inp.iter_mut().zip(&self.collect) {
             *d = if s.is_finite() { soft_limit(*s) * I16_SCALE } else { 0.0 };
         }
-        self.state.process_frame(&mut wet, &inp);
+        let vad = self.state.process_frame(&mut wet, &inp);
         for (k, ((o, w), d)) in self.out.iter_mut().zip(&wet).zip(&self.collect).enumerate() {
             let a = a0 + (a1 - a0) * ((k + 1) as f32 / FRAME_SIZE as f32);
             let w = w / I16_SCALE;
@@ -49,6 +50,7 @@ impl Chan {
             let dry = if d.is_finite() { *d } else { 0.0 };
             *o = dry + (w - dry) * a;
         }
+        if vad.is_finite() { vad.clamp(0.0, 1.0) } else { 0.0 }
     }
 }
 
@@ -64,11 +66,17 @@ pub struct Rnnoise {
     /// that to the cleaned one (the model's first frame back is let go: its old history makes it
     /// unlike the next). Never a gap and never a step.
     fresh: u8,
+    /// Highest voice-activity probability (`0.0..=1.0`) seen in the last processed block.
+    last_vad: f32,
 }
 
 impl std::fmt::Debug for Rnnoise {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Rnnoise").field("pos", &self.pos).field("amount", &self.amount).finish_non_exhaustive()
+        f.debug_struct("Rnnoise")
+            .field("pos", &self.pos)
+            .field("amount", &self.amount)
+            .field("last_vad", &self.last_vad)
+            .finish_non_exhaustive()
     }
 }
 
@@ -84,7 +92,7 @@ impl Rnnoise {
     #[must_use]
     pub fn new(amount: u32) -> Self {
         let a = wet_share(amount);
-        Self { ch: [Chan::new(), Chan::new()], pos: 0, amount: a, target: a, fresh: 0 }
+        Self { ch: [Chan::new(), Chan::new()], pos: 0, amount: a, target: a, fresh: 0, last_vad: 0.0 }
     }
 }
 
@@ -92,6 +100,8 @@ impl SoundPlugin for Rnnoise {
     fn process(&mut self, ch: [&mut [f32]; 2]) -> bool {
         let [l, r] = ch;
         let n = l.len().min(r.len());
+        let mut saw_frame = false;
+        let mut block_vad = 0.0f32;
         for i in 0..n {
             let p = self.pos;
             // What goes out is the previous frame's result at this place: a fixed 480 delay.
@@ -115,8 +125,11 @@ impl SoundPlugin for Rnnoise {
             if self.pos == FRAME_SIZE {
                 self.pos = 0;
                 let (a0, a1) = (self.amount, self.target);
-                self.ch[0].run_frame(a0, a1);
-                self.ch[1].run_frame(a0, a1);
+                let v0 = self.ch[0].run_frame(a0, a1);
+                let v1 = self.ch[1].run_frame(a0, a1);
+                let frame_vad = v0.max(v1);
+                block_vad = if saw_frame { block_vad.max(frame_vad) } else { frame_vad };
+                saw_frame = true;
                 // The first frame back plays dry (a frame late); the next goes from dry to
                 // cleaned over the frame.
                 if self.fresh > 1 {
@@ -132,7 +145,14 @@ impl SoundPlugin for Rnnoise {
                 self.amount = a1;
             }
         }
+        if saw_frame {
+            self.last_vad = block_vad;
+        }
         true
+    }
+
+    fn vad_prob(&self) -> Option<f32> {
+        Some(self.last_vad)
     }
 
     fn latency_frames(&self) -> usize {
@@ -148,6 +168,7 @@ impl SoundPlugin for Rnnoise {
         }
         self.pos = 0;
         self.fresh = 3;
+        self.last_vad = 0.0;
     }
 
     fn retune(&mut self, effect: &AudioEffect) -> bool {
@@ -224,5 +245,80 @@ mod tests {
             let quiet = longest_quiet(&after, settled * 0.03);
             assert!(quiet <= 96, "amount {amount}: {quiet} near-silent samples in a row after re-enabling");
         }
+    }
+
+    #[test]
+    fn vad_prob_separates_noise_and_silence_from_quiet_speech() {
+        use crate::afx::db_to_mul;
+
+        let make_rnn = || {
+            let mut f = AudioFilter::new_without_plugin(AudioEffect::Rnnoise { amount: 100 }, 48_000);
+            f.install_plugin(AudioFilter::build_plugin(AudioEffect::Rnnoise { amount: 100 }, 48_000).unwrap());
+            f
+        };
+
+        // 1. Digital silence stays at 0.0.
+        let mut f = make_rnn();
+        let mut l = vec![0.0f32; 1024];
+        let mut r = vec![0.0f32; 1024];
+        for _ in 0..20 {
+            l.fill(0.0);
+            r.fill(0.0);
+            f.process([&mut l, &mut r]);
+        }
+        assert!(f.voice_prob().unwrap() < 0.1, "silence vad: {:?}", f.voice_prob());
+
+        // 2. White & pink broadband room noise at -40 dBFS keeps low VAD probability (< 0.5).
+        let mut seed = 42u32;
+        let mut b0 = 0.0f32;
+        let mut b1 = 0.0f32;
+        let mut b2 = 0.0f32;
+        let scale_noise = db_to_mul(-40.0);
+        let mut f_noise = make_rnn();
+        let mut max_noise_vad = 0.0f32;
+        for blk in 0..100 {
+            let mut nl = vec![0.0f32; 1024];
+            for s in &mut nl {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let white = ((seed >> 8) as f32 / 8_388_608.0) - 1.0;
+                b0 = 0.997 * b0 + white * 0.029;
+                b1 = 0.985 * b1 + white * 0.032;
+                b2 = 0.950 * b2 + white * 0.048;
+                *s = (b0 + b1 + b2 + white * 0.184) * scale_noise;
+            }
+            let mut nr = nl.clone();
+            f_noise.process([&mut nl, &mut nr]);
+            if blk >= 20 {
+                max_noise_vad = max_noise_vad.max(f_noise.voice_prob().unwrap());
+            }
+        }
+        assert!(max_noise_vad < 0.5, "pink room noise triggered VAD: {max_noise_vad}");
+
+        // 3. Quiet voiced speech (-36 dBFS peak, harmonic vowel with 4 Hz syllables) raises VAD >= 0.65.
+        let mut f_speech = make_rnn();
+        let mut max_speech_vad = 0.0f32;
+        let amp = db_to_mul(-36.0) / 1.8;
+        let mut sample_idx = 0usize;
+        for blk in 0..100 {
+            let mut sl = Vec::with_capacity(1024);
+            for _ in 0..1024 {
+                let t = sample_idx as f32 / 48_000.0;
+                sample_idx += 1;
+                let env = 0.35 + 0.65 * (2.0 * std::f32::consts::PI * 4.0 * t).sin().max(0.0);
+                let voice: f32 =
+                    (1..=10).map(|h| (2.0 * std::f32::consts::PI * 145.0 * h as f32 * t).sin() / h as f32).sum();
+                sl.push(voice * amp * env);
+            }
+            let mut sr = sl.clone();
+            f_speech.process([&mut sl, &mut sr]);
+            if blk >= 15 {
+                max_speech_vad = max_speech_vad.max(f_speech.voice_prob().unwrap());
+            }
+        }
+        assert!(max_speech_vad >= 0.65, "quiet speech VAD too low: {max_speech_vad}");
+
+        // 4. Bypassing returns None, and re-enabling after reset clears stale VAD before new audio.
+        f_speech.set_enabled(false);
+        assert_eq!(f_speech.voice_prob(), None);
     }
 }

@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Endpoints, TwitchError, now_ms};
 
+pub const POLL_MANAGE_SCOPE: &str = "channel:manage:polls";
+
 /// Every scope Ferrocast needs this year, asked for at the first sign-in so streamers aren't
 /// sent back to Twitch for each new feature (R-22).
 pub const SCOPES: &[&str] = &[
@@ -26,6 +28,8 @@ pub const SCOPES: &[&str] = &[
     "bits:read",
     // The stream-info editor and stream markers (Modify Channel Information).
     "channel:manage:broadcast",
+    // Native Twitch polls on Affiliate/Partner channels; pre-3.8.0 tokens fall back to chat.
+    POLL_MANAGE_SCOPE,
     // Go live everywhere: the stream key, fetched so it's never pasted.
     "channel:read:stream_key",
 ];
