@@ -121,6 +121,7 @@ pub(crate) fn api() -> Router<AppState> {
         .route("/loyalty/viewers/{platform}/{user_id}/adjust", post(loyalty::adjust))
         // polls
         .route("/polls", post(polls::start))
+        .route("/polls/capabilities", get(polls::capabilities))
         .route("/polls/current", get(polls::current).delete(polls::clear))
         .route("/polls/current/end", post(polls::end))
         // giveaways

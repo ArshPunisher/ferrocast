@@ -162,6 +162,7 @@ struct Inner {
     activity: Mutex<ferrocast_core::loyalty::Activity>,
     points_cooldown: Mutex<loyalty::PointsCooldowns>,
     poll: Mutex<polls::PollSlot>,
+    poll_op: tokio::sync::Mutex<()>,
     giveaway: tokio::sync::Mutex<giveaways::GiveawaySlot>,
     highlight: Mutex<widgets::HighlightSlot>,
     /// When the last welcome went out (they're spaced out during raids).
@@ -360,6 +361,7 @@ impl Engine {
                 activity: Mutex::new(Default::default()),
                 points_cooldown: Mutex::new(Default::default()),
                 poll: Mutex::new(Default::default()),
+                poll_op: tokio::sync::Mutex::new(()),
                 giveaway: tokio::sync::Mutex::new(Default::default()),
                 highlight: Mutex::new(Default::default()),
                 last_welcome: Mutex::new(None),

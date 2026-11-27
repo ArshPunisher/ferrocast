@@ -1270,6 +1270,235 @@
         ],
         "type": "object"
       },
+      "PlatformPollCapability": {
+        "properties": {
+          "limits": {
+            "$ref": "#/components/schemas/PollLimits"
+          },
+          "mode": {
+            "enum": [
+              "native",
+              "chat_fallback",
+              "reconnect_needed"
+            ],
+            "type": "string"
+          },
+          "platform": {
+            "enum": [
+              "twitch",
+              "youtube",
+              "kick"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "platform",
+          "mode",
+          "limits"
+        ],
+        "type": "object"
+      },
+      "PlatformPollStatus": {
+        "properties": {
+          "external_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "enum": [
+              "native",
+              "chat"
+            ],
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "platform": {
+            "enum": [
+              "twitch",
+              "youtube",
+              "kick"
+            ],
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "ended",
+              "failed_fallback"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "platform",
+          "mode",
+          "state"
+        ],
+        "type": "object"
+      },
+      "PollLimits": {
+        "properties": {
+          "max_duration_s": {
+            "type": "integer"
+          },
+          "max_options": {
+            "type": "integer"
+          },
+          "min_duration_s": {
+            "type": "integer"
+          },
+          "min_options": {
+            "type": "integer"
+          },
+          "option_chars": {
+            "type": "integer"
+          },
+          "question_chars": {
+            "type": "integer"
+          },
+          "supports_no_timer": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "min_options",
+          "max_options",
+          "min_duration_s",
+          "max_duration_s",
+          "supports_no_timer",
+          "question_chars",
+          "option_chars"
+        ],
+        "type": "object"
+      },
+      "PollSpec": {
+        "properties": {
+          "chat_fallback": {
+            "default": true,
+            "type": "boolean"
+          },
+          "duration_s": {
+            "description": "Duration in seconds (10..1800), or null for an untimed poll.",
+            "maximum": 1800,
+            "minimum": 10,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5,
+            "minItems": 2,
+            "type": "array"
+          },
+          "question": {
+            "maxLength": 140,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "options"
+        ],
+        "type": "object"
+      },
+      "PollView": {
+        "properties": {
+          "closed": {
+            "type": "boolean"
+          },
+          "ends_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "leaders": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "options": {
+            "items": {
+              "properties": {
+                "text": {
+                  "type": "string"
+                },
+                "votes": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "text",
+                "votes"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "platforms": {
+            "items": {
+              "$ref": "#/components/schemas/PlatformPollStatus"
+            },
+            "type": "array"
+          },
+          "question": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "integer"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "question",
+          "options",
+          "total",
+          "started_at",
+          "closed",
+          "leaders"
+        ],
+        "type": "object"
+      },
+      "PollsCapabilities": {
+        "properties": {
+          "platforms": {
+            "items": {
+              "$ref": "#/components/schemas/PlatformPollCapability"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "platforms"
+        ],
+        "type": "object"
+      },
       "ResolvedLinks": {
         "properties": {
           "channel_name": {
@@ -16437,20 +16666,18 @@
           "content": {
             "application/json": {
               "schema": {
-                "type": "object"
+                "$ref": "#/components/schemas/PollSpec"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/PollView"
                 }
               }
             },
@@ -16492,11 +16719,71 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Start a live chat poll.",
+        "summary": "Start a live chat or native platform poll.",
         "tags": [
           "Bot & Widgets"
         ],
         "x-ferrocast-scopes": [
+          "chat"
+        ]
+      }
+    },
+    "/api/v1/polls/capabilities": {
+      "get": {
+        "operationId": "get_polls_capabilities",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PollsCapabilities"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Missing, invalid, revoked, or expired credentials."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Insufficient API key scope, forbidden origin, or PC-only endpoint."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            },
+            "description": "Per-key rate limit exceeded (see Retry-After header)."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Per-platform native poll capabilities and limits.",
+        "tags": [
+          "Bot & Widgets"
+        ],
+        "x-ferrocast-scopes": [
+          "read_only",
           "chat"
         ]
       }
@@ -16631,10 +16918,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": [
-                    "object",
-                    "array"
-                  ]
+                  "$ref": "#/components/schemas/PollView"
                 }
               }
             },

@@ -4,13 +4,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use ferrocast_connector::{Connector, ConnectorError};
+use ferrocast_connector::{Connector, ConnectorError, NativePollSpec, NativePollTally};
 use ferrocast_core::command::{Access, Command, Timer};
 use ferrocast_core::event::*;
 use ferrocast_core::goal::{Goal, GoalKind};
 use ferrocast_core::loyalty::MAX_ADJUST;
 use ferrocast_core::moderation::{Capabilities, ModeChange};
 use ferrocast_core::money::Money;
+use ferrocast_core::poll::{
+    DEFAULT_LIMITS, PlatformPollCapability, PlatformPollMode, PlatformPollState, PollCapabilityMode, PollLimits,
+};
 use ferrocast_core::queue::AckPhase;
 use serde_json::Value;
 
@@ -21,6 +24,9 @@ struct FakePlatform {
     platform: Option<Platform>,
     log: Mutex<Vec<String>>,
     fail_bans: bool,
+    poll_capability: Option<PlatformPollCapability>,
+    fail_native_poll: bool,
+    native_ended_tally: Option<Vec<u64>>,
 }
 
 impl FakePlatform {
@@ -73,6 +79,34 @@ impl Connector for FakePlatform {
     async fn last_game(&self, login: &str) -> ferrocast_connector::Result<Option<String>> {
         self.push(format!("lookup {login}"))?;
         Ok((login == "friend").then(|| "Hades II".to_string()))
+    }
+    async fn poll_capability(&self) -> Option<PlatformPollCapability> {
+        self.poll_capability.clone()
+    }
+    async fn create_native_poll(&self, spec: &NativePollSpec) -> ferrocast_connector::Result<NativePollTally> {
+        if self.fail_native_poll {
+            let _ = self.push(format!("native_poll_fail {}", spec.question));
+            return Err(ConnectorError::Refused { platform: self.platform(), message: "poll refused".into() });
+        }
+        self.push(format!(
+            "native_poll_start {} opts={} dur={:?}",
+            spec.question,
+            spec.options.len(),
+            spec.duration_s
+        ))?;
+        Ok(NativePollTally {
+            external_id: format!("ext-{}", self.platform()).to_lowercase(),
+            counts: vec![0; spec.options.len()],
+            ended: false,
+        })
+    }
+    async fn end_native_poll(&self, external_id: &str) -> ferrocast_connector::Result<Option<NativePollTally>> {
+        self.push(format!("native_poll_end {external_id}"))?;
+        Ok(self.native_ended_tally.clone().map(|counts| NativePollTally {
+            external_id: external_id.to_string(),
+            counts,
+            ended: true,
+        }))
     }
 }
 
@@ -1287,6 +1321,220 @@ async fn a_poll_without_any_chat_connected_says_so() {
         }
     }
     assert!(notice.unwrap().contains("No chat is connected"));
+}
+
+fn native_twitch_cap() -> PlatformPollCapability {
+    PlatformPollCapability {
+        platform: Platform::Twitch,
+        mode: PollCapabilityMode::Native,
+        reason: None,
+        limits: PollLimits {
+            min_options: 2,
+            max_options: 5,
+            min_duration_s: 15,
+            max_duration_s: 1800,
+            supports_no_timer: true,
+            question_chars: 60,
+            option_chars: 25,
+        },
+    }
+}
+
+#[tokio::test]
+async fn poll_capabilities_reports_native_and_chat_fallback_platforms() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        ..Default::default()
+    });
+    let yt = Arc::new(FakePlatform {
+        platform: Some(Platform::Youtube),
+        poll_capability: Some(PlatformPollCapability {
+            platform: Platform::Youtube,
+            mode: PollCapabilityMode::ChatFallback,
+            reason: Some("not_live".into()),
+            limits: PollLimits {
+                min_options: 2,
+                max_options: 4,
+                min_duration_s: 10,
+                max_duration_s: 1800,
+                supports_no_timer: true,
+                question_chars: 100,
+                option_chars: 35,
+            },
+        }),
+        ..Default::default()
+    });
+    let kick = FakePlatform::new(Platform::Kick);
+    e.register_connector(tw);
+    e.register_connector(yt);
+    e.register_connector(kick);
+
+    let caps = e.poll_capabilities().await;
+    assert_eq!(caps.platforms.len(), 3);
+    assert_eq!(caps.platforms[0].platform, Platform::Twitch);
+    assert_eq!(caps.platforms[0].mode, PollCapabilityMode::Native);
+    assert_eq!(caps.platforms[1].platform, Platform::Youtube);
+    assert_eq!(caps.platforms[1].mode, PollCapabilityMode::ChatFallback);
+    assert_eq!(caps.platforms[1].reason.as_deref(), Some("not_live"));
+    assert_eq!(caps.platforms[2].platform, Platform::Kick);
+    assert_eq!(caps.platforms[2].mode, PollCapabilityMode::ChatFallback);
+    assert_eq!(caps.platforms[2].reason.as_deref(), Some("platform_unsupported"));
+    assert_eq!(caps.platforms[2].limits, DEFAULT_LIMITS);
+}
+
+#[tokio::test]
+async fn mixed_native_and_chat_poll_isolates_vote_routing_and_merges_tallies() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        ..Default::default()
+    });
+    let kick = FakePlatform::new(Platform::Kick);
+    e.register_connector(tw.clone());
+    e.register_connector(kick.clone());
+
+    let p = e.start_poll(poll_spec(&["Ascent", "Bind"])).await.unwrap();
+    assert_eq!(p.platforms.len(), 2);
+    assert_eq!(p.platforms[0].mode, PlatformPollMode::Native);
+    assert_eq!(p.platforms[0].external_id.as_deref(), Some("ext-twitch"));
+    assert_eq!(p.platforms[1].mode, PlatformPollMode::Chat);
+
+    // Kick gets the !vote announcement; Twitch runs natively and stays silent in chat.
+    eventually(|| kick.log().iter().any(|l| l.starts_with("say Poll: Which map next?"))).await;
+    assert!(tw.log().iter().any(|l| l == "native_poll_start Which map next? opts=2 dur=Some(60)"));
+    assert!(!tw.log().iter().any(|l| l.starts_with("say ")));
+
+    // Twitch !vote is ignored while Twitch runs natively; Kick !vote counts.
+    e.ingest(chat(Platform::Twitch, "tw-v1", "viewer1", "!vote 1")).await;
+    e.ingest(chat(Platform::Kick, "kk-v1", "viewer2", "!vote 2")).await;
+    assert_eq!(e.poll().unwrap().options.iter().map(|o| o.votes).collect::<Vec<_>>(), vec![0, 1]);
+
+    // Native tally updates from Twitch EventSub add onto Kick's !vote counts and aren't stored in DB.
+    let stored_before = repo::events::recent(&e.store(), None, 50, &[]).unwrap().len();
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("ev-np-1".into()),
+        Millis(0),
+        EventKind::NativePoll { poll_id: "ext-twitch".into(), counts: vec![3, 1], ended: false },
+    ))
+    .await;
+    assert_eq!(repo::events::recent(&e.store(), None, 50, &[]).unwrap().len(), stored_before);
+    let view = e.poll().unwrap();
+    assert_eq!(view.options.iter().map(|o| o.votes).collect::<Vec<_>>(), vec![3, 2]);
+    assert_eq!(view.total, 5);
+    assert_eq!(view.leaders, vec![0]);
+
+    // End terminates Twitch natively and announces result only on Kick.
+    let ended = e.end_poll().await.unwrap();
+    assert!(ended.closed);
+    eventually(|| tw.log().iter().any(|l| l == "native_poll_end ext-twitch")).await;
+    eventually(|| kick.log().iter().any(|l| l.starts_with("say Poll closed: Which map next? Winner: Ascent"))).await;
+    assert!(!tw.log().iter().any(|l| l.starts_with("say Poll closed:")));
+}
+
+#[tokio::test]
+async fn native_poll_failure_falls_back_to_chat_or_errors_when_disabled() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        fail_native_poll: true,
+        ..Default::default()
+    });
+    e.register_connector(tw.clone());
+
+    let mut no_fb = poll_spec(&["Yes", "No"]);
+    no_fb.chat_fallback = false;
+    assert!(matches!(e.start_poll(no_fb).await, Err(EngineError::Invalid(_))));
+    assert!(e.poll().is_none());
+
+    let with_fb = e.start_poll(poll_spec(&["Yes", "No"])).await.unwrap();
+    assert_eq!(with_fb.platforms.len(), 1);
+    assert_eq!(with_fb.platforms[0].mode, PlatformPollMode::Chat);
+    assert_eq!(with_fb.platforms[0].state, PlatformPollState::FailedFallback);
+    eventually(|| tw.log().iter().any(|l| l.starts_with("say Poll: Which map next?"))).await;
+
+    e.ingest(chat(Platform::Twitch, "tw-fb-1", "ana", "!vote 1")).await;
+    assert_eq!(e.poll().unwrap().total, 1);
+}
+
+#[tokio::test]
+async fn native_poll_exceeding_limits_falls_back_without_truncation() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        ..Default::default()
+    });
+    e.register_connector(tw.clone());
+
+    let long_q = "Long question text exceeding sixty characters cleanly for fallback";
+    let p = e
+        .start_poll(ferrocast_core::poll::PollSpec {
+            question: long_q.into(),
+            options: vec!["Alpha".into(), "Beta".into()],
+            duration_s: Some(60),
+            chat_fallback: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(p.question, long_q);
+    assert_eq!(p.platforms[0].mode, PlatformPollMode::Chat);
+    assert_eq!(p.platforms[0].state, PlatformPollState::FailedFallback);
+    assert_eq!(p.platforms[0].note.as_deref(), Some("text_too_long_for_native"));
+    eventually(|| tw.log().iter().any(|l| l.contains(long_q))).await;
+    assert!(!tw.log().iter().any(|l| l.starts_with("native_poll_start")));
+}
+
+#[tokio::test]
+async fn untimed_poll_lives_until_end_or_external_native_end_and_clear_cancels_native() {
+    let (e, _d) = engine().await;
+    let tw = Arc::new(FakePlatform {
+        platform: Some(Platform::Twitch),
+        poll_capability: Some(native_twitch_cap()),
+        ..Default::default()
+    });
+    e.register_connector(tw.clone());
+
+    let untimed = e
+        .start_poll(ferrocast_core::poll::PollSpec {
+            question: "Wait for boss?".into(),
+            options: vec!["Stay".into(), "Reset".into()],
+            duration_s: None,
+            chat_fallback: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(untimed.ends_at, None);
+    assert!(tw.log().iter().any(|l| l == "native_poll_start Wait for boss? opts=2 dur=None"));
+
+    // Clearing an active native poll ends it on the platform cleanly.
+    e.clear_poll().unwrap();
+    eventually(|| tw.log().iter().any(|l| l == "native_poll_end ext-twitch")).await;
+
+    // External native poll end auto-closes a native-only poll without needing clicking End.
+    e.start_poll(ferrocast_core::poll::PollSpec {
+        question: "Round 2?".into(),
+        options: vec!["Left".into(), "Right".into()],
+        duration_s: None,
+        chat_fallback: false,
+    })
+    .await
+    .unwrap();
+    e.ingest(Event::live(
+        Platform::Twitch,
+        Some("ev-np-end".into()),
+        Millis(0),
+        EventKind::NativePoll { poll_id: "ext-twitch".into(), counts: vec![2, 5], ended: true },
+    ))
+    .await;
+    eventually(|| e.poll().is_some_and(|p| p.closed && p.total == 7)).await;
+    let final_view = e.poll().unwrap();
+    assert_eq!(final_view.options.iter().map(|o| o.votes).collect::<Vec<_>>(), vec![2, 5]);
+    assert_eq!(final_view.leaders, vec![1]);
 }
 
 // ---------------------------------------------------------------- giveaways

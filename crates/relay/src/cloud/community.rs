@@ -19,10 +19,10 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use ferrocast_core::event::{Event, EventKind, Millis, Origin};
+use ferrocast_core::event::{Event, EventKind, Millis, Origin, Platform};
 use ferrocast_core::giveaway::{Giveaway, GiveawaySpec};
 use ferrocast_core::overlay::WidgetKind;
-use ferrocast_core::poll::{self, Poll, PollSpec};
+use ferrocast_core::poll::{self, PlatformPollCapability, Poll, PollCapabilityMode, PollSpec, PollsCapabilities};
 use serde_json::{Value, json};
 
 use super::bus::{Audience, Bus, platform_key};
@@ -35,6 +35,7 @@ const FLUSH: Duration = Duration::from_millis(250);
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/c/api/v1/polls", post(start_poll))
+        .route("/c/api/v1/polls/capabilities", get(poll_capabilities))
         .route("/c/api/v1/polls/current", get(current_poll).delete(clear_poll))
         .route("/c/api/v1/polls/current/end", post(end_poll))
         .route("/c/api/v1/giveaways", post(start_giveaway))
@@ -146,6 +147,28 @@ pub(crate) fn on_event(_st: &AppState, bus: &Arc<Bus>, ev: &Event) {
 }
 
 // ── Polls ────────────────────────────────────────────────────────────────────────────
+
+/// `GET /c/api/v1/polls/capabilities` → `PollsCapabilities` (cloud mode runs `!vote` in chat).
+async fn poll_capabilities(
+    State(st): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let a = web_account(&st, &headers, &method, true)?;
+    let status = super::web::status_json(&st, &a.account.id)?;
+    let mut platforms = Vec::new();
+    for (key, platform) in [("twitch", Platform::Twitch), ("youtube", Platform::Youtube), ("kick", Platform::Kick)] {
+        if status["connectors"][key]["state"].as_str() == Some("connected") {
+            platforms.push(PlatformPollCapability {
+                platform,
+                mode: PollCapabilityMode::ChatFallback,
+                reason: Some("platform_unsupported".into()),
+                limits: poll::DEFAULT_LIMITS,
+            });
+        }
+    }
+    Ok(json(json!(PollsCapabilities { platforms })))
+}
 
 /// `GET /c/api/v1/polls/current` → `PollView | null`.
 async fn current_poll(State(st): State<AppState>, method: Method, headers: HeaderMap) -> Result<Response, ApiError> {

@@ -16,6 +16,11 @@ pub async fn current(State(app): State<AppState>) -> Json<Value> {
     Json(json!(app.engine.poll()))
 }
 
+/// Per-platform native vs `!vote` poll capabilities and limits for connected chat platforms.
+pub async fn capabilities(State(app): State<AppState>) -> Json<Value> {
+    Json(json!(app.engine.poll_capabilities().await))
+}
+
 /// `{ question, options: string[2..5], duration_s: 10..1800 | null, chat_fallback?: bool }`. Read by
 /// hand so every wrong type gets a message that names its field.
 pub async fn start(State(app): State<AppState>, Body(b): Body<Value>) -> ApiResult<impl IntoResponse> {

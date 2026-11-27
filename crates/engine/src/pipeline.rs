@@ -54,7 +54,7 @@ impl Engine {
             e.source_id = Some(format!("{id}#{}", tip_status_key(*status)));
         }
 
-        if e.origin != Origin::Test && !matches!(e.kind, EventKind::ViewerCount { .. }) {
+        if e.origin != Origin::Test && !matches!(e.kind, EventKind::ViewerCount { .. } | EventKind::NativePoll { .. }) {
             let first = self.inner.dedupe.lock().unwrap_or_else(|p| p.into_inner()).first_time(&e, at);
             if !first {
                 tracing::debug!(platform = %e.platform, source = ?e.source_id, "duplicate dropped");
@@ -110,6 +110,10 @@ impl Engine {
                 self.send_live(LiveFrame::new("event", &e));
                 self.history_saw(&e, None);
                 self.discord_saw(&e);
+                return;
+            }
+            EventKind::NativePoll { poll_id, counts, ended } => {
+                self.on_native_poll_event(e.platform, poll_id, counts, *ended).await;
                 return;
             }
             _ => {}

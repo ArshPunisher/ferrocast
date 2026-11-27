@@ -44,6 +44,10 @@ async fn a_chat_poll_counts_one_vote_per_person_and_closes_once() {
     w.bind_channels(&u);
     let (_, none) = w.web(&u, Method::GET, "/c/api/v1/polls/current", None).await;
     assert_eq!(none, Value::Null);
+    let (s, caps) = w.web(&u, Method::GET, "/c/api/v1/polls/capabilities", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(caps["platforms"].as_array().unwrap().len(), 2);
+    assert_eq!(caps["platforms"][0]["mode"], "chat_fallback");
 
     let (s, v) =
         w.web(&u, Method::POST, "/c/api/v1/polls", Some(json!({ "question": "Next?", "options": ["A"] }))).await;

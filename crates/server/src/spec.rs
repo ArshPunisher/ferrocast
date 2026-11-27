@@ -167,10 +167,25 @@ const BOT_AND_WIDGETS: &[RouteDoc] = &[
         None,
         None,
     ),
-    doc("POST", "/polls", "Bot & Widgets", "Start a live chat poll.", None, None),
+    doc(
+        "POST",
+        "/polls",
+        "Bot & Widgets",
+        "Start a live chat or native platform poll.",
+        Some("PollSpec"),
+        Some("PollView"),
+    ),
+    doc(
+        "GET",
+        "/polls/capabilities",
+        "Bot & Widgets",
+        "Per-platform native poll capabilities and limits.",
+        None,
+        Some("PollsCapabilities"),
+    ),
     doc("GET", "/polls/current", "Bot & Widgets", "Current active or finished poll.", None, None),
     doc("DELETE", "/polls/current", "Bot & Widgets", "Clear the current poll widget.", None, None),
-    doc("POST", "/polls/current/end", "Bot & Widgets", "End the active poll early.", None, None),
+    doc("POST", "/polls/current/end", "Bot & Widgets", "End the active poll early.", None, Some("PollView")),
     doc("POST", "/giveaways", "Bot & Widgets", "Start a chat giveaway.", None, None),
     doc("GET", "/giveaways/current", "Bot & Widgets", "Current giveaway state and entries.", None, None),
     doc("DELETE", "/giveaways/current", "Bot & Widgets", "Cancel and refund the active giveaway.", None, None),
@@ -3074,8 +3089,108 @@ fn schemas() -> Value {
         map.extend(store_schemas());
         map.extend(schedule_schemas());
         map.extend(links_and_labels_schemas());
+        map.extend(poll_schemas());
     }
     doc
+}
+
+fn poll_schemas() -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "PollSpec".into(),
+        json!({
+            "type": "object",
+            "required": ["question", "options"],
+            "properties": {
+                "question": { "type": "string", "minLength": 1, "maxLength": 140 },
+                "options": { "type": "array", "minItems": 2, "maxItems": 5, "items": { "type": "string" } },
+                "duration_s": { "type": ["integer", "null"], "minimum": 10, "maximum": 1800, "description": "Duration in seconds (10..1800), or null for an untimed poll." },
+                "chat_fallback": { "type": "boolean", "default": true }
+            }
+        }),
+    );
+    m.insert(
+        "PollLimits".into(),
+        json!({
+            "type": "object",
+            "required": ["min_options", "max_options", "min_duration_s", "max_duration_s", "supports_no_timer", "question_chars", "option_chars"],
+            "properties": {
+                "min_options": { "type": "integer" },
+                "max_options": { "type": "integer" },
+                "min_duration_s": { "type": "integer" },
+                "max_duration_s": { "type": "integer" },
+                "supports_no_timer": { "type": "boolean" },
+                "question_chars": { "type": "integer" },
+                "option_chars": { "type": "integer" }
+            }
+        }),
+    );
+    m.insert(
+        "PlatformPollCapability".into(),
+        json!({
+            "type": "object",
+            "required": ["platform", "mode", "limits"],
+            "properties": {
+                "platform": { "type": "string", "enum": ["twitch", "youtube", "kick"] },
+                "mode": { "type": "string", "enum": ["native", "chat_fallback", "reconnect_needed"] },
+                "reason": { "type": ["string", "null"] },
+                "limits": { "$ref": "#/components/schemas/PollLimits" }
+            }
+        }),
+    );
+    m.insert(
+        "PollsCapabilities".into(),
+        json!({
+            "type": "object",
+            "required": ["platforms"],
+            "properties": {
+                "platforms": { "type": "array", "items": { "$ref": "#/components/schemas/PlatformPollCapability" } }
+            }
+        }),
+    );
+    m.insert(
+        "PlatformPollStatus".into(),
+        json!({
+            "type": "object",
+            "required": ["platform", "mode", "state"],
+            "properties": {
+                "platform": { "type": "string", "enum": ["twitch", "youtube", "kick"] },
+                "mode": { "type": "string", "enum": ["native", "chat"] },
+                "external_id": { "type": ["string", "null"] },
+                "state": { "type": "string", "enum": ["active", "ended", "failed_fallback"] },
+                "note": { "type": ["string", "null"] }
+            }
+        }),
+    );
+    m.insert(
+        "PollView".into(),
+        json!({
+            "type": "object",
+            "required": ["id", "question", "options", "total", "started_at", "closed", "leaders"],
+            "properties": {
+                "id": { "type": "string" },
+                "question": { "type": "string" },
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["text", "votes"],
+                        "properties": {
+                            "text": { "type": "string" },
+                            "votes": { "type": "integer" }
+                        }
+                    }
+                },
+                "total": { "type": "integer" },
+                "started_at": { "type": "integer" },
+                "ends_at": { "type": ["integer", "null"] },
+                "closed": { "type": "boolean" },
+                "leaders": { "type": "array", "items": { "type": "integer" } },
+                "platforms": { "type": "array", "items": { "$ref": "#/components/schemas/PlatformPollStatus" } }
+            }
+        }),
+    );
+    m
 }
 
 fn links_and_labels_schemas() -> Map<String, Value> {

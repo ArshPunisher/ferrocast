@@ -937,7 +937,11 @@ async fn poll_routes_validate_and_refuse_races() {
     use reqwest::Method;
     let r = start().await;
     assert_eq!(r.get("/api/v1/polls/current").await.json::<Value>().await.unwrap(), Value::Null);
+    let caps = r.get("/api/v1/polls/capabilities").await;
+    assert_eq!(caps.status(), StatusCode::OK);
+    assert_eq!(caps.json::<Value>().await.unwrap(), json!({ "platforms": [] }));
     for (m, path) in [
+        (Method::GET, "/api/v1/polls/capabilities"),
         (Method::GET, "/api/v1/polls/current"),
         (Method::POST, "/api/v1/polls"),
         (Method::POST, "/api/v1/polls/current/end"),
@@ -1025,6 +1029,12 @@ async fn poll_routes_validate_and_refuse_races() {
     let uv: Value = untimed.json().await.unwrap();
     assert_eq!(uv["ends_at"], Value::Null, "explicit null creates an untimed poll");
     assert_eq!(r.post("/api/v1/polls/current/end", json!({})).await.status(), StatusCode::OK);
+
+    // Disabling chat fallback refuses to start when no connected platform supports native polls.
+    let no_fb = r
+        .post("/api/v1/polls", json!({ "question": "Native only?", "options": ["A", "B"], "chat_fallback": false }))
+        .await;
+    assert_eq!(error_code(no_fb).await.0, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
