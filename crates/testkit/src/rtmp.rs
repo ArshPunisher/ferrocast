@@ -94,6 +94,11 @@ fn exceeds_dimensions(w: u32, h: u32, max_w: u32, max_h: u32) -> bool {
     w.max(h) > max_w.max(max_h) || w.min(h) > max_w.min(max_h)
 }
 
+fn is_video_sequence_header(data: &[u8]) -> bool {
+    let Some(&b) = data.first() else { return false };
+    if b & 0x80 != 0 { b & 0x0F == 0 } else { matches!(b & 0x0F, 7 | 12) && data.get(1) == Some(&0) }
+}
+
 /// Fake ingest enforcing `(max_w, max_h, max_kbps)`: inspects AMF0 `onMetaData`, H.264 `avcC` SPS
 /// dimensions via `sps_dims`, and RTMP-timestamped video rate, closing TCP ~200 ms after an
 /// offending header or metadata payload arrives. Also forwards decoded [`StreamMetadata`].
@@ -128,7 +133,9 @@ pub async fn platform_rejecting_above(
                             over_dims || over_kbps
                         }
                         ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
-                            if let Some((w, h)) = sps_dims(data) {
+                            if is_video_sequence_header(data) {
+                                sps_dims(data).is_some_and(|(w, h)| exceeds_dimensions(w, h, max_w, max_h))
+                            } else if let Some((w, h)) = sps_dims(data) {
                                 exceeds_dimensions(w, h, max_w, max_h)
                             } else {
                                 let start = *first_ts.get_or_insert(timestamp.value);
@@ -507,5 +514,40 @@ mod tests {
                 Got::Video(..) | Got::Audio(..) | Got::Publish(..) => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn platform_rejecting_above_does_not_count_non_avc_sequence_header_as_coded_frame() {
+        let (port, mut got, _meta) = platform_rejecting_above("hkey", 1920, 1080, 1000, stub_dims).await;
+        let mut obs = Obs::publish(port, "live", "hkey").await.unwrap();
+        assert_eq!(next(&mut got).await, Got::Publish("hkey".into()));
+
+        // Enhanced RTMP HEVC sequence header (stub_dims returns None) large enough to blow 1000 kbps
+        // over 1.1s if erroneously added to coded video byte totals at ts=0.
+        let mut hevc_hdr = vec![0x90, b'h', b'v', b'c', b'1'];
+        hevc_hdr.resize(200_000, 0xAA);
+        let r = obs.c.publish_video_data(Bytes::from(hevc_hdr), RtmpTimestamp::new(0), false).unwrap();
+        obs.send(vec![r]).await.unwrap();
+
+        // Two tiny coded frames 1.1 s and 1.4 s later (< 1 kbps coded rate).
+        let coded = vec![0xA1, b'h', b'v', b'c', b'1', 0x00, 0x01, 0x02];
+        let r1 = obs.c.publish_video_data(Bytes::from(coded.clone()), RtmpTimestamp::new(1100), false).unwrap();
+        obs.send(vec![r1]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r2 = obs.c.publish_video_data(Bytes::from(coded), RtmpTimestamp::new(1400), false).unwrap();
+        obs.send(vec![r2]).await.unwrap();
+
+        let mut saw_coded_1400 = false;
+        while let Ok(Some(msg)) = timeout(WAIT, got.recv()).await {
+            match msg {
+                Got::Closed => panic!("non-AVC sequence header must not trip coded bitrate limit"),
+                Got::Video(1400, _) => {
+                    saw_coded_1400 = true;
+                    break;
+                }
+                Got::Video(..) | Got::Audio(..) | Got::Publish(..) => {}
+            }
+        }
+        assert!(saw_coded_1400, "expected coded frame at ts=1400");
     }
 }
