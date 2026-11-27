@@ -482,6 +482,10 @@ pub trait StudioHost: Send + Sync + std::fmt::Debug {
     async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
         None
     }
+    /// Live [`EncodeKey`] of active encode group `id`, if the host is currently running it.
+    async fn live_group_key(&self, _id: &str) -> Option<EncodeKey> {
+        None
+    }
     /// `ferrocast_studio::StreamStats` plus `error`, or null when not streaming.
     async fn stream_stats(&self) -> Result<Value, String>;
     /// Also sends the Studio's stream straight to an SRT, RIST or WebRTC (WHIP) server. Fails
@@ -2805,7 +2809,7 @@ impl Engine {
         if !from_auto_config {
             self.disarm_auto_config_if_output_changed(&saved);
         }
-        self.note_studio_settings(&saved);
+        self.sync_studio_settings_live(&saved, restart.as_deref()).await;
         self.send_golive_pub();
         // One short line (`restart`), the full words behind the page's (i) (`restart_detail`).
         let (restart, detail) = one_line(restart, "Some changes apply after a restart");
