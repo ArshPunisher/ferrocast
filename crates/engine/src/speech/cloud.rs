@@ -464,33 +464,5 @@ impl Engine {
 }
 
 pub(crate) fn wav_duration_ms(bytes: &[u8]) -> u64 {
-    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
-        return 0;
-    }
-    let mut pos = 12usize;
-    let mut byte_rate = 0u32;
-    let mut data_bytes = 0u32;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]);
-        let payload_start = pos + 8;
-        let payload_end = payload_start.saturating_add(size as usize).min(bytes.len());
-        if id == b"fmt " && payload_end.saturating_sub(payload_start) >= 12 {
-            byte_rate = u32::from_le_bytes([
-                bytes[payload_start + 8],
-                bytes[payload_start + 9],
-                bytes[payload_start + 10],
-                bytes[payload_start + 11],
-            ]);
-        } else if id == b"data" {
-            data_bytes = size;
-            break;
-        }
-        let padded = (size as usize).saturating_add((size as usize) & 1);
-        pos = payload_start.saturating_add(padded);
-    }
-    if byte_rate == 0 || data_bytes == 0 {
-        return 0;
-    }
-    u64::from(data_bytes).saturating_mul(1_000).saturating_div(u64::from(byte_rate)).min(60_000)
+    super::parse_wav_duration_ms(bytes).unwrap_or(0).min(60_000)
 }

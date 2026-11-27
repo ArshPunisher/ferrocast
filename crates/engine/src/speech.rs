@@ -31,6 +31,9 @@ pub use cloud::{
 /// The longest a synthesis may take before we give up and the overlay falls back to the
 /// browser's own voice.
 const SYNTH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Hard byte and duration bounds for locally synthesized WAV files.
+const MAX_WAV_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_WAV_DURATION_MS: u64 = 45_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Voice {
@@ -234,24 +237,73 @@ pub async fn synthesize_in(
     synthesize_inner(text, voice, work, out).await
 }
 
+pub(crate) fn parse_wav_duration_ms(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut byte_rate = 0u32;
+    let mut data_bytes = 0u32;
+    let mut seen_data = false;
+    for _ in 0..64 {
+        if pos + 8 > bytes.len() {
+            break;
+        }
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]);
+        let payload_start = pos + 8;
+        let payload_end = payload_start.saturating_add(size as usize).min(bytes.len());
+        if id == b"fmt " && payload_end.saturating_sub(payload_start) >= 12 {
+            byte_rate = u32::from_le_bytes([
+                bytes[payload_start + 8],
+                bytes[payload_start + 9],
+                bytes[payload_start + 10],
+                bytes[payload_start + 11],
+            ]);
+        } else if id == b"data" {
+            data_bytes = size;
+            seen_data = true;
+            break;
+        }
+        let padded = (size as usize).saturating_add((size as usize) & 1);
+        pos = payload_start.saturating_add(padded);
+    }
+    if byte_rate == 0 || !seen_data || data_bytes == 0 {
+        return None;
+    }
+    Some(u64::from(data_bytes).saturating_mul(1_000).saturating_div(u64::from(byte_rate)))
+}
+
+async fn validate_wav_output(out: &Path) -> Result<(), SpeechError> {
+    let meta = tokio::fs::metadata(out).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
+    if meta.len() > MAX_WAV_BYTES {
+        let _ = tokio::fs::remove_file(out).await;
+        return Err(SpeechError::Failed("the voice output exceeded the size limit".into()));
+    }
+    let bytes = tokio::fs::read(out).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
+    let Some(duration_ms) = parse_wav_duration_ms(&bytes) else {
+        let _ = tokio::fs::remove_file(out).await;
+        return Err(SpeechError::Failed("the voice didn't produce a WAV file".into()));
+    };
+    if duration_ms > MAX_WAV_DURATION_MS {
+        let _ = tokio::fs::remove_file(out).await;
+        return Err(SpeechError::Failed("the voice output exceeded the duration limit".into()));
+    }
+    Ok(())
+}
+
 async fn synthesize_inner(text: &str, voice: Option<&str>, work: &Path, out: &Path) -> Result<(), SpeechError> {
+    let safe = ferrocast_core::tts::sanitize_synth_text(text);
+    if safe.is_empty() {
+        return Err(SpeechError::Failed("nothing to speak".into()));
+    }
     tokio::fs::create_dir_all(work).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
     let input: PathBuf = work.join(input_name());
-    tokio::fs::write(&input, text.as_bytes()).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
+    tokio::fs::write(&input, safe.as_bytes()).await.map_err(|e| SpeechError::Failed(e.to_string()))?;
     let result = run(&input, voice.and_then(safe_voice), out).await;
     let _ = tokio::fs::remove_file(&input).await;
     result?;
-    // Only the first 12 bytes tell a WAV: not the whole file read into memory.
-    let mut head = [0u8; 12];
-    let ok = match tokio::fs::File::open(out).await {
-        Ok(mut f) => tokio::io::AsyncReadExt::read_exact(&mut f, &mut head).await.is_ok(),
-        Err(e) => return Err(SpeechError::Failed(e.to_string())),
-    };
-    if !(ok && head.starts_with(b"RIFF") && &head[8..12] == b"WAVE") {
-        let _ = tokio::fs::remove_file(out).await;
-        return Err(SpeechError::Failed("the voice didn't produce a WAV file".into()));
-    }
-    Ok(())
+    validate_wav_output(out).await
 }
 
 fn rand_suffix() -> u32 {
@@ -399,5 +451,55 @@ mod tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "txt"))
             .count();
         assert_eq!(left, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn embedded_say_commands_do_not_extend_wav_duration_or_bypass_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("slnc.wav");
+        synthesize("[[slnc 5000]] hi", None, dir.path(), &out).await.unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let ms = cloud::wav_duration_ms(&bytes);
+        assert!(ms > 0 && ms < 2_500, "[[slnc 5000]] must be neutralised, got {ms} ms");
+
+        let out_phon = dir.path().join("phon.wav");
+        synthesize("[[inpt PHON]] [[slnc 99999]] [[inpt TEXT]] ok", None, dir.path(), &out_phon).await.unwrap();
+        let phon_bytes = std::fs::read(&out_phon).unwrap();
+        let phon_ms = cloud::wav_duration_ms(&phon_bytes);
+        assert!(phon_ms > 0 && phon_ms < 10_000, "[[slnc 99999]] must be neutralised, got {phon_ms} ms");
+    }
+
+    #[tokio::test]
+    async fn validate_wav_output_enforces_size_and_duration_caps() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Synthetic WAV header claiming ~98 s at 44,100 bytes/s (under MAX_WAV_BYTES).
+        let over_dur = dir.path().join("long.wav");
+        let mut hdr = Vec::with_capacity(44);
+        hdr.extend_from_slice(b"RIFF");
+        hdr.extend_from_slice(&(44u32 + 4_321_800).to_le_bytes());
+        hdr.extend_from_slice(b"WAVE");
+        hdr.extend_from_slice(b"fmt ");
+        hdr.extend_from_slice(&16u32.to_le_bytes());
+        hdr.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        hdr.extend_from_slice(&1u16.to_le_bytes()); // mono
+        hdr.extend_from_slice(&22_050u32.to_le_bytes());
+        hdr.extend_from_slice(&44_100u32.to_le_bytes());
+        hdr.extend_from_slice(&2u16.to_le_bytes());
+        hdr.extend_from_slice(&16u16.to_le_bytes());
+        hdr.extend_from_slice(b"data");
+        hdr.extend_from_slice(&4_321_800u32.to_le_bytes());
+        std::fs::write(&over_dur, &hdr).unwrap();
+        let err = validate_wav_output(&over_dur).await.unwrap_err();
+        assert!(err.to_string().contains("duration limit"), "{err}");
+        assert!(!over_dur.exists());
+
+        // Oversized output (> MAX_WAV_BYTES) is rejected and deleted.
+        let over_size = dir.path().join("big.wav");
+        std::fs::write(&over_size, vec![0u8; usize::try_from(MAX_WAV_BYTES).unwrap() + 1]).unwrap();
+        let err = validate_wav_output(&over_size).await.unwrap_err();
+        assert!(err.to_string().contains("size limit"), "{err}");
+        assert!(!over_size.exists());
     }
 }
