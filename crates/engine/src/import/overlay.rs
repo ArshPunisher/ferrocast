@@ -420,28 +420,35 @@ impl Engine {
 
         // The checks at the start were a while ago (media copied, fonts downloaded): a show or a
         // recording may have started since, and the collection mustn't be swapped under it.
-        if let Err(e) = self.ensure_idle_for_switch("scene collections").await {
-            rollback_media_and_overlays().await;
-            // Nothing was used up: the same preview can be imported once the show has ended.
-            parsed.assets = assets_back;
-            stage_preview(&self.inner.overlay_import, preview_id.to_string(), parsed);
-            return Err(e);
-        }
+        let _lib = self.studio().library_lock.lock().await;
+        let _gate = match self.prepare_shelf_mutation("collections", true).await {
+            Ok(g) => g,
+            Err(e) => {
+                drop(_lib);
+                rollback_media_and_overlays().await;
+                // Nothing was used up: the same preview can be imported once the show has ended.
+                parsed.assets = assets_back;
+                stage_preview(&self.inner.overlay_import, preview_id.to_string(), parsed);
+                return Err(e);
+            }
+        };
 
         let host_opt = self.inner.studio_host.optional();
-        let (col_id, saved_name, previous_id) = if let Some(host) = host_opt {
-            let data_prev = data.clone();
-            let prev =
-                tokio::task::spawn_blocking(move || studio_library::load(&data_prev).collections.current).await.ok();
+        let data_prev = data.clone();
+        let prev_before =
+            tokio::task::spawn_blocking(move || studio_library::load(&data_prev).collections.current).await.ok();
+        let (col_id, saved_name, previous_id) = if let Some(host) = &host_opt {
             let res =
                 host.shelf("collections".into(), ShelfAct::Import { name: clean_name.clone(), doc: final_doc }).await;
             match res {
                 Ok(v) => (
                     v["id"].as_str().unwrap_or("").to_string(),
                     v["name"].as_str().unwrap_or(&clean_name).to_string(),
-                    prev,
+                    v["previous_id"].as_str().map(str::to_string).or(prev_before),
                 ),
                 Err(e) => {
+                    drop(_gate);
+                    drop(_lib);
                     rollback_media_and_overlays().await;
                     return Err(crate::studio_host::failed(e));
                 }
@@ -457,11 +464,16 @@ impl Engine {
             match res {
                 Ok((id, prev, sname)) => (id, sname, Some(prev)),
                 Err(msg) => {
+                    drop(_gate);
+                    drop(_lib);
                     rollback_media_and_overlays().await;
                     return Err(crate::studio_host::failed(msg));
                 }
             }
         };
+        drop(_gate);
+        drop(_lib);
+        self.finish_collection_switch(true, host_opt.is_some()).await;
 
         // 5. Persist one-click Undo record cleanly on disk.
         let undo_token = new_token();
@@ -523,7 +535,8 @@ impl Engine {
     /// pack media files cleanly (cached Google Fonts remain reusable in `<data>/fonts/`).
     pub async fn undo_overlay_pack(&self, undo_token: &str) -> Result<OverlayPackUndoReport, EngineError> {
         let _one_at_a_time = self.inner.import_busy.lock().await;
-        self.ensure_idle_for_switch("scene collections").await?;
+        let _lib = self.studio().library_lock.lock().await;
+        let _gate = self.prepare_shelf_mutation("collections", true).await?;
 
         let data = self.store().dir().to_path_buf();
         let rec_path = undo_file(&data, undo_token.trim())?;
@@ -539,22 +552,24 @@ impl Engine {
             })?;
 
         let host_opt = self.inner.studio_host.optional();
-        let restored_id = if let Some(host) = host_opt {
-            // Ensure we switch off the imported collection first before removing it.
-            let target_restore = if let Some(prev) = &rec.previous_id {
-                let data_c = data.clone();
-                let prev_c = prev.clone();
-                let exists = tokio::task::spawn_blocking(move || {
-                    studio_library::load(&data_c).collections.get(&prev_c).is_some()
-                })
-                .await
-                .unwrap_or(false);
-                if exists { Some(prev.clone()) } else { None }
-            } else {
-                None
-            };
+        let restored_id = if let Some(host) = &host_opt {
+            // Switch off the imported collection first; fall back to any remaining collection if the
+            // original `previous_id` was removed after the import.
+            let data_c = data.clone();
+            let prev_opt = rec.previous_id.clone();
+            let remove_id = rec.collection_id.clone();
+            let target_restore = tokio::task::spawn_blocking(move || {
+                let lib = studio_library::load(&data_c);
+                prev_opt
+                    .filter(|p| p != &remove_id && lib.collections.get(p).is_some())
+                    .or_else(|| lib.collections.list.iter().find(|e| e.id != remove_id).map(|e| e.id.clone()))
+            })
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
             if let Some(prev_id) = &target_restore {
-                let _ = host.shelf("collections".into(), ShelfAct::Switch { id: prev_id.clone() }).await;
+                host.shelf("collections".into(), ShelfAct::Switch { id: prev_id.clone() })
+                    .await
+                    .map_err(crate::studio_host::failed)?;
             }
             host.shelf("collections".into(), ShelfAct::Remove { id: rec.collection_id.clone() })
                 .await
@@ -572,6 +587,9 @@ impl Engine {
             .map_err(crate::studio_host::failed)?;
             Some(restored)
         };
+        drop(_gate);
+        drop(_lib);
+        self.finish_collection_switch(true, host_opt.is_some()).await;
 
         let mut removed_overlays = 0usize;
         for oid in &rec.overlay_ids {

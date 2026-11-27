@@ -1595,3 +1595,191 @@ fn an_overlay_that_could_not_be_made_is_said_in_the_import_report() {
     let note = overlay_not_made_note("BRB", "config.source: pick a label source.");
     assert!(note.contains("BRB") && note.contains("pick a label source"), "{note}");
 }
+
+#[derive(Debug)]
+struct OverlayTestHost {
+    data: std::path::PathBuf,
+    fail_switch: std::sync::atomic::AtomicBool,
+    released_holds: std::sync::Mutex<Vec<String>>,
+    pushes: std::sync::Mutex<Vec<(String, i64, bool)>>,
+    shelf_calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl OverlayTestHost {
+    fn new(data: &Path) -> Self {
+        Self {
+            data: data.to_path_buf(),
+            fail_switch: std::sync::atomic::AtomicBool::new(false),
+            released_holds: std::sync::Mutex::new(Vec::new()),
+            pushes: std::sync::Mutex::new(Vec::new()),
+            shelf_calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::studio_host::StudioHost for OverlayTestHost {
+    async fn status(&self) -> crate::studio_host::StudioStatus {
+        crate::studio_host::StudioStatus { available: true, running: true, ..Default::default() }
+    }
+    async fn preview(&self, _rect: Option<crate::studio_host::PreviewRect>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn start(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        Ok(self.status().await)
+    }
+    async fn stop(&self) -> Result<crate::studio_host::StudioStatus, String> {
+        Ok(Default::default())
+    }
+    async fn kinds(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn options(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn defaults(&self, _kind: String) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn act(&self, act: crate::studio_host::StudioAct) -> Result<Value, String> {
+        match act {
+            crate::studio_host::StudioAct::Items { .. } => Ok(json!([
+                { "id": 1, "name": "Cam", "visible": false }
+            ])),
+            crate::studio_host::StudioAct::PushItem { scene, id, visible, .. } => {
+                self.pushes.lock().unwrap().push((scene.clone(), id, visible));
+                if !visible {
+                    self.released_holds.lock().unwrap().push(format!("{scene}:{id}"));
+                }
+                Ok(Value::Null)
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+    async fn settings(&self) -> crate::studio_host::StudioSettings {
+        crate::studio_host::StudioSettings::default()
+    }
+    async fn set_settings(&self, _s: crate::studio_host::StudioSettings) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+    async fn stats(&self) -> Result<Value, String> {
+        Ok(json!({}))
+    }
+    async fn record(&self, _on: bool) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn record_pause(&self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+    async fn monitoring(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn stream_start(&self, _s: String, _k: String, _t: Vec<(u32, u32, u32)>) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn stream_stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+    async fn stream_stats(&self) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    async fn obs_collections(&self) -> Result<Value, String> {
+        Ok(json!([]))
+    }
+    async fn import_obs(&self, _id: String) -> Result<Value, String> {
+        Err("n/a".into())
+    }
+    async fn shelf(&self, kind: String, act: crate::studio_host::ShelfAct) -> Result<Value, String> {
+        use crate::studio_host::ShelfAct;
+        match act {
+            ShelfAct::List => studio_library::headless_shelf_list(&self.data, &kind),
+            ShelfAct::New { name, copy } => {
+                self.shelf_calls.lock().unwrap().push(format!("new:{name}"));
+                studio_library::headless_shelf_new(&self.data, &kind, &name, copy)
+            }
+            ShelfAct::Switch { id } => {
+                self.shelf_calls.lock().unwrap().push(format!("switch:{id}"));
+                if self.fail_switch.load(Ordering::SeqCst) {
+                    return Err("switch failed intentionally".into());
+                }
+                studio_library::headless_shelf_switch(&self.data, &kind, &id)
+            }
+            ShelfAct::Rename { id, name } => studio_library::headless_shelf_rename(&self.data, &kind, &id, &name),
+            ShelfAct::Remove { id } => {
+                self.shelf_calls.lock().unwrap().push(format!("remove:{id}"));
+                studio_library::headless_shelf_remove(&self.data, &kind, &id)
+            }
+            ShelfAct::Export { id } => studio_library::headless_shelf_export(&self.data, &kind, &id),
+            ShelfAct::Import { name, doc } => {
+                self.shelf_calls.lock().unwrap().push(format!("import:{name}"));
+                let (id, _prev, saved_name) = studio_library::import_collection_doc(&self.data, &name, doc)?;
+                Ok(json!({ "id": id, "name": saved_name }))
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn col03_and_col12_overlay_import_and_undo_serialize_release_holds_fallback_and_propagate_switch_errors() {
+    let (e, dir) = engine().await;
+    let host = Arc::new(OverlayTestHost::new(dir.path()));
+    e.set_studio_host(host.clone());
+
+    let png = make_tiny_png();
+    let cfg = serde_json::to_vec(&streamlabs_sample_json(vec![])).unwrap();
+    let zip = build_zip(vec![("config.json", &cfg, None), ("assets/frame.png", &png, None)]);
+
+    // 1. Push a hold; overlay import must release holds before committing the collection switch.
+    e.studio_push_hold("push_show:Main\nCam", true).await.unwrap();
+    assert!(!e.studio().holds.lock().unwrap().is_empty());
+
+    let prev = e.preview_overlay_pack(zip, "pack.overlay".into()).await.unwrap();
+    let report = e
+        .import_overlay_pack(OverlayPackImportReq {
+            preview_id: prev.preview_id,
+            name: Some("Neon Pack".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(e.studio().holds.lock().unwrap().is_empty(), "COL-03: import_overlay_pack must release holds");
+    assert_eq!(host.released_holds.lock().unwrap().as_slice(), ["Main:1"]);
+
+    // 2. While output_gate is held, undo_overlay_pack must wait for it rather than racing shelf mutations.
+    host.shelf_calls.lock().unwrap().clear();
+    let gate = e.studio().output_gate.lock().await;
+    let e_undo = e.clone();
+    let token = report.undo_token.clone();
+    let undo_task = tokio::spawn(async move { e_undo.undo_overlay_pack(&token).await });
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        host.shelf_calls.lock().unwrap().is_empty(),
+        "COL-03: undo_overlay_pack entered shelf while output_gate held"
+    );
+
+    // Configure Switch to fail once `output_gate` is released: COL-12 must propagate the Switch error
+    // without removing the imported collection or deleting copied pack assets / undo record.
+    host.fail_switch.store(true, Ordering::SeqCst);
+    drop(gate);
+    let err = undo_task.await.unwrap().unwrap_err();
+    assert!(matches!(err, EngineError::Refused { status: 422, code: "studio_failed", .. }), "{err:?}");
+    let lib_after_fail = studio_library::load(dir.path());
+    assert_eq!(lib_after_fail.collections.current, report.id, "failed switch must keep collection intact");
+    assert!(!e.overlays().await.unwrap().is_empty(), "overlays must survive failed undo");
+    assert!(!files_under(&dir.path().join("studio").join("packs")).is_empty(), "pack media must survive failed undo");
+
+    // 3. Delete previous_id ("untitled") after creating another collection ("fallback-show"):
+    // COL-12 undo must fall back to "fallback-show" instead of failing with "is in use now."
+    host.fail_switch.store(false, Ordering::SeqCst);
+    studio_library::headless_shelf_new(dir.path(), "collections", "Fallback Show", false).unwrap();
+    studio_library::headless_shelf_switch(dir.path(), "collections", &report.id).unwrap();
+    studio_library::headless_shelf_remove(dir.path(), "collections", "untitled").unwrap();
+
+    e.studio_push_hold("push_show:Main\nCam", true).await.unwrap();
+    let undone = e.undo_overlay_pack(&report.undo_token).await.unwrap();
+    assert!(e.studio().holds.lock().unwrap().is_empty(), "COL-03: undo_overlay_pack must release holds");
+    assert_eq!(undone.restored_collection_id.as_deref(), Some("fallback-show"));
+    assert_eq!(studio_library::load(dir.path()).collections.current, "fallback-show");
+    assert!(!studio_library::file(dir.path(), studio_library::Kind::Collections, &report.id).exists());
+}
