@@ -441,27 +441,35 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::DragDrop(drop) = event
-                && window.label() == "main"
-            {
-                forward_drop(window, drop);
-            }
-            if let WindowEvent::CloseRequested { api, .. } = event
-                && window.label() == "main"
-            {
-                let app = window.app_handle();
-                let _ = app.save_window_state(StateFlags::all());
-                let to_tray = app
-                    .try_state::<Arc<Shell>>()
-                    .is_none_or(|s| s.close_to_tray.load(Ordering::Relaxed) && s.has_tray.load(Ordering::Relaxed));
-                if to_tray {
-                    // Closing hides: the engine keeps alerts and the bot running from the tray.
-                    api.prevent_close();
-                    let _ = window.hide();
-                } else {
-                    // Closing the window quits: asked first when something is on air.
-                    api.prevent_close();
-                    quit::request(app);
+            if window.label() == "main" {
+                match event {
+                    WindowEvent::DragDrop(drop) => forward_drop(window, drop),
+                    WindowEvent::Resized(size) => studio::on_window_resized(window, size.width, size.height),
+                    WindowEvent::ScaleFactorChanged { scale_factor, new_inner_size, .. } => {
+                        studio::on_window_scale_changed(
+                            window,
+                            *scale_factor,
+                            Some((new_inner_size.width, new_inner_size.height)),
+                        );
+                    }
+                    WindowEvent::Destroyed => studio::detach_window_watcher(),
+                    WindowEvent::CloseRequested { api, .. } => {
+                        let app = window.app_handle();
+                        let _ = app.save_window_state(StateFlags::all());
+                        let to_tray = app.try_state::<Arc<Shell>>().is_none_or(|s| {
+                            s.close_to_tray.load(Ordering::Relaxed) && s.has_tray.load(Ordering::Relaxed)
+                        });
+                        if to_tray {
+                            // Closing hides: the engine keeps alerts and the bot running from the tray.
+                            api.prevent_close();
+                            let _ = window.hide();
+                        } else {
+                            // Closing the window quits: asked first when something is on air.
+                            api.prevent_close();
+                            quit::request(app);
+                        }
+                    }
+                    _ => {}
                 }
             }
         })
@@ -1500,7 +1508,8 @@ pub(crate) fn show_window(app: &AppHandle) {
         })
         .build();
     match built {
-        Ok(_) => {
+        Ok(win) => {
+            studio::attach_window_watcher(&win);
             if let (Some(used), Some(pending)) = (&pending_uri, app.try_state::<PendingDeepLink>()) {
                 pending.clear_if(used);
             }

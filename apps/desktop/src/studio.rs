@@ -54,6 +54,8 @@ struct TestView {
     opacity: std::cell::Cell<f64>,
     shade: std::cell::Cell<f64>,
     paused: std::cell::Cell<bool>,
+    hidden_for_resize: std::cell::Cell<bool>,
+    live_resize: std::cell::Cell<bool>,
 }
 
 #[cfg(test)]
@@ -164,6 +166,20 @@ impl Preview {
         match self {
             Preview::Real(p) => p.set_paused(paused),
             Preview::Test(p) => p.paused.set(paused),
+        }
+    }
+
+    fn set_hidden_for_resize(&self, hidden: bool) {
+        match self {
+            Preview::Real(p) => p.set_hidden_for_resize(hidden),
+            Preview::Test(p) => p.hidden_for_resize.set(hidden),
+        }
+    }
+
+    fn set_live_resize(&self, active: bool) {
+        match self {
+            Preview::Real(p) => p.set_live_resize(active),
+            Preview::Test(p) => p.live_resize.set(active),
         }
     }
 
@@ -544,6 +560,8 @@ fn create_stage_view(
                 opacity: std::cell::Cell::new(1.0),
                 shade: std::cell::Cell::new(0.0),
                 paused: std::cell::Cell::new(false),
+                hidden_for_resize: std::cell::Cell::new(false),
+                live_resize: std::cell::Cell::new(false),
             }))
         }
     }
@@ -560,19 +578,24 @@ fn make_vertical_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     }
     // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
     let mut p = create_stage_view(ctx, c, rect, scale, true)?;
+    let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
     let v = &h.vertical;
-    if let Some(area) = v.canvas {
-        p.set_area(rect, area, scale);
-    }
+    configure_stage_view(
+        &mut p,
+        ViewProps {
+            rect,
+            canvas: v.canvas,
+            bg: v.bg,
+            stripe: v.stripe,
+            holes: &v.holes,
+            opacity: v.opacity,
+            shade: v.shade,
+            scale,
+            hide_for_resize,
+        },
+    );
     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
     p.frames(h.frames.as_deref());
-    if let Some(bg) = v.bg {
-        p.background(bg);
-    }
-    p.overflow_stripes(v.stripe);
-    p.set_holes(&v.holes);
-    p.set_opacity(v.opacity.unwrap_or(1.0));
-    p.set_shade(v.shade);
     p.set_paused(h.preview_paused);
     h.vertical.view = Some(p);
     Ok(())
@@ -643,6 +666,271 @@ fn fetch_matte(data: std::path::PathBuf) {
 
 thread_local! {
     static HELD: RefCell<Held> = RefCell::default();
+    static WINDOW_RESIZE: RefCell<WindowResizeState> = RefCell::default();
+    static WINDOW_WATCHER: RefCell<Option<ferrocast_studio::WindowWatch>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewLiveResizeEvent {
+    active: bool,
+    reason: &'static str,
+    seq: u64,
+    scale: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScaleChangedEvent {
+    scale: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_scale: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<String>,
+}
+
+fn preview_live_resize_script(detail: &PreviewLiveResizeEvent) -> Option<String> {
+    let json = serde_json::to_string(detail).ok()?;
+    Some(format!("window.dispatchEvent(new CustomEvent('fc://preview-live-resize', {{ detail: {json} }}))"))
+}
+
+fn scale_changed_script(detail: &ScaleChangedEvent) -> Option<String> {
+    let json = serde_json::to_string(detail).ok()?;
+    Some(format!("window.dispatchEvent(new CustomEvent('fc://scale-changed', {{ detail: {json} }}))"))
+}
+
+#[derive(Debug, Default)]
+struct WindowResizeState {
+    live_resizing: bool,
+    scale: Option<f64>,
+    logical_size: Option<(u32, u32)>,
+    seq: u64,
+}
+
+impl WindowResizeState {
+    fn sanitize_scale(scale: f64) -> Option<f64> {
+        (scale.is_finite() && scale > 0.0).then_some(scale)
+    }
+
+    fn logical_of(phys_w: u32, phys_h: u32, scale: f64) -> (u32, u32) {
+        let s = Self::sanitize_scale(scale).unwrap_or(1.0);
+        ((f64::from(phys_w) / s).round().max(1.0) as u32, (f64::from(phys_h) / s).round().max(1.0) as u32)
+    }
+
+    fn on_live_resize(&mut self, active: bool) -> Option<u64> {
+        if self.live_resizing == active {
+            return None;
+        }
+        self.live_resizing = active;
+        self.seq = self.seq.saturating_add(1);
+        Some(self.seq)
+    }
+
+    fn is_live_resizing(&self) -> bool {
+        self.live_resizing
+    }
+
+    fn on_scale_changed(&mut self, raw_scale: f64, phys_size: Option<(u32, u32)>) -> Option<(f64, Option<f64>)> {
+        let next = Self::sanitize_scale(raw_scale)?;
+        if let Some((pw, ph)) = phys_size {
+            self.logical_size = Some(Self::logical_of(pw, ph, next));
+        }
+        if self.scale.is_some_and(|prev| (prev - next).abs() <= 1e-4) {
+            return None;
+        }
+        let prev = self.scale.replace(next);
+        Some((next, prev))
+    }
+
+    fn on_window_resized(&mut self, phys_w: u32, phys_h: u32, raw_scale: f64) -> bool {
+        let scale = Self::sanitize_scale(raw_scale).or(self.scale).unwrap_or(1.0);
+        let logical = Self::logical_of(phys_w, phys_h, scale);
+        if self.live_resizing {
+            self.logical_size = Some(logical);
+            return false;
+        }
+        self.logical_size.replace(logical).is_some_and(|prev| prev != logical)
+    }
+}
+
+fn hide_active_previews_for_resize(h: &Held, pause_gpu: bool) {
+    ferrocast_studio::batch_preview_updates(|| {
+        for p in [h.preview.as_ref(), h.program_view.as_ref(), h.vertical.view.as_ref()].into_iter().flatten() {
+            p.set_hidden_for_resize(true);
+            if pause_gpu {
+                p.set_live_resize(true);
+            }
+        }
+    });
+}
+
+fn handle_live_resize_event(app: &AppHandle, active: bool) {
+    let Some(seq) = WINDOW_RESIZE.with(|w| w.borrow_mut().on_live_resize(active)) else {
+        return;
+    };
+    if active {
+        HELD.with(|h| {
+            if let Ok(h) = h.try_borrow() {
+                hide_active_previews_for_resize(&h, true);
+            }
+        });
+    }
+    let Some(win) = app.get_webview_window("main") else { return };
+    let scale = win.scale_factor().ok().and_then(WindowResizeState::sanitize_scale).unwrap_or(1.0);
+    let (width, height) =
+        win.inner_size().map(|s| (f64::from(s.width) / scale, f64::from(s.height) / scale)).unwrap_or((0.0, 0.0));
+    let event = PreviewLiveResizeEvent { active, reason: "window", seq, scale, width, height };
+    if let Some(script) = preview_live_resize_script(&event) {
+        let _ = win.eval(script);
+    }
+}
+
+fn handle_scale_changed_event(app: &AppHandle, new_scale: f64, phys_size: Option<(u32, u32)>) {
+    let win = app.get_webview_window("main");
+    let size = phys_size.or_else(|| win.as_ref().and_then(|w| w.inner_size().ok().map(|s| (s.width, s.height))));
+    let Some((scale, previous_scale)) = WINDOW_RESIZE.with(|w| w.borrow_mut().on_scale_changed(new_scale, size)) else {
+        return;
+    };
+    let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
+    HELD.with(|h| {
+        if let Ok(mut h) = h.try_borrow_mut() {
+            let Held {
+                preview,
+                preview_at,
+                preview_canvas,
+                preview_bg,
+                preview_stripe,
+                preview_holes,
+                preview_opacity,
+                preview_shade,
+                program_view,
+                program_at,
+                program_bg,
+                program_stripe,
+                program_holes,
+                program_opacity,
+                program_shade,
+                vertical,
+                ..
+            } = &mut *h;
+            ferrocast_studio::batch_preview_updates(|| {
+                if let (Some(p), Some((rect, old_scale))) = (preview.as_mut(), preview_at.as_mut()) {
+                    *old_scale = scale;
+                    configure_stage_view(
+                        p,
+                        ViewProps {
+                            rect: *rect,
+                            canvas: *preview_canvas,
+                            bg: *preview_bg,
+                            stripe: *preview_stripe,
+                            holes: preview_holes,
+                            opacity: *preview_opacity,
+                            shade: *preview_shade,
+                            scale,
+                            hide_for_resize,
+                        },
+                    );
+                }
+                if let (Some(p), Some((rect, old_scale))) = (program_view.as_mut(), program_at.as_mut()) {
+                    *old_scale = scale;
+                    configure_stage_view(
+                        p,
+                        ViewProps {
+                            rect: *rect,
+                            canvas: None,
+                            bg: *program_bg,
+                            stripe: *program_stripe,
+                            holes: program_holes,
+                            opacity: *program_opacity,
+                            shade: *program_shade,
+                            scale,
+                            hide_for_resize,
+                        },
+                    );
+                }
+                if let (Some(p), Some((rect, old_scale))) = (vertical.view.as_mut(), vertical.at.as_mut()) {
+                    *old_scale = scale;
+                    configure_stage_view(
+                        p,
+                        ViewProps {
+                            rect: *rect,
+                            canvas: vertical.canvas,
+                            bg: vertical.bg,
+                            stripe: vertical.stripe,
+                            holes: &vertical.holes,
+                            opacity: vertical.opacity,
+                            shade: vertical.shade,
+                            scale,
+                            hide_for_resize,
+                        },
+                    );
+                }
+            });
+        }
+    });
+    if let Some(win) = win {
+        let display = win.current_monitor().ok().flatten().and_then(|m| m.name().cloned());
+        let event = ScaleChangedEvent { scale, previous_scale, display };
+        if let Some(script) = scale_changed_script(&event) {
+            let _ = win.eval(script);
+        }
+    }
+}
+
+fn attach_window_watcher_on_main(window: &tauri::WebviewWindow) {
+    let scale = window.scale_factor().ok().and_then(WindowResizeState::sanitize_scale).unwrap_or(1.0);
+    let logical = window.inner_size().ok().map(|s| WindowResizeState::logical_of(s.width, s.height, scale));
+    WINDOW_RESIZE.with(|w| {
+        let mut st = w.borrow_mut();
+        st.live_resizing = false;
+        st.scale = Some(scale);
+        st.logical_size = logical;
+    });
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else { return };
+    let app_resize = window.app_handle().clone();
+    let app_scale = window.app_handle().clone();
+    let watcher = ferrocast_studio::watch_window(
+        handle.as_raw(),
+        ferrocast_studio::WindowWatchHooks {
+            on_live_resize: Box::new(move |active| handle_live_resize_event(&app_resize, active)),
+            on_scale_changed: Box::new(move |s| handle_scale_changed_event(&app_scale, s, None)),
+        },
+    );
+    WINDOW_WATCHER.with(|slot| *slot.borrow_mut() = watcher);
+}
+
+/// Installs native OS live-resize, fullscreen, and DPI watchers on the main window.
+pub(crate) fn attach_window_watcher(window: &tauri::WebviewWindow) {
+    let w = window.clone();
+    let _ = window.app_handle().run_on_main_thread(move || attach_window_watcher_on_main(&w));
+}
+
+/// Drops the main window's native observers when the window is destroyed.
+pub(crate) fn detach_window_watcher() {
+    WINDOW_WATCHER.with(|slot| *slot.borrow_mut() = None);
+    WINDOW_RESIZE.with(|w| *w.borrow_mut() = WindowResizeState::default());
+}
+
+/// Hides native previews synchronously when a non-drag window resize (maximize, tile, snap)
+/// jumps the window bounds before the webview layout settles.
+pub(crate) fn on_window_resized(window: &tauri::Window, width: u32, height: u32) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let jumped = WINDOW_RESIZE.with(|w| w.borrow_mut().on_window_resized(width, height, scale));
+    if jumped {
+        HELD.with(|h| {
+            if let Ok(h) = h.try_borrow() {
+                hide_active_previews_for_resize(&h, true);
+            }
+        });
+    }
+}
+
+/// Handles Tauri `WindowEvent::ScaleFactorChanged` by re-applying cached rects/holes and
+/// notifying the webview via `fc://scale-changed`.
+pub(crate) fn on_window_scale_changed(window: &tauri::Window, scale_factor: f64, new_inner_size: Option<(u32, u32)>) {
+    handle_scale_changed_event(window.app_handle(), scale_factor, new_inner_size);
 }
 
 const CAPTURE_RECORDING: u8 = 1 << 0;
@@ -2645,6 +2933,34 @@ fn sync_views(h: &Held) {
     refresh_projectors(h);
 }
 
+struct ViewProps<'a> {
+    rect: Rect,
+    canvas: Option<(f64, f64, f64, f64)>,
+    bg: Option<u32>,
+    stripe: Option<u32>,
+    holes: &'a [(f64, f64, f64, f64, f64)],
+    opacity: Option<f64>,
+    shade: f64,
+    scale: f64,
+    hide_for_resize: bool,
+}
+
+fn configure_stage_view(p: &mut Preview, props: ViewProps<'_>) {
+    if let Some(c) = props.bg {
+        p.background(c);
+    }
+    p.overflow_stripes(props.stripe);
+    match props.canvas {
+        Some(c) => p.set_area(props.rect, c, props.scale),
+        None => p.set_rect(props.rect, props.scale),
+    }
+    p.set_holes(props.holes);
+    p.set_shade(props.shade);
+    p.set_opacity(props.opacity.unwrap_or(1.0));
+    p.set_hidden_for_resize(props.hide_for_resize);
+    p.set_live_resize(props.hide_for_resize);
+}
+
 /// Makes Studio Mode's picture of what's on air at its last place (main thread).
 fn make_program_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     let Some((rect, scale)) = h.program_at else { return Ok(()) };
@@ -2654,15 +2970,23 @@ fn make_program_view(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
         h.program_view = None;
         return Ok(());
     }
-    let p = create_stage_view(ctx, c, rect, scale, false)?;
+    let mut p = create_stage_view(ctx, c, rect, scale, false)?;
+    let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
     // Made again (a new canvas size): the stage keeps the page's colour.
-    if let Some(c) = h.program_bg {
-        p.background(c);
-    }
-    p.overflow_stripes(h.program_stripe);
-    p.set_holes(&h.program_holes);
-    p.set_opacity(h.program_opacity.unwrap_or(1.0));
-    p.set_shade(h.program_shade);
+    configure_stage_view(
+        &mut p,
+        ViewProps {
+            rect,
+            canvas: None,
+            bg: h.program_bg,
+            stripe: h.program_stripe,
+            holes: &h.program_holes,
+            opacity: h.program_opacity,
+            shade: h.program_shade,
+            scale,
+            hide_for_resize,
+        },
+    );
     p.set_paused(h.preview_paused);
     h.program_view = Some(p);
     Ok(())
@@ -2674,18 +2998,23 @@ fn make_preview(ctx: ViewCtx<'_>, h: &mut Held) -> Result<(), String> {
     // Drawn by Ferrocast's own engine (on a Mac so far; elsewhere it says so).
     let c = h.collection.as_ref().ok_or(STOPPED)?;
     let mut p = create_stage_view(ctx, c, rect, scale, false)?;
-    if let Some(c) = h.preview_canvas {
-        p.set_area(rect, c, scale);
-    }
+    let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
+    configure_stage_view(
+        &mut p,
+        ViewProps {
+            rect,
+            canvas: h.preview_canvas,
+            bg: h.preview_bg,
+            stripe: h.preview_stripe,
+            holes: &h.preview_holes,
+            opacity: h.preview_opacity,
+            shade: h.preview_shade,
+            scale,
+            hide_for_resize,
+        },
+    );
     p.select(h.selected.as_ref().map(|(s, i)| (s.as_str(), i.as_slice())));
     p.frames(h.frames.as_deref());
-    if let Some(c) = h.preview_bg {
-        p.background(c);
-    }
-    p.overflow_stripes(h.preview_stripe);
-    p.set_holes(&h.preview_holes);
-    p.set_opacity(h.preview_opacity.unwrap_or(1.0));
-    p.set_shade(h.preview_shade);
     p.set_paused(h.preview_paused);
     h.preview = Some(p);
     sync_views(h);
@@ -2710,6 +3039,134 @@ fn shelf_action_result(id: &str, note: Option<String>) -> Value {
         o.insert("note".into(), json!(n));
     }
     out
+}
+
+fn rect_of(r: &PreviewRect) -> Rect {
+    Rect { x: r.x, y: r.y, w: r.w, h: r.h, vh: r.vh }
+}
+
+fn holes_of(r: &PreviewRect) -> Vec<(f64, f64, f64, f64, f64)> {
+    r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect()
+}
+
+fn apply_main_preview(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    rect: Option<PreviewRect>,
+    scale: f64,
+    hide_for_resize: bool,
+) -> Result<(), String> {
+    let Some(r) = rect else {
+        h.preview = None;
+        h.preview_at = None;
+        return Ok(());
+    };
+    let box_rect = rect_of(&r);
+    h.preview_at = Some((box_rect, scale));
+    h.preview_canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
+    h.preview_bg = r.bg_abgr();
+    h.preview_stripe = r.stripe_abgr();
+    h.preview_holes = holes_of(&r);
+    h.preview_opacity = r.opacity;
+    h.preview_shade = r.shade.unwrap_or(0.0);
+    if let Some(p) = h.preview.as_mut() {
+        configure_stage_view(
+            p,
+            ViewProps {
+                rect: box_rect,
+                canvas: h.preview_canvas,
+                bg: h.preview_bg,
+                stripe: h.preview_stripe,
+                holes: &h.preview_holes,
+                opacity: h.preview_opacity,
+                shade: h.preview_shade,
+                scale,
+                hide_for_resize,
+            },
+        );
+        return Ok(());
+    }
+    make_preview(ctx, h)
+}
+
+fn apply_program_preview(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    rect: Option<PreviewRect>,
+    scale: f64,
+    hide_for_resize: bool,
+) -> Result<(), String> {
+    let Some(r) = rect else {
+        h.program_view = None;
+        h.program_at = None;
+        return Ok(());
+    };
+    let box_rect = rect_of(&r);
+    h.program_at = Some((box_rect, scale));
+    h.program_holes = holes_of(&r);
+    h.program_opacity = r.opacity;
+    h.program_shade = r.shade.unwrap_or(0.0);
+    h.program_bg = r.bg_abgr();
+    h.program_stripe = r.stripe_abgr();
+    if let Some(p) = h.program_view.as_mut() {
+        configure_stage_view(
+            p,
+            ViewProps {
+                rect: box_rect,
+                canvas: None,
+                bg: h.program_bg,
+                stripe: h.program_stripe,
+                holes: &h.program_holes,
+                opacity: h.program_opacity,
+                shade: h.program_shade,
+                scale,
+                hide_for_resize,
+            },
+        );
+        return Ok(());
+    }
+    make_program_view(ctx, h)
+}
+
+fn apply_vertical_preview(
+    ctx: ViewCtx<'_>,
+    h: &mut Held,
+    rect: Option<PreviewRect>,
+    scale: f64,
+    hide_for_resize: bool,
+) -> Result<(), String> {
+    let Some(r) = rect else {
+        h.vertical.view = None;
+        h.vertical.at = None;
+        return Ok(());
+    };
+    let box_rect = rect_of(&r);
+    let v = &mut h.vertical;
+    v.at = Some((box_rect, scale));
+    v.canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
+    v.bg = r.bg_abgr();
+    v.stripe = r.stripe_abgr();
+    v.holes = holes_of(&r);
+    v.opacity = r.opacity;
+    v.shade = r.shade.unwrap_or(0.0);
+    if let Some(p) = v.view.as_mut() {
+        configure_stage_view(
+            p,
+            ViewProps {
+                rect: box_rect,
+                canvas: v.canvas,
+                bg: v.bg,
+                stripe: v.stripe,
+                holes: &v.holes,
+                opacity: v.opacity,
+                shade: v.shade,
+                scale,
+                hide_for_resize,
+            },
+        );
+        return Ok(());
+    }
+    make_vertical_view(ctx, h)
 }
 
 #[derive(Debug, Clone)]
@@ -3506,38 +3963,10 @@ impl StudioHost for DesktopStudio {
     async fn program_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
-            let Some(r) = rect else {
-                h.program_view = None;
-                h.program_at = None;
-                return Ok(());
-            };
-            let rect = Rect { x: r.x, y: r.y, w: r.w, h: r.h, vh: r.vh };
             let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
             let scale = window.scale_factor().unwrap_or(1.0);
-            h.program_at = Some((rect, scale));
-            if let Some(p) = h.program_view.as_mut() {
-                p.set_rect(rect, scale);
-            } else {
-                make_program_view(ViewCtx::App(&app), h)?;
-            }
-            h.program_holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
-            h.program_opacity = r.opacity;
-            h.program_shade = r.shade.unwrap_or(0.0);
-            if let Some(p) = h.program_view.as_ref() {
-                p.set_holes(&h.program_holes);
-                p.set_opacity(h.program_opacity.unwrap_or(1.0));
-                p.set_shade(h.program_shade);
-            }
-            // The stage round it matches the page's theme.
-            h.program_bg = r.bg_abgr();
-            h.program_stripe = r.stripe_abgr();
-            if let (Some(p), Some(c)) = (h.program_view.as_ref(), h.program_bg) {
-                p.background(c);
-            }
-            if let Some(p) = h.program_view.as_ref() {
-                p.overflow_stripes(h.program_stripe);
-            }
-            Ok(())
+            let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
+            apply_program_preview(ViewCtx::App(&app), h, rect, scale, hide_for_resize)
         })
         .await?
     }
@@ -3554,35 +3983,10 @@ impl StudioHost for DesktopStudio {
     async fn vertical_view(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
-            let Some(r) = rect else {
-                h.vertical.view = None;
-                h.vertical.at = None;
-                return Ok(());
-            };
-            let rect = Rect { x: r.x, y: r.y, w: r.w, h: r.h, vh: r.vh };
             let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
             let scale = window.scale_factor().unwrap_or(1.0);
-            let v = &mut h.vertical;
-            v.at = Some((rect, scale));
-            v.canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
-            v.bg = r.bg_abgr();
-            v.stripe = r.stripe_abgr();
-            v.holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
-            v.opacity = r.opacity;
-            v.shade = r.shade.unwrap_or(0.0);
-            let Some(p) = v.view.as_mut() else { return make_vertical_view(ViewCtx::App(&app), h) };
-            if let Some(bg) = v.bg {
-                p.background(bg);
-            }
-            p.overflow_stripes(v.stripe);
-            match v.canvas {
-                Some(c) => p.set_area(rect, c, scale),
-                None => p.set_rect(rect, scale),
-            }
-            p.set_holes(&v.holes);
-            p.set_opacity(v.opacity.unwrap_or(1.0));
-            p.set_shade(v.shade);
-            Ok(())
+            let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
+            apply_vertical_preview(ViewCtx::App(&app), h, rect, scale, hide_for_resize)
         })
         .await?
     }
@@ -3590,36 +3994,31 @@ impl StudioHost for DesktopStudio {
     async fn preview(&self, rect: Option<PreviewRect>) -> Result<(), String> {
         let app = self.app.clone();
         self.on_main(move |h| {
-            let Some(r) = rect else {
-                h.preview = None;
-                h.preview_at = None;
-                return Ok(());
-            };
-            let rect = Rect { x: r.x, y: r.y, w: r.w, h: r.h, vh: r.vh };
             let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
             let scale = window.scale_factor().unwrap_or(1.0);
-            h.preview_at = Some((rect, scale));
-            h.preview_canvas = r.canvas.map(|c| (c.x, c.y, c.w, c.h));
-            h.preview_bg = r.bg_abgr();
-            h.preview_stripe = r.stripe_abgr();
-            h.preview_holes = r.holes.iter().map(|c| (c.x, c.y, c.w, c.h, c.r)).collect();
-            h.preview_opacity = r.opacity;
-            h.preview_shade = r.shade.unwrap_or(0.0);
-            if let Some(p) = h.preview.as_mut() {
-                if let Some(c) = h.preview_bg {
-                    p.background(c);
-                }
-                p.overflow_stripes(h.preview_stripe);
-                match h.preview_canvas {
-                    Some(c) => p.set_area(rect, c, scale),
-                    None => p.set_rect(rect, scale),
-                }
-                p.set_holes(&h.preview_holes);
-                p.set_opacity(h.preview_opacity.unwrap_or(1.0));
-                p.set_shade(h.preview_shade);
-                return Ok(());
-            }
-            make_preview(ViewCtx::App(&app), h)
+            let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
+            apply_main_preview(ViewCtx::App(&app), h, rect, scale, hide_for_resize)
+        })
+        .await?
+    }
+
+    async fn set_previews(
+        &self,
+        preview: Option<PreviewRect>,
+        program: Option<PreviewRect>,
+        vertical: Option<PreviewRect>,
+    ) -> Result<(), String> {
+        let app = self.app.clone();
+        self.on_main(move |h| {
+            let window = app.get_webview_window("main").ok_or("The Ferrocast window isn't open.")?;
+            let scale = window.scale_factor().unwrap_or(1.0);
+            let hide_for_resize = WINDOW_RESIZE.with(|w| w.borrow().is_live_resizing());
+            ferrocast_studio::batch_preview_updates(|| -> Result<(), String> {
+                apply_main_preview(ViewCtx::App(&app), h, preview, scale, hide_for_resize)?;
+                apply_program_preview(ViewCtx::App(&app), h, program, scale, hide_for_resize)?;
+                apply_vertical_preview(ViewCtx::App(&app), h, vertical, scale, hide_for_resize)?;
+                Ok(())
+            })
         })
         .await?
     }
@@ -8266,6 +8665,57 @@ mod import_tests {
     fn desktop_machine_load_reports_valid_cpu_percentage() {
         let cpu = ferrocast_studio::system::machine_cpu_pct();
         assert!((0.0..=100.0).contains(&cpu) && cpu > 0.0, "unexpected machine CPU pct: {cpu}");
+    }
+
+    #[test]
+    fn window_resize_state_tracks_monotonic_seq_scale_dedup_and_jumps() {
+        use super::{
+            PreviewLiveResizeEvent, ScaleChangedEvent, WindowResizeState, preview_live_resize_script,
+            scale_changed_script,
+        };
+
+        let mut st = WindowResizeState::default();
+        assert!(!st.on_window_resized(2480, 1600, 2.0), "first observed size initializes baseline without hiding");
+        assert!(!st.on_window_resized(2480, 1600, 2.0), "unchanged size never triggers hide");
+        assert!(st.on_window_resized(1920, 1200, 2.0), "logical jump outside drag hides immediately");
+
+        assert_eq!(st.on_live_resize(false), None, "duplicate inactive edge ignored");
+        assert_eq!(st.on_live_resize(true), Some(1));
+        assert_eq!(st.on_live_resize(true), None, "duplicate active edge ignored");
+        assert!(st.is_live_resizing());
+        assert!(!st.on_window_resized(2200, 1400, 2.0), "resized events during drag stay quiet");
+        assert_eq!(st.on_live_resize(false), Some(2));
+        assert!(!st.is_live_resizing());
+
+        assert_eq!(st.on_scale_changed(f64::NAN, None), None);
+        assert_eq!(st.on_scale_changed(0.0, None), None);
+        assert_eq!(st.on_scale_changed(2.0, Some((2480, 1600))), Some((2.0, None)));
+        assert_eq!(st.on_scale_changed(2.0, Some((2480, 1600))), None, "unchanged scale deduped");
+        assert_eq!(st.on_scale_changed(1.5, Some((1860, 1200))), Some((1.5, Some(2.0))));
+
+        let live_js = preview_live_resize_script(&PreviewLiveResizeEvent {
+            active: true,
+            reason: "window",
+            seq: 1,
+            scale: 2.0,
+            width: 1240.0,
+            height: 800.0,
+        })
+        .unwrap_or_else(|| panic!("live resize script"));
+        assert!(live_js.contains("fc://preview-live-resize"));
+        assert!(live_js.contains("\"active\":true"));
+        assert!(live_js.contains("\"reason\":\"window\""));
+        assert!(live_js.contains("\"seq\":1"));
+
+        let scale_js = scale_changed_script(&ScaleChangedEvent {
+            scale: 1.5,
+            previous_scale: Some(2.0),
+            display: Some("Built-in Retina Display".into()),
+        })
+        .unwrap_or_else(|| panic!("scale changed script"));
+        assert!(scale_js.contains("fc://scale-changed"));
+        assert!(scale_js.contains("\"previousScale\":2.0"));
+        assert!(scale_js.contains("\"display\":\"Built-in Retina Display\""));
     }
 }
 
