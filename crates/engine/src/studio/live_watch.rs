@@ -979,6 +979,7 @@ mod tests {
             vod_track: false,
             is_light: false,
             is_twitch_eb: true,
+            cap_kbps: None,
         });
         let _ = e.refresh_pc_budget().await;
 
@@ -998,6 +999,7 @@ mod tests {
             vod_track: false,
             is_light: false,
             is_twitch_eb: true,
+            cap_kbps: None,
         });
         host.group_calls.lock().unwrap().clear();
         tw_rx.send_modify(|h| h.dropped = 120);

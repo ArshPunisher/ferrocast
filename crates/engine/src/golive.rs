@@ -88,7 +88,7 @@ pub struct DestinationConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub enhanced: bool,
     /// A custom server made for a platform whose key is made in its own app: `x`, `instagram` or
-    /// `facebook` (the dashboard shows its name and icon). Display only.
+    /// `facebook` (the dashboard shows its name and icon, and limit checks enforce its ceiling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brand: Option<String>,
     /// Per-destination stream quality (`same_as_main` by default; omitted on default for v3.7 parity).
@@ -2882,6 +2882,7 @@ impl Engine {
         if !has_main && (specs.is_empty() || any_direct || record_shares) {
             let studio = (*lock(&self.golive().studio_video)).unwrap_or_default();
             let main_key = plan.main.clone();
+            let cap_kbps = self.studio_limit().map(|l| l.max_kbps_for(main_key.width, main_key.height, main_key.fps));
             specs.insert(
                 0,
                 crate::studio_host::EncodeGroupSpec {
@@ -2891,6 +2892,7 @@ impl Engine {
                     vod_track: studio.vod_track,
                     is_light: false,
                     is_twitch_eb: false,
+                    cap_kbps,
                 },
             );
         }
@@ -3580,7 +3582,28 @@ impl Engine {
                     ));
                 }
             }
-            if d.quality == quality && d.light == target_light && !is_route_light && !is_paused {
+            let direct = d.url.as_deref().and_then(direct_kind);
+            let is_eb = d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main && direct.is_none();
+            let ignore_dest = ignore && direct != Some("whip");
+            let legacy_equiv = (legacy_light.is_none()
+                && d.light
+                && d.quality == DestinationQuality::SameAsMain
+                && d.canvas == Canvas::Main
+                && direct.is_none()
+                && !is_eb)
+                .then(|| {
+                    let lim =
+                        (!ignore_dest).then(|| probe::platform_limit(d.kind, d.brand.as_deref(), d.canvas)).flatten();
+                    DestinationQuality::Custom(legacy_light_custom_quality(
+                        &studio.as_main_encode(),
+                        lim.as_ref(),
+                        ignore_dest,
+                    ))
+                });
+            if !is_route_light
+                && !is_paused
+                && ((d.quality == quality && d.light == target_light) || legacy_equiv.as_ref() == Some(&quality))
+            {
                 return Ok(cfg);
             }
             if live_active && !studio_live {
@@ -3819,18 +3842,25 @@ impl Engine {
             );
             let target_spec =
                 plan.groups.iter().find(|grp| grp.id == target_group_id).map(encode_group_spec_from).unwrap_or_else(
-                    || crate::studio_host::EncodeGroupSpec {
-                        id: target_group_id.clone(),
-                        key: match moved_snapshot.canvas {
+                    || {
+                        let key = match moved_snapshot.canvas {
                             Canvas::Vertical => {
                                 planner_in.vertical.unwrap_or_else(|| studio.as_vertical_encode(1080, 1920)).as_key()
                             }
                             Canvas::Main => studio.as_main_encode().as_key(),
-                        },
-                        extra_tracks: Vec::new(),
-                        vod_track: moved_snapshot.kind == Service::Twitch && studio.vod_track,
-                        is_light: target_group_id == GROUP_LIGHT,
-                        is_twitch_eb: target_group_id == GROUP_TWITCH_EB,
+                        };
+                        let cap_kbps = (target_group_id == GROUP_MAIN)
+                            .then(|| self.studio_limit().map(|l| l.max_kbps_for(key.width, key.height, key.fps)))
+                            .flatten();
+                        crate::studio_host::EncodeGroupSpec {
+                            id: target_group_id.clone(),
+                            key,
+                            extra_tracks: Vec::new(),
+                            vod_track: moved_snapshot.kind == Service::Twitch && studio.vod_track,
+                            is_light: target_group_id == GROUP_LIGHT,
+                            is_twitch_eb: target_group_id == GROUP_TWITCH_EB,
+                            cap_kbps,
+                        }
                     },
                 );
 
@@ -6711,6 +6741,7 @@ fn encode_group_spec_from(g: &crate::golive_plan::EncodeGroup) -> crate::studio_
         vod_track: g.vod_track,
         is_light: g.is_light,
         is_twitch_eb: g.is_twitch_eb,
+        cap_kbps: g.cap_kbps,
     }
 }
 

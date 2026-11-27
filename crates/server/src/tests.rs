@@ -3160,6 +3160,8 @@ async fn golive_quality_options_and_put_quality_cover_every_status_code() {
     );
     for bad_body in [
         json!({ "mode": "same_as_main", "extra": 1 }),
+        json!({ "mode": "same_as_main", "width": null }),
+        json!({ "mode": "same_as_main", "codec": null }),
         json!({ "mode": "same_as_main", "kbps": 3000 }),
         json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30 }),
         json!({ "mode": "custom", "width": 1280, "height": 720, "fps": 30, "kbps": 3000, "extra": true }),

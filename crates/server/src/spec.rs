@@ -2687,7 +2687,7 @@ fn schedule_schemas() -> Map<String, Value> {
             "url": { "type": "string", "description": "rtmp://, rtmps://, srt://, rist:// or https:// (WebRTC WHIP)." },
             "key": { "type": "string", "maxLength": 512, "description": "No spaces. Never returned. Needed for RTMP and RTMPS; optional for SRT (stream id), RIST (passphrase) and WebRTC (bearer token)." },
             "canvas": { "type": "string", "enum": ["main", "vertical"] },
-            "brand": { "type": "string", "enum": ["x", "instagram", "facebook"], "description": "Names a server and key pasted from that platform; changes nothing about how the stream is sent." }
+            "brand": { "type": "string", "enum": ["x", "instagram", "facebook"], "description": "Names a server and key pasted from that platform and applies that platform's stream limits." }
         }
     }));
     m

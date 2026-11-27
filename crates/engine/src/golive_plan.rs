@@ -395,6 +395,8 @@ pub struct EncodeGroup {
     pub vod_track: bool,
     pub is_light: bool,
     pub is_twitch_eb: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_kbps: Option<u32>,
 }
 
 /// Effective encode decision for a single destination in [`EncodePlan`].
@@ -1453,6 +1455,14 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
         .into_iter()
         .map(|g| {
             let vod_track = g.members.iter().any(|&i| working[i].input.vod_track);
+            let cap_kbps = g
+                .members
+                .iter()
+                .filter(|&&i| !effective_ignore_limits(&working[i].input, input.ignore_service_limits))
+                .filter_map(|&i| {
+                    working[i].limit.as_ref().map(|lim| lim.max_kbps_for(g.key.width, g.key.height, g.key.fps))
+                })
+                .min();
             let members = g.members.iter().map(|&i| working[i].input.id.clone()).collect();
             EncodeGroup {
                 id: g.id,
@@ -1462,6 +1472,7 @@ pub fn plan_encodes(input: &PlannerInput) -> EncodePlan {
                 vod_track,
                 is_light: g.is_light,
                 is_twitch_eb: g.is_twitch_eb,
+                cap_kbps,
             }
         })
         .collect();
@@ -2356,6 +2367,7 @@ mod tests {
                 vod_track: false,
                 is_light: false,
                 is_twitch_eb: false,
+                cap_kbps: None,
             },
             crate::studio_host::EncodeGroupSpec {
                 id: "g_kick".into(),
@@ -2376,10 +2388,48 @@ mod tests {
                 vod_track: false,
                 is_light: false,
                 is_twitch_eb: false,
+                cap_kbps: None,
             },
         ];
         let _ = kick;
         let overlap = evaluate_plan_with_extra_groups(&sim_plan, &main, &budget, &extra_groups);
         assert_eq!(overlap.status, BudgetStatus::Over, "must bill live 1440p60 main spec on ID collision: {overlap:?}");
+    }
+
+    #[test]
+    fn f56_encode_group_exposes_explicit_cap_kbps_even_at_equal_bitrate() {
+        let main = MainEncode::from_canvas(Canvas::Main, 1920, 1080, 60, 6_000, VideoCodec::H264);
+        let twitch = dest("twitch", "Twitch", Service::Twitch, Canvas::Main);
+        let yt = dest("youtube", "YouTube", Service::Youtube, Canvas::Main);
+        let plan = plan_encodes(&PlannerInput {
+            main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![twitch, yt],
+            ignore_service_limits: false,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: PcBudget::with_limits(BudgetSource::NvencDefault, Some(500.0), Some(1)),
+        });
+        let main_group = plan.groups.iter().find(|g| g.id == GROUP_MAIN).expect("GROUP_MAIN");
+        assert_eq!(main_group.key.kbps, 6_000);
+        assert_eq!(
+            main_group.cap_kbps,
+            Some(6_000),
+            "GROUP_MAIN sharing Twitch 6000 limit at equal 6000 video_kbps must still report explicit cap_kbps"
+        );
+
+        let plan_ignored = plan_encodes(&PlannerInput {
+            main,
+            vertical: None,
+            vertical_cut: false,
+            destinations: vec![dest("twitch", "Twitch", Service::Twitch, Canvas::Main)],
+            ignore_service_limits: true,
+            twitch_eb: None,
+            whip_simulcast: false,
+            budget: PcBudget::with_limits(BudgetSource::NvencDefault, Some(500.0), Some(1)),
+        });
+        let main_ignored = plan_ignored.groups.iter().find(|g| g.id == GROUP_MAIN).expect("GROUP_MAIN");
+        assert_eq!(main_ignored.cap_kbps, None, "ignoring limits clears explicit cap_kbps");
     }
 }

@@ -5746,6 +5746,7 @@ async fn r_f8b_ffenc_handover_session_exhausted_counts_unshared_recording_sessio
         vod_track: true, // prevents sharing with plain "Same as stream" recording -> +1 session!
         is_light: false,
         is_twitch_eb: false,
+        cap_kbps: None,
     });
     e.set_active_group_for_test(crate::studio_host::EncodeGroupSpec {
         id: "g_other".into(),
@@ -5766,6 +5767,7 @@ async fn r_f8b_ffenc_handover_session_exhausted_counts_unshared_recording_sessio
         vod_track: false,
         is_light: false,
         is_twitch_eb: false,
+        cap_kbps: None,
     });
     assert!(
         e.ffenc_handover_session_exhausted(),
@@ -8425,4 +8427,109 @@ async fn f55_start_vertical_midstream_recovers_quarantined_vertical_without_rest
     assert_eq!(e.golive_running_group(&vert.id).as_deref(), Some(GROUP_VERTICAL));
     assert_eq!(inner.start_counts.lock().unwrap().get(GROUP_MAIN).copied(), Some(1));
     e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f57_live_switch_under_platform_exclusive_with_concurrent_reconcile() {
+    use crate::golive::{CustomQuality, DestinationQuality, GROUP_MAIN, VideoCodec};
+    use ferrocast_core::event::Platform;
+    use ferrocast_testkit::rtmp::{Got, platform_exclusive};
+    use tokio::time::{Duration, timeout};
+
+    let (e, _dir) = engine().await;
+    let host = ivs_budget_host(1920, 1080, 60, 10_000, 3);
+    let s = host.settings.lock().unwrap().clone();
+    e.set_studio_host(host);
+    e.note_studio_settings(&s);
+
+    let (p_tw, mut got_tw) = platform_exclusive("excl-tw").await;
+    let (p_kick, mut got_kick) = platform_exclusive("excl-kick").await;
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Twitch,
+        format!("rtmp://127.0.0.1:{p_tw}/app"),
+        "excl-tw".into(),
+    )));
+    e.register_connector(Arc::new(LocalPlatform(
+        Platform::Kick,
+        format!("rtmp://127.0.0.1:{p_kick}/app"),
+        "excl-kick".into(),
+    )));
+    let order: Vec<(String, bool)> = e
+        .golive_config()
+        .destinations
+        .into_iter()
+        .map(|d| (d.id.clone(), d.id == "twitch" || d.id == "kick"))
+        .collect();
+    e.set_golive_destinations(order).await.unwrap();
+
+    e.studio_stream(true).await.unwrap();
+    for (rx, want) in [(&mut got_tw, "excl-tw"), (&mut got_kick, "excl-kick")] {
+        loop {
+            match timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap() {
+                Ok(Got::Publish(k)) if k == want => break,
+                Err(why) => panic!("unexpected exclusive overlap at startup for {want}: {why}"),
+                _ => {}
+            }
+        }
+    }
+    while got_tw.try_recv().is_ok() {}
+    while got_kick.try_recv().is_ok() {}
+
+    // Live switch Kick while concurrently hammering `reconcile()`: strict single-publisher server must never see an overlap.
+    let q720 = CustomQuality { width: 1280, height: 720, fps: 30, kbps: 3_500, codec: Some(VideoCodec::H264) };
+    let (r_sw, ()) = tokio::join!(e.set_golive_quality("kick", DestinationQuality::Custom(q720)), e.reconcile());
+    r_sw.unwrap();
+
+    // Wait for clean single-publisher handover on Kick (1 Closed followed by 1 Publish, 0 overlaps).
+    let mut saw_closed = false;
+    loop {
+        match timeout(Duration::from_secs(3), got_kick.recv()).await.unwrap().unwrap() {
+            Ok(Got::Closed) => saw_closed = true,
+            Ok(Got::Publish(k)) if k == "excl-kick" && saw_closed => break,
+            Err(why) => panic!("platform_exclusive saw overlapping publish during switch: {why}"),
+            _ => {}
+        }
+    }
+    while let Ok(msg) = got_tw.try_recv() {
+        assert!(
+            !matches!(msg, Ok(Got::Closed) | Err(_)),
+            "Twitch must remain continuously live with zero overlap: {msg:?}"
+        );
+    }
+    assert_ne!(e.golive_running_group("kick").as_deref(), Some(GROUP_MAIN));
+    e.studio_stream(false).await.unwrap();
+}
+
+#[tokio::test]
+async fn f58_obs_live_v37_light_quality_options_matches_put_200_and_light_off_422() {
+    use crate::golive::{Canvas, DestinationQuality};
+    use ferrocast_testkit::rtmp::Obs;
+
+    let (e, _dir) = engine().await;
+    let d = e.add_golive_destination("ObsLight", "rtmp://127.0.0.1:9/app", "obs-light", Canvas::Main).await.unwrap();
+    // Seed persisted v3.7 destination (`light: true, quality: SameAsMain`).
+    let mut cfg = e.golive_config();
+    cfg.destinations.iter_mut().find(|x| x.id == d.id).unwrap().light = true;
+    e.save_golive(cfg).await.unwrap();
+
+    let (server, key) = e.golive_ingest().await.unwrap();
+    let ingest_port: u16 = server.rsplit(':').next().unwrap().split('/').next().unwrap().parse().unwrap();
+    let _obs = Obs::publish(ingest_port, "live", &key).await.unwrap();
+    eventually_async(|| async { e.golive_stream_running() }).await;
+
+    let opts = e.golive_quality_options().await;
+    let d_opts = &opts.destinations[&d.id];
+    assert!(matches!(d_opts.current, DestinationQuality::Custom(_)), "v3.7 light must resolve to Custom current");
+    let cur_opt = d_opts.options.iter().find(|o| o.quality == d_opts.current).expect("matching option for current");
+    assert!(cur_opt.allowed, "current option from quality-options must be allowed while OBS is live");
+
+    // Matching PUT .../quality must succeed 200 (consistent with `allowed: true`), while turning light off refuses 422.
+    e.set_golive_quality(&d.id, d_opts.current.clone())
+        .await
+        .expect("PUT quality matching GET quality-options current must return 200 while OBS is live");
+    let off_err = e.set_golive_light(&d.id, false).await.unwrap_err();
+    assert!(
+        matches!(off_err, crate::EngineError::Refused { status: 422, code: "golive_needs_new_encode", .. }),
+        "disabling light while OBS is live must still refuse 422: {off_err:?}"
+    );
 }

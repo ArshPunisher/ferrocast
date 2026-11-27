@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::error::{ApiError, ApiResult};
+use crate::error::ApiResult;
 use crate::extract::Body;
 
 pub(crate) fn routes() -> Router<AppState> {
@@ -151,43 +151,18 @@ async fn enhanced(
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum QualityModeBody {
-    SameAsMain,
-    Custom,
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum QualityBody {
+    SameAsMain {},
+    Custom { width: u32, height: u32, fps: u32, kbps: u32, codec: Option<ferrocast_engine::golive::VideoCodec> },
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QualityBody {
-    mode: QualityModeBody,
-    width: Option<u32>,
-    height: Option<u32>,
-    fps: Option<u32>,
-    kbps: Option<u32>,
-    codec: Option<ferrocast_engine::golive::VideoCodec>,
-}
-
-impl TryFrom<QualityBody> for ferrocast_engine::golive::DestinationQuality {
-    type Error = ApiError;
-
-    fn try_from(b: QualityBody) -> Result<Self, Self::Error> {
-        match b.mode {
-            QualityModeBody::SameAsMain => {
-                if b.width.is_some() || b.height.is_some() || b.fps.is_some() || b.kbps.is_some() || b.codec.is_some() {
-                    return Err(ApiError::invalid(
-                        "\"same_as_main\" mode does not accept width, height, fps, kbps, or codec.",
-                    ));
-                }
-                Ok(Self::SameAsMain)
-            }
-            QualityModeBody::Custom => {
-                let (Some(width), Some(height), Some(fps), Some(kbps)) = (b.width, b.height, b.fps, b.kbps) else {
-                    return Err(ApiError::invalid(
-                        "Custom quality requires integer width, height, fps, and kbps fields.",
-                    ));
-                };
-                Ok(Self::Custom(ferrocast_engine::golive::CustomQuality { width, height, fps, kbps, codec: b.codec }))
+impl From<QualityBody> for ferrocast_engine::golive::DestinationQuality {
+    fn from(b: QualityBody) -> Self {
+        match b {
+            QualityBody::SameAsMain {} => Self::SameAsMain,
+            QualityBody::Custom { width, height, fps, kbps, codec } => {
+                Self::Custom(ferrocast_engine::golive::CustomQuality { width, height, fps, kbps, codec })
             }
         }
     }
@@ -199,7 +174,7 @@ async fn quality(
     Path(id): Path<String>,
     Body(b): Body<QualityBody>,
 ) -> ApiResult<Json<Value>> {
-    let quality = ferrocast_engine::golive::DestinationQuality::try_from(b)?;
+    let quality = ferrocast_engine::golive::DestinationQuality::from(b);
     app.engine.set_golive_quality(&id, quality).await?;
     Ok(Json(json!(app.engine.golive_view().await)))
 }

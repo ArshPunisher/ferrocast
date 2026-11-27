@@ -784,6 +784,14 @@ fn apply_main_slot_bitrate_on_spec(
     at_pct(base, live_pct)
 }
 
+fn main_slot_cap_kbps(spec: &EncodeGroupSpec, slot_cap: Option<u32>, was_video_kbps: Option<u32>) -> Option<u32> {
+    (spec.id == GROUP_MAIN)
+        .then(|| {
+            slot_cap.or(spec.cap_kbps).or_else(|| was_video_kbps.filter(|&k| spec.key.kbps < k).map(|_| spec.key.kbps))
+        })
+        .flatten()
+}
+
 fn next_main_spec_for_settings(
     spec: &EncodeGroupSpec,
     s: &StudioSettings,
@@ -799,8 +807,9 @@ fn next_main_spec_for_settings(
         next.key.fps = s.fps;
         next.key.fps_ntsc = s.fps_ntsc;
     }
-    let effective_cap = cap_kbps.or_else(|| was.filter(|o| spec.key.kbps < o.video_kbps).map(|_| spec.key.kbps));
+    let effective_cap = main_slot_cap_kbps(spec, cap_kbps, was.map(|o| o.video_kbps));
     next.key.kbps = effective_cap.map_or(s.video_kbps, |c| s.video_kbps.min(c));
+    next.cap_kbps = effective_cap;
     next
 }
 
@@ -3247,9 +3256,7 @@ impl StudioHost for DesktopStudio {
                     && shape_changed
                     && let Some(slot) = h.groups.get_mut(GROUP_MAIN).filter(|g| g.output.stats().active)
                 {
-                    let inferred_cap = slot.cap_kbps.or_else(|| {
-                        was.as_ref().filter(|o| slot.spec.key.kbps < o.video_kbps).map(|_| slot.spec.key.kbps)
-                    });
+                    let inferred_cap = main_slot_cap_kbps(&slot.spec, slot.cap_kbps, was.as_ref().map(|o| o.video_kbps));
                     let next_spec = next_main_spec_for_settings(&slot.spec, &s, inferred_cap, was.as_ref());
                     let mut next_group_settings = stream_settings_for_group(&s, &next_spec);
                     let live_kbps = at_pct(next_spec.key.kbps, slot.live_pct);
@@ -3286,9 +3293,7 @@ impl StudioHost for DesktopStudio {
                         st.set_video_kbps(at_pct(s.video_kbps, h.live_pct));
                     }
                     if !reshaped && let Some(slot) = h.groups.get_mut(GROUP_MAIN) {
-                        let cap = slot.cap_kbps.or_else(|| {
-                            was.as_ref().filter(|o| slot.spec.key.kbps < o.video_kbps).map(|_| slot.spec.key.kbps)
-                        });
+                        let cap = main_slot_cap_kbps(&slot.spec, slot.cap_kbps, was.as_ref().map(|o| o.video_kbps));
                         if slot.cap_kbps.is_none() {
                             slot.cap_kbps = cap;
                         }
@@ -4796,7 +4801,7 @@ impl StudioHost for DesktopStudio {
                 kbps = spec.key.kbps,
                 "started encode group directly into Hub"
             );
-            let cap_kbps = (spec.id == GROUP_MAIN && spec.key.kbps < s.video_kbps).then_some(spec.key.kbps);
+            let cap_kbps = main_slot_cap_kbps(&spec, None, Some(s.video_kbps));
             h.groups.insert(
                 spec.id.clone(),
                 GroupSlot { spec, output, started: now, with: settings, live_pct: None, cap_kbps },
@@ -5896,6 +5901,7 @@ mod budget_tests {
             vod_track: true,
             is_light: false,
             is_twitch_eb: false,
+            cap_kbps: None,
         };
         let t_out = stream_settings_for_group(&s, &twitch_spec);
         assert_eq!(t_out.encode.scale, Some((1920, 1080)));
@@ -5925,6 +5931,7 @@ mod budget_tests {
             vod_track: false,
             is_light: false,
             is_twitch_eb: false,
+            cap_kbps: None,
         };
         let v_out = stream_settings_for_group(&s, &vert_spec);
         assert_eq!(v_out.encode.scale, Some((720, 1280)));
@@ -6218,6 +6225,7 @@ mod budget_tests {
             vod_track: false,
             is_light: false,
             is_twitch_eb: false,
+            cap_kbps: None,
         };
         let gs = stream_settings_for_group(&s, &hevc_spec);
         assert!(
@@ -6273,6 +6281,7 @@ mod budget_tests {
             vod_track: false,
             is_light: false,
             is_twitch_eb: false,
+            cap_kbps: None,
         };
         assert_eq!(
             record_encode_for_group_spec(&s, None, Some(&scaled_spec)),
@@ -6312,6 +6321,7 @@ mod budget_tests {
             vod_track: false,
             is_light: false,
             is_twitch_eb: false,
+            cap_kbps: None,
         };
         let reshaped = next_main_spec_for_settings(&spec, &next, None, Some(&was));
         assert_eq!((reshaped.key.width, reshaped.key.height, reshaped.key.fps), (1280, 720, 30));
@@ -6344,6 +6354,7 @@ mod budget_tests {
             vod_track: false,
             is_light: false,
             is_twitch_eb: false,
+            cap_kbps: None,
         };
         let cap = Some(6_000);
         let live_kbps = apply_main_slot_bitrate_on_spec(&mut spec, cap, Some(75), next.video_kbps);
@@ -6361,6 +6372,41 @@ mod budget_tests {
 
         let next_reshape = next_main_spec_for_settings(&spec, &next, cap, Some(&was));
         assert_eq!(next_reshape.key.kbps, 6_000, "reshape spec must keep 100% capped base bitrate");
+    }
+
+    #[test]
+    fn f56_main_group_started_at_equal_video_kbps_keeps_cap_kbps_on_raise() {
+        let was = StudioSettings { width: 1920, height: 1080, fps: 60, video_kbps: 6_000, ..StudioSettings::default() };
+        let raised = StudioSettings { width: 1280, height: 720, fps: 60, video_kbps: 12_000, ..was.clone() };
+        let mut spec = EncodeGroupSpec {
+            id: GROUP_MAIN.into(),
+            key: ferrocast_engine::studio_host::EncodeKey {
+                canvas: EncodeCanvas::Main,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                fps_ntsc: false,
+                kbps: 6_000,
+                codec: EncodeCodec::H264,
+                keyframe_s: 2,
+                strict_cbr: true,
+                no_bframes: false,
+                audio_kbps: 160,
+            },
+            extra_tracks: Vec::new(),
+            vod_track: false,
+            is_light: false,
+            is_twitch_eb: false,
+            cap_kbps: Some(6_000),
+        };
+        let cap = main_slot_cap_kbps(&spec, None, Some(was.video_kbps));
+        assert_eq!(cap, Some(6_000), "explicit cap_kbps on spec must persist even when start bitrate equals cap");
+        let applied = apply_main_slot_bitrate_on_spec(&mut spec, cap, None, raised.video_kbps);
+        assert_eq!(applied, 6_000);
+        assert_eq!(spec.key.kbps, 6_000, "raising Settings.video_kbps must remain clamped to spec.cap_kbps");
+        let reshaped = next_main_spec_for_settings(&spec, &raised, cap, Some(&was));
+        assert_eq!(reshaped.key.kbps, 6_000, "reshaping after equal-bitrate start must keep cap_kbps");
+        assert_eq!(reshaped.cap_kbps, Some(6_000));
     }
 }
 

@@ -1542,7 +1542,7 @@
       "GoLiveDestinationCreate": {
         "properties": {
           "brand": {
-            "description": "Names a server and key pasted from that platform; changes nothing about how the stream is sent.",
+            "description": "Names a server and key pasted from that platform and applies that platform's stream limits.",
             "enum": [
               "x",
               "instagram",

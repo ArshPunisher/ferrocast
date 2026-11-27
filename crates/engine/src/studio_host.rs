@@ -36,6 +36,8 @@ pub struct EncodeGroupSpec {
     pub is_light: bool,
     #[serde(default)]
     pub is_twitch_eb: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_kbps: Option<u32>,
 }
 
 /// Host hardware/driver capabilities reported by [`StudioHost::host_budget_info`].
