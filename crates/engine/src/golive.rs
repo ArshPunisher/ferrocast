@@ -732,6 +732,8 @@ pub(crate) struct GoLive {
     switching_groups: Mutex<HashMap<GroupId, usize>>,
     /// Planned specs for in-flight switch groups so concurrent switches see reserved budget.
     switching_group_specs: Mutex<HashMap<GroupId, crate::studio_host::EncodeGroupSpec>>,
+    /// Newly started switch groups not yet committed to any `Running` destination (cleaned up on all-fail).
+    uncommitted_switch_groups: Mutex<std::collections::HashSet<GroupId>>,
     /// Serializes budget checks and `start_encode_group` reservations across concurrent switches.
     switch_budget_lock: tokio::sync::Mutex<()>,
     /// Monotonic switch generation per destination (`switch_seq` increments on every switch or Stop).
@@ -745,6 +747,8 @@ pub(crate) struct GoLive {
     keyframe_wait_timeout: Mutex<std::time::Duration>,
     /// Whether Ferrocast Studio itself started the live main stream (vs external OBS ingest).
     studio_live: std::sync::atomic::AtomicBool,
+    /// True once Studio multi-encode group startup has claimed the live session until Stop/end.
+    encode_groups_active: std::sync::atomic::AtomicBool,
     /// The Studio couldn't put the platform's cap on the stream on air (its encoder is shared with
     /// a recording, say): the stream isn't held to it, so no badge says it is and no warning about
     /// its bitrate is held back.
@@ -886,7 +890,8 @@ impl From<&crate::studio_host::StudioSettings> for StudioCapConfig {
             _ => VideoCodec::H264,
         };
         let (width, height) = s.scale.map_or((s.width, s.height), |[w, h]| (w, h));
-        let is_software = s.encoder == "software" || low_enc.as_deref().is_some_and(|e| e.contains("x264"));
+        let is_software = s.encoder == "software"
+            || crate::golive_plan::encoder_is_software(s.video_encoder.as_deref().unwrap_or(""));
         Self {
             width,
             height,
@@ -971,6 +976,7 @@ impl Default for GoLive {
             switching: Mutex::new(std::collections::HashSet::new()),
             switching_groups: Mutex::new(HashMap::new()),
             switching_group_specs: Mutex::new(HashMap::new()),
+            uncommitted_switch_groups: Mutex::new(std::collections::HashSet::new()),
             switch_budget_lock: tokio::sync::Mutex::new(()),
             switch_gen: Mutex::new(HashMap::new()),
             switch_seq: std::sync::atomic::AtomicU64::new(0),
@@ -978,6 +984,7 @@ impl Default for GoLive {
             stream_cancel: Mutex::new(watch::channel(false).0),
             keyframe_wait_timeout: Mutex::new(std::time::Duration::from_secs(3)),
             studio_live: std::sync::atomic::AtomicBool::new(false),
+            encode_groups_active: std::sync::atomic::AtomicBool::new(false),
             cap_failed: std::sync::atomic::AtomicBool::new(false),
             applied_cap: Mutex::new(None),
             applied_limit: Mutex::new(None),
@@ -1583,6 +1590,7 @@ impl Engine {
     fn resolve_hub_for_destination(&self, d: &DestinationConfig, plan: Option<&EncodePlan>) -> (GroupId, Arc<Hub>) {
         let g = self.golive();
         let uses_groups = !lock(&g.active_groups).is_empty()
+            || g.encode_groups_active.load(std::sync::atomic::Ordering::Acquire)
             || (g.studio_live.load(std::sync::atomic::Ordering::Acquire) && self.golive_uses_encode_groups());
         if uses_groups
             && let Some(p) = plan
@@ -1724,6 +1732,40 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_sentinel_running_for_test(
+        &self,
+        id: &str,
+        stop: watch::Sender<bool>,
+        health: watch::Receiver<Health>,
+        other_live: watch::Sender<bool>,
+    ) {
+        lock(&self.golive().running).insert(
+            id.to_string(),
+            Running { stop, health, group_id: GROUP_MAIN.to_string(), light: false, task: None, other_live },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_direct_for_test(&self, d: &DestinationConfig, url: String) {
+        self.start_direct(d, url).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn current_studio_cap_is_software_for_test(&self) -> bool {
+        self.current_studio_cap_config().await.is_software
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protector_is_paused_for_test(&self, id: &str) -> bool {
+        lock(&self.golive().protector).is_paused(id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn golive_is_paused_for_test(&self, id: &str) -> bool {
+        lock(&self.golive().paused).contains_key(id)
+    }
+
     /// Whether a stream is running that a destination change would be applied to.
     pub(crate) fn health_end_deferred(&self) {
         self.golive().health_end_pending.store(true, std::sync::atomic::Ordering::Release);
@@ -1746,7 +1788,31 @@ impl Engine {
     }
 
     pub(crate) fn note_studio_settings(&self, s: &crate::studio_host::StudioSettings) {
-        *lock(&self.golive().studio_video) = Some(StudioCapConfig::from(s));
+        let g = self.golive();
+        let next = StudioCapConfig::from(s);
+        let prev = {
+            let mut slot = lock(&g.studio_video);
+            let old = *slot;
+            *slot = Some(next);
+            old
+        };
+        if g.studio_live.load(std::sync::atomic::Ordering::Acquire) {
+            let applied_cap = *lock(&g.applied_cap);
+            if let Some(main_spec) = lock(&g.active_groups).get_mut(GROUP_MAIN) {
+                if prev.is_none_or(|p| main_spec.key.width == p.width && main_spec.key.height == p.height) {
+                    main_spec.key.width = next.width;
+                    main_spec.key.height = next.height;
+                }
+                if prev.is_none_or(|p| main_spec.key.fps == p.fps && main_spec.key.fps_ntsc == p.fps_ntsc)
+                    || next.fps < main_spec.key.fps
+                {
+                    main_spec.key.fps = next.fps;
+                    main_spec.key.fps_ntsc = next.fps_ntsc;
+                }
+                main_spec.key.kbps =
+                    applied_cap.and_then(|c| c.max_kbps).map_or(next.video_kbps, |cap_k| next.video_kbps.min(cap_k));
+            }
+        }
     }
 
     pub(crate) fn set_studio_live(&self, on: bool) {
@@ -2128,9 +2194,16 @@ impl Engine {
                             .flatten()
                             .and_then(|lim| match &d.quality {
                                 DestinationQuality::Custom(q) => lim.recommendation_note(q.width, q.height, q.fps),
-                                DestinationQuality::SameAsMain => {
-                                    studio_cfg.and_then(|sv| lim.recommendation_note(sv.width, sv.height, sv.fps))
-                                }
+                                DestinationQuality::SameAsMain => studio_cfg.and_then(|sv| {
+                                    let (w, h, fps) = if d.canvas == Canvas::Vertical {
+                                        vert_for_resolve
+                                            .as_ref()
+                                            .map_or((1080, 1920, sv.fps), |v| (v.width, v.height, v.fps))
+                                    } else {
+                                        (sv.width, sv.height, sv.fps)
+                                    };
+                                    lim.recommendation_note(w, h, fps)
+                                }),
                             })
                     }),
                     quality: d.quality.clone(),
@@ -2157,7 +2230,14 @@ impl Engine {
                     .map(|(_, _, h)| (h.live().borrow().on, h.stats()))
                     .unwrap_or_default();
                 let gs_entry = cached_group_stats.as_ref().and_then(|v| v.get(&grp.id));
-                let dropped_frames = gs_entry.and_then(|v| v.get("dropped")).and_then(serde_json::Value::as_u64);
+                let sender_dropped: u64 =
+                    grp.members.iter().filter_map(|id| running_health.get(id).map(|h| h.dropped)).sum();
+                let engine_skipped =
+                    gs_entry.and_then(|v| v.get("engine_skipped")).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let gs_dropped = gs_entry.and_then(|v| v.get("dropped")).and_then(serde_json::Value::as_u64);
+                let dropped_frames = gs_dropped
+                    .map(|d| engine_skipped.saturating_add(d.max(sender_dropped)))
+                    .or_else(|| hub_live.then_some(engine_skipped.saturating_add(sender_dropped)));
                 let encode_ms = gs_entry.and_then(|v| v.get("encode_ms")).and_then(serde_json::Value::as_f64);
                 EncodeGroupView {
                     id: grp.id.clone(),
@@ -2417,17 +2497,38 @@ impl Engine {
         };
         let eff_cap = valid_bench.and_then(|b| b.max_sessions_ok).map_or(raw_cap, |m| m.min(raw_cap).max(1));
         let g = self.golive();
-        let (active_sessions, active_ids): (usize, std::collections::HashSet<GroupId>) = {
+        let (active_sessions, active_ids, main_shares_with_record): (usize, std::collections::HashSet<GroupId>, bool) = {
             let active = lock(&g.active_groups);
             let sessions = active.values().map(|spec| 1 + spec.extra_tracks.len()).sum();
             let ids = active.keys().cloned().collect();
-            (sessions, ids)
+            let sv = *lock(&g.studio_video);
+            let main_shares = info.record_shares_main
+                && active.get(GROUP_MAIN).is_some_and(|spec| {
+                    spec.extra_tracks.is_empty()
+                        && !spec.vod_track
+                        && sv.is_none_or(|c| {
+                            spec.key.width == c.canvas_width
+                                && spec.key.height == c.canvas_height
+                                && spec.key.fps == c.fps
+                        })
+                });
+            (sessions, ids, main_shares)
         };
         let running_extra = self.golive_group_senders().keys().filter(|id| !active_ids.contains(*id)).count();
         let live_main_fallback =
             usize::from(active_ids.is_empty() && running_extra == 0 && self.golive_stream_running());
+        let shares_legacy_main = info.record_shares_main
+            && active_ids.is_empty()
+            && live_main_fallback == 1
+            && !lock(&g.studio_video)
+                .is_some_and(|sv| sv.vod_track || sv.width != sv.canvas_width || sv.height != sv.canvas_height);
+        let record_extra = if info.record_shares_main && !main_shares_with_record && !shares_legacy_main {
+            info.record_extra_sessions.saturating_add(1)
+        } else {
+            info.record_extra_sessions
+        };
         let used_stream = u32::try_from((active_sessions + running_extra).max(live_main_fallback)).unwrap_or(u32::MAX);
-        used_stream.saturating_add(info.record_extra_sessions) >= eff_cap
+        used_stream.saturating_add(record_extra) >= eff_cap
     }
 
     /// Cancels any in-flight live quality switches (e.g. on Studio Stop).
@@ -2456,11 +2557,14 @@ impl Engine {
     /// Stops every Studio direct-Hub encode group owned by `GoLive` and clears dynamic hubs.
     pub(crate) async fn stop_all_studio_encode_groups(&self) {
         let g = self.golive();
+        let _reconcile = g.reconciling.lock().await;
         let _budget = g.switch_budget_lock.lock().await;
+        g.encode_groups_active.store(false, std::sync::atomic::Ordering::Release);
         let ids: Vec<GroupId> = lock(&g.active_groups).keys().cloned().collect();
         lock(&g.active_groups).clear();
         lock(&g.switching_groups).clear();
         lock(&g.switching_group_specs).clear();
+        lock(&g.uncommitted_switch_groups).clear();
         if let Ok(host) = self.studio_host() {
             for id in &ids {
                 if let Err(e) = host.stop_encode_group(id).await {
@@ -2490,6 +2594,8 @@ impl Engine {
             return Ok(None);
         }
         let g = self.golive();
+        let _reconcile_guard = g.reconciling.lock().await;
+        g.encode_groups_active.store(true, std::sync::atomic::Ordering::Release);
         let mut notes: Vec<String> = Vec::new();
         let mut started_any = false;
         let mut first_err: Option<String> = None;
@@ -2539,6 +2645,7 @@ impl Engine {
             }
         }
         if !started_any {
+            g.encode_groups_active.store(false, std::sync::atomic::Ordering::Release);
             if let Some(err) = first_err {
                 return Err(err);
             }
@@ -3047,46 +3154,37 @@ impl Engine {
     /// Running, it starts again on the stream it now takes; the Studio's lighter stream follows.
     pub async fn set_golive_light(&self, id: &str, on: bool) -> Result<GoLiveConfig, EngineError> {
         let studio = self.current_studio_cap_config().await;
-        let one_at_a_time = self.config_lock().await;
-        let mut cfg = self.golive_config();
-        let ignore = cfg.advanced.ignore_service_limits;
-        let d = cfg.destinations.iter_mut().find(|d| d.id == id).ok_or(EngineError::NotFound("destination"))?;
-        if on && d.canvas != Canvas::Main {
-            return Err(EngineError::Invalid("light: the vertical stream has no lighter copy.".into()));
-        }
-        if on && d.url.as_deref().and_then(direct_kind).is_some() {
-            return Err(EngineError::Invalid(
-                "light: SRT, RIST and WebRTC servers get the full stream from the Studio.".into(),
-            ));
-        }
-        if d.light == on && (!on || d.quality != DestinationQuality::SameAsMain) {
-            return Ok(cfg);
-        }
-        d.light = on;
-        d.quality = if on {
-            let limit = (!ignore && !(d.kind == Service::Twitch && d.enhanced))
-                .then(|| probe::platform_limit(d.kind, d.brand.as_deref(), d.canvas))
-                .flatten();
-            DestinationQuality::Custom(legacy_light_custom_quality(&studio.as_main_encode(), limit.as_ref(), ignore))
-        } else {
-            DestinationQuality::SameAsMain
-        };
-        // Off while live puts it on the full stream: that must fit as a new destination does.
-        let moved = d.clone();
-        if !on && moved.enabled && self.golive_stream_running() {
-            let now: Vec<DestinationConfig> = cfg.destinations.clone();
-            if let Some(why) = self.midstream_misfit(&now, &moved) {
-                return Err(refused("golive_needs_new_encode", why, "Stop and start the stream again to change it."));
+        let target_quality = {
+            let cfg = self.golive_config();
+            let ignore = cfg.advanced.ignore_service_limits;
+            let d = cfg.destinations.iter().find(|d| d.id == id).ok_or(EngineError::NotFound("destination"))?;
+            if on && d.canvas != Canvas::Main {
+                return Err(EngineError::Invalid("light: the vertical stream has no lighter copy.".into()));
             }
-        }
-        self.save_golive(cfg.clone()).await?;
-        drop(one_at_a_time);
-        let old = lock(&self.golive().running).remove(id);
-        if let Some(old) = old {
-            stop_and_drain_running(old).await;
-        }
-        self.reconcile_midstream().await;
-        Ok(cfg)
+            if on && d.url.as_deref().and_then(direct_kind).is_some() {
+                return Err(refused(
+                    "golive_quality_locked",
+                    "SRT, RIST and WebRTC servers get the full stream from the Studio.",
+                    "Direct servers always forward your main stream.",
+                ));
+            }
+            if d.light == on && (!on || d.quality != DestinationQuality::SameAsMain) {
+                return Ok(cfg);
+            }
+            if on {
+                let limit = (!ignore && !(d.kind == Service::Twitch && d.enhanced))
+                    .then(|| probe::platform_limit(d.kind, d.brand.as_deref(), d.canvas))
+                    .flatten();
+                DestinationQuality::Custom(legacy_light_custom_quality(
+                    &studio.as_main_encode(),
+                    limit.as_ref(),
+                    ignore,
+                ))
+            } else {
+                DestinationQuality::SameAsMain
+            }
+        };
+        self.set_golive_quality_inner(id, target_quality, Some(on)).await
     }
 
     /// Sets per-destination stream quality (`same_as_main` or explicit `custom` encode settings).
@@ -3094,31 +3192,47 @@ impl Engine {
     /// forwarder live until the target hub emits its first IDR keyframe (with timeout + Stop cancellation),
     /// atomically swaps only this destination's forwarder, and stops the old encode group once refcount reaches 0.
     pub async fn set_golive_quality(&self, id: &str, quality: DestinationQuality) -> Result<GoLiveConfig, EngineError> {
+        self.set_golive_quality_inner(id, quality, None).await
+    }
+
+    async fn set_golive_quality_inner(
+        &self,
+        id: &str,
+        quality: DestinationQuality,
+        legacy_light: Option<bool>,
+    ) -> Result<GoLiveConfig, EngineError> {
+        let target_light = legacy_light.unwrap_or(false);
         let studio = self.current_studio_cap_config().await;
         let initial_budget = self.refresh_pc_budget().await;
         let host_info = self.cached_host_budget_info();
         let host_vert = host_info.as_ref().and_then(|i| i.vertical_size);
         let cfg_snapshot = {
             let _one_at_a_time = self.config_lock().await;
-            let mut cfg = self.golive_config();
+            let cfg_before = self.golive_config();
+            let mut cfg = cfg_before.clone();
             let ignore = cfg.advanced.ignore_service_limits;
             let vertical_cut = cfg.vertical_source == VerticalSource::Cut;
             let d = cfg.destinations.iter_mut().find(|d| d.id == id).ok_or(EngineError::NotFound("destination"))?;
             if let DestinationQuality::Custom(ref q) = quality {
                 if d.url.as_deref().and_then(direct_kind).is_some() {
-                    return Err(EngineError::Invalid(
-                        "quality: SRT, RIST and WebRTC servers get the full stream from the Studio.".into(),
+                    return Err(refused(
+                        "golive_quality_locked",
+                        "SRT, RIST and WebRTC servers get the full stream from the Studio.",
+                        "Direct servers always forward your main stream.",
                     ));
                 }
                 if d.kind == Service::Twitch && d.enhanced && d.canvas == Canvas::Main {
-                    return Err(EngineError::Invalid(
-                        "quality: turn off Twitch Enhanced Broadcasting before choosing a custom quality.".into(),
+                    return Err(refused(
+                        "golive_quality_locked",
+                        "Turn off Twitch Enhanced Broadcasting before choosing a custom quality.",
+                        "Turn off Enhanced Broadcasting in Go live, then pick a custom quality.",
                     ));
                 }
                 if d.canvas == Canvas::Vertical && vertical_cut {
-                    return Err(EngineError::Invalid(
-                        "quality: custom vertical quality requires a Vertical scene source instead of Cut-from-stream."
-                            .into(),
+                    return Err(refused(
+                        "golive_quality_locked",
+                        "Custom vertical quality requires a Vertical scene source instead of Cut-from-stream.",
+                        "Switch Vertical source to Canvas to set custom vertical quality.",
                     ));
                 }
                 if let Some(codec) = q.codec {
@@ -3127,15 +3241,22 @@ impl Engine {
                         VideoCodec::H264 => {}
                         VideoCodec::Hevc if supports_hevc => {}
                         VideoCodec::Hevc => {
-                            return Err(EngineError::Invalid(
-                                "quality: HEVC custom destination encoding requires macOS VideoToolbox; choose H.264."
-                                    .into(),
+                            return Err(refused(
+                                "golive_quality_locked",
+                                "HEVC custom destination encoding requires macOS VideoToolbox; choose H.264.",
+                                "Choose H.264 for custom destination quality on this host.",
                             ));
                         }
-                        VideoCodec::Av1 | VideoCodec::Vp9 => {
+                        VideoCodec::Av1 => {
+                            return Err(refused(
+                                "golive_quality_locked",
+                                "AV1 destination encoding is not supported yet; choose H.264 or HEVC (on macOS).",
+                                "Choose H.264 or HEVC (on macOS).",
+                            ));
+                        }
+                        VideoCodec::Vp9 => {
                             return Err(EngineError::Invalid(
-                                "quality: AV1 and VP9 destination encoding are not supported yet; choose H.264 or HEVC (on macOS)."
-                                    .into(),
+                                "quality: VP9 destination encoding is not supported; choose H.264 or HEVC.".into(),
                             ));
                         }
                     }
@@ -3149,26 +3270,44 @@ impl Engine {
                 let limit = (!ignore && !(d.kind == Service::Twitch && d.enhanced))
                     .then(|| probe::platform_limit(d.kind, d.brand.as_deref(), d.canvas))
                     .flatten();
-                q.validate(d.canvas, canvas_w, canvas_h, canvas_fps, limit.as_ref(), ignore)
-                    .map_err(|e| EngineError::Invalid(format!("quality: {e}")))?;
+                q.validate_typed(d.canvas, canvas_w, canvas_h, canvas_fps, limit.as_ref(), ignore).map_err(|e| match e {
+                    probe::CustomQualityError::Field(msg) => EngineError::Invalid(format!("quality: {msg}")),
+                    probe::CustomQualityError::PlatformLimit(msg) => refused(
+                        "platform_limit_exceeded",
+                        msg,
+                        "Choose a lower quality within this platform's limit, or enable Ignore service limits in Advanced settings.",
+                    ),
+                })?;
             }
-            if d.quality == quality && !d.light {
+            if d.quality == quality && d.light == target_light {
                 return Ok(cfg);
             }
             d.quality = quality.clone();
-            d.light = false;
+            d.light = target_light;
             let moved = d.clone();
             let failing = lock(&self.golive().backup).failing.clone();
             let sends_now = moved.enabled || destination_sends(&cfg, &failing, &moved);
             let live_active = self.golive_stream_running() && sends_now;
             if !live_active {
                 if sends_now && matches!(quality, DestinationQuality::Custom(_)) {
+                    let before_plan = crate::golive_plan::plan_encodes(&self.planner_input_for(
+                        &cfg_before,
+                        &studio,
+                        initial_budget.clone(),
+                    ));
                     let mut planner_in = self.planner_input_for(&cfg, &studio, initial_budget.clone());
                     if let Some(pd) = planner_in.destinations.iter_mut().find(|x| x.id == id) {
                         pd.route_light = false;
                     }
                     let plan = crate::golive_plan::plan_encodes(&planner_in);
-                    if plan.budget.status == crate::golive_plan::BudgetStatus::Over {
+                    let shares_existing = plan.destinations.get(id).is_some_and(|new_pd| {
+                        before_plan
+                            .groups
+                            .iter()
+                            .any(|grp| grp.id == new_pd.group_id && grp.members.iter().any(|m| m != id))
+                            || before_plan.destinations.get(id).is_some_and(|old_pd| old_pd.group_id == new_pd.group_id)
+                    });
+                    if !shares_existing && plan.budget.status == crate::golive_plan::BudgetStatus::Over {
                         return Err(refused(
                             "encode_budget_exceeded",
                             plan.budget
@@ -3226,8 +3365,15 @@ impl Engine {
 
         let budget = self.refresh_pc_budget().await;
         let old_group_id = lock(&g.running).get(id).map(|r| r.group_id.clone());
+        let is_dest_sending = |cfg: &GoLiveConfig| {
+            let failing = lock(&g.backup).failing.clone();
+            cfg.destinations
+                .iter()
+                .find(|d| d.id == id)
+                .is_some_and(|d| d.enabled || destination_sends(cfg, &failing, d))
+        };
 
-        let (target_group_id, target_hub, idr_baseline, started_here, moved_after_budget) = {
+        let (target_group_id, target_hub, idr_baseline, moved_after_budget) = {
             let _budget_guard = g.switch_budget_lock.lock().await;
             if *cancel_rx.borrow() || !g.studio_live.load(std::sync::atomic::Ordering::Acquire) {
                 return Err(refused(
@@ -3237,15 +3383,22 @@ impl Engine {
                 ));
             }
             let mut cfg_live = self.golive_config();
-            let Some(moved_now) = cfg_live.destinations.iter_mut().find(|d| d.id == id && d.enabled) else {
+            if !is_dest_sending(&cfg_live) {
                 return Err(refused(
                     "golive_switch_cancelled",
                     "The destination was disabled before the quality switch completed.",
                     "Enable the destination again before switching its quality.",
                 ));
+            }
+            let Some(moved_now) = cfg_live.destinations.iter_mut().find(|d| d.id == id) else {
+                return Err(refused(
+                    "golive_switch_cancelled",
+                    "The destination was removed before the quality switch completed.",
+                    "Re-add the destination before switching its quality.",
+                ));
             };
             moved_now.quality = quality.clone();
-            moved_now.light = false;
+            moved_now.light = target_light;
             let moved_snapshot = moved_now.clone();
 
             let mut planner_in = self.planner_input_for(&cfg_live, &studio, budget.clone());
@@ -3253,17 +3406,23 @@ impl Engine {
             if let Some(pd) = planner_in.destinations.iter_mut().find(|d| d.id == id) {
                 pd.route_light = false;
             }
-            let preliminary = crate::golive_plan::plan_encodes(&planner_in);
-            let pending_specs: Vec<_> = lock(&g.switching_group_specs).values().cloned().collect();
-            for spec in &pending_specs {
-                if !preliminary.groups.iter().any(|grp| grp.id == spec.id) {
-                    planner_in.budget.extra_sessions = planner_in.budget.extra_sessions.saturating_add(1);
-                    planner_in.budget.extra_mpx_s +=
-                        f64::from(spec.key.width) * f64::from(spec.key.height) * f64::from(spec.key.fps) / 1e6;
-                }
+            let plan = crate::golive_plan::plan_encodes(&planner_in);
+
+            let running_peers: Vec<(String, GroupId)> = lock(&g.running)
+                .iter()
+                .filter(|(oid, _)| oid.as_str() != id)
+                .map(|(oid, r)| (oid.clone(), r.group_id.clone()))
+                .collect();
+            if running_peers
+                .iter()
+                .any(|(oid, prev_gid)| plan.destinations.get(oid).is_some_and(|pd| pd.group_id != *prev_gid))
+            {
+                return Err(refused(
+                    "encode_budget_exceeded",
+                    "Changing to that quality now would move or restart another live destination.",
+                    "Lower main quality, pick a quality shared with another destination, or stop and restart the stream.",
+                ));
             }
-            let plan =
-                if pending_specs.is_empty() { preliminary } else { crate::golive_plan::plan_encodes(&planner_in) };
 
             let target_group_id = plan.destinations.get(id).map_or_else(
                 || match moved_snapshot.canvas {
@@ -3301,17 +3460,35 @@ impl Engine {
                 ));
             }
 
+            let mut overlap_specs: Vec<crate::studio_host::EncodeGroupSpec> =
+                lock(&g.active_groups).values().cloned().collect();
+            for spec in lock(&g.switching_group_specs).values() {
+                if !overlap_specs.iter().any(|s| s.id == spec.id) {
+                    overlap_specs.push(spec.clone());
+                }
+            }
             let target_active = lock(&g.active_groups).contains_key(&target_group_id);
             let target_reserved = lock(&g.switching_group_specs).contains_key(&target_group_id);
-            if !target_active && !target_reserved && plan.budget.status == crate::golive_plan::BudgetStatus::Over {
-                return Err(refused(
-                    "encode_budget_exceeded",
-                    plan.budget
+            if !target_active && !target_reserved {
+                let overlap = crate::golive_plan::evaluate_plan_with_extra_groups(
+                    &plan,
+                    &planner_in.main,
+                    &planner_in.budget,
+                    &overlap_specs,
+                );
+                if plan.budget.status == crate::golive_plan::BudgetStatus::Over
+                    || overlap.status == crate::golive_plan::BudgetStatus::Over
+                {
+                    let note = overlap
                         .note
-                        .clone()
-                        .unwrap_or_else(|| "This quality would exceed your computer's encode limit.".into()),
-                    "Lower main quality or keep more destinations on Same as main.",
-                ));
+                        .or_else(|| plan.budget.note.clone())
+                        .unwrap_or_else(|| "This quality would exceed your computer's encode limit.".into());
+                    return Err(refused(
+                        "encode_budget_exceeded",
+                        note,
+                        "Lower main quality or keep more destinations on Same as main.",
+                    ));
+                }
             }
 
             let target_hub = g.ensure_hub(&target_group_id, moved_snapshot.canvas);
@@ -3319,14 +3496,12 @@ impl Engine {
             guard.held_group = Some(target_group_id.clone());
 
             let baseline = target_hub.encoded_idr_count();
-            let started_here = if target_active || target_hub.live().borrow().on {
-                None
-            } else {
+            if !(target_active || target_hub.live().borrow().on) {
                 let host = self.studio_host()?;
                 match host.start_encode_group(target_spec.clone(), target_hub.clone()).await {
                     Ok(true) => {
                         lock(&g.active_groups).insert(target_group_id.clone(), target_spec.clone());
-                        Some(target_group_id.clone())
+                        lock(&g.uncommitted_switch_groups).insert(target_group_id.clone());
                     }
                     Ok(false) => {
                         g.end_and_remove_hub(&target_group_id);
@@ -3341,17 +3516,20 @@ impl Engine {
                         return Err(crate::studio_host::failed(e));
                     }
                 }
-            };
-            (target_group_id, target_hub, baseline, started_here, moved_snapshot)
+            }
+            (target_group_id, target_hub, baseline, moved_snapshot)
         };
         let _ = cfg_snapshot;
 
         let wait_res = await_hub_idr(&target_hub, idr_baseline, &mut cancel_rx, timeout).await;
         let gen_current = lock(&g.switch_gen).get(id).copied() == Some(my_gen);
         let live_still = g.studio_live.load(std::sync::atomic::Ordering::Acquire);
-        let dest_still_on = self.golive_config().destinations.iter().any(|d| d.id == id && d.enabled);
+        let dest_still_on = is_dest_sending(&self.golive_config());
         if wait_res.is_err() || *cancel_rx.borrow() || !gen_current || !live_still || !dest_still_on {
-            self.cleanup_failed_switch_group(started_here.as_deref()).await;
+            if let Some(gid) = guard.held_group.take() {
+                g.release_switching_group(&gid);
+            }
+            self.cleanup_failed_switch_group(&target_group_id).await;
             return match wait_res {
                 Err(SwitchWaitError::Cancelled) => Err(refused(
                     "golive_switch_cancelled",
@@ -3380,7 +3558,10 @@ impl Engine {
         let dest = match self.resolve(&moved_after_budget).await {
             Ok(d) => d,
             Err(why) => {
-                self.cleanup_failed_switch_group(started_here.as_deref()).await;
+                if let Some(gid) = guard.held_group.take() {
+                    g.release_switching_group(&gid);
+                }
+                self.cleanup_failed_switch_group(&target_group_id).await;
                 return Err(refused(
                     "golive_dest_error",
                     format!("{} couldn't reconnect with the new quality: {why}", dest_name(&moved_after_budget)),
@@ -3392,8 +3573,8 @@ impl Engine {
         // Persist the new quality while re-checking stream and destination state. Lock drops before any await.
         let save_res = {
             let _one_at_a_time = self.config_lock().await;
-            let mut cfg = self.golive_config();
-            let dest_active = cfg.destinations.iter().any(|d| d.id == id && d.enabled);
+            let cfg = self.golive_config();
+            let dest_active = is_dest_sending(&cfg);
             if *cancel_rx.borrow() || !g.studio_live.load(std::sync::atomic::Ordering::Acquire) || !dest_active {
                 Err(refused(
                     "golive_switch_cancelled",
@@ -3401,9 +3582,10 @@ impl Engine {
                     "Start streaming again to apply the new quality.",
                 ))
             } else {
+                let mut cfg = cfg;
                 if let Some(d) = cfg.destinations.iter_mut().find(|d| d.id == id) {
                     d.quality = quality;
-                    d.light = false;
+                    d.light = target_light;
                 }
                 self.save_golive(cfg.clone()).await.map(|()| cfg)
             }
@@ -3411,7 +3593,10 @@ impl Engine {
         let final_cfg = match save_res {
             Ok(cfg) => cfg,
             Err(e) => {
-                self.cleanup_failed_switch_group(started_here.as_deref()).await;
+                if let Some(gid) = guard.held_group.take() {
+                    g.release_switching_group(&gid);
+                }
+                self.cleanup_failed_switch_group(&target_group_id).await;
                 return Err(e);
             }
         };
@@ -3425,9 +3610,12 @@ impl Engine {
         }
         let still_valid = !*cancel_rx.borrow()
             && g.studio_live.load(std::sync::atomic::Ordering::Acquire)
-            && self.golive_config().destinations.iter().any(|d| d.id == id && d.enabled);
+            && is_dest_sending(&self.golive_config());
         if !still_valid {
-            self.cleanup_failed_switch_group(started_here.as_deref()).await;
+            if let Some(gid) = guard.held_group.take() {
+                g.release_switching_group(&gid);
+            }
+            self.cleanup_failed_switch_group(&target_group_id).await;
             return Err(refused(
                 "golive_switch_cancelled",
                 "The destination was disabled before connecting at the new quality.",
@@ -3435,6 +3623,8 @@ impl Engine {
             ));
         }
 
+        lock(&g.paused).remove(id);
+        lock(&g.protector).release(id);
         lock(&g.blocked).remove(id);
         lock(&g.failed).remove(id);
         lock(&g.failed_alerted).remove(id);
@@ -3456,10 +3646,20 @@ impl Engine {
             stop_rx,
             Some(other_rx),
         ));
-        lock(&g.running).insert(
+        if let Some(prev) = lock(&g.running).insert(
             id.to_string(),
-            Running { stop, health, group_id: target_group_id.clone(), light: false, task: Some(handle), other_live },
-        );
+            Running {
+                stop,
+                health,
+                group_id: target_group_id.clone(),
+                light: target_light,
+                task: Some(handle),
+                other_live,
+            },
+        ) {
+            prev.stop.send_replace(true);
+        }
+        lock(&g.uncommitted_switch_groups).remove(&target_group_id);
         g.sync_other_live();
         lock(&g.switch_gen).remove(id);
 
@@ -3475,13 +3675,18 @@ impl Engine {
         Ok(final_cfg)
     }
 
-    async fn cleanup_failed_switch_group(&self, started_here: Option<&str>) {
-        let Some(gid) = started_here else { return };
+    async fn cleanup_failed_switch_group(&self, gid: &str) {
         let g = self.golive();
-        let still_used = lock(&g.running).values().any(|r| r.group_id == gid);
+        let _budget_guard = g.switch_budget_lock.lock().await;
+        if !lock(&g.uncommitted_switch_groups).contains(gid) {
+            return;
+        }
+        let still_used =
+            lock(&g.running).values().any(|r| r.group_id == gid) || lock(&g.switching_groups).contains_key(gid);
         if still_used {
             return;
         }
+        lock(&g.uncommitted_switch_groups).remove(gid);
         lock(&g.active_groups).remove(gid);
         if let Ok(host) = self.studio_host() {
             let _ = host.abort_encode_group(gid).await;
@@ -3591,6 +3796,7 @@ impl Engine {
             d.enhanced = on;
             self.save_golive(cfg.clone()).await?;
         }
+        drop(_one_at_a_time);
         // It takes effect the next time the Studio starts streaming: a running stream's encoder
         // is shared by every output and isn't reshaped for it.
         if !self.golive_stream_running() {
@@ -4552,10 +4758,12 @@ impl Engine {
             }
         });
         let (other_live, _) = watch::channel(false);
-        lock(&g.running).insert(
+        if let Some(prev) = lock(&g.running).insert(
             d.id.clone(),
             Running { stop, health, group_id: GROUP_MAIN.to_string(), light: false, task: None, other_live },
-        );
+        ) {
+            prev.stop.send_replace(true);
+        }
         g.sync_other_live();
     }
 
@@ -5152,7 +5360,18 @@ impl Engine {
         let eb_spec = lock(&g.enhanced).as_ref().and_then(|p| TwitchEbSpec::from_plan(p, &main_encode));
 
         let failing = lock(&g.backup).failing.clone();
-        let active_group_ids: HashSet<GroupId> = lock(&g.active_groups).keys().cloned().collect();
+        let active_group_specs: Vec<crate::studio_host::EncodeGroupSpec> = {
+            let mut specs: Vec<_> = lock(&g.active_groups).values().cloned().collect();
+            for spec in lock(&g.switching_group_specs).values() {
+                if !specs.iter().any(|s| s.id == spec.id) {
+                    specs.push(spec.clone());
+                }
+            }
+            specs
+        };
+        let active_group_ids: HashSet<GroupId> = active_group_specs.iter().map(|s| s.id.clone()).collect();
+        let running_groups: Vec<(String, GroupId)> =
+            lock(&g.running).iter().map(|(oid, r)| (oid.clone(), r.group_id.clone())).collect();
         let live_main_spec = lock(&g.active_groups).get(GROUP_MAIN).cloned();
         let supports_hevc = host_info.as_ref().map_or(cfg!(target_os = "macos"), |i| i.os == "macos");
         let ignore_global = cfg.advanced.ignore_service_limits;
@@ -5233,20 +5452,22 @@ impl Engine {
                 }
             });
 
-            let mut options = Vec::new();
-            let same_sim = simulate_quality_option(
-                d,
-                &DestinationQuality::SameAsMain,
-                &planner_in,
-                &base_plan,
+            let sim_ctx = QualitySimContext {
+                base_input: &planner_in,
+                base_plan: &base_plan,
                 studio_live,
-                &active_group_ids,
-                live_main_spec.as_ref(),
-                locked_reason.as_deref(),
+                active_group_ids: &active_group_ids,
+                active_group_specs: &active_group_specs,
+                running_groups: &running_groups,
+                live_main_spec: live_main_spec.as_ref(),
+                locked_reason: locked_reason.as_deref(),
                 obs_live_locked,
-                lim.as_ref(),
+                sends_now: sends,
+                lim: lim.as_ref(),
                 ignore_dest,
-            );
+            };
+            let mut options = Vec::new();
+            let same_sim = simulate_quality_option(d, &DestinationQuality::SameAsMain, &sim_ctx);
             let same_label = if is_eb {
                 "Twitch Enhanced Broadcasting (Auto)".to_string()
             } else {
@@ -5338,29 +5559,26 @@ impl Engine {
                 let mut rec_marked = !same_has_soft_note;
                 for rung in valid_rungs {
                     let q = DestinationQuality::Custom(rung.clone());
-                    let sim = simulate_quality_option(
-                        d,
-                        &q,
-                        &planner_in,
-                        &base_plan,
-                        studio_live,
-                        &active_group_ids,
-                        live_main_spec.as_ref(),
-                        locked_reason.as_deref(),
-                        obs_live_locked,
-                        lim.as_ref(),
-                        ignore_dest,
-                    );
-                    let id = if d.canvas == Canvas::Vertical {
+                    let sim = simulate_quality_option(d, &q, &sim_ctx);
+                    let eff_codec = rung.codec.unwrap_or(primary_codec);
+                    let is_16_9 = rung.width * 9 == rung.height * 16;
+                    let base_id = if d.canvas == Canvas::Vertical || !is_16_9 {
                         format!("{}x{}p{}_{}", rung.width, rung.height, rung.fps, rung.kbps)
                     } else {
                         format!("{}p{}_{}", rung.height, rung.fps, rung.kbps)
                     };
-                    let codec_suffix = if rung.codec.is_some_and(|c| c != VideoCodec::H264 && codecs.len() > 1) {
-                        " · HEVC"
+                    let id = if codecs.len() > 1 || eff_codec != VideoCodec::H264 {
+                        let codec_id = match eff_codec {
+                            VideoCodec::H264 => "h264",
+                            VideoCodec::Hevc => "hevc",
+                            VideoCodec::Av1 => "av1",
+                            VideoCodec::Vp9 => "vp9",
+                        };
+                        format!("{base_id}_{codec_id}")
                     } else {
-                        ""
+                        base_id
                     };
+                    let codec_suffix = if eff_codec != VideoCodec::H264 && codecs.len() > 1 { " · HEVC" } else { "" };
                     let label = format!(
                         "{} · {}{codec_suffix}",
                         probe::format_res_fps(rung.width, rung.height, rung.fps),
@@ -5421,22 +5639,28 @@ struct SimulatedQualityOption {
     disabled_reason: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
+struct QualitySimContext<'a> {
+    base_input: &'a PlannerInput,
+    base_plan: &'a EncodePlan,
+    studio_live: bool,
+    active_group_ids: &'a std::collections::HashSet<GroupId>,
+    active_group_specs: &'a [crate::studio_host::EncodeGroupSpec],
+    running_groups: &'a [(String, GroupId)],
+    live_main_spec: Option<&'a crate::studio_host::EncodeGroupSpec>,
+    locked_reason: Option<&'a str>,
+    obs_live_locked: bool,
+    sends_now: bool,
+    lim: Option<&'a PlatformLimit>,
+    ignore_dest: bool,
+}
+
 fn simulate_quality_option(
     d: &DestinationConfig,
     candidate: &DestinationQuality,
-    base_input: &PlannerInput,
-    base_plan: &EncodePlan,
-    studio_live: bool,
-    active_group_ids: &std::collections::HashSet<GroupId>,
-    live_main_spec: Option<&crate::studio_host::EncodeGroupSpec>,
-    locked_reason: Option<&str>,
-    obs_live_locked: bool,
-    lim: Option<&PlatformLimit>,
-    ignore_dest: bool,
+    ctx: &QualitySimContext<'_>,
 ) -> SimulatedQualityOption {
-    let mut sim_in = base_input.clone();
-    let was_active = base_plan.destinations.contains_key(&d.id);
+    let mut sim_in = ctx.base_input.clone();
+    let was_active = ctx.base_plan.destinations.contains_key(&d.id);
     if let Some(pd) = sim_in.destinations.iter_mut().find(|x| x.id == d.id) {
         pd.quality = candidate.clone();
         pd.light = false;
@@ -5449,13 +5673,13 @@ fn simulate_quality_option(
     }
     let sim_plan = plan_encodes(&sim_in);
     let sim_pd = sim_plan.destinations.get(&d.id);
-    let key = sim_pd.map_or_else(|| base_input.main.as_key(), |p| p.key.clone());
+    let key = sim_pd.map_or_else(|| ctx.base_input.main.as_key(), |p| p.key.clone());
     let group_id = sim_pd.map_or_else(|| GROUP_MAIN.to_string(), |p| p.group_id.clone());
     let auto_fitted = sim_pd.is_some_and(|p| p.auto_fitted);
     let note = if let Some(pd_note) = sim_pd.and_then(|p| p.note.clone()) {
         Some(pd_note)
-    } else if !ignore_dest {
-        lim.and_then(|l| l.recommendation_note(key.width, key.height, key.fps))
+    } else if !ctx.ignore_dest {
+        ctx.lim.and_then(|l| l.recommendation_note(key.width, key.height, key.fps))
     } else {
         None
     };
@@ -5463,26 +5687,62 @@ fn simulate_quality_option(
 
     let mut allowed = true;
     let mut disabled_reason = None;
-    if let Some(lock_msg) = locked_reason {
-        let disallowed_by_lock =
-            if obs_live_locked { *candidate != d.quality } else { matches!(candidate, DestinationQuality::Custom(_)) };
+    if let Some(lock_msg) = ctx.locked_reason {
+        let disallowed_by_lock = if ctx.obs_live_locked {
+            *candidate != d.quality
+        } else {
+            matches!(candidate, DestinationQuality::Custom(_))
+        };
         if disallowed_by_lock {
             allowed = false;
             disabled_reason = Some(lock_msg.to_string());
         }
     }
 
-    if allowed && matches!(candidate, DestinationQuality::Custom(_)) {
-        let shares_existing = base_plan.groups.iter().any(|g| g.id == group_id && g.members.iter().any(|m| m != &d.id));
-        let group_already_running = studio_live && active_group_ids.contains(&group_id);
-        if studio_live
-            && let Some(main_spec) = live_main_spec
+    let is_live_dest = ctx.studio_live && ctx.sends_now;
+    if allowed && (is_live_dest || matches!(candidate, DestinationQuality::Custom(_))) {
+        let shares_existing =
+            ctx.base_plan.groups.iter().any(|g| g.id == group_id && g.members.iter().any(|m| m != &d.id))
+                || ctx.base_plan.destinations.get(&d.id).is_some_and(|old_pd| old_pd.group_id == group_id);
+        let group_already_running = is_live_dest && ctx.active_group_ids.contains(&group_id);
+        let peer_disrupted = is_live_dest
+            && ctx
+                .running_groups
+                .iter()
+                .filter(|(oid, _)| oid != &d.id)
+                .any(|(oid, prev_gid)| sim_plan.destinations.get(oid).is_some_and(|pd| pd.group_id != *prev_gid));
+        if peer_disrupted {
+            allowed = false;
+            disabled_reason =
+                Some("Changing to that quality now would move or restart another live destination.".into());
+        } else if is_live_dest
+            && let Some(main_spec) = ctx.live_main_spec
             && (sim_pd.is_some_and(|p| p.shared_cap_fallback)
                 || (group_id == GROUP_MAIN && main_spec.key != key && !group_already_running))
         {
             allowed = false;
             disabled_reason = Some("Changing to that quality now would restart the main stream.".into());
-        } else if !group_already_running && !shares_existing && sim_plan.budget.status == BudgetStatus::Over {
+        } else if is_live_dest && !group_already_running {
+            let overlap = crate::golive_plan::evaluate_plan_with_extra_groups(
+                &sim_plan,
+                &sim_in.main,
+                &sim_in.budget,
+                ctx.active_group_specs,
+            );
+            if sim_plan.budget.status == BudgetStatus::Over || overlap.status == BudgetStatus::Over {
+                allowed = false;
+                disabled_reason = Some(
+                    overlap
+                        .note
+                        .or_else(|| sim_plan.budget.note.clone())
+                        .unwrap_or_else(|| "Exceeds your computer's encode budget.".into()),
+                );
+            }
+        } else if !is_live_dest
+            && matches!(candidate, DestinationQuality::Custom(_))
+            && !shares_existing
+            && sim_plan.budget.status == BudgetStatus::Over
+        {
             allowed = false;
             disabled_reason =
                 Some(sim_plan.budget.note.clone().unwrap_or_else(|| "Exceeds your computer's encode budget.".into()));
@@ -5731,6 +5991,7 @@ pub(crate) async fn run(engine: Engine) {
             }
             if !now_any && was_any {
                 g.studio_live.store(false, std::sync::atomic::Ordering::Release);
+                g.encode_groups_active.store(false, std::sync::atomic::Ordering::Release);
                 *lock(&g.applied_cap) = None;
                 *lock(&g.applied_limit) = None;
             }
