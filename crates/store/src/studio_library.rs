@@ -255,6 +255,16 @@ pub fn headless_shelf_list(data: &Path, kind: &str) -> Result<Value, String> {
     Ok(json!(load(data).shelf(kind)))
 }
 
+fn load_shelf_doc(path: &Path, kind: Kind) -> Result<Option<Value>, String> {
+    if let Some(loaded) = durable::load_json_with_backup::<Value>(path, |v| v.is_object()) {
+        return Ok(Some(loaded.value));
+    }
+    if path.exists() || durable::backup_path(path).exists() {
+        return Err(format!("Couldn't read the {} file cleanly.", kind.noun()));
+    }
+    Ok(None)
+}
+
 pub fn headless_shelf_new(data: &Path, kind_str: &str, name: &str, copy: bool) -> Result<Value, String> {
     let kind = Kind::parse(kind_str).ok_or_else(|| "kind: collections or profiles.".to_string())?;
     let name = check_name(name)?;
@@ -266,16 +276,23 @@ pub fn headless_shelf_new(data: &Path, kind_str: &str, name: &str, copy: bool) -
     let to = file(data, kind, &id);
     if copy {
         let from = lib.current_file(data, kind);
-        if let Ok(bytes) = std::fs::read(&from) {
+        if let Some(mut doc) = load_shelf_doc(&from, kind)? {
             if let Some(p) = to.parent() {
                 std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
             }
-            if let Ok(mut doc) = serde_json::from_slice::<Value>(&bytes) {
-                if kind == Kind::Collections {
-                    doc["name"] = json!(name);
-                }
-                durable::save_json_pretty(&to, &doc).map_err(|e| e.to_string())?;
+            if kind == Kind::Collections {
+                doc["name"] = json!(name);
             }
+            durable::save_json_pretty(&to, &doc).map_err(|e| e.to_string())?;
+        } else if kind == Kind::Collections {
+            if let Some(p) = to.parent() {
+                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            durable::save_json_pretty(
+                &to,
+                &json!({ "name": name, "current_scene": "Main", "current_program_scene": "Main", "sources": [] }),
+            )
+            .map_err(|e| e.to_string())?;
         }
     } else if kind == Kind::Collections {
         if let Some(p) = to.parent() {
@@ -347,10 +364,7 @@ pub fn headless_shelf_export(data: &Path, kind_str: &str, id: &str) -> Result<Va
         return Err(format!("There's no {} with the id \"{id}\".", kind.noun()));
     }
     let path = file(data, kind, id);
-    let doc = durable::read_patiently(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .unwrap_or_else(|| json!({}));
+    let doc = load_shelf_doc(&path, kind)?.unwrap_or_else(|| json!({}));
     Ok(doc)
 }
 
@@ -458,5 +472,54 @@ mod tests {
         assert_eq!(restored, "untitled");
         assert!(!file(dir.path(), Kind::Collections, &id).exists());
         assert_eq!(load(dir.path()).collections.current, "untitled");
+    }
+
+    #[test]
+    fn headless_copy_and_export_recover_from_backup_and_reject_corrupt_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lib = load(dir.path());
+        settle();
+
+        let current_col = file(dir.path(), Kind::Collections, "untitled");
+        let v1_col = json!({
+            "name": "Untitled",
+            "current_scene": "Main",
+            "current_program_scene": "Main",
+            "sources": [{ "id": "cam-1" }]
+        });
+        let v2_col = json!({
+            "name": "Untitled",
+            "current_scene": "Main",
+            "current_program_scene": "Main",
+            "sources": [{ "id": "cam-2" }]
+        });
+        durable::save_json_pretty(&current_col, &v1_col).unwrap();
+        durable::save_json_pretty(&current_col, &v2_col).unwrap();
+        std::fs::write(&current_col, b"{truncated").unwrap();
+
+        let copied = headless_shelf_new(dir.path(), "collections", "Copied Show", true).unwrap();
+        let copied_id = copied["id"].as_str().unwrap();
+        let exported_copy = headless_shelf_export(dir.path(), "collections", copied_id).unwrap();
+        assert_eq!(exported_copy["sources"][0]["id"], "cam-1");
+        assert_eq!(exported_copy["name"], "Copied Show");
+
+        let current_prof = file(dir.path(), Kind::Profiles, "untitled");
+        durable::save_json_pretty(&current_prof, &json!({ "fps": 30, "video_kbps": 4500 })).unwrap();
+        durable::save_json_pretty(&current_prof, &json!({ "fps": 60, "video_kbps": 8000 })).unwrap();
+        std::fs::write(&current_prof, b"not json").unwrap();
+
+        let exported_prof = headless_shelf_export(dir.path(), "profiles", "untitled").unwrap();
+        assert_eq!(exported_prof["fps"], 30);
+        assert_eq!(exported_prof["video_kbps"], 4500);
+
+        let copied_prof = headless_shelf_new(dir.path(), "profiles", "Backup Profile", true).unwrap();
+        let copied_prof_id = copied_prof["id"].as_str().unwrap();
+        let exported_copied_prof = headless_shelf_export(dir.path(), "profiles", copied_prof_id).unwrap();
+        assert_eq!(exported_copied_prof["fps"], 30);
+
+        // If both primary and backup are missing/corrupt, fail instead of returning empty objects.
+        std::fs::write(&current_prof, b"bad").unwrap();
+        let _ = std::fs::remove_file(durable::backup_path(&current_prof));
+        assert!(headless_shelf_export(dir.path(), "profiles", "untitled").is_err());
     }
 }
