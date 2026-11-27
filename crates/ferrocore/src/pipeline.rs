@@ -2720,7 +2720,9 @@ mod bframe_tests {
         tags.extend(pipe.audio(&pre_audio, start_ns - block_ns / 2).unwrap_or_else(|e| panic!("{e}")));
         for i in 1..=15u64 {
             tags.extend(pipe.video(frame, start_ns + i * step_ns).unwrap_or_else(|e| panic!("{e}")));
-            tags.extend(pipe.audio(&pre_audio, start_ns - block_ns / 2 + i * block_ns).unwrap_or_else(|e| panic!("{e}")));
+            tags.extend(
+                pipe.audio(&pre_audio, start_ns - block_ns / 2 + i * block_ns).unwrap_or_else(|e| panic!("{e}")),
+            );
         }
         let anchored_0 = pipe.anchored_pts_us(0);
         tags.extend(pipe.finish().unwrap_or_else(|e| panic!("{e}")));

@@ -784,7 +784,13 @@ pub fn fit(
                 || cbr_enforced
                 || (no_bframes != main.no_bframes);
             if !auto_fitted {
-                return Ok(FittedEncode { key: main_key, separate_encode: false, auto_fitted: false, capped: None, note });
+                return Ok(FittedEncode {
+                    key: main_key,
+                    separate_encode: false,
+                    auto_fitted: false,
+                    capped: None,
+                    note,
+                });
             }
             let key = EncodeKey {
                 canvas: main.canvas,
@@ -1663,7 +1669,10 @@ mod tests {
         // Twitch SameAsMain keeps 1440p60 untouched while enforcing hard 6000 kbps / H264 / 2s / CBR.
         let main_1440_hevc = MainEncode::from_canvas(Canvas::Main, 2560, 1440, 60, 18_000, VideoCodec::Hevc);
         let twitch_same = fit(&main_1440_hevc, Some(&twitch_lim), &DestinationQuality::SameAsMain, false).unwrap();
-        assert_eq!((twitch_same.key.width, twitch_same.key.height, twitch_same.key.fps, twitch_same.key.kbps), (2560, 1440, 60, 6_000));
+        assert_eq!(
+            (twitch_same.key.width, twitch_same.key.height, twitch_same.key.fps, twitch_same.key.kbps),
+            (2560, 1440, 60, 6_000)
+        );
         assert_eq!(twitch_same.key.codec, VideoCodec::H264);
         assert!(twitch_same.key.strict_cbr);
         assert_eq!(twitch_same.note.as_deref(), Some("Above Twitch's recommended 1080p"));
