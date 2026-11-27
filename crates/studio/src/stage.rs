@@ -4524,6 +4524,18 @@ impl Stage {
         }
     }
 
+    /// Configured monitoring device id (`None` when using the system default).
+    pub fn monitoring_device(&self) -> Option<String> {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.monitor_device.borrow().clone()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            None
+        }
+    }
+
     // ------------------------------------------------------------------ meters and channels
 
     /// Each named source's sound now (dBFS; -100 is silence): the mixer's meters.
