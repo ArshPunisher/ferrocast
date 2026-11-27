@@ -80,6 +80,14 @@ fn publish_engine(shared: Option<&Arc<own::Shared>>) {
     *LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()) = shared.map_or_else(std::sync::Weak::new, Arc::downgrade);
 }
 
+fn clear_published_engine_if(shared: &Arc<own::Shared>) {
+    let mut slot = LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+    let target = Arc::downgrade(shared);
+    if std::sync::Weak::ptr_eq(&*slot, &target) {
+        *slot = std::sync::Weak::new();
+    }
+}
+
 /// How long a level ask leaves the engine alone after it failed to start.
 const LEVELS_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -96,6 +104,34 @@ pub fn levels_now(
 ) -> Option<std::collections::HashMap<String, crate::collection::LevelInfo>> {
     let e = LIVE_ENGINE.lock().unwrap_or_else(|e| e.into_inner()).upgrade()?;
     Some(read_levels(&e, names, fast))
+}
+
+/// Handle to a [`Stage`]'s active engine, used by views and lifetime tests.
+#[derive(Debug, Clone)]
+pub struct EngineRef(Arc<own::Shared>);
+
+/// Weak reference to a [`Stage`]'s active engine.
+#[derive(Debug, Clone)]
+pub struct WeakEngineRef(std::sync::Weak<own::Shared>);
+
+impl EngineRef {
+    pub fn downgrade(&self) -> WeakEngineRef {
+        WeakEngineRef(Arc::downgrade(&self.0))
+    }
+
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.0.engine.stats().frames
+    }
+}
+
+impl WeakEngineRef {
+    pub fn is_alive(&self) -> bool {
+        self.0.upgrade().is_some()
+    }
 }
 
 /// The scene store.
@@ -624,6 +660,14 @@ fn cutout_filter_name(f: &Value) -> &str {
 const PICTURE_ONLY_DEVICES: [&str; 6] =
     ["av_capture_input", "av_capture_input_v2", "macos-avcapture", "macos-avcapture-fast", "dshow_input", "v4l2_input"];
 
+impl Drop for Stage {
+    fn drop(&mut self) {
+        if let Some(shared) = self.engine.borrow_mut().take() {
+            clear_published_engine_if(&shared);
+        }
+    }
+}
+
 impl Stage {
     /// A collection with one empty scene, on air.
     pub fn new(canvas: Canvas, first_scene: &str) -> Result<Self, StudioError> {
@@ -714,6 +758,16 @@ impl Stage {
         let mut d = self.doc.borrow().clone();
         d["name"] = json!(name);
         d
+    }
+
+    /// Whether this stage has an open engine instance.
+    pub fn has_engine(&self) -> bool {
+        self.engine.borrow().is_some()
+    }
+
+    /// Returns a handle to this stage's running engine, opening it if needed.
+    pub fn engine_ref(&self) -> Result<EngineRef, StudioError> {
+        self.engine().map(EngineRef)
     }
 
     /// Ferrocast's own engine with this collection open: the one running, or a new one.
@@ -7121,6 +7175,11 @@ impl Stage {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageView {
+    /// Returns a handle to the engine backing this view.
+    pub fn engine_ref(&self) -> EngineRef {
+        EngineRef(self.shared.clone())
+    }
+
     /// Moves or resizes it (the page's box changed). Main thread.
     pub fn set_rect(&mut self, rect: crate::Rect, scale: f64) {
         // A box of the page's own (Studio Mode's halves): placed by the page only.
@@ -7535,6 +7594,11 @@ impl Stage {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 impl StageProjector {
+    /// Returns a handle to the engine backing this projector.
+    pub fn engine_ref(&self) -> EngineRef {
+        EngineRef(self.shared.clone())
+    }
+
     /// Its window's number (to screenshot it in checks).
     pub fn window_number(&self) -> isize {
         self.win.number()
