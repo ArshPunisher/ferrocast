@@ -471,6 +471,14 @@ fn engine_stats_schema_documents_capture_problem_waiting_enum() {
 }
 
 #[test]
+fn engine_stats_schema_declares_collection_and_profile_ids() {
+    let o = spec::openapi();
+    let def = &o["components"]["schemas"]["StudioEngineStats"];
+    assert_eq!(def["properties"]["collection_id"]["type"], serde_json::json!(["string", "null"]));
+    assert_eq!(def["properties"]["profile_id"]["type"], serde_json::json!(["string", "null"]));
+}
+
+#[test]
 fn screenshot_screen_still_and_source_status_contracts_match_runtime() {
     let o = spec::openapi();
     let schemas = &o["components"]["schemas"];

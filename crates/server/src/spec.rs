@@ -3753,6 +3753,8 @@ fn studio_stats_schemas() -> Map<String, Value> {
                     }
                 },
                 "scene": { "type": ["string", "null"] },
+                "collection_id": { "type": ["string", "null"], "description": "Active scene collection ID." },
+                "profile_id": { "type": ["string", "null"], "description": "Active settings profile ID." },
                 "history": {
                     "type": "object",
                     "properties": {

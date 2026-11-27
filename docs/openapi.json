@@ -3483,6 +3483,13 @@
             },
             "type": "array"
           },
+          "collection_id": {
+            "description": "Active scene collection ID.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "disk_free_mb": {
             "type": "integer"
           },
@@ -3565,6 +3572,13 @@
           "ndi": {
             "type": [
               "object",
+              "null"
+            ]
+          },
+          "profile_id": {
+            "description": "Active settings profile ID.",
+            "type": [
+              "string",
               "null"
             ]
           },
