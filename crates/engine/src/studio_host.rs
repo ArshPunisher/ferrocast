@@ -2696,36 +2696,38 @@ impl Engine {
             let _ = self.get_ffmpeg().await;
         }
         let host = self.studio_host()?;
-        let was_running = host.status().await.running;
-        // A running Studio reloads its scene collection only to put the held-back saved scenes in
-        // place of the temporary ones. That is a collection switch, refused while a show or any
-        // output is on (it used to run on every Start, wiping the undo history and stopping NDI,
-        // the virtual camera and the vertical picture), and it is asked before any choice is made,
-        // so a refused one leaves Safe Mode as it was.
-        let confirming = was_running
-            && self.safe_mode_status().collection_pending
-            && (opts.confirm_collection || opts.safe_mode == Some(false));
-        let (load_collection, allow_auto_start, _enabled_normal, mut status) = if confirming {
+        let (load_collection, allow_auto_start, _enabled_normal, mut status) = {
             let _lib = self.studio().library_lock.lock().await;
-            let _gate = self.prepare_shelf_mutation("collections", false).await?;
-            let (load_collection, allow_auto_start, enabled_normal) = self.apply_start_options(&opts)?;
-            let status = if load_collection {
-                self.studio_release_holds().await;
-                let s = host.confirm_collection().await.map_err(failed)?;
-                self.notify_obsws_poll();
-                s
+            let was_running = host.status().await.running;
+            // A running Studio reloads its scene collection only to put the held-back saved scenes in
+            // place of the temporary ones. That is a collection switch, refused while a show or any
+            // output is on (it used to run on every Start, wiping the undo history and stopping NDI,
+            // the virtual camera and the vertical picture), and it is asked before any choice is made,
+            // so a refused one leaves Safe Mode as it was.
+            let confirming = was_running
+                && self.safe_mode_status().collection_pending
+                && (opts.confirm_collection || opts.safe_mode == Some(false));
+            if confirming {
+                let _gate = self.prepare_shelf_mutation("collections", false).await?;
+                let (load_collection, allow_auto_start, enabled_normal) = self.apply_start_options(&opts)?;
+                let status = if load_collection {
+                    self.studio_release_holds().await;
+                    let s = host.confirm_collection().await.map_err(failed)?;
+                    self.notify_obsws_poll();
+                    s
+                } else {
+                    host.status().await
+                };
+                (load_collection, allow_auto_start, enabled_normal, status)
             } else {
-                host.status().await
-            };
-            (load_collection, allow_auto_start, enabled_normal, status)
-        } else {
-            let (load_collection, allow_auto_start, enabled_normal) = self.apply_start_options(&opts)?;
-            let status = if was_running {
-                host.status().await
-            } else {
-                host.start_with_mode(load_collection).await.map_err(failed)?
-            };
-            (load_collection, allow_auto_start, enabled_normal, status)
+                let (load_collection, allow_auto_start, enabled_normal) = self.apply_start_options(&opts)?;
+                let status = if was_running {
+                    host.status().await
+                } else {
+                    host.start_with_mode(load_collection).await.map_err(failed)?
+                };
+                (load_collection, allow_auto_start, enabled_normal, status)
+            }
         };
         let _ = load_collection;
         // After a crash: the replay buffer and the recording come back on as they were (a new
@@ -2757,6 +2759,7 @@ impl Engine {
         let host = self.studio_host()?;
         // Keys held down put their items back before the scenes are saved and let go.
         self.studio_release_holds().await;
+        let _lib = self.studio().library_lock.lock().await;
         let was_running = host.status().await.running;
         // Cancel any active Show, countdown, or pending delayed stop immediately (even before
         // acquiring output_lock) so an in-flight start_show / go_live_now sees the generation
@@ -2783,6 +2786,7 @@ impl Engine {
             self.reconcile_locked(&group_ops).await;
         }
         drop(group_ops);
+        drop(_lib);
         self.send_golive_pub();
         self.send_update_frame();
         Ok(status)
@@ -3748,6 +3752,22 @@ impl Engine {
         self.notify_obsws_poll();
     }
 
+    async fn shelf_current_id(&self, host: Option<&dyn StudioHost>, kind: &str) -> Option<String> {
+        let list = if let Some(h) = host {
+            h.shelf(kind.to_string(), ShelfAct::List).await.ok()?
+        } else {
+            let data = self.store().dir().to_path_buf();
+            let kind_owned = kind.to_string();
+            tokio::task::spawn_blocking(move || {
+                ferrocast_store::studio_library::headless_shelf_list(&data, &kind_owned)
+            })
+            .await
+            .ok()?
+            .ok()?
+        };
+        list.get("current").and_then(Value::as_str).map(String::from)
+    }
+
     /// Scene collections or profiles: one act on that list. Falls back to file-backed storage on
     /// disk when no desktop [`StudioHost`] is attached (such as in `ferrocast-headless`).
     pub async fn studio_shelf(&self, kind: &str, act: ShelfAct) -> Result<Value, EngineError> {
@@ -3755,13 +3775,24 @@ impl Engine {
         let host = self.inner.studio_host.host.read().unwrap_or_else(|p| p.into_inner()).clone();
         let mutating = !matches!(act, ShelfAct::List | ShelfAct::Export { .. });
         let switched_shelf = matches!(act, ShelfAct::Switch { .. } | ShelfAct::New { .. } | ShelfAct::Import { .. });
-        // Swapping, renaming, removing, or importing shelves is serialized with `library_lock` and
-        // refused while live, recording, in a show, or benchmarking (`output_gate`). When changing
-        // profiles, `auto_config_op` is acquired outermost so rollback cannot race the switch.
+        // Swapping, renaming, or removing shelves is serialized with `library_lock`. Switches and
+        // active-item renames/removals are refused while live, in a show, or benchmarking; inactive
+        // renames/removals only touch library metadata or non-active files under `library_lock`.
+        // When changing profiles, `auto_config_op` is acquired outermost so rollback cannot race.
         let _auto_op =
             if kind == "profiles" && switched_shelf { Some(self.studio().auto_config_op.lock().await) } else { None };
         let _lib = if mutating { Some(self.studio().library_lock.lock().await) } else { None };
-        let _gate = if mutating { Some(self.prepare_shelf_mutation(kind, switched_shelf).await?) } else { None };
+        let targets_active = match &act {
+            ShelfAct::Rename { id, .. } | ShelfAct::Remove { id } => {
+                self.shelf_current_id(host.as_deref(), kind).await.is_none_or(|cur| cur == *id)
+            }
+            _ => false,
+        };
+        let _gate = if switched_shelf || targets_active {
+            Some(self.prepare_shelf_mutation(kind, switched_shelf).await?)
+        } else {
+            None
+        };
         let out = if let Some(host) = &host {
             host.shelf(kind.to_string(), act).await.map_err(failed)?
         } else {
@@ -3798,8 +3829,8 @@ impl Engine {
             self.notify_obsws_poll();
         } else {
             drop(_auto_op);
-            if kind == "collections" && mutating {
-                self.finish_collection_switch(switched_shelf, host.is_some()).await;
+            if kind == "collections" && switched_shelf {
+                self.finish_collection_switch(true, host.is_some()).await;
             } else if mutating {
                 self.notify_obsws_poll();
             }
@@ -5823,8 +5854,11 @@ mod tests {
     #[derive(Debug, Default)]
     struct ColTestHost {
         streaming: std::sync::atomic::AtomicBool,
+        stopped: std::sync::atomic::AtomicBool,
         settings: std::sync::Mutex<StudioSettings>,
         events: std::sync::Mutex<Vec<String>>,
+        current_collection: std::sync::Mutex<Option<String>>,
+        current_profile: std::sync::Mutex<Option<String>>,
         switch_entered: tokio::sync::Notify,
         switch_release: tokio::sync::Notify,
         hold_collection_switch: std::sync::atomic::AtomicBool,
@@ -5834,15 +5868,20 @@ mod tests {
     #[async_trait::async_trait]
     impl StudioHost for ColTestHost {
         async fn status(&self) -> StudioStatus {
-            StudioStatus { available: true, running: true, ..Default::default() }
+            let running = !self.stopped.load(std::sync::atomic::Ordering::SeqCst);
+            StudioStatus { available: true, running, ..Default::default() }
         }
         async fn preview(&self, _rect: Option<PreviewRect>) -> Result<(), String> {
             Ok(())
         }
         async fn start(&self) -> Result<StudioStatus, String> {
+            self.stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+            self.events.lock().unwrap().push("start".into());
             Ok(self.status().await)
         }
         async fn stop(&self) -> Result<StudioStatus, String> {
+            self.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.events.lock().unwrap().push("stop".into());
             Ok(Default::default())
         }
         async fn kinds(&self) -> Result<Value, String> {
@@ -5906,7 +5945,15 @@ mod tests {
         }
         async fn shelf(&self, kind: String, act: ShelfAct) -> Result<Value, String> {
             match act {
-                ShelfAct::List => Ok(serde_json::json!({ "current": "untitled", "list": [] })),
+                ShelfAct::List => {
+                    let current = match kind.as_str() {
+                        "collections" => {
+                            self.current_collection.lock().unwrap().clone().unwrap_or_else(|| "untitled".into())
+                        }
+                        _ => self.current_profile.lock().unwrap().clone().unwrap_or_else(|| "untitled".into()),
+                    };
+                    Ok(serde_json::json!({ "current": current, "list": [] }))
+                }
                 ShelfAct::Export { id } => Ok(serde_json::json!({ "id": id })),
                 ShelfAct::Switch { id } => {
                     self.events.lock().unwrap().push(format!("switch:enter:{kind}:{id}"));
@@ -5914,11 +5961,21 @@ mod tests {
                         self.switch_entered.notify_one();
                         self.switch_release.notified().await;
                     }
+                    if kind == "collections" {
+                        *self.current_collection.lock().unwrap() = Some(id.clone());
+                    } else if kind == "profiles" {
+                        *self.current_profile.lock().unwrap() = Some(id.clone());
+                    }
                     self.events.lock().unwrap().push(format!("switch:exit:{kind}:{id}"));
                     Ok(serde_json::json!({ "id": id }))
                 }
                 ShelfAct::New { name, .. } => {
                     self.events.lock().unwrap().push(format!("new:{kind}:{name}"));
+                    if kind == "collections" {
+                        *self.current_collection.lock().unwrap() = Some(name.clone());
+                    } else if kind == "profiles" {
+                        *self.current_profile.lock().unwrap() = Some(name.clone());
+                    }
                     Ok(serde_json::json!({ "id": name }))
                 }
                 ShelfAct::Rename { id, .. } => {
@@ -5980,17 +6037,28 @@ mod tests {
             assert!(exit_pos < rm_pos && exit_pos < rn_pos, "expected sequential order: {ev:?}");
         }
 
-        // 2. Remove and Rename are refused while live; List and Export remain allowed.
+        // 2. While live: active Remove/Rename refuse with studio_busy; inactive Remove/Rename,
+        // List, and Export remain allowed.
         host.streaming.store(true, std::sync::atomic::Ordering::SeqCst);
         for (kind, act) in [
-            ("collections", ShelfAct::Remove { id: "c3".into() }),
-            ("collections", ShelfAct::Rename { id: "c3".into(), name: "X".into() }),
-            ("profiles", ShelfAct::Remove { id: "p2".into() }),
-            ("profiles", ShelfAct::Rename { id: "p2".into(), name: "Y".into() }),
+            ("collections", ShelfAct::Remove { id: "c2".into() }),
+            ("collections", ShelfAct::Rename { id: "c2".into(), name: "X".into() }),
+            ("profiles", ShelfAct::Remove { id: "untitled".into() }),
+            ("profiles", ShelfAct::Rename { id: "untitled".into(), name: "Y".into() }),
         ] {
             let err = e.studio_shelf(kind, act).await.unwrap_err();
             assert!(matches!(err, EngineError::Refused { status: 409, code: "studio_busy", .. }), "{err:?}");
         }
+        assert!(
+            e.studio_shelf("collections", ShelfAct::Rename { id: "c3".into(), name: "RenamedLive".into() })
+                .await
+                .is_ok()
+        );
+        assert!(e.studio_shelf("collections", ShelfAct::Remove { id: "c3".into() }).await.is_ok());
+        assert!(
+            e.studio_shelf("profiles", ShelfAct::Rename { id: "p2".into(), name: "LiveProf".into() }).await.is_ok()
+        );
+        assert!(e.studio_shelf("profiles", ShelfAct::Remove { id: "p2".into() }).await.is_ok());
         assert!(e.studio_shelf("collections", ShelfAct::List).await.is_ok());
         assert!(e.studio_shelf("collections", ShelfAct::Export { id: "c2".into() }).await.is_ok());
         host.streaming.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -6111,5 +6179,46 @@ mod tests {
             assert!(!sm.collection_pending, "collection action must clear collection_pending");
             assert!(!sm.offer, "collection action must clear crash offer");
         }
+    }
+
+    #[tokio::test]
+    async fn col05_start_and_stop_serialize_with_library_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::start_with_secrets(dir.path(), Arc::new(ferrocast_secrets::MemorySecrets::default()))
+            .await
+            .unwrap();
+        let host = Arc::new(ColTestHost::default());
+        host.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        e.set_studio_host(host.clone());
+
+        // Non-confirming start must wait on library_lock.
+        let lib = e.studio().library_lock.lock().await;
+        let e_start = e.clone();
+        let start_task = tokio::spawn(async move { e_start.studio_start().await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !host.events.lock().unwrap().iter().any(|ev| ev == "start"),
+            "studio_start must wait for library_lock before invoking host.start_with_mode"
+        );
+        drop(lib);
+        assert!(start_task.await.unwrap().unwrap().running);
+        assert!(host.events.lock().unwrap().iter().any(|ev| ev == "start"));
+
+        // Stop must also wait on library_lock before invoking host.stop.
+        let lib = e.studio().library_lock.lock().await;
+        let e_stop = e.clone();
+        let stop_task = tokio::spawn(async move { e_stop.studio_stop().await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !host.events.lock().unwrap().iter().any(|ev| ev == "stop"),
+            "studio_stop must wait for library_lock before invoking host.stop"
+        );
+        drop(lib);
+        assert!(!stop_task.await.unwrap().unwrap().running);
+        assert!(host.events.lock().unwrap().iter().any(|ev| ev == "stop"));
     }
 }

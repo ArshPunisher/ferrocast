@@ -2697,6 +2697,18 @@ pub struct DesktopStudio {
     shelf_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+fn shelf_switch_is_noop(h: &Held, kind: Kind, current: &str, id: &str) -> bool {
+    if current != id {
+        return false;
+    }
+    match kind {
+        Kind::Collections => {
+            h.collection.as_ref().is_none_or(|_| !h.collection_deferred && h.collection_id.as_deref() == Some(id))
+        }
+        Kind::Profiles => true,
+    }
+}
+
 impl DesktopStudio {
     pub fn new(app: AppHandle, data: PathBuf) -> DesktopStudio {
         let _ = APP.set(app.clone());
@@ -2849,7 +2861,9 @@ impl DesktopStudio {
         if lib.shelf(kind).get(id).is_none() {
             return Err(format!("There's no {} with the id \"{id}\".", kind.noun()));
         }
-        if lib.shelf(kind).current == id {
+        let current = lib.shelf(kind).current.clone();
+        let target_id = id.to_string();
+        if self.on_main(move |h| shelf_switch_is_noop(h, kind, &current, &target_id)).await? {
             return Ok(None);
         }
         let busy = self.on_main(|h| outputs_busy_for_switch(h)).await?;
@@ -3323,6 +3337,7 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn start_with_mode(&self, load_collection: bool) -> Result<StudioStatus, String> {
+        let _shelf_lock = self.shelf_lock.lock().await;
         #[cfg(windows)]
         fetch_matte(self.data.clone());
         let config = self.data.join("studio");
@@ -3371,6 +3386,7 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn confirm_collection(&self) -> Result<StudioStatus, String> {
+        let _shelf_lock = self.shelf_lock.lock().await;
         let data = self.data.clone();
         let app = self.app.clone();
         let release_keys = crate::studio_keys::release_active(&self.app);
@@ -3389,6 +3405,7 @@ impl StudioHost for DesktopStudio {
     }
 
     async fn stop(&self) -> Result<StudioStatus, String> {
+        let _shelf_lock = self.shelf_lock.lock().await;
         // Extract active outputs on main thread without blocking UI, then drain them in parallel
         // off the main thread BEFORE saving and dropping the scene collection.
         let jobs = self.on_main(take_outputs_from_held).await?;
@@ -9239,5 +9256,44 @@ mod collection_profile_tests {
         };
         let _ = stop_source_record(ViewCtx::Test, &mut h, dir.path(), "SharedColor");
         assert_eq!(h.collection.as_ref().map(Collection::canvas), Some(target));
+    }
+
+    #[test]
+    fn col17_safe_mode_switch_to_active_collection_reloads_saved() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let canvas = Canvas { width: 1280, height: 720, fps: 30 };
+        let scenes_a = library::file(dir.path(), Kind::Collections, "a");
+        let saved_doc = make_collection_doc(canvas, "SavedMain", "SavedPreview", None, "SavedColor");
+        write_json_sync(&scenes_a, &saved_doc);
+
+        let temp_col = Collection::new(canvas, "SafeTemp").unwrap_or_else(|e| panic!("{e}"));
+        if cfg!(not(any(target_os = "macos", target_os = "windows"))) && temp_col.engine_ref().is_err() {
+            return;
+        }
+        let mut h = Held {
+            settings: Some(StudioSettings::default()),
+            collection: Some(temp_col),
+            collection_id: Some("a".into()),
+            collection_file: Some(scenes_a.clone()),
+            collection_deferred: true,
+            ..Held::default()
+        };
+
+        assert!(
+            !shelf_switch_is_noop(&h, Kind::Collections, "a", "a"),
+            "Safe Mode switch to active collection id must not short-circuit while deferred"
+        );
+        swap_collection_to(ViewCtx::Test, &mut h, dir.path(), Some("a"), &scenes_a, &scenes_a, &[])
+            .unwrap_or_else(|e| panic!("reload saved active collection: {e}"));
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
+
+        assert!(!h.collection_deferred, "reload must clear collection_deferred");
+        let names: Vec<String> = h.collection.as_ref().unwrap().scenes().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"SavedMain".to_string()), "expected SavedMain after reload, got {names:?}");
+        assert!(!names.contains(&"SafeTemp".to_string()));
     }
 }
