@@ -3253,9 +3253,6 @@ fn apply_settings_for_profile(
         } else if rate_only && canvas.fps > now.fps {
             notes.push(format!("The stream goes up to {} fps once it ends.", canvas.fps));
         }
-        if !busy {
-            drop_inactive_outputs(h);
-        }
         let c = h.collection.as_ref().ok_or(STOPPED)?;
         let (name, id) = s.monitoring.clone().unwrap_or(("Default".into(), "default".into()));
         if c.set_monitoring_device(&name, &id).is_err() {
@@ -9435,5 +9432,47 @@ mod collection_profile_tests {
         drop(h.collection.take());
         drop(guests);
         assert!(!sdp.is_file(), ".sdp must be unlinked after collection and guests drop");
+    }
+
+    #[test]
+    fn col21_settings_edit_preserves_stopped_record_error_unless_engine_replaced() {
+        let _guard = lock_engine();
+        let _reset = ResetAudioFormat;
+        apply_audio_format(&StudioSettings::default());
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let initial = StudioSettings { width: 1280, height: 720, fps: 30, ..StudioSettings::default() };
+        let canvas = Canvas { width: initial.width, height: initial.height, fps: initial.fps };
+        let doc = make_collection_doc(canvas, "MainA", "PreviewA", None, "SharedColor");
+        let col = Collection::load(canvas, &doc, FIRST_SCENE).unwrap_or_else(|e| panic!("load: {e}"));
+        let rec_path = dir.path().join("failed.mkv");
+        let failed = ferrocast_studio::stage::StageOutput::test_failed(
+            rec_path.clone(),
+            canvas,
+            "The recording stopped: the disk is full.",
+        );
+        let mut h = Held {
+            settings: Some(initial.clone()),
+            collection: Some(col),
+            record: Some((failed, rec_path, std::time::Instant::now())),
+            ..Held::default()
+        };
+
+        // Unrelated settings change (e.g. hotkeys) does not replace the engine and must keep
+        // stopped-output errors visible in record stats.
+        let mut hotkey_edit = initial.clone();
+        hotkey_edit.hotkeys.insert("record".into(), "F9".into());
+        apply_settings_on_main(ViewCtx::Test, &mut h, dir.path(), hotkey_edit.clone())
+            .unwrap_or_else(|e| panic!("hotkey edit: {e}"));
+        let rec = h.record.as_ref().expect("stopped recording error must survive unrelated settings edit");
+        assert_eq!(record_stats(rec)["error"], json!("The recording stopped: the disk is full."));
+
+        // Canvas change replaces the engine and drops inactive outputs cleanly.
+        let canvas_edit = StudioSettings { width: 1920, height: 1080, fps: 60, ..hotkey_edit };
+        apply_settings_on_main(ViewCtx::Test, &mut h, dir.path(), canvas_edit)
+            .unwrap_or_else(|e| panic!("canvas edit: {e}"));
+        assert!(h.record.is_none(), "engine replacement must drop inactive outputs");
+
+        ferrocast_store::durable::flush_saves(std::time::Duration::from_secs(10));
     }
 }

@@ -1743,6 +1743,27 @@ impl OwnStream {
             _ => None,
         }
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn test_failed(error: &str) -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            thread: None,
+            counts: Arc::new(Counts {
+                running: AtomicBool::new(false),
+                error: Mutex::new(Some(error.to_string())),
+                ..Default::default()
+            }),
+            health: None,
+            stop_push: None,
+            runtime: None,
+            drawn: None,
+            hub: None,
+            drain: Arc::new(DrainGate::default()),
+            begin: Arc::new(Begin::default()),
+            directs: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// The stream's `onMetaData`, as OBS sends it before any packet: size, frame rate, codecs and

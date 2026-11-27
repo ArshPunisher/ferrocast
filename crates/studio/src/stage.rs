@@ -6864,6 +6864,11 @@ impl StageOutput {
         Self { own, path, canvas, replay: None }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_failed(path: PathBuf, canvas: Canvas, error: &str) -> Self {
+        Self::new(own::OwnStream::test_failed(error), Some(path), canvas)
+    }
+
     pub fn stats(&self) -> StreamStats {
         self.own.stats()
     }
