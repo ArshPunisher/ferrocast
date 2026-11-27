@@ -495,8 +495,7 @@ fn default_budget_mpx(
     cpu_cores: u32,
     encoder_id: &str,
 ) -> Option<f64> {
-    let low = encoder_id.to_ascii_lowercase();
-    let is_sw = low.contains("x264") || low.contains("software");
+    let is_sw = ferrocast_engine::golive_plan::encoder_is_software(encoder_id);
     if is_sw {
         let cores = cpu_cores.max(1);
         return Some(if cores < 8 {
@@ -510,9 +509,9 @@ fn default_budget_mpx(
     if os == "macos" {
         return Some(engines.map_or(125.0, |n| f64::from(n) * ferrocast_studio::system::MPX_PER_ENGINE));
     }
+    let _ = hw_backend;
     if matches!(os, "windows" | "linux") {
-        let is_nvenc = low.contains("nvenc") || hw_backend == Some("nvenc");
-        return Some(if is_nvenc { 250.0 } else { 125.0 });
+        return Some(250.0);
     }
     engines.map(|n| f64::from(n) * ferrocast_studio::system::MPX_PER_ENGINE)
 }
@@ -531,8 +530,8 @@ fn encode_budget_with_host(
 ) -> Value {
     let mpx = |w: u32, h: u32| f64::from(w) * f64::from(h) * f64::from(s.fps) / 1e6;
     let canvas = mpx(s.width, s.height);
-    // Only the video encoder's own encodes count against HW unless stream uses software x264.
-    let hardware = |id: &str| !id.to_ascii_lowercase().contains("x264");
+    // Only the video encoder's own encodes count against HW unless stream uses software encoding.
+    let hardware = |id: &str| !ferrocast_engine::golive_plan::encoder_is_software(id);
     let mut stream = stream_settings(s, cap);
     // Twitch Enhanced Broadcasting's qualities: Twitch's plan sets them when the stream starts;
     // about 720p and 480p beside the main one (projects-60).
@@ -612,6 +611,25 @@ fn h264_encoder_for(id: &str) -> String {
     }
 }
 
+/// Replaces any H.264 encoder id with its HEVC counterpart when an encode group asks for HEVC.
+fn hevc_encoder_for(id: &str) -> String {
+    let low = id.to_ascii_lowercase();
+    if low.contains("hevc") || low.contains("h265") {
+        return id.to_string();
+    }
+    if let Some(prefix) = id.strip_suffix(".avc") {
+        format!("{prefix}.hevc")
+    } else if let Some(suffix) = low.strip_prefix("h264_") {
+        format!("hevc_{suffix}")
+    } else if low.contains("nvenc") {
+        "hevc_nvenc".into()
+    } else if cfg!(target_os = "macos") {
+        "com.apple.videotoolbox.videoencoder.ave.hevc".into()
+    } else {
+        id.to_string()
+    }
+}
+
 /// Effective encode settings for the main stream after clamping to `cap` (if any) and `live_pct`.
 fn effective_stream_encode(s: &StudioSettings, cap: Option<StreamCap>, live_pct: Option<u8>) -> EncodeSettings {
     let mut e = encode_of(s);
@@ -684,7 +702,8 @@ fn stream_settings_for_group(s: &StudioSettings, spec: &EncodeGroupSpec) -> Stre
     enc.audio_kbps = spec.key.audio_kbps;
     enc.video_encoder = match spec.key.codec {
         EncodeCodec::H264 => h264_encoder_for(&enc.video_encoder),
-        EncodeCodec::Hevc | EncodeCodec::Av1 | EncodeCodec::Vp9 => enc.video_encoder,
+        EncodeCodec::Hevc => hevc_encoder_for(&enc.video_encoder),
+        EncodeCodec::Av1 | EncodeCodec::Vp9 => enc.video_encoder,
     };
     let native = match spec.key.canvas {
         EncodeCanvas::Main => (s.width, s.height),
@@ -720,6 +739,38 @@ fn main_stream_stats(h: &Held) -> Option<(&Streaming, Option<std::time::Instant>
         .values()
         .find(|g| g.spec.key.canvas == EncodeCanvas::Main && g.output.stats().active)
         .map(|g| (&g.output, Some(g.started)))
+        .or_else(|| h.vstream.as_ref().filter(|s| s.stats().active).map(|s| (s, h.stream_started)))
+        .or_else(|| h.groups.values().find(|g| g.output.stats().active).map(|g| (&g.output, Some(g.started))))
+        .or_else(|| h.lstream.as_ref().filter(|s| s.stats().active).map(|s| (s, h.stream_started)))
+}
+
+fn record_encode_for_stream(
+    s: &StudioSettings,
+    cap: Option<StreamCap>,
+    main_group: Option<&GroupSlot>,
+) -> EncodeSettings {
+    if s.record_quality == "stream"
+        && let Some(g) = main_group.filter(|g| g.output.stats().active)
+    {
+        return EncodeSettings { scale: None, ..stream_settings_for_group(s, &g.spec).encode };
+    }
+    record_encode_capped(s, cap)
+}
+
+fn baseline_record_shares(s: &StudioSettings, cap: Option<StreamCap>, selective: bool) -> bool {
+    let mut stream = stream_settings(s, cap);
+    stream.vod_track = None;
+    stream.video_tracks.clear();
+    let plan = ferrocast_studio::RecordPlan {
+        tracks: s.record_tracks.clone(),
+        encode: record_encode_capped(s, cap),
+        ..Default::default()
+    };
+    ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps, selective).is_ok()
+}
+
+fn direct_uses_light_layer(simulcast: bool, lstream_active: bool, group_light_active: bool) -> bool {
+    simulcast && (lstream_active || group_light_active)
 }
 
 fn main_stream_mut(h: &mut Held) -> Option<&mut Streaming> {
@@ -3077,6 +3128,7 @@ impl StudioHost for DesktopStudio {
                 // Streaming now: what Optimize changes (frame rate, size, encoder) goes to the
                 // stream on air at once (owner, 15 Nov: "I have to end and stream again").
                 let live = any_main_stream_active(h);
+                let any_live = any_stream_group_active(h);
                 if let Some(c) = h.collection.as_mut() {
                     let canvas = Canvas { width: s.width, height: s.height, fps: s.fps };
                     let now = c.canvas();
@@ -3088,7 +3140,7 @@ impl StudioHost for DesktopStudio {
                     // stop, and the rest of the settings are saved now. Before, the virtual
                     // camera and NDI were turned off first and then the change was refused, and
                     // the whole save with it (peer, 18 Nov).
-                    let busy = live
+                    let busy = any_live
                         || h.record.as_ref().is_some_and(|r| r.0.stats().active)
                         || h.replay.as_ref().is_some_and(|r| r.active())
                         || h.ndi.is_some()
@@ -3128,25 +3180,42 @@ impl StudioHost for DesktopStudio {
                     was_encode.as_ref().is_some_and(|a| shape_differs(a, &encode)) || o.fps != s.fps
                 });
                 let kbps = encode.video_kbps;
-                let reshaped = match h.stream.as_ref() {
-                    Some(st) if live && shape_changed => {
-                        match st.reshape(&encode, s.fps) {
-                            Ok(()) => {
-                                // What it runs with now: a recording "Same as stream" started
-                                // next compares with this (CodeRabbit: 1080p reshaped to 720p
-                                // was still taken as unscaled).
-                                if let Some(w) = h.stream_with.as_mut() {
-                                    w.encode = encode;
-                                }
-                                true
+                let reshaped = if let Some(st) = h.stream.as_ref().filter(|_| live && shape_changed) {
+                    match st.reshape(&encode, s.fps) {
+                        Ok(()) => {
+                            // What it runs with now: a recording "Same as stream" started
+                            // next compares with this (CodeRabbit: 1080p reshaped to 720p
+                            // was still taken as unscaled).
+                            if let Some(w) = h.stream_with.as_mut() {
+                                w.encode = encode;
                             }
-                            Err(e) => {
-                                notes.push(format!("{e} The next stream uses the new settings."));
-                                false
-                            }
+                            true
+                        }
+                        Err(e) => {
+                            notes.push(format!("{e} The next stream uses the new settings."));
+                            false
                         }
                     }
-                    _ => false,
+                } else if live
+                    && shape_changed
+                    && let Some(slot) = h.groups.get_mut(GROUP_MAIN).filter(|g| g.output.stats().active)
+                {
+                    let next_group_settings = stream_settings_for_group(&s, &slot.spec);
+                    match slot.output.reshape(&next_group_settings.encode, s.fps) {
+                        Ok(()) => {
+                            slot.with = next_group_settings;
+                            true
+                        }
+                        Err(e) => {
+                            notes.push(format!("{e} The next stream uses the new settings."));
+                            false
+                        }
+                    }
+                } else if any_live && shape_changed {
+                    notes.push("The next stream uses the new settings.".into());
+                    false
+                } else {
+                    false
                 };
                 if live && was.as_ref().is_some_and(|o| o.audio_kbps != s.audio_kbps) {
                     notes.push("The new sound bitrate starts with the next stream.".into());
@@ -3286,7 +3355,7 @@ impl StudioHost for DesktopStudio {
                 Ok(json!({
                     "program": program,
                     "preview": preview,
-                    "stream": any_main_stream_active(h),
+                    "stream": any_stream_group_active(h),
                     "record": h.record.as_ref().map(|r| {
                         let st = r.0.record_stats();
                         json!({
@@ -3380,6 +3449,7 @@ impl StudioHost for DesktopStudio {
             let folder = record_folder(&s);
             std::fs::create_dir_all(&folder)
                 .map_err(|e| format!("The recordings folder {} can't be made: {e}", folder.display()))?;
+            let main_group = if h.stream.is_none() { h.groups.get(GROUP_MAIN) } else { None };
             let plan = ferrocast_studio::RecordPlan {
                 folder,
                 name: s.record_name.clone(),
@@ -3389,7 +3459,7 @@ impl StudioHost for DesktopStudio {
                 split_minutes: s.record_split_minutes,
                 split_mb: s.record_split_mb,
                 tracks: s.record_tracks.clone(),
-                encode: record_encode_capped(&s, h.stream_cap),
+                encode: record_encode_for_stream(&s, h.stream_cap, main_group),
                 muxer: s.record_muxer.clone(),
                 own_encoder: s.own_encoder,
             };
@@ -4378,7 +4448,7 @@ impl StudioHost for DesktopStudio {
 
     async fn host_budget_info(&self) -> Option<HostBudgetInfo> {
         let data = self.data.clone();
-        let telem = ferrocast_studio::system::hardware_telemetry();
+        let telem = tokio::task::spawn_blocking(ferrocast_studio::system::hardware_telemetry).await.ok()?;
         let (s, replay_active, record_active, cap, selective, vertical_on) = self
             .on_main(move |h| {
                 let s = h.settings.get_or_insert_with(|| load_settings(&data)).clone();
@@ -4391,17 +4461,11 @@ impl StudioHost for DesktopStudio {
             .await
             .ok()?;
         let stream = stream_settings(&s, cap);
-        let plan = ferrocast_studio::RecordPlan {
-            tracks: s.record_tracks.clone(),
-            encode: record_encode_capped(&s, cap),
-            ..Default::default()
-        };
-        let shares =
-            ferrocast_studio::stage::can_share(&stream, &plan, s.record_quality == "stream", s.fps, s.fps, selective)
-                .is_ok();
+        let plan_encode = record_encode_capped(&s, cap);
+        let shares = baseline_record_shares(&s, cap, selective);
         let mpx_canvas = f64::from(s.width) * f64::from(s.height) * f64::from(s.fps) / 1e6;
-        let stream_sw = stream.encode.video_encoder.to_ascii_lowercase().contains("x264");
-        let rec_sw = plan.encode.video_encoder.to_ascii_lowercase().contains("x264");
+        let stream_sw = ferrocast_engine::golive_plan::encoder_is_software(&stream.encode.video_encoder);
+        let rec_sw = ferrocast_engine::golive_plan::encoder_is_software(&plan_encode.video_encoder);
         let mut extra_mpx = 0.0;
         let mut extra_sessions = 0u32;
         let record_needed = record_active || s.record_when_streaming;
@@ -4600,6 +4664,10 @@ impl StudioHost for DesktopStudio {
         .await
     }
 
+    fn supports_encode_groups(&self) -> bool {
+        true
+    }
+
     async fn start_encode_group(&self, spec: EncodeGroupSpec, hub: std::sync::Arc<Hub>) -> Result<bool, String> {
         let app = self.app.clone();
         self.on_main(move |h| -> Result<bool, String> {
@@ -4674,6 +4742,22 @@ impl StudioHost for DesktopStudio {
         let group_id = id.to_string();
         self.on_main(move |h| {
             h.groups.remove(&group_id);
+            if !any_stream_group_active(h) {
+                h.stream_started = None;
+                h.stream_with = None;
+                apply_waiting_canvas(&app, h);
+            }
+        })
+        .await
+    }
+
+    async fn abort_encode_group(&self, id: &str) -> Result<(), String> {
+        let app = self.app.clone();
+        let group_id = id.to_string();
+        self.on_main(move |h| {
+            if let Some(slot) = h.groups.remove(&group_id) {
+                slot.output.abort_without_drain();
+            }
             if !any_stream_group_active(h) {
                 h.stream_started = None;
                 h.stream_with = None;
@@ -4788,15 +4872,9 @@ impl StudioHost for DesktopStudio {
 
     async fn direct_start(&self, id: String, url: String, key: String, simulcast: bool) -> Result<(), String> {
         self.on_main(move |h| {
-            let lower = h
-                .lstream
-                .as_ref()
-                .filter(|l| simulcast && l.stats().active)
-                .or_else(|| h.groups.get(GROUP_LIGHT).filter(|g| g.output.stats().active).map(|g| &g.output))
-                .map(|_| ());
-            // Safety against borrowing h twice: extract lower pointer index cleanly by cloning StreamStats? No, StageOutput is not Clone;
-            // handle groups/lstream disjointly:
-            if lower.is_some() {
+            let lstream_active = h.lstream.as_ref().is_some_and(|l| l.stats().active);
+            let group_light_active = h.groups.get(GROUP_LIGHT).is_some_and(|g| g.output.stats().active);
+            if direct_uses_light_layer(simulcast, lstream_active, group_light_active) {
                 if let Some(l) = h.lstream.take() {
                     let res = main_stream_mut(h)
                         .ok_or_else(|| "The Studio isn't streaming.".to_string())
@@ -6023,6 +6101,64 @@ mod budget_tests {
         assert!(!whip_main.bframes && whip_main.vbr && !whip_main.strict_cbr);
         let whip_light = light_stream_settings(&s, Canvas { width: 1920, height: 1080, fps: 60 }, true);
         assert!(!whip_light.encode.bframes);
+    }
+
+    #[test]
+    fn desktop_budget_mpx_and_group_hevc_and_sw_classifiers() {
+        // F8.5: Windows/Linux HW encoders (QSV/AMF/NVENC) default to 250 Mpx/s.
+        assert_eq!(default_budget_mpx("windows", None, Some("qsv"), 8, "obs_qsv11"), Some(250.0));
+        assert_eq!(default_budget_mpx("linux", None, Some("vaapi"), 8, "h264_vaapi"), Some(250.0));
+        // N8: SVT-AV1 is classified as software (uses CPU core tier: <8 cores -> 125 Mpx/s).
+        assert_eq!(default_budget_mpx("linux", None, Some("vaapi"), 4, "libsvtav1"), Some(125.0));
+
+        // F9.3: EncodeCodec::Hevc rewrites an H.264 encoder id into its HEVC counterpart.
+        let s = StudioSettings {
+            video_encoder: Some("com.apple.videotoolbox.videoencoder.ave.avc".into()),
+            ..StudioSettings::default()
+        };
+        let hevc_spec = EncodeGroupSpec {
+            id: "g_hevc".into(),
+            key: ferrocast_engine::studio_host::EncodeKey {
+                canvas: EncodeCanvas::Main,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                fps_ntsc: false,
+                kbps: 8_000,
+                codec: EncodeCodec::Hevc,
+                keyframe_s: 2,
+                strict_cbr: true,
+                no_bframes: false,
+                audio_kbps: 160,
+            },
+            extra_tracks: Vec::new(),
+            vod_track: false,
+            is_light: false,
+            is_twitch_eb: false,
+        };
+        let gs = stream_settings_for_group(&s, &hevc_spec);
+        assert!(
+            gs.encode.video_encoder.to_ascii_lowercase().contains("hevc"),
+            "HEVC encode group must map H.264 encoder to HEVC: {}",
+            gs.encode.video_encoder
+        );
+
+        // N5: Baseline share ignores twitch_vod_track (GROUP_MAIN bills VOD separately in planner).
+        let vod_s = StudioSettings {
+            record_quality: "stream".into(),
+            record_tracks: vec![1],
+            twitch_vod_track: 2,
+            ..StudioSettings::default()
+        };
+        assert!(baseline_record_shares(&vod_s, None, false));
+        assert!(!baseline_record_shares(&vod_s, None, true));
+
+        // N8: GROUP_LIGHT must not attach to WHIP when simulcast == false.
+        assert!(!direct_uses_light_layer(false, false, true));
+        assert!(direct_uses_light_layer(true, false, true));
+
+        // F10.1: `record_encode_for_stream` matches `GROUP_MAIN` encode shape when active, else falls back cleanly.
+        assert_eq!(record_encode_for_stream(&vod_s, None, None), record_encode_capped(&vod_s, None));
     }
 }
 
