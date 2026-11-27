@@ -683,28 +683,41 @@ fn mpx_s(w: u32, h: u32, fps: u32) -> f64 {
     f64::from(w) * f64::from(h) * f64::from(fps) / 1e6
 }
 
-fn evaluate_budget(groups: &[WorkingGroup], main: &MainEncode, budget: &PcBudget) -> BudgetCheck {
+struct BudgetRow<'a> {
+    id: &'a str,
+    key: &'a EncodeKey,
+    extra_tracks: &'a [(u32, u32, u32)],
+    vod_track: bool,
+}
+
+fn evaluate_budget_rows<'a>(
+    rows: impl Iterator<Item = BudgetRow<'a>>,
+    main: &MainEncode,
+    budget: &PcBudget,
+) -> BudgetCheck {
     let mut used_mpx_s = budget.extra_mpx_s;
     let mut used_sessions = budget.extra_sessions;
+    let mut main_shares_with_record = false;
     let stream_counted =
         !(budget.stream_is_software && !matches!(budget.source, BudgetSource::CpuDefault | BudgetSource::Bench));
     if stream_counted {
-        for g in groups {
-            used_mpx_s += mpx_s(g.key.width, g.key.height, g.key.fps);
+        for row in rows {
+            used_mpx_s += mpx_s(row.key.width, row.key.height, row.key.fps);
             used_sessions = used_sessions.saturating_add(1);
-            for &(tw, th, _) in &g.extra_tracks {
-                used_mpx_s += mpx_s(tw, th, g.key.fps);
+            for &(tw, th, _) in row.extra_tracks {
+                used_mpx_s += mpx_s(tw, th, row.key.fps);
                 used_sessions = used_sessions.saturating_add(1);
             }
+            if row.id == GROUP_MAIN
+                && row.extra_tracks.is_empty()
+                && !row.vod_track
+                && row.key.width == main.canvas_width
+                && row.key.height == main.canvas_height
+                && row.key.fps == main.canvas_fps
+            {
+                main_shares_with_record = true;
+            }
         }
-        let main_shares_with_record = groups.iter().any(|g| {
-            g.id == GROUP_MAIN
-                && g.extra_tracks.is_empty()
-                && !g.vod_track
-                && g.key.width == main.canvas_width
-                && g.key.height == main.canvas_height
-                && g.key.fps == main.canvas_fps
-        });
         if budget.record_shares_main && !main_shares_with_record {
             used_mpx_s += mpx_s(main.canvas_width, main.canvas_height, main.canvas_fps);
             used_sessions = used_sessions.saturating_add(1);
@@ -729,6 +742,38 @@ fn evaluate_budget(groups: &[WorkingGroup], main: &MainEncode, budget: &PcBudget
         max_sessions: eff_max,
         note: budget.note.clone(),
     }
+}
+
+fn evaluate_budget(groups: &[WorkingGroup], main: &MainEncode, budget: &PcBudget) -> BudgetCheck {
+    evaluate_budget_rows(
+        groups.iter().map(|g| BudgetRow {
+            id: &g.id,
+            key: &g.key,
+            extra_tracks: &g.extra_tracks,
+            vod_track: g.vod_track,
+        }),
+        main,
+        budget,
+    )
+}
+
+/// Evaluates steady-state `plan` combined with any still-running or reserved encode groups not yet in `plan`.
+pub(crate) fn evaluate_plan_with_extra_groups(
+    plan: &EncodePlan,
+    main: &MainEncode,
+    budget: &PcBudget,
+    extra_groups: &[crate::studio_host::EncodeGroupSpec],
+) -> BudgetCheck {
+    let plan_rows = plan.groups.iter().map(|g| BudgetRow {
+        id: &g.id,
+        key: &g.key,
+        extra_tracks: &g.extra_tracks,
+        vod_track: g.vod_track,
+    });
+    let extra_rows = extra_groups.iter().filter(|spec| !plan.groups.iter().any(|g| g.id == spec.id)).map(|spec| {
+        BudgetRow { id: &spec.id, key: &spec.key, extra_tracks: &spec.extra_tracks, vod_track: spec.vod_track }
+    });
+    evaluate_budget_rows(plan_rows.chain(extra_rows), main, budget)
 }
 
 fn rebuild_groups(dests: &[WorkingDest], eb_extra: &[(u32, u32, u32)]) -> Vec<WorkingGroup> {
